@@ -140,6 +140,89 @@ fn parses_call_traversal_sites_and_formal_input_selectors() {
 }
 
 #[test]
+fn receiver_steps_parse_canonically_and_validate_capture_domains() {
+    let json = json!({
+        "match": {
+            "kind": "call",
+            "receiver": { "capture": "service" }
+        },
+        "steps": [
+            { "op": "receiver_targets", "capture": "service" },
+            { "op": "file_of" }
+        ]
+    });
+    let query = parse_ok(json.clone());
+    assert_eq!(
+        query.steps[0],
+        QueryStep::ReceiverTargets(ReceiverTraversalFilter {
+            capture: Some("service".to_string()),
+        })
+    );
+    assert_eq!(query.to_canonical_json()["schema_version"], 2);
+
+    let rql = CodeQuery::from_sexp(
+        r#"(file-of (receiver-targets :capture service (call :receiver (capture "service"))))"#,
+    )
+    .expect("receiver RQL");
+    assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
+
+    for (steps, path) in [
+        (
+            json!([{ "op": "points_to", "capture": "missing" }]),
+            "steps[0].capture",
+        ),
+        (
+            json!([
+                { "op": "enclosing_decl" },
+                { "op": "references_of" },
+                { "op": "points_to", "capture": "service" }
+            ]),
+            "steps[2].capture",
+        ),
+    ] {
+        let error = error_of(json!({
+            "match": {
+                "kind": "call",
+                "receiver": { "capture": "service" }
+            },
+            "steps": steps
+        }));
+        assert_eq!(error.path, path);
+    }
+}
+
+#[test]
+fn receiver_steps_enforce_their_typed_input_domains() {
+    for (steps, path) in [
+        (
+            json!([{ "op": "member_targets" }, { "op": "file_of" }]),
+            None,
+        ),
+        (
+            json!([{ "op": "enclosing_decl" }, { "op": "points_to" }]),
+            Some("steps[1]"),
+        ),
+        (
+            json!([
+                { "op": "enclosing_decl" },
+                { "op": "call_sites_to" },
+                { "op": "member_targets" }
+            ]),
+            Some("steps[2]"),
+        ),
+    ] {
+        let result = parse(json!({
+            "match": { "kind": "call" },
+            "steps": steps
+        }));
+        match path {
+            None => assert!(result.is_ok()),
+            Some(path) => assert_eq!(result.expect_err("invalid domain").path, path),
+        }
+    }
+}
+
+#[test]
 fn reference_options_are_operation_specific_and_constrained() {
     for (step, path) in [
         (

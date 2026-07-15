@@ -59,11 +59,84 @@ export interface RqlFileResult extends RqlQueryResultBase {
   language: string;
 }
 
+type RqlDeclarationValue = Omit<
+  RqlDeclarationResult,
+  "result_type" | "uri" | "provenance" | "provenance_truncated"
+>;
+
+export interface RqlCallSiteResult extends RqlQueryResultBase {
+  result_type: "call_site";
+  language: string;
+  range: RqlResultRange;
+  caller: RqlDeclarationValue;
+  callee: RqlDeclarationValue;
+  call_kind: string;
+  proof: string;
+}
+
+export interface RqlExpressionSiteResult extends RqlQueryResultBase {
+  result_type: "expression_site";
+  language: string;
+  range: RqlResultRange;
+  text: string;
+  input_kind: string;
+  caller_fq_name: string;
+  callee_fq_name: string;
+}
+
+export interface RqlReceiverValue {
+  receiver_value_kind: string;
+  declaration?: RqlDeclarationValue;
+  type_declaration?: RqlDeclarationValue;
+  allocation_site?: { path: string; range: RqlResultRange };
+  factory?: RqlDeclarationValue;
+  returned_value?: RqlReceiverValue;
+}
+
+function receiverValueLabel(value: RqlReceiverValue): string {
+  switch (value.receiver_value_kind) {
+    case "allocation_site":
+      return `allocation ${value.type_declaration?.fq_name ?? "unknown"}`;
+    case "instance_type":
+      return `instance ${value.declaration?.fq_name ?? "unknown"}`;
+    case "class_or_static_object":
+      return `class/static ${value.declaration?.fq_name ?? "unknown"}`;
+    case "module_or_export_object":
+      return `module/export ${value.declaration?.fq_name ?? "unknown"}`;
+    case "current_receiver":
+      return `current receiver ${value.declaration?.fq_name ?? "unknown"}`;
+    case "factory_return":
+      return `factory ${value.factory?.fq_name ?? "unknown"} → ${
+        value.returned_value ? receiverValueLabel(value.returned_value) : "unknown"
+      }`;
+    default:
+      return value.receiver_value_kind;
+  }
+}
+
+export interface RqlReceiverAnalysisResult extends RqlQueryResultBase {
+  result_type: "receiver_analysis";
+  analysis_kind: string;
+  language: string;
+  range: RqlResultRange;
+  text: string;
+  input_kind: string;
+  capture?: string;
+  outcome: string;
+  values?: RqlReceiverValue[];
+  member_targets?: RqlDeclarationValue[];
+  reason?: string;
+  limit?: string;
+}
+
 export type RqlQueryResultItem =
   | RqlStructuralMatchResult
   | RqlDeclarationResult
   | RqlFileResult
-  | RqlReferenceSiteResult;
+  | RqlReferenceSiteResult
+  | RqlCallSiteResult
+  | RqlExpressionSiteResult
+  | RqlReceiverAnalysisResult;
 
 export interface RqlQueryResponse {
   text: string;
@@ -96,7 +169,9 @@ export async function runRqlQuery(
     return undefined;
   }
   if (!runner.isReady()) {
-    runner.showWarning("Bifrost is not ready. Start the language server and wait for indexing to finish.");
+    runner.showWarning(
+      "Bifrost is not ready. Start the language server and wait for indexing to finish."
+    );
     return undefined;
   }
 
@@ -139,6 +214,12 @@ export function queryResultLabel(result: RqlQueryResultItem): string {
       return result.path;
     case "reference_site":
       return result.target.fq_name;
+    case "call_site":
+      return `${result.caller.fq_name} → ${result.callee.fq_name}`;
+    case "expression_site":
+      return result.text;
+    case "receiver_analysis":
+      return `${result.analysis_kind}: ${result.text}`;
   }
 }
 
@@ -148,6 +229,12 @@ export function queryResultDescription(result: RqlQueryResultItem): string {
       return `file · ${result.language}`;
     case "reference_site":
       return `${result.reference_kind ?? "reference"} · ${result.range.start_line}:${result.range.start_column}`;
+    case "call_site":
+      return `${result.call_kind} · ${result.proof}`;
+    case "expression_site":
+      return `call input · ${result.input_kind}`;
+    case "receiver_analysis":
+      return `${result.outcome} · ${result.range.start_line}:${result.range.start_column}`;
     case "structural_match":
     case "declaration":
       return `${result.kind} · ${result.start_line}-${result.end_line}`;
@@ -174,6 +261,29 @@ export function queryResultTooltip(result: RqlQueryResultItem): string {
         `${result.path}:${result.range.start_line}:${result.range.start_column}` +
         `\n\n${result.usage_kind} · ${result.proof}`
       );
+    case "call_site":
+      return (
+        `**${result.call_kind} call** at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
+        `\n\n\`${result.caller.fq_name}\` → \`${result.callee.fq_name}\` · ${result.proof}`
+      );
+    case "expression_site":
+      return (
+        `**${result.input_kind} call input** at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
+        `\n\n\`${result.text}\``
+      );
+    case "receiver_analysis":
+      return (
+        `**${result.analysis_kind}** at ${result.path}:${result.range.start_line}:${result.range.start_column}` +
+        `\n\n${result.outcome} · \`${result.text}\`` +
+        (result.values?.length
+          ? `\n\n${result.values.map((value) => `Value: \`${receiverValueLabel(value)}\``).join("\n\n")}`
+          : "") +
+        (result.member_targets?.length
+          ? `\n\n${result.member_targets.map((target) => `Member: \`${target.fq_name}\``).join("\n\n")}`
+          : "") +
+        (result.reason ? `\n\n${result.reason}` : "") +
+        (result.limit ? `\n\nLimit: ${result.limit}` : "")
+      );
   }
 }
 
@@ -187,6 +297,12 @@ export function queryResultIcon(result: RqlQueryResultItem): string {
       return "file-code";
     case "reference_site":
       return "references";
+    case "call_site":
+      return "call-outgoing";
+    case "expression_site":
+      return "symbol-variable";
+    case "receiver_analysis":
+      return "type-hierarchy";
   }
 }
 
@@ -195,6 +311,9 @@ export function queryResultRange(result: RqlQueryResultItem): RqlResultRange | u
     case "file":
       return undefined;
     case "reference_site":
+    case "call_site":
+    case "expression_site":
+    case "receiver_analysis":
       return result.range;
     case "structural_match":
     case "declaration":

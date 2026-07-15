@@ -74,7 +74,9 @@ export async function showRuneIr(
     return undefined;
   }
   if (!runner.isReady()) {
-    runner.showWarning("Bifrost is not ready. Start the language server and wait for indexing to finish.");
+    runner.showWarning(
+      "Bifrost is not ready. Start the language server and wait for indexing to finish."
+    );
     return undefined;
   }
   if (!selection && !position) {

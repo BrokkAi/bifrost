@@ -12,9 +12,10 @@ Bifrost has several interfaces because editor navigation, agent tools, structura
 | “Where is this known symbol defined or referenced?” | `search_symbols`, then a mode-specific definition or usage tool | These tools preserve declaration identity, aliases, imports, and language-specific resolution. |
 | “Which code has this syntactic shape?” | [`query_code`](/code-querying/) | It matches normalized calls, declarations, assignments, imports, literals, containment, and typed graph steps across languages. |
 | “Which declarations call, use, inherit from, or import this result?” | A `query_code` typed pipeline | Start with a structural match, then traverse exact indexed declarations, reference/call edges, hierarchy, ownership, or project-file imports. |
+| “What JavaScript/TypeScript value can this receiver denote, or which exact member does it select?” | [`receiver_targets`, `points_to`, or `member_targets`](/code-query-tutorials/receiver-traversal/) | Returns a bounded `receiver_analysis` row with explicit precision, ambiguity, unsupported, and budget outcomes. |
 | “Which code is conceptually about this topic?” | [`semantic_search`](/semantic-search/) | This optional feature retrieves by meaning when names and shapes are not known in advance. |
 | “Where does this literal string occur?” | A text-search tool | Text search is the honest choice when the question is textual rather than structural or semantic. |
-| “Can Bifrost prove control flow, aliasing, points-to, or general data flow?” | Do not use the current query engine for that proof | Those analyses are outside the current product boundary. Structural containment and resolved graph edges are not substitutes for them. |
+| “Can Bifrost prove path-sensitive control flow, whole-program points-to, general aliasing, taint, or general data flow?” | Do not use the current query engine for that proof | The bounded JavaScript/TypeScript receiver provider is not a substitute for those analyses. |
 
 When a question begins with a known declaration, prefer symbol and usage tools. When it begins with a language-neutral shape, prefer `query_code`. A common workflow is to find candidates structurally and then use exact locations or declarations for semantic follow-up.
 
@@ -52,4 +53,4 @@ Begin with [Build a Static-Analysis Rule](/build-static-analysis-rule/), use RQL
 
 ## Check Suitability Before Installation
 
-Bifrost is a good fit when the answer can be grounded in parsed source structure, indexed declarations, exact source references, resolved call edges, direct project-file imports, or indexed type relationships. It is not currently a control-flow, points-to, general alias, taint, or whole-program data-flow engine. Read the [capability matrix](/capabilities/) for language-specific boundaries before relying on a zero-result or completeness claim.
+Bifrost is a good fit when the answer can be grounded in parsed source structure, indexed declarations, exact source references, resolved call edges, direct project-file imports, indexed type relationships, or bounded JavaScript/TypeScript receiver provenance. It is not a path-sensitive control-flow, whole-program points-to, general alias, taint, or whole-program data-flow engine. Read the [capability matrix](/capabilities/) for language-specific boundaries before relying on a zero-result or completeness claim.

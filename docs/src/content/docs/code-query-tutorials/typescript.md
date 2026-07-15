@@ -5,7 +5,7 @@ description: Query TypeScript declarations, callable refinements, decorators, an
 
 > Last verified end to end: 2026-07-14 (`query_code` schema version 2).
 
-For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
+For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/). For bounded allocation/factory provenance, ambiguity, exact member targets, and call-input composition, see [Receiver Traversal](../receiver-traversal/).
 
 TypeScript shares JavaScript's structural adapter and adds interface, enum, abstract-class, type-alias, type-identifier, decorator, and TSX grammar shapes.
 
@@ -206,6 +206,8 @@ The TypeScript language filter includes `.tsx`; `where` narrows this call to the
 ## Precision Boundary
 
 Interfaces, enums, and abstract classes intentionally share the normalized `class` kind. Use `name`, containment, or source/path scoping when their source syntax matters; version 2 has no separate public `interface` kind.
+
+TypeScript and JavaScript are the only languages whose `query_code` provider currently exposes bounded receiver values. That provider preserves explicit `unknown`, `ambiguous`, `unsupported`, and budget outcomes; it does not provide whole-program points-to, general alias analysis, path-sensitive control flow, taint, or general data flow.
 
 ## Traverse Indexed Types And Members
 

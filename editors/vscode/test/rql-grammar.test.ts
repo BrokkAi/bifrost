@@ -1,25 +1,35 @@
-const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
-const test = require("node:test");
-const {
-  assertScoped,
-  loadTextMateGrammar,
-  tokenizeGrammar
-} = require("./textmate-test-utils");
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { test } from "node:test";
+import { assertScoped, loadTextMateGrammar, tokenizeGrammar } from "./textmate-test-utils";
 
-const extensionRoot = path.resolve(__dirname, "..");
+interface ExtensionManifest {
+  activationEvents: string[];
+  contributes: {
+    languages: unknown[];
+    grammars: unknown[];
+    commands: Array<{ command: string; [key: string]: unknown }>;
+    menus: Record<string, Array<Record<string, string>>>;
+    views: { explorer: unknown[] };
+  };
+}
+
+const extensionRoot = path.resolve(__dirname, "../..");
 const grammarPath = path.join(extensionRoot, "syntaxes", "bifrost-rql.tmLanguage.json");
-const fixturePath = path.join(__dirname, "fixtures", "rql", "highlighting.rql");
+const fixturePath = path.join(extensionRoot, "test", "fixtures", "rql", "highlighting.rql");
 const scopeName = "source.bifrost-rql";
 
 async function grammar() {
   return loadTextMateGrammar(grammarPath, scopeName);
 }
 
-test("registers Bifrost RQL as a distinct .rql language", () => {
-  const manifest = JSON.parse(fs.readFileSync(path.join(extensionRoot, "package.json"), "utf8"));
-  const runeIrSourceContext = "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == ruby";
+void test("registers Bifrost RQL as a distinct .rql language", () => {
+  const manifest = JSON.parse(
+    fs.readFileSync(path.join(extensionRoot, "package.json"), "utf8")
+  ) as ExtensionManifest;
+  const runeIrSourceContext =
+    "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == ruby";
   assert.ok(manifest.activationEvents.includes("onLanguage:bifrost-rql"));
   assert.ok(!manifest.activationEvents.includes("onLanguage:bifrost-rune-ir"));
   assert.deepEqual(manifest.contributes.languages, [
@@ -95,35 +105,41 @@ test("registers Bifrost RQL as a distinct .rql language", () => {
   ]);
 });
 
-test("tokenizes nested RQL structure, literals, and incomplete input", async () => {
+void test("tokenizes nested RQL structure, literals, and incomplete input", async () => {
   const tokens = tokenizeGrammar(await grammar(), fs.readFileSync(fixturePath, "utf8"));
 
-  assertScoped(tokens, "; A complete nested query and deliberately incomplete trailing input.", "comment.line.semicolon.bifrost-rql");
+  assertScoped(
+    tokens,
+    "; A complete nested query and deliberately incomplete trailing input.",
+    "comment.line.semicolon.bifrost-rql"
+  );
   assertScoped(tokens, "(", "punctuation.section.brackets.bifrost-rql");
   assertScoped(tokens, "where", "support.function.wrapper.bifrost-rql");
   assertScoped(tokens, "call", "entity.name.type.kind.bifrost-rql");
   assertScoped(tokens, ":callee", "variable.parameter.role.bifrost-rql");
   assertScoped(tokens, "name/regex", "support.function.predicate.bifrost-rql");
   assertScoped(tokens, "eval\\\\(", "string.regexp.bifrost-rql");
-  assertScoped(tokens, "\"src/**/*.py\"", "string.quoted.double.bifrost-rql");
+  assertScoped(tokens, '"src/**/*.py"', "string.quoted.double.bifrost-rql");
   assertScoped(tokens, "25", "constant.numeric.integer.decimal.bifrost-rql");
   assertScoped(tokens, "full", "constant.language.result-detail.bifrost-rql");
   assertScoped(tokens, "; trailing comment", "comment.line.semicolon.bifrost-rql");
-  assertScoped(tokens, "\"semi;colon\"", "string.quoted.double.bifrost-rql");
-  const unknown = tokens.find((candidate) => candidate.text.includes("custom_identifier :unexpected true false null 7"));
+  assertScoped(tokens, '"semi;colon"', "string.quoted.double.bifrost-rql");
+  const unknown = tokens.find((candidate) =>
+    candidate.text.includes("custom_identifier :unexpected true false null 7")
+  );
   assert.deepEqual(unknown?.scopes, [scopeName]);
 });
 
-test("highlights registered underscore predicate aliases", async () => {
+void test("highlights registered underscore predicate aliases", async () => {
   const tokens = tokenizeGrammar(await grammar(), "(not_has (call)) (not_kind class)");
   assertScoped(tokens, "not_has", "support.function.predicate.bifrost-rql");
   assertScoped(tokens, "not_kind", "support.function.predicate.bifrost-rql");
 });
 
-test("highlights semantic traversal forms and options", async () => {
+void test("highlights semantic traversal forms and options", async () => {
   const tokens = tokenizeGrammar(
     await grammar(),
-    "(references-of :reference-kinds [field-write] :proof proven :surface external-usages (class :name \"Target\")) (used-by (class)) (uses (method)) (call-input :parameter-name \"payload\" (call-sites-to (method))) (callers :depth 2 (method))"
+    '(references-of :reference-kinds [field-write] :proof proven :surface external-usages (class :name "Target")) (used-by (class)) (uses (method)) (call-input :parameter-name "payload" (call-sites-to (method))) (callers :depth 2 (method))'
   );
   assertScoped(tokens, "references-of", "support.function.wrapper.bifrost-rql");
   assertScoped(tokens, ":reference-kinds", "variable.parameter.role.bifrost-rql");
@@ -135,4 +151,15 @@ test("highlights semantic traversal forms and options", async () => {
   assertScoped(tokens, ":parameter-name", "variable.parameter.role.bifrost-rql");
   assertScoped(tokens, "call-sites-to", "support.function.wrapper.bifrost-rql");
   assertScoped(tokens, "callers", "support.function.wrapper.bifrost-rql");
+});
+
+void test("highlights receiver traversal forms and capture options", async () => {
+  const tokens = tokenizeGrammar(
+    await grammar(),
+    "(receiver-targets (call)) (points-to :capture service (call :receiver (capture service))) (member-targets (field-access))"
+  );
+  assertScoped(tokens, "receiver-targets", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, "points-to", "support.function.wrapper.bifrost-rql");
+  assertScoped(tokens, ":capture", "variable.parameter.role.bifrost-rql");
+  assertScoped(tokens, "member-targets", "support.function.wrapper.bifrost-rql");
 });

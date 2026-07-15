@@ -39,6 +39,10 @@ fn query_step_input_variants() -> Vec<Value> {
         .value_shape()
         .string_length_bounds()
         .expect("parameter-name shape has string bounds");
+    let (capture_name_minimum, capture_name_maximum) = QueryStepField::Capture
+        .value_shape()
+        .string_length_bounds()
+        .expect("capture-name shape has string bounds");
     let plain = ALL_QUERY_STEP_OPS
         .iter()
         .copied()
@@ -47,6 +51,7 @@ fn query_step_input_variants() -> Vec<Value> {
                 && !op.allows_reference_options()
                 && !op.allows_call_options()
                 && !op.allows_call_site_options()
+                && !op.allows_receiver_options()
                 && op.label() != "call_input"
         })
         .map(|op| op.label())
@@ -73,6 +78,12 @@ fn query_step_input_variants() -> Vec<Value> {
         .iter()
         .copied()
         .filter(|op| op.allows_call_site_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let receiver_steps = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_receiver_options())
         .map(|op| op.label())
         .collect::<Vec<_>>();
     let reference_kinds = ALL_REFERENCE_KINDS
@@ -177,6 +188,19 @@ fn query_step_input_variants() -> Vec<Value> {
             "required": ["op", "parameter_name"],
             "additionalProperties": false
         }),
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": receiver_steps },
+                "capture": {
+                    "type": "string",
+                    "minLength": capture_name_minimum,
+                    "maxLength": capture_name_maximum
+                }
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
     ]
 }
 
@@ -200,7 +224,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         .collect::<Vec<_>>()
         .join(", ");
     let query_code_description = format!(
-        "Query normalized code structure, then optionally apply typed semantic steps. Version 2 supports {step_vocabulary}. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Call traversal is direct by default, accepts only finite positive depth, and can expose call sites plus one direct receiver or formal-parameter input. Reference and call steps preserve proof-bearing exact indexed targets and sites. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, file, reference_site, call_site, or expression_site results with provenance. It does not perform points-to, control-flow, or data-flow analysis. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. Call-input example: {{\"match\":{{\"kind\":\"callable\",\"name\":\"execute\"}},\"steps\":[{{\"op\":\"enclosing_decl\"}},{{\"op\":\"call_sites_to\",\"proof\":\"proven\"}},{{\"op\":\"call_input\",\"parameter_name\":\"payload\"}}]}}. Guide: https://brokkai.github.io/bifrost/code-querying/"
+        "Query normalized code structure, then optionally apply typed semantic steps. Version 2 supports {step_vocabulary}. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Call traversal is direct by default, accepts only finite positive depth, and can expose call sites plus one direct receiver or formal-parameter input. Reference and call steps preserve proof-bearing exact indexed targets and sites. JavaScript and TypeScript receiver_targets, points_to, and member_targets expose bounded demand-driven receiver provenance; other languages return explicit unsupported analysis rows. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, file, reference_site, call_site, expression_site, or receiver_analysis results with provenance. This is not whole-program points-to, general alias, control-flow, taint, or data-flow analysis. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. Receiver example: {{\"match\":{{\"kind\":\"call\",\"receiver\":{{\"capture\":\"object\"}}}},\"steps\":[{{\"op\":\"points_to\",\"capture\":\"object\"}}]}}. Guide: https://brokkai.github.io/bifrost/code-querying/"
     );
     let query_step_variants = query_step_input_variants();
     vec![
@@ -562,6 +586,21 @@ mod tests {
             steps["items"]["oneOf"][2]["properties"]["depth"]["minimum"],
             1
         );
+        let receiver_variant = steps["items"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| {
+                variant["properties"]["op"]["enum"]
+                    == json!(["receiver_targets", "points_to", "member_targets"])
+            })
+            .expect("receiver traversal schema");
+        assert_eq!(receiver_variant["properties"]["capture"]["minLength"], 1);
+        assert_eq!(
+            receiver_variant["properties"]["capture"]["maxLength"],
+            MAX_CAPTURE_LENGTH
+        );
+        assert_eq!(receiver_variant["required"], json!(["op"]));
         let advertised = steps["items"]["oneOf"]
             .as_array()
             .unwrap()

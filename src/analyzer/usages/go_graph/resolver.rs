@@ -3,8 +3,9 @@ use crate::analyzer::go::packages::{canonical_go_package_name, read_go_module_pa
 use crate::analyzer::usages::common::language_for_file;
 pub(super) use crate::analyzer::usages::common::node_text;
 use crate::analyzer::usages::go_graph::extractor::{
-    field_owner_token, first_named_child, type_ref_from_node,
+    field_owner_token, first_named_child, selector_parts, type_ref_from_node,
 };
+use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind,
 };
@@ -12,6 +13,7 @@ use crate::analyzer::usages::reexport_seeds;
 use crate::analyzer::usages::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::{
     CodeUnit, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, ProjectFile,
+    TypeAliasProvider,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -43,7 +45,7 @@ pub(crate) struct GoProjectGraph {
     reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
     star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
     importer_reverse: HashMap<ProjectFile, Vec<ImportEdge>>,
-    edge_index: GoEdgeIndex,
+    pub(super) edge_index: GoEdgeIndex,
 }
 
 impl GoProjectGraph {
@@ -58,6 +60,14 @@ impl GoProjectGraph {
         self.parsed
             .get(file)
             .map(|parsed| canonical_go_package_name(file, &parsed.package_name))
+    }
+
+    pub(super) fn namespace_packages(&self, file: &ProjectFile) -> NamespacePackages {
+        self.edge_index.namespace_packages(file)
+    }
+
+    pub(super) fn is_known_non_alias_type(&self, fq_name: &str) -> bool {
+        self.edge_index.is_known_non_alias_type(fq_name)
     }
 
     pub(super) fn scan_files(
@@ -233,8 +243,9 @@ fn build_importer_reverse_go(
 pub(crate) struct GoEdgeIndex {
     package_names: HashMap<ProjectFile, String>,
     constructor_return_types: HashMap<String, Vec<String>>,
-    constructor_names_by_return_type: HashMap<String, Vec<String>>,
     type_units: Vec<CodeUnit>,
+    non_alias_type_fqns: HashSet<String>,
+    type_alias_targets: HashMap<String, String>,
     direct_member_fqns: HashMap<String, HashMap<String, Vec<String>>>,
     embedded_field_type_fqns: HashMap<String, Vec<String>>,
     namespace_packages_by_file: HashMap<ProjectFile, NamespacePackages>,
@@ -266,11 +277,12 @@ impl GoEdgeIndex {
         self.constructor_return_types.get(callee)
     }
 
-    pub(super) fn constructor_names_for_return_type(&self, return_type_fqn: &str) -> &[String] {
-        self.constructor_names_by_return_type
-            .get(return_type_fqn)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+    pub(super) fn is_known_non_alias_type(&self, fq_name: &str) -> bool {
+        self.non_alias_type_fqns.contains(fq_name)
+    }
+
+    pub(super) fn resolve_type_alias(&self, fq_name: &str) -> String {
+        resolve_go_alias_fqn(&self.type_alias_targets, fq_name)
     }
 
     fn type_units(&self) -> impl Iterator<Item = &CodeUnit> {
@@ -302,6 +314,73 @@ impl GoEdgeIndex {
             GoIndexedMemberLookup::Missing | GoIndexedMemberLookup::Ambiguous => None,
         }
     }
+}
+
+pub(super) fn constructor_call_type_fqns(
+    node: Node<'_>,
+    source: &str,
+    file_package: &str,
+    alias_packages: &HashMap<String, Vec<String>>,
+    dot_packages: &[String],
+    index: &GoEdgeIndex,
+    locals: Option<&LocalInferenceEngine<String>>,
+) -> Vec<String> {
+    if node.kind() != "call_expression" {
+        return Vec::new();
+    }
+    let Some(function) = node
+        .child_by_field_name("function")
+        .or_else(|| first_named_child(node))
+    else {
+        return Vec::new();
+    };
+    let mut return_types = match function.kind() {
+        "identifier" => {
+            let name = node_text(function, source);
+            if locals.is_some_and(|locals| locals.is_shadowed(name)) {
+                return Vec::new();
+            }
+            let mut types = index
+                .constructor_return_types(&format!("{file_package}.{name}"))
+                .cloned()
+                .unwrap_or_default();
+            for package in dot_packages {
+                types.extend(
+                    index
+                        .constructor_return_types(&format!("{package}.{name}"))
+                        .into_iter()
+                        .flatten()
+                        .cloned(),
+                );
+            }
+            types
+        }
+        "selector_expression" => {
+            let Some((qualifier, _, field)) = selector_parts(function, source) else {
+                return Vec::new();
+            };
+            if locals.is_some_and(|locals| locals.is_shadowed(&qualifier)) {
+                return Vec::new();
+            }
+            let field = node_text(field, source);
+            alias_packages
+                .get(&qualifier)
+                .into_iter()
+                .flatten()
+                .flat_map(|package| {
+                    index
+                        .constructor_return_types(&format!("{package}.{field}"))
+                        .into_iter()
+                        .flatten()
+                        .cloned()
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    return_types.sort();
+    return_types.dedup();
+    return_types
 }
 
 /// Build the tree-free [`GoEdgeIndex`] over `files`: parse each Go file once to
@@ -362,9 +441,6 @@ fn build_go_edge_index_from_parsed(
         return_types.sort();
         return_types.dedup();
     }
-    let constructor_names_by_return_type =
-        collect_constructor_names_by_return_type(&constructor_return_types);
-
     let dir_index = build_parent_dir_index(package_names.keys());
     let namespace_packages_by_file = parsed_files
         .iter()
@@ -380,6 +456,15 @@ fn build_go_edge_index_from_parsed(
             )
         })
         .collect();
+    let type_alias_targets =
+        collect_go_type_alias_targets(parsed_files, &package_names, &namespace_packages_by_file);
+    for return_types in constructor_return_types.values_mut() {
+        for return_type in return_types.iter_mut() {
+            *return_type = resolve_go_alias_fqn(&type_alias_targets, return_type);
+        }
+        return_types.sort();
+        return_types.dedup();
+    }
     let indexed_files: Vec<ProjectFile> =
         parsed_files.iter().map(|(file, _)| file.clone()).collect();
     let declaration_facts = collect_go_declaration_facts(analyzer, &indexed_files);
@@ -395,7 +480,8 @@ fn build_go_edge_index_from_parsed(
     GoEdgeIndex {
         package_names,
         constructor_return_types,
-        constructor_names_by_return_type,
+        non_alias_type_fqns: declaration_facts.non_alias_type_fqns,
+        type_alias_targets,
         type_units: declaration_facts.type_units,
         direct_member_fqns: declaration_facts.direct_member_fqns,
         embedded_field_type_fqns,
@@ -403,30 +489,9 @@ fn build_go_edge_index_from_parsed(
     }
 }
 
-fn collect_constructor_names_by_return_type(
-    constructor_return_types: &HashMap<String, Vec<String>>,
-) -> HashMap<String, Vec<String>> {
-    let mut by_return_type: HashMap<String, Vec<String>> = HashMap::default();
-    for (callee, return_types) in constructor_return_types {
-        let Some((_, name)) = callee.rsplit_once('.') else {
-            continue;
-        };
-        for return_type in return_types {
-            by_return_type
-                .entry(return_type.clone())
-                .or_default()
-                .push(name.to_string());
-        }
-    }
-    for names in by_return_type.values_mut() {
-        names.sort();
-        names.dedup();
-    }
-    by_return_type
-}
-
 struct GoDeclarationFacts {
     type_fqns: HashSet<String>,
+    non_alias_type_fqns: HashSet<String>,
     type_units: Vec<CodeUnit>,
     direct_member_fqns: HashMap<String, HashMap<String, Vec<String>>>,
 }
@@ -436,6 +501,7 @@ fn collect_go_declaration_facts(
     files: &[ProjectFile],
 ) -> GoDeclarationFacts {
     let mut type_fqns = HashSet::default();
+    let mut non_alias_type_fqns = HashSet::default();
     let mut type_units = Vec::new();
     let mut members: HashMap<String, HashMap<String, Vec<String>>> = HashMap::default();
     for file in files {
@@ -443,6 +509,9 @@ fn collect_go_declaration_facts(
             let fqn = unit.fq_name();
             if unit.is_class() {
                 type_fqns.insert(fqn.clone());
+                if !analyzer.is_type_alias(&unit) {
+                    non_alias_type_fqns.insert(fqn.clone());
+                }
                 type_units.push(unit.clone());
             }
             if !(unit.is_function() || unit.is_field()) {
@@ -461,9 +530,71 @@ fn collect_go_declaration_facts(
     }
     GoDeclarationFacts {
         type_fqns,
+        non_alias_type_fqns,
         type_units,
         direct_member_fqns: members,
     }
+}
+
+fn collect_go_type_alias_targets(
+    parsed_files: &[(ProjectFile, &ParsedFile)],
+    package_names: &HashMap<ProjectFile, String>,
+    namespace_packages_by_file: &HashMap<ProjectFile, NamespacePackages>,
+) -> HashMap<String, String> {
+    let mut aliases = HashMap::default();
+    for (file, parsed) in parsed_files {
+        let package = canonical_go_package_name(
+            file,
+            package_names
+                .get(file)
+                .map(String::as_str)
+                .unwrap_or_default(),
+        );
+        let mut stack = vec![parsed.tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "type_alias"
+                && let (Some(name_node), Some(type_node)) = (
+                    node.child_by_field_name("name"),
+                    node.child_by_field_name("type"),
+                )
+                && let Some(ty) = type_ref_from_node(type_node, &parsed.source)
+                && let Some(name) = ty.name
+            {
+                let target = match ty.qualifier {
+                    None => Some(format!("{package}.{name}")),
+                    Some(qualifier) => namespace_packages_by_file
+                        .get(file)
+                        .and_then(|(packages, _)| packages.get(&qualifier))
+                        .and_then(|packages| {
+                            let mut packages = packages.iter();
+                            let first = packages.next()?;
+                            packages.next().is_none().then(|| format!("{first}.{name}"))
+                        }),
+                };
+                if let Some(target) = target {
+                    aliases.insert(
+                        format!("{package}.{}", node_text(name_node, &parsed.source)),
+                        target,
+                    );
+                }
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+    }
+    aliases
+}
+
+fn resolve_go_alias_fqn(aliases: &HashMap<String, String>, fq_name: &str) -> String {
+    let mut current = fq_name.to_string();
+    let mut visited = HashSet::default();
+    while let Some(next) = aliases.get(&current) {
+        if !visited.insert(current.clone()) {
+            return fq_name.to_string();
+        }
+        current = next.clone();
+    }
+    current
 }
 
 fn collect_go_embedded_field_type_fqns(
@@ -971,8 +1102,9 @@ pub(super) struct TargetSpec {
     top_level_seeds: Option<BTreeSet<(ProjectFile, String)>>,
     owner_seeds: Option<BTreeSet<(ProjectFile, String)>>,
     compatible_receiver_types: BTreeSet<(ProjectFile, String)>,
+    compatible_receiver_fqns: HashSet<String>,
+    owner_is_interface: bool,
     field_owner_direct_names: HashMap<ProjectFile, HashMap<String, HashSet<String>>>,
-    owner_constructor_names: HashSet<String>,
 }
 
 impl TargetSpec {
@@ -997,6 +1129,15 @@ impl TargetSpec {
                 )
             })
             .unwrap_or_default();
+        let compatible_receiver_fqns = compatible_receiver_types
+            .iter()
+            .filter_map(|(file, receiver)| {
+                graph
+                    .package_name_of(file)
+                    .map(|package| format!("{package}.{receiver}"))
+            })
+            .collect();
+        let owner_is_interface = go_target_owner_is_interface(analyzer, graph, target);
         let field_owner_direct_names =
             collect_field_owner_direct_names(graph, &compatible_receiver_types);
         let owner_seeds = (!compatible_receiver_types.is_empty()).then(|| {
@@ -1011,14 +1152,6 @@ impl TargetSpec {
             }
             seeds
         });
-        let mut owner_constructor_names = HashSet::default();
-        for (receiver_file, receiver) in &compatible_receiver_types {
-            owner_constructor_names.extend(collect_owner_constructor_names(
-                graph,
-                receiver,
-                receiver_file,
-            ));
-        }
         Self {
             target: target.clone(),
             identifier,
@@ -1026,8 +1159,9 @@ impl TargetSpec {
             top_level_seeds,
             owner_seeds,
             compatible_receiver_types,
+            compatible_receiver_fqns,
+            owner_is_interface,
             field_owner_direct_names,
-            owner_constructor_names,
         }
     }
 
@@ -1047,12 +1181,41 @@ impl TargetSpec {
         self.owner.is_some() && !is_module_field(&self.target)
     }
 
-    /// Whether `name` is a package-level function in the owner type's package whose
-    /// result is the owner type (e.g. `NewService` for `Service`), so a local bound
-    /// to its return value can be seeded as the owner receiver.
-    pub(super) fn is_owner_constructor(&self, name: &str) -> bool {
-        self.owner_constructor_names.contains(name)
+    pub(super) fn owner_is_interface(&self) -> bool {
+        self.owner_is_interface
     }
+
+    pub(super) fn matches_receiver_fqn(&self, fq_name: &str) -> bool {
+        self.compatible_receiver_fqns.contains(fq_name)
+    }
+}
+
+fn go_target_owner_is_interface(
+    analyzer: &GoAnalyzer,
+    graph: &GoProjectGraph,
+    target: &CodeUnit,
+) -> bool {
+    let Some(owner) = analyzer.parent_of(target) else {
+        return false;
+    };
+    let Some(parsed) = graph.parsed_file(owner.source()) else {
+        return false;
+    };
+    let mut stack = vec![parsed.tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "type_spec"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| node_text(name, &parsed.source) == owner.identifier())
+        {
+            return node
+                .child_by_field_name("type")
+                .is_some_and(|ty| ty.kind() == "interface_type");
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
 }
 
 fn collect_compatible_receiver_types(
@@ -1252,27 +1415,6 @@ fn receiver_type_seeds(
     seeds
 }
 
-/// Names of package-level functions in the owner type's package whose first result
-/// is the owner type. A local bound to `NewOwner()` (or `pkg.NewOwner()`) then
-/// carries the owner type, so value-receiver method calls on it resolve on the
-/// graph path instead of silently returning no hits (#232).
-fn collect_owner_constructor_names(
-    graph: &GoProjectGraph,
-    owner: &str,
-    owner_source: &ProjectFile,
-) -> HashSet<String> {
-    let Some(package) = graph.package_name_of(owner_source) else {
-        return HashSet::default();
-    };
-    let owner_fqn = format!("{package}.{owner}");
-    graph
-        .edge_index
-        .constructor_names_for_return_type(&owner_fqn)
-        .iter()
-        .cloned()
-        .collect()
-}
-
 fn first_result_type_ref(result: Node<'_>, source: &str) -> Option<TypeRef> {
     if let Some(ty) = type_ref_from_node(result, source) {
         return Some(ty);
@@ -1445,10 +1587,10 @@ pub(super) struct ScanBindings {
     direct_names: HashSet<String>,
     pub(super) namespace_names: HashSet<String>,
     owner_direct_names: HashSet<String>,
-    owner_namespace_names: HashSet<String>,
     owner_namespace_type_names: HashMap<String, HashSet<String>>,
     field_owner_direct_names: HashMap<String, HashSet<String>>,
     field_owner_namespace_names: HashMap<String, HashMap<String, HashSet<String>>>,
+    mark_non_owner_types: bool,
 }
 
 impl ScanBindings {
@@ -1472,13 +1614,10 @@ impl ScanBindings {
         }
 
         let mut owner_direct_names = HashSet::default();
-        let mut owner_namespace_names = HashSet::default();
         if let Some(seeds) = &spec.owner_seeds {
             for edge in graph.matching_edges_for_importer(file, seeds) {
                 match edge.kind {
-                    ImportEdgeKind::Namespace | ImportEdgeKind::CommonJsRequire(_) => {
-                        owner_namespace_names.insert(edge.local_name);
-                    }
+                    ImportEdgeKind::Namespace | ImportEdgeKind::CommonJsRequire(_) => {}
                     ImportEdgeKind::Named(_) | ImportEdgeKind::Default => {
                         if let Some(owner) = &spec.owner {
                             owner_direct_names.insert(owner.clone());
@@ -1529,33 +1668,19 @@ impl ScanBindings {
                 }
             }
         }
-
         Self {
             direct_names,
             namespace_names,
             owner_direct_names,
-            owner_namespace_names,
             owner_namespace_type_names,
             field_owner_direct_names,
             field_owner_namespace_names,
+            mark_non_owner_types: spec.owner_is_interface(),
         }
     }
 
     pub(super) fn matches_direct_target(&self, text: &str) -> bool {
         self.direct_names.contains(text)
-    }
-
-    /// Whether the owner type is referable by a bare (unqualified) name in this
-    /// file — true in the owner's own package and through dot imports — so a bare
-    /// constructor call like `NewOwner()` resolves to the owner type here.
-    pub(super) fn owner_referable_directly(&self) -> bool {
-        !self.owner_direct_names.is_empty()
-    }
-
-    /// Whether `qualifier` is an import name bound to the owner type's package, so a
-    /// qualified constructor call like `pkg.NewOwner()` resolves to the owner type.
-    pub(super) fn owner_namespace_contains(&self, qualifier: &str) -> bool {
-        self.owner_namespace_names.contains(qualifier)
     }
 
     pub(super) fn matches_owner_type(&self, ty: &TypeRef) -> bool {
@@ -1572,7 +1697,11 @@ impl ScanBindings {
         })
     }
 
-    pub(super) fn receiver_tokens_for_type(&self, ty: &TypeRef) -> Vec<String> {
+    pub(super) fn receiver_tokens_for_type(
+        &self,
+        ty: &TypeRef,
+        known_non_alias_type: bool,
+    ) -> Vec<String> {
         let mut tokens = Vec::new();
         if self.matches_owner_type(ty) {
             tokens.push(crate::analyzer::usages::go_graph::extractor::OWNER_TOKEN.to_string());
@@ -1594,6 +1723,14 @@ impl ScanBindings {
                     }
                 }
             }
+        }
+        if self.mark_non_owner_types
+            && known_non_alias_type
+            && !tokens
+                .iter()
+                .any(|token| token == crate::analyzer::usages::go_graph::extractor::OWNER_TOKEN)
+        {
+            tokens.push(crate::analyzer::usages::go_graph::extractor::NON_OWNER_TOKEN.to_string());
         }
         tokens.sort();
         tokens.dedup();

@@ -13,7 +13,7 @@ pub(crate) const DEFAULT_RECEIVER_MAX_TARGETS: usize = 4;
 pub(crate) const DEFAULT_RECEIVER_MAX_SUMMARY_EXPANSIONS: usize = 64;
 pub(crate) const DEFAULT_RECEIVER_MAX_SCOPE_NODES: usize = 20_000;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum ReceiverAnalysisOutcome<T> {
     Precise(Vec<T>),
     Ambiguous(Vec<T>),
@@ -23,6 +23,20 @@ pub(crate) enum ReceiverAnalysisOutcome<T> {
 }
 
 impl<T> ReceiverAnalysisOutcome<T> {
+    pub(crate) fn values(&self) -> Option<&[T]> {
+        match self {
+            Self::Precise(values) | Self::Ambiguous(values) => Some(values),
+            Self::Unknown | Self::Unsupported { .. } | Self::ExceededBudget { .. } => None,
+        }
+    }
+
+    fn truncate_values(&mut self, limit: usize) {
+        match self {
+            Self::Precise(values) | Self::Ambiguous(values) => values.truncate(limit),
+            Self::Unknown | Self::Unsupported { .. } | Self::ExceededBudget { .. } => {}
+        }
+    }
+
     pub(crate) fn is_precise(&self) -> bool {
         matches!(self, Self::Precise(_))
     }
@@ -263,6 +277,39 @@ pub(crate) struct ReceiverAnalysisBudgetTracker {
     scope_nodes: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) struct ReceiverAnalysisWork {
+    pub(crate) setup_nodes: usize,
+    pub(crate) summary_expansions: usize,
+    pub(crate) scope_nodes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReceiverAnalysisReport<T> {
+    pub(crate) outcome: ReceiverAnalysisOutcome<T>,
+    pub(crate) work: ReceiverAnalysisWork,
+    pub(crate) candidates_truncated: bool,
+}
+
+impl<T> ReceiverAnalysisReport<T> {
+    pub(crate) fn without_work(
+        mut outcome: ReceiverAnalysisOutcome<T>,
+        budget: ReceiverAnalysisBudget,
+    ) -> Self {
+        let candidates_truncated = outcome
+            .values()
+            .is_some_and(|values| values.len() > budget.max_targets);
+        if candidates_truncated {
+            outcome.truncate_values(budget.max_targets);
+        }
+        Self {
+            outcome,
+            work: ReceiverAnalysisWork::default(),
+            candidates_truncated,
+        }
+    }
+}
+
 impl ReceiverAnalysisBudgetTracker {
     pub(crate) fn new(budget: ReceiverAnalysisBudget) -> Self {
         Self {
@@ -287,6 +334,31 @@ impl ReceiverAnalysisBudgetTracker {
             Err(ReceiverBudgetLimit::ScopeNodes)
         } else {
             Ok(())
+        }
+    }
+
+    pub(crate) fn work(&self) -> ReceiverAnalysisWork {
+        ReceiverAnalysisWork {
+            setup_nodes: 0,
+            summary_expansions: self.summary_expansions,
+            scope_nodes: self.scope_nodes,
+        }
+    }
+
+    pub(crate) fn report<T>(
+        &self,
+        mut outcome: ReceiverAnalysisOutcome<T>,
+    ) -> ReceiverAnalysisReport<T> {
+        let candidates_truncated = outcome
+            .values()
+            .is_some_and(|values| values.len() > self.budget.max_targets);
+        if candidates_truncated {
+            outcome.truncate_values(self.budget.max_targets);
+        }
+        ReceiverAnalysisReport {
+            outcome,
+            work: self.work(),
+            candidates_truncated,
         }
     }
 }

@@ -1140,25 +1140,6 @@ fn jsts_receiver_provider_member_candidates(
     let Some(node) = node else {
         return ReceiverAnalysisOutcome::Unknown;
     };
-    let member_expr = if node.kind() == "member_expression" {
-        node
-    } else if node
-        .parent()
-        .is_some_and(|parent| parent.kind() == "member_expression")
-    {
-        node.parent().expect("checked parent")
-    } else {
-        return ReceiverAnalysisOutcome::Unknown;
-    };
-    let Some(property) = member_expr.child_by_field_name("property") else {
-        return ReceiverAnalysisOutcome::Unknown;
-    };
-    if node_text(property, source) != member {
-        return ReceiverAnalysisOutcome::Unknown;
-    }
-    let Some(object) = member_expr.child_by_field_name("object") else {
-        return ReceiverAnalysisOutcome::Unknown;
-    };
     let provider = JsTsReceiverFactProvider::new(
         analyzer,
         support,
@@ -1168,12 +1149,15 @@ fn jsts_receiver_provider_member_candidates(
         tree.root_node(),
         compute_jsts_import_binder(source, tree),
     );
-    provider.resolve_member_targets(
-        object,
-        member,
-        site.focus_start_byte,
-        ReceiverAnalysisBudget::default(),
-    )
+    provider
+        .resolve_member_targets_at_site(
+            node,
+            Some(member),
+            site.focus_start_byte,
+            ReceiverAnalysisBudget::default(),
+        )
+        .map(|report| report.analysis.outcome)
+        .unwrap_or(ReceiverAnalysisOutcome::Unknown)
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {

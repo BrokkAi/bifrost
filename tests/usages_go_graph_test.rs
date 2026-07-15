@@ -3,6 +3,7 @@ mod common;
 use brokk_bifrost::IAnalyzer;
 use brokk_bifrost::usages::{FuzzyResult, GoUsageGraphStrategy, UsageAnalyzer, UsageFinder};
 use common::{definition, go_analyzer_with_files};
+use std::collections::BTreeSet;
 
 #[test]
 fn usage_finder_routes_go_targets_through_graph_strategy() {
@@ -397,6 +398,72 @@ func run() {
 
     assert_eq!(1, hits.len(), "bounded graph hits: {hits:?}");
     assert!(hits.iter().all(|hit| hit.file == project.file("main.go")));
+}
+
+#[test]
+fn go_graph_strategy_finds_struct_literal_field_labels_for_exact_owner() {
+    let (project, analyzer) = go_analyzer_with_files(&[
+        (
+            "model.go",
+            r#"
+package main
+
+type Wanted struct {
+    Field string
+}
+
+type Other struct {
+    Field string
+}
+"#,
+        ),
+        (
+            "keys/keys.go",
+            r#"
+package keys
+
+const MapKey = "Field"
+"#,
+        ),
+        (
+            "consumer.go",
+            r#"
+package main
+
+import "example.com/app/keys"
+
+func build() {
+    _ = Wanted{Field: "value"}
+    _ = &Wanted{Field: "pointer"}
+    _ = Other{Field: "wrong owner"}
+    Field := "local"
+    _ = map[string]string{Field: "map key"}
+    _ = map[string]string{keys.MapKey: "map expression"}
+    _ = Field
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "example.com/app.Wanted.Field");
+    let candidates = [project.file("consumer.go")].into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("struct literal field labels should resolve through their literal owner");
+
+    assert_eq!(2, hits.len(), "exact-owner field-label hits: {hits:?}");
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("consumer.go"))
+    );
+
+    let map_key = definition(&analyzer, "example.com/app/keys._module_.MapKey");
+    let map_key_hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&map_key), &candidates, 1000)
+        .into_either()
+        .expect("a qualified map-key expression remains an ordinary reference");
+    assert_eq!(1, map_key_hits.len(), "map-key hits: {map_key_hits:?}");
 }
 
 #[test]
@@ -1245,6 +1312,128 @@ func Run(m ExtensionManager, args []string, streams IOStreams) error {
                 .snippet
                 .contains("m.Dispatch(args, streams.In, streams.Out, streams.ErrOut)")
     }));
+}
+
+#[test]
+fn go_graph_strategy_excludes_concrete_receivers_from_interface_method_usages() {
+    let (project, analyzer) = go_analyzer_with_files(&[
+        (
+            "worker/worker.go",
+            r#"
+package worker
+
+type Worker struct{}
+
+func (Worker) Record() {}
+
+type Recorder interface {
+    Record()
+}
+
+type RecorderAlias = Recorder
+
+func NewWorker() Worker { return Worker{} }
+"#,
+        ),
+        (
+            "factory/factory.go",
+            r#"
+package factory
+
+import "example.com/app/worker"
+
+type Recorder = worker.Recorder
+
+func NewRecorder() Recorder { return worker.NewWorker() }
+"#,
+        ),
+        (
+            "cmd/app/main.go",
+            r#"
+package main
+
+import . "example.com/app/worker"
+import factory "example.com/app/factory"
+
+func main() {
+    worker := NewWorker()
+    worker.Record()
+    _, paired := 0, NewWorker()
+    paired.Record()
+    literal := Worker{}
+    literal.Record()
+    var recorder Recorder = worker
+    recorder.Record()
+    var aliased RecorderAlias = worker
+    aliased.Record()
+    viaFactory := factory.NewRecorder()
+    viaFactory.Record()
+}
+"#,
+        ),
+        (
+            "cmd/qualified/main.go",
+            r#"
+package main
+
+import worker "example.com/app/worker"
+
+func main() {
+    constructed := worker.NewWorker()
+    constructed.Record()
+    literal := worker.Worker{}
+    literal.Record()
+    var recorder worker.RecorderAlias = literal
+    recorder.Record()
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "example.com/app/worker.Recorder.Record");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let result = GoUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            unproven_total_by_overload,
+            ..
+        } => {
+            let hits = hits_by_overload
+                .get(&target)
+                .expect("interface receiver call should be proven");
+            assert_eq!(
+                4,
+                hits.len(),
+                "only interface and interface-alias receivers should be proven: {hits:#?}"
+            );
+            assert_eq!(
+                BTreeSet::from([
+                    (project.file("cmd/app/main.go"), 15),
+                    (project.file("cmd/app/main.go"), 17),
+                    (project.file("cmd/app/main.go"), 19),
+                    (project.file("cmd/qualified/main.go"), 12),
+                ]),
+                hits.iter()
+                    .map(|hit| (hit.file.clone(), hit.line))
+                    .collect::<BTreeSet<_>>()
+            );
+            assert_eq!(
+                None,
+                unproven_total_by_overload.get(&target),
+                "known concrete receivers must not be interface-method candidates: {:#?}",
+                unproven_by_overload.get(&target)
+            );
+        }
+        other => panic!("expected interface proof-tier result, got {other:#?}"),
+    }
 }
 
 #[test]

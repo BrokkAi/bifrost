@@ -5,6 +5,7 @@
 //! factory calls that return constructed values, and class factory methods whose body
 //! returns a constructed value.
 
+use crate::analyzer::js_ts::imports::require_call_module_specifier;
 use crate::analyzer::js_ts::syntax::slice;
 use crate::analyzer::usages::get_definition::js_ts::{
     parse_js_ts_tree, resolve_js_ts_module_binding_candidates,
@@ -14,15 +15,17 @@ use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
 use crate::analyzer::usages::model::{ImportBinder, ImportKind};
 use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisBudgetTracker, ReceiverAnalysisCacheKey,
-    ReceiverAnalysisOutcome, ReceiverAnalysisQuery, ReceiverContext, ReceiverFactProvider,
-    ReceiverSummaryQuery, ReceiverValue,
+    ReceiverAnalysisOutcome, ReceiverAnalysisQuery, ReceiverAnalysisReport, ReceiverContext,
+    ReceiverFactProvider, ReceiverSummaryQuery, ReceiverValue,
 };
 use crate::analyzer::{
     AliasResolver, BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile, Range,
 };
+use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
 use std::cell::RefCell;
+use std::sync::Arc;
 use tree_sitter::Node;
 
 const MAX_JSTS_RECEIVER_RECURSION: usize = 8;
@@ -36,11 +39,28 @@ pub(crate) struct JsTsReceiverFactProvider<'tree, 'a> {
     root: Node<'tree>,
     imports: ImportBinder,
     aliases: AliasResolver,
-    function_declarations_by_name: HashMap<String, Vec<Node<'tree>>>,
-    class_declarations_by_name: HashMap<String, Vec<Node<'tree>>>,
+    syntax_index: Arc<JsTsReceiverSyntaxIndex>,
     member_target_cache:
         RefCell<HashMap<ReceiverAnalysisCacheKey, ReceiverAnalysisOutcome<CodeUnit>>>,
     jsx_props_owner_cache: RefCell<HashMap<(ProjectFile, String), Vec<CodeUnit>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IndexedNodeRange {
+    start_byte: usize,
+    end_byte: usize,
+}
+
+#[derive(Debug, Default)]
+pub(in crate::analyzer::usages) struct JsTsReceiverSyntaxIndex {
+    function_declarations_by_name: HashMap<String, Vec<IndexedNodeRange>>,
+    class_declarations_by_name: HashMap<String, Vec<IndexedNodeRange>>,
+}
+
+pub(in crate::analyzer::usages) struct JsTsMemberTargetReport {
+    pub(crate) receiver_range: Range,
+    pub(crate) member_name: String,
+    pub(crate) analysis: ReceiverAnalysisReport<CodeUnit>,
 }
 
 impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
@@ -53,8 +73,31 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         root: Node<'tree>,
         imports: ImportBinder,
     ) -> Self {
-        let (function_declarations_by_name, class_declarations_by_name) =
-            index_js_ts_declarations(root, source);
+        let (syntax_index, _) =
+            build_js_ts_receiver_syntax_index(root, source, None).expect("uncancelled index build");
+        Self::new_with_syntax_index(
+            analyzer,
+            support,
+            language,
+            file,
+            source,
+            root,
+            imports,
+            syntax_index,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::analyzer::usages) fn new_with_syntax_index(
+        analyzer: &'a dyn IAnalyzer,
+        support: &'a dyn BoundedDefinitionLookup,
+        language: Language,
+        file: &'a ProjectFile,
+        source: &'a str,
+        root: Node<'tree>,
+        imports: ImportBinder,
+        syntax_index: Arc<JsTsReceiverSyntaxIndex>,
+    ) -> Self {
         let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
         Self {
             analyzer,
@@ -65,8 +108,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             root,
             imports,
             aliases,
-            function_declarations_by_name,
-            class_declarations_by_name,
+            syntax_index,
             member_target_cache: RefCell::new(HashMap::default()),
             jsx_props_owner_cache: RefCell::new(HashMap::default()),
         }
@@ -77,9 +119,18 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         node: Node<'tree>,
         budget: ReceiverAnalysisBudget,
     ) -> ReceiverAnalysisOutcome<ReceiverValue> {
+        self.resolve_receiver_node_report(node, budget).outcome
+    }
+
+    pub(crate) fn resolve_receiver_node_report(
+        &self,
+        node: Node<'tree>,
+        budget: ReceiverAnalysisBudget,
+    ) -> ReceiverAnalysisReport<ReceiverValue> {
         let _scope = profiling::scope("jsts.receiver_analysis.resolve_receiver_node");
         let mut tracker = ReceiverAnalysisBudgetTracker::new(budget);
-        self.resolve_expression(node, 0, budget, &mut tracker)
+        let outcome = self.resolve_expression(node, 0, budget, &mut tracker);
+        tracker.report(outcome)
     }
 
     pub(crate) fn resolve_iterable_element(
@@ -118,6 +169,17 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         _before_byte: usize,
         budget: ReceiverAnalysisBudget,
     ) -> ReceiverAnalysisOutcome<CodeUnit> {
+        self.resolve_member_targets_report(receiver, member, _before_byte, budget)
+            .outcome
+    }
+
+    pub(crate) fn resolve_member_targets_report(
+        &self,
+        receiver: Node<'tree>,
+        member: &str,
+        _before_byte: usize,
+        budget: ReceiverAnalysisBudget,
+    ) -> ReceiverAnalysisReport<CodeUnit> {
         let _scope = profiling::scope("jsts.receiver_analysis.resolve_member_targets");
         let query = ReceiverAnalysisQuery {
             language: self.language,
@@ -130,21 +192,21 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         };
         let cache_key = ReceiverAnalysisCacheKey::for_receiver(&query);
         if let Some(cached) = self.member_target_cache.borrow().get(&cache_key).cloned() {
-            return cached;
+            return ReceiverAnalysisReport::without_work(cached, budget);
         }
         let mut tracker = ReceiverAnalysisBudgetTracker::new(budget);
         let outcome = match self.resolve_expression(receiver, 0, budget, &mut tracker) {
             ReceiverAnalysisOutcome::Precise(values) => {
                 let targets = values
                     .iter()
-                    .flat_map(|value| self.member_targets(value.owner(), member))
+                    .flat_map(|value| self.member_targets_for_value(value, member))
                     .collect::<Vec<_>>();
                 ReceiverAnalysisOutcome::single_precise_or_ambiguous(targets, budget)
             }
             ReceiverAnalysisOutcome::Ambiguous(values) => {
                 let targets = values
                     .iter()
-                    .flat_map(|value| self.member_targets(value.owner(), member))
+                    .flat_map(|value| self.member_targets_for_value(value, member))
                     .collect::<Vec<_>>();
                 if targets.is_empty() {
                     ReceiverAnalysisOutcome::Ambiguous(Vec::new())
@@ -163,7 +225,34 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         self.member_target_cache
             .borrow_mut()
             .insert(cache_key, outcome.clone());
-        outcome
+        tracker.report(outcome)
+    }
+
+    pub(crate) fn resolve_member_targets_at_site(
+        &self,
+        site: Node<'tree>,
+        expected_member: Option<&str>,
+        before_byte: usize,
+        budget: ReceiverAnalysisBudget,
+    ) -> Option<JsTsMemberTargetReport> {
+        let member_expression = member_expression_at_site(site)?;
+        let property = member_expression.child_by_field_name("property")?;
+        let member_name = slice(property, self.source);
+        if member_name.is_empty() || expected_member.is_some_and(|expected| expected != member_name)
+        {
+            return None;
+        }
+        let receiver = member_expression.child_by_field_name("object")?;
+        Some(JsTsMemberTargetReport {
+            receiver_range: node_range(receiver),
+            member_name: member_name.to_string(),
+            analysis: self.resolve_member_targets_report(
+                receiver,
+                member_name,
+                before_byte,
+                budget,
+            ),
+        })
     }
 
     pub(crate) fn resolve_contextual_object_literal_key_targets(
@@ -184,7 +273,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         let owners = self.contextual_object_literal_receiver_values(object, budget);
         let mut targets = owners
             .iter()
-            .flat_map(|value| self.member_targets(value.owner(), &member))
+            .flat_map(|value| self.member_targets_for_value(value, &member))
             .collect::<Vec<_>>();
         sort_units(&mut targets);
         targets.dedup();
@@ -729,7 +818,13 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         let functions = self.visible_function_declarations_named(name, site);
         let mut outcomes: Vec<_> = functions
             .into_iter()
-            .map(|function| self.summarize_function_body(function, depth + 1, budget, tracker))
+            .filter_map(|function| {
+                let factory = self.function_unit_for_node(name, function)?;
+                Some(wrap_factory_outcome(
+                    self.summarize_function_body(function, depth + 1, budget, tracker),
+                    &factory,
+                ))
+            })
             .collect();
         if let Some(imported) = self.summarize_imported_function(name, depth + 1, budget, tracker) {
             outcomes.push(imported);
@@ -776,6 +871,16 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             return None;
         }
 
+        self.summarize_external_functions(functions, depth, budget, tracker)
+    }
+
+    fn summarize_external_functions(
+        &self,
+        functions: Vec<CodeUnit>,
+        depth: usize,
+        budget: ReceiverAnalysisBudget,
+        tracker: &mut ReceiverAnalysisBudgetTracker,
+    ) -> Option<ReceiverAnalysisOutcome<ReceiverValue>> {
         let mut outcomes = Vec::new();
         for function in functions {
             let Ok(source) = function.source().read_to_string() else {
@@ -795,11 +900,51 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 imports,
             );
             for node in nodes_for_code_unit(self.analyzer, &function, tree.root_node()) {
-                outcomes.push(provider.summarize_function_body(node, depth + 1, budget, tracker));
+                outcomes.push(wrap_factory_outcome(
+                    provider.summarize_function_body(node, depth + 1, budget, tracker),
+                    &function,
+                ));
             }
         }
         (!outcomes.is_empty())
             .then(|| ReceiverAnalysisOutcome::merge_branch_outcomes(outcomes, budget))
+    }
+
+    fn summarize_module_member_function(
+        &self,
+        object: Node<'tree>,
+        member: &str,
+        depth: usize,
+        budget: ReceiverAnalysisBudget,
+        tracker: &mut ReceiverAnalysisBudgetTracker,
+    ) -> Option<ReceiverAnalysisOutcome<ReceiverValue>> {
+        if self.language != Language::JavaScript {
+            return None;
+        }
+        let module_specifier =
+            require_call_module_specifier(object, self.source).or_else(|| {
+                let binding_name = simple_identifier_text(object, self.source)?;
+                let binding = self.imports.bindings.get(binding_name)?;
+                matches!(
+                    binding.kind,
+                    ImportKind::Namespace | ImportKind::CommonJsRequire
+                )
+                .then(|| binding.module_specifier.clone())
+            })?;
+        let functions = resolve_js_ts_module_binding_candidates(
+            self.analyzer,
+            self.support,
+            self.language,
+            self.file,
+            &module_specifier,
+            member,
+            Some(&self.aliases),
+            true,
+        )
+        .into_iter()
+        .filter(|unit| unit.is_function())
+        .collect::<Vec<_>>();
+        self.summarize_external_functions(functions, depth, budget, tracker)
     }
 
     fn summarize_member_call(
@@ -820,20 +965,36 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         if member.is_empty() {
             return ReceiverAnalysisOutcome::Unknown;
         }
+        if let Some(outcome) =
+            self.summarize_module_member_function(object, member, depth + 1, budget, tracker)
+        {
+            return outcome;
+        }
         let class_values = self.resolve_static_object_expression(object, call_byte, budget);
         let ReceiverAnalysisOutcome::Precise(values) = class_values else {
             return class_values;
         };
         let mut methods = Vec::new();
         for value in values {
-            methods.extend(self.class_method_nodes(value.owner(), member));
+            for factory in self.member_targets_for_value(&value, member) {
+                methods.extend(
+                    nodes_for_code_unit(self.analyzer, &factory, self.root)
+                        .into_iter()
+                        .map(|node| (node, factory.clone())),
+                );
+            }
         }
         if methods.is_empty() {
             return ReceiverAnalysisOutcome::Unknown;
         }
         let outcomes: Vec<_> = methods
             .into_iter()
-            .map(|method| self.summarize_function_body(method, depth + 1, budget, tracker))
+            .map(|(method, factory)| {
+                wrap_factory_outcome(
+                    self.summarize_function_body(method, depth + 1, budget, tracker),
+                    &factory,
+                )
+            })
             .collect();
         ReceiverAnalysisOutcome::merge_branch_outcomes(outcomes, budget)
     }
@@ -907,18 +1068,30 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         units
     }
 
+    fn member_targets_for_value(&self, receiver: &ReceiverValue, member: &str) -> Vec<CodeUnit> {
+        let indexed_member = if matches!(receiver, ReceiverValue::ClassOrStaticObject(_)) {
+            format!("{member}$static")
+        } else {
+            member.to_string()
+        };
+        self.member_targets(receiver.owner(), &indexed_member)
+    }
+
     fn visible_function_declarations_named(
         &self,
         name: &str,
         site: Node<'tree>,
     ) -> Vec<Node<'tree>> {
         let visible_scopes = lexical_scope_ids_for_node(site);
-        self.function_declarations_by_name
+        self.syntax_index
+            .function_declarations_by_name
             .get(name)
             .map(|functions| {
                 functions
                     .iter()
-                    .copied()
+                    .filter_map(|range| {
+                        smallest_named_node_covering(self.root, range.start_byte, range.end_byte)
+                    })
                     .filter(|function| {
                         declaration_scope_id(*function)
                             .is_some_and(|id| visible_scopes.contains(&id))
@@ -928,41 +1101,66 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             .unwrap_or_default()
     }
 
-    fn class_method_nodes(&self, owner: &CodeUnit, member: &str) -> Vec<Node<'tree>> {
-        let mut methods = Vec::new();
-        for class_node in self.class_declaration_nodes(owner.identifier()) {
-            let Some(body) = class_node.child_by_field_name("body") else {
-                continue;
-            };
-            let mut cursor = body.walk();
-            for child in body.named_children(&mut cursor) {
-                if child.kind() == "method_definition"
-                    && child
-                        .child_by_field_name("name")
-                        .is_some_and(|name| node_text_matches(name, self.source, member))
-                {
-                    methods.push(child);
-                }
-            }
-        }
-        methods
-    }
-
-    fn class_declaration_nodes(&self, name: &str) -> Vec<Node<'tree>> {
-        self.class_declarations_by_name
-            .get(name)
-            .cloned()
-            .unwrap_or_default()
+    fn function_unit_for_node(&self, name: &str, node: Node<'_>) -> Option<CodeUnit> {
+        let target = IndexedNodeRange {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+        };
+        let syntax_ranges = self.syntax_index.function_declarations_by_name.get(name)?;
+        self.support
+            .file_identifier(self.file, name)
+            .into_iter()
+            .filter(|unit| unit.source() == self.file && unit.is_function())
+            .filter_map(|unit| {
+                let associated_syntax = self
+                    .analyzer
+                    .ranges(&unit)
+                    .into_iter()
+                    .flat_map(|declaration_range| {
+                        syntax_ranges
+                            .iter()
+                            .filter(move |syntax_range| {
+                                declaration_range.start_byte < syntax_range.end_byte
+                                    && syntax_range.start_byte < declaration_range.end_byte
+                            })
+                            .map(move |syntax_range| {
+                                let boundary_distance = declaration_range
+                                    .start_byte
+                                    .abs_diff(syntax_range.start_byte)
+                                    .saturating_add(
+                                        declaration_range.end_byte.abs_diff(syntax_range.end_byte),
+                                    );
+                                let span_distance = declaration_range
+                                    .end_byte
+                                    .saturating_sub(declaration_range.start_byte)
+                                    .abs_diff(
+                                        syntax_range
+                                            .end_byte
+                                            .saturating_sub(syntax_range.start_byte),
+                                    );
+                                (boundary_distance, span_distance, *syntax_range)
+                            })
+                    })
+                    .min_by_key(|(boundary_distance, span_distance, syntax_range)| {
+                        (*boundary_distance, *span_distance, syntax_range.start_byte)
+                    })?
+                    .2;
+                (associated_syntax == target).then_some(unit)
+            })
+            .min()
     }
 
     fn visible_class_declaration_nodes(&self, name: &str, site: Node<'tree>) -> Vec<Node<'tree>> {
         let visible_scopes = lexical_scope_ids_for_node(site);
-        self.class_declarations_by_name
+        self.syntax_index
+            .class_declarations_by_name
             .get(name)
             .map(|classes| {
                 classes
                     .iter()
-                    .copied()
+                    .filter_map(|range| {
+                        smallest_named_node_covering(self.root, range.start_byte, range.end_byte)
+                    })
                     .filter(|class| {
                         declaration_scope_id(*class).is_some_and(|id| visible_scopes.contains(&id))
                     })
@@ -1357,7 +1555,7 @@ fn is_nonlinear_control_boundary(kind: &str) -> bool {
     )
 }
 
-fn smallest_named_node_covering<'tree>(
+pub(in crate::analyzer::usages) fn smallest_named_node_covering<'tree>(
     root: Node<'tree>,
     start_byte: usize,
     end_byte: usize,
@@ -1428,33 +1626,40 @@ fn is_summary_boundary(kind: &str) -> bool {
     )
 }
 
-fn index_js_ts_declarations<'tree>(
+pub(in crate::analyzer::usages) fn build_js_ts_receiver_syntax_index<'tree>(
     root: Node<'tree>,
     source: &str,
-) -> (
-    HashMap<String, Vec<Node<'tree>>>,
-    HashMap<String, Vec<Node<'tree>>>,
-) {
-    let mut functions: HashMap<String, Vec<Node<'tree>>> = HashMap::default();
-    let mut classes: HashMap<String, Vec<Node<'tree>>> = HashMap::default();
+    cancellation: Option<&CancellationToken>,
+) -> Option<(Arc<JsTsReceiverSyntaxIndex>, usize)> {
+    let mut functions: HashMap<String, Vec<IndexedNodeRange>> = HashMap::default();
+    let mut classes: HashMap<String, Vec<IndexedNodeRange>> = HashMap::default();
     let mut seen = HashSet::default();
     let mut stack = vec![root];
+    let mut visited = 0usize;
     while let Some(node) = stack.pop() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return None;
+        }
         if !seen.insert(node.id()) {
             continue;
         }
+        visited += 1;
+        let range = IndexedNodeRange {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+        };
         if node.kind() == "function_declaration"
             && let Some(name_node) = node.child_by_field_name("name")
             && let Some(name) = simple_identifier_text(name_node, source)
         {
-            functions.entry(name.to_string()).or_default().push(node);
+            functions.entry(name.to_string()).or_default().push(range);
         } else if matches!(
             node.kind(),
             "class_declaration" | "abstract_class_declaration"
         ) && let Some(name_node) = node.child_by_field_name("name")
             && let Some(name) = simple_identifier_text(name_node, source)
         {
-            classes.entry(name.to_string()).or_default().push(node);
+            classes.entry(name.to_string()).or_default().push(range);
         }
         for index in (0..node.named_child_count()).rev() {
             if let Some(child) = node.named_child(index) {
@@ -1462,7 +1667,13 @@ fn index_js_ts_declarations<'tree>(
             }
         }
     }
-    (functions, classes)
+    Some((
+        Arc::new(JsTsReceiverSyntaxIndex {
+            function_declarations_by_name: functions,
+            class_declarations_by_name: classes,
+        }),
+        visited,
+    ))
 }
 
 fn simple_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
@@ -1479,13 +1690,56 @@ fn node_text_matches(node: Node<'_>, source: &str, expected: &str) -> bool {
     slice(node, source) == expected
 }
 
-fn node_range(node: Node<'_>) -> Range {
+fn wrap_factory_outcome(
+    outcome: ReceiverAnalysisOutcome<ReceiverValue>,
+    factory: &CodeUnit,
+) -> ReceiverAnalysisOutcome<ReceiverValue> {
+    let wrap = |value| ReceiverValue::FactoryReturn {
+        factory: factory.clone(),
+        value: Box::new(value),
+    };
+    match outcome {
+        ReceiverAnalysisOutcome::Precise(values) => {
+            ReceiverAnalysisOutcome::Precise(values.into_iter().map(wrap).collect())
+        }
+        ReceiverAnalysisOutcome::Ambiguous(values) => {
+            ReceiverAnalysisOutcome::Ambiguous(values.into_iter().map(wrap).collect())
+        }
+        ReceiverAnalysisOutcome::Unknown => ReceiverAnalysisOutcome::Unknown,
+        ReceiverAnalysisOutcome::Unsupported { reason } => {
+            ReceiverAnalysisOutcome::Unsupported { reason }
+        }
+        ReceiverAnalysisOutcome::ExceededBudget { limit } => {
+            ReceiverAnalysisOutcome::ExceededBudget { limit }
+        }
+    }
+}
+
+pub(in crate::analyzer::usages) fn node_range(node: Node<'_>) -> Range {
     Range {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
         start_line: node.start_position().row,
         end_line: node.end_position().row,
     }
+}
+
+pub(in crate::analyzer::usages) fn member_expression_at_site(
+    mut node: Node<'_>,
+) -> Option<Node<'_>> {
+    for _ in 0..4 {
+        if node.kind() == "member_expression" {
+            return Some(node);
+        }
+        if node.kind() == "call_expression"
+            && let Some(function) = node.child_by_field_name("function")
+            && function.kind() == "member_expression"
+        {
+            return Some(function);
+        }
+        node = node.parent()?;
+    }
+    None
 }
 
 fn sort_units(units: &mut [CodeUnit]) {
@@ -1507,7 +1761,7 @@ fn dedup_units(mut units: Vec<CodeUnit>, limit: usize) -> Vec<CodeUnit> {
 mod tests {
     use super::*;
     use crate::analyzer::usages::receiver_analysis::DEFAULT_RECEIVER_MAX_TARGETS;
-    use crate::analyzer::{ProjectFile, TestProject, TypescriptAnalyzer};
+    use crate::analyzer::{AnalyzerDefinitionLookup, ProjectFile, TestProject, TypescriptAnalyzer};
     use std::path::PathBuf;
     use tree_sitter::Parser;
 
@@ -1567,7 +1821,7 @@ export function caller() {
         );
         let receiver = receiver_node(tree.root_node(), source, "service.run", "service");
 
-        let outcome = provider.resolve_member_targets(
+        let report = provider.resolve_member_targets_report(
             receiver,
             "run",
             receiver.start_byte(),
@@ -1575,12 +1829,14 @@ export function caller() {
         );
 
         assert_eq!(
-            outcome,
+            report.outcome,
             ReceiverAnalysisOutcome::ExceededBudget {
                 limit: "scope_nodes"
             }
         );
-        assert!(outcome.is_terminal_for_graph());
+        assert!(report.outcome.is_terminal_for_graph());
+        assert_eq!(report.work.scope_nodes, 2);
+        assert!(!report.candidates_truncated);
     }
 
     #[test]
@@ -1664,7 +1920,7 @@ export function caller(which: number) {
         );
         let receiver = receiver_node(tree.root_node(), source, "service.run", "service");
 
-        let outcome = provider.resolve_member_targets(
+        let report = provider.resolve_member_targets_report(
             receiver,
             "run",
             receiver.start_byte(),
@@ -1672,9 +1928,44 @@ export function caller(which: number) {
         );
 
         assert!(
-            matches!(outcome, ReceiverAnalysisOutcome::Ambiguous(ref targets) if targets.len() > DEFAULT_RECEIVER_MAX_TARGETS),
-            "expected fanout to become ambiguous, got {outcome:?}"
+            matches!(report.outcome, ReceiverAnalysisOutcome::Ambiguous(ref targets) if targets.len() == DEFAULT_RECEIVER_MAX_TARGETS),
+            "expected fanout to become ambiguous, got {:?}",
+            report.outcome
         );
-        assert!(outcome.is_terminal_for_graph());
+        assert!(report.outcome.is_terminal_for_graph());
+        assert!(report.candidates_truncated);
+        assert!(report.work.summary_expansions > 0);
+    }
+
+    #[test]
+    fn nested_same_name_factory_does_not_reuse_the_enclosing_declaration() {
+        let source = r#"
+class Outer {}
+class Inner {}
+function make() {
+  function make() { return new Inner(); }
+  return make();
+}
+"#;
+        let (_temp, file, analyzer) = test_project(source);
+        let tree = parse(source);
+        let definitions = AnalyzerDefinitionLookup::new(&analyzer, Language::TypeScript);
+        let provider = JsTsReceiverFactProvider::new(
+            &analyzer,
+            &definitions,
+            Language::TypeScript,
+            &file,
+            source,
+            tree.root_node(),
+            ImportBinder::empty(),
+        );
+        let inner_start = source.rfind("function make").expect("inner factory");
+        let inner = smallest_named_node_covering(
+            tree.root_node(),
+            inner_start,
+            inner_start + "function make".len(),
+        )
+        .expect("inner function node");
+        assert_eq!(provider.function_unit_for_node("make", inner), None);
     }
 }

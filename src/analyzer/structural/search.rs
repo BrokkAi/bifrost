@@ -23,6 +23,13 @@ use crate::analyzer::usages::get_definition::{
     CallSyntaxKind, DefinitionLookupRequest, DefinitionLookupStatus, parse_tree_for_language,
     resolve_definition_batch_with_source, resolve_definition_batch_with_source_and_cancellation,
 };
+use crate::analyzer::usages::receiver_analysis::{
+    ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverValue,
+};
+use crate::analyzer::usages::receiver_query::{
+    ReceiverQueryAnalysis, ReceiverQueryInput, ReceiverQueryOperation, ReceiverQueryReport,
+    ReceiverQueryService,
+};
 use crate::analyzer::usages::{
     CallBindingCache, CallRelationLimits, CallRelationResult, CallRelationService, CallSite,
     DEFAULT_MAX_FILES, ExplicitCandidateProvider, FuzzyResult, ReferenceHit, ReferenceKind,
@@ -92,6 +99,10 @@ pub enum CodeQueryResultValue {
     ExpressionSite {
         #[serde(flatten)]
         value: Box<CodeQueryExpressionSite>,
+    },
+    ReceiverAnalysis {
+        #[serde(flatten)]
+        value: Box<CodeQueryReceiverAnalysis>,
     },
 }
 
@@ -202,6 +213,117 @@ pub struct CodeQueryExpressionSite {
     pub call_range: CodeQueryRange,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryReceiverAnalysis {
+    pub analysis_kind: &'static str,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub text: String,
+    pub input_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture: Option<String>,
+    pub outcome: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<CodeQueryReceiverValue>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub member_targets: Vec<CodeQueryDeclaration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "receiver_value_kind", rename_all = "snake_case")]
+pub enum CodeQueryReceiverValue {
+    AllocationSite {
+        type_declaration: CodeQueryDeclaration,
+        allocation_site: CodeQuerySourceSite,
+    },
+    InstanceType {
+        declaration: CodeQueryDeclaration,
+    },
+    ClassOrStaticObject {
+        declaration: CodeQueryDeclaration,
+    },
+    ModuleOrExportObject {
+        declaration: CodeQueryDeclaration,
+    },
+    CurrentReceiver {
+        declaration: CodeQueryDeclaration,
+    },
+    FactoryReturn {
+        factory: CodeQueryDeclaration,
+        returned_value: Box<CodeQueryReceiverValue>,
+    },
+}
+
+impl CodeQueryReceiverValue {
+    pub fn render_text(&self) -> String {
+        match self {
+            Self::AllocationSite {
+                type_declaration,
+                allocation_site,
+            } => format!(
+                "allocation {} at {}:{}:{}",
+                type_declaration.fq_name,
+                allocation_site.path,
+                allocation_site.range.start_line,
+                allocation_site.range.start_column
+            ),
+            Self::InstanceType { declaration } => {
+                format!("instance {}", declaration.fq_name)
+            }
+            Self::ClassOrStaticObject { declaration } => {
+                format!("class/static {}", declaration.fq_name)
+            }
+            Self::ModuleOrExportObject { declaration } => {
+                format!("module/export {}", declaration.fq_name)
+            }
+            Self::CurrentReceiver { declaration } => {
+                format!("current receiver {}", declaration.fq_name)
+            }
+            Self::FactoryReturn {
+                factory,
+                returned_value,
+            } => format!(
+                "factory {} -> {}",
+                factory.fq_name,
+                returned_value.render_text()
+            ),
+        }
+    }
+}
+
+impl CodeQueryReceiverAnalysis {
+    pub fn render_detail_lines(&self) -> Vec<String> {
+        let mut lines = self
+            .values
+            .iter()
+            .map(|value| format!("value -> {}", value.render_text()))
+            .collect::<Vec<_>>();
+        lines.extend(
+            self.member_targets
+                .iter()
+                .map(|target| format!("member -> {}", target.fq_name)),
+        );
+        if let Some(reason) = self.reason {
+            lines.push(format!("reason -> {reason}"));
+        }
+        if let Some(limit) = self.limit {
+            lines.push(format!("limit -> {limit}"));
+        }
+        lines
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQuerySourceSite {
+    pub path: String,
+    pub range: CodeQueryRange,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CodeQueryProvenance {
     pub seed: CodeQueryResultRef,
@@ -270,6 +392,14 @@ pub enum CodeQueryResultRef {
         parameter_index: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
         parameter_name: Option<String>,
+    },
+    ReceiverAnalysis {
+        path: String,
+        range: CodeQueryRange,
+        analysis_kind: &'static str,
+        outcome: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        capture: Option<String>,
     },
 }
 
@@ -341,6 +471,12 @@ struct ExpressionSiteValue {
     call_site: CallSiteValue,
     range: Range,
     input: ExpressionInput,
+}
+
+#[derive(Debug, Clone)]
+struct ReceiverAnalysisValue {
+    report: ReceiverQueryReport,
+    capture: Option<String>,
 }
 
 #[derive(Default)]
@@ -457,6 +593,7 @@ enum PipelineValue {
     ReferenceSite(ReferenceSiteValue),
     CallSite(CallSiteValue),
     ExpressionSite(ExpressionSiteValue),
+    ReceiverAnalysis(ReceiverAnalysisValue),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -467,6 +604,7 @@ enum PipelineKey {
     ReferenceSite(ReferenceSiteValue),
     CallSite(CallSiteValue),
     ExpressionSite(ExpressionSiteValue),
+    ReceiverAnalysis(ReceiverQueryOperation, ProjectFile, Range),
 }
 
 impl PipelineValue {
@@ -480,6 +618,11 @@ impl PipelineValue {
             Self::ReferenceSite(site) => PipelineKey::ReferenceSite(site.clone()),
             Self::CallSite(site) => PipelineKey::CallSite(site.clone()),
             Self::ExpressionSite(site) => PipelineKey::ExpressionSite(site.clone()),
+            Self::ReceiverAnalysis(value) => PipelineKey::ReceiverAnalysis(
+                value.report.operation,
+                value.report.site.file.clone(),
+                value.report.site.range,
+            ),
         }
     }
 }
@@ -504,6 +647,7 @@ enum PipelineTraceValue {
     ReferenceSite(ReferenceSiteValue),
     CallSite(CallSiteValue),
     ExpressionSite(ExpressionSiteValue),
+    ReceiverAnalysis(ReceiverAnalysisValue),
 }
 
 #[derive(Debug, Clone)]
@@ -713,7 +857,7 @@ pub fn execute_with_limits(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResult {
-    execute_internal(analyzer, query, limits, None)
+    execute_internal(analyzer, query, limits, None, None)
 }
 
 pub(crate) fn execute_with_cancellation(
@@ -722,7 +866,22 @@ pub(crate) fn execute_with_cancellation(
     limits: CodeQueryExecutionLimits,
     cancellation: &CancellationToken,
 ) -> CodeQueryResult {
-    execute_internal(analyzer, query, limits, Some(cancellation))
+    execute_internal(analyzer, query, limits, Some(cancellation), None)
+}
+
+#[cfg(test)]
+fn execute_with_receiver_budget_for_test(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    receiver_budget: ReceiverAnalysisBudget,
+) -> CodeQueryResult {
+    execute_internal(
+        analyzer,
+        query,
+        CodeQueryExecutionLimits::default(),
+        None,
+        Some(receiver_budget),
+    )
 }
 
 fn execute_internal(
@@ -730,6 +889,7 @@ fn execute_internal(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
+    receiver_budget_override: Option<ReceiverAnalysisBudget>,
 ) -> CodeQueryResult {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return cancelled_query_result();
@@ -1000,7 +1160,8 @@ fn execute_internal(
                         | PipelineValue::Declaration(_)
                         | PipelineValue::ReferenceSite(_)
                         | PipelineValue::CallSite(_)
-                        | PipelineValue::ExpressionSite(_) => None,
+                        | PipelineValue::ExpressionSite(_)
+                        | PipelineValue::ReceiverAnalysis(_) => None,
                     })
                     .collect::<Vec<_>>();
                 frontier.sort_by_key(rel_path_string);
@@ -1021,7 +1182,7 @@ fn execute_internal(
                 }
             }
         }
-        let (next, exhausted) = apply_pipeline_step(
+        let (next, exhausted, step_truncated) = apply_pipeline_step(
             analyzer,
             step,
             rows,
@@ -1038,7 +1199,9 @@ fn execute_internal(
             },
             cancellation,
             &mut diagnostics,
+            receiver_budget_override,
         );
+        budget_exhausted |= step_truncated;
         rows = next;
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return cancelled_query_result();
@@ -1209,20 +1372,32 @@ fn apply_pipeline_step(
     max_step_outputs: usize,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
-) -> (Vec<PipelineRow>, bool) {
+    receiver_budget_override: Option<ReceiverAnalysisBudget>,
+) -> (Vec<PipelineRow>, bool, bool) {
     let max_pipeline_rows = limits.max_pipeline_rows;
     let mut output = Vec::new();
     let mut indexes: HashMap<PipelineKey, usize> = HashMap::default();
     let mut unsupported_languages = BTreeSet::new();
     let mut semantic_omissions: BTreeMap<(Language, &'static str), usize> = BTreeMap::new();
+    let mut receiver_diagnostics: BTreeMap<(Language, &'static str, String), usize> =
+        BTreeMap::new();
     let mut enclosing_declarations: HashMap<ProjectFile, Vec<DeclarationValue>> =
         HashMap::default();
     let mut exhausted = false;
+    let mut receiver_truncated = false;
+    let receiver_service = matches!(
+        step,
+        QueryStep::ReceiverTargets(_) | QueryStep::PointsTo(_) | QueryStep::MemberTargets(_)
+    )
+    .then(|| ReceiverQueryService::new(analyzer));
 
     let mut indexed_declarations = indexed_declarations;
     'rows: for row in rows {
+        if output.len() >= max_step_outputs {
+            break;
+        }
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return (Vec::new(), true);
+            return (Vec::new(), true, receiver_truncated);
         }
         let mut row_exhausted = false;
         let expansions = match (&row.value, step) {
@@ -1250,6 +1425,11 @@ fn apply_pipeline_step(
             (PipelineValue::ExpressionSite(site), QueryStep::FileOf) => vec![pipeline_expansion(
                 PipelineValue::File(site.call_site.0.file.clone()),
             )],
+            (PipelineValue::ReceiverAnalysis(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.report.site.file.clone(),
+                ))]
+            }
             (PipelineValue::File(file), QueryStep::ImportsOf) => {
                 let graph = import_graph.expect("import graph exists for import steps");
                 if graph.unsupported.contains(file) {
@@ -1432,6 +1612,102 @@ fn apply_pipeline_step(
             (PipelineValue::CallSite(site), QueryStep::CallInput(selector)) => {
                 call_input_expansions(site, selector)
             }
+            (
+                PipelineValue::StructuralMatch(seed),
+                QueryStep::ReceiverTargets(filter)
+                | QueryStep::PointsTo(filter)
+                | QueryStep::MemberTargets(filter),
+            ) => {
+                let operation = receiver_operation(step);
+                let (ranges, input) =
+                    structural_receiver_ranges(seed, operation, filter.capture.as_deref());
+                receiver_analysis_expansions(
+                    receiver_service
+                        .as_ref()
+                        .expect("receiver query service exists for receiver steps"),
+                    operation,
+                    &seed.file,
+                    ranges,
+                    input,
+                    filter.capture.clone(),
+                    budget,
+                    limits,
+                    receiver_budget_override,
+                    max_step_outputs.saturating_sub(output.len()),
+                    cancellation,
+                    &mut receiver_diagnostics,
+                    &mut row_exhausted,
+                    &mut receiver_truncated,
+                )
+            }
+            (
+                PipelineValue::ReferenceSite(site),
+                QueryStep::ReceiverTargets(_)
+                | QueryStep::PointsTo(_)
+                | QueryStep::MemberTargets(_),
+            ) => receiver_analysis_expansions(
+                receiver_service
+                    .as_ref()
+                    .expect("receiver query service exists for receiver steps"),
+                receiver_operation(step),
+                &site.file,
+                vec![site.range],
+                if matches!(step, QueryStep::PointsTo(_)) {
+                    ReceiverQueryInput::Expression
+                } else {
+                    ReceiverQueryInput::ContainingSite
+                },
+                None,
+                budget,
+                limits,
+                receiver_budget_override,
+                max_step_outputs.saturating_sub(output.len()),
+                cancellation,
+                &mut receiver_diagnostics,
+                &mut row_exhausted,
+                &mut receiver_truncated,
+            ),
+            (PipelineValue::CallSite(site), QueryStep::ReceiverTargets(_)) => {
+                receiver_analysis_expansions(
+                    receiver_service
+                        .as_ref()
+                        .expect("receiver query service exists for receiver steps"),
+                    ReceiverQueryOperation::ReceiverTargets,
+                    &site.0.file,
+                    vec![site.0.range],
+                    ReceiverQueryInput::ContainingSite,
+                    None,
+                    budget,
+                    limits,
+                    receiver_budget_override,
+                    max_step_outputs.saturating_sub(output.len()),
+                    cancellation,
+                    &mut receiver_diagnostics,
+                    &mut row_exhausted,
+                    &mut receiver_truncated,
+                )
+            }
+            (
+                PipelineValue::ExpressionSite(site),
+                QueryStep::ReceiverTargets(_) | QueryStep::PointsTo(_),
+            ) => receiver_analysis_expansions(
+                receiver_service
+                    .as_ref()
+                    .expect("receiver query service exists for receiver steps"),
+                receiver_operation(step),
+                &site.call_site.0.file,
+                vec![site.range],
+                ReceiverQueryInput::Expression,
+                None,
+                budget,
+                limits,
+                receiver_budget_override,
+                max_step_outputs.saturating_sub(output.len()),
+                cancellation,
+                &mut receiver_diagnostics,
+                &mut row_exhausted,
+                &mut receiver_truncated,
+            ),
             _ => unreachable!("query step domains are validated before execution"),
         };
 
@@ -1505,7 +1781,214 @@ fn apply_pipeline_step(
             ),
         });
     }
-    (output, exhausted)
+    for ((language, operation, reason), count) in receiver_diagnostics {
+        diagnostics.push(CodeQueryDiagnostic {
+            language: language.config_label(),
+            message: format!(
+                "{operation} returned {count} analysis row{} with {reason}",
+                if count == 1 { "" } else { "s" }
+            ),
+        });
+    }
+    (output, exhausted, receiver_truncated)
+}
+
+fn receiver_operation(step: &QueryStep) -> ReceiverQueryOperation {
+    match step {
+        QueryStep::ReceiverTargets(_) => ReceiverQueryOperation::ReceiverTargets,
+        QueryStep::PointsTo(_) => ReceiverQueryOperation::PointsTo,
+        QueryStep::MemberTargets(_) => ReceiverQueryOperation::MemberTargets,
+        _ => unreachable!("receiver operation requested for a non-receiver step"),
+    }
+}
+
+fn structural_receiver_ranges(
+    seed: &SeedMatch,
+    operation: ReceiverQueryOperation,
+    capture: Option<&str>,
+) -> (Vec<Range>, ReceiverQueryInput) {
+    let (spans, input) = if let Some(capture) = capture {
+        let spans = seed
+            .fact_match
+            .captures
+            .iter()
+            .filter(|binding| binding.name == capture)
+            .map(|binding| binding.span)
+            .collect::<Vec<_>>();
+        (spans, ReceiverQueryInput::Expression)
+    } else {
+        let fact_id = seed.fact_match.node;
+        let fact = seed.facts.node(fact_id);
+        let normalized = match operation {
+            ReceiverQueryOperation::PointsTo => seed
+                .facts
+                .role_targets(fact_id, Role::Right)
+                .next()
+                .map(|target| target.span),
+            ReceiverQueryOperation::ReceiverTargets => match fact.kind {
+                NormalizedKind::Call => seed
+                    .facts
+                    .role_targets(fact_id, Role::Receiver)
+                    .next()
+                    .map(|target| target.span),
+                NormalizedKind::FieldAccess => seed
+                    .facts
+                    .role_targets(fact_id, Role::Object)
+                    .next()
+                    .map(|target| target.span),
+                _ => None,
+            },
+            ReceiverQueryOperation::MemberTargets => None,
+        };
+        let input = match operation {
+            ReceiverQueryOperation::PointsTo => ReceiverQueryInput::Expression,
+            ReceiverQueryOperation::ReceiverTargets if normalized.is_some() => {
+                ReceiverQueryInput::Expression
+            }
+            ReceiverQueryOperation::ReceiverTargets | ReceiverQueryOperation::MemberTargets => {
+                ReceiverQueryInput::ContainingSite
+            }
+        };
+        (vec![normalized.unwrap_or_else(|| fact.span())], input)
+    };
+    let mut seen = HashSet::default();
+    let ranges = spans
+        .into_iter()
+        .filter(|span| seen.insert((span.start_byte, span.end_byte)))
+        .map(|span| Range {
+            start_byte: span.start_byte,
+            end_byte: span.end_byte,
+            start_line: seed.facts.line_of_byte(span.start_byte),
+            end_line: seed.facts.line_of_byte(span.end_byte),
+        })
+        .collect();
+    (ranges, input)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn receiver_analysis_expansions(
+    service: &ReceiverQueryService<'_>,
+    operation: ReceiverQueryOperation,
+    file: &ProjectFile,
+    mut ranges: Vec<Range>,
+    input: ReceiverQueryInput,
+    capture: Option<String>,
+    budget: &mut CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    receiver_budget_override: Option<ReceiverAnalysisBudget>,
+    max_outputs: usize,
+    cancellation: Option<&CancellationToken>,
+    receiver_diagnostics: &mut BTreeMap<(Language, &'static str, String), usize>,
+    shared_budget_exhausted: &mut bool,
+    receiver_truncated: &mut bool,
+) -> Vec<PipelineExpansion> {
+    ranges.sort_by_key(primary_range_key);
+    ranges.dedup();
+    ranges.truncate(max_outputs);
+    let mut expansions = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let remaining_facts = limits
+            .max_fact_nodes
+            .saturating_sub(budget.fact_nodes.saturating_add(budget.examined_references));
+        let remaining_rows = limits
+            .max_pipeline_rows
+            .saturating_sub(budget.pipeline_rows);
+        let base = receiver_budget_override.unwrap_or_default();
+        let receiver_budget = ReceiverAnalysisBudget {
+            context_depth: base.context_depth,
+            max_targets: base.max_targets.min(remaining_rows.saturating_sub(1)),
+            max_summary_expansions: base.max_summary_expansions.min(remaining_facts),
+            max_scope_nodes: base.max_scope_nodes.min(remaining_facts),
+        };
+        let Ok(report) =
+            service.analyze(operation, file, range, input, receiver_budget, cancellation)
+        else {
+            *shared_budget_exhausted = true;
+            break;
+        };
+
+        let candidate_count = receiver_candidate_count(&report);
+        budget.fact_nodes = budget
+            .fact_nodes
+            .saturating_add(report.work.setup_nodes)
+            .saturating_add(report.work.scope_nodes)
+            .saturating_add(report.work.summary_expansions);
+        budget.pipeline_rows = budget
+            .pipeline_rows
+            .saturating_add(1)
+            .saturating_add(candidate_count);
+        if budget.fact_nodes.saturating_add(budget.examined_references) > limits.max_fact_nodes
+            || budget.pipeline_rows > limits.max_pipeline_rows
+        {
+            *shared_budget_exhausted = true;
+        }
+
+        let language = report.site.language;
+        match &report.analysis {
+            ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Unsupported { reason })
+            | ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Unsupported {
+                reason,
+            }) => {
+                *receiver_diagnostics
+                    .entry((
+                        language,
+                        operation.as_str(),
+                        format!("unsupported provider or shape: {reason}"),
+                    ))
+                    .or_default() += 1;
+            }
+            ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::ExceededBudget { limit })
+            | ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::ExceededBudget {
+                limit,
+            }) => {
+                *receiver_truncated = true;
+                *receiver_diagnostics
+                    .entry((
+                        language,
+                        operation.as_str(),
+                        format!("exceeded receiver limit {limit}"),
+                    ))
+                    .or_default() += 1;
+            }
+            ReceiverQueryAnalysis::Values(
+                ReceiverAnalysisOutcome::Precise(_)
+                | ReceiverAnalysisOutcome::Ambiguous(_)
+                | ReceiverAnalysisOutcome::Unknown,
+            )
+            | ReceiverQueryAnalysis::MemberTargets(
+                ReceiverAnalysisOutcome::Precise(_)
+                | ReceiverAnalysisOutcome::Ambiguous(_)
+                | ReceiverAnalysisOutcome::Unknown,
+            ) => {}
+        }
+        if report.candidates_truncated {
+            *receiver_truncated = true;
+            *receiver_diagnostics
+                .entry((
+                    language,
+                    operation.as_str(),
+                    "truncated candidates at max_targets".to_string(),
+                ))
+                .or_default() += 1;
+        }
+        let value = ReceiverAnalysisValue {
+            report,
+            capture: capture.clone(),
+        };
+        expansions.push(PipelineExpansion {
+            value: PipelineValue::ReceiverAnalysis(value.clone()),
+            trace: vec![(PipelineTraceValue::ReceiverAnalysis(value), None)],
+            budgeted: true,
+        });
+    }
+    expansions
+}
+
+fn receiver_candidate_count(report: &ReceiverQueryReport) -> usize {
+    match &report.analysis {
+        ReceiverQueryAnalysis::Values(outcome) => outcome.values().map_or(0, <[_]>::len),
+        ReceiverQueryAnalysis::MemberTargets(outcome) => outcome.values().map_or(0, <[_]>::len),
+    }
 }
 
 fn pipeline_expansion(value: PipelineValue) -> PipelineExpansion {
@@ -2822,6 +3305,9 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         PipelineValue::ExpressionSite(site) => {
             Some(PipelineTraceValue::ExpressionSite(site.clone()))
         }
+        PipelineValue::ReceiverAnalysis(value) => {
+            Some(PipelineTraceValue::ReceiverAnalysis(value.clone()))
+        }
     }
 }
 
@@ -2891,6 +3377,9 @@ fn render_pipeline_item(
         PipelineValue::ExpressionSite(site) => CodeQueryResultValue::ExpressionSite {
             value: Box::new(render_expression_site(analyzer, &site, cache)),
         },
+        PipelineValue::ReceiverAnalysis(value) => CodeQueryResultValue::ReceiverAnalysis {
+            value: Box::new(render_receiver_analysis(analyzer, &value, detail, cache)),
+        },
     };
     CodeQueryResultItem {
         value,
@@ -2925,6 +3414,9 @@ fn render_provenance(
                     }
                     PipelineTraceValue::ExpressionSite(site) => {
                         render_expression_site_ref(analyzer, site, cache)
+                    }
+                    PipelineTraceValue::ReceiverAnalysis(value) => {
+                        render_receiver_analysis_ref(analyzer, value, cache)
                     }
                 },
                 via: step.via.as_ref().map(|via| match via {
@@ -3035,6 +3527,25 @@ fn render_expression_site_ref(
         input_kind,
         parameter_index,
         parameter_name,
+    }
+}
+
+fn render_receiver_analysis_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &ReceiverAnalysisValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    CodeQueryResultRef::ReceiverAnalysis {
+        path: rel_path_string(&value.report.site.file),
+        range: render_source_range(
+            analyzer,
+            &value.report.site.file,
+            &value.report.site.range,
+            cache,
+        ),
+        analysis_kind: value.report.operation.as_str(),
+        outcome: receiver_query_outcome_label(&value.report.analysis),
+        capture: value.capture.clone(),
     }
 }
 
@@ -3163,6 +3674,122 @@ fn render_expression_site(
         caller_fq_name: site.call_site.0.caller.fq_name(),
         callee_fq_name: site.call_site.0.callee.fq_name(),
         call_range: render_source_range(analyzer, file, &site.call_site.0.range, cache),
+    }
+}
+
+fn render_receiver_analysis(
+    analyzer: &dyn IAnalyzer,
+    value: &ReceiverAnalysisValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryReceiverAnalysis {
+    let fallback = value.report.site.range;
+    let (outcome, values, member_targets, reason, limit) = match &value.report.analysis {
+        ReceiverQueryAnalysis::Values(outcome) => {
+            let rendered = outcome
+                .values()
+                .into_iter()
+                .flatten()
+                .map(|value| render_receiver_value(analyzer, value, fallback, detail, cache))
+                .collect();
+            let (label, reason, limit) = receiver_outcome_metadata(outcome);
+            (label, rendered, Vec::new(), reason, limit)
+        }
+        ReceiverQueryAnalysis::MemberTargets(outcome) => {
+            let rendered = outcome
+                .values()
+                .into_iter()
+                .flatten()
+                .map(|unit| {
+                    let declaration = declaration_value_for_unit(analyzer, unit, fallback);
+                    render_declaration(analyzer, &declaration, detail, cache)
+                })
+                .collect();
+            let (label, reason, limit) = receiver_outcome_metadata(outcome);
+            (label, Vec::new(), rendered, reason, limit)
+        }
+    };
+    CodeQueryReceiverAnalysis {
+        analysis_kind: value.report.operation.as_str(),
+        path: rel_path_string(&value.report.site.file),
+        language: value.report.site.language.config_label(),
+        range: render_source_range(
+            analyzer,
+            &value.report.site.file,
+            &value.report.site.range,
+            cache,
+        ),
+        text: snippet(&value.report.site.text),
+        input_kind: value.report.site.syntax_kind.clone(),
+        capture: value.capture.clone(),
+        outcome,
+        values,
+        member_targets,
+        reason,
+        limit,
+    }
+}
+
+fn render_receiver_value(
+    analyzer: &dyn IAnalyzer,
+    value: &ReceiverValue,
+    fallback: Range,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryReceiverValue {
+    let declaration = |unit: &CodeUnit, cache: &mut PipelineRenderCache| {
+        let value = declaration_value_for_unit(analyzer, unit, fallback);
+        render_declaration(analyzer, &value, detail, cache)
+    };
+    match value {
+        ReceiverValue::AllocationSite { ty, file, range } => {
+            CodeQueryReceiverValue::AllocationSite {
+                type_declaration: declaration(ty, cache),
+                allocation_site: CodeQuerySourceSite {
+                    path: rel_path_string(file),
+                    range: render_source_range(analyzer, file, range, cache),
+                },
+            }
+        }
+        ReceiverValue::InstanceType(unit) => CodeQueryReceiverValue::InstanceType {
+            declaration: declaration(unit, cache),
+        },
+        ReceiverValue::ClassOrStaticObject(unit) => CodeQueryReceiverValue::ClassOrStaticObject {
+            declaration: declaration(unit, cache),
+        },
+        ReceiverValue::ModuleOrExportObject(unit) => CodeQueryReceiverValue::ModuleOrExportObject {
+            declaration: declaration(unit, cache),
+        },
+        ReceiverValue::CurrentReceiver(unit) => CodeQueryReceiverValue::CurrentReceiver {
+            declaration: declaration(unit, cache),
+        },
+        ReceiverValue::FactoryReturn { factory, value } => CodeQueryReceiverValue::FactoryReturn {
+            factory: declaration(factory, cache),
+            returned_value: Box::new(render_receiver_value(
+                analyzer, value, fallback, detail, cache,
+            )),
+        },
+    }
+}
+
+fn receiver_query_outcome_label(analysis: &ReceiverQueryAnalysis) -> &'static str {
+    match analysis {
+        ReceiverQueryAnalysis::Values(outcome) => receiver_outcome_metadata(outcome).0,
+        ReceiverQueryAnalysis::MemberTargets(outcome) => receiver_outcome_metadata(outcome).0,
+    }
+}
+
+fn receiver_outcome_metadata<T>(
+    outcome: &ReceiverAnalysisOutcome<T>,
+) -> (&'static str, Option<&'static str>, Option<&'static str>) {
+    match outcome {
+        ReceiverAnalysisOutcome::Precise(_) => ("precise", None, None),
+        ReceiverAnalysisOutcome::Ambiguous(_) => ("ambiguous", None, None),
+        ReceiverAnalysisOutcome::Unknown => ("unknown", None, None),
+        ReceiverAnalysisOutcome::Unsupported { reason } => ("unsupported", Some(*reason), None),
+        ReceiverAnalysisOutcome::ExceededBudget { limit } => {
+            ("exceeded_budget", None, Some(*limit))
+        }
     }
 }
 
@@ -3466,7 +4093,8 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::File { .. }
                 | CodeQueryResultValue::ReferenceSite { .. }
                 | CodeQueryResultValue::CallSite { .. }
-                | CodeQueryResultValue::ExpressionSite { .. } => None,
+                | CodeQueryResultValue::ExpressionSite { .. }
+                | CodeQueryResultValue::ReceiverAnalysis { .. } => None,
             })
             .collect()
     }
@@ -3557,6 +4185,20 @@ impl CodeQueryResult {
                             value.callee_fq_name
                         ));
                     }
+                    CodeQueryResultValue::ReceiverAnalysis { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [receiver analysis; {}; {}] `{}`\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.analysis_kind,
+                            value.outcome,
+                            value.text
+                        ));
+                        for detail in value.render_detail_lines() {
+                            out.push_str(&format!("  {detail}\n"));
+                        }
+                    }
                 }
                 if !result.provenance.is_empty() {
                     out.push_str(&format!(
@@ -3609,8 +4251,10 @@ fn is_false(value: &bool) -> bool {
 mod tests {
     use super::*;
     use crate::analyzer::structural::CodeQuery;
+    use crate::analyzer::{TestProject, TypescriptAnalyzer};
     use serde_json::json;
     use std::cell::Cell;
+    use std::path::PathBuf;
 
     #[test]
     fn where_globs_match_slash_normalized_paths() {
@@ -3646,5 +4290,57 @@ mod tests {
             assert_eq!(coordinates.line_starts, vec![0, 13]);
         }
         assert_eq!(loads.get(), 1);
+    }
+
+    #[test]
+    fn tiny_receiver_budget_returns_an_explicit_exceeded_row() {
+        let source = r#"class Service { run() {} }
+function makeService() { return new Service(); }
+export function caller() {
+    const service = makeService();
+    service.run();
+}
+"#;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(root.clone(), PathBuf::from("app.ts"));
+        file.write(source).expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let query = CodeQuery::from_json(&json!({
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "steps": [{ "op": "receiver_targets" }]
+        }))
+        .expect("query");
+
+        let result = execute_with_receiver_budget_for_test(
+            &analyzer,
+            &query,
+            ReceiverAnalysisBudget::tiny(),
+        );
+
+        assert!(result.truncated);
+        assert!(result.render_text().contains("limit -> scope_nodes"));
+        assert!(matches!(
+            result.results[0].value,
+            CodeQueryResultValue::ReceiverAnalysis { ref value }
+                if value.outcome == "exceeded_budget" && value.limit == Some("scope_nodes")
+        ));
+
+        let file_query = CodeQuery::from_json(&json!({
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "steps": [{ "op": "receiver_targets" }, { "op": "file_of" }]
+        }))
+        .expect("file query");
+        let file_result = execute_with_receiver_budget_for_test(
+            &analyzer,
+            &file_query,
+            ReceiverAnalysisBudget::tiny(),
+        );
+        assert!(file_result.truncated);
+        assert!(matches!(
+            file_result.results[0].value,
+            CodeQueryResultValue::File { ref value } if value.path == "app.ts"
+        ));
     }
 }

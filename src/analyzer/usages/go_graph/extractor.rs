@@ -2,19 +2,20 @@ use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::go_graph::hits::{record_hit, record_unproven_hit};
 use crate::analyzer::usages::go_graph::reference::go_is_top_level_decl;
 use crate::analyzer::usages::go_graph::resolver::{
-    GoProjectGraph, ScanBindings, TargetSpec, TypeRef, node_text,
+    GoProjectGraph, ScanBindings, TargetSpec, TypeRef, constructor_call_type_fqns, node_text,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::{IAnalyzer, ProjectFile};
 use crate::cancellation::CancellationToken;
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 use tree_sitter::Node;
 
 pub(super) const OWNER_TOKEN: &str = "__go_target_owner__";
+pub(super) const NON_OWNER_TOKEN: &str = "__go_known_non_target_owner__";
 const FIELD_OWNER_TOKEN_PREFIX: &str = "__go_field_owner__:";
 
 pub(super) fn scan_files_for_target(
@@ -50,15 +51,21 @@ pub(super) fn scan_files_for_target(
             return;
         }
         let scan_bindings = ScanBindings::new(graph, file, spec);
+        let file_package = graph.package_name_of(file).unwrap_or_default();
+        let (alias_packages, dot_packages) = graph.namespace_packages(file);
         let mut local_hits = BTreeSet::new();
         let mut local_unproven_hits = BTreeSet::new();
         let mut ctx = ScanCtx {
+            graph,
             file,
             source,
             line_starts: &parsed.line_starts,
             analyzer,
             spec,
             bindings: scan_bindings,
+            file_package,
+            alias_packages,
+            dot_packages,
             hits: &mut local_hits,
             unproven_hits: &mut local_unproven_hits,
         };
@@ -91,14 +98,58 @@ pub(super) struct GoScanResult {
 }
 
 pub(super) struct ScanCtx<'a> {
+    pub(super) graph: &'a GoProjectGraph,
     pub(super) file: &'a ProjectFile,
     pub(super) source: &'a str,
     pub(super) line_starts: &'a [usize],
     pub(super) analyzer: &'a dyn IAnalyzer,
     pub(super) spec: &'a TargetSpec,
     bindings: ScanBindings,
+    file_package: String,
+    alias_packages: HashMap<String, Vec<String>>,
+    dot_packages: Vec<String>,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
     pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
+}
+
+impl ScanCtx<'_> {
+    fn receiver_tokens_for_type(&self, ty: &TypeRef) -> Vec<String> {
+        let resolved_types = ty
+            .name
+            .as_deref()
+            .map(|name| match ty.qualifier.as_deref() {
+                None => std::iter::once(self.file_package.as_str())
+                    .chain(self.dot_packages.iter().map(String::as_str))
+                    .map(|package| format!("{package}.{name}"))
+                    .collect::<Vec<_>>(),
+                Some(qualifier) => self
+                    .alias_packages
+                    .get(qualifier)
+                    .into_iter()
+                    .flatten()
+                    .map(|package| format!("{package}.{name}"))
+                    .collect(),
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|fq_name| self.graph.edge_index.resolve_type_alias(&fq_name))
+            .collect::<Vec<_>>();
+        let known_non_alias_type = resolved_types
+            .iter()
+            .any(|fq_name| self.graph.is_known_non_alias_type(fq_name));
+        let mut tokens = self
+            .bindings
+            .receiver_tokens_for_type(ty, known_non_alias_type);
+        if resolved_types
+            .iter()
+            .any(|fq_name| self.spec.matches_receiver_fqn(fq_name))
+            && !tokens.iter().any(|token| token == OWNER_TOKEN)
+        {
+            tokens.retain(|token| token != NON_OWNER_TOKEN);
+            tokens.push(OWNER_TOKEN.to_string());
+        }
+        tokens
+    }
 }
 
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInferenceEngine<String>) {
@@ -134,7 +185,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInferenceE
         "selector_expression" | "qualified_type" => {
             scan_selector_like(node, ctx, locals);
         }
-        "identifier" | "type_identifier" => {
+        "identifier" | "type_identifier" if !scan_composite_literal_field_label(node, ctx) => {
             scan_direct_identifier(node, ctx, locals);
         }
         _ => {}
@@ -190,7 +241,7 @@ fn seed_parameter_declaration(
         return;
     };
     let tokens = type_ref_from_node(type_node, ctx.source)
-        .map(|ty| ctx.bindings.receiver_tokens_for_type(&ty))
+        .map(|ty| ctx.receiver_tokens_for_type(&ty))
         .unwrap_or_default();
     if tokens.is_empty() {
         for name in parameter_names {
@@ -254,7 +305,7 @@ fn seed_var_spec(node: Node<'_>, ctx: &ScanCtx<'_>, locals: &mut LocalInferenceE
     if let Some(tokens) = node
         .child_by_field_name("type")
         .and_then(|type_node| type_ref_from_node(type_node, ctx.source))
-        .map(|ty| ctx.bindings.receiver_tokens_for_type(&ty))
+        .map(|ty| ctx.receiver_tokens_for_type(&ty))
         .filter(|tokens| !tokens.is_empty())
     {
         for name in names {
@@ -292,7 +343,7 @@ fn seed_assignment_like(
 }
 
 enum InferredBinding {
-    Owner,
+    Targets(Vec<String>),
     Alias(String),
 }
 
@@ -311,10 +362,24 @@ fn infer_names_from_values(
         .zip(values.iter())
         .filter_map(|(name, value)| {
             let name = name.as_ref()?;
-            if expression_matches_owner_type(*value, ctx)
-                || call_returns_owner_type(*value, ctx, locals)
+            let constructor_targets = constructor_call_receiver_targets(*value, ctx, locals);
+            if !constructor_targets.is_empty() {
+                Some((name.clone(), InferredBinding::Targets(constructor_targets)))
+            } else if let Some(tokens) = type_ref_from_node(*value, ctx.source)
+                .or_else(|| {
+                    value
+                        .child_by_field_name("type")
+                        .and_then(|ty| type_ref_from_node(ty, ctx.source))
+                })
+                .map(|ty| ctx.receiver_tokens_for_type(&ty))
+                .filter(|tokens| !tokens.is_empty())
             {
-                Some((name.clone(), InferredBinding::Owner))
+                Some((name.clone(), InferredBinding::Targets(tokens)))
+            } else if expression_matches_owner_type(*value, ctx) {
+                Some((
+                    name.clone(),
+                    InferredBinding::Targets(vec![OWNER_TOKEN.to_string()]),
+                ))
             } else if is_identifier_node(*value) {
                 Some((
                     name.clone(),
@@ -333,47 +398,37 @@ fn apply_inferred_bindings(
 ) {
     for (name, binding) in bindings {
         match binding {
-            InferredBinding::Owner => locals.seed_symbol(name, OWNER_TOKEN.to_string()),
+            InferredBinding::Targets(targets) => locals.seed_symbol_many(name, targets),
             InferredBinding::Alias(source) => locals.alias_symbol(name, &source),
         }
     }
 }
 
-/// Whether `value` is a call to a constructor whose result is the owner type, so
-/// the local it initializes carries the owner receiver. Covers a bare in-package
-/// call (`NewOwner()`) and a qualified call through an import (`pkg.NewOwner()`). A
-/// callee (or qualifier) shadowed by a local binding is not the package constructor.
-fn call_returns_owner_type(
+fn constructor_call_receiver_targets(
     value: Node<'_>,
     ctx: &ScanCtx<'_>,
     locals: &LocalInferenceEngine<String>,
-) -> bool {
-    if value.kind() != "call_expression" {
-        return false;
-    }
-    let Some(function) = value
-        .child_by_field_name("function")
-        .or_else(|| first_named_child(value))
-    else {
-        return false;
-    };
-    match function.kind() {
-        "identifier" => {
-            let name = node_text(function, ctx.source);
-            !locals.is_shadowed(name)
-                && ctx.bindings.owner_referable_directly()
-                && ctx.spec.is_owner_constructor(name)
+) -> Vec<String> {
+    constructor_call_type_fqns(
+        value,
+        ctx.source,
+        &ctx.file_package,
+        &ctx.alias_packages,
+        &ctx.dot_packages,
+        &ctx.graph.edge_index,
+        Some(locals),
+    )
+    .into_iter()
+    .filter_map(|return_type| {
+        if ctx.spec.matches_receiver_fqn(&return_type) {
+            Some(OWNER_TOKEN.to_string())
+        } else if ctx.spec.owner_is_interface() && ctx.graph.is_known_non_alias_type(&return_type) {
+            Some(NON_OWNER_TOKEN.to_string())
+        } else {
+            None
         }
-        "selector_expression" => {
-            let Some((qualifier, _, field)) = selector_parts(function, ctx.source) else {
-                return false;
-            };
-            !locals.is_shadowed(&qualifier)
-                && ctx.bindings.owner_namespace_contains(&qualifier)
-                && ctx.spec.is_owner_constructor(node_text(field, ctx.source))
-        }
-        _ => false,
-    }
+    })
+    .collect()
 }
 
 pub(super) fn var_spec_names(node: Node<'_>, source: &str) -> Vec<String> {
@@ -510,14 +565,19 @@ fn scan_selector_like(
 
     if ctx.spec.is_member() {
         let receiver = receiver_symbol_from_qualifier(&qualifier);
-        if locals
-            .resolve_symbol(receiver)
+        let receiver_resolution = locals.resolve_symbol(receiver);
+        if receiver_resolution
             .as_precise()
             .is_some_and(|targets| targets.contains(OWNER_TOKEN))
             || field_receiver_matches_owner(qualifier_node, ctx, locals)
             || composite_literal_receiver_matches_owner(qualifier_node, ctx)
         {
             record_hit(field_node, ctx);
+        } else if receiver_resolution
+            .as_precise()
+            .is_some_and(|targets| targets.contains(NON_OWNER_TOKEN))
+        {
+            return;
         } else if !ctx.bindings.namespace_names.contains(&qualifier)
             || locals.is_shadowed(&qualifier)
         {
@@ -543,7 +603,7 @@ fn composite_literal_receiver_matches_owner(qualifier_node: Node<'_>, ctx: &Scan
         && qualifier_node
             .child_by_field_name("type")
             .and_then(|type_node| type_ref_from_node(type_node, ctx.source))
-            .map(|ty| ctx.bindings.receiver_tokens_for_type(&ty))
+            .map(|ty| ctx.receiver_tokens_for_type(&ty))
             .is_some_and(|tokens| tokens.iter().any(|token| token == OWNER_TOKEN))
 }
 
@@ -578,6 +638,25 @@ fn scan_direct_identifier(
     if ctx.bindings.matches_direct_target(text) && !locals.is_shadowed(text) {
         record_hit(node, ctx);
     }
+}
+
+/// Resolve a keyed struct-literal label through the literal's declared type.
+///
+/// Go uses the same `keyed_element` syntax for struct fields and map keys. The
+/// enclosing `composite_literal` type is therefore the structured fact that
+/// distinguishes `Owner{Field: value}` from `map[string]T{Field: value}` and
+/// from another struct with a same-named field.
+fn scan_composite_literal_field_label(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
+    let Some(type_node) = direct_composite_literal_type_for_key(node) else {
+        return false;
+    };
+    if node_text(node, ctx.source) == ctx.spec.identifier
+        && type_ref_from_node(type_node, ctx.source)
+            .is_some_and(|ty| ctx.bindings.matches_owner_type(&ty))
+    {
+        record_hit(node, ctx);
+    }
+    true
 }
 
 pub(super) fn selector_parts<'a>(
@@ -640,18 +719,11 @@ pub(super) fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
     node.named_children(&mut cursor).last()
 }
 
-pub(super) fn is_definition_identifier(node: Node<'_>, source: &str) -> bool {
+pub(super) fn is_definition_identifier(node: Node<'_>, _source: &str) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    if has_ancestor_kind(node, "literal_value") && next_non_whitespace_is_colon(node, source) {
-        return true;
-    }
-    if parent.kind() == "keyed_element"
-        && parent
-            .child_by_field_name("key")
-            .is_some_and(|key| same_node(key, node))
-    {
+    if keyed_element_for_key(node).is_some() {
         return true;
     }
     if parent.kind() == "field_declaration"
@@ -684,20 +756,37 @@ pub(super) fn is_definition_identifier(node: Node<'_>, source: &str) -> bool {
         .is_some_and(|name| same_node(name, node))
 }
 
-pub(super) fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
+/// Return the type syntax for a key belonging directly to a composite literal.
+/// Keys in nested elided literal values intentionally return `None`: without an
+/// explicit type at that literal boundary, attributing a field would require
+/// additional element-type propagation rather than guessing from source text.
+fn direct_composite_literal_type_for_key(node: Node<'_>) -> Option<Node<'_>> {
+    let keyed = keyed_element_for_key(node)?;
+    let literal = keyed
+        .parent()
+        .filter(|parent| parent.kind() == "literal_value")?;
+    let composite = literal
+        .parent()
+        .filter(|parent| parent.kind() == "composite_literal")?;
+    composite.child_by_field_name("type")
+}
+
+fn keyed_element_for_key(node: Node<'_>) -> Option<Node<'_>> {
     let mut current = node.parent();
     while let Some(parent) = current {
-        if parent.kind() == kind {
-            return true;
+        if parent.kind() == "keyed_element" {
+            let key = parent.child_by_field_name("key")?;
+            if same_node(key, node) {
+                return Some(parent);
+            }
+            let mut cursor = key.walk();
+            let mut children = key.named_children(&mut cursor);
+            return children
+                .next()
+                .filter(|child| same_node(*child, node) && children.next().is_none())
+                .map(|_| parent);
         }
         current = parent.parent();
     }
-    false
-}
-
-pub(super) fn next_non_whitespace_is_colon(node: Node<'_>, source: &str) -> bool {
-    source
-        .get(node.end_byte()..)
-        .and_then(|rest| rest.chars().find(|ch| !ch.is_whitespace()))
-        == Some(':')
+    None
 }

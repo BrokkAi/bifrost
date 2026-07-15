@@ -29,6 +29,7 @@ pub enum QueryValueKind {
     ReferenceSite,
     CallSite,
     ExpressionSite,
+    ReceiverAnalysis,
     File,
 }
 
@@ -40,6 +41,7 @@ impl QueryValueKind {
             Self::ReferenceSite => "reference_site",
             Self::CallSite => "call_site",
             Self::ExpressionSite => "expression_site",
+            Self::ReceiverAnalysis => "receiver_analysis",
             Self::File => "file",
         }
     }
@@ -70,6 +72,11 @@ impl Default for CallTraversalFilter {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CallSiteTraversalFilter {
     pub proof: Option<UsageProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReceiverTraversalFilter {
+    pub capture: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +111,9 @@ pub enum QueryStep {
     CallSitesTo(CallSiteTraversalFilter),
     CallSitesFrom(CallSiteTraversalFilter),
     CallInput(CallInputSelector),
+    ReceiverTargets(ReceiverTraversalFilter),
+    PointsTo(ReceiverTraversalFilter),
+    MemberTargets(ReceiverTraversalFilter),
 }
 
 impl QueryStep {
@@ -129,6 +139,9 @@ impl QueryStep {
             Self::CallSitesTo(_) => QueryStepOp::CallSitesTo,
             Self::CallSitesFrom(_) => QueryStepOp::CallSitesFrom,
             Self::CallInput(_) => QueryStepOp::CallInput,
+            Self::ReceiverTargets(_) => QueryStepOp::ReceiverTargets,
+            Self::PointsTo(_) => QueryStepOp::PointsTo,
+            Self::MemberTargets(_) => QueryStepOp::MemberTargets,
         }
     }
 
@@ -154,6 +167,13 @@ impl QueryStep {
                 Some(Self::CallSitesFrom(CallSiteTraversalFilter::default()))
             }
             QueryStepOp::CallInput => Some(Self::CallInput(CallInputSelector::Receiver)),
+            QueryStepOp::ReceiverTargets => {
+                Some(Self::ReceiverTargets(ReceiverTraversalFilter::default()))
+            }
+            QueryStepOp::PointsTo => Some(Self::PointsTo(ReceiverTraversalFilter::default())),
+            QueryStepOp::MemberTargets => {
+                Some(Self::MemberTargets(ReceiverTraversalFilter::default()))
+            }
         }
     }
 
@@ -168,7 +188,8 @@ impl QueryStep {
                 | QueryValueKind::Declaration
                 | QueryValueKind::ReferenceSite
                 | QueryValueKind::CallSite
-                | QueryValueKind::ExpressionSite,
+                | QueryValueKind::ExpressionSite
+                | QueryValueKind::ReceiverAnalysis,
             ) => Some(QueryValueKind::File),
             (Self::ImportsOf | Self::ImportersOf, QueryValueKind::File) => {
                 Some(QueryValueKind::File)
@@ -190,6 +211,23 @@ impl QueryStep {
                 Some(QueryValueKind::CallSite)
             }
             (Self::CallInput(_), QueryValueKind::CallSite) => Some(QueryValueKind::ExpressionSite),
+            (
+                Self::ReceiverTargets(_),
+                QueryValueKind::StructuralMatch
+                | QueryValueKind::ReferenceSite
+                | QueryValueKind::CallSite
+                | QueryValueKind::ExpressionSite,
+            ) => Some(QueryValueKind::ReceiverAnalysis),
+            (
+                Self::PointsTo(_),
+                QueryValueKind::StructuralMatch
+                | QueryValueKind::ReferenceSite
+                | QueryValueKind::ExpressionSite,
+            ) => Some(QueryValueKind::ReceiverAnalysis),
+            (
+                Self::MemberTargets(_),
+                QueryValueKind::StructuralMatch | QueryValueKind::ReferenceSite,
+            ) => Some(QueryValueKind::ReceiverAnalysis),
             _ => None,
         }
     }
@@ -208,7 +246,7 @@ pub(super) fn validate_query_steps(steps: &[QueryStep]) -> Result<QueryValueKind
         let expected_input = match step {
             QueryStep::EnclosingDecl => "structural_match",
             QueryStep::FileOf => {
-                "structural_match, declaration, reference_site, call_site, or expression_site"
+                "structural_match, declaration, reference_site, call_site, expression_site, or receiver_analysis"
             }
             QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
             QueryStep::Supertypes(_)
@@ -221,6 +259,11 @@ pub(super) fn validate_query_steps(steps: &[QueryStep]) -> Result<QueryValueKind
             | QueryStep::CallSitesTo(_)
             | QueryStep::CallSitesFrom(_) => "declaration",
             QueryStep::CallInput(_) => "call_site",
+            QueryStep::ReceiverTargets(_) => {
+                "structural_match, reference_site, call_site, or expression_site"
+            }
+            QueryStep::PointsTo(_) => "structural_match, reference_site, or expression_site",
+            QueryStep::MemberTargets(_) => "structural_match or reference_site",
         };
         value_kind = step.output_kind(value_kind).ok_or_else(|| {
             QueryError::new(
@@ -290,7 +333,76 @@ impl CodeQuery {
     /// Embedders may construct this public IR directly, so execution cannot
     /// rely solely on decoder validation.
     pub fn validate_steps(&self) -> Result<QueryValueKind, QueryError> {
-        validate_query_steps(&self.steps)
+        let output = validate_query_steps(&self.steps)?;
+        let captures = self.positive_capture_names();
+        let mut input = QueryValueKind::StructuralMatch;
+        for (index, step) in self.steps.iter().enumerate() {
+            let filter = match step {
+                QueryStep::ReceiverTargets(filter)
+                | QueryStep::PointsTo(filter)
+                | QueryStep::MemberTargets(filter) => filter,
+                _ => {
+                    input = step
+                        .output_kind(input)
+                        .expect("typed steps were validated above");
+                    continue;
+                }
+            };
+            if let Some(capture) = &filter.capture {
+                let path = format!("steps[{index}].capture");
+                if input != QueryValueKind::StructuralMatch {
+                    return Err(QueryError::new(
+                        path,
+                        "capture is allowed only when the preceding stage produces structural_match",
+                    ));
+                }
+                if capture.is_empty() {
+                    return Err(QueryError::new(path, "capture name must not be empty"));
+                }
+                if capture.len() > MAX_CAPTURE_LENGTH {
+                    return Err(QueryError::new(
+                        path,
+                        format!("capture name must be at most {MAX_CAPTURE_LENGTH} bytes"),
+                    ));
+                }
+                if !captures.contains(capture.as_str()) {
+                    return Err(QueryError::new(
+                        path,
+                        format!("capture {capture:?} is not declared by a positive pattern"),
+                    ));
+                }
+            }
+            input = step
+                .output_kind(input)
+                .expect("typed steps were validated above");
+        }
+        Ok(output)
+    }
+
+    fn positive_capture_names(&self) -> std::collections::HashSet<&str> {
+        let mut captures = std::collections::HashSet::new();
+        let mut stack = vec![&self.root];
+        if let Some(inside) = &self.inside {
+            stack.push(inside);
+        }
+        while let Some(pattern) = stack.pop() {
+            if let Some(capture) = pattern.capture.as_deref() {
+                captures.insert(capture);
+            }
+            if let Some(has) = pattern.has.as_deref() {
+                stack.push(has);
+            }
+            for role in Role::single_target_roles() {
+                if let Some(child) = pattern.single_role_pattern(*role) {
+                    stack.push(child);
+                }
+            }
+            for role in Role::list_target_roles() {
+                stack.extend(pattern.list_role_patterns(*role));
+            }
+            stack.extend(pattern.kwargs.iter().map(|(_, pattern)| pattern));
+        }
+        captures
     }
 }
 

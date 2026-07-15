@@ -106,10 +106,7 @@ export class RqlValidationController<Token = unknown> {
     try {
       const response = await this.dependencies.validate(document.text, cancellation.token);
       const current = this.states.get(document.uri);
-      if (
-        current?.generation === generation &&
-        this.dependencies.isCurrent(document)
-      ) {
+      if (current?.generation === generation && this.dependencies.isCurrent(document)) {
         this.dependencies.publish(document.uri, response.diagnostics);
       }
     } catch {

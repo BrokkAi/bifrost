@@ -23,7 +23,7 @@ pub use ir::{
     MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
     MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
     MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError, QueryStep, QueryValueKind,
-    ReferenceTraversalFilter, SCHEMA_VERSION, StringPredicate,
+    ReceiverTraversalFilter, ReferenceTraversalFilter, SCHEMA_VERSION, StringPredicate,
 };
 pub use source::{
     QuerySourceDiagnostic, QuerySourceEdit, QuerySourceFix, QuerySourceHelp, query_source_help_at,

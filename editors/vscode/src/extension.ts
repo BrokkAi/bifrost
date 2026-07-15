@@ -1,25 +1,26 @@
 import * as vscode from "vscode";
+import type { LanguageClientOptions, ServerOptions } from "vscode-languageclient/node";
 import {
   CloseAction,
   ErrorAction,
   LanguageClient,
-  LanguageClientOptions,
   RevealOutputChannelOn,
-  ServerOptions,
   State
 } from "vscode-languageclient/node";
-import {
+import type {
   BifrostLaunchConfig,
   BifrostFormatterCommandRule,
   BifrostInitializationOptions,
+  BifrostMcpConfig,
+  LaunchMode
+} from "./lifecycle";
+import {
   bifrostConfigurationChangeRequiresRestart,
   buildBifrostInitializationOptions,
   buildLaunchConfig,
   buildMcpConfig,
   buildMcpHostCommands,
-  BifrostMcpConfig,
   formatError,
-  LaunchMode,
   appendBifrostGitignoreEntry,
   parseExtraArgs,
   selectTrustedFormatterCommands,
@@ -37,27 +38,16 @@ import {
   releaseAssetFor,
   releaseTargetFor
 } from "./provisioning";
-import {
-  queryResultRange,
-  RqlQueryDocument,
-  RqlQueryResponse,
-  RqlQueryResultItem,
-  runRqlQuery
-} from "./rql_query";
+import type { RqlQueryDocument, RqlQueryResponse, RqlQueryResultItem } from "./rql_query";
+import { queryResultRange, runRqlQuery } from "./rql_query";
 import { RqlQueryResultsProvider } from "./rql_results";
-import {
-  RUNE_IR_LANGUAGE_ID,
-  RUNE_IR_SOURCE_LANGUAGE_IDS,
-  RuneIrRange,
-  RuneIrResponse,
-  showRuneIr
-} from "./rune_ir";
+import type { RuneIrRange, RuneIrResponse } from "./rune_ir";
+import { RUNE_IR_SOURCE_LANGUAGE_IDS, showRuneIr } from "./rune_ir";
+import type { WireDiagnostic, WireHover } from "./rql_validation";
 import {
   RQL_QUERY_HOVER_METHOD,
   RqlValidationController,
   VALIDATE_RQL_QUERY_METHOD,
-  WireDiagnostic,
-  WireHover,
   handleRqlServerClosed,
   queryHoverParams,
   validationDocument
@@ -123,9 +113,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (
         client?.state === State.Running &&
-        bifrostConfigurationChangeRequiresRestart((section) =>
-          event.affectsConfiguration(section)
-        )
+        bifrostConfigurationChangeRequiresRestart((section) => event.affectsConfiguration(section))
       ) {
         void promptRestartAfterConfigurationChange(context);
       }
@@ -173,25 +161,23 @@ async function showRuneIrForEditor(): Promise<void> {
   const document = editor?.document;
   const currentClient = client;
   const selection = editor?.selection;
-  const selectedRange: RuneIrRange | undefined = selection && !selection.isEmpty
-    ? {
-        start: { line: selection.start.line, character: selection.start.character },
-        end: { line: selection.end.line, character: selection.end.character }
-      }
-    : undefined;
+  const selectedRange: RuneIrRange | undefined =
+    selection && !selection.isEmpty
+      ? {
+          start: { line: selection.start.line, character: selection.start.character },
+          end: { line: selection.end.line, character: selection.end.character }
+        }
+      : undefined;
   const position = selection
     ? { line: selection.active.line, character: selection.active.character }
     : undefined;
   await showRuneIr(
-    document
-      ? { uri: document.uri.toString(), languageId: document.languageId }
-      : undefined,
+    document ? { uri: document.uri.toString(), languageId: document.languageId } : undefined,
     selectedRange,
     position,
     {
       isReady: () => currentClient?.state === State.Running,
-      sendRequest: (method, params) =>
-        currentClient!.sendRequest<RuneIrResponse>(method, params),
+      sendRequest: (method, params) => currentClient!.sendRequest<RuneIrResponse>(method, params),
       showError: (message) => {
         void vscode.window.showErrorMessage(message);
       },
@@ -244,11 +230,8 @@ async function runRqlQueryForEditor(resource?: vscode.Uri): Promise<void> {
 async function openRqlQueryResult(result: RqlQueryResultItem): Promise<void> {
   const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(result.uri));
   const editor = await vscode.window.showTextDocument(document, { preview: true });
-  if (result.result_type === "reference_site") {
-    const resultRange = queryResultRange(result);
-    if (!resultRange) {
-      return;
-    }
+  const resultRange = queryResultRange(result);
+  if (resultRange) {
     const startLine = Math.min(Math.max(0, resultRange.start_line - 1), document.lineCount - 1);
     const endLine = Math.min(Math.max(startLine, resultRange.end_line - 1), document.lineCount - 1);
     const startColumn = Math.min(
@@ -266,8 +249,8 @@ async function openRqlQueryResult(result: RqlQueryResultItem): Promise<void> {
     editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
     return;
   }
-  const resultStartLine = result.result_type === "file" ? 1 : result.start_line;
-  const resultEndLine = result.result_type === "file" ? resultStartLine : result.end_line;
+  const resultStartLine = 1;
+  const resultEndLine = resultStartLine;
   const startLine = Math.min(Math.max(0, resultStartLine - 1), document.lineCount - 1);
   const endLine = Math.min(Math.max(startLine, resultEndLine - 1), document.lineCount - 1);
   const start = new vscode.Position(startLine, 0);
@@ -358,10 +341,10 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
   setStatus("$(sync~spin) Bifrost", "Starting Bifrost language server...");
   log(`Starting Bifrost language server using ${launchConfig.label} launch mode.`);
 
-  const serverOptions: ServerOptions = async () => {
+  const serverOptions: ServerOptions = () => {
     const handle = spawnBifrostServer(launchConfig, log);
     log(`Command: ${handle.commandLine}`);
-    return handle.process;
+    return Promise.resolve(handle.process);
   };
 
   const clientOptions: LanguageClientOptions = {
@@ -714,13 +697,7 @@ async function resolveMcpConfig(context: vscode.ExtensionContext): Promise<Bifro
   const command = config.get<string>("serverPath") || "bifrost";
   const mode = config.get<LaunchMode>("launchMode") || "auto";
   const managedBinaryPath = await prepareManagedBinary(context, mode, command);
-  return buildMcpConfig(
-    root,
-    context.extensionUri.fsPath,
-    mode,
-    command,
-    managedBinaryPath
-  );
+  return buildMcpConfig(root, context.extensionUri.fsPath, mode, command, managedBinaryPath);
 }
 
 async function copyText(text: string, label: string): Promise<void> {
@@ -755,14 +732,11 @@ async function prepareManagedBinary(
 
   let binaryPath = await findManagedBinary(storageDir, binaryVersion);
   if (!binaryPath) {
-    binaryPath = await promptAndInstallManagedBinary(
-      context,
-      mode,
-      binaryVersion,
-      archiveSha256
-    );
+    binaryPath = await promptAndInstallManagedBinary(context, mode, binaryVersion, archiveSha256);
     if (!binaryPath && mode === "bundled") {
-      throw new Error(`Bifrost ${binaryVersion} is not installed for ${process.platform}-${process.arch}.`);
+      throw new Error(
+        `Bifrost ${binaryVersion} is not installed for ${process.platform}-${process.arch}.`
+      );
     }
     return binaryPath;
   }
@@ -793,7 +767,9 @@ async function verifyManagedBinary(
       return tryInstallManagedBinaryForMode(context, mode, binaryVersion, archiveSha256);
     }
     if (mode === "bundled") {
-      throw new Error(`Managed Bifrost binary version ${found} does not match required ${binaryVersion}.`);
+      throw new Error(
+        `Managed Bifrost binary version ${found} does not match required ${binaryVersion}.`
+      );
     }
     return null;
   } catch (error) {
@@ -808,7 +784,7 @@ async function verifyManagedBinary(
       return tryInstallManagedBinaryForMode(context, mode, binaryVersion, archiveSha256);
     }
     if (mode === "bundled") {
-      throw new Error(`Managed Bifrost binary is not runnable: ${message}`);
+      throw new Error(`Managed Bifrost binary is not runnable: ${message}`, { cause: error });
     }
     return null;
   }
@@ -884,10 +860,7 @@ function requiredBinaryVersion(context: vscode.ExtensionContext): string {
   return version.replace(/^v/, "");
 }
 
-function requiredArchiveSha256(
-  context: vscode.ExtensionContext,
-  binaryVersion: string
-): string {
+function requiredArchiveSha256(context: vscode.ExtensionContext, binaryVersion: string): string {
   const packageJson = context.extension.packageJSON as {
     bifrost?: {
       archiveSha256?: Record<string, string>;

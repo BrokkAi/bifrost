@@ -123,6 +123,13 @@ fn query_step_to_json(step: &QueryStep) -> Value {
                 object.insert("parameter_name".to_string(), json!(name));
             }
         },
+        QueryStep::ReceiverTargets(filter)
+        | QueryStep::PointsTo(filter)
+        | QueryStep::MemberTargets(filter) => {
+            if let Some(capture) = &filter.capture {
+                object.insert("capture".to_string(), json!(capture));
+            }
+        }
     }
     Value::Object(object)
 }

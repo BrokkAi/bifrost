@@ -33,6 +33,7 @@ pub(crate) mod parsed_tree;
 pub(crate) mod php_graph;
 pub(crate) mod python_graph;
 pub(crate) mod receiver_analysis;
+pub(crate) mod receiver_query;
 mod reexport_seeds;
 pub(crate) mod reference_site;
 pub(crate) mod ruby_graph;
