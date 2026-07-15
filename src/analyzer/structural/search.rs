@@ -37,6 +37,7 @@ use crate::analyzer::usages::{
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
+use crate::compact_graph::CompactDirectedGraph;
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use crate::text_utils::{compute_line_starts, line_column_for_offset};
@@ -738,7 +739,7 @@ impl PipelineRenderCache {
 #[derive(Debug, Default)]
 struct DirectImportGraph {
     forward: HashMap<ProjectFile, Vec<ProjectFile>>,
-    reverse: HashMap<ProjectFile, Vec<ProjectFile>>,
+    compact: Option<CompactDirectedGraph<ProjectFile>>,
     unsupported: HashSet<ProjectFile>,
     all_files: Vec<ProjectFile>,
     analyzed: HashSet<ProjectFile>,
@@ -758,6 +759,61 @@ impl DirectImportGraph {
             analyzed,
             ..Self::default()
         }
+    }
+
+    fn freeze(&mut self) {
+        if self.compact.is_some() {
+            return;
+        }
+        let nodes = std::mem::take(&mut self.all_files);
+        let index_by_file: HashMap<_, _> = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, file)| (file.clone(), index as u32))
+            .collect();
+        let mut edges = Vec::with_capacity(self.resolved_edges);
+        for (source, targets) in std::mem::take(&mut self.forward) {
+            let Some(source) = index_by_file.get(&source).copied() else {
+                continue;
+            };
+            edges.extend(targets.into_iter().filter_map(|target| {
+                index_by_file
+                    .get(&target)
+                    .copied()
+                    .map(|target| (source, target))
+            }));
+        }
+        self.compact = Some(CompactDirectedGraph::from_indexed_nodes(
+            nodes,
+            index_by_file,
+            edges,
+        ));
+        self.analyzed.clear();
+        self.analyzed.shrink_to_fit();
+    }
+
+    fn imports_of(&self, file: &ProjectFile) -> Vec<ProjectFile> {
+        if let Some(compact) = &self.compact {
+            return compact
+                .node_id(file)
+                .into_iter()
+                .flat_map(|source| compact.outgoing(source))
+                .map(|target| compact.nodes()[*target as usize].clone())
+                .collect();
+        }
+        self.forward.get(file).cloned().unwrap_or_default()
+    }
+
+    fn importers_of(&self, file: &ProjectFile) -> Vec<ProjectFile> {
+        let Some(compact) = &self.compact else {
+            return Vec::new();
+        };
+        compact
+            .node_id(file)
+            .into_iter()
+            .flat_map(|target| compact.incoming(target))
+            .map(|source| compact.nodes()[*source as usize].clone())
+            .collect()
     }
 }
 
@@ -1209,7 +1265,12 @@ fn ensure_complete_import_graph(
     max_files: usize,
     max_edges: usize,
 ) -> bool {
-    if graph.complete || graph.truncated {
+    if graph.complete {
+        graph.freeze();
+        return false;
+    }
+    if graph.truncated {
+        graph.freeze();
         return graph.truncated;
     }
     let files = graph.all_files.clone();
@@ -1217,6 +1278,7 @@ fn ensure_complete_import_graph(
     if !exhausted {
         graph.complete = true;
     }
+    graph.freeze();
     exhausted
 }
 
@@ -1290,20 +1352,8 @@ fn ensure_forward_import_edges(
                 graph.truncated = true;
             }
             graph.resolved_edges += targets.len();
-            for target in &targets {
-                graph
-                    .reverse
-                    .entry(target.clone())
-                    .or_default()
-                    .push(file.clone());
-            }
             graph.forward.insert(file.clone(), targets);
         }
-    }
-
-    for importers in graph.reverse.values_mut() {
-        importers.sort_by_key(rel_path_string);
-        importers.dedup();
     }
     graph.truncated
 }
@@ -1387,11 +1437,8 @@ fn apply_pipeline_step(
                     Vec::new()
                 } else {
                     graph
-                        .forward
-                        .get(file)
+                        .imports_of(file)
                         .into_iter()
-                        .flatten()
-                        .cloned()
                         .map(PipelineValue::File)
                         .map(pipeline_expansion)
                         .collect()
@@ -1399,11 +1446,8 @@ fn apply_pipeline_step(
             }
             (PipelineValue::File(file), QueryStep::ImportersOf) => import_graph
                 .expect("import graph exists for import steps")
-                .reverse
-                .get(file)
+                .importers_of(file)
                 .into_iter()
-                .flatten()
-                .cloned()
                 .map(PipelineValue::File)
                 .map(pipeline_expansion)
                 .collect(),
@@ -1773,19 +1817,23 @@ fn structural_receiver_ranges(
             .collect::<Vec<_>>();
         (spans, ReceiverQueryInput::Expression)
     } else {
-        let fact = seed.facts.node(seed.fact_match.node);
+        let fact_id = seed.fact_match.node;
+        let fact = seed.facts.node(fact_id);
         let normalized = match operation {
-            ReceiverQueryOperation::PointsTo => fact
-                .role_targets(Role::Right)
+            ReceiverQueryOperation::PointsTo => seed
+                .facts
+                .role_targets(fact_id, Role::Right)
                 .next()
                 .map(|target| target.span),
             ReceiverQueryOperation::ReceiverTargets => match fact.kind {
-                NormalizedKind::Call => fact
-                    .role_targets(Role::Receiver)
+                NormalizedKind::Call => seed
+                    .facts
+                    .role_targets(fact_id, Role::Receiver)
                     .next()
                     .map(|target| target.span),
-                NormalizedKind::FieldAccess => fact
-                    .role_targets(Role::Object)
+                NormalizedKind::FieldAccess => seed
+                    .facts
+                    .role_targets(fact_id, Role::Object)
                     .next()
                     .map(|target| target.span),
                 _ => None,
@@ -2948,8 +2996,8 @@ fn classify_reference_kind(
         } else {
             Role::Receiver
         };
-        let receiver = node
-            .role_targets(receiver_role)
+        let receiver = facts
+            .role_targets(id as u32, receiver_role)
             .next()
             .map(|role| role.span.text(facts.source()).trim());
         if receiver.is_some_and(|text| matches!(text, "super" | "base")) {
@@ -2976,7 +3024,10 @@ fn classify_reference_kind(
             let fact = facts.node(current);
             if fact.kind == NormalizedKind::Assignment {
                 return Some(
-                    if fact.role_targets(Role::Left).any(|role| covers(role.span)) {
+                    if facts
+                        .role_targets(current, Role::Left)
+                        .any(|role| covers(role.span))
+                    {
                         ReferenceKind::FieldWrite
                     } else {
                         ReferenceKind::FieldRead
@@ -3963,7 +4014,8 @@ fn render_match(
         .collect();
     let node_range = full_detail.then(|| range_for_span(facts, fact.span()));
     let decorator_spans: Vec<_> = if full_detail {
-        fact.role_targets(Role::Decorator)
+        facts
+            .role_targets(fact_match.node, Role::Decorator)
             .map(|target| target.span)
             .collect()
     } else {

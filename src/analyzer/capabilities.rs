@@ -1,5 +1,6 @@
 use crate::analyzer::pool_memo::PoolSafeMemo;
 use crate::analyzer::{CodeUnit, IAnalyzer, ImportInfo, ProjectFile};
+use crate::compact_graph::{CompactRows, CompactRowsBuilder};
 use crate::hash::{HashMap, HashSet};
 use std::any::Any;
 use std::collections::{BTreeSet, VecDeque};
@@ -230,10 +231,78 @@ pub trait TypeHierarchyProvider: CapabilityProvider {
     }
 }
 
+/// Exact declaration identities plus compact ancestor-to-descendant rows.
+pub(crate) struct DirectDescendantIndex {
+    nodes: Box<[CodeUnit]>,
+    row_by_ancestor: HashMap<CodeUnit, u32>,
+    descendants: CompactRows<u32>,
+}
+
+impl DirectDescendantIndex {
+    pub(crate) fn from_indexed_nodes(
+        nodes: Vec<CodeUnit>,
+        index_by_node: HashMap<CodeUnit, u32>,
+        mut edges: Vec<(u32, u32)>,
+    ) -> Self {
+        assert_eq!(nodes.len(), index_by_node.len());
+        assert!(nodes.iter().enumerate().all(|(index, node)| {
+            index_by_node.get(node).copied()
+                == Some(
+                    u32::try_from(index).expect("hierarchy index declarations must fit in a u32"),
+                )
+        }));
+        assert!(edges.iter().all(|(ancestor, descendant)| {
+            (*ancestor as usize) < nodes.len() && (*descendant as usize) < nodes.len()
+        }));
+        edges.sort_unstable();
+        edges.dedup();
+
+        let row_count = usize::from(!edges.is_empty())
+            + edges
+                .windows(2)
+                .filter(|pair| pair[0].0 != pair[1].0)
+                .count();
+        let mut row_by_ancestor = HashMap::default();
+        let mut descendants = CompactRowsBuilder::with_capacity(row_count, edges.len());
+        let mut cursor = 0;
+        while cursor < edges.len() {
+            let ancestor = edges[cursor].0;
+            let start = cursor;
+            while cursor < edges.len() && edges[cursor].0 == ancestor {
+                cursor += 1;
+            }
+            let row =
+                u32::try_from(descendants.rows()).expect("hierarchy index rows must fit in a u32");
+            row_by_ancestor.insert(nodes[ancestor as usize].clone(), row);
+            descendants.push_row(
+                edges[start..cursor]
+                    .iter()
+                    .map(|(_, descendant)| *descendant),
+            );
+        }
+        Self {
+            nodes: nodes.into_boxed_slice(),
+            row_by_ancestor,
+            descendants: descendants.finish(),
+        }
+    }
+
+    pub(crate) fn descendants(&self, ancestor: &CodeUnit) -> HashSet<CodeUnit> {
+        let Some(row) = self.row_by_ancestor.get(ancestor).copied() else {
+            return HashSet::default();
+        };
+        self.descendants
+            .row(row as usize)
+            .iter()
+            .map(|descendant| self.nodes[*descendant as usize].clone())
+            .collect()
+    }
+}
+
 pub(crate) fn build_direct_descendant_index<A, P>(
     analyzer: &A,
     provider: &P,
-) -> HashMap<CodeUnit, Arc<HashSet<CodeUnit>>>
+) -> DirectDescendantIndex
 where
     A: IAnalyzer,
     P: TypeHierarchyProvider + ?Sized,
@@ -250,8 +319,20 @@ where
             .or_default()
             .push(candidate.clone());
     }
-    let mut reverse: HashMap<CodeUnit, HashSet<CodeUnit>> = HashMap::default();
+    let mut nodes = candidates.clone();
+    let mut index_by_node: HashMap<_, _> = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| {
+            (
+                node.clone(),
+                u32::try_from(index).expect("hierarchy index declarations must fit in a u32"),
+            )
+        })
+        .collect();
+    let mut edges = Vec::new();
     for candidate in candidates {
+        let descendant = index_by_node[&candidate];
         for ancestor in provider.get_direct_ancestors(&candidate) {
             let ancestor = types_by_fq_name
                 .get(&ancestor.fq_name())
@@ -263,17 +344,16 @@ where
                     same_source.next().is_none().then(|| exact.clone())
                 })
                 .unwrap_or(ancestor);
-            reverse
-                .entry(ancestor)
-                .or_default()
-                .insert(candidate.clone());
+            let ancestor = *index_by_node.entry(ancestor.clone()).or_insert_with(|| {
+                let index = u32::try_from(nodes.len())
+                    .expect("hierarchy index declarations must fit in a u32");
+                nodes.push(ancestor);
+                index
+            });
+            edges.push((ancestor, descendant));
         }
     }
-
-    reverse
-        .into_iter()
-        .map(|(ancestor, descendants)| (ancestor, Arc::new(descendants)))
-        .collect()
+    DirectDescendantIndex::from_indexed_nodes(nodes, index_by_node, edges)
 }
 
 fn traverse_hierarchy<F>(root: &CodeUnit, mut next: F) -> Vec<CodeUnit>

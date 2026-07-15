@@ -88,7 +88,7 @@ impl CompiledKinds {
 pub struct RoleSink<'a> {
     fact_by_ts_node: &'a HashMap<usize, u32>,
     name: Option<Span>,
-    roles: Vec<RoleTarget>,
+    roles: &'a mut Vec<RoleTarget>,
 }
 
 fn span_of(node: Node<'_>) -> Span {
@@ -99,16 +99,19 @@ fn span_of(node: Node<'_>) -> Span {
 }
 
 impl<'a> RoleSink<'a> {
-    pub(crate) fn new(fact_by_ts_node: &'a HashMap<usize, u32>) -> Self {
+    pub(crate) fn new(
+        fact_by_ts_node: &'a HashMap<usize, u32>,
+        roles: &'a mut Vec<RoleTarget>,
+    ) -> Self {
         Self {
             fact_by_ts_node,
             name: None,
-            roles: Vec::new(),
+            roles,
         }
     }
 
-    pub(crate) fn into_parts(self) -> (Option<Span>, Vec<RoleTarget>) {
-        (self.name, self.roles)
+    pub(crate) fn into_name(self) -> Option<Span> {
+        self.name
     }
 
     /// Set the fact's own name from the given node's span.

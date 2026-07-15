@@ -1,4 +1,4 @@
-use crate::analyzer::{CodeUnit, PoolSafeMemo, ProjectFile};
+use crate::analyzer::{CodeUnit, DirectDescendantIndex, PoolSafeMemo, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use std::mem::size_of;
@@ -13,8 +13,7 @@ pub(super) struct CSharpMemoCaches {
     pub(super) imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     pub(super) referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     pub(super) direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    pub(super) direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
-    pub(super) direct_descendant_index: OnceLock<HashMap<CodeUnit, Arc<HashSet<CodeUnit>>>>,
+    pub(super) direct_descendant_index: OnceLock<DirectDescendantIndex>,
     pub(super) reverse_import_index: PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     pub(super) implicit_reference_index:
         PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
@@ -35,10 +34,6 @@ impl CSharpMemoCaches {
             ),
             referencing_files: build_weighted_cache(budget_bytes / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(budget_bytes / 8, weight_code_unit_vec),
-            direct_descendants: build_weighted_cache(
-                budget_bytes / 8,
-                weight_hierarchy_code_unit_set,
-            ),
             direct_descendant_index: OnceLock::new(),
             reverse_import_index: PoolSafeMemo::new(),
             implicit_reference_index: PoolSafeMemo::new(),
@@ -75,10 +70,6 @@ fn weight_project_code_unit_set(_key: &ProjectFile, value: &Arc<HashSet<CodeUnit
 
 fn weight_code_unit_vec(_key: &CodeUnit, value: &Arc<Vec<CodeUnit>>) -> u32 {
     weight_bytes(estimate_code_unit_vec(value.as_ref()))
-}
-
-fn weight_hierarchy_code_unit_set(_key: &CodeUnit, value: &Arc<HashSet<CodeUnit>>) -> u32 {
-    weight_bytes(estimate_code_unit_set(value.as_ref()))
 }
 
 fn weight_project_file_set(_key: &ProjectFile, value: &Arc<HashSet<ProjectFile>>) -> u32 {

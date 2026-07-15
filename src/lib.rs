@@ -5,6 +5,7 @@ pub mod cache_gc;
 mod cancellation;
 pub mod code_quality;
 pub mod commit_analysis;
+mod compact_graph;
 pub mod file_tools;
 mod get_summaries_output;
 mod git_file;
