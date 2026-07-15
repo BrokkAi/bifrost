@@ -2,7 +2,7 @@ mod common;
 
 use brokk_bifrost::analyzer::structural::{ALL_KINDS, CodeQuery, execute};
 use brokk_bifrost::{AnalyzerConfig, WorkspaceAnalyzer};
-use common::InlineTestProject;
+use common::{InlineTestProject, normalize_line_endings};
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -136,6 +136,7 @@ fn ten_minute_evaluation_tutorial() {
             .join(&fixture.path);
         let contents = fs::read_to_string(&published)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", published.display()));
+        let contents = normalize_line_endings(&contents);
         assert_eq!(
             contents.trim_end(),
             fixture.source,
@@ -147,6 +148,7 @@ fn ten_minute_evaluation_tutorial() {
     let published_query = root.join("docs/fixtures/ten-minute-evaluation/queries/find-audit.rql");
     let query_contents = fs::read_to_string(&published_query)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", published_query.display()));
+    let query_contents = normalize_line_endings(&query_contents);
     let documented_query = tutorial
         .cases
         .get("find-audit")

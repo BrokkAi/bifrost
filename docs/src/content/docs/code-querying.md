@@ -49,7 +49,7 @@ Semantic declaration steps intentionally stop at the analyzer's indexed declarat
 | `imports-of` | `imports_of` | file → file | Follow one resolved direct project-local import. |
 | `importers-of` | `importers_of` | file → file | Find every project file with a resolved direct import of that file. |
 
-For example, `(importers-of (file-of (function :name "target")))` answers “which project files directly import the file declaring `target`?” It is deliberately a file relationship: it does not prove that an importer uses that particular declaration, resolve an out-of-scope library's members, or manufacture external declarations. The schema-v2 `references-of`, `used-by`, and `uses` steps provide that exact declaration relationship separately, and `references-of` can compose through `file-of` when both symbol and import-file provenance matter. See [Reference Traversal](./code-query-tutorials/reference-traversal/).
+For example, `(importers-of (file-of (function :name "target")))` answers “which project files directly import the file declaring `target`?” It is deliberately a file relationship: it does not prove that an importer uses that particular declaration, resolve an out-of-scope library's members, or manufacture external declarations. The schema-v2 `references-of`, `used-by`, and `uses` steps provide that exact declaration relationship separately, and `references-of` can compose through `file-of` when both symbol and import-file provenance matter. See [Reference Traversal](/code-query-tutorials/reference-traversal/).
 
 The engine has one semantic query model: `CodeQuery`. Different input formats must lower into that same model before execution.
 
