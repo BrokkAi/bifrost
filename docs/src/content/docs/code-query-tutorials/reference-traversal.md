@@ -260,4 +260,4 @@ The same inbound and outbound pipeline is executable in the test suite for every
 | `csharp` | methods, fields, constructors, types | receiver and overload resolution |
 | `ruby` | methods, fields, constants | dynamic candidates may be `unproven` |
 
-External library declarations appear only when they are genuinely indexed and have a renderable source range. Alias sets, points-to analysis, receiver-value provenance, allocation sites, control flow, and data flow remain outside this query domain.
+External library declarations appear only when they are genuinely indexed and have a renderable source range. Reference traversal itself does not produce alias sets, receiver values, allocation sites, control flow, or data flow. JavaScript/TypeScript reference-site rows may compose into the separate bounded [`member_targets` receiver analysis](../receiver-traversal/#compose-from-a-reference-site); that still does not provide whole-program points-to, general alias analysis, path-sensitive control flow, taint, or general data flow.

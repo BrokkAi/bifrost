@@ -123,9 +123,14 @@ Pipeline wrappers transform the result domain. Inner wrappers execute first:
 (callees (enclosing-decl (method :name "handle")))
 (call-input :receiver true (call-sites-from (enclosing-decl (method :name "handle"))))
 (call-input :parameter-name "payload" (call-sites-to :proof proven (enclosing-decl (method :name "sink"))))
+(receiver-targets (call :callee "run" :receiver "service"))
+(points-to :capture receiver (call :receiver (capture "receiver")))
+(member-targets (references-of :proof proven (enclosing-decl (method :name "run"))))
 ```
 
-The fourth expression performs two direct reverse-import hops. Hierarchy traversal is direct when no option is supplied; `:depth N` returns the one-through-N closure, and `:transitive true` returns the full indexed closure under the execution budget. Call traversal is also direct by default and accepts finite `:depth N`, but not `:transitive`. `call-input` requires exactly one receiver, parameter-index, or parameter-name selector. `members` returns direct declarations and `owner` recovers their exact declaring type. Reference and call proof options may appear before the nested query. `:json` renders every wrapper as an ordered `steps` array.
+The fourth expression performs two direct reverse-import hops. Hierarchy traversal is direct when no option is supplied; `:depth N` returns the one-through-N closure, and `:transitive true` returns the full indexed closure under the execution budget. Call traversal is also direct by default and accepts finite `:depth N`, but not `:transitive`. `call-input` requires exactly one receiver, parameter-index, or parameter-name selector. `members` returns direct declarations and `owner` recovers their exact declaring type. Reference and call proof options may appear before the nested query. Receiver wrappers produce terminal `receiver_analysis` rows; only `file-of` may wrap them. Their optional `:capture name` is legal only over a structural match and must name a declared positive capture. `:json` renders every wrapper as an ordered `steps` array.
+
+JavaScript and TypeScript provide the bounded receiver provider. Other languages preserve an explicit `unsupported` row and capability diagnostic. See [Receiver Traversal](/code-query-tutorials/receiver-traversal/) for allocation, factory, ambiguity, reference-site, and call-input examples with exact output.
 
 Only declarations indexed by the active workspace analyzer can appear. A visible usage of library code does not imply that the library declaration itself is indexed or queryable.
 

@@ -16,7 +16,7 @@ This is a bounded, demand-driven exposure of Bifrost's existing receiver facts. 
 - [x] (2026-07-15 11:46Z) Created this implementation plan and fixed the public names, typed domains, capture semantics, explicit outcome model, provider scope, and validation contract.
 - [x] (2026-07-15 12:34Z) Milestone 1: added the analyzer-owned receiver query service, shared member-site resolution, exact factory provenance, work/truncation reports, cancellation, and focused JS/TS tests.
 - [x] (2026-07-15) Milestone 2: added JSON/RQL steps, the receiver-analysis pipeline/result domain, public consumers, live help, grammar support, and end-to-end tests.
-- [ ] Milestone 3: add the executable cookbook and update every relevant public capability/query document.
+- [x] (2026-07-15) Milestone 3: added the executable receiver cookbook, updated public capability/query/safety documentation, and inspected fresh development and production-base renders.
 - [ ] Milestone 4: review the complete diff, repair findings, and run the full repository validation bundle.
 
 ## Surprises & Discoveries
@@ -50,6 +50,15 @@ This is a bounded, demand-driven exposure of Bifrost's existing receiver facts. 
 
 - Observation: The issue worktree had no VS Code dependencies, while the main checkout only had reusable docs dependencies.
   Evidence: `npm ci` under `editors/vscode` installed 340 locked packages; lint, compilation, grammar tests, and all 54 extension unit tests pass.
+
+- Observation: Reusing the main checkout's docs `node_modules` as a symlink made Vite try to update the main checkout's `.vite` cache outside the worktree sandbox.
+  Evidence: the first docs check failed with `EPERM` while unlinking a main-checkout cache entry. A copy-on-write clone of the existing dependency tree kept the installed packages reusable while giving this worktree a writable cache; check and build then passed.
+
+- Observation: Adding receiver support as an eighth column made the already dense capability matrix visually cramped.
+  Evidence: the fresh browser preview showed narrow wrapped columns. Moving receiver-provider support into a focused two-column table restored the existing matrix layout while keeping every language's supported/unsupported result explicit.
+
+- Observation: The production-base link checker caught an extra slash at the end of the new reference-tutorial fragment.
+  Evidence: the first build reported one broken internal link. Removing the trailing fragment slash yielded 3,993 checked links with no failures, and the production preview preserved `/bifrost` on sidebar, safety, stylesheet, and social-card URLs.
 
 ## Decision Log
 
@@ -85,7 +94,9 @@ This is a bounded, demand-driven exposure of Bifrost's existing receiver facts. 
 
 Milestones 1 and 2 are complete. The analyzer-owned service accepts an exact file/range, operation, and expression-versus-containing-site mode; checks cancellation; uses indexed JS/TS source and tree-sitter nodes; and returns explicit supported or unsupported reports. Provider reports expose actual scope-node and summary-expansion work and candidate truncation. Member-site extraction is shared with get-definition, and factory summaries retain exact recursive provenance.
 
-Schema version 2 now exposes all three typed receiver steps through JSON, RQL, MCP help, live diagnostics/hover, and the TextMate grammar. The executor preserves receiver analysis as a terminal domain, supports `file_of`, charges provider work, retains bounded ambiguity, and renders explicit unknown, unsupported, candidate-cap, and budget outcomes. Rust, Python, LSP, CLI, and VS Code result consumers include the recursive result variant. The 13 receiver baseline, 4 focused service tests, 66 query/schema tests, 61 query-pipeline tests, and all 54 VS Code tests pass. Public documentation remains for Milestone 3.
+Schema version 2 now exposes all three typed receiver steps through JSON, RQL, MCP help, live diagnostics/hover, and the TextMate grammar. The executor preserves receiver analysis as a terminal domain, supports `file_of`, charges provider work, retains bounded ambiguity, and renders explicit unknown, unsupported, candidate-cap, and budget outcomes. Rust, Python, LSP, CLI, and VS Code result consumers include the recursive result variant. The 13 receiver baseline, 4 focused service tests, 66 query/schema tests, 61 query-pipeline tests, and all 54 VS Code tests pass.
+
+Milestone 3 adds an executable six-case TypeScript receiver cookbook covering allocation, recursive factory provenance, exact same-name member selection, ambiguity, reference-site composition, and call-input composition. The docs overview, CodeQuery/RQL references, capability matrix, Python client, rule guide, evaluation/safety guidance, language index, TypeScript page, and former blanket no-points-to claims now distinguish bounded JS/TS receiver evidence from unsupported whole-program/general analyses. All 20 executable tutorial tests and 3 query-doc contract tests pass. Astro reports zero diagnostics; the production build checks 3,993 base-aware links across 50 pages. Fresh browser inspection verified the tutorial, sidebar, revised capability layout, and `/bifrost` deployment links. Final cross-repository gates remain for Milestone 4.
 
 ## Context and Orientation
 
@@ -197,6 +208,8 @@ Revision note (2026-07-15): Created the implementation-ready ExecPlan after reba
 Revision note (2026-07-15): Completed Milestone 1 with a shared analyzer service, real work/truncation reports, exact factory wrapping, cancellation, unsupported-language results, and focused regression coverage.
 
 Revision note (2026-07-15): Completed Milestone 2 with schema-v2 JSON/RQL operations, exact capture validation, a budgeted receiver-analysis terminal domain, all public result unions, editor/MCP metadata, and end-to-end JS/TS outcome/composition coverage. A review repair added explicit expression-versus-containing-site selection so unsupported shapes cannot be mistaken for receiver expressions.
+
+Revision note (2026-07-15): Completed Milestone 3 with six exact executable receiver recipes, capability/query/client/safety documentation, a readable receiver-provider capability table, base-aware link validation, and fresh visual inspection of development and production builds.
 
 ## Interfaces and Dependencies
 

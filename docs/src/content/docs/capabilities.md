@@ -9,7 +9,7 @@ Bifrost supports the same broad analysis categories across its languages, but la
 
 **Structural** means `query_code` can match language-neutral parsed shapes such as declarations, calls, assignments, imports, literals, and containment. **Exact graph** means an indexed declaration identity can be connected to source references, semantic users, and resolved calls without resolving a display name by text. **Proven** means the analyzer established the target from structured language facts. **Unproven** is an explicit best-effort graph candidate used when a dynamic language leaves identity incomplete; it is never silently upgraded to proven.
 
-Named arguments refer to call-site syntax represented by the normalized `kwargs` role. Import-file edges are direct, project-local file relationships used by `imports_of` and `importers_of`; matching an `import` node structurally is a separate, broader capability. Hierarchy means indexed direct `supertypes` and `subtypes`, not compiler-complete effective-member lookup.
+Named arguments refer to call-site syntax represented by the normalized `kwargs` role. Import-file edges are direct, project-local file relationships used by `imports_of` and `importers_of`; matching an `import` node structurally is a separate, broader capability. Hierarchy means indexed direct `supertypes` and `subtypes`, not compiler-complete effective-member lookup. **Bounded receiver provenance** means the `receiver_targets`, `points_to`, and `member_targets` query steps return explicit analysis outcomes and bounded candidates; it is separate from ordinary call/reference receiver resolution.
 
 ## Language Matrix
 
@@ -28,7 +28,14 @@ Named arguments refer to call-site syntax represented by the normalized `kwargs`
 | C# | Yes | Yes | Receiver and overload resolution across methods, constructors, fields, and types | Yes | Yes | Yes |
 | Ruby | Yes | Yes | Resolved methods, fields, and constants; dynamic candidates may be `unproven` | Yes | Yes, for conservative static imports | Yes |
 
-The executable [language tutorials](/code-query-tutorials/) prove structural vocabulary against fixtures. [Reference Traversal](/code-query-tutorials/reference-traversal/#cross-language-support) exercises inbound and outbound graph pipelines across every graph-backed adapter, while [Import Traversal](/code-query-tutorials/import-traversal/#direct-import-forms-by-language) records the direct-edge support and the PHP diagnostic boundary.
+### Bounded Receiver Provenance
+
+| Query languages | `receiver_targets`, `points_to`, and `member_targets` |
+| --- | --- |
+| JavaScript and TypeScript | Bounded values, allocation/factory provenance, and exact member declarations with explicit outcomes. |
+| Python, Java, Go, C/C++, Rust, PHP, Scala, C#, and Ruby | An explicit `unsupported` analysis row plus an aggregated capability diagnostic. |
+
+The executable [language tutorials](/code-query-tutorials/) prove structural vocabulary against fixtures. [Reference Traversal](/code-query-tutorials/reference-traversal/#cross-language-support) exercises inbound and outbound graph pipelines across every graph-backed adapter, [Import Traversal](/code-query-tutorials/import-traversal/#direct-import-forms-by-language) records direct-edge support and the PHP diagnostic boundary, and [Receiver Traversal](/code-query-tutorials/receiver-traversal/) locks the JavaScript/TypeScript provider's exact outcomes and provenance.
 
 ## Precision And Completeness
 
@@ -51,9 +58,9 @@ External package imports can be matched structurally, and source references to l
 Bifrost does not currently provide:
 
 - control-flow graphs or path feasibility;
-- whole-program points-to or allocation-site analysis;
-- general alias-set or receiver-value provenance;
+- whole-program points-to or complete allocation-site analysis (the JavaScript/TypeScript query provider is bounded and demand-driven);
+- general alias sets or receiver provenance outside the bounded JavaScript/TypeScript provider;
 - general interprocedural data-flow or taint tracking; or
 - compiler-complete external dependency indexing.
 
-`call_input` can project the expression written at a resolved call site, but it does not follow assignments into that expression. Structural `inside` and `has` constraints prove syntax-tree containment, not runtime control or data flow. Choose another analysis engine when the required claim depends on one of these unsupported guarantees.
+`call_input` can project the expression written at a resolved call site, and JavaScript/TypeScript `points_to` can analyze that exact expression under a bounded receiver budget. Neither operation is a general value-flow engine. Structural `inside` and `has` constraints prove syntax-tree containment, not runtime control or data flow. Choose another analysis engine when the required claim depends on one of these unsupported guarantees.

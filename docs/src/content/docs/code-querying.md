@@ -3,9 +3,9 @@ title: Code Querying
 description: Understand Bifrost's structural code-querying model and its query representations.
 ---
 
-Bifrost's composable code-query engine is `query_code`. Version 2 searches normalized syntactic structure and can transform matches through enclosing declarations, exact source references and semantic users, resolved call edges and call-site inputs, direct import-file edges, indexed type hierarchies, and declaration ownership. It answers questions such as “find calls to this callee,” “which declarations call this function,” “what enters this sensitive formal parameter,” “which types derive from this type,” and “which declarations are direct members of those types” across supported languages.
+Bifrost's composable code-query engine is `query_code`. Version 2 searches normalized syntactic structure and can transform matches through enclosing declarations, exact source references and semantic users, resolved call edges and call-site inputs, direct import-file edges, indexed type hierarchies, declaration ownership, and bounded JavaScript/TypeScript receiver analysis. It answers questions such as “find calls to this callee,” “which declarations call this function,” “what enters this sensitive formal parameter,” “what may this receiver denote,” “which exact member does it select,” and “which types derive from this type” across supported languages.
 
-The broader name is intentional. Future versions may add more steps backed by future control-flow and data-flow analyses. Version 2 traverses resolved calls but does not resolve arbitrary types or aliases or prove control/data flow. `call_input` projects only the expression written directly at the call site; it does not follow assignments into that expression.
+The broader name is intentional. Future versions may add more steps backed by future control-flow and data-flow analyses. Version 2 does not resolve arbitrary aliases or prove control/data flow. `call_input` projects only the expression written directly at the call site. JavaScript/TypeScript `points_to` may analyze that exact expression through the bounded receiver provider, but it does not become whole-program points-to or general value flow.
 
 ## Choose The Right Tool
 
@@ -30,7 +30,7 @@ See [Rune IR](/rune-ir/) for the representation, `.rune` files and VS Code previ
 
 ## Version 2 Typed Pipelines
 
-`query_code` validates the structural seed query, chooses candidate files and facts, and then applies an ordered typed pipeline. Queries without steps return tagged structural matches. `enclosing_decl` returns exact indexed declarations; `references_of`, `used_by`, and `uses` traverse exact structured references; `callers`, `callees`, and the call-site steps traverse only AST-confirmed calls; `file_of`, `imports_of`, and `importers_of` navigate project files; `supertypes` and `subtypes` traverse indexed hierarchy edges; and `members` / `owner` navigate exact declaration ownership. Derived results retain seed-and-edge provenance.
+`query_code` validates the structural seed query, chooses candidate files and facts, and then applies an ordered typed pipeline. Queries without steps return tagged structural matches. `enclosing_decl` returns exact indexed declarations; `references_of`, `used_by`, and `uses` traverse exact structured references; `callers`, `callees`, and the call-site steps traverse only AST-confirmed calls; `receiver_targets`, `points_to`, and `member_targets` produce terminal receiver-analysis rows; `file_of`, `imports_of`, and `importers_of` navigate project files; `supertypes` and `subtypes` traverse indexed hierarchy edges; and `members` / `owner` navigate exact declaration ownership. Derived results retain seed-and-edge provenance.
 
 Semantic declaration steps intentionally stop at the analyzer's indexed declaration boundary. Seeing a reference or usage into a dependency is not evidence that the dependency declaration is indexed. Until Bifrost can target library code for indexing, unindexed library declarations are omitted rather than reconstructed from names, and their absence is not reported as a capability error.
 
@@ -45,11 +45,14 @@ Semantic declaration steps intentionally stop at the analyzer's indexed declarat
 | `call-sites-to` | `call_sites_to` | declaration → call site | Return incoming call sites with caller, callee, proof, receiver, and bound arguments. |
 | `call-sites-from` | `call_sites_from` | declaration → call site | Return call sites lexically owned by the declaration. |
 | `call-input` | `call_input` | call site → expression site | Select `receiver: true`, a zero-based `parameter_index`, or `parameter_name`. |
-| `file-of` | `file_of` | structural match or semantic source value → file | Move from code, a declaration, reference, call, or input expression to its project file. |
+| `receiver-targets` | `receiver_targets` | structural match, reference site, call site, or expression site → receiver analysis | Analyze the receiver extracted from a call/member site or an exact receiver expression. |
+| `points-to` | `points_to` | structural match, reference site, or expression site → receiver analysis | Return bounded value/allocation/factory provenance for an expression. |
+| `member-targets` | `member_targets` | structural match or reference site → receiver analysis | Return exact member declarations selected through the receiver candidates. |
+| `file-of` | `file_of` | structural match or semantic source value → file | Move from code, a declaration, reference, call, input expression, or receiver analysis to its project file. |
 | `imports-of` | `imports_of` | file → file | Follow one resolved direct project-local import. |
 | `importers-of` | `importers_of` | file → file | Find every project file with a resolved direct import of that file. |
 
-For example, `(importers-of (file-of (function :name "target")))` answers “which project files directly import the file declaring `target`?” It is deliberately a file relationship: it does not prove that an importer uses that particular declaration, resolve an out-of-scope library's members, or manufacture external declarations. The schema-v2 `references-of`, `used-by`, and `uses` steps provide that exact declaration relationship separately, and `references-of` can compose through `file-of` when both symbol and import-file provenance matter. See [Reference Traversal](/code-query-tutorials/reference-traversal/).
+For example, `(importers-of (file-of (function :name "target")))` answers “which project files directly import the file declaring `target`?” It is deliberately a file relationship: it does not prove that an importer uses that particular declaration, resolve an out-of-scope library's members, or manufacture external declarations. The schema-v2 `references-of`, `used-by`, and `uses` steps provide that exact declaration relationship separately, and `references-of` can compose through `file-of` when both symbol and import-file provenance matter. See [Reference Traversal](/code-query-tutorials/reference-traversal/). For bounded JavaScript/TypeScript values and members, see the executable [Receiver Traversal](/code-query-tutorials/receiver-traversal/) cookbook.
 
 The engine has one semantic query model: `CodeQuery`. Different input formats must lower into that same model before execution.
 

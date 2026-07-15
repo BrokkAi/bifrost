@@ -5,7 +5,7 @@ description: Learn query_code through executable, per-language structural matchi
 
 These tutorials start from recognizable source code and show the same query in [Rune Query Language](/rune-query-language/) and canonical [JSON `CodeQuery`](/code-query-json/). Their fixtures, queries, and complete expected results are executed by Bifrost's integration tests.
 
-Each page builds from a broad structural query to narrower filters and exclusions. [Import Traversal](./import-traversal/) covers direct project-file edges, while [Reference Traversal](./reference-traversal/) follows exact indexed declarations to source sites and semantic users. Every language cookbook also executes `supertypes`, `subtypes`, `members`, and `owner`, with bounded and transitive hierarchy examples distributed across the suite. The examples do not claim points-to, control-flow, or data-flow reasoning.
+Each page builds from a broad structural query to narrower filters and exclusions. [Import Traversal](./import-traversal/) covers direct project-file edges, [Reference Traversal](./reference-traversal/) follows exact indexed declarations to source sites and semantic users, and [Receiver Traversal](./receiver-traversal/) exercises bounded JavaScript/TypeScript values and exact members. Every language cookbook also executes `supertypes`, `subtypes`, `members`, and `owner`, with bounded and transitive hierarchy examples distributed across the suite. The receiver cookbook does not claim whole-program points-to, general alias, control-flow, taint, or data-flow reasoning.
 
 Hierarchy recipes return only declarations indexed by the fixture's analyzer. Real projects may expose usages of library types whose declarations are not indexed; those library declarations remain outside the query result until library indexing can be targeted explicitly.
 
@@ -15,6 +15,7 @@ All language pages below are marked with the date of their last successful end-t
 
 - [Import Traversal Across Languages](./import-traversal/)
 - [Reference Traversal Across Languages](./reference-traversal/)
+- [Bounded JavaScript/TypeScript Receiver Traversal](./receiver-traversal/)
 - [Python](./python/)
 - [Java](./java/)
 - [JavaScript](./javascript/)

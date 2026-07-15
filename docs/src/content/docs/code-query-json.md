@@ -5,7 +5,7 @@ description: Use the canonical JSON representation for Bifrost's query_code engi
 
 JSON `CodeQuery` is the canonical machine-facing representation accepted by Bifrost's `query_code` tool. MCP hosts and the Python client send this shape directly. The RQL REPL prints the same representation with `:json`.
 
-Version 2 starts with normalized syntactic structure and can apply typed semantic steps for enclosing declarations, resolved call edges and direct call-site inputs, direct project import edges, indexed type hierarchies, and declaration ownership. It does not infer override families, resolve arbitrary aliases, or perform control-flow or data-flow analysis.
+Version 2 starts with normalized syntactic structure and can apply typed semantic steps for enclosing declarations, resolved call edges and direct call-site inputs, direct project import edges, indexed type hierarchies, declaration ownership, and bounded JavaScript/TypeScript receiver provenance. It does not infer override families, resolve general aliases, or perform control-flow, taint, or general data-flow analysis.
 
 ## Minimal Query
 
@@ -132,7 +132,7 @@ Each `args` pattern must match a distinct positional argument in source order, b
 
 The same capture label may appear more than once in a query. Every occurrence must bind exactly the same source text, allowing equality constraints such as “both arguments use the same expression.”
 
-The response contains a `results` array. Every item has a `result_type`: `structural_match`, `declaration`, `reference_site`, `call_site`, `expression_site`, or `file`. A query without steps returns structural matches with path, language, kind, line range, a bounded text snippet, captures, and a best-effort `enclosing_symbol`.
+The response contains a `results` array. Every item has a `result_type`: `structural_match`, `declaration`, `reference_site`, `call_site`, `expression_site`, `receiver_analysis`, or `file`. A query without steps returns structural matches with path, language, kind, line range, a bounded text snippet, captures, and a best-effort `enclosing_symbol`.
 
 With `result_detail: "full"`, results additionally include:
 
@@ -142,7 +142,7 @@ With `result_detail: "full"`, results additionally include:
 - `decorator_ranges` for matched declarations
 - `decorated_range`, the union of the declaration and its decorators
 
-Derived declaration, reference-site, and file results include `provenance`. Each provenance path records the original structural seed and every ordered step result. Declaration-returning reference steps additionally record the exact proving reference site under `via`. Compact mode keeps minimal identities; full mode adds stable IDs and precise ranges. At most sixteen paths are retained per terminal result, with `provenance_truncated: true` when more paths converge.
+Every derived result includes `provenance`. Each provenance path records the original structural seed and every ordered step result. Declaration-returning reference steps additionally record the exact proving reference site under `via`. Compact mode keeps minimal identities; full mode adds stable IDs and precise ranges. At most sixteen paths are retained per terminal result, with `provenance_truncated: true` when more paths converge.
 
 For completeness claims, result metadata is mandatory: inspect diagnostics, require `truncated: false`, distinguish `proven` from `unproven` graph edges, and check every derived result's `provenance_truncated` field. [Agent Result Safety](/agent-result-safety/) turns those fields into an explicit decision rule.
 
@@ -161,7 +161,10 @@ Steps execute in array order and are validated before the workspace is searched:
 | `call_sites_to` | declaration | call site | Structured incoming sites; accepts optional `proof`. |
 | `call_sites_from` | declaration | call site | Structured outgoing sites; accepts optional `proof`. |
 | `call_input` | call site | expression site | Direct receiver or formal-parameter input selected by exactly one selector. |
-| `file_of` | structural match, declaration, reference site, call site, or expression site | file | Exact project file containing the value. |
+| `receiver_targets` | structural match, reference site, call site, or expression site | receiver analysis | Receiver values extracted from a call/member site or supplied as an exact expression. |
+| `points_to` | structural match, reference site, or expression site | receiver analysis | Bounded value, allocation, type, module, current-receiver, and factory provenance. |
+| `member_targets` | structural match or reference site | receiver analysis | Exact indexed declarations selected by a receiver-qualified member access. |
+| `file_of` | structural match, declaration, reference site, call site, expression site, or receiver analysis | file | Exact project file containing the analyzed input value. |
 | `imports_of` | file | file | Direct project-local files imported by the input file. |
 | `importers_of` | file | file | Direct project-local files importing the input file. |
 | `supertypes` | declaration | declaration | Direct ancestors by default, or a bounded/full indexed ancestor closure. |
@@ -198,6 +201,12 @@ Reference steps accept optional `reference_kinds`, `proof`, and `surface` fields
 Call traversal is direct by default. `callers` and `callees` accept a positive finite `depth`; there is deliberately no unbounded `transitive` form. Traversal is iterative and cycle-safe. A real recursive or cyclic edge is returned, but Bifrost stops expanding when the next declaration is already present on that provenance path. The same declaration may still be expanded through a different path, preserving alternate provenance within the execution budget. Every declaration reached by a call step records the proving `call_site` under provenance `via`.
 
 `call_sites_to` and `call_sites_from` expose the full call range, callee range, caller and callee declarations, call kind, proof tier, optional explicit receiver, and arguments. `call_input` requires exactly one of `{"receiver":true}`, `{"parameter_index":0}`, or `{"parameter_name":"payload"}`. Parameter indexes are zero-based formal slots and exclude receiver-bound parameters; keyword/named arguments bind by the callee's declared parameter name. A variadic slot may yield several expression rows. Spreads/splats are retained on the call-site result but are not guessed into a formal slot. An implicit receiver has no synthetic expression row.
+
+The three receiver steps return a tagged `receiver_analysis` row for every input, including unknown and unsupported cases. Each row includes `analysis_kind`, input path/language/range/text/kind, and `outcome`. `receiver_targets` and `points_to` use recursive `values`; `member_targets` uses exact `CodeQueryDeclaration` values under `member_targets`. Allocation values include their exact type declaration and allocation site. Factory returns include the exact factory declaration plus a nested returned value. Unsupported shapes/providers add `reason`; budget exits add `limit`.
+
+Stable outcomes are `precise`, `ambiguous`, `unknown`, `unsupported`, and `exceeded_budget`. Ordinary bounded ambiguity retains every candidate and does not set top-level `truncated`. Candidate-cap truncation and `exceeded_budget` do set `truncated` and emit an aggregated limit diagnostic. Languages other than JavaScript and TypeScript return explicit `unsupported` rows plus capability diagnostics rather than empty results. Receiver-analysis rows are terminal except for `file_of`.
+
+An optional `capture` is valid only when the preceding domain is a structural match. It must be between 1 and 128 bytes and name a positive capture declared by the structural query; every unique bound range is analyzed. Without a capture, `points_to` analyzes the match or the normalized `right` side of assignment/binding shapes, `receiver_targets` extracts the call `receiver` or field-access `object`, and `member_targets` extracts the receiver plus terminal member. See [Receiver Traversal](/code-query-tutorials/receiver-traversal/) for exact JSON/RQL/output triples.
 
 These steps use tree-sitter call shapes and the existing definition/usage resolvers for Java, Go, C/C++, JavaScript, TypeScript, Python, Rust, PHP, Scala, C#, and Ruby. Resolution precision still varies with each language analyzer: unresolved calls are omitted, ambiguous edges are `unproven`, and formal input projection appears only when Bifrost can pair the resolved callee with structured parameter syntax. This is direct call-site projection, not local or interprocedural data flow.
 
