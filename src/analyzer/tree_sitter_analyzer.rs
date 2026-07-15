@@ -5223,6 +5223,7 @@ mod tests {
         let root = temp.path().canonicalize().expect("canonical temp dir");
         let first = temp_file(&root, "src/First.java");
         first.write("first\n").expect("first source");
+        let expected_first_error = format!("{} overlay OID failure", first.rel_path().display());
         let second = temp_file(&root, "src/Second.java");
         second.write("second\n").expect("second source");
 
@@ -5252,7 +5253,7 @@ mod tests {
             !timed_out.load(Ordering::SeqCst),
             "the error-order test should exercise concurrent planning"
         );
-        assert_eq!(error, "src/First.java overlay OID failure");
+        assert_eq!(error, expected_first_error);
     }
 
     #[test]
