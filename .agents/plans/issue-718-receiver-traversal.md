@@ -19,7 +19,8 @@ This is a bounded, demand-driven exposure of Bifrost's existing receiver facts. 
 - [x] (2026-07-15) Milestone 3: added the executable receiver cookbook, updated public capability/query/safety documentation, and inspected fresh development and production-base renders.
 - [x] (2026-07-15) Milestone 4: reviewed the complete diff, repaired exported and static factory receiver regressions, and ran the full repository validation bundle.
 - [x] (2026-07-15) Post-milestone guided review: queued and repaired all seven confirmed findings covering prepared-context reuse, terminal-limit short-circuiting, nonhalting receiver truncation, complete text rendering, schema-owned capture bounds, exact factory association, `file_of` metadata, and shared member-site extraction.
-- [ ] (2026-07-15) Re-run the complete publish gate, push the reviewed branch, and open the user-authorized ready-for-review pull request.
+- [x] (2026-07-15) Re-ran the complete publish gate: formatting/diff checks, isolated all-feature clippy, isolated `nlp,python` tests, Python, VS Code, and docs check/build all pass.
+- [ ] (2026-07-15) Push the reviewed branch and open the user-authorized ready-for-review pull request.
 
 ## Surprises & Discoveries
 
@@ -128,7 +129,9 @@ Milestone 3 adds an executable six-case TypeScript receiver cookbook covering al
 
 Milestone 4 repaired two integration defects found only by the complete suite: exported factory declarations now match their exact analyzer units across wrapper-range differences, and static factory summaries select `$static` member identities while returned instances continue to select ordinary members. All 17 JS/TS usage-graph tests, the 13 receiver tests, 61 query-pipeline tests, clippy with every target/feature, Python's 41 tests, VS Code's 54 tests, docs checks/build, formatting, and diff checks pass. The all-feature Rust run passed 842 library tests (3 ignored) and every integration-test binary; its first final doctest phase was invalidated solely by the host's mixed Homebrew/rustup artifact identities, so the gate was repeated with a pinned toolchain in the repository's self-cleaning isolated target.
 
-The guided-review repair keeps the public contract intact while closing seven implementation and consumer gaps. Receiver steps now reuse prepared per-file syntax/import contexts and bounded definition lookup, charge setup work, and stop preparing rows once the terminal output cap is satisfied. Candidate caps and provider budget exits remain explicit, diagnostic, top-level truncation states but no longer discard later rows or prevent `file_of`. Rust, REPL, Python, and VS Code presentations expose recursive values plus member, reason, and limit details. Capture bounds and `file_of` help come from the declarative schema. Factory-to-`CodeUnit` association and member-site extraction now each have one structured implementation path. Focused validation passes 31 receiver-related unit tests, 23 query-source tests, all 61 query-pipeline tests, Python's 41 tests, and all 54 VS Code tests; the complete publish gate remains the final step before the authorized pull request.
+The guided-review repair keeps the public contract intact while closing seven implementation and consumer gaps. Receiver steps now reuse prepared per-file syntax/import contexts and bounded definition lookup, charge setup work, and stop preparing rows once the terminal output cap is satisfied. Candidate caps and provider budget exits remain explicit, diagnostic, top-level truncation states but no longer discard later rows or prevent `file_of`. Rust, REPL, Python, and VS Code presentations expose recursive values plus member, reason, and limit details. Capture bounds and `file_of` help come from the declarative schema. Factory-to-`CodeUnit` association and member-site extraction now each have one structured implementation path. Focused validation passes 31 receiver-related unit tests, 23 query-source tests, all 61 query-pipeline tests, Python's 41 tests, and all 54 VS Code tests.
+
+The final publish gate passes with the rustup 1.96.0 toolchain pinned, macOS Python dynamic lookup enabled, and the system PATH retaining `/usr/sbin` for the temporary-storage safety tests. Isolated all-target/all-feature clippy is warning-free. The isolated `BIFROST_SEMANTIC_INDEX=off cargo test --features nlp,python` run passes 855 library tests with 4 ignored, every binary and integration suite, and doctests. Python passes 41 tests; VS Code passes 54; Astro reports no diagnostics and builds 50 pages with all 3,993 internal links valid. Formatting and `git diff --check` are clean.
 
 ## Context and Orientation
 
@@ -246,6 +249,8 @@ Revision note (2026-07-15): Completed Milestone 3 with six exact executable rece
 Revision note (2026-07-15): Completed Milestone 4 by repairing exported-range and static-member factory regressions found by the full suite, then validating with a pinned Rust toolchain and the repository-managed isolated-target workflow.
 
 Revision note (2026-07-15): Applied every confirmed guided-review finding: reusable and metered receiver setup, terminal-limit short-circuiting, nonhalting receiver truncation, complete recursive renderers, schema-driven capture validation and `file_of` metadata, exact factory association, and one shared member-site walk. Focused Rust, Python, and VS Code regressions pass; final publish validation is pending.
+
+Revision note (2026-07-15): Completed the publish gate. The first sandboxed full run proved all receiver/query paths but could not exercise subprocess and git-history tests; the unrestricted isolated rerun initially omitted `/usr/sbin` and therefore could not locate `lsof`. The corrected pinned PATH produced a completely green all-feature run and self-cleaned its target.
 
 ## Interfaces and Dependencies
 
