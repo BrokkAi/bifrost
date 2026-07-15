@@ -371,18 +371,20 @@ mod tests {
         );
         drop(disk_reopened);
 
-        let snapshot_rows = Connection::open(root.join(".brokk/bifrost_cache.db"))
+        let disk_oid = git2::Oid::hash_object(git2::ObjectType::Blob, disk_source.as_bytes())
+            .expect("hash committed source");
+        let committed_snapshot_rows = Connection::open(root.join(".brokk/bifrost_cache.db"))
             .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM structural_facts_snapshots
-                 WHERE lang = 'typescript:ts'",
-                [],
+                 WHERE blob_oid = ?1 AND lang = 'typescript:ts'",
+                [disk_oid.to_string()],
                 |row| row.get::<_, usize>(0),
             )
             .unwrap();
         assert_eq!(
-            snapshot_rows, 2,
-            "disk and overlay source OIDs must retain distinct cache rows"
+            committed_snapshot_rows, 1,
+            "overlay analysis must not replace the committed source snapshot"
         );
     }
 }

@@ -24,7 +24,7 @@ A successful implementation can be demonstrated by running an ignored release be
 - [x] (2026-07-15T18:27:31Z) Added and exercised focused coverage for warm reopen, content changes, TypeScript/TSX storage keys, generation changes, corruption repair, in-memory bypass, overlay isolation, snapshot cascade, replacement accounting, and legacy cost repair.
 - [x] (2026-07-15T18:27:31Z) Ran alternating optimized baseline/candidate measurements at 200 x 50 and 400 x 100, repeated the larger pair in reverse order, and isolated hot CSR reads with a direct role scan.
 - [x] (2026-07-15T18:27:31Z) Assessed import, hierarchy, and usage graph lifecycles and recorded the promote/keep-hot/discard matrix in `.agents/docs/sqlite-backed-compact-graph-applicability.md`.
-- [ ] Run formatting, focused suites, all-target/all-feature Clippy, and the full `nlp,python` test gate; perform a final diff and design audit.
+- [x] (2026-07-15T18:58:59Z) Ran formatting, focused structural/persistence/query suites, all-target/all-feature Clippy, and the full `nlp,python` test gate; performed the final diff and design audit.
 
 ## Surprises & Discoveries
 
@@ -63,6 +63,12 @@ A successful implementation can be demonstrated by running an ignored release be
 
 - Observation: a separate 2 MiB non-mmap SQLite snapshot reader lowered the benchmark's cumulative cold-plus-warm peak by roughly 15 MiB, but made cold and hydration materialization 5-10% slower and did not improve the hot query. The experiment was reverted.
   Evidence: isolated-reader candidate runs at 400 files x 100 calls compared with the shared-connection candidate.
+
+- Observation: an overlay snapshot is correctly content-addressed while the request clone is live, but it is rebuildable cache state and may be reclaimed when the committed workspace is reopened. The durable overlay-safety invariant is that the committed source OID still owns a valid snapshot and reopens with zero extraction, not that an ephemeral overlay row remains forever.
+  Evidence: the full-suite concurrency exposed the overly strict total-row assertion in `request_overlay_snapshot_cannot_replace_committed_structural_facts`; the corrected test verifies the committed blob OID directly and passed twenty repetitions plus the full gate.
+
+- Observation: the local `cargo` and `rustc` resolved through rustup while `cargo-clippy` initially resolved to Homebrew, producing incompatible compiler metadata. Pinning the rustup toolchain directory first in `PATH` made the all-feature Clippy gate reproducible. PyO3 integration linking also requires the same `dynamic_lookup` linker flags used by CI on macOS.
+  Evidence: the successful final commands used the rustup 1.96.0 toolchain path and `.github/workflows/ci.yml`'s macOS `RUSTFLAGS`.
 
 ## Decision Log
 
@@ -106,7 +112,7 @@ Hot CSR reads are at parity: the 400-file direct role scan was 0.822 ms freshly 
 
 The reusable conclusion is narrower than a universal persisted graph. Structural facts meet the stable content identity, expensive reconstruction, immutable snapshot, and repeated-row-read criteria. Import and hierarchy relations should keep their already-promoted compact hot layouts but rebuild from raw SQLite facts; usage persistence should target a future measured stable resolver intermediate, not the final calibrated graph. The detailed matrix is in `.agents/docs/sqlite-backed-compact-graph-applicability.md`.
 
-The implementation remains rebuildable cache state with public APIs unchanged. A corrupt, missing, stale, or unsupported snapshot falls back to correct extraction and best-effort repair. The remaining acceptance work is the full repository validation and final diff audit.
+The implementation remains rebuildable cache state with public APIs unchanged. A corrupt, missing, stale, or unsupported snapshot falls back to correct extraction and best-effort repair. Formatting and all focused suites passed. All-target/all-feature Clippy passed with warnings denied, and the complete `cargo test --features nlp,python --jobs 1` gate passed unsandboxed with the CI macOS PyO3 linker flags; the run included 875 passing library tests, four ignored library tests, every integration target, and doctests, with zero failures. The final audit found no retained alternate-reader experiment or unrelated source changes.
 
 ## Context and Orientation
 
