@@ -96,8 +96,8 @@ fn push_hit_with_options(
 
 pub(super) fn enclosing_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> EnclosingContext {
     let key = (node.start_byte(), node.end_byte());
-    if let Some(cached) = ctx.enclosing_cache.get(&key) {
-        return cached.clone();
+    if let Some(cached) = ctx.enclosing_cache.borrow().get(&key).cloned() {
+        return cached;
     }
     let range = Range {
         start_byte: node.start_byte(),
@@ -106,15 +106,23 @@ pub(super) fn enclosing_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> EnclosingC
         end_line: find_line_index_for_offset(ctx.line_starts, node.end_byte()),
     };
     let enclosing = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
-    let owner = enclosing
-        .as_ref()
-        .and_then(|enclosing| precise_parent_of(ctx.analyzer, enclosing))
-        .or_else(|| {
-            enclosing
-                .as_ref()
-                .and_then(|enclosing| visible_owner_from_member_name(ctx, enclosing))
-        });
-    EnclosingContext { enclosing, owner }
+    let owner = enclosing.as_ref().and_then(|enclosing| {
+        let cached = ctx.enclosing_owner_cache.borrow().get(enclosing).cloned();
+        if let Some(cached) = cached {
+            return cached;
+        }
+        let resolved = precise_parent_of(ctx.analyzer, enclosing)
+            .or_else(|| visible_owner_from_member_name(ctx, enclosing));
+        ctx.enclosing_owner_cache
+            .borrow_mut()
+            .insert(enclosing.clone(), resolved.clone());
+        resolved
+    });
+    let context = EnclosingContext { enclosing, owner };
+    ctx.enclosing_cache
+        .borrow_mut()
+        .insert(key, context.clone());
+    context
 }
 
 fn is_inside_target_declaration(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {

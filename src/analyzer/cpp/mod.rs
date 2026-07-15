@@ -138,6 +138,21 @@ impl CppAnalyzer {
 }
 
 impl CppAnalyzer {
+    #[doc(hidden)]
+    pub fn reset_enclosing_parent_query_counts_for_test(&self) {
+        self.inner.reset_enclosing_parent_query_counts_for_test();
+    }
+
+    #[doc(hidden)]
+    pub fn enclosing_code_unit_query_count_for_test(&self) -> usize {
+        self.inner.enclosing_code_unit_query_count_for_test()
+    }
+
+    #[doc(hidden)]
+    pub fn sql_definitions_query_count_for_test(&self) -> usize {
+        self.inner.sql_definitions_query_count_for_test()
+    }
+
     pub fn extract_type_identifiers(&self, source: &str) -> BTreeSet<String> {
         static IDENT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
         let regex =

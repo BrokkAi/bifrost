@@ -963,6 +963,8 @@ pub struct TreeSitterAnalyzer<A> {
     usage_facts_fallback: Arc<UsageFactsIndex>,
     full_hydration_count: Arc<AtomicUsize>,
     bulk_hydration_count: Arc<AtomicUsize>,
+    sql_definitions_query_count: Arc<AtomicUsize>,
+    enclosing_code_unit_query_count: Arc<AtomicUsize>,
     full_declaration_scan_count: Arc<AtomicUsize>,
     global_usage_definition_index_build_count: Arc<AtomicUsize>,
     workspace_path_scan_count: Arc<AtomicUsize>,
@@ -990,6 +992,8 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             usage_facts_fallback: Arc::clone(&self.usage_facts_fallback),
             full_hydration_count: Arc::clone(&self.full_hydration_count),
             bulk_hydration_count: Arc::clone(&self.bulk_hydration_count),
+            sql_definitions_query_count: Arc::clone(&self.sql_definitions_query_count),
+            enclosing_code_unit_query_count: Arc::clone(&self.enclosing_code_unit_query_count),
             full_declaration_scan_count: Arc::clone(&self.full_declaration_scan_count),
             global_usage_definition_index_build_count: Arc::clone(
                 &self.global_usage_definition_index_build_count,
@@ -1149,6 +1153,8 @@ where
             usage_facts_fallback: Arc::new(UsageFactsIndex::default()),
             full_hydration_count: Arc::new(AtomicUsize::new(0)),
             bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
+            sql_definitions_query_count: Arc::new(AtomicUsize::new(0)),
+            enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
             workspace_path_scan_count: Arc::new(AtomicUsize::new(0)),
@@ -1214,6 +1220,8 @@ where
             usage_facts_fallback: Arc::new(UsageFactsIndex::default()),
             full_hydration_count: Arc::new(AtomicUsize::new(0)),
             bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
+            sql_definitions_query_count: Arc::new(AtomicUsize::new(0)),
+            enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
             workspace_path_scan_count: Arc::new(AtomicUsize::new(0)),
@@ -3127,6 +3135,23 @@ where
     }
 
     #[doc(hidden)]
+    pub fn reset_enclosing_parent_query_counts_for_test(&self) {
+        self.enclosing_code_unit_query_count
+            .store(0, Ordering::Relaxed);
+        self.sql_definitions_query_count.store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn enclosing_code_unit_query_count_for_test(&self) -> usize {
+        self.enclosing_code_unit_query_count.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn sql_definitions_query_count_for_test(&self) -> usize {
+        self.sql_definitions_query_count.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
     pub fn reset_full_declaration_scan_count_for_test(&self) {
         self.full_declaration_scan_count.store(0, Ordering::Relaxed);
     }
@@ -3376,6 +3401,8 @@ where
     }
 
     fn sql_definitions_vec(&self, fq_name: &str) -> Option<Vec<CodeUnit>> {
+        self.sql_definitions_query_count
+            .fetch_add(1, Ordering::Relaxed);
         self.sql_definition_candidates_vec(fq_name, false)
     }
 
@@ -4524,6 +4551,8 @@ where
     }
 
     fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
+        self.enclosing_code_unit_query_count
+            .fetch_add(1, Ordering::Relaxed);
         if range.start_byte >= range.end_byte {
             return None;
         }

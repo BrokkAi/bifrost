@@ -311,6 +311,110 @@ struct Foo {
     );
 }
 
+#[test]
+fn cpp_scan_reuses_enclosing_owner_resolution_within_each_file_batch() {
+    const EXPECTED_HITS: usize = 4;
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "target.h",
+            r#"namespace demo { struct Target {}; }
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"#include "target.h"
+namespace demo {
+struct Consumer {
+    void run() {
+        Target first;
+        Target second;
+        Target third;
+        Target fourth;
+    }
+};
+}
+"#,
+        ),
+    ]);
+    let target = class_definition(&analyzer, "Target");
+    let consumer = project.file("consumer.cpp");
+    let candidates = std::iter::once(consumer).collect();
+    let strategy = CppUsageGraphStrategy::new();
+
+    analyzer.reset_enclosing_parent_query_counts_for_test();
+    let first_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("first C++ graph batch");
+    let first_enclosing_queries = analyzer.enclosing_code_unit_query_count_for_test();
+    let first_parent_queries = analyzer.sql_definitions_query_count_for_test();
+
+    analyzer.reset_enclosing_parent_query_counts_for_test();
+    let second_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("second C++ graph batch");
+    let second_enclosing_queries = analyzer.enclosing_code_unit_query_count_for_test();
+    let second_parent_queries = analyzer.sql_definitions_query_count_for_test();
+
+    for hits in [&first_hits, &second_hits] {
+        assert_eq!(hits.len(), EXPECTED_HITS, "type-reference hits: {hits:#?}");
+        assert!(
+            hits.iter()
+                .all(|hit| hit.enclosing.fq_name() == "demo.Consumer.run"),
+            "every hit should retain the same structured enclosing declaration: {hits:#?}"
+        );
+    }
+    assert_eq!(
+        (first_enclosing_queries, second_enclosing_queries),
+        (EXPECTED_HITS, EXPECTED_HITS),
+        "distinct hit nodes still require enclosing-code-unit lookup in each fresh scan batch"
+    );
+    assert_eq!(
+        (first_parent_queries, second_parent_queries),
+        (1, 1),
+        "the enclosing declaration's owner should be resolved once per file scan, with no cache shared across batches"
+    );
+}
+
+#[test]
+fn cpp_scan_caches_missing_enclosing_owner_within_the_file_batch() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        ("target.h", "struct Target {};\n"),
+        (
+            "consumer.cpp",
+            r#"#include "target.h"
+void Missing::run() {
+    Target first;
+    Target second;
+    Target third;
+}
+"#,
+        ),
+    ]);
+    let target = class_definition(&analyzer, "Target");
+    let candidates = std::iter::once(project.file("consumer.cpp")).collect();
+
+    analyzer.reset_enclosing_parent_query_counts_for_test();
+    let hits = CppUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("C++ graph batch with unresolved enclosing owner");
+
+    assert_eq!(hits.len(), 3, "type-reference hits: {hits:#?}");
+    assert!(
+        hits.iter()
+            .all(|hit| hit.enclosing.fq_name() == "Missing.run"),
+        "the malformed out-of-line method still supplies one structured enclosing unit: {hits:#?}"
+    );
+    assert_eq!(analyzer.enclosing_code_unit_query_count_for_test(), 3);
+    assert_eq!(
+        analyzer.sql_definitions_query_count_for_test(),
+        1,
+        "a cached missing owner must not repeat the same SQL definition miss"
+    );
+}
+
 fn signature_arity(signature: Option<&str>) -> usize {
     let Some(signature) = signature else {
         return 0;

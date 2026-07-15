@@ -13,6 +13,7 @@ use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, cpp_node_text as node_text};
 use crate::hash::HashMap;
 use crate::text_utils::compute_line_starts;
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};
 
@@ -38,7 +39,8 @@ pub(super) struct ScanCtx<'a> {
     pub(super) raw_match_count: &'a mut usize,
     pub(super) max_usages: usize,
     pub(super) limit_exceeded: &'a mut bool,
-    pub(super) enclosing_cache: HashMap<(usize, usize), EnclosingContext>,
+    pub(super) enclosing_cache: RefCell<HashMap<(usize, usize), EnclosingContext>>,
+    pub(super) enclosing_owner_cache: RefCell<HashMap<CodeUnit, Option<CodeUnit>>>,
 }
 
 #[derive(Clone, Default)]
@@ -88,7 +90,8 @@ pub(super) fn scan_file(
         raw_match_count: state.raw_match_count,
         max_usages: state.max_usages,
         limit_exceeded: state.limit_exceeded,
-        enclosing_cache: HashMap::default(),
+        enclosing_cache: RefCell::new(HashMap::default()),
+        enclosing_owner_cache: RefCell::new(HashMap::default()),
     };
     scan_node(tree.root_node(), &mut ctx);
 }
