@@ -25,7 +25,7 @@ The work happens on branch `748-explore-compact-csrcsc-graph-representations-for
 - [x] (2026-07-15T15:29:00Z) Added and captured a generated exact-identity hierarchy/ownership baseline covering reverse-index construction, direct and transitive reads, RQL subtypes, members-owner round trips, and standalone owner lookup.
 - [x] (2026-07-15T15:40:44Z) Replaced the common rich reverse hierarchy map and redundant per-key memo sets with exact-identity keyed CSR rows, measured alternating optimized A/B binaries, promoted hierarchy CSR, and rejected a workspace CSC for query-local singular ownership.
 - [x] (2026-07-15T15:46:38Z) Added and captured a generated Go weighted usage-relevance baseline for the dense `WorkspaceUsageGraph`, including first and warm graph construction plus PageRank and phase RSS.
-- [ ] Adapt the dense-ID `WorkspaceUsageGraph` introduced by #781 to contiguous weighted outgoing storage without reintroducing rich-key construction, then measure graph construction, PageRank, rendering adapters, and memory.
+- [x] (2026-07-15T15:56:34Z) Adapted the dense-ID `WorkspaceUsageGraph` to outgoing compact weighted rows, removed PageRank's per-row adapter, measured preserved release binaries at 500 and 2,000 modules, and discarded the candidate because its sub-megabyte theoretical saving produced no repeatable end-to-end memory or read benefit.
 - [ ] Run the checked-in performance regression suite on representative pinned repositories, complete final review and CI-equivalent validation, publish the conclusion to #748, and summarize which structures should remain map-based.
 
 ## Surprises & Discoveries
@@ -90,6 +90,9 @@ The work happens on branch `748-explore-compact-csrcsc-graph-representations-for
 - Observation: the new generated usage-relevance fixture reproduces the existing Go memory workload at a smaller configurable scale and makes the ranking representation measurable. At 500 modules it implies at least 3,500 catalog nodes and exactly 3,000 aggregated call edges; first ranking takes 1,229.977 ms, warm ranking 814.111 ms, and peak RSS grows from 35,520,512 bytes after analyzer construction to 81,985,536 after the first rank and 83,591,168 after warm reranking.
   Evidence: `tests/measure_usage_relevance_graph.rs` uses one helper target and six caller methods per module, asserts `sub/sub.go` ranks first, uses one analyzer thread, and reports one versioned JSON line.
 
+- Observation: compacting only the final weighted usage adjacency is too small a lever for the current end-to-end path. At 2,000 modules the candidate replaces 12,000 retained 24-byte `{ usize, usize, counts }` edges with 12-byte `{ u32, counts }` targets plus about 56 KB of row offsets, and avoids roughly 528 KB of temporary PageRank row headers and weighted pairs; resolver/catalog construction still drives a roughly 400 MB process high-water mark.
+  Evidence: alternating preserved release binaries were at parity at 500 modules. At 2,000 modules, baseline first/warm ranking ranges were 2,915.780-2,968.974 ms / 1,893.032-1,934.331 ms and candidate ranges were 2,965.992-3,006.331 ms / 1,926.133-1,937.840 ms; peak RSS ranges overlapped with no candidate reduction.
+
 ## Decision Log
 
 - Decision: begin with structural fact roles and keep the first compact representation local to `FileFacts` until its measurements are known.
@@ -132,9 +135,13 @@ The work happens on branch `748-explore-compact-csrcsc-graph-representations-for
   Rationale: ownership is singular and already stored per file as parent-to-child facts; `members | owner` records its exact reverse relation query-locally, and standalone `owner` scans only the member's file under the existing work budget. Optimized owner timings stayed at parity after hierarchy compaction, so a workspace graph would add lifecycle and memory cost without evidence of benefit. A future immutable per-file `children` layout should use a single-parent reverse array rather than general CSC.
   Date/Author: 2026-07-15 / Codex
 
+- Decision: retain the existing dense weighted usage edge vector and PageRank adapter rather than promote compact outgoing rows.
+  Rationale: the candidate preserves exact results but only removes well under 1 MB at the 14,000-node / 12,000-edge scale, while usage resolution and catalog construction consume hundreds of megabytes. Alternating release runs show no repeatable RSS reduction or read improvement. A future usage-memory effort should target rich-key resolver/catalog state or reuse across reranks before revisiting final adjacency layout; no incoming CSC consumer exists.
+  Date/Author: 2026-07-15 / Codex
+
 ## Outcomes & Retrospective
 
-The structural-role, file-dependency, and reverse-hierarchy experiments are promoted. Together they justify shared crate-private compact row mechanics while preserving domain-specific identities and lifecycles. RQL ownership is explicitly not promoted to a workspace graph: its singular, per-file, query-local shape does not justify CSC. The next experiment adapts the already dense usage graph to weighted contiguous adjacency and measures whether construction or only reads benefit.
+The structural-role, file-dependency, and reverse-hierarchy experiments are promoted. Together they justify shared crate-private compact row mechanics while preserving domain-specific identities and lifecycles. RQL ownership is explicitly not promoted to a workspace graph: its singular, per-file, query-local shape does not justify CSC. Weighted usage adjacency is also not promoted: its dense edge IDs were already compact enough that changing only final storage did not move resolver-dominated end-to-end metrics. The remaining milestone is the representative regression suite, full validation, and final issue report.
 
 Milestone 1 outcome 2026-07-15T14:20:00Z: the representation-neutral benchmark is implemented and exercises nonzero facts and semantic role edges. Synthetic retained storage scales from 7,844,400 bytes at 36,100 facts to 123,759,200 bytes at 564,400 facts. The real `vscode` run establishes a 1.530 GB retained-storage baseline and proves the role representation is large enough for the pilot to produce a meaningful signal.
 
@@ -149,6 +156,8 @@ Milestone 4 baseline 2026-07-15T15:29:00Z: `tests/measure_hierarchy_relations.rs
 Milestone 4 outcome 2026-07-15T15:40:44Z: the common reverse hierarchy index now stores exact `CodeUnit` identities once, hash-indexes only ancestors that own rows, and retains all descendant endpoints in `CompactRows<u32>`. Nine providers no longer retain a second weighted Moka cache of per-key descendant sets. In three alternating release process runs, median first full-descendant traversal moved from 0.516 ms to 0.219 ms and warm traversal from 0.224 ms to 0.192 ms. RQL subtypes were 156.554 ms versus 156.598 ms first and 156.296 ms versus 155.590 ms warm; members-owner was 289.814 ms versus 290.238 ms warm; standalone owner was 236.270 ms versus 237.158 ms warm. Those end-to-end paths are at parity. Median peak RSS after the hierarchy query fell from 42,876,928 to 42,270,720 bytes; after the complete ownership workload it fell from 81,248,256 to 80,773,120 bytes. All 182 focused hierarchy, update/cache, exact-identity pipeline, and language-provider tests pass, as does all-target/all-feature Clippy with warnings denied. Hierarchy CSR is promoted; ownership CSC is discarded.
 
 Milestone 5 baseline 2026-07-15T15:46:38Z: `tests/measure_usage_relevance_graph.rs` builds a deterministic Go workspace and calls the public `most_relevant_files` surface in `usage_graph` ranking mode, thereby exercising catalog construction, weighted edge aggregation, the dense ranking graph, PageRank, and file aggregation. At 500 modules / at least 3,500 nodes / 3,000 edges, analyzer construction is 452.258 ms, first ranking is 1,229.977 ms, and the five-iteration warm median is 814.111 ms. Peak RSS is 35,520,512 bytes after the analyzer, 81,985,536 after first ranking, and 83,591,168 after warm ranking. The exact first result is `sub/sub.go` and is stable across every rerank.
+
+Milestone 5 outcome 2026-07-15T15:56:34Z: the candidate stored each outgoing weighted target as `{ u32, UsageReferenceCounts }` in `CompactRows`, exposed a representation-neutral edge iterator to calibration, and let weighted PageRank read rows directly. Exact ranking output remained `sub/sub.go`. Across three alternating 500-module release processes, baseline versus candidate medians were 495.447 ms versus 490.197 ms first, 369.238 ms versus 363.862 ms warm, 67,436,544 versus 68,599,808 bytes RSS after first ranking, and 68,534,272 versus 71,204,864 bytes after warm ranking. The small timing difference is within variance and RSS moved in the wrong direction. Two alternating 2,000-module runs likewise overlapped: baseline first/warm ranges were 2,915.780-2,968.974 ms / 1,893.032-1,934.331 ms, candidate ranges were 2,965.992-3,006.331 ms / 1,926.133-1,937.840 ms, baseline final RSS was 400,130,048-420,560,896 bytes, and candidate final RSS was 417,988,608-418,873,344 bytes. Because the candidate's retained plus temporary saving is under 1 MB at this scale and does not affect end-to-end metrics, the representation edit is discarded while the benchmark is retained.
 
 ## Context and Orientation
 
@@ -285,6 +294,18 @@ Weighted usage-relevance baseline at Bifrost commit `e0bc329569d74d430de65818e4c
     BIFROST_SEMANTIC_INDEX=off cargo test --test measure_usage_relevance_graph -- --ignored --nocapture
     modules=500 expected_minimum_nodes=3500 expected_edges=3000 analyzer_build_ms=452.258 ranking_first_ms=1229.977 ranking_warm_median_ms=814.111 ranking_results=1 first_result=sub/sub.go rss_after_analyzer=35520512 rss_after_first_ranking=81985536 rss_after_warm_ranking=83591168
 
+Weighted usage-relevance optimized A/B at baseline commit `0003183ad4383b8e8807e7e1a21dbedab0e1569f` and its uncommitted compact candidate, single-threaded release profile. The 500-module figures are medians of three alternating preserved-binary process runs:
+
+    baseline modules=500 analyzer_build_ms=162.800 ranking_first_ms=495.447 ranking_warm_median_ms=369.238 rss_after_analyzer=27607040 rss_after_first_ranking=67436544 rss_after_warm_ranking=68534272
+
+    candidate modules=500 analyzer_build_ms=162.958 ranking_first_ms=490.197 ranking_warm_median_ms=363.862 rss_after_analyzer=27377664 rss_after_first_ranking=68599808 rss_after_warm_ranking=71204864
+
+At 2,000 modules / at least 14,000 nodes / 12,000 edges / two warm iterations, two alternating runs produced these ranges:
+
+    baseline ranking_first_ms=2915.780..2968.974 ranking_warm_median_ms=1893.032..1934.331 rss_after_first_ranking=371032064..393379840 rss_after_warm_ranking=400130048..420560896
+
+    candidate ranking_first_ms=2965.992..3006.331 ranking_warm_median_ms=1926.133..1937.840 rss_after_first_ranking=388825088..391315456 rss_after_warm_ranking=417988608..418873344
+
 ## Interfaces and Dependencies
 
 The first benchmark may add representation-neutral methods to `FileFacts`:
@@ -319,3 +340,5 @@ Revision note 2026-07-15T15:29:00Z: Added the exact-identity hierarchy and owner
 Revision note 2026-07-15T15:40:44Z: Promoted exact-identity one-way hierarchy CSR after alternating optimized A/B and cross-language validation; recorded that RQL ownership should remain query-local and use a single-parent reverse array only if per-file child storage is later compacted.
 
 Revision note 2026-07-15T15:46:38Z: Added the weighted usage-relevance benchmark, captured its 500-module baseline, and confirmed the compact ranking graph can remain separate from the public usage-graph rendering model while retaining an iterator adapter for calibration.
+
+Revision note 2026-07-15T15:56:34Z: Discarded compact weighted usage adjacency after preserved release binaries at 500 and 2,000 modules showed no repeatable end-to-end memory or read improvement; retained the representation-neutral benchmark and redirected future usage-memory work toward resolver/catalog state.
