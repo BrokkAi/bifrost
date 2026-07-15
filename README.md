@@ -38,6 +38,28 @@ right interface for your workflow, and the [Language and Analysis
 Capabilities](https://brokkai.github.io/bifrost/capabilities/) matrix for
 language-by-language support, precision tiers, and current analysis boundaries.
 
+## License and Commercial Use
+
+Bifrost is licensed under `LGPL-3.0-or-later`. You may use it in research,
+internal systems, hosted services, and commercial products. The integration and
+distribution boundary determines what you need to share:
+
+- A separate application that invokes Bifrost through its CLI, MCP, or LSP
+  process can normally keep its own license. If you bundle the Bifrost artifact,
+  you still need to provide its notices, license texts, and corresponding source.
+- A proprietary application may link to Bifrost under the LGPL, but users must
+  be able to replace or relink the Bifrost portion and debug their modifications.
+- You may keep a private fork private. If you distribute a modified Bifrost
+  binary or fork, recipients must get the corresponding source and LGPL rights.
+- Running Bifrost only on your servers does not by itself trigger a network
+  source-release requirement; distributing an on-premise binary or container
+  does.
+
+Read [License and Use Cases](https://brokkai.github.io/bifrost/license-use-cases/)
+for researcher, MCP server, code-agent, and RQL dashboard examples, practical
+distribution steps, and limitations. That guide is an orientation, not legal
+advice; the [license text](LICENSE.md) controls.
+
 ## Language Coverage
 
 Bifrost includes analyzers for C, C++, C#, Go, Java, JavaScript, PHP, Python, Ruby, Rust, Scala, and TypeScript.
@@ -50,6 +72,7 @@ The public documentation site lives in [`docs/`](docs/) and is published at
 Useful starting points:
 
 - [Overview](docs/src/content/docs/overview.md)
+- [License and use cases](docs/src/content/docs/license-use-cases.md)
 - [Install Bifrost](docs/src/content/docs/install.md)
 - [MCP server and toolsets](docs/src/content/docs/mcp.md)
 - [LSP server](docs/src/content/docs/lsp.md)
@@ -58,6 +81,7 @@ Useful starting points:
 - [Rust library usage](docs/src/content/docs/rust-library.md)
 - [Python client usage](docs/src/content/docs/python-client.md)
 - [Semantic search](docs/src/content/docs/semantic-search.md)
+- [Citing Bifrost](docs/src/content/docs/cite-bifrost.md)
 
 Run the docs site locally with:
 

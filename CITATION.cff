@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use Bifrost, please cite the software using these metadata and record the exact version and commit used."
+title: "Bifrost: Tree-sitter-backed multi-language code analyzer"
+type: software
+abstract: "Bifrost is a Rust-based multi-language static analysis toolbox for code intelligence, coding agents, editors, and large repositories."
+authors:
+  - name: "Bifrost contributors"
+    website: "https://github.com/BrokkAi/bifrost/graphs/contributors"
+contact:
+  - name: "Brokk, Inc."
+    website: "https://brokk.ai"
+version: "0.8.3"
+date-released: "2026-07-15"
+repository-code: "https://github.com/BrokkAi/bifrost"
+repository-artifact: "https://github.com/BrokkAi/bifrost/releases"
+url: "https://brokkai.github.io/bifrost/"
+license: LGPL-3.0-or-later
+keywords:
+  - static analysis
+  - code intelligence
+  - tree-sitter
+  - MCP
+  - LSP
+  - RQL
+references:
+  - type: software
+    title: "Brokk"
+    authors:
+      - name: "Brokk contributors"
+        website: "https://github.com/BrokkAi/brokk/graphs/contributors"
+    repository-code: "https://github.com/BrokkAi/brokk"
+    scope: "Bifrost is a Rust port and continuation of analyzer architecture, resources, and tests developed in Brokk's Java codebase."

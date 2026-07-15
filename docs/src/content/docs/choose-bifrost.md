@@ -54,3 +54,7 @@ Begin with [Build a Static-Analysis Rule](/build-static-analysis-rule/), use RQL
 ## Check Suitability Before Installation
 
 Bifrost is a good fit when the answer can be grounded in parsed source structure, indexed declarations, exact source references, resolved call edges, direct project-file imports, indexed type relationships, or bounded JavaScript/TypeScript receiver provenance. It is not a path-sensitive control-flow, whole-program points-to, general alias, taint, or whole-program data-flow engine. Read the [capability matrix](/capabilities/) for language-specific boundaries before relying on a zero-result or completeness claim.
+
+Once you have chosen an interface, read [License and Use Cases](/license-use-cases/)
+for the practical differences between running Bifrost as a subprocess, linking
+it into an application, operating a hosted service, and distributing a fork.
