@@ -808,7 +808,11 @@ impl AnalyzerStore {
             )));
         }
         let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        let tx = conn.transaction()?;
+        // This transaction reads the existing snapshot/cost before replacing
+        // them. Acquire the writer slot up front so a concurrent cache writer
+        // cannot commit between the read and a deferred write upgrade, which
+        // would surface as SQLITE_BUSY_SNAPSHOT and leave a one-file hole.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_current_generation(&tx, lang, generation)?;
         let complete_sql = format!(
             "SELECT 1 FROM blob_meta AS meta

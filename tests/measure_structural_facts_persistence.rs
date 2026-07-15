@@ -8,7 +8,7 @@
 //! Run with:
 //!   BIFROST_SEMANTIC_INDEX=off cargo test --release --test measure_structural_facts_persistence -- --ignored --nocapture
 
-use brokk_bifrost::analyzer::structural::{CodeQuery, execute};
+use brokk_bifrost::analyzer::structural::{CodeQuery, Role, execute};
 use brokk_bifrost::{AnalyzerConfig, IAnalyzer, Language, Project, TestProject, WorkspaceAnalyzer};
 use git2::{IndexAddOption, Repository, Signature};
 use rusqlite::Connection;
@@ -40,6 +40,7 @@ struct MaterializationMetrics {
     facts: usize,
     roles: usize,
     estimated_retained_bytes: u64,
+    direct_role_scan_median_ms: f64,
     hot_query_median_ms: f64,
 }
 
@@ -241,6 +242,29 @@ fn materialize(
     assert!(facts > 0, "benchmark must materialize structural facts");
     assert!(roles > 0, "benchmark must materialize structural roles");
 
+    let mut direct_scan_times = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let started = Instant::now();
+        let mut scanned_roles = 0usize;
+        let mut checksum = 0usize;
+        for entry in &retained {
+            for node in 0..entry.nodes().len() as u32 {
+                let row = entry.roles(node);
+                scanned_roles = scanned_roles.saturating_add(row.len());
+                for target in row {
+                    checksum = checksum
+                        .wrapping_add(target.span.start_byte)
+                        .wrapping_add(target.node.unwrap_or_default() as usize)
+                        .wrapping_add(usize::from(target.role == Role::Arg));
+                }
+            }
+        }
+        assert_eq!(scanned_roles, roles);
+        std::hint::black_box(checksum);
+        direct_scan_times.push(started.elapsed().as_secs_f64() * 1_000.0);
+    }
+    let direct_role_scan_median_ms = median(&mut direct_scan_times);
+
     let query = role_heavy_query();
     let mut query_times = Vec::with_capacity(iterations);
     for _ in 0..iterations {
@@ -262,6 +286,7 @@ fn materialize(
         facts,
         roles,
         estimated_retained_bytes,
+        direct_role_scan_median_ms,
         hot_query_median_ms: median(&mut query_times),
     }
 }
@@ -368,12 +393,20 @@ fn structural_facts_cold_extraction_and_warm_persisted_hydration() {
         cold.facts, cold.roles
     );
     eprintln!(
-        "cold build/materialize/query: {:.1} / {:.1} / {:.1} ms; extractions: {}",
-        cold_build_ms, cold.duration_ms, cold.hot_query_median_ms, cold.extractions
+        "cold build/materialize/direct scan/query: {:.1} / {:.1} / {:.1} / {:.1} ms; extractions: {}",
+        cold_build_ms,
+        cold.duration_ms,
+        cold.direct_role_scan_median_ms,
+        cold.hot_query_median_ms,
+        cold.extractions
     );
     eprintln!(
-        "warm build/materialize/query: {:.1} / {:.1} / {:.1} ms; extractions: {}",
-        warm_build_ms, warm.duration_ms, warm.hot_query_median_ms, warm.extractions
+        "warm build/materialize/direct scan/query: {:.1} / {:.1} / {:.1} / {:.1} ms; extractions: {}",
+        warm_build_ms,
+        warm.duration_ms,
+        warm.direct_role_scan_median_ms,
+        warm.hot_query_median_ms,
+        warm.extractions
     );
     eprintln!(
         "snapshots after cold/warm: {} / {} rows, {:.1} / {:.1} MB payload",
@@ -397,7 +430,7 @@ fn structural_facts_cold_extraction_and_warm_persisted_hydration() {
     );
 
     let result = StructuralPersistenceBenchmarkResult {
-        format: "bifrost_structural_facts_persistence_benchmark/v1",
+        format: "bifrost_structural_facts_persistence_benchmark/v2",
         bifrost_commit: git_commit(Path::new(env!("CARGO_MANIFEST_DIR"))),
         workspace_commit: git_commit(&root),
         files: file_count,

@@ -15,14 +15,15 @@ A successful implementation can be demonstrated by running an ignored release be
 ## Progress
 
 - [x] (2026-07-15T17:36:49Z) Created and synchronized `experiment-sqlite-backed-compact-graph-snapshots` from `origin/master` at `fce80f1664df0564fc4bef99115439c08bc82f9e`.
+- [x] (2026-07-15T18:27:31Z) Fetched and rebased the four experiment checkpoints onto current `origin/master` at `e0cff896`, then restored the in-progress reliability and benchmark edits.
 - [x] (2026-07-15T17:36:49Z) Traced the structural-facts cache, persisted analyzer context, blob identity, schema migrations, analyzer epochs, cache GC accounting, compact rows, and the existing memory benchmark.
 - [x] (2026-07-15T17:47:00Z) Added an implementation-independent persisted-reopen benchmark, smoke-tested it, preserved the optimized baseline executable, and recorded three 200-file baseline runs.
 - [x] (2026-07-15T18:03:00Z) Added snapshot semantic version 1, a packed explicit-code wire DTO, checked compact-row construction, source-aware validation, and round-trip/corruption tests.
 - [x] (2026-07-15T18:18:00Z) Added migration 0007 plus current-generation/complete-parent snapshot reads and writes, version replacement, cascade deletion, legacy cost repair, and snapshot-aware row/payload accounting.
 - [x] (2026-07-15T18:42:00Z) Integrated best-effort persisted hydration before extraction and write-through snapshots after extraction, with separate counters, in-memory bypass, exact-source identities, and LSP-style overlay isolation tests.
-- [ ] Validate content changes, language keys, generation changes, corrupt rows, in-memory stores, and cache deletion.
-- [ ] Run alternating optimized baseline/candidate measurements at multiple fixture sizes and record raw results.
-- [ ] Assess the same persistence boundary for import, hierarchy, and usage graphs; document promote/defer/discard decisions.
+- [x] (2026-07-15T18:27:31Z) Added and exercised focused coverage for warm reopen, content changes, TypeScript/TSX storage keys, generation changes, corruption repair, in-memory bypass, overlay isolation, snapshot cascade, replacement accounting, and legacy cost repair.
+- [x] (2026-07-15T18:27:31Z) Ran alternating optimized baseline/candidate measurements at 200 x 50 and 400 x 100, repeated the larger pair in reverse order, and isolated hot CSR reads with a direct role scan.
+- [x] (2026-07-15T18:27:31Z) Assessed import, hierarchy, and usage graph lifecycles and recorded the promote/keep-hot/discard matrix in `.agents/docs/sqlite-backed-compact-graph-applicability.md`.
 - [ ] Run formatting, focused suites, all-target/all-feature Clippy, and the full `nlp,python` test gate; perform a final diff and design audit.
 
 ## Surprises & Discoveries
@@ -43,7 +44,7 @@ A successful implementation can be demonstrated by running an ignored release be
   Evidence: three release runs from the preserved `fce80f16` benchmark executable recorded below.
 
 - Observation: the role-heavy query in the second analyzer lifetime was consistently slower than in the first lifetime (about 32 ms versus 5 ms) even though fact/role counts, retained bytes, and extraction counts matched. The persistence candidate must be compared in the same lifecycle positions rather than treating the cold-lifetime query as its baseline.
-  Evidence: all three baseline runs reproduced the difference. The cause is not yet established and is not required to evaluate snapshot hydration, but it should be revisited if the candidate changes the gap.
+  Evidence: all baseline and candidate runs reproduced the lifecycle gap. The direct CSR scan later isolated the hydrated representation and showed parity, so the remaining difference is in surrounding reopened provider/source lifecycle.
 
 - Observation: bincode's free `serialize`/`deserialize` functions use a legacy fixed-width configuration that permits trailing bytes, while `DefaultOptions` uses varints and rejects trailing bytes. The snapshot boundary explicitly selects varints, a payload-size read limit, and trailing-byte rejection rather than inheriting either implicit configuration.
   Evidence: bincode 1.3.3 configuration documentation and the corruption tests in `structural::facts`.
@@ -53,6 +54,15 @@ A successful implementation can be demonstrated by running an ignored release be
 
 - Observation: constructing a persisted workspace directly around an `OverlayProject` does not exercise the same state transition as the LSP. The production request path clones the already-built workspace with an overlay snapshot; testing that actual path proved separate source identities and preserved the disk snapshot.
   Evidence: `WorkspaceAnalyzer::clone_with_project` use in `src/lsp/server.rs` and `request_overlay_snapshot_cannot_replace_committed_structural_facts` in `src/analyzer/workspace.rs`.
+
+- Observation: deferred snapshot upserts occasionally persisted 199 of 200 files while the warm analyzer extracted the missing file. The transaction reads existing snapshot/accounting rows before writing, so a concurrent WAL writer can invalidate a deferred read snapshot and make the upgrade fail with `SQLITE_BUSY_SNAPSHOT`. Acquiring an immediate writer transaction before those reads eliminated the gap in five consecutive 200-file runs and six 400-file runs.
+  Evidence: exact snapshot-row and warm-extraction counts from the optimized candidate runs; `AnalyzerStore::upsert_structural_facts_snapshot` now starts `TransactionBehavior::Immediate`.
+
+- Observation: the repeatable 6.7-7.9% larger 400-file reopened role-heavy query median does not come from the hydrated CSR representation. A direct scan of every role row and target measured 0.822 ms for freshly extracted facts versus 0.804 ms for hydrated facts, about 2.2% faster and effectively parity.
+  Evidence: three 21-iteration candidate runs; the direct scan was added to benchmark format v2.
+
+- Observation: a separate 2 MiB non-mmap SQLite snapshot reader lowered the benchmark's cumulative cold-plus-warm peak by roughly 15 MiB, but made cold and hydration materialization 5-10% slower and did not improve the hot query. The experiment was reverted.
+  Evidence: isolated-reader candidate runs at 400 files x 100 calls compared with the shared-connection candidate.
 
 ## Decision Log
 
@@ -80,9 +90,23 @@ A successful implementation can be demonstrated by running an ignored release be
   Rationale: the content hash is the persisted blob identity and cannot race with a concurrent disk or overlay change. The store only accepts the snapshot if a complete parsed parent exists for that OID, language key, and generation. This is stronger than resolving a path and then assuming it still represents the already-read source.
   Date: 2026-07-15.
 
+- Decision: acquire an immediate SQLite transaction for snapshot replacement.
+  Rationale: snapshot replacement reads both the existing snapshot payload and cached blob cost before writing. Reserving the writer slot first avoids WAL read-snapshot upgrade races without changing the best-effort cache semantics.
+  Date: 2026-07-15.
+
+- Decision: promote the hybrid only for structural facts; retain compact imports and hierarchy as rebuildable in-memory views, and discard final usage-graph persistence.
+  Rationale: structural normalization is expensive, content-addressed, immutable, and repeated across process lifetimes. Import graphs are seed/query/workspace views over already persisted raw facts, the hierarchy CSR rebuild is sub-millisecond, and usage resolution/catalog construction has richer semantic identity while final adjacency compaction previously failed to improve end-to-end metrics.
+  Date: 2026-07-15.
+
 ## Outcomes & Retrospective
 
-Not yet complete. Record baseline and candidate tables, correctness findings, promoted interfaces, and discarded alternatives here. Explain whether persisted snapshots should remain enabled by default and identify graph families for which the same pattern does or does not fit.
+The hybrid is promoted for structural facts. A warm persisted analyzer performs zero tree-sitter structural extractions, reproduces exact fact and role counts, and reduces reopened materialization by 69.0% at 200 x 50 and 73.2% at 400 x 100. The first lifetime pays 16.8-21.1% for serialization and SQLite writes, and the database grows about 37-38%. Hydration constructs exact-capacity arrays, reducing the retained facts estimate about 20% relative to fresh extraction.
+
+Hot CSR reads are at parity: the 400-file direct role scan was 0.822 ms freshly extracted and 0.804 ms hydrated. The larger end-to-end reopened query remained 6.7-7.9% slower depending on run order, so follow-up performance work should inspect provider/source lifecycle rather than change the compact representation or query SQLite directly. Cumulative-process RSS is explicitly non-decisive because the harness reuses one process and `getrusage` includes allocator and SQLite mmap history.
+
+The reusable conclusion is narrower than a universal persisted graph. Structural facts meet the stable content identity, expensive reconstruction, immutable snapshot, and repeated-row-read criteria. Import and hierarchy relations should keep their already-promoted compact hot layouts but rebuild from raw SQLite facts; usage persistence should target a future measured stable resolver intermediate, not the final calibrated graph. The detailed matrix is in `.agents/docs/sqlite-backed-compact-graph-applicability.md`.
+
+The implementation remains rebuildable cache state with public APIs unchanged. A corrupt, missing, stale, or unsupported snapshot falls back to correct extraction and best-effort repair. The remaining acceptance work is the full repository validation and final diff audit.
 
 ## Context and Orientation
 
@@ -92,7 +116,7 @@ Not yet complete. Record baseline and candidate tables, correctness findings, pr
 
 `src/analyzer/tree_sitter_analyzer.rs` owns both `AnalyzerStoreContext` and the structural cache. `resolve_live_oid_for_file` obtains the content identity while respecting overlays, liveness, live filesystem paths, and Git index state. `LanguageAdapter::storage_language_key_for_file` supplies the exact persisted language key. These existing methods should be exposed through narrow crate-private helpers rather than reimplementing identity logic in the structural module.
 
-`src/analyzer/store.rs` and its submodules implement the SQLite store. The root `blobs(blob_oid, lang)` row is generation-scoped; child tables cascade when a blob is removed. `src/cache_db.rs` owns ordered migrations, currently through version 6. Migration 0006 added `blob_payload_costs`, which avoids repeatedly summing all child payloads. Any snapshot write must preserve this accounting, and fallback cost SQL must include snapshots for legacy or repaired rows.
+`src/analyzer/store.rs` and its submodules implement the SQLite store. The root `blobs(blob_oid, lang)` row is generation-scoped; child tables cascade when a blob is removed. `src/cache_db.rs` owns ordered migrations, now through version 7. Migration 0006 added `blob_payload_costs`, which avoids repeatedly summing all child payloads; migration 0007 adds structural snapshots. Snapshot writes preserve this accounting, and fallback cost SQL includes snapshots for legacy or repaired rows.
 
 `tests/measure_structural_facts_memory.rs` is the retained-hot-memory benchmark from the compact graph work. This experiment adds a separate persisted-reopen benchmark because the existing fixture uses a non-Git `TestProject` and intentionally retains every `Arc<FileFacts>` in a single process. The new harness will initialize and commit a deterministic Git workspace, open it through `WorkspaceAnalyzer::build_persisted`, materialize structural facts, drop the workspace, reopen it, materialize again, and query SQLite directly for snapshot size when the candidate table exists.
 
@@ -151,7 +175,7 @@ The broader design is accepted when the final plan contains an evidence-backed t
 
 ## Idempotence and Recovery
 
-The benchmark creates a fresh temporary Git workspace unless an explicit path is supplied, so reruns are independent. Persistence writes use upsert semantics and are safe to repeat. Migration 0007 must be transactional through the existing migration runner. If a snapshot is corrupt or from an unknown version, the provider ignores it, extracts correct facts, and overwrites only the current supported-version row; older-version rows remain eligible for ordinary blob eviction and may be cleaned by a later migration.
+The benchmark creates a fresh temporary Git workspace unless an explicit path is supplied, so reruns are independent. Persistence writes use upsert semantics and are safe to repeat. Migration 0007 is transactional through the existing migration runner. If a snapshot is corrupt or from an unknown version, the provider ignores it and extracts correct facts. A successful write deletes other semantic versions for that blob before storing the current version, preventing rebuildable rows from accumulating.
 
 If a benchmark or test is interrupted, rerun it. Use `scripts/with-isolated-cargo-target.sh` for isolated full gates so temporary targets are removed. Do not manually create named Cargo target directories. Check `git status --short` before each checkpoint and stage only files belonging to the milestone.
 
@@ -170,7 +194,31 @@ Baseline raw summary, in run order:
 
 All runs produced exactly 142,200 normalized facts, 70,000 semantic roles, and 22,603,600 estimated retained bytes in both lifetimes. The baseline has zero snapshot rows and bytes. The small 20-file smoke run also passed and extracted 20 files in each lifetime.
 
-The first candidate smoke run used 20 files x 10 calls. Cold extraction wrote 20 snapshots in 5.392 ms; reopened materialization hydrated all 20 with zero extractions in 2.265 ms. Facts and roles remained 3,020 and 1,400. Snapshot payload was 66,060 bytes, total database size grew from the baseline smoke's 417,792 bytes to 516,096 bytes, and estimated retained facts fell from 530,120 cold bytes to 378,920 hydrated bytes. This is directional evidence only; representative alternating runs remain required.
+The first candidate smoke run used 20 files x 10 calls. Cold extraction wrote 20 snapshots in 5.392 ms; reopened materialization hydrated all 20 with zero extractions in 2.265 ms. Facts and roles remained 3,020 and 1,400. Snapshot payload was 66,060 bytes, total database size grew from the baseline smoke's 417,792 bytes to 516,096 bytes, and estimated retained facts fell from 530,120 cold bytes to 378,920 hydrated bytes. Representative alternating results follow.
+
+Representative 200-file A/B used 50 calls per file, seven query iterations, one analyzer worker, and alternating fresh processes. The baseline medians below are from three paired runs under the same thermal conditions; the candidate is the median of five runs after the immediate-transaction reliability fix.
+
+| Variant | cold build ms | cold materialize ms | cold query ms | warm build ms | warm materialize ms | warm query ms | warm extractions | snapshot payload MiB | retained warm MiB | DB MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline | 273.937 | 132.621 | 5.488 | 12.823 | 140.420 | 33.407 | 200 | 0 | 21.6 | 10.9 |
+| hybrid | 272.971 | 154.946 | 7.029 | 13.053 | 43.573 | 33.831 | 0 | 3.67 | 17.3 | 14.9-15.0 |
+
+At this scale the hybrid makes reopened materialization 69.0% faster, makes cold materialization 16.8% slower, leaves the lifecycle-matched warm query within 1.3%, reduces estimated retained facts 19.9%, and grows the database about 37%.
+
+Representative 400-file A/B used 100 calls per file. Three baseline-then-candidate pairs produced these medians:
+
+| Variant | cold build ms | cold materialize ms | cold query ms | warm build ms | warm materialize ms | warm query ms | warm extractions | snapshot payload MiB | retained warm MiB | DB MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline | 980.470 | 519.783 | 77.161 | 30.342 | 539.081 | 104.570 | 400 | 0 | 86.2 | 42.2 |
+| hybrid | 977.801 | 629.273 | 84.656 | 30.451 | 144.334 | 111.590 | 0 | 15.50 | 68.7 | 58.1 |
+
+At this scale the hybrid makes reopened materialization 73.2% faster, makes cold materialization 21.1% slower, reduces retained facts 20.3%, and grows the database 37.7%. A three-pair reverse-order check measured 102.10 ms baseline versus 110.13 ms hybrid for the warm role-heavy query, confirming a 7.9% lifecycle-level difference. Three 21-iteration representation-only scans measured 0.822 ms freshly extracted versus 0.804 ms hydrated, so the compact rows themselves remain at parity.
+
+Peak RSS values are retained only as diagnostic context. At 400 files, the baseline cumulative cold/warm high-water medians were 236.4/245.1 MiB and the hybrid values were 249.2/273.8 MiB. Because the same process performs both lifetimes and `getrusage` never decreases, those values combine cold allocator state, SQLite mmap, and warm values; they are not a fresh-process retained-memory comparison.
+
+Reliability check: before the immediate transaction, two of the first three representative runs wrote 199/200 rows and performed one warm extraction. After the change, five consecutive 200-file runs and six consecutive 400-file runs wrote the exact expected row count and performed zero warm extractions.
+
+The current-source post-rebase v2 smoke run again produced 20/20 snapshots, zero warm extractions, exact 3,020 facts and 1,400 roles, and 66,060 payload bytes. Benchmark format v2 adds `direct_role_scan_median_ms`; preserved baseline binaries remain format v1 and print the checkout's runtime HEAD, so provenance must use the preserved-binary filename and recorded build commit rather than that JSON field alone.
 
 Keep transient executables and bulky raw logs in `/private/tmp`; keep durable conclusions in this plan. If a reusable operator/developer note is needed, place it under `.agents/docs/`, not public `docs/`.
 
