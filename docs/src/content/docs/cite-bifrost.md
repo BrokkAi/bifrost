@@ -37,4 +37,4 @@ If a packaged launcher supplied the binary, record the version printed by that b
 
 Software attribution does not make a result reproducible. Alongside the citation, publish the source repository revision, query and schema version, workspace scope, Bifrost configuration, proof policy, diagnostics, truncation state, and output artifact. Use the [analysis manifest](/reproduce-analysis/#run-manifest) as the minimum companion record.
 
-When quoting a result, identify its evidence level. For example: “Bifrost 0.8.2 returned a proven indexed call edge at `path:line` for query revision `abc…`, with no execution diagnostics and `truncated: false`.” Avoid turning that bounded static result into an unqualified runtime or whole-program claim.
+When quoting a result, identify its evidence level. For example: “Bifrost 0.8.3 returned a proven indexed call edge at `path:line` for query revision `abc…`, with no execution diagnostics and `truncated: false`.” Avoid turning that bounded static result into an unqualified runtime or whole-program claim.
