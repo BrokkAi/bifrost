@@ -27,6 +27,7 @@ const FILE_STATE_BATCH_SIZE: usize = 256;
 /// Re-export and reverse-import indices over the Python workspace.
 #[derive(Debug, Default)]
 pub(crate) struct PythonUsageIndex {
+    module_index: HashMap<String, Vec<ProjectFile>>,
     exports_by_file: HashMap<ProjectFile, ExportIndex>,
     reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
     star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
@@ -160,6 +161,7 @@ impl PythonUsageIndex {
             build_importer_reverse(&module_index, &files, &binders_by_file, &exports_by_file);
 
         Self {
+            module_index,
             exports_by_file,
             reexport_edges,
             star_reexports,
@@ -229,6 +231,33 @@ impl PythonUsageIndex {
             );
         }
         matches
+    }
+
+    fn importer_files_for_seeds(
+        &self,
+        seeds: &BTreeSet<(ProjectFile, String)>,
+    ) -> crate::hash::HashSet<ProjectFile> {
+        let mut importers = crate::hash::HashSet::default();
+        for (target_file, _) in seeds {
+            let Some(edges) = self.importer_reverse.get(target_file) else {
+                continue;
+            };
+            importers.extend(
+                edges
+                    .iter()
+                    .filter(|edge| edge_matches_seed(edge, seeds))
+                    .map(|edge| edge.importer.clone()),
+            );
+        }
+        importers
+    }
+
+    fn resolve_module_files(
+        &self,
+        importing_file: &ProjectFile,
+        module_specifier: &str,
+    ) -> Vec<ProjectFile> {
+        resolve_module(&self.module_index, importing_file, module_specifier)
     }
 }
 
@@ -325,5 +354,21 @@ impl PythonAnalyzer {
     ) -> Vec<ImportEdge> {
         self.usage_index()
             .matching_edges_for_importer(importer, seeds)
+    }
+
+    pub(crate) fn usage_importer_files(
+        &self,
+        seeds: &BTreeSet<(ProjectFile, String)>,
+    ) -> crate::hash::HashSet<ProjectFile> {
+        self.usage_index().importer_files_for_seeds(seeds)
+    }
+
+    pub(crate) fn usage_resolve_module_files(
+        &self,
+        importing_file: &ProjectFile,
+        module_specifier: &str,
+    ) -> Vec<ProjectFile> {
+        self.usage_index()
+            .resolve_module_files(importing_file, module_specifier)
     }
 }

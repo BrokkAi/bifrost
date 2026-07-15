@@ -738,7 +738,7 @@ def run():
 }
 
 #[test]
-fn imported_module_target_retains_complete_usage_result() {
+fn imported_module_target_reports_qualifier_usage() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(
             "pkg/expression.py",
@@ -753,6 +753,9 @@ class Expression:
 import pkg.expression as expression
 
 def run():
+    return expression.Expression()
+
+def shadow(expression):
     return expression.Expression()
 "#,
         )
@@ -770,10 +773,14 @@ def run():
     let hits = result
         .into_either()
         .expect("graph should retain the imported module's usage seed");
-    assert!(
-        hits.is_empty(),
-        "module seed should resolve completely without inventing a type hit: {hits:#?}"
+    assert_eq!(
+        hits.len(),
+        1,
+        "module qualifier should be a usage: {hits:#?}"
     );
+    let hit = hits.iter().next().expect("one module qualifier hit");
+    assert_eq!(hit.file, project.file("consumer.py"));
+    assert!(hit.snippet.contains("expression.Expression()"), "{hit:#?}");
 }
 
 #[test]
@@ -2527,4 +2534,160 @@ fn import_binding_is_import_kind_hit() {
     assert_eq!(result.all_hits().len(), 1);
     // find-references: also the `from service import Widget` binding.
     assert_eq!(result.all_hits_including_imports().len(), 2);
+}
+
+#[test]
+fn namespace_import_resolves_reexported_function_alias() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "proto/modules.py",
+            "def define_module():\n    return None\n",
+        )
+        .file(
+            "proto/__init__.py",
+            "from .modules import define_module as module\n",
+        )
+        .file("consumer.py", "import proto\n\nvalue = proto.module()\n")
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "proto.modules.define_module");
+
+    let hits = UsageFinder::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), 100, 100)
+        .all_hits();
+
+    assert_eq!(hits.len(), 1, "re-export alias should resolve: {hits:#?}");
+    let hit = hits.iter().next().expect("one re-export alias hit");
+    assert_eq!(hit.file, project.file("consumer.py"));
+    assert!(hit.snippet.contains("proto.module()"), "{hit:#?}");
+}
+
+#[test]
+fn nested_class_bare_reference_in_owner_body_resolves() {
+    assert_eq!(
+        single_file_member_hits(
+            "class Outer:\n    class Inner:\n        pass\n\n    alias = Inner\n",
+            "m.Outer$Inner",
+        ),
+        1,
+    );
+}
+
+#[test]
+fn imported_name_before_later_module_rebinding_resolves_only_before_rebind() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", "TOKEN = object()\n")
+        .file(
+            "consumer.py",
+            concat!(
+                "from service import TOKEN\n",
+                "before = TOKEN\n",
+                "TOKEN = object()\n",
+                "after = TOKEN\n",
+            ),
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.TOKEN");
+
+    let hits = UsageFinder::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), 100, 100)
+        .all_hits();
+
+    assert_eq!(
+        hits.len(),
+        1,
+        "only the pre-rebind read is imported: {hits:#?}"
+    );
+    let hit = hits.iter().next().expect("one pre-rebind hit");
+    assert!(hit.snippet.contains("before = TOKEN"), "{hit:#?}");
+}
+
+#[test]
+fn deferred_function_body_observes_later_module_rebinding() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", "TOKEN = object()\n")
+        .file(
+            "consumer.py",
+            concat!(
+                "from service import TOKEN\n",
+                "def read():\n",
+                "    return TOKEN\n",
+                "TOKEN = object()\n",
+            ),
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.TOKEN");
+
+    let hits = UsageFinder::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), 100, 100)
+        .all_hits();
+
+    assert!(
+        hits.is_empty(),
+        "a deferred body observes the final module binding: {hits:#?}"
+    );
+}
+
+#[test]
+fn call_initialized_module_container_is_not_shadowed_by_its_definition() {
+    assert_eq!(
+        single_file_member_hits(
+            "REGISTRY = dict()\nREGISTRY[\"rest\"] = object()\n",
+            "m.REGISTRY",
+        ),
+        1,
+    );
+}
+
+#[test]
+fn nested_package_module_field_resolves_after_redeclaration() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "packages/google-cloud-example/setup.py",
+            concat!(
+                "import os\n",
+                "package_root = os.getcwd()\n",
+                "package_root = os.getcwd()\n",
+                "readme = os.path.join(package_root, \"README.rst\")\n",
+            ),
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(
+        &analyzer,
+        "packages.google-cloud-example.setup.package_root",
+    );
+    let hits = UsageFinder::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), 100, 100)
+        .all_hits();
+
+    assert_eq!(
+        hits.len(),
+        1,
+        "nested module field read should resolve: {hits:#?}"
+    );
+    let hit = hits.iter().next().expect("one nested module-field hit");
+    assert!(
+        hit.snippet.contains("package_root, \"README.rst\""),
+        "{hit:#?}"
+    );
+}
+
+#[test]
+fn class_field_default_argument_resolves_in_owner_class_scope() {
+    assert_eq!(
+        single_file_member_hits(
+            concat!(
+                "class Transport:\n",
+                "    DEFAULT_HOST = \"localhost\"\n",
+                "    def __init__(self, host=DEFAULT_HOST):\n",
+                "        return DEFAULT_HOST\n",
+            ),
+            "m.Transport.DEFAULT_HOST",
+        ),
+        1,
+        "the default is evaluated in the class body; the method body is not",
+    );
 }

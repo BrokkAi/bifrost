@@ -3,9 +3,8 @@ use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, PythonAnalyzer};
 use std::collections::BTreeSet;
 
 pub(super) fn infer_export_names(analyzer: &PythonAnalyzer, target: &CodeUnit) -> BTreeSet<String> {
-    if (target.is_function() || target.is_field())
-        && let Some(owner_name) = owner_name(target)
-    {
+    if target_owner_code_unit(analyzer, target).is_some() {
+        let owner_name = top_level_identifier(analyzer, target);
         let owner_exports =
             infer_export_names_for_local(analyzer, target, target.source(), &owner_name);
         if !owner_exports.is_empty() {
@@ -72,39 +71,28 @@ fn is_module_level_target_identifier(
             .is_some_and(|parent| parent.is_module() && parent.source() == file)
 }
 
-fn owner_name(target: &CodeUnit) -> Option<String> {
-    let short_name = target.short_name();
-    let last_dot = short_name.rfind('.')?;
-    (last_dot > 0).then(|| short_name[..last_dot].to_string())
+pub(super) fn top_level_identifier(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> String {
+    let mut current = target.clone();
+    while let Some(parent) = analyzer.parent_of(&current) {
+        if parent.is_module() {
+            break;
+        }
+        current = parent;
+    }
+    current.identifier().to_string()
 }
 
-pub(super) fn top_level_identifier(target: &CodeUnit) -> &str {
-    target
-        .short_name()
-        .split('.')
-        .next()
-        .unwrap_or(target.short_name())
-}
-
-pub(super) fn member_name(target: &CodeUnit) -> Option<String> {
-    let parts: Vec<&str> = target.short_name().split('.').collect();
-    (parts.len() > 1).then(|| parts.last().unwrap().to_string())
+pub(super) fn member_name(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> Option<String> {
+    target_owner_code_unit(analyzer, target).map(|_| target.identifier().to_string())
 }
 
 pub(super) fn target_owner_code_unit(
     analyzer: &dyn IAnalyzer,
     target: &CodeUnit,
 ) -> Option<CodeUnit> {
-    let owner_name = top_level_identifier(target);
-    let owner_fq = if target.package_name().is_empty() {
-        owner_name.to_string()
-    } else {
-        format!("{}.{}", target.package_name(), owner_name)
-    };
     analyzer
-        .get_definitions(&owner_fq)
-        .into_iter()
-        .find(|code_unit| code_unit.source() == target.source() && code_unit.is_class())
+        .parent_of(target)
+        .filter(|parent| parent.source() == target.source() && parent.is_class())
 }
 
 pub(in crate::analyzer::usages) fn resolve_receiver_type(

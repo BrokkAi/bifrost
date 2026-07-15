@@ -97,6 +97,8 @@ where
 
             let mut ctx = PyScan {
                 analyzer,
+                py,
+                nodes,
                 file,
                 source,
                 named,
@@ -112,6 +114,8 @@ where
 
 struct PyScan<'a, 'b> {
     analyzer: &'a dyn IAnalyzer,
+    py: &'a PythonAnalyzer,
+    nodes: &'a HashSet<String>,
     file: &'a ProjectFile,
     source: &'a str,
     named: HashMap<String, String>,
@@ -301,7 +305,27 @@ fn handle_attribute<'a>(
     if !is_shadowed(scopes, object_text)
         && let Some(module) = ctx.namespace.get(object_text)
     {
-        ctx.record(format!("{module}.{attribute_text}"), attribute);
+        let module = module.clone();
+        let workspace_module = !ctx
+            .py
+            .usage_resolve_module_files(ctx.file, &module)
+            .is_empty();
+        if ctx.nodes.contains(&module) {
+            ctx.record(module.clone(), object);
+        }
+        let direct = format!("{module}.{attribute_text}");
+        if ctx.nodes.contains(&direct) {
+            ctx.record(direct, attribute);
+            return;
+        }
+        if workspace_module {
+            for resolved in ctx
+                .py
+                .resolve_fqn_candidates(&direct, |name| ctx.analyzer.definitions(name).collect())
+            {
+                ctx.record(resolved.fq_name(), attribute);
+            }
+        }
         return;
     }
 

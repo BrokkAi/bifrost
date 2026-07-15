@@ -510,13 +510,19 @@ pub(crate) fn find_default_candidates_with_cancellation(
     analyzer: &dyn IAnalyzer,
     cancellation: &CancellationToken,
 ) -> HashSet<ProjectFile> {
-    apply_fallback_policy(
+    let mut candidates = apply_fallback_policy(
         target,
         analyzer,
         || find_import_graph_candidates(target, analyzer, Some(cancellation)),
         || find_text_candidates(target, analyzer, Some(cancellation)),
         || cancellation.is_cancelled(),
-    )
+    );
+    if !cancellation.is_cancelled() && language_for_target(target) == Language::Python {
+        candidates.extend(super::python_graph::python_usage_candidate_files(
+            analyzer, target,
+        ));
+    }
+    candidates
 }
 
 fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {

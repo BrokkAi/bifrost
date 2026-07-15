@@ -51,6 +51,21 @@ where
     Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
 }
 
+pub(in crate::analyzer::usages) fn python_usage_candidate_files(
+    analyzer: &dyn IAnalyzer,
+    target: &CodeUnit,
+) -> HashSet<ProjectFile> {
+    let Some(py) = resolve_analyzer::<PythonAnalyzer>(analyzer) else {
+        return HashSet::default();
+    };
+    let export_names = infer_export_names(py, target);
+    if export_names.is_empty() {
+        return HashSet::default();
+    }
+    let seeds = infer_usage_seeds(py, target, export_names);
+    py.usage_importer_files(&seeds)
+}
+
 pub(crate) struct PythonQueryResolver<'a> {
     py: &'a PythonAnalyzer,
 }

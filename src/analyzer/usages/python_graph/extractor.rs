@@ -101,8 +101,8 @@ pub(super) fn scan_files_for_seeds(
 ) -> ScanResult {
     let collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
     let unproven_collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
-    let target_short = top_level_identifier(target).to_string();
-    let target_member = member_name(target);
+    let target_short = top_level_identifier(analyzer, target);
+    let target_member = member_name(analyzer, target);
     let target_owner = target_owner_code_unit(analyzer, target);
     // A same-file best-effort for unresolvable receivers is only safe when the
     // member name is unambiguous in the target's file (exactly one class there
@@ -111,7 +111,9 @@ pub(super) fn scan_files_for_seeds(
         let owners: HashSet<CodeUnit> = analyzer
             .declarations(target.source())
             .into_iter()
-            .filter(|decl| member_name(decl).as_deref() == Some(member))
+            .filter(|decl| {
+                decl.identifier() == member && target_owner_code_unit(analyzer, decl).is_some()
+            })
             .filter_map(|decl| target_owner_code_unit(analyzer, &decl))
             .collect();
         owners.len() == 1
@@ -153,7 +155,8 @@ pub(super) fn scan_files_for_seeds(
         }
 
         let edges = py.usage_matching_edges(file, seeds);
-        let local_conflicts = collect_top_level_conflicts(tree_ref.root_node(), source_str);
+        let module_bindings =
+            collect_module_binding_timeline(py, file, tree_ref.root_node(), source_str, seeds);
         let target_self_file = *file == target.source();
         let scope_facts = collect_scope_facts_from_parsed_source(
             analyzer,
@@ -177,10 +180,12 @@ pub(super) fn scan_files_for_seeds(
             target_short: &target_short,
             target_member: target_member.as_deref(),
             target_owner: target_owner.clone(),
+            target_is_module: target.is_module(),
+            seeds,
             edges: &edges,
             target_self_file,
             member_best_effort_unique: target_self_file && member_unique_in_target_file,
-            local_conflicts: &local_conflicts,
+            module_bindings: &module_bindings,
             scope_facts: &scope_facts,
             scope_range_index: &scope_range_index,
             hits: &mut local_hits,
@@ -226,6 +231,8 @@ pub(super) struct ScanCtx<'a> {
     target_short: &'a str,
     target_member: Option<&'a str>,
     target_owner: Option<CodeUnit>,
+    target_is_module: bool,
+    seeds: &'a BTreeSet<(ProjectFile, String)>,
     edges: &'a [ImportEdge],
     target_self_file: bool,
     /// True when a same-file best-effort is justified for an unresolvable
@@ -234,7 +241,7 @@ pub(super) struct ScanCtx<'a> {
     /// an un-inferrable `recv` unambiguously means the target). Cross-file
     /// untyped receivers stay conservative.
     member_best_effort_unique: bool,
-    local_conflicts: &'a HashSet<String>,
+    module_bindings: &'a HashMap<String, Vec<ModuleBindingEvent>>,
     scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
     scope_range_index: &'a [ScopeRangeEntry],
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
@@ -329,13 +336,10 @@ impl ScanCtx<'_> {
         {
             return false;
         }
-        if !self.target_self_file && self.local_conflicts.contains(ident) {
-            return false;
-        }
-        if self.edges.iter().any(|edge| edge.local_name == ident) {
+        if self.target_self_file && ident == self.target_short {
             return true;
         }
-        self.target_self_file && ident == self.target_short
+        self.module_binding_targets_query(ident, node)
     }
 
     fn receiver_binds_target(&self, expr: &str, node: Node<'_>) -> bool {
@@ -367,12 +371,11 @@ impl ScanCtx<'_> {
         self.receiver_type_matches_target(raw_type)
     }
 
-    /// Whether `node` sits directly in the body of the target member's owner
-    /// class — the class itself or a class-level field of it (e.g. the
-    /// initializer of `alias = method`), but NOT inside a method. In a Python
-    /// class body the member names are directly in scope, so a bare reference
-    /// there is a usage of the member; inside a method you instead need
-    /// `self.member`.
+    /// Whether `node` is evaluated in the target member owner's class namespace.
+    /// This includes class-level field initializers and the decorators,
+    /// annotations, and defaults of a method declaration. The method body itself
+    /// executes later with ordinary function scoping, where a bare member name
+    /// does not reach the class namespace.
     fn node_directly_in_owner_class_body(&self, node: Node<'_>) -> bool {
         let Some(target_owner) = self.target_owner.as_ref() else {
             return false;
@@ -389,11 +392,10 @@ impl ScanCtx<'_> {
         if &enclosing == target_owner {
             return true;
         }
-        // A class-level assignment (`alias = member`) nests the reference inside
-        // a field CodeUnit; that field is still in the class namespace. A method
-        // body is not — bare names there don't reach the class members.
         if enclosing.is_function() {
-            return false;
+            return target_owner_code_unit(self.analyzer, &enclosing).as_ref()
+                == Some(target_owner)
+                && function_declaration_expression_is_class_scoped(node);
         }
         target_owner_code_unit(self.analyzer, &enclosing).as_ref() == Some(target_owner)
     }
@@ -414,10 +416,26 @@ impl ScanCtx<'_> {
         {
             return false;
         }
-        if !self.target_self_file && self.local_conflicts.contains(ident) {
+        self.module_binding_targets_query(ident, node)
+    }
+
+    fn module_binding_targets_query(&self, ident: &str, node: Node<'_>) -> bool {
+        if !self.edges.iter().any(|edge| edge.local_name == ident) {
             return false;
         }
-        self.edges.iter().any(|edge| edge.local_name == ident)
+        let Some(events) = self.module_bindings.get(ident) else {
+            return true;
+        };
+        let cutoff = if reference_is_deferred_function_body(node) {
+            usize::MAX
+        } else {
+            node.start_byte()
+        };
+        events
+            .iter()
+            .rev()
+            .find(|event| event.visible_from <= cutoff)
+            .is_some_and(|event| event.kind == ModuleBindingKind::TargetImport)
     }
 
     /// Whether the class enclosing `node` is the target member's owner (or a
@@ -483,6 +501,27 @@ impl ScanCtx<'_> {
             .into_iter()
             .any(|ancestor| ancestor == *target_owner)
     }
+}
+
+fn function_declaration_expression_is_class_scoped(node: Node<'_>) -> bool {
+    let site_start = node.start_byte();
+    let site_end = node.end_byte();
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "function_definition" {
+            return parent.child_by_field_name("body").is_none_or(|body| {
+                !(body.start_byte() <= site_start && site_end <= body.end_byte())
+            });
+        }
+        if parent.kind() == "decorated_definition" {
+            return current.kind() == "decorator";
+        }
+        if parent.kind() == "class_definition" {
+            break;
+        }
+        current = parent;
+    }
+    false
 }
 
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -584,12 +623,13 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
     }
 
-    if ctx.target_member.is_none()
-        && object.kind() == "identifier"
+    if object.kind() == "identifier"
         && ctx.binds_target(object_text, node)
-        && !ctx.edges.iter().any(|edge| {
-            matches!(edge.kind, ImportEdgeKind::Namespace) && edge.local_name == object_text
-        })
+        && (ctx.target_is_module
+            || (ctx.target_member.is_none()
+                && !ctx.edges.iter().any(|edge| {
+                    matches!(edge.kind, ImportEdgeKind::Namespace) && edge.local_name == object_text
+                })))
     {
         record_hit(object, ctx);
     }
@@ -625,8 +665,11 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         matches!(edge.kind, ImportEdgeKind::Namespace)
             && (edge.local_name == object_text
                 || object_text.ends_with(&format!(".{}", edge.local_name)))
+            && ctx
+                .seeds
+                .contains(&(edge.target_file.clone(), attribute_text.to_string()))
     });
-    if ctx.target_member.is_none() && namespace_match && attribute_text == ctx.target_short {
+    if ctx.target_member.is_none() && namespace_match {
         record_hit(attribute, ctx);
     }
 }
@@ -695,31 +738,240 @@ pub(in crate::analyzer::usages) fn is_declaration_identifier(node: Node<'_>) -> 
             .unwrap_or(false)
 }
 
-fn collect_top_level_conflicts(root: Node<'_>, source: &str) -> HashSet<String> {
-    let mut conflicts = HashSet::default();
-    let mut cursor = root.walk();
-    for child in root.named_children(&mut cursor) {
-        match child.kind() {
-            "class_definition" | "function_definition" => {
-                if let Some(name) = child.child_by_field_name("name") {
-                    let text = slice(name, source).trim();
-                    if !text.is_empty() {
-                        conflicts.insert(text.to_string());
-                    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModuleBindingKind {
+    TargetImport,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ModuleBindingEvent {
+    visible_from: usize,
+    kind: ModuleBindingKind,
+}
+
+fn collect_module_binding_timeline(
+    py: &PythonAnalyzer,
+    file: &ProjectFile,
+    root: Node<'_>,
+    source: &str,
+    seeds: &BTreeSet<(ProjectFile, String)>,
+) -> HashMap<String, Vec<ModuleBindingEvent>> {
+    let mut timeline: HashMap<String, Vec<ModuleBindingEvent>> = HashMap::default();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "function_definition" | "class_definition" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    record_module_binding(
+                        &mut timeline,
+                        slice(name, source),
+                        node.end_byte(),
+                        ModuleBindingKind::Other,
+                    );
                 }
+                continue;
             }
-            "expression_statement" => {
-                if let Some(assignment) = child.named_child(0)
-                    && assignment.kind() == "assignment"
-                    && let Some(left) = assignment.child_by_field_name("left")
-                {
-                    collect_assigned_identifiers(left, source, &mut conflicts);
+            "import_statement" | "import_from_statement" => {
+                collect_import_binding_events(py, file, node, source, seeds, &mut timeline);
+                continue;
+            }
+            "assignment" | "augmented_assignment" | "named_expression" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    record_local_binding_targets(left, source, node.end_byte(), &mut timeline);
+                }
+                continue;
+            }
+            "for_statement" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    record_local_binding_targets(left, source, left.end_byte(), &mut timeline);
                 }
             }
             _ => {}
         }
+
+        let mut cursor = node.walk();
+        let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
     }
-    conflicts
+    for events in timeline.values_mut() {
+        events.sort_by_key(|event| event.visible_from);
+    }
+    timeline
+}
+
+fn collect_import_binding_events(
+    py: &PythonAnalyzer,
+    file: &ProjectFile,
+    node: Node<'_>,
+    source: &str,
+    seeds: &BTreeSet<(ProjectFile, String)>,
+    timeline: &mut HashMap<String, Vec<ModuleBindingEvent>>,
+) {
+    if node.kind() == "import_statement" {
+        let mut cursor = node.walk();
+        for imported in node.children_by_field_name("name", &mut cursor) {
+            let name = imported.child_by_field_name("name").unwrap_or(imported);
+            let Some(local) = imported
+                .child_by_field_name("alias")
+                .or_else(|| first_identifier(name))
+            else {
+                continue;
+            };
+            let module = slice(name, source).trim();
+            let target_import = py
+                .usage_resolve_module_files(file, module)
+                .iter()
+                .any(|resolved| seeds.iter().any(|(seed_file, _)| seed_file == resolved));
+            record_module_binding(
+                timeline,
+                slice(local, source),
+                node.end_byte(),
+                if target_import {
+                    ModuleBindingKind::TargetImport
+                } else {
+                    ModuleBindingKind::Other
+                },
+            );
+        }
+        return;
+    }
+
+    let Some(module_node) = node.child_by_field_name("module_name") else {
+        return;
+    };
+    let module = slice(module_node, source).trim();
+    let module_files = py.usage_resolve_module_files(file, module);
+    let mut cursor = node.walk();
+    for imported in node.children_by_field_name("name", &mut cursor) {
+        if imported.kind() == "wildcard_import" {
+            continue;
+        }
+        let name = imported.child_by_field_name("name").unwrap_or(imported);
+        let Some(imported_identifier) = last_identifier(name) else {
+            continue;
+        };
+        let imported_name = slice(imported_identifier, source).trim();
+        let Some(local) = imported
+            .child_by_field_name("alias")
+            .or_else(|| last_identifier(name))
+        else {
+            continue;
+        };
+        let direct_target = module_files
+            .iter()
+            .any(|resolved| seeds.contains(&(resolved.clone(), imported_name.to_string())));
+        let submodule = if module.ends_with('.') {
+            format!("{module}{imported_name}")
+        } else {
+            format!("{module}.{imported_name}")
+        };
+        let submodule_target = py
+            .usage_resolve_module_files(file, &submodule)
+            .iter()
+            .any(|resolved| seeds.iter().any(|(seed_file, _)| seed_file == resolved));
+        record_module_binding(
+            timeline,
+            slice(local, source),
+            node.end_byte(),
+            if direct_target || submodule_target {
+                ModuleBindingKind::TargetImport
+            } else {
+                ModuleBindingKind::Other
+            },
+        );
+    }
+}
+
+fn record_module_binding(
+    timeline: &mut HashMap<String, Vec<ModuleBindingEvent>>,
+    name: &str,
+    visible_from: usize,
+    kind: ModuleBindingKind,
+) {
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    timeline
+        .entry(name.to_string())
+        .or_default()
+        .push(ModuleBindingEvent { visible_from, kind });
+}
+
+fn record_local_binding_targets(
+    target: Node<'_>,
+    source: &str,
+    visible_from: usize,
+    timeline: &mut HashMap<String, Vec<ModuleBindingEvent>>,
+) {
+    let mut stack = vec![target];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" {
+            record_module_binding(
+                timeline,
+                slice(node, source),
+                visible_from,
+                ModuleBindingKind::Other,
+            );
+            continue;
+        }
+        if matches!(node.kind(), "attribute" | "subscript") {
+            continue;
+        }
+        let mut cursor = node.walk();
+        let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
+    }
+}
+
+fn first_identifier(node: Node<'_>) -> Option<Node<'_>> {
+    identifier_extreme(node, false)
+}
+
+fn last_identifier(node: Node<'_>) -> Option<Node<'_>> {
+    identifier_extreme(node, true)
+}
+
+fn identifier_extreme(node: Node<'_>, last: bool) -> Option<Node<'_>> {
+    let mut best = None;
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" {
+            if best.is_none_or(|current: Node<'_>| {
+                if last {
+                    node.start_byte() > current.start_byte()
+                } else {
+                    node.start_byte() < current.start_byte()
+                }
+            }) {
+                best = Some(node);
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    best
+}
+
+fn reference_is_deferred_function_body(node: Node<'_>) -> bool {
+    let site_start = node.start_byte();
+    let site_end = node.end_byte();
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if matches!(parent.kind(), "function_definition" | "lambda")
+            && parent
+                .child_by_field_name("body")
+                .is_some_and(|body| body.start_byte() <= site_start && site_end <= body.end_byte())
+        {
+            return true;
+        }
+        current = parent;
+    }
+    false
 }
 
 pub(in crate::analyzer::usages) fn collect_assigned_identifiers(
@@ -1000,9 +1252,15 @@ fn collect_scope_facts_from_source(
                 ScopeFactEvent::Assignment { lhs, rhs } => {
                     // A module-level assignment of the target's own name is its
                     // definition, not a shadow that hides an outer binding, so
-                    // it must not block the target's same-file usages.
+                    // it must not block the target's same-file usages. Its RHS
+                    // may still infer a receiver type for ordinary locals, but
+                    // seeding the queried target itself would make
+                    // `is_shadowed(target)` true and hide every later read.
                     let is_target_module_definition = is_module_scope && lhs == target_short;
-                    if !is_target_module_definition && !engine.is_shadowed(lhs) {
+                    if is_target_module_definition {
+                        continue;
+                    }
+                    if !engine.is_shadowed(lhs) {
                         engine.declare_shadow(lhs.clone());
                     }
                     if lhs.starts_with("self.") && !allow_self_receivers {
