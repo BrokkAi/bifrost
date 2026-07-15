@@ -33,7 +33,7 @@
 mod extractor;
 mod hits;
 mod inverted;
-mod receiver_analysis;
+pub(in crate::analyzer::usages) mod receiver_analysis;
 mod resolver;
 
 /// The cacheable JS/TS resolution index and its tree-free builder, exposed so the

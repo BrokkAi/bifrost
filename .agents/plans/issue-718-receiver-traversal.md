@@ -14,7 +14,7 @@ This is a bounded, demand-driven exposure of Bifrost's existing receiver facts. 
 - [x] (2026-07-15 11:46Z) Verified the pre-change baseline: 13 receiver-analysis tests and all 57 `code_query_pipelines` tests pass.
 - [x] (2026-07-15 11:46Z) Inspected the typed query IR/executor, declarative schema, public result consumers, receiver provider, get-definition member resolution, documentation harness, and current capability claims.
 - [x] (2026-07-15 11:46Z) Created this implementation plan and fixed the public names, typed domains, capture semantics, explicit outcome model, provider scope, and validation contract.
-- [ ] Milestone 1: add the analyzer-owned receiver query service, work reporting, and focused JS/TS provider tests.
+- [x] (2026-07-15 12:34Z) Milestone 1: added the analyzer-owned receiver query service, shared member-site resolution, exact factory provenance, work/truncation reports, cancellation, and focused JS/TS tests.
 - [ ] Milestone 2: add JSON/RQL steps, the receiver-analysis pipeline/result domain, consumers, and end-to-end tests.
 - [ ] Milestone 3: add the executable cookbook and update every relevant public capability/query document.
 - [ ] Milestone 4: review the complete diff, repair findings, and run the full repository validation bundle.
@@ -35,6 +35,12 @@ This is a bounded, demand-driven exposure of Bifrost's existing receiver facts. 
 
 - Observation: Both docs and the MCP description currently make blanket statements that `query_code` does not perform points-to or receiver-value analysis.
   Evidence: repository search finds those statements in `docs/src/content/docs/` and `src/mcp_extended.rs`; they must be narrowed to distinguish this bounded JS/TS capability from unsupported whole-program analysis.
+
+- Observation: `ReceiverValue::FactoryReturn` existed in the shared model but no provider path constructed it.
+  Evidence: the first service provenance test returned the allocation directly; wrapping local, imported, and static factory summaries with their exact indexed `CodeUnit` made the recursive public contract real instead of merely serializable.
+
+- Observation: Cargo's non-test library build reports the new service as dead code until Milestone 2 wires it into structural traversal.
+  Evidence: the receiver and pipeline tests pass, while the integration-test build warns on the not-yet-consumed service types. This is an expected transient milestone state and will be eliminated by the query executor integration rather than suppressed.
 
 ## Decision Log
 
@@ -62,9 +68,13 @@ This is a bounded, demand-driven exposure of Bifrost's existing receiver facts. 
   Rationale: Receiver analysis must not create an unmetered nested traversal, and budget tests must not depend on timing or source size accidents.
   Date/Author: 2026-07-15 / user and Codex
 
+- Decision: Wrap every summarized local, imported, or static factory result at the provider boundary with the exact indexed factory declaration.
+  Rationale: Reconstructing factory provenance in a renderer would be impossible and would let get-definition, usage analysis, and query traversal disagree about the underlying value.
+  Date/Author: 2026-07-15 / Codex
+
 ## Outcomes & Retrospective
 
-Implementation has not started. The branch is synchronized, the existing focused baselines are green, and the public/implementation contracts are fixed below.
+Milestone 1 is complete. The analyzer-owned service accepts an exact file/range and operation, checks cancellation, uses indexed JS/TS source and tree-sitter nodes, and returns explicit supported or unsupported reports. Provider reports now expose actual scope-node and summary-expansion work and candidate truncation. Member-site extraction is shared with get-definition, and factory summaries retain exact recursive provenance. The 13 receiver baseline, 5 focused service tests, and all 57 query-pipeline tests pass. Structural query integration and public consumers remain for Milestone 2.
 
 ## Context and Orientation
 
@@ -172,6 +182,8 @@ Canonical outcome labels:
     precise, ambiguous, unknown, unsupported, exceeded_budget
 
 Revision note (2026-07-15): Created the implementation-ready ExecPlan after rebasing onto current master, verifying focused baselines, and fixing the public outcome, domain, provider, budget, consumer, documentation, and validation contracts.
+
+Revision note (2026-07-15): Completed Milestone 1 with a shared analyzer service, real work/truncation reports, exact factory wrapping, cancellation, unsupported-language results, and focused regression coverage.
 
 ## Interfaces and Dependencies
 

@@ -23,6 +23,13 @@ pub(crate) enum ReceiverAnalysisOutcome<T> {
 }
 
 impl<T> ReceiverAnalysisOutcome<T> {
+    pub(crate) fn values(&self) -> Option<&[T]> {
+        match self {
+            Self::Precise(values) | Self::Ambiguous(values) => Some(values),
+            Self::Unknown | Self::Unsupported { .. } | Self::ExceededBudget { .. } => None,
+        }
+    }
+
     pub(crate) fn is_precise(&self) -> bool {
         matches!(self, Self::Precise(_))
     }
@@ -263,6 +270,35 @@ pub(crate) struct ReceiverAnalysisBudgetTracker {
     scope_nodes: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) struct ReceiverAnalysisWork {
+    pub(crate) summary_expansions: usize,
+    pub(crate) scope_nodes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReceiverAnalysisReport<T> {
+    pub(crate) outcome: ReceiverAnalysisOutcome<T>,
+    pub(crate) work: ReceiverAnalysisWork,
+    pub(crate) candidates_truncated: bool,
+}
+
+impl<T> ReceiverAnalysisReport<T> {
+    pub(crate) fn without_work(
+        outcome: ReceiverAnalysisOutcome<T>,
+        budget: ReceiverAnalysisBudget,
+    ) -> Self {
+        let candidates_truncated = outcome
+            .values()
+            .is_some_and(|values| values.len() > budget.max_targets);
+        Self {
+            outcome,
+            work: ReceiverAnalysisWork::default(),
+            candidates_truncated,
+        }
+    }
+}
+
 impl ReceiverAnalysisBudgetTracker {
     pub(crate) fn new(budget: ReceiverAnalysisBudget) -> Self {
         Self {
@@ -287,6 +323,27 @@ impl ReceiverAnalysisBudgetTracker {
             Err(ReceiverBudgetLimit::ScopeNodes)
         } else {
             Ok(())
+        }
+    }
+
+    pub(crate) fn work(&self) -> ReceiverAnalysisWork {
+        ReceiverAnalysisWork {
+            summary_expansions: self.summary_expansions,
+            scope_nodes: self.scope_nodes,
+        }
+    }
+
+    pub(crate) fn report<T>(
+        &self,
+        outcome: ReceiverAnalysisOutcome<T>,
+    ) -> ReceiverAnalysisReport<T> {
+        let candidates_truncated = outcome
+            .values()
+            .is_some_and(|values| values.len() > self.budget.max_targets);
+        ReceiverAnalysisReport {
+            outcome,
+            work: self.work(),
+            candidates_truncated,
         }
     }
 }

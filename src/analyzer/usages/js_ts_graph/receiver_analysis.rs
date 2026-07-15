@@ -14,8 +14,8 @@ use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
 use crate::analyzer::usages::model::{ImportBinder, ImportKind};
 use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisBudgetTracker, ReceiverAnalysisCacheKey,
-    ReceiverAnalysisOutcome, ReceiverAnalysisQuery, ReceiverContext, ReceiverFactProvider,
-    ReceiverSummaryQuery, ReceiverValue,
+    ReceiverAnalysisOutcome, ReceiverAnalysisQuery, ReceiverAnalysisReport, ReceiverContext,
+    ReceiverFactProvider, ReceiverSummaryQuery, ReceiverValue,
 };
 use crate::analyzer::{
     AliasResolver, BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile, Range,
@@ -41,6 +41,12 @@ pub(crate) struct JsTsReceiverFactProvider<'tree, 'a> {
     member_target_cache:
         RefCell<HashMap<ReceiverAnalysisCacheKey, ReceiverAnalysisOutcome<CodeUnit>>>,
     jsx_props_owner_cache: RefCell<HashMap<(ProjectFile, String), Vec<CodeUnit>>>,
+}
+
+pub(in crate::analyzer::usages) struct JsTsMemberTargetReport {
+    pub(crate) receiver_range: Range,
+    pub(crate) member_name: String,
+    pub(crate) analysis: ReceiverAnalysisReport<CodeUnit>,
 }
 
 impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
@@ -77,9 +83,18 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         node: Node<'tree>,
         budget: ReceiverAnalysisBudget,
     ) -> ReceiverAnalysisOutcome<ReceiverValue> {
+        self.resolve_receiver_node_report(node, budget).outcome
+    }
+
+    pub(crate) fn resolve_receiver_node_report(
+        &self,
+        node: Node<'tree>,
+        budget: ReceiverAnalysisBudget,
+    ) -> ReceiverAnalysisReport<ReceiverValue> {
         let _scope = profiling::scope("jsts.receiver_analysis.resolve_receiver_node");
         let mut tracker = ReceiverAnalysisBudgetTracker::new(budget);
-        self.resolve_expression(node, 0, budget, &mut tracker)
+        let outcome = self.resolve_expression(node, 0, budget, &mut tracker);
+        tracker.report(outcome)
     }
 
     pub(crate) fn resolve_iterable_element(
@@ -118,6 +133,17 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         _before_byte: usize,
         budget: ReceiverAnalysisBudget,
     ) -> ReceiverAnalysisOutcome<CodeUnit> {
+        self.resolve_member_targets_report(receiver, member, _before_byte, budget)
+            .outcome
+    }
+
+    pub(crate) fn resolve_member_targets_report(
+        &self,
+        receiver: Node<'tree>,
+        member: &str,
+        _before_byte: usize,
+        budget: ReceiverAnalysisBudget,
+    ) -> ReceiverAnalysisReport<CodeUnit> {
         let _scope = profiling::scope("jsts.receiver_analysis.resolve_member_targets");
         let query = ReceiverAnalysisQuery {
             language: self.language,
@@ -130,7 +156,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         };
         let cache_key = ReceiverAnalysisCacheKey::for_receiver(&query);
         if let Some(cached) = self.member_target_cache.borrow().get(&cache_key).cloned() {
-            return cached;
+            return ReceiverAnalysisReport::without_work(cached, budget);
         }
         let mut tracker = ReceiverAnalysisBudgetTracker::new(budget);
         let outcome = match self.resolve_expression(receiver, 0, budget, &mut tracker) {
@@ -163,7 +189,34 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         self.member_target_cache
             .borrow_mut()
             .insert(cache_key, outcome.clone());
-        outcome
+        tracker.report(outcome)
+    }
+
+    pub(crate) fn resolve_member_targets_at_site(
+        &self,
+        site: Node<'tree>,
+        expected_member: Option<&str>,
+        before_byte: usize,
+        budget: ReceiverAnalysisBudget,
+    ) -> Option<JsTsMemberTargetReport> {
+        let member_expression = member_expression_at_site(site)?;
+        let property = member_expression.child_by_field_name("property")?;
+        let member_name = slice(property, self.source);
+        if member_name.is_empty() || expected_member.is_some_and(|expected| expected != member_name)
+        {
+            return None;
+        }
+        let receiver = member_expression.child_by_field_name("object")?;
+        Some(JsTsMemberTargetReport {
+            receiver_range: node_range(receiver),
+            member_name: member_name.to_string(),
+            analysis: self.resolve_member_targets_report(
+                receiver,
+                member_name,
+                before_byte,
+                budget,
+            ),
+        })
     }
 
     pub(crate) fn resolve_contextual_object_literal_key_targets(
@@ -729,7 +782,13 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         let functions = self.visible_function_declarations_named(name, site);
         let mut outcomes: Vec<_> = functions
             .into_iter()
-            .map(|function| self.summarize_function_body(function, depth + 1, budget, tracker))
+            .filter_map(|function| {
+                let factory = self.function_unit_for_node(name, function)?;
+                Some(wrap_factory_outcome(
+                    self.summarize_function_body(function, depth + 1, budget, tracker),
+                    &factory,
+                ))
+            })
             .collect();
         if let Some(imported) = self.summarize_imported_function(name, depth + 1, budget, tracker) {
             outcomes.push(imported);
@@ -795,7 +854,10 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 imports,
             );
             for node in nodes_for_code_unit(self.analyzer, &function, tree.root_node()) {
-                outcomes.push(provider.summarize_function_body(node, depth + 1, budget, tracker));
+                outcomes.push(wrap_factory_outcome(
+                    provider.summarize_function_body(node, depth + 1, budget, tracker),
+                    &function,
+                ));
             }
         }
         (!outcomes.is_empty())
@@ -826,14 +888,25 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         };
         let mut methods = Vec::new();
         for value in values {
-            methods.extend(self.class_method_nodes(value.owner(), member));
+            for factory in self.member_targets(value.owner(), member) {
+                methods.extend(
+                    nodes_for_code_unit(self.analyzer, &factory, self.root)
+                        .into_iter()
+                        .map(|node| (node, factory.clone())),
+                );
+            }
         }
         if methods.is_empty() {
             return ReceiverAnalysisOutcome::Unknown;
         }
         let outcomes: Vec<_> = methods
             .into_iter()
-            .map(|method| self.summarize_function_body(method, depth + 1, budget, tracker))
+            .map(|(method, factory)| {
+                wrap_factory_outcome(
+                    self.summarize_function_body(method, depth + 1, budget, tracker),
+                    &factory,
+                )
+            })
             .collect();
         ReceiverAnalysisOutcome::merge_branch_outcomes(outcomes, budget)
     }
@@ -928,31 +1001,16 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             .unwrap_or_default()
     }
 
-    fn class_method_nodes(&self, owner: &CodeUnit, member: &str) -> Vec<Node<'tree>> {
-        let mut methods = Vec::new();
-        for class_node in self.class_declaration_nodes(owner.identifier()) {
-            let Some(body) = class_node.child_by_field_name("body") else {
-                continue;
-            };
-            let mut cursor = body.walk();
-            for child in body.named_children(&mut cursor) {
-                if child.kind() == "method_definition"
-                    && child
-                        .child_by_field_name("name")
-                        .is_some_and(|name| node_text_matches(name, self.source, member))
-                {
-                    methods.push(child);
-                }
-            }
-        }
-        methods
-    }
-
-    fn class_declaration_nodes(&self, name: &str) -> Vec<Node<'tree>> {
-        self.class_declarations_by_name
-            .get(name)
-            .cloned()
-            .unwrap_or_default()
+    fn function_unit_for_node(&self, name: &str, node: Node<'_>) -> Option<CodeUnit> {
+        self.support
+            .file_identifier(self.file, name)
+            .into_iter()
+            .filter(|unit| unit.source() == self.file && unit.is_function())
+            .find(|unit| {
+                self.analyzer.ranges(unit).iter().any(|range| {
+                    node.start_byte() <= range.start_byte && range.end_byte <= node.end_byte()
+                })
+            })
     }
 
     fn visible_class_declaration_nodes(&self, name: &str, site: Node<'tree>) -> Vec<Node<'tree>> {
@@ -1357,7 +1415,7 @@ fn is_nonlinear_control_boundary(kind: &str) -> bool {
     )
 }
 
-fn smallest_named_node_covering<'tree>(
+pub(in crate::analyzer::usages) fn smallest_named_node_covering<'tree>(
     root: Node<'tree>,
     start_byte: usize,
     end_byte: usize,
@@ -1479,13 +1537,54 @@ fn node_text_matches(node: Node<'_>, source: &str, expected: &str) -> bool {
     slice(node, source) == expected
 }
 
-fn node_range(node: Node<'_>) -> Range {
+fn wrap_factory_outcome(
+    outcome: ReceiverAnalysisOutcome<ReceiverValue>,
+    factory: &CodeUnit,
+) -> ReceiverAnalysisOutcome<ReceiverValue> {
+    let wrap = |value| ReceiverValue::FactoryReturn {
+        factory: factory.clone(),
+        value: Box::new(value),
+    };
+    match outcome {
+        ReceiverAnalysisOutcome::Precise(values) => {
+            ReceiverAnalysisOutcome::Precise(values.into_iter().map(wrap).collect())
+        }
+        ReceiverAnalysisOutcome::Ambiguous(values) => {
+            ReceiverAnalysisOutcome::Ambiguous(values.into_iter().map(wrap).collect())
+        }
+        ReceiverAnalysisOutcome::Unknown => ReceiverAnalysisOutcome::Unknown,
+        ReceiverAnalysisOutcome::Unsupported { reason } => {
+            ReceiverAnalysisOutcome::Unsupported { reason }
+        }
+        ReceiverAnalysisOutcome::ExceededBudget { limit } => {
+            ReceiverAnalysisOutcome::ExceededBudget { limit }
+        }
+    }
+}
+
+pub(in crate::analyzer::usages) fn node_range(node: Node<'_>) -> Range {
     Range {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
         start_line: node.start_position().row,
         end_line: node.end_position().row,
     }
+}
+
+fn member_expression_at_site(mut node: Node<'_>) -> Option<Node<'_>> {
+    for _ in 0..4 {
+        if node.kind() == "member_expression" {
+            return Some(node);
+        }
+        if node.kind() == "call_expression"
+            && let Some(function) = node.child_by_field_name("function")
+            && function.kind() == "member_expression"
+        {
+            return Some(function);
+        }
+        node = node.parent()?;
+    }
+    None
 }
 
 fn sort_units(units: &mut [CodeUnit]) {
@@ -1567,7 +1666,7 @@ export function caller() {
         );
         let receiver = receiver_node(tree.root_node(), source, "service.run", "service");
 
-        let outcome = provider.resolve_member_targets(
+        let report = provider.resolve_member_targets_report(
             receiver,
             "run",
             receiver.start_byte(),
@@ -1575,12 +1674,14 @@ export function caller() {
         );
 
         assert_eq!(
-            outcome,
+            report.outcome,
             ReceiverAnalysisOutcome::ExceededBudget {
                 limit: "scope_nodes"
             }
         );
-        assert!(outcome.is_terminal_for_graph());
+        assert!(report.outcome.is_terminal_for_graph());
+        assert_eq!(report.work.scope_nodes, 2);
+        assert!(!report.candidates_truncated);
     }
 
     #[test]
@@ -1664,7 +1765,7 @@ export function caller(which: number) {
         );
         let receiver = receiver_node(tree.root_node(), source, "service.run", "service");
 
-        let outcome = provider.resolve_member_targets(
+        let report = provider.resolve_member_targets_report(
             receiver,
             "run",
             receiver.start_byte(),
@@ -1672,9 +1773,12 @@ export function caller(which: number) {
         );
 
         assert!(
-            matches!(outcome, ReceiverAnalysisOutcome::Ambiguous(ref targets) if targets.len() > DEFAULT_RECEIVER_MAX_TARGETS),
-            "expected fanout to become ambiguous, got {outcome:?}"
+            matches!(report.outcome, ReceiverAnalysisOutcome::Ambiguous(ref targets) if targets.len() > DEFAULT_RECEIVER_MAX_TARGETS),
+            "expected fanout to become ambiguous, got {:?}",
+            report.outcome
         );
-        assert!(outcome.is_terminal_for_graph());
+        assert!(report.outcome.is_terminal_for_graph());
+        assert!(report.candidates_truncated);
+        assert!(report.work.summary_expansions > 0);
     }
 }
