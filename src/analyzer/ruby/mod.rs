@@ -10,9 +10,10 @@ mod tests;
 use crate::analyzer::js_ts::build_weighted_cache;
 use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, CodeUnitType, IAnalyzer,
-    ImportAnalysisProvider, Language, PoolSafeMemo, Project, ProjectFile, RubyMethodDispatchMode,
-    SignatureMetadata, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, CodeUnitType,
+    DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project,
+    ProjectFile, RubyMethodDispatchMode, SignatureMetadata, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -21,10 +22,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::RubyAdapter;
-use cache::{
-    weight_code_unit_set, weight_code_unit_set_by_unit, weight_code_unit_vec,
-    weight_project_file_set,
-};
+use cache::{weight_code_unit_set, weight_code_unit_vec, weight_project_file_set};
 
 pub(crate) use declarations::{
     RubyFieldScope, extract_name_path, extract_name_segments, parse_ruby_tree,
@@ -39,8 +37,7 @@ pub struct RubyAnalyzer {
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
-    direct_descendant_index: Arc<OnceLock<HashMap<CodeUnit, Arc<HashSet<CodeUnit>>>>>,
+    direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     autoload_constant_files: Arc<OnceLock<HashMap<String, HashSet<ProjectFile>>>>,
     zeitwerk_project: Arc<OnceLock<bool>>,
@@ -100,7 +97,6 @@ impl RubyAnalyzer {
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
-            direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             autoload_constant_files: Arc::new(OnceLock::new()),

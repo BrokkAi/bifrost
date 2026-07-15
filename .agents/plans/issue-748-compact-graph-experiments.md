@@ -23,7 +23,7 @@ The work happens on branch `748-explore-compact-csrcsc-graph-representations-for
 - [x] (2026-07-15T14:47:31Z) Added and captured a generated file-dependency baseline that exercises both import-based PageRank and complete reverse RQL traversal with identical files and edges.
 - [x] (2026-07-15T15:11:55Z) Introduced shared compact rows plus directed CSR/CSC storage, migrated import PageRank and completed RQL import graphs, measured alternating optimized A/B binaries, and promoted the candidate.
 - [x] (2026-07-15T15:29:00Z) Added and captured a generated exact-identity hierarchy/ownership baseline covering reverse-index construction, direct and transitive reads, RQL subtypes, members-owner round trips, and standalone owner lookup.
-- [ ] Prototype compact hierarchy and ownership relations using exact `CodeUnit` identity, repeat the baseline, and make a promote-or-discard decision.
+- [x] (2026-07-15T15:40:44Z) Replaced the common rich reverse hierarchy map and redundant per-key memo sets with exact-identity keyed CSR rows, measured alternating optimized A/B binaries, promoted hierarchy CSR, and rejected a workspace CSC for query-local singular ownership.
 - [ ] Adapt the dense-ID `WorkspaceUsageGraph` introduced by #781 to contiguous outgoing and incoming edge storage without reintroducing rich-key construction, then measure graph construction, PageRank, public rendering, and memory.
 - [ ] Run the checked-in performance regression suite on representative pinned repositories, complete final review and CI-equivalent validation, publish the conclusion to #748, and summarize which structures should remain map-based.
 
@@ -77,6 +77,12 @@ The work happens on branch `748-explore-compact-csrcsc-graph-representations-for
 - Observation: the generated 800-type / 799-edge hierarchy makes reverse-index construction and both ownership paths measurable without exhausting provenance budgets. The first direct-descendant lookup costs 242.494 ms and raises peak RSS by 7,405,568 bytes; warm transitive provider reads are 1.449 ms, warm RQL subtypes are 459.111 ms, members-owner is 866.424 ms, and standalone owner is 722.372 ms.
   Evidence: `tests/measure_hierarchy_relations.rs` uses a breadth-four bounded-depth Java tree, four member methods per type, exact result-count assertions, one analyzer thread, and seven warm iterations.
 
+- Observation: a one-way keyed CSR is a better hierarchy shape than the bidirectional `CompactDirectedGraph`. Only ancestors with outgoing rows need hash lookup; every descendant can remain a dense arena ID, and no incoming orientation is consumed because direct ancestors already come from language-specific structured resolution.
+  Evidence: `DirectDescendantIndex` retains one exact `CodeUnit` arena, `HashMap<CodeUnit, u32>` only for ancestors with rows, and `CompactRows<u32>` descendants. At 800 types, only about 200 breadth-four parents require row lookup rather than all 800 nodes.
+
+- Observation: the old per-key `direct_descendants` memo caches duplicated the global reverse index without removing return allocations. Every lookup cloned a cached `HashSet`, while the compact index can collect the same owned API result directly from a slice; removing these caches improved traversal and lowers retained state after broad queries.
+  Evidence: across three alternating release processes, full provider descendants fell from 0.516 ms to 0.219 ms first (57.6%) and from 0.224 ms to 0.192 ms warm (14.1%). RQL subtypes remained at parity because structural matching and provenance rendering dominate that path.
+
 ## Decision Log
 
 - Decision: begin with structural fact roles and keep the first compact representation local to `FileFacts` until its measurements are known.
@@ -111,9 +117,17 @@ The work happens on branch `748-explore-compact-csrcsc-graph-representations-for
   Rationale: usage ranking can retain its weighted vectors until its own experiment, while unweighted compact imports expose CSR/CSC rows directly. This isolates numerical PageRank from storage layout and removes the import path's last per-row reconstruction allocation.
   Date/Author: 2026-07-15 / Codex
 
+- Decision: promote one-way exact-identity CSR for the shared reverse hierarchy index and remove its redundant per-key descendant memo caches.
+  Rationale: the common Java, C#, C++, Python, Ruby, PHP, Scala, JavaScript, and TypeScript path has immutable reverse rows, and the optimized A/B shows materially faster provider traversal plus a repeatable 606,208-byte lower peak after hierarchy traversal at only 800 types. Exact duplicate-FQN and module-scoped identity tests remain green. Go and Rust retain their specialized indexes until measured independently.
+  Date/Author: 2026-07-15 / Codex
+
+- Decision: do not introduce workspace CSC or eager dense identity for RQL ownership in this milestone.
+  Rationale: ownership is singular and already stored per file as parent-to-child facts; `members | owner` records its exact reverse relation query-locally, and standalone `owner` scans only the member's file under the existing work budget. Optimized owner timings stayed at parity after hierarchy compaction, so a workspace graph would add lifecycle and memory cost without evidence of benefit. A future immutable per-file `children` layout should use a single-parent reverse array rather than general CSC.
+  Date/Author: 2026-07-15 / Codex
+
 ## Outcomes & Retrospective
 
-The structural-role and file-dependency experiments are promoted. The latter justifies the first shared crate-private compact-relation primitives while preserving separate construction lifecycles for RQL and relevance. The next experiment evaluates whether exact-identity hierarchy and ownership relations benefit from the same rows or from a simpler single-owner reverse array.
+The structural-role, file-dependency, and reverse-hierarchy experiments are promoted. Together they justify shared crate-private compact row mechanics while preserving domain-specific identities and lifecycles. RQL ownership is explicitly not promoted to a workspace graph: its singular, per-file, query-local shape does not justify CSC. The next experiment adapts the already dense usage graph to weighted contiguous adjacency and measures whether construction or only reads benefit.
 
 Milestone 1 outcome 2026-07-15T14:20:00Z: the representation-neutral benchmark is implemented and exercises nonzero facts and semantic role edges. Synthetic retained storage scales from 7,844,400 bytes at 36,100 facts to 123,759,200 bytes at 564,400 facts. The real `vscode` run establishes a 1.530 GB retained-storage baseline and proves the role representation is large enough for the pilot to produce a meaningful signal.
 
@@ -124,6 +138,8 @@ Milestone 3 baseline 2026-07-15T14:47:31Z: `tests/measure_file_dependency_graph.
 Milestone 3 outcome 2026-07-15T15:11:55Z: `CompactRows<T>` now owns validated contiguous row offsets and values, and `CompactDirectedGraph<K>` adds snapshot-local exact identities with sorted outgoing CSR and incoming CSC. Structural roles reuse the row primitive without changing their measured representation. Relevance emits dense import edges during its existing two-hop exploration and PageRank traverses compact rows directly through a storage-neutral adjacency view. RQL retains its incremental forward map and diagnostics until reverse traversal completes or truncates, then consumes that map into compact forward and reverse rows and drops redundant construction state. Three alternating optimized runs at 1,000 files / 17,982 edges moved median first relevance from 331.219 ms to 312.926 ms, warm relevance from 38.618 ms to 17.818 ms, first RQL traversal from 199.590 ms to 203.174 ms, and warm RQL traversal from 133.480 ms to 131.658 ms. Median peak RSS after relevance fell by 966,656 bytes and after RQL by 1,179,648 bytes. The first-RQL difference is within run variance; warm RQL reads are at parity. Exact output-count assertions, 86 structural tests, four PageRank unit tests, 27 relevance integration tests, 57 query-pipeline tests, formatting, and all-target/all-feature Clippy with warnings denied pass. The candidate is promoted.
 
 Milestone 4 baseline 2026-07-15T15:29:00Z: `tests/measure_hierarchy_relations.rs` generates one exact Java declaration per file in a bounded-depth breadth-four tree, with four member methods that call a local sink. At 800 types / 799 hierarchy edges, analyzer construction is 668.868 ms; the first direct-descendant lookup that materializes the global reverse index is 242.494 ms and its warm median is 0.001 ms; full provider descendants are 3.209 ms first and 1.449 ms warm. RQL transitive subtypes are 466.728 ms first and 459.111 ms warm; all-class `members | owner` is 960.740 ms first and 866.424 ms warm; standalone call-site `enclosing_decl | owner` is 722.748 ms first and 722.372 ms warm. Peak RSS rises from 36,896,768 after analyzer construction to 44,302,336 after hierarchy-index construction, 53,116,928 after RQL subtypes, 87,490,560 after members-owner, and 98,222,080 after standalone owner. The next change will compact only the shared global reverse hierarchy index first; the query-local ownership path remains a separately measured promote-or-discard decision.
+
+Milestone 4 outcome 2026-07-15T15:40:44Z: the common reverse hierarchy index now stores exact `CodeUnit` identities once, hash-indexes only ancestors that own rows, and retains all descendant endpoints in `CompactRows<u32>`. Nine providers no longer retain a second weighted Moka cache of per-key descendant sets. In three alternating release process runs, median first full-descendant traversal moved from 0.516 ms to 0.219 ms and warm traversal from 0.224 ms to 0.192 ms. RQL subtypes were 156.554 ms versus 156.598 ms first and 156.296 ms versus 155.590 ms warm; members-owner was 289.814 ms versus 290.238 ms warm; standalone owner was 236.270 ms versus 237.158 ms warm. Those end-to-end paths are at parity. Median peak RSS after the hierarchy query fell from 42,876,928 to 42,270,720 bytes; after the complete ownership workload it fell from 81,248,256 to 80,773,120 bytes. All 182 focused hierarchy, update/cache, exact-identity pipeline, and language-provider tests pass, as does all-target/all-feature Clippy with warnings denied. Hierarchy CSR is promoted; ownership CSC is discarded.
 
 ## Context and Orientation
 
@@ -249,6 +265,12 @@ File-dependency optimized A/B at the `868c8d9f49c625be8ca3bbcf9ba9de46f49a666e` 
 
     candidate relevance_first_ms=312.926 relevance_warm_median_ms=17.818 importers_first_ms=203.174 importers_warm_median_ms=131.658 rss_after_relevance=88522752 rss_after_importers=111935488
 
+Hierarchy/ownership optimized A/B at baseline commit `05033258e0afa80e12e54a6c37e6c9f71ed54f1e` and its compact candidate, single-threaded release test profile, 800 types / 799 edges / four member methods / seven warm iterations. Each figure is the median of three alternating preserved-binary process runs:
+
+    baseline direct_first_ms=75.476 descendants_first_ms=0.516 descendants_warm_median_ms=0.224 rql_subtypes_first_ms=156.554 rql_subtypes_warm_median_ms=156.296 members_owner_warm_median_ms=289.814 standalone_owner_warm_median_ms=236.270 rss_after_hierarchy_index=34390016 rss_after_rql_subtypes=42876928 rss_after_standalone_owner=81248256
+
+    candidate direct_first_ms=75.694 descendants_first_ms=0.219 descendants_warm_median_ms=0.192 rql_subtypes_first_ms=156.598 rql_subtypes_warm_median_ms=155.590 members_owner_warm_median_ms=290.238 standalone_owner_warm_median_ms=237.158 rss_after_hierarchy_index=34275328 rss_after_rql_subtypes=42270720 rss_after_standalone_owner=80773120
+
 ## Interfaces and Dependencies
 
 The first benchmark may add representation-neutral methods to `FileFacts`:
@@ -279,3 +301,5 @@ Revision note 2026-07-15T14:47:31Z: Added the file-dependency benchmark, recorde
 Revision note 2026-07-15T15:11:55Z: Promoted shared compact rows and directed CSR/CSC after alternating optimized A/B runs showed substantially faster direct PageRank reads, RQL read parity, modest repeatable RSS savings, and focused behavior plus lint validation.
 
 Revision note 2026-07-15T15:29:00Z: Added the exact-identity hierarchy and ownership benchmark, captured its 800-type baseline, and narrowed the first candidate to the common retained reverse hierarchy index because ownership is currently singular, per-file, and query-local in the RQL path.
+
+Revision note 2026-07-15T15:40:44Z: Promoted exact-identity one-way hierarchy CSR after alternating optimized A/B and cross-language validation; recorded that RQL ownership should remain query-local and use a single-parent reverse array only if per-file child storage is later compacted.

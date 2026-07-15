@@ -10,16 +10,17 @@ mod tests;
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::cache::{
-    build_weighted_cache, weight_code_unit_set, weight_code_unit_set_by_unit,
-    weight_code_unit_vec_by_unit, weight_project_file_set,
+    build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
+    weight_project_file_set,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BulkFileStateSource, CodeUnit, IAnalyzer,
-    ImportAnalysisProvider, Language, PoolSafeMemo, Project, ProjectFile, SignatureMetadata,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeHierarchyProvider, UsageFactsIndex, build_direct_descendant_index,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BulkFileStateSource, CodeUnit,
+    DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project,
+    ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex,
+    build_direct_descendant_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -128,12 +129,11 @@ pub struct ScalaAnalyzer {
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     importable_declarations_by_package: Arc<OnceLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
     same_package_reference_index:
         Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
-    direct_descendant_index: Arc<OnceLock<HashMap<CodeUnit, Arc<HashSet<CodeUnit>>>>>,
+    direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
     /// Analyzer-cached Scala usage/type-resolution support, built once per
     /// analyzer generation and reset on `update`/`update_all`.
     project_types: Arc<OnceLock<Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes>>>,
@@ -198,7 +198,6 @@ impl ScalaAnalyzer {
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
-            direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             importable_declarations_by_package: Arc::new(OnceLock::new()),
             same_package_reference_index: Arc::new(PoolSafeMemo::new()),

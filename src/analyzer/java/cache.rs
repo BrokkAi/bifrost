@@ -1,5 +1,5 @@
 use super::*;
-use crate::analyzer::PoolSafeMemo;
+use crate::analyzer::{DirectDescendantIndex, PoolSafeMemo};
 use moka::sync::Cache;
 use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
@@ -11,8 +11,7 @@ pub(super) struct JavaMemoCaches {
     pub(super) referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     pub(super) relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
     pub(super) direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    pub(super) direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
-    pub(super) direct_descendant_index: OnceLock<HashMap<CodeUnit, Arc<HashSet<CodeUnit>>>>,
+    pub(super) direct_descendant_index: OnceLock<DirectDescendantIndex>,
     pub(super) reverse_import_index: PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     pub(super) same_package_reference_index:
         PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
@@ -27,7 +26,6 @@ impl JavaMemoCaches {
             referencing_files: Self::build_cache(budget_bytes / 8, weight_project_file_set),
             relevant_imports: Self::build_cache(budget_bytes / 8, weight_string_set),
             direct_ancestors: Self::build_cache(budget_bytes / 8, weight_code_unit_vec),
-            direct_descendants: Self::build_cache(budget_bytes / 8, weight_code_unit_set),
             direct_descendant_index: OnceLock::new(),
             reverse_import_index: PoolSafeMemo::new(),
             same_package_reference_index: PoolSafeMemo::new(),
@@ -74,10 +72,6 @@ fn weight_code_unit_vec(key: &CodeUnit, value: &Arc<Vec<CodeUnit>>) -> u32 {
     weight_bytes(estimate_code_unit(key) + estimate_code_unit_vec(value.as_ref()))
 }
 
-fn weight_code_unit_set(key: &CodeUnit, value: &Arc<HashSet<CodeUnit>>) -> u32 {
-    weight_bytes(estimate_code_unit(key) + estimate_code_unit_set(value.as_ref()))
-}
-
 fn weight_bytes(bytes: u64) -> u32 {
     bytes.clamp(1, u32::MAX as u64) as u32
 }
@@ -118,8 +112,4 @@ fn estimate_string_set(values: &HashSet<String>) -> u64 {
 
 fn estimate_code_unit_vec(values: &[CodeUnit]) -> u64 {
     size_of::<Vec<CodeUnit>>() as u64 + values.iter().map(estimate_code_unit).sum::<u64>()
-}
-
-fn estimate_code_unit_set(values: &HashSet<CodeUnit>) -> u64 {
-    size_of::<HashSet<CodeUnit>>() as u64 + values.iter().map(estimate_code_unit).sum::<u64>()
 }

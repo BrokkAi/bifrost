@@ -4,8 +4,8 @@ use crate::analyzer::clone_detection::{
 };
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::cache::{
-    build_weighted_cache, weight_code_unit_set, weight_code_unit_set_by_unit,
-    weight_code_unit_vec_by_unit, weight_project_file_set, weight_string_set,
+    build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
+    weight_project_file_set, weight_string_set,
 };
 use crate::analyzer::js_ts::clones::{
     build_js_ts_clone_ast_signature, normalized_clone_tokens_js_ts, refine_js_ts_clone_similarity,
@@ -33,10 +33,11 @@ use crate::analyzer::usages::js_ts_graph::{
     JsTsUsageIndex, build_jsts_usage_index, build_jsts_usage_index_with_cancellation,
 };
 use crate::analyzer::{
-    AliasResolver, AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
-    ImportAnalysisProvider, ImportInfo, Language, LanguageAdapter, ParameterMetadata, PoolSafeMemo,
-    Project, ProjectFile, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    AliasResolver, AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit,
+    DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
+    LanguageAdapter, ParameterMetadata, PoolSafeMemo, Project, ProjectFile, SemanticDiagnostic,
+    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeHierarchyProvider,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -210,8 +211,7 @@ struct JsMemoCaches {
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     relevant_imports: Cache<CodeUnit, Arc<HashSet<String>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
-    direct_descendant_index: OnceLock<HashMap<CodeUnit, Arc<HashSet<CodeUnit>>>>,
+    direct_descendant_index: OnceLock<DirectDescendantIndex>,
     reverse_import_index: PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     /// Analyzer-cached JS/TS usage-resolution maps, built once and reused across queries.
     /// Reset (with the rest of this bucket) on `update`/`update_all`.
@@ -225,10 +225,6 @@ impl JsMemoCaches {
             referencing_files: build_weighted_cache(budget_bytes / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(budget_bytes / 6, weight_string_set),
             direct_ancestors: build_weighted_cache(budget_bytes / 8, weight_code_unit_vec_by_unit),
-            direct_descendants: build_weighted_cache(
-                budget_bytes / 8,
-                weight_code_unit_set_by_unit,
-            ),
             direct_descendant_index: OnceLock::new(),
             reverse_import_index: PoolSafeMemo::new(),
             jsts_usage_index: PoolSafeMemo::new(),
@@ -519,21 +515,10 @@ impl TypeHierarchyProvider for JavascriptAnalyzer {
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
-        if let Some(cached) = self.memo_caches.direct_descendants.get(code_unit) {
-            return (*cached).clone();
-        }
-
-        let descendants = self
-            .memo_caches
+        self.memo_caches
             .direct_descendant_index
             .get_or_init(|| build_direct_descendant_index_by_unit(self, self))
-            .get(code_unit)
-            .map(|descendants| descendants.as_ref().clone())
-            .unwrap_or_default();
-        self.memo_caches
-            .direct_descendants
-            .insert(code_unit.clone(), Arc::new(descendants.clone()));
-        descendants
+            .descendants(code_unit)
     }
 }
 

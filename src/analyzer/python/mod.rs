@@ -19,9 +19,10 @@ use crate::analyzer::usages::{
 };
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
-    CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, PoolSafeMemo, Project,
-    ProjectFile, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, build_reverse_import_index,
+    CodeUnitType, DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
+    PoolSafeMemo, Project, ProjectFile, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
@@ -30,10 +31,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::PythonAdapter;
-use cache::{
-    weight_code_unit_set, weight_code_unit_set_by_unit, weight_code_unit_vec,
-    weight_project_file_set,
-};
+use cache::{weight_code_unit_set, weight_code_unit_vec, weight_project_file_set};
 use clones::{build_clone_candidate_data, refine_python_clone_similarity};
 use declarations::{
     collect_python_identifiers, parse_python_tree, py_node_text, python_expanded_comment_start,
@@ -53,8 +51,7 @@ pub struct PythonAnalyzer {
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
-    direct_descendant_index: Arc<OnceLock<HashMap<CodeUnit, Arc<HashSet<CodeUnit>>>>>,
+    direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     usage_index: Arc<OnceLock<PythonUsageIndex>>,
 }
@@ -102,7 +99,6 @@ impl PythonAnalyzer {
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
-            direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(OnceLock::new()),
@@ -747,10 +743,6 @@ impl IAnalyzer for PythonAnalyzer {
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
-            direct_descendants: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_code_unit_set_by_unit,
-            ),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(OnceLock::new()),
@@ -765,10 +757,6 @@ impl IAnalyzer for PythonAnalyzer {
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
-            direct_descendants: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_code_unit_set_by_unit,
-            ),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(OnceLock::new()),

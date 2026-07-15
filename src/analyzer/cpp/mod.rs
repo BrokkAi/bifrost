@@ -9,14 +9,13 @@ mod tests;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
-use crate::analyzer::js_ts::{
-    build_weighted_cache, weight_code_unit_set_by_unit, weight_code_unit_vec_by_unit,
-};
+use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
-    CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, PoolSafeMemo, Project,
-    ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    CodeUnitType, DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language,
+    PoolSafeMemo, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
+    TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -40,11 +39,10 @@ pub struct CppAnalyzer {
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
     include_target_index: Arc<OnceLock<IncludeTargetIndex>>,
     reverse_include_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     direct_ancestor_index: Arc<OnceLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
-    direct_descendant_index: Arc<OnceLock<HashMap<CodeUnit, Arc<HashSet<CodeUnit>>>>>,
+    direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
     #[cfg(test)]
     type_alias_classification_count: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -93,7 +91,6 @@ impl CppAnalyzer {
             ),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
-            direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
             direct_ancestor_index: Arc::new(OnceLock::new()),
@@ -115,10 +112,6 @@ impl CppAnalyzer {
             direct_ancestors: build_weighted_cache(
                 self.memo_budget / 8,
                 weight_code_unit_vec_by_unit,
-            ),
-            direct_descendants: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_code_unit_set_by_unit,
             ),
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
