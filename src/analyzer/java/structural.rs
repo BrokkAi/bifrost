@@ -59,13 +59,21 @@ const JAVA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("marker_annotation", NormalizedKind::Decorator),
 ];
 
+fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    node.named_child_count()
+        .checked_sub(1)
+        .and_then(|index| node.named_child(index))
+}
+
 fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
     let mut current = expression;
     loop {
         match current.kind() {
             "identifier" | "type_identifier" | "this" | "super" => return Some(current),
             "scoped_identifier" | "scoped_type_identifier" => {
-                current = current.child_by_field_name("name")?;
+                current = current
+                    .child_by_field_name("name")
+                    .or_else(|| last_named_child(current))?;
             }
             "generic_type" => current = current.child_by_field_name("type")?,
             "field_access" => current = current.child_by_field_name("field")?,
@@ -217,7 +225,10 @@ impl StructuralSpec for JavaStructuralSpec {
             }
             NormalizedKind::Identifier => match node.kind() {
                 "scoped_identifier" | "scoped_type_identifier" => {
-                    if let Some(name) = node.child_by_field_name("name") {
+                    if let Some(name) = node
+                        .child_by_field_name("name")
+                        .or_else(|| last_named_child(node))
+                    {
                         sink.set_name(name);
                     }
                 }
