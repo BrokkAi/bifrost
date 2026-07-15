@@ -134,7 +134,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInferenceE
         "selector_expression" | "qualified_type" => {
             scan_selector_like(node, ctx, locals);
         }
-        "identifier" | "type_identifier" => {
+        "identifier" | "type_identifier" if !scan_composite_literal_field_label(node, ctx) => {
             scan_direct_identifier(node, ctx, locals);
         }
         _ => {}
@@ -580,6 +580,25 @@ fn scan_direct_identifier(
     }
 }
 
+/// Resolve a keyed struct-literal label through the literal's declared type.
+///
+/// Go uses the same `keyed_element` syntax for struct fields and map keys. The
+/// enclosing `composite_literal` type is therefore the structured fact that
+/// distinguishes `Owner{Field: value}` from `map[string]T{Field: value}` and
+/// from another struct with a same-named field.
+fn scan_composite_literal_field_label(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
+    let Some(type_node) = direct_composite_literal_type_for_key(node) else {
+        return false;
+    };
+    if node_text(node, ctx.source) == ctx.spec.identifier
+        && type_ref_from_node(type_node, ctx.source)
+            .is_some_and(|ty| ctx.bindings.matches_owner_type(&ty))
+    {
+        record_hit(node, ctx);
+    }
+    true
+}
+
 pub(super) fn selector_parts<'a>(
     node: Node<'a>,
     source: &str,
@@ -640,18 +659,11 @@ pub(super) fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
     node.named_children(&mut cursor).last()
 }
 
-pub(super) fn is_definition_identifier(node: Node<'_>, source: &str) -> bool {
+pub(super) fn is_definition_identifier(node: Node<'_>, _source: &str) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    if has_ancestor_kind(node, "literal_value") && next_non_whitespace_is_colon(node, source) {
-        return true;
-    }
-    if parent.kind() == "keyed_element"
-        && parent
-            .child_by_field_name("key")
-            .is_some_and(|key| same_node(key, node))
-    {
+    if keyed_element_for_key(node).is_some() {
         return true;
     }
     if parent.kind() == "field_declaration"
@@ -684,20 +696,37 @@ pub(super) fn is_definition_identifier(node: Node<'_>, source: &str) -> bool {
         .is_some_and(|name| same_node(name, node))
 }
 
-pub(super) fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
+/// Return the type syntax for a key belonging directly to a composite literal.
+/// Keys in nested elided literal values intentionally return `None`: without an
+/// explicit type at that literal boundary, attributing a field would require
+/// additional element-type propagation rather than guessing from source text.
+fn direct_composite_literal_type_for_key(node: Node<'_>) -> Option<Node<'_>> {
+    let keyed = keyed_element_for_key(node)?;
+    let literal = keyed
+        .parent()
+        .filter(|parent| parent.kind() == "literal_value")?;
+    let composite = literal
+        .parent()
+        .filter(|parent| parent.kind() == "composite_literal")?;
+    composite.child_by_field_name("type")
+}
+
+fn keyed_element_for_key(node: Node<'_>) -> Option<Node<'_>> {
     let mut current = node.parent();
     while let Some(parent) = current {
-        if parent.kind() == kind {
-            return true;
+        if parent.kind() == "keyed_element" {
+            let key = parent.child_by_field_name("key")?;
+            if same_node(key, node) {
+                return Some(parent);
+            }
+            let mut cursor = key.walk();
+            let mut children = key.named_children(&mut cursor);
+            return children
+                .next()
+                .filter(|child| same_node(*child, node) && children.next().is_none())
+                .map(|_| parent);
         }
         current = parent.parent();
     }
-    false
-}
-
-pub(super) fn next_non_whitespace_is_colon(node: Node<'_>, source: &str) -> bool {
-    source
-        .get(node.end_byte()..)
-        .and_then(|rest| rest.chars().find(|ch| !ch.is_whitespace()))
-        == Some(':')
+    None
 }

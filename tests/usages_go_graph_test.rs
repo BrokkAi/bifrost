@@ -400,6 +400,72 @@ func run() {
 }
 
 #[test]
+fn go_graph_strategy_finds_struct_literal_field_labels_for_exact_owner() {
+    let (project, analyzer) = go_analyzer_with_files(&[
+        (
+            "model.go",
+            r#"
+package main
+
+type Wanted struct {
+    Field string
+}
+
+type Other struct {
+    Field string
+}
+"#,
+        ),
+        (
+            "keys/keys.go",
+            r#"
+package keys
+
+const MapKey = "Field"
+"#,
+        ),
+        (
+            "consumer.go",
+            r#"
+package main
+
+import "example.com/app/keys"
+
+func build() {
+    _ = Wanted{Field: "value"}
+    _ = &Wanted{Field: "pointer"}
+    _ = Other{Field: "wrong owner"}
+    Field := "local"
+    _ = map[string]string{Field: "map key"}
+    _ = map[string]string{keys.MapKey: "map expression"}
+    _ = Field
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "example.com/app.Wanted.Field");
+    let candidates = [project.file("consumer.go")].into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("struct literal field labels should resolve through their literal owner");
+
+    assert_eq!(2, hits.len(), "exact-owner field-label hits: {hits:?}");
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("consumer.go"))
+    );
+
+    let map_key = definition(&analyzer, "example.com/app/keys._module_.MapKey");
+    let map_key_hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&map_key), &candidates, 1000)
+        .into_either()
+        .expect("a qualified map-key expression remains an ordinary reference");
+    assert_eq!(1, map_key_hits.len(), "map-key hits: {map_key_hits:?}");
+}
+
+#[test]
 fn usage_finder_go_graph_respects_file_filters_as_result_scope() {
     let (project, analyzer) = go_analyzer_with_files(&[
         ("helper.go", "package main\nfunc helper() {}\n"),
