@@ -156,20 +156,9 @@ impl TypeHierarchyProvider for CSharpAnalyzer {
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
-        if let Some(cached) = self.memo_caches.direct_descendants.get(code_unit) {
-            return (*cached).clone();
-        }
-
-        let descendants = self
-            .memo_caches
+        self.memo_caches
             .direct_descendant_index
             .get_or_init(|| build_direct_descendant_index(self, self))
-            .get(code_unit)
-            .map(|descendants| descendants.as_ref().clone())
-            .unwrap_or_default();
-        self.memo_caches
-            .direct_descendants
-            .insert(code_unit.clone(), Arc::new(descendants.clone()));
-        descendants
+            .descendants(code_unit)
     }
 }

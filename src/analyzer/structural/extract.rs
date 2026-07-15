@@ -7,6 +7,7 @@
 
 use super::facts::{FileFacts, NormalizedNode};
 use super::spec::{CompiledKinds, RoleSink, StructuralSpec};
+use crate::compact_graph::CompactRowsBuilder;
 use crate::hash::HashMap;
 use crate::text_utils::compute_line_starts;
 use tree_sitter::{Language as TsLanguage, Node, Parser};
@@ -62,7 +63,6 @@ pub(crate) fn extract_file_facts(
                 range: node_range(node),
                 parent: enclosing,
                 name: None,
-                roles: Vec::new(),
                 subtree_end: fact_id + 1,
             });
             fact_by_ts_node.insert(node.id(), fact_id);
@@ -85,16 +85,21 @@ pub(crate) fn extract_file_facts(
     }
 
     // Pass 2: role extraction, now that every normalized node has a fact id.
+    let mut roles = CompactRowsBuilder::with_capacity(nodes.len(), 0);
     for (node, fact_id) in fact_sources {
+        debug_assert_eq!(fact_id as usize, roles.rows());
         let kind = nodes[fact_id as usize].kind;
-        let mut sink = RoleSink::new(&fact_by_ts_node);
+        let mut sink = RoleSink::new(&fact_by_ts_node, roles.values_mut());
         spec.extract(node, kind, &mut sink);
-        let (name, roles) = sink.into_parts();
-        let fact = &mut nodes[fact_id as usize];
-        fact.name = name;
-        fact.roles = roles;
+        nodes[fact_id as usize].name = sink.into_name();
+        roles.finish_row();
     }
 
     let line_starts = compute_line_starts(source);
-    Some(FileFacts::new(source.to_string(), line_starts, nodes))
+    Some(FileFacts::new(
+        source.to_string(),
+        line_starts,
+        nodes,
+        roles.finish(),
+    ))
 }

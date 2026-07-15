@@ -2,11 +2,10 @@ use crate::analyzer::js_ts::AliasResolver;
 use crate::analyzer::js_ts::model::node_text;
 use crate::analyzer::usages::{ImportKind, js_ts_graph::JsTsUsageIndex};
 use crate::analyzer::{
-    CodeUnit, IAnalyzer, Language, ProjectFile, TypeHierarchyProvider,
+    CodeUnit, DirectDescendantIndex, IAnalyzer, Language, ProjectFile, TypeHierarchyProvider,
     resolve_js_ts_module_specifier,
 };
 use crate::hash::{HashMap, HashSet};
-use std::sync::Arc;
 use tree_sitter::Node;
 
 pub(crate) fn extract_js_supertypes(declaration: Node<'_>, source: &str) -> Vec<String> {
@@ -100,28 +99,41 @@ pub(crate) fn resolve_direct_ancestors(
 pub(crate) fn build_direct_descendant_index_by_unit<A, P>(
     analyzer: &A,
     provider: &P,
-) -> HashMap<CodeUnit, Arc<HashSet<CodeUnit>>>
+) -> DirectDescendantIndex
 where
     A: IAnalyzer,
     P: TypeHierarchyProvider + ?Sized,
 {
-    let mut reverse: HashMap<CodeUnit, HashSet<CodeUnit>> = HashMap::default();
-    for candidate in analyzer
+    let mut nodes = analyzer
         .all_declarations()
         .filter(|candidate| candidate.is_class())
-    {
+        .collect::<Vec<_>>();
+    nodes.sort();
+    let mut index_by_node: HashMap<_, _> = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| {
+            (
+                node.clone(),
+                u32::try_from(index).expect("hierarchy index declarations must fit in a u32"),
+            )
+        })
+        .collect();
+    let candidates = nodes.clone();
+    let mut edges = Vec::new();
+    for candidate in candidates {
+        let descendant = index_by_node[&candidate];
         for ancestor in provider.get_direct_ancestors(&candidate) {
-            reverse
-                .entry(ancestor)
-                .or_default()
-                .insert(candidate.clone());
+            let ancestor = *index_by_node.entry(ancestor.clone()).or_insert_with(|| {
+                let index = u32::try_from(nodes.len())
+                    .expect("hierarchy index declarations must fit in a u32");
+                nodes.push(ancestor);
+                index
+            });
+            edges.push((ancestor, descendant));
         }
     }
-
-    reverse
-        .into_iter()
-        .map(|(ancestor, descendants)| (ancestor, Arc::new(descendants)))
-        .collect()
+    DirectDescendantIndex::from_indexed_nodes(nodes, index_by_node, edges)
 }
 
 fn collect_heritage_clause_types(

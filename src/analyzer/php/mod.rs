@@ -9,14 +9,12 @@ mod tests;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
-use crate::analyzer::js_ts::{
-    build_weighted_cache, weight_code_unit_set_by_unit, weight_code_unit_vec_by_unit,
-};
+use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer, Language, Project,
-    ProjectFile, Range, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
-    UsageFactsIndex, build_direct_descendant_index,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, DirectDescendantIndex,
+    IAnalyzer, Language, Project, ProjectFile, Range, SemanticDiagnostic, SignatureMetadata,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TypeHierarchyProvider, UsageFactsIndex, build_direct_descendant_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -43,8 +41,7 @@ pub struct PhpAnalyzer {
     inner: TreeSitterAnalyzer<PhpAdapter>,
     memo_budget: u64,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
-    direct_descendant_index: Arc<OnceLock<HashMap<CodeUnit, Arc<HashSet<CodeUnit>>>>>,
+    direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
     composer_autoload: Arc<PhpComposerAutoload>,
 }
 
@@ -98,7 +95,6 @@ impl PhpAnalyzer {
             inner,
             memo_budget,
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
-            direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
             direct_descendant_index: Arc::new(OnceLock::new()),
             composer_autoload,
         }
@@ -292,19 +288,9 @@ impl TypeHierarchyProvider for PhpAnalyzer {
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
-        if let Some(cached) = self.direct_descendants.get(code_unit) {
-            return (*cached).clone();
-        }
-
-        let descendants = self
-            .direct_descendant_index
+        self.direct_descendant_index
             .get_or_init(|| build_direct_descendant_index(self, self))
-            .get(code_unit)
-            .map(|descendants| descendants.as_ref().clone())
-            .unwrap_or_default();
-        self.direct_descendants
-            .insert(code_unit.clone(), Arc::new(descendants.clone()));
-        descendants
+            .descendants(code_unit)
     }
 }
 

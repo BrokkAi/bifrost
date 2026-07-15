@@ -3,6 +3,7 @@ use crate::analyzer::usages::workspace_graph::{
     WorkspaceUsageCatalog, WorkspaceUsageGraph, build_workspace_usage_graph,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
+use crate::compact_graph::CompactDirectedGraph;
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
 use git2::{Oid, Repository};
@@ -424,9 +425,45 @@ fn seed_weight_map(seeds: &[(ProjectFile, f64)]) -> HashMap<ProjectFile, f64> {
 }
 
 #[derive(Debug, Default)]
-struct ImportGraph {
-    forward: HashMap<ProjectFile, BTreeSet<ProjectFile>>,
-    reverse: HashMap<ProjectFile, BTreeSet<ProjectFile>>,
+struct ImportGraphBuilder {
+    nodes: Vec<ProjectFile>,
+    index_by_file: HashMap<ProjectFile, u32>,
+    edges: HashSet<(u32, u32)>,
+}
+
+impl ImportGraphBuilder {
+    fn insert_node(&mut self, file: ProjectFile) -> bool {
+        if self.index_by_file.contains_key(&file) {
+            return false;
+        }
+        let id = u32::try_from(self.nodes.len()).expect("import graph nodes must fit in a u32");
+        self.nodes.push(file.clone());
+        self.index_by_file.insert(file, id);
+        true
+    }
+
+    fn insert_edge(&mut self, source: &ProjectFile, target: &ProjectFile) {
+        let source = self.index_by_file[source];
+        let target = self.index_by_file[target];
+        self.edges.insert((source, target));
+    }
+
+    fn finish(mut self) -> CompactDirectedGraph<ProjectFile> {
+        let mut ordered = self.nodes.into_iter().enumerate().collect::<Vec<_>>();
+        ordered.sort_by(|(_, left), (_, right)| left.cmp(right));
+        let mut remap = vec![0_u32; ordered.len()];
+        let mut nodes = Vec::with_capacity(ordered.len());
+        for (new, (old, file)) in ordered.into_iter().enumerate() {
+            remap[old] = new as u32;
+            nodes.push(file);
+        }
+        let edges = self
+            .edges
+            .drain()
+            .map(|(source, target)| (remap[source as usize], remap[target as usize]))
+            .collect();
+        CompactDirectedGraph::new(nodes, edges)
+    }
 }
 
 fn related_files_by_imports(
@@ -453,55 +490,42 @@ fn related_files_by_imports(
         let _scope = profiling::scope("relevance::build_import_graph");
         build_import_graph(analyzer, &positive_seeds)
     };
-    let adjacency = if reversed {
-        &graph.reverse
-    } else {
-        &graph.forward
-    };
-
-    let mut nodes: Vec<_> = adjacency.keys().cloned().collect();
-    nodes.sort();
-    if nodes.is_empty() {
+    if profiling::enabled() {
+        profiling::note(format!(
+            "compact-import-graph nodes={} edges={}",
+            graph.nodes().len(),
+            graph.edge_count()
+        ));
+    }
+    if graph.nodes().is_empty() {
         return Vec::new();
     }
-
-    let index_by_file: HashMap<_, _> = nodes
-        .iter()
-        .enumerate()
-        .map(|(index, file)| (file.clone(), index))
-        .collect();
 
     let total_seed_weight: f64 = positive_seeds.values().sum();
     if total_seed_weight <= 0.0 {
         return Vec::new();
     }
 
-    let mut teleport = vec![0.0; nodes.len()];
+    let mut teleport = vec![0.0; graph.nodes().len()];
     for (file, weight) in &positive_seeds {
-        if let Some(index) = index_by_file.get(file) {
-            teleport[*index] = *weight / total_seed_weight;
+        if let Some(index) = graph.node_id(file) {
+            teleport[index as usize] = *weight / total_seed_weight;
         }
     }
 
-    let mut outgoing = vec![Vec::new(); nodes.len()];
-    for (index, file) in nodes.iter().enumerate() {
-        let outs = adjacency.get(file).cloned().unwrap_or_default();
-        let mut out_indices = outs
-            .into_iter()
-            .filter_map(|neighbor| index_by_file.get(&neighbor).copied())
-            .collect::<Vec<_>>();
-        out_indices.sort_unstable();
-        outgoing[index] = out_indices
-            .into_iter()
-            .map(|neighbor| (neighbor, 1.0))
-            .collect();
-    }
-
-    let rank = weighted_page_rank(&outgoing, &teleport);
+    let rank = weighted_page_rank(
+        &CompactImportAdjacency {
+            graph: &graph,
+            reversed,
+        },
+        &teleport,
+    );
 
     let seed_files: HashSet<_> = positive_seeds.keys().cloned().collect();
-    let mut ranked = nodes
-        .into_iter()
+    let mut ranked = graph
+        .nodes()
+        .iter()
+        .cloned()
         .enumerate()
         .filter_map(|(index, file)| {
             if seed_files.contains(&file) || rank[index] <= 0.0 {
@@ -518,6 +542,80 @@ fn related_files_by_imports(
     ranked
 }
 
+struct CompactImportAdjacency<'a> {
+    graph: &'a CompactDirectedGraph<ProjectFile>,
+    reversed: bool,
+}
+
+impl WeightedAdjacency for CompactImportAdjacency<'_> {
+    fn node_count(&self) -> usize {
+        self.graph.nodes().len()
+    }
+
+    fn for_each_edge<F>(&self, source: usize, mut visit: F)
+    where
+        F: FnMut(usize, f64),
+    {
+        let neighbors = if self.reversed {
+            self.graph.incoming(source as u32)
+        } else {
+            self.graph.outgoing(source as u32)
+        };
+        for target in neighbors {
+            visit(*target as usize, 1.0);
+        }
+    }
+}
+
+trait WeightedAdjacency {
+    fn node_count(&self) -> usize;
+
+    fn for_each_edge<F>(&self, source: usize, visit: F)
+    where
+        F: FnMut(usize, f64);
+}
+
+impl WeightedAdjacency for [Vec<(usize, f64)>] {
+    fn node_count(&self) -> usize {
+        self.len()
+    }
+
+    fn for_each_edge<F>(&self, source: usize, mut visit: F)
+    where
+        F: FnMut(usize, f64),
+    {
+        for &(target, weight) in &self[source] {
+            visit(target, weight);
+        }
+    }
+}
+
+impl WeightedAdjacency for Vec<Vec<(usize, f64)>> {
+    fn node_count(&self) -> usize {
+        self.as_slice().node_count()
+    }
+
+    fn for_each_edge<F>(&self, source: usize, visit: F)
+    where
+        F: FnMut(usize, f64),
+    {
+        self.as_slice().for_each_edge(source, visit);
+    }
+}
+
+impl<const N: usize> WeightedAdjacency for [Vec<(usize, f64)>; N] {
+    fn node_count(&self) -> usize {
+        N
+    }
+
+    fn for_each_edge<F>(&self, source: usize, visit: F)
+    where
+        F: FnMut(usize, f64),
+    {
+        self.as_slice().for_each_edge(source, visit);
+    }
+}
+
 /// Run weighted PageRank over a dense, caller-supplied node order.
 ///
 /// Each outgoing entry is `(target_index, positive_weight)`. Transition mass is
@@ -526,8 +624,11 @@ fn related_files_by_imports(
 /// which is the ordinary global-centrality form of PageRank. Dangling mass is
 /// redistributed through the same teleport vector so personalized rank remains
 /// anchored to its seeds.
-fn weighted_page_rank(outgoing: &[Vec<(usize, f64)>], teleport: &[f64]) -> Vec<f64> {
-    let node_count = outgoing.len();
+fn weighted_page_rank<G>(outgoing: &G, teleport: &[f64]) -> Vec<f64>
+where
+    G: WeightedAdjacency + ?Sized,
+{
+    let node_count = outgoing.node_count();
     if node_count == 0 {
         return Vec::new();
     }
@@ -563,13 +664,15 @@ fn weighted_page_rank(outgoing: &[Vec<(usize, f64)>], teleport: &[f64]) -> Vec<f
     // distribution it teleports to, preserving the previous personalized path.
     let mut rank = normalized_teleport.clone();
     let mut next = vec![0.0; node_count];
-    let outgoing_weight = outgoing
-        .iter()
-        .map(|edges| {
-            edges
-                .iter()
-                .filter_map(|(_, weight)| (weight.is_finite() && *weight > 0.0).then_some(*weight))
-                .sum::<f64>()
+    let outgoing_weight = (0..node_count)
+        .map(|source| {
+            let mut total = 0.0;
+            outgoing.for_each_edge(source, |_, weight| {
+                if weight.is_finite() && weight > 0.0 {
+                    total += weight;
+                }
+            });
+            total
         })
         .collect::<Vec<_>>();
 
@@ -579,7 +682,7 @@ fn weighted_page_rank(outgoing: &[Vec<(usize, f64)>], teleport: &[f64]) -> Vec<f
         }
 
         let mut dangling_mass = 0.0;
-        for (source, edges) in outgoing.iter().enumerate() {
+        for source in 0..node_count {
             let total_weight = outgoing_weight[source];
             if total_weight <= 0.0 {
                 dangling_mass += rank[source];
@@ -587,11 +690,11 @@ fn weighted_page_rank(outgoing: &[Vec<(usize, f64)>], teleport: &[f64]) -> Vec<f
             }
 
             let source_mass = ALPHA * rank[source] / total_weight;
-            for (target, weight) in edges {
-                if *target < node_count && weight.is_finite() && *weight > 0.0 {
-                    next[*target] += source_mass * weight;
+            outgoing.for_each_edge(source, |target, weight| {
+                if target < node_count && weight.is_finite() && weight > 0.0 {
+                    next[target] += source_mass * weight;
                 }
-            }
+            });
         }
 
         if dangling_mass.abs() > 1.0e-10 {
@@ -618,9 +721,9 @@ fn weighted_page_rank(outgoing: &[Vec<(usize, f64)>], teleport: &[f64]) -> Vec<f
 fn build_import_graph(
     analyzer: &dyn IAnalyzer,
     seed_weights: &HashMap<ProjectFile, f64>,
-) -> ImportGraph {
+) -> CompactDirectedGraph<ProjectFile> {
     let _scope = profiling::scope("relevance::build_import_graph");
-    let mut graph = ImportGraph::default();
+    let mut graph = ImportGraphBuilder::default();
     let mut import_cache = HashMap::default();
     let mut reverse_cache = HashMap::default();
     let mut frontier: VecDeque<_> = seed_weights.keys().cloned().collect();
@@ -632,8 +735,7 @@ fn build_import_graph(
     let mut depth = 0usize;
 
     for seed in seed_weights.keys() {
-        graph.forward.entry(seed.clone()).or_default();
-        graph.reverse.entry(seed.clone()).or_default();
+        graph.insert_node(seed.clone());
     }
 
     for _ in 0..IMPORT_DEPTH {
@@ -672,22 +774,11 @@ fn build_import_graph(
                 ));
             }
             for target in imported {
-                if !graph.forward.contains_key(&target) {
-                    graph.forward.entry(target.clone()).or_default();
-                    graph.reverse.entry(target.clone()).or_default();
+                if graph.insert_node(target.clone()) {
                     next.push_back(target.clone());
                 }
-                graph
-                    .forward
-                    .entry(file.clone())
-                    .or_default()
-                    .insert(target.clone());
+                graph.insert_edge(&file, &target);
                 forward_edges += 1;
-                graph
-                    .reverse
-                    .entry(target)
-                    .or_default()
-                    .insert(file.clone());
             }
 
             if profiling::enabled() {
@@ -709,22 +800,11 @@ fn build_import_graph(
                 ));
             }
             for source in referencing {
-                if !graph.forward.contains_key(&source) {
-                    graph.forward.entry(source.clone()).or_default();
-                    graph.reverse.entry(source.clone()).or_default();
+                if graph.insert_node(source.clone()) {
                     next.push_back(source.clone());
                 }
-                graph
-                    .forward
-                    .entry(source.clone())
-                    .or_default()
-                    .insert(file.clone());
+                graph.insert_edge(&source, &file);
                 reverse_edges += 1;
-                graph
-                    .reverse
-                    .entry(file.clone())
-                    .or_default()
-                    .insert(source);
             }
         }
         if profiling::enabled() {
@@ -742,7 +822,7 @@ fn build_import_graph(
         frontier = next;
     }
 
-    graph
+    graph.finish()
 }
 
 fn imported_files_for(

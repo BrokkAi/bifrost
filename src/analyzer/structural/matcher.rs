@@ -140,14 +140,16 @@ fn eval_pattern_inner_with_name(
     {
         return false;
     }
+    let roles = facts.roles(node);
 
     // Single-target roles: the first (typically only) edge of that role must
     // match the sub-pattern; a role constraint on a fact without that edge
     // fails.
     for &role in Role::single_target_roles() {
         if let Some(sub_pattern) = pattern.single_role_pattern(role) {
-            let matched = fact
-                .role_targets(role)
+            let matched = roles
+                .iter()
+                .filter(|target| target.role == role)
                 .any(|target| eval_target(sub_pattern, facts, target, captures));
             if !matched {
                 return false;
@@ -158,7 +160,10 @@ fn eval_pattern_inner_with_name(
     // Positional args: the listed patterns must match distinct arguments in
     // order, but not necessarily contiguously (greedy subsequence).
     if !pattern.args.is_empty() {
-        let targets: Vec<&RoleTarget> = fact.role_targets(Role::Arg).collect();
+        let targets: Vec<&RoleTarget> = roles
+            .iter()
+            .filter(|target| target.role == Role::Arg)
+            .collect();
         let mut cursor = 0usize;
         for arg_pattern in &pattern.args {
             let mut advanced = None;
@@ -177,12 +182,15 @@ fn eval_pattern_inner_with_name(
 
     // Keyword args match by keyword name.
     for (keyword, value_pattern) in &pattern.kwargs {
-        let matched = fact.role_targets(Role::Kwarg).any(|target| {
-            target
-                .keyword
-                .is_some_and(|span| span.text(facts.source()) == keyword)
-                && eval_target(value_pattern, facts, target, captures)
-        });
+        let matched = roles
+            .iter()
+            .filter(|target| target.role == Role::Kwarg)
+            .any(|target| {
+                target
+                    .keyword
+                    .is_some_and(|span| span.text(facts.source()) == keyword)
+                    && eval_target(value_pattern, facts, target, captures)
+            });
         if !matched {
             return false;
         }
@@ -190,8 +198,9 @@ fn eval_pattern_inner_with_name(
 
     // Each decorator pattern must match some decorator edge.
     for decorator_pattern in &pattern.decorators {
-        let matched = fact
-            .role_targets(Role::Decorator)
+        let matched = roles
+            .iter()
+            .filter(|target| target.role == Role::Decorator)
             .any(|target| eval_target(decorator_pattern, facts, target, captures));
         if !matched {
             return false;
