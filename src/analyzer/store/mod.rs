@@ -164,6 +164,8 @@ pub struct AnalyzerStore {
     db_path: Option<PathBuf>,
     #[cfg(test)]
     parsed_blob_transaction_starts: AtomicUsize,
+    #[cfg(test)]
+    parsed_blob_point_contains_queries: AtomicUsize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -475,6 +477,8 @@ impl AnalyzerStore {
             db_path: Some(db_path.to_path_buf()),
             #[cfg(test)]
             parsed_blob_transaction_starts: AtomicUsize::new(0),
+            #[cfg(test)]
+            parsed_blob_point_contains_queries: AtomicUsize::new(0),
         })
     }
 
@@ -487,6 +491,8 @@ impl AnalyzerStore {
             db_path: None,
             #[cfg(test)]
             parsed_blob_transaction_starts: AtomicUsize::new(0),
+            #[cfg(test)]
+            parsed_blob_point_contains_queries: AtomicUsize::new(0),
         })
     }
 
@@ -694,12 +700,39 @@ impl AnalyzerStore {
         lang: &str,
         generation: GenerationId,
     ) -> Result<bool> {
+        #[cfg(test)]
+        self.parsed_blob_point_contains_queries
+            .fetch_add(1, Ordering::SeqCst);
         let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
         let exists = contains_parsed_blob_conn(&tx, oid, lang)?;
         tx.commit()?;
         Ok(exists)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_parsed_blob_point_contains_queries_for_test(&self) {
+        self.parsed_blob_point_contains_queries
+            .store(0, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parsed_blob_point_contains_queries_for_test(&self) -> usize {
+        self.parsed_blob_point_contains_queries
+            .load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_parsed_blob_incomplete_for_test(&self, oid: Oid, lang: &str) {
+        self.conn
+            .lock()
+            .expect("analyzer store mutex poisoned")
+            .execute(
+                "UPDATE blob_meta SET is_complete = 0 WHERE blob_oid = ?1 AND lang = ?2",
+                params![oid.to_string(), lang],
+            )
+            .expect("mark parsed blob incomplete");
     }
 
     #[cfg(test)]

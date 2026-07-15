@@ -463,6 +463,13 @@ enum PreparedAnalysis {
     Unparseable(ProjectFile),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepresentativeBlobOutcome {
+    Persisted,
+    Dirty,
+    Unparseable,
+}
+
 #[derive(Debug, Default)]
 struct PreparedInFlight {
     current_items: usize,
@@ -1960,17 +1967,27 @@ where
         let oid_plan = Self::resolve_live_oids(project, &files, store_context, replace_live_paths);
         match oid_plan {
             Ok(file_oids) => {
-                let all_blob_keys: Vec<_> = file_oids
+                let all_blob_keys: Vec<_> = files
                     .iter()
-                    .map(|(file, oid)| (*oid, adapter.storage_language_key_for_file(file)))
+                    .filter_map(|file| {
+                        file_oids
+                            .get(file)
+                            .map(|oid| (*oid, adapter.storage_language_key_for_file(file)))
+                    })
                     .collect();
-                let missing = store_context
-                    .store
-                    .missing_parsed_blob_keys_at_generations(
-                        &all_blob_keys,
-                        store_context.generations.as_ref(),
-                    )
-                    .unwrap_or(all_blob_keys);
+                let missing = match store_context.store.missing_parsed_blob_keys_at_generations(
+                    &all_blob_keys,
+                    store_context.generations.as_ref(),
+                ) {
+                    Ok(missing) => missing,
+                    Err(_) => {
+                        let mut seen = HashSet::default();
+                        all_blob_keys
+                            .into_iter()
+                            .filter(|key| seen.insert(key.clone()))
+                            .collect()
+                    }
+                };
                 let missing_blob_keys: HashSet<(Oid, String)> = missing.iter().cloned().collect();
 
                 if let Some(progress) = progress.as_ref() {
@@ -1984,31 +2001,29 @@ where
                 }
 
                 let mut representative_by_blob_key = HashMap::default();
-                for (file, oid) in &file_oids {
+                for file in &files {
+                    let Some(oid) = file_oids.get(file).copied() else {
+                        continue;
+                    };
                     let storage_key = adapter.storage_language_key_for_file(file);
-                    if missing_blob_keys.contains(&(*oid, storage_key.clone())) {
+                    if missing_blob_keys.contains(&(oid, storage_key.clone())) {
                         representative_by_blob_key
-                            .entry((*oid, storage_key))
+                            .entry((oid, storage_key))
                             .or_insert_with(|| file.clone());
                     }
                 }
                 let parse_targets: Vec<_> = missing
                     .iter()
-                    .filter_map(|(oid, storage_key)| {
-                        representative_by_blob_key
+                    .map(|(oid, storage_key)| {
+                        let file = representative_by_blob_key
                             .get(&(*oid, storage_key.clone()))
-                            .cloned()
-                            .map(|file| {
-                                (
-                                    file,
-                                    *oid,
-                                    storage_key.clone(),
-                                    store_context.generations[storage_key],
-                                )
-                            })
+                            .expect("every missing blob key must have a representative")
+                            .clone();
+                        let generation = store_context.generations[storage_key];
+                        (file, *oid, storage_key.clone(), generation)
                     })
                     .collect();
-                let mut failed_blob_keys = HashSet::default();
+                let mut representative_blob_outcomes = HashMap::default();
                 let mut parsed_files = HashSet::default();
                 persistence_stats = Self::analyze_prepare_and_persist_files(
                     adapter,
@@ -2024,6 +2039,13 @@ where
                         let storage_key = adapter.storage_language_key_for_file(&file);
                         match outcome {
                             Some((state, error)) => {
+                                let blob_outcome = if error.is_some() {
+                                    RepresentativeBlobOutcome::Dirty
+                                } else {
+                                    RepresentativeBlobOutcome::Persisted
+                                };
+                                representative_blob_outcomes
+                                    .insert((oid, storage_key.clone()), blob_outcome);
                                 let key = Self::transient_cache_key(oid, &file);
                                 match error {
                                     Some(error) => {
@@ -2052,7 +2074,10 @@ where
                                 parsed_files.insert(file);
                             }
                             None => {
-                                failed_blob_keys.insert((oid, storage_key));
+                                representative_blob_outcomes.insert(
+                                    (oid, storage_key),
+                                    RepresentativeBlobOutcome::Unparseable,
+                                );
                             }
                         }
                     },
@@ -2067,19 +2092,17 @@ where
                         continue;
                     };
                     let storage_key = adapter.storage_language_key_for_file(file);
-                    if failed_blob_keys.contains(&(oid, storage_key.clone())) {
+                    let blob_key = (oid, storage_key);
+                    if !missing_blob_keys.contains(&blob_key) {
                         continue;
                     }
-                    if !store_context
-                        .store
-                        .contains_parsed_blob_at_generation(
-                            oid,
-                            &storage_key,
-                            store_context.generations[&storage_key],
-                        )
-                        .unwrap_or(false)
+                    match representative_blob_outcomes
+                        .get(&blob_key)
+                        .expect("every missing blob key must have a representative outcome")
                     {
-                        hydrate_misses.push(file.clone());
+                        RepresentativeBlobOutcome::Persisted
+                        | RepresentativeBlobOutcome::Unparseable => {}
+                        RepresentativeBlobOutcome::Dirty => hydrate_misses.push(file.clone()),
                     }
                 }
 
@@ -6038,6 +6061,103 @@ mod tests {
             project.read_count(),
             reads_after_hydration + 1,
             "the next query should read the overlay once"
+        );
+    }
+
+    #[test]
+    fn warm_rebuild_uses_bulk_presence_without_redundant_point_contains_queries() {
+        const UNIQUE_FILES: usize = 10;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        for index in 0..UNIQUE_FILES {
+            let file = ProjectFile::new(root.clone(), format!("pkg{index}/type{index}.py"));
+            file.write(format!("class Type{index}:\n    pass\n"))
+                .unwrap();
+        }
+        let shared_source = "class Shared:\n    pass\n";
+        for path in ["dup_a/shared.py", "dup_b/shared.py"] {
+            ProjectFile::new(root.clone(), path)
+                .write(shared_source)
+                .unwrap();
+        }
+        for path in ["broken_a/binary.py", "broken_b/binary.py"] {
+            ProjectFile::new(root.clone(), path)
+                .write("\0not parseable source")
+                .unwrap();
+        }
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Python));
+        let store = Arc::new(
+            AnalyzerStore::open_persistent(&temp.path().join("analyzer.db"))
+                .expect("persistent analyzer store"),
+        );
+        let store_context = AnalyzerStoreContext {
+            store: Arc::clone(&store),
+            gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
+            liveness: None,
+            live_paths: Arc::new(LivePathMap::default()),
+            generations: Arc::new(HashMap::default()),
+        };
+        let config = AnalyzerConfig::default();
+
+        let _cold = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            Arc::clone(&project),
+            PythonAdapter,
+            config.clone(),
+            store_context.clone(),
+            None,
+        );
+        store.reset_parsed_blob_point_contains_queries_for_test();
+        let warm_parse_count = Arc::new(AtomicUsize::new(0));
+        let warm_progress_count = Arc::clone(&warm_parse_count);
+        let warm = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            Arc::clone(&project),
+            PythonAdapter,
+            config.clone(),
+            store_context.clone(),
+            Some(Arc::new(move |event| {
+                if event.phase == BuildProgressPhase::Parse {
+                    warm_progress_count.fetch_add(1, Ordering::Relaxed);
+                }
+            })),
+        );
+        let warm_point_queries = store.parsed_blob_point_contains_queries_for_test();
+        assert_eq!(warm.get_definitions("dup_a.shared.Shared").len(), 1);
+        assert_eq!(warm.get_definitions("dup_b.shared.Shared").len(), 1);
+
+        let shared_oid = Oid::hash_object(ObjectType::Blob, shared_source.as_bytes()).unwrap();
+        store.mark_parsed_blob_incomplete_for_test(shared_oid, "python");
+        store.reset_parsed_blob_point_contains_queries_for_test();
+        let parse_count = Arc::new(AtomicUsize::new(0));
+        let progress_count = Arc::clone(&parse_count);
+        let recovered = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            project,
+            PythonAdapter,
+            config,
+            store_context,
+            Some(Arc::new(move |event| {
+                if event.phase == BuildProgressPhase::Parse {
+                    progress_count.fetch_add(1, Ordering::Relaxed);
+                }
+            })),
+        );
+        let recovery_point_queries = store.parsed_blob_point_contains_queries_for_test();
+
+        assert_eq!(
+            warm_parse_count.load(Ordering::Relaxed),
+            1,
+            "one unparseable representative should cover both duplicate paths"
+        );
+        assert_eq!(
+            parse_count.load(Ordering::Relaxed),
+            2,
+            "rebuild should parse one corrupt representative and retry the unparseable key once"
+        );
+        assert_eq!(recovered.get_definitions("dup_a.shared.Shared").len(), 1);
+        assert_eq!(recovered.get_definitions("dup_b.shared.Shared").len(), 1);
+        assert_eq!(
+            (warm_point_queries, recovery_point_queries),
+            (0, 0),
+            "the authoritative bulk missing set should avoid per-file contains checks on warm and one-corrupt-key rebuilds"
         );
     }
 
