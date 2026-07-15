@@ -1,15 +1,42 @@
-# Why bifrost
+<h1 align="center">Bifrost</h1>
+
+<p align="center">
+  <a href="https://brokkai.github.io/bifrost/">
+    <img src="docs/src/assets/bifrost-social-card.svg" alt="Bifrost — static analysis built for code intelligence" width="720">
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://brokkai.github.io/bifrost/">Documentation</a> ·
+  <a href="https://github.com/BrokkAi/bifrost">GitHub</a> ·
+  <a href="https://discord.gg/geYkWUeH">Discord</a>
+</p>
+
+## Why Bifrost?
 
 `bifrost` is Brokk's Rust-based static analysis toolbox for AI coding harnesses,
 editors, and large repositories.
 
-In a nutshell:
+Bifrost gives every supported language a shared intermediate representation, so
+the same structural query and navigation workflows work across a mixed-language
+repository instead of stopping at language boundaries.
 
-1. Bifrost parses unbuilt or partially broken repositories, including mixed-language workspaces.
-1. Bifrost is designed for concurrency, with snapshot isolation and fast incremental updates when code changes underneath.
-1. Bifrost is fast and lazy; it avoids optional work such as import analysis unless a request needs it.
-1. Bifrost is built to be git- and worktree- aware; its index is content-based and won't need to reindex code it's seen before on any branch.
-1. Bifrost can be used through MCP, LSP, the command line, Python, or Rust.
+- **One multi-language IR.** Parse unbuilt or partially broken workspaces and
+  normalize their source structure for cross-language analysis.
+- **A real query language.** Use JSON CodeQuery or the Rune Query Language
+  (RQL) to find language-neutral code shapes and traverse indexed declarations,
+  references, calls, imports, and type relationships.
+- **Built for agents and editors.** Expose structured MCP tools to coding
+  agents, LSP features to editors, and the same analyzer through the CLI,
+  Python, and Rust.
+- **Designed for active repositories.** Snapshot isolation, incremental updates,
+  content-based caching, and git/worktree awareness keep analysis responsive as
+  a repository changes.
+
+See [Choose Bifrost](https://brokkai.github.io/bifrost/choose-bifrost/) for the
+right interface for your workflow, and the [Language and Analysis
+Capabilities](https://brokkai.github.io/bifrost/capabilities/) matrix for
+language-by-language support, precision tiers, and current analysis boundaries.
 
 ## Language Coverage
 
