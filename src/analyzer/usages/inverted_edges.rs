@@ -503,20 +503,6 @@ fn node_terminal<K: NodeKey>(node: &K) -> String {
 /// `keep_file` drops out-of-scope caller files (tests / path filter) before the
 /// closure runs. See the Go implementation in [`super::go_graph`] for the canonical
 /// `scan` shape.
-#[allow(clippy::redundant_closure)] // the closure borrows `scan`; see the note below
-pub(crate) fn build_edges<K, KeepFn, ScanFn>(
-    files: &[ProjectFile],
-    keep_file: KeepFn,
-    scan: ScanFn,
-) -> UsageEdges<K>
-where
-    K: NodeKey + Send,
-    KeepFn: Fn(&ProjectFile) -> bool + Sync,
-    ScanFn: Fn(&ProjectFile) -> Option<PerFileEdges<K>> + Sync,
-{
-    build_edge_output(files, keep_file, scan)
-}
-
 #[allow(clippy::redundant_closure)] // the closure borrows `scan`; see the note above
 pub(crate) fn build_edge_weights<K, KeepFn, ScanFn>(
     files: &[ProjectFile],

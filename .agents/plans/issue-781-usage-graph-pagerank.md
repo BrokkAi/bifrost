@@ -15,8 +15,8 @@ The behavior is observable through the MCP tool, the `most_relevant_files` helpe
 - [x] (2026-07-15T08:43:07Z) Confirmed the issue branch was clean, fetched origin, and rebased it onto `origin/master` at `3aee987b`.
 - [x] (2026-07-15T08:49:00Z) Extracted the import-specific PageRank loop into a reusable weighted dense-ID kernel and proved focused unit and import-ranking parity tests pass.
 - [x] (2026-07-15T09:24:00Z) Added an exact-identity, weight-only workspace usage graph with shared node catalog and completeness metadata.
-- [ ] Add opt-in usage-primary file ranking and public Rust, MCP, CLI, and Python surfaces.
-- [ ] Add behavior, identity, schema, client, and performance coverage.
+- [x] (2026-07-15T10:02:00Z) Added opt-in usage-primary file ranking and public Rust, MCP, CLI, and Python surfaces.
+- [ ] Add final performance coverage and complete the behavior, identity, schema, and client validation matrix.
 - [ ] Run formatting, Clippy, focused tests, and the full `nlp,python` test gate.
 - [ ] Complete guided post-implementation review and address material findings.
 
@@ -45,13 +45,19 @@ The behavior is observable through the MCP tool, the `most_relevant_files` helpe
   Rationale: issue #781 is a file-ranking capability; compact retained storage and generation-safe caching remain in #748.
   Date/Author: 2026-07-15 / User and Codex
 
+- Decision: usage mode builds every language in the CLI workspace even when seed extensions identify only one language.
+  Rationale: the usage graph is a whole-program feature and cross-language ecosystems must remain distinguishable; the legacy CLI keeps its narrower seed-language optimization.
+  Date/Author: 2026-07-15 / Codex
+
 ## Outcomes & Retrospective
 
-The weighted-PageRank and exact workspace-graph milestones are complete; usage-primary ranking and public surfaces remain.
+The weighted-PageRank, exact workspace graph, and opt-in public ranking milestones are complete; final performance/full-suite validation and guided review remain.
 
 Milestone 1 outcome 2026-07-15T08:49:00Z: `weighted_page_rank` now supports unit or weighted arcs, explicit personalized teleportation, uniform global teleportation, and personalized dangling-mass redistribution. The import adapter supplies unit weights and all 22 `most_relevant_files` integration tests remain green.
 
 Milestone 2 outcome 2026-07-15T09:24:00Z: every language's inverted resolver can now finalize the same per-file scan into either call-site edges or compact weights. `WorkspaceUsageCatalog` owns ecosystem-qualified and JS/TS file-qualified identity, deterministic primary declarations, declaration-file membership, and completeness metadata. The public `usage_graph` reuses this catalog without changing its wire result.
+
+Milestone 3 outcome 2026-07-15T10:02:00Z: `usage_graph` ranking personalizes caller-to-callee PageRank from declaration-bearing seed files, aggregates complete symbol scores into deterministic primary files, and fills from the unchanged git/import pipeline. Rust, MCP schema/JSON, CLI, semantic-search, and Python client surfaces all carry an explicit mode while omitted requests remain legacy.
 
 ## Context and Orientation
 
@@ -128,6 +134,22 @@ Milestone 2 evidence:
     test result: ok. 5 passed; 0 failed
     test result: ok. 16 passed; 0 failed
 
+Milestone 3 evidence:
+
+    BIFROST_SEMANTIC_INDEX=off cargo test --test most_relevant_files
+    test result: ok. 27 passed; 0 failed
+
+    BIFROST_SEMANTIC_INDEX=off cargo test --test usage_graph_identity_test
+    test result: ok. 7 passed; 0 failed
+
+    cargo test mcp_extended::tests::most_relevant_files_schema_exposes_ranking_modes --lib
+    cargo test parses_ranking_modes --bin most_relevant_files
+    BIFROST_SEMANTIC_INDEX=off cargo test --test searchtools_service python_boundary_returns_most_relevant_files_json
+    All focused schema, CLI, and JSON tests passed.
+
+    BIFROST_SEMANTIC_INDEX=off uv run --python 3.12 --with maturin python -m unittest python_tests.test_searchtools_client.SearchToolsClientTest.test_most_relevant_files_returns_ranked_paths
+    Ran 1 test; OK. The test passes MostRelevantFilesRankingMode.USAGE_GRAPH through the native boundary.
+
 ## Interfaces and Dependencies
 
 The public Rust request gains:
@@ -155,3 +177,5 @@ Revision note 2026-07-15T08:43:07Z: Created the implementation ExecPlan from the
 Revision note 2026-07-15T08:49:00Z: Recorded the completed weighted-PageRank milestone and its focused validation evidence.
 
 Revision note 2026-07-15T09:24:00Z: Recorded the shared exact-identity catalog, direct weight finalization, and public usage-graph parity evidence.
+
+Revision note 2026-07-15T10:02:00Z: Recorded the opt-in ranking pipeline, public interfaces, semantic-search pin, behavior coverage, and focused client validation.

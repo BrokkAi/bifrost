@@ -2267,6 +2267,15 @@ fn python_boundary_returns_most_relevant_files_json() {
         "payload: {value}"
     );
     assert_eq!(0, value["not_found"].as_array().unwrap().len());
+
+    let usage_payload = service
+        .call_tool_json(
+            "most_relevant_files",
+            r#"{"seed_file_paths":["A.java"],"ranking_mode":"usage_graph","limit":5}"#,
+        )
+        .unwrap();
+    let usage_value: Value = serde_json::from_str(&usage_payload).unwrap();
+    assert_eq!(value["files"], usage_value["files"]);
 }
 
 #[test]

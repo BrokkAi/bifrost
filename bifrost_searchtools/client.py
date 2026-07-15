@@ -64,6 +64,11 @@ class SymbolKindFilter(StrEnum):
     MODULE = "module"
 
 
+class MostRelevantFilesRankingMode(StrEnum):
+    HISTORY_IMPORTS = "history_imports"
+    USAGE_GRAPH = "usage_graph"
+
+
 class XmlSelectOutput(StrEnum):
     TEXT = "text"
     ATTRIBUTE = "attribute"
@@ -416,6 +421,7 @@ class SearchToolsClient:
         *,
         limit: int = 20,
         seed_weights: list[float] | None = None,
+        ranking_mode: MostRelevantFilesRankingMode = MostRelevantFilesRankingMode.HISTORY_IMPORTS,
     ) -> MostRelevantFilesResult: ...
 
     @overload
@@ -426,6 +432,7 @@ class SearchToolsClient:
         limit: int = 20,
         seed_weights: list[float] | None = None,
         recency_half_life: float | None = None,
+        ranking_mode: MostRelevantFilesRankingMode = MostRelevantFilesRankingMode.HISTORY_IMPORTS,
     ) -> MostRelevantFilesResult: ...
 
     def most_relevant_files(
@@ -435,8 +442,13 @@ class SearchToolsClient:
         limit: int = 20,
         seed_weights: list[float] | None = None,
         recency_half_life: float | None | object = _UNSET,
+        ranking_mode: MostRelevantFilesRankingMode = MostRelevantFilesRankingMode.HISTORY_IMPORTS,
     ) -> MostRelevantFilesResult:
-        arguments: dict[str, Any] = {"seed_file_paths": seed_files, "limit": limit}
+        arguments: dict[str, Any] = {
+            "seed_file_paths": seed_files,
+            "ranking_mode": ranking_mode.value,
+            "limit": limit,
+        }
         if seed_weights is not None:
             arguments["seed_weights"] = seed_weights
         if recency_half_life is not _UNSET:

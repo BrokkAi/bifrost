@@ -1,8 +1,12 @@
+use crate::analyzer::usages::workspace_graph::{
+    WorkspaceUsageCatalog, build_workspace_usage_graph,
+};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
 use git2::{Oid, Repository};
 use moka::sync::Cache;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -71,6 +75,14 @@ struct FileRelevance {
     score: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MostRelevantFilesRankingMode {
+    #[default]
+    HistoryImports,
+    UsageGraph,
+}
+
 pub(crate) fn most_relevant_project_files(
     analyzer: &dyn IAnalyzer,
     seeds: &[(ProjectFile, f64)],
@@ -125,6 +137,135 @@ pub(crate) fn most_relevant_project_files_with_half_life(
     }
 
     results
+}
+
+pub(crate) fn most_relevant_project_files_with_ranking_mode(
+    analyzer: &dyn IAnalyzer,
+    seeds: &[(ProjectFile, f64)],
+    top_k: usize,
+    half_life: Option<f64>,
+    ranking_mode: MostRelevantFilesRankingMode,
+) -> Vec<ProjectFile> {
+    let _scope = profiling::scope("relevance::most_relevant_project_files_with_ranking_mode");
+    if ranking_mode == MostRelevantFilesRankingMode::HistoryImports {
+        return most_relevant_project_files_with_half_life(analyzer, seeds, top_k, half_life);
+    }
+    if top_k == 0 {
+        return Vec::new();
+    }
+
+    let seed_weights = seed_weight_map(seeds);
+    if seed_weights.is_empty() {
+        return Vec::new();
+    }
+    let excluded: HashSet<_> = seed_weights.keys().cloned().collect();
+    let mut results = Vec::new();
+    let mut seen = HashSet::default();
+
+    for candidate in related_files_by_usage(analyzer, &seed_weights, top_k) {
+        if append_candidate(&mut results, &mut seen, &excluded, candidate.file, top_k) {
+            return results;
+        }
+    }
+
+    for candidate in most_relevant_project_files_with_half_life(analyzer, seeds, top_k, half_life) {
+        if append_candidate(&mut results, &mut seen, &excluded, candidate, top_k) {
+            break;
+        }
+    }
+    results
+}
+
+fn related_files_by_usage(
+    analyzer: &dyn IAnalyzer,
+    seed_weights: &HashMap<ProjectFile, f64>,
+    k: usize,
+) -> Vec<FileRelevance> {
+    let _scope = profiling::scope("relevance::related_files_by_usage");
+    if k == 0 {
+        return Vec::new();
+    }
+
+    let catalog = {
+        let _scope = profiling::scope("relevance::usage_graph_catalog");
+        WorkspaceUsageCatalog::build(analyzer)
+    };
+    let mut node_indices_by_file: HashMap<ProjectFile, Vec<usize>> = HashMap::default();
+    for (index, node) in catalog.nodes.iter().enumerate() {
+        for file in &node.declaration_files {
+            node_indices_by_file
+                .entry(file.clone())
+                .or_default()
+                .push(index);
+        }
+    }
+
+    let mut teleport = vec![0.0; catalog.nodes.len()];
+    for (file, weight) in seed_weights.iter().filter(|(_, weight)| **weight > 0.0) {
+        let Some(indices) = node_indices_by_file.get(file) else {
+            continue;
+        };
+        if indices.is_empty() {
+            continue;
+        }
+        let per_node = *weight / indices.len() as f64;
+        for index in indices {
+            teleport[*index] += per_node;
+        }
+    }
+    if teleport.iter().all(|weight| *weight <= 0.0) {
+        return Vec::new();
+    }
+
+    let graph = {
+        let _scope = profiling::scope("relevance::usage_graph_construction");
+        build_workspace_usage_graph(analyzer, catalog)
+    };
+    if graph.edges.is_empty() {
+        return Vec::new();
+    }
+    if profiling::enabled() {
+        let unproven_inbound: usize = graph.nodes.iter().map(|node| node.unproven_inbound).sum();
+        profiling::note(format!(
+            "usage-graph nodes={} edges={} unproven_inbound={unproven_inbound}",
+            graph.nodes.len(),
+            graph.edges.len()
+        ));
+    }
+    let mut outgoing = vec![Vec::new(); graph.nodes.len()];
+    for edge in &graph.edges {
+        outgoing[edge.from].push((edge.to, edge.weight as f64));
+    }
+    for neighbors in &mut outgoing {
+        neighbors.sort_by_key(|(target, _)| *target);
+    }
+
+    let scores = {
+        let _scope = profiling::scope("relevance::usage_graph_page_rank");
+        weighted_page_rank(&outgoing, &teleport)
+    };
+    let excluded: HashSet<_> = seed_weights.keys().collect();
+    let mut file_scores: HashMap<ProjectFile, f64> = HashMap::default();
+    {
+        let _scope = profiling::scope("relevance::usage_graph_file_aggregation");
+        for (node, score) in graph.nodes.iter().zip(scores) {
+            if node.truncated_inbound.is_some() || excluded.contains(node.primary.source()) {
+                continue;
+            }
+            *file_scores
+                .entry(node.primary.source().clone())
+                .or_insert(0.0) += score;
+        }
+    }
+
+    let mut ranked: Vec<_> = file_scores
+        .into_iter()
+        .filter(|(_, score)| *score > 0.0)
+        .map(|(file, score)| FileRelevance { file, score })
+        .collect();
+    ranked.sort_by(compare_file_relevance);
+    ranked.truncate(k);
+    ranked
 }
 
 pub(crate) fn most_important_project_files(
@@ -1668,6 +1809,17 @@ mod tests {
 
         assert!(scores[0] > 0.0 && scores[1] > 0.0, "scores: {scores:?}");
         assert!((scores.iter().sum::<f64>() - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn weighted_page_rank_converges_deterministically_on_a_cycle() {
+        let outgoing = [vec![(1, 1.0)], vec![(2, 1.0)], vec![(0, 1.0)]];
+        let first = weighted_page_rank(&outgoing, &[3.0, 1.0, 0.0]);
+        let second = weighted_page_rank(&outgoing, &[3.0, 1.0, 0.0]);
+
+        assert_eq!(first, second);
+        assert!((first.iter().sum::<f64>() - 1.0).abs() < 1.0e-6);
+        assert!(first.iter().all(|score| score.is_finite() && *score > 0.0));
     }
 
     #[test]

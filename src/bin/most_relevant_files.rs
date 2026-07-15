@@ -1,6 +1,6 @@
 use brokk_bifrost::{
     AnalyzerConfig, FilesystemProject, Language, WorkspaceAnalyzer,
-    searchtools::{MostRelevantFilesParams, most_relevant_files},
+    searchtools::{MostRelevantFilesParams, MostRelevantFilesRankingMode, most_relevant_files},
 };
 use std::env;
 use std::path::Path;
@@ -27,6 +27,7 @@ fn run() -> Result<(), String> {
         env::current_dir().map_err(|err| format!("Failed to get current directory: {err}"))?;
     let mut seed_file_paths = Vec::new();
     let mut recency_half_life = None;
+    let mut ranking_mode = MostRelevantFilesRankingMode::HistoryImports;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -41,6 +42,12 @@ fn run() -> Result<(), String> {
                     .next()
                     .ok_or_else(|| "--recency-half-life requires a number or 'none'".to_string())?;
                 recency_half_life = Some(parse_recency_half_life(&value)?);
+            }
+            "--ranking-mode" => {
+                let value = args.next().ok_or_else(|| {
+                    "--ranking-mode requires history_imports or usage_graph".to_string()
+                })?;
+                ranking_mode = parse_ranking_mode(&value)?;
             }
             "--help" | "-h" => {
                 print_help();
@@ -74,7 +81,7 @@ fn run() -> Result<(), String> {
                     .filter(|language| *language != Language::None)
             })
             .collect();
-        if seed_languages.is_empty() {
+        if ranking_mode == MostRelevantFilesRankingMode::UsageGraph || seed_languages.is_empty() {
             WorkspaceAnalyzer::build(project, AnalyzerConfig::default())
         } else {
             WorkspaceAnalyzer::build_for_languages(
@@ -92,6 +99,7 @@ fn run() -> Result<(), String> {
                 seed_file_paths,
                 seed_weights: None,
                 recency_half_life: recency_half_life.unwrap_or(Some(DEFAULT_RECENCY_HALF_LIFE)),
+                ranking_mode,
                 limit: DEFAULT_LIMIT,
             },
         )
@@ -140,8 +148,36 @@ fn parse_recency_half_life(value: &str) -> Result<Option<f64>, String> {
     Ok(Some(parsed))
 }
 
+fn parse_ranking_mode(value: &str) -> Result<MostRelevantFilesRankingMode, String> {
+    match value {
+        "history_imports" => Ok(MostRelevantFilesRankingMode::HistoryImports),
+        "usage_graph" => Ok(MostRelevantFilesRankingMode::UsageGraph),
+        _ => Err(format!(
+            "Invalid --ranking-mode value {value:?}; expected history_imports or usage_graph"
+        )),
+    }
+}
+
 fn print_help() {
     println!(
-        "Usage: most_relevant_files [--root PROJECT_ROOT] [--recency-half-life COMMITS|none] <seed-file>..."
+        "Usage: most_relevant_files [--root PROJECT_ROOT] [--recency-half-life COMMITS|none] [--ranking-mode history_imports|usage_graph] <seed-file>..."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_ranking_modes() {
+        assert_eq!(
+            parse_ranking_mode("history_imports").unwrap(),
+            MostRelevantFilesRankingMode::HistoryImports
+        );
+        assert_eq!(
+            parse_ranking_mode("usage_graph").unwrap(),
+            MostRelevantFilesRankingMode::UsageGraph
+        );
+        assert!(parse_ranking_mode("imports").is_err());
+    }
 }

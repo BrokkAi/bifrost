@@ -33,9 +33,10 @@ use crate::path_utils::{
     normalize_pattern, rel_path_string, workspace_rel_path,
 };
 use crate::profiling;
+pub use crate::relevance::MostRelevantFilesRankingMode;
 use crate::relevance::{
     DEFAULT_RECENCY_HALF_LIFE, most_important_project_files, most_relevant_project_files,
-    most_relevant_project_files_with_half_life,
+    most_relevant_project_files_with_ranking_mode,
 };
 use crate::text_utils::{
     compute_line_starts, find_line_index_for_offset, render_location_diagnostic,
@@ -105,6 +106,8 @@ pub struct MostRelevantFilesParams {
     pub seed_weights: Option<Vec<f64>>,
     #[serde(default = "default_recency_half_life")]
     pub recency_half_life: Option<f64>,
+    #[serde(default)]
+    pub ranking_mode: MostRelevantFilesRankingMode,
     #[serde(default = "default_limit")]
     pub limit: usize,
 }
@@ -3150,6 +3153,7 @@ pub fn most_relevant_files(
         .seed_weights
         .unwrap_or_else(|| vec![1.0; params.seed_file_paths.len()]);
     let recency_half_life = params.recency_half_life;
+    let ranking_mode = params.ranking_mode;
     let mut resolved_by_file = HashMap::default();
 
     {
@@ -3188,14 +3192,17 @@ pub fn most_relevant_files(
 
     let files = {
         let _scope = profiling::scope("searchtools::most_relevant_files.rank");
-        let ranked = if recency_half_life == Some(DEFAULT_RECENCY_HALF_LIFE) {
+        let ranked = if ranking_mode == MostRelevantFilesRankingMode::HistoryImports
+            && recency_half_life == Some(DEFAULT_RECENCY_HALF_LIFE)
+        {
             most_relevant_project_files(analyzer, &seeds, params.limit)
         } else {
-            most_relevant_project_files_with_half_life(
+            most_relevant_project_files_with_ranking_mode(
                 analyzer,
                 &seeds,
                 params.limit,
                 recency_half_life,
+                ranking_mode,
             )
         };
         ranked

@@ -18,7 +18,7 @@ uv run --python 3.12 --with maturin maturin develop
 ## Quick Start
 
 ```python
-from bifrost_searchtools import SearchToolsClient
+from bifrost_searchtools import MostRelevantFilesRankingMode, SearchToolsClient
 
 with SearchToolsClient("/path/to/project") as client:
     print(client.get_summaries(["src/main.py"]).render_text())
@@ -27,6 +27,11 @@ with SearchToolsClient("/path/to/project") as client:
         print(file.path)
 
     print(client.most_relevant_files(["src/main.py"]).render_text())
+
+    print(client.most_relevant_files(
+        ["src/main.py"],
+        ranking_mode=MostRelevantFilesRankingMode.USAGE_GRAPH,
+    ).render_text())
 ```
 
 The client talks directly to Rust through a native extension module. It does not start an MCP subprocess. Results are typed dataclasses from `bifrost_searchtools.models` plus ready-to-render text helpers.

@@ -13,6 +13,7 @@ use brokk_bifrost::SearchToolsService;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use tempfile::TempDir;
 
 fn fixture_root(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -39,6 +40,17 @@ fn scan_usages_by_reference(fixture: &str, args: &str) -> Value {
         .call_tool_json("scan_usages_by_reference", args)
         .expect("scan_usages_by_reference call failed");
     serde_json::from_str(&payload).expect("scan_usages_by_reference returned invalid JSON")
+}
+
+fn most_relevant_files(fixture: &str, seed: &str) -> Value {
+    let service = SearchToolsService::new_manual_without_semantic_index(fixture_root(fixture))
+        .expect("service");
+    let arguments =
+        format!(r#"{{"seed_file_paths":[{seed:?}],"ranking_mode":"usage_graph","limit":1}}"#);
+    let payload = service
+        .call_tool_json("most_relevant_files", &arguments)
+        .expect("most_relevant_files call failed");
+    serde_json::from_str(&payload).expect("most_relevant_files returned invalid JSON")
 }
 
 /// All `(fqn, path)` pairs for nodes whose fqn equals `fqn`.
@@ -154,6 +166,42 @@ fn same_name_module_exports_are_distinct_nodes() {
         "both importers must have a resolved edge to their helper; edges: {:#}",
         graph["edges"]
     );
+}
+
+#[test]
+fn usage_relevance_keeps_same_name_module_exports_distinct() {
+    let result = most_relevant_files("usage-graph-ts-modres", "c.ts");
+    assert_eq!(result["files"], serde_json::json!(["a.ts"]));
+}
+
+#[test]
+fn usage_relevance_keeps_identical_cross_language_fqns_distinct() {
+    let temp = TempDir::new().unwrap();
+    std::fs::write(
+        temp.path().join("main.go"),
+        "package service\nfunc run() int { return helper() }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("z.go"),
+        "package service\nfunc helper() int { return 1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("service.py"),
+        "def helper():\n    return 2\n",
+    )
+    .unwrap();
+    let service = SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
+        .expect("service");
+    let payload = service
+        .call_tool_json(
+            "most_relevant_files",
+            r#"{"seed_file_paths":["main.go"],"ranking_mode":"usage_graph","limit":1}"#,
+        )
+        .expect("most_relevant_files call failed");
+    let result: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(result["files"], serde_json::json!(["z.go"]));
 }
 
 // The inverted path must resolve typed receivers like the forward path does:

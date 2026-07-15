@@ -88,23 +88,6 @@ where
     Some(resolver.build_edges(analyzer, nodes, keep_file))
 }
 
-pub(crate) fn build_jsts_usage_edge_weights<F>(
-    analyzer: &dyn IAnalyzer,
-    nodes: &HashSet<String>,
-    keep_file: F,
-) -> Option<UsageEdgeWeights>
-where
-    F: Fn(&ProjectFile) -> bool + Sync,
-{
-    let resolver = JsTsEdgeResolver::try_new(analyzer)?;
-    for language in [Language::TypeScript, Language::JavaScript] {
-        if !analyzed_files_for_language(analyzer, language).is_empty() {
-            let _ = prewarm_cached_jsts_index(analyzer, language);
-        }
-    }
-    Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
-}
-
 /// Borrow the analyzer-cached [`JsTsUsageIndex`] for `language` off the concrete TS/JS
 /// analyzer behind `analyzer`, building it on first use. `None` when the analyzer does
 /// not expose the matching JS/TS analyzer.

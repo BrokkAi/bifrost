@@ -1,4 +1,5 @@
 from .client import (
+    MostRelevantFilesRankingMode,
     SearchToolsClient,
     SearchToolsError,
     SymbolKindFilter,
@@ -120,6 +121,7 @@ __all__ = [
     "LineMatch",
     "ListFilesResult",
     "MostRelevantFilesResult",
+    "MostRelevantFilesRankingMode",
     "MovedSymbol",
     "PatchSymbols",
     "PatchTouchedSymbol",

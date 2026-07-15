@@ -19,6 +19,7 @@ from bifrost_searchtools import (
     CodeQueryMatch,
     CodeQueryReferenceSite,
     CodeQueryResult,
+    MostRelevantFilesRankingMode,
     SearchToolsClient,
     SearchToolsError,
     SymbolKindFilter,
@@ -556,7 +557,11 @@ class SearchToolsClientTest(unittest.TestCase):
 
             with SearchToolsClient(root=root) as client:
                 result = client.most_relevant_files(
-                    ["A.java"], limit=5, seed_weights=[2.0], recency_half_life=250.0
+                    ["A.java"],
+                    limit=5,
+                    seed_weights=[2.0],
+                    recency_half_life=250.0,
+                    ranking_mode=MostRelevantFilesRankingMode.USAGE_GRAPH,
                 )
                 text = result.render_text()
 

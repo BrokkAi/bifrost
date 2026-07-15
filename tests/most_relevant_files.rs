@@ -3,10 +3,11 @@ mod common;
 use brokk_bifrost::{
     CSharpAnalyzer, FilesystemProject, GoAnalyzer, ImportAnalysisProvider, JavaAnalyzer, Language,
     ProjectFile, TestProject,
-    searchtools::{MostRelevantFilesParams, most_relevant_files},
+    searchtools::{MostRelevantFilesParams, MostRelevantFilesRankingMode, most_relevant_files},
 };
 use common::InlineTestProject;
 use git2::{Repository, Signature};
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -90,6 +91,7 @@ fn no_git_fallback_uses_import_page_ranker() {
             seed_file_paths: vec!["test/A.java".to_string()],
             seed_weights: None,
             recency_half_life: Some(250.0),
+            ranking_mode: Default::default(),
             limit: 5,
         },
     )
@@ -142,6 +144,7 @@ fn csharp_namespace_imports_rank_related_files_without_git() {
             seed_file_paths: vec!["Consumer.cs".to_string()],
             seed_weights: None,
             recency_half_life: Some(250.0),
+            ranking_mode: Default::default(),
             limit: 5,
         },
     )
@@ -280,6 +283,7 @@ fn repo_root_go_seed_is_resolved_and_ranked() {
             seed_file_paths: vec!["context.go".to_string()],
             seed_weights: None,
             recency_half_life: Some(250.0),
+            ranking_mode: Default::default(),
             limit: 5,
         },
     )
@@ -348,6 +352,7 @@ fn hybrid_git_and_import_results_are_merged_without_duplicates() {
             seed_file_paths: vec!["test/A.java".to_string()],
             seed_weights: None,
             recency_half_life: Some(250.0),
+            ranking_mode: Default::default(),
             limit: 3,
         },
     )
@@ -412,6 +417,7 @@ fn multi_seed_ranking_merges_shared_targets_without_duplicates() {
             ],
             seed_weights: None,
             recency_half_life: Some(250.0),
+            ranking_mode: Default::default(),
             limit: 4,
         },
     )
@@ -453,6 +459,7 @@ fn git_results_are_filled_with_import_ranking_when_needed() {
             seed_file_paths: vec!["test/A.java".to_string()],
             seed_weights: None,
             recency_half_life: Some(250.0),
+            ranking_mode: Default::default(),
             limit: 2,
         },
     )
@@ -502,6 +509,7 @@ fn git_ties_are_sorted_by_normalized_path_name() {
             seed_file_paths: vec!["Seed.java".to_string()],
             seed_weights: None,
             recency_half_life: Some(250.0),
+            ranking_mode: Default::default(),
             limit: 3,
         },
     )
@@ -549,6 +557,7 @@ fn untracked_seed_skips_git_and_uses_import_results() {
             seed_file_paths: vec!["test/A.java".to_string()],
             seed_weights: None,
             recency_half_life: Some(250.0),
+            ranking_mode: Default::default(),
             limit: 2,
         },
     )
@@ -633,6 +642,7 @@ fn rename_history_is_canonicalized_to_current_paths() {
             seed_file_paths: vec!["UserService.java".to_string()],
             seed_weights: None,
             recency_half_life: Some(250.0),
+            ranking_mode: Default::default(),
             limit: 10,
         },
     )
@@ -702,6 +712,7 @@ fn consolidation_commit_does_not_merge_deleted_file_history_into_new_file() {
             seed_file_paths: vec!["Seed.java".to_string()],
             seed_weights: None,
             recency_half_life: Some(250.0),
+            ranking_mode: Default::default(),
             limit: 10,
         },
     )
@@ -727,6 +738,7 @@ fn missing_seed_files_are_reported() {
             seed_file_paths: vec!["missing.java".to_string(), "test/A.java".to_string()],
             seed_weights: None,
             recency_half_life: Some(250.0),
+            ranking_mode: Default::default(),
             limit: 5,
         },
     )
@@ -782,6 +794,7 @@ fn weighted_seeds_change_import_ranking() {
             ],
             seed_weights: None,
             recency_half_life: Some(250.0),
+            ranking_mode: Default::default(),
             limit: 2,
         },
     )
@@ -795,6 +808,7 @@ fn weighted_seeds_change_import_ranking() {
             ],
             seed_weights: Some(vec![1.0, 10.0]),
             recency_half_life: Some(250.0),
+            ranking_mode: Default::default(),
             limit: 2,
         },
     )
@@ -817,6 +831,7 @@ fn invalid_seed_weights_are_rejected() {
             seed_file_paths: vec!["test/A.java".to_string()],
             seed_weights: Some(vec![1.0, 2.0]),
             recency_half_life: Some(250.0),
+            ranking_mode: Default::default(),
             limit: 5,
         },
     )
@@ -839,6 +854,7 @@ fn duplicate_resolved_seeds_fail_before_ranking() {
             seed_file_paths: vec!["test/A.java".to_string(), "./test/A.java".to_string()],
             seed_weights: Some(vec![1.0, 2.0]),
             recency_half_life: Some(250.0),
+            ranking_mode: Default::default(),
             limit: 5,
         },
     )
@@ -861,6 +877,7 @@ fn invalid_recency_half_life_is_rejected() {
             seed_file_paths: vec!["test/A.java".to_string()],
             seed_weights: None,
             recency_half_life: Some(0.0),
+            ranking_mode: Default::default(),
             limit: 5,
         },
     )
@@ -918,6 +935,7 @@ fn recency_weighting_prefers_recent_cochange_targets() {
             seed_file_paths: vec!["Seed.java".to_string()],
             seed_weights: None,
             recency_half_life: Some(250.0),
+            ranking_mode: Default::default(),
             limit: 2,
         },
     )
@@ -973,10 +991,246 @@ fn recency_half_life_none_pins_legacy_uniform_behavior() {
             seed_file_paths: vec!["Seed.java".to_string()],
             seed_weights: None,
             recency_half_life: None,
+            ranking_mode: Default::default(),
             limit: 2,
         },
     )
     .unwrap();
 
     assert_eq!("OldTarget.java", results.files[0], "{:?}", results.files);
+}
+
+#[test]
+fn usage_mode_prefers_resolved_calls_and_respects_edge_weights() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "test/Seed.java",
+            r#"
+            package test;
+            import test.ImportOnly;
+            import test.SingleUse;
+            import test.WeightedUse;
+            public class Seed {
+                void run() {
+                    WeightedUse.work();
+                    WeightedUse.work();
+                    SingleUse.work();
+                }
+            }
+            "#,
+        )
+        .file(
+            "test/WeightedUse.java",
+            "package test; public class WeightedUse { static void work() {} }",
+        )
+        .file(
+            "test/SingleUse.java",
+            "package test; public class SingleUse { static void work() {} }",
+        )
+        .file(
+            "test/ImportOnly.java",
+            "package test; public class ImportOnly {}",
+        )
+        .build();
+    let analyzer = java_analyzer(project.root());
+
+    let results = most_relevant_files(
+        &analyzer,
+        MostRelevantFilesParams {
+            seed_file_paths: vec!["test/Seed.java".to_string()],
+            seed_weights: None,
+            recency_half_life: Some(250.0),
+            ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            limit: 3,
+        },
+    )
+    .unwrap();
+
+    assert_eq!("test/WeightedUse.java", results.files[0]);
+    assert_eq!("test/SingleUse.java", results.files[1]);
+    assert_eq!("test/ImportOnly.java", results.files[2]);
+}
+
+#[test]
+fn usage_rank_flows_from_caller_to_callee_not_backward() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "test/Seed.java",
+            "package test; public class Seed { static void run() { Callee.work(); } }",
+        )
+        .file(
+            "test/Callee.java",
+            "package test; public class Callee { static void work() {} }",
+        )
+        .file(
+            "test/Caller.java",
+            "package test; public class Caller { void invoke() { Seed.run(); } }",
+        )
+        .build();
+    let analyzer = java_analyzer(project.root());
+
+    let results = most_relevant_files(
+        &analyzer,
+        MostRelevantFilesParams {
+            seed_file_paths: vec!["test/Seed.java".to_string()],
+            seed_weights: None,
+            recency_half_life: Some(250.0),
+            ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            limit: 1,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(vec!["test/Callee.java"], results.files);
+}
+
+#[test]
+fn usage_mode_combines_seed_weights_and_same_file_symbol_scores_deterministically() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "test/LeftSeed.java",
+            "package test; public class LeftSeed { void run() { Shared.first(); } }",
+        )
+        .file(
+            "test/RightSeed.java",
+            "package test; public class RightSeed { void run() { Shared.second(); Other.work(); } }",
+        )
+        .file(
+            "test/Shared.java",
+            "package test; public class Shared { static void first() {} static void second() {} }",
+        )
+        .file(
+            "test/Other.java",
+            "package test; public class Other { static void work() {} }",
+        )
+        .build();
+    let analyzer = java_analyzer(project.root());
+
+    let params = MostRelevantFilesParams {
+        seed_file_paths: vec![
+            "test/LeftSeed.java".to_string(),
+            "test/RightSeed.java".to_string(),
+        ],
+        seed_weights: Some(vec![1.0, 3.0]),
+        recency_half_life: Some(250.0),
+        ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+        limit: 2,
+    };
+    let first = most_relevant_files(&analyzer, params.clone()).unwrap();
+    let second = most_relevant_files(&analyzer, params).unwrap();
+
+    assert_eq!(first.files, second.files);
+    assert_eq!("test/Shared.java", first.files[0]);
+    assert_eq!("test/Other.java", first.files[1]);
+}
+
+#[test]
+fn usage_mode_fills_from_legacy_and_falls_back_for_unmapped_seed() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "test/Seed.java",
+            "package test; import test.ImportOnly; public class Seed { void run() { Called.work(); } }",
+        )
+        .file(
+            "test/Called.java",
+            "package test; public class Called { static void work() {} }",
+        )
+        .file(
+            "test/ImportOnly.java",
+            "package test; public class ImportOnly {}",
+        )
+        .file("resources/seed.txt", "seed")
+        .file(
+            "resources/Imported.java",
+            "package resources; public class Imported {}",
+        )
+        .build();
+    let repo = Repository::init(project.root()).unwrap();
+    commit_paths(
+        &repo,
+        "resource seed and fallback",
+        &["resources/seed.txt", "resources/Imported.java"],
+        &[],
+    );
+    let analyzer = java_analyzer(project.root());
+
+    let filled = most_relevant_files(
+        &analyzer,
+        MostRelevantFilesParams {
+            seed_file_paths: vec!["test/Seed.java".to_string()],
+            seed_weights: None,
+            recency_half_life: Some(250.0),
+            ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            limit: 2,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        vec!["test/Called.java", "test/ImportOnly.java"],
+        filled.files
+    );
+    assert_eq!(
+        filled.files.len(),
+        filled.files.iter().collect::<HashSet<_>>().len()
+    );
+
+    let default = most_relevant_files(
+        &analyzer,
+        MostRelevantFilesParams {
+            seed_file_paths: vec!["resources/seed.txt".to_string()],
+            seed_weights: None,
+            recency_half_life: Some(250.0),
+            ranking_mode: MostRelevantFilesRankingMode::HistoryImports,
+            limit: 3,
+        },
+    )
+    .unwrap();
+    let usage = most_relevant_files(
+        &analyzer,
+        MostRelevantFilesParams {
+            seed_file_paths: vec!["resources/seed.txt".to_string()],
+            seed_weights: None,
+            recency_half_life: Some(250.0),
+            ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            limit: 3,
+        },
+    )
+    .unwrap();
+    assert_eq!(default.files, usage.files);
+    assert_eq!(vec!["resources/Imported.java"], usage.files);
+}
+
+#[test]
+fn usage_mode_does_not_promote_a_truncated_callee() {
+    let mut seed = String::from("package test; public class Seed { void run() {\nNormal.work();\n");
+    for _ in 0..=1000 {
+        seed.push_str("Hot.work();\n");
+    }
+    seed.push_str("} }");
+
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("test/Seed.java", seed)
+        .file(
+            "test/Normal.java",
+            "package test; public class Normal { static void work() {} }",
+        )
+        .file(
+            "test/Hot.java",
+            "package test; public class Hot { static void work() {} }",
+        )
+        .build();
+    let analyzer = java_analyzer(project.root());
+    let results = most_relevant_files(
+        &analyzer,
+        MostRelevantFilesParams {
+            seed_file_paths: vec!["test/Seed.java".to_string()],
+            seed_weights: None,
+            recency_half_life: Some(250.0),
+            ranking_mode: MostRelevantFilesRankingMode::UsageGraph,
+            limit: 1,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(vec!["test/Normal.java"], results.files);
 }

@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::analyzer::{IAnalyzer, WorkspaceAnalyzer};
 use crate::path_utils::rel_path_string;
-use crate::searchtools::{MostRelevantFilesParams, most_relevant_files};
+use crate::searchtools::{
+    MostRelevantFilesParams, MostRelevantFilesRankingMode, most_relevant_files,
+};
 
 use super::active_index::ActiveIndex;
 use super::bm25::{RepoEntityUniverse, build_match_query, grounded_prompt_text, tokenize};
@@ -208,6 +210,7 @@ pub fn semantic_search(
                 seed_file_paths: seed_paths,
                 seed_weights: Some(seed_weights),
                 recency_half_life: Some(COEDIT_HALF_LIFE),
+                ranking_mode: MostRelevantFilesRankingMode::HistoryImports,
                 limit: k,
             },
         ) {

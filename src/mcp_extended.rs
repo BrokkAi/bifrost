@@ -363,6 +363,12 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "exclusiveMinimum": 0.0,
                         "description": "Optional git recency half-life in commits. Omit for the default 250-commit exponential decay, or pass null for uniform weighting."
                     },
+                    "ranking_mode": {
+                        "type": "string",
+                        "enum": ["history_imports", "usage_graph"],
+                        "default": "history_imports",
+                        "description": "Ranking source. history_imports preserves git-first/import-fill behavior; usage_graph ranks resolved caller-to-callee relationships first and uses the legacy ranking to fill remaining slots."
+                    },
                     "limit": {
                         "type": "integer",
                         "default": 20,
@@ -578,5 +584,16 @@ mod tests {
             query_code["inputSchema"]["properties"]["schema_version"]["enum"],
             json!([2])
         );
+    }
+
+    #[test]
+    fn most_relevant_files_schema_exposes_ranking_modes() {
+        let descriptor = extended_tool_descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor["name"] == "most_relevant_files")
+            .expect("most_relevant_files descriptor");
+        let mode = &descriptor["inputSchema"]["properties"]["ranking_mode"];
+        assert_eq!(mode["enum"], json!(["history_imports", "usage_graph"]));
+        assert_eq!(mode["default"], "history_imports");
     }
 }
