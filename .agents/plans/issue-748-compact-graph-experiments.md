@@ -24,7 +24,8 @@ The work happens on branch `748-explore-compact-csrcsc-graph-representations-for
 - [x] (2026-07-15T15:11:55Z) Introduced shared compact rows plus directed CSR/CSC storage, migrated import PageRank and completed RQL import graphs, measured alternating optimized A/B binaries, and promoted the candidate.
 - [x] (2026-07-15T15:29:00Z) Added and captured a generated exact-identity hierarchy/ownership baseline covering reverse-index construction, direct and transitive reads, RQL subtypes, members-owner round trips, and standalone owner lookup.
 - [x] (2026-07-15T15:40:44Z) Replaced the common rich reverse hierarchy map and redundant per-key memo sets with exact-identity keyed CSR rows, measured alternating optimized A/B binaries, promoted hierarchy CSR, and rejected a workspace CSC for query-local singular ownership.
-- [ ] Adapt the dense-ID `WorkspaceUsageGraph` introduced by #781 to contiguous outgoing and incoming edge storage without reintroducing rich-key construction, then measure graph construction, PageRank, public rendering, and memory.
+- [x] (2026-07-15T15:46:38Z) Added and captured a generated Go weighted usage-relevance baseline for the dense `WorkspaceUsageGraph`, including first and warm graph construction plus PageRank and phase RSS.
+- [ ] Adapt the dense-ID `WorkspaceUsageGraph` introduced by #781 to contiguous weighted outgoing storage without reintroducing rich-key construction, then measure graph construction, PageRank, rendering adapters, and memory.
 - [ ] Run the checked-in performance regression suite on representative pinned repositories, complete final review and CI-equivalent validation, publish the conclusion to #748, and summarize which structures should remain map-based.
 
 ## Surprises & Discoveries
@@ -83,6 +84,12 @@ The work happens on branch `748-explore-compact-csrcsc-graph-representations-for
 - Observation: the old per-key `direct_descendants` memo caches duplicated the global reverse index without removing return allocations. Every lookup cloned a cached `HashSet`, while the compact index can collect the same owned API result directly from a slice; removing these caches improved traversal and lowers retained state after broad queries.
   Evidence: across three alternating release processes, full provider descendants fell from 0.516 ms to 0.219 ms first (57.6%) and from 0.224 ms to 0.192 ms warm (14.1%). RQL subtypes remained at parity because structural matching and provenance rendering dominate that path.
 
+- Observation: `WorkspaceUsageGraph` is currently private to usage-based relevance and its calibration benchmark; the public `usage_graph` tool has a separate richer rendering path. Compaction can therefore preserve an edge iterator adapter for calibration while measuring public-tool regressions separately, rather than forcing public call-site payloads into the ranking graph.
+  Evidence: direct consumers of `WorkspaceUsageGraph.edges` are `related_files_by_usage_graph` and `relevance/weight_benchmark.rs`; `searchtools::usage_graph` independently builds its filtered response.
+
+- Observation: the new generated usage-relevance fixture reproduces the existing Go memory workload at a smaller configurable scale and makes the ranking representation measurable. At 500 modules it implies at least 3,500 catalog nodes and exactly 3,000 aggregated call edges; first ranking takes 1,229.977 ms, warm ranking 814.111 ms, and peak RSS grows from 35,520,512 bytes after analyzer construction to 81,985,536 after the first rank and 83,591,168 after warm reranking.
+  Evidence: `tests/measure_usage_relevance_graph.rs` uses one helper target and six caller methods per module, asserts `sub/sub.go` ranks first, uses one analyzer thread, and reports one versioned JSON line.
+
 ## Decision Log
 
 - Decision: begin with structural fact roles and keep the first compact representation local to `FileFacts` until its measurements are known.
@@ -140,6 +147,8 @@ Milestone 3 outcome 2026-07-15T15:11:55Z: `CompactRows<T>` now owns validated co
 Milestone 4 baseline 2026-07-15T15:29:00Z: `tests/measure_hierarchy_relations.rs` generates one exact Java declaration per file in a bounded-depth breadth-four tree, with four member methods that call a local sink. At 800 types / 799 hierarchy edges, analyzer construction is 668.868 ms; the first direct-descendant lookup that materializes the global reverse index is 242.494 ms and its warm median is 0.001 ms; full provider descendants are 3.209 ms first and 1.449 ms warm. RQL transitive subtypes are 466.728 ms first and 459.111 ms warm; all-class `members | owner` is 960.740 ms first and 866.424 ms warm; standalone call-site `enclosing_decl | owner` is 722.748 ms first and 722.372 ms warm. Peak RSS rises from 36,896,768 after analyzer construction to 44,302,336 after hierarchy-index construction, 53,116,928 after RQL subtypes, 87,490,560 after members-owner, and 98,222,080 after standalone owner. The next change will compact only the shared global reverse hierarchy index first; the query-local ownership path remains a separately measured promote-or-discard decision.
 
 Milestone 4 outcome 2026-07-15T15:40:44Z: the common reverse hierarchy index now stores exact `CodeUnit` identities once, hash-indexes only ancestors that own rows, and retains all descendant endpoints in `CompactRows<u32>`. Nine providers no longer retain a second weighted Moka cache of per-key descendant sets. In three alternating release process runs, median first full-descendant traversal moved from 0.516 ms to 0.219 ms and warm traversal from 0.224 ms to 0.192 ms. RQL subtypes were 156.554 ms versus 156.598 ms first and 156.296 ms versus 155.590 ms warm; members-owner was 289.814 ms versus 290.238 ms warm; standalone owner was 236.270 ms versus 237.158 ms warm. Those end-to-end paths are at parity. Median peak RSS after the hierarchy query fell from 42,876,928 to 42,270,720 bytes; after the complete ownership workload it fell from 81,248,256 to 80,773,120 bytes. All 182 focused hierarchy, update/cache, exact-identity pipeline, and language-provider tests pass, as does all-target/all-feature Clippy with warnings denied. Hierarchy CSR is promoted; ownership CSC is discarded.
+
+Milestone 5 baseline 2026-07-15T15:46:38Z: `tests/measure_usage_relevance_graph.rs` builds a deterministic Go workspace and calls the public `most_relevant_files` surface in `usage_graph` ranking mode, thereby exercising catalog construction, weighted edge aggregation, the dense ranking graph, PageRank, and file aggregation. At 500 modules / at least 3,500 nodes / 3,000 edges, analyzer construction is 452.258 ms, first ranking is 1,229.977 ms, and the five-iteration warm median is 814.111 ms. Peak RSS is 35,520,512 bytes after the analyzer, 81,985,536 after first ranking, and 83,591,168 after warm ranking. The exact first result is `sub/sub.go` and is stable across every rerank.
 
 ## Context and Orientation
 
@@ -271,6 +280,11 @@ Hierarchy/ownership optimized A/B at baseline commit `05033258e0afa80e12e54a6c37
 
     candidate direct_first_ms=75.694 descendants_first_ms=0.219 descendants_warm_median_ms=0.192 rql_subtypes_first_ms=156.598 rql_subtypes_warm_median_ms=155.590 members_owner_warm_median_ms=290.238 standalone_owner_warm_median_ms=237.158 rss_after_hierarchy_index=34275328 rss_after_rql_subtypes=42270720 rss_after_standalone_owner=80773120
 
+Weighted usage-relevance baseline at Bifrost commit `e0bc329569d74d430de65818e4cf473293c3eca7`, single-threaded debug test profile:
+
+    BIFROST_SEMANTIC_INDEX=off cargo test --test measure_usage_relevance_graph -- --ignored --nocapture
+    modules=500 expected_minimum_nodes=3500 expected_edges=3000 analyzer_build_ms=452.258 ranking_first_ms=1229.977 ranking_warm_median_ms=814.111 ranking_results=1 first_result=sub/sub.go rss_after_analyzer=35520512 rss_after_first_ranking=81985536 rss_after_warm_ranking=83591168
+
 ## Interfaces and Dependencies
 
 The first benchmark may add representation-neutral methods to `FileFacts`:
@@ -303,3 +317,5 @@ Revision note 2026-07-15T15:11:55Z: Promoted shared compact rows and directed CS
 Revision note 2026-07-15T15:29:00Z: Added the exact-identity hierarchy and ownership benchmark, captured its 800-type baseline, and narrowed the first candidate to the common retained reverse hierarchy index because ownership is currently singular, per-file, and query-local in the RQL path.
 
 Revision note 2026-07-15T15:40:44Z: Promoted exact-identity one-way hierarchy CSR after alternating optimized A/B and cross-language validation; recorded that RQL ownership should remain query-local and use a single-parent reverse array only if per-file child storage is later compacted.
+
+Revision note 2026-07-15T15:46:38Z: Added the weighted usage-relevance benchmark, captured its 500-module baseline, and confirmed the compact ranking graph can remain separate from the public usage-graph rendering model while retaining an iterator adapter for calibration.
