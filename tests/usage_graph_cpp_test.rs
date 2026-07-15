@@ -523,3 +523,197 @@ class Broken {
         value["edges"]
     );
 }
+
+#[test]
+fn qualified_method_values_create_exact_owner_usage_graph_edges() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "worker.h",
+            r#"#pragma once
+namespace demo {
+class Worker {
+public:
+    void OnDone();
+    void Arm();
+};
+class Other {
+public:
+    void OnDone();
+    void Arm();
+};
+}
+"#,
+        )
+        .file(
+            "worker.cc",
+            r#"#include "worker.h"
+namespace demo {
+void Worker::OnDone() {}
+void Other::OnDone() {}
+void Worker::Arm() {
+    auto callback = &::demo::Worker::OnDone;
+}
+void Other::Arm() {
+    auto callback = &Other::OnDone;
+}
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "demo.Worker.Arm", "demo.Worker.OnDone"),
+        "expected Worker::Arm -> Worker::OnDone method-value edge: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "demo.Other.Arm", "demo.Other.OnDone"),
+        "expected Other::Arm -> Other::OnDone method-value edge: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "demo.Worker.Arm", "demo.Other.OnDone"),
+        "Worker method value must not cross over to Other::OnDone: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "demo.Other.Arm", "demo.Worker.OnDone"),
+        "Other method value must not cross over to Worker::OnDone: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn qualified_callable_values_follow_cpp_lexical_owner_tiers() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "worker.h",
+            r#"#pragma once
+namespace Worker {
+void OnDone();
+}
+namespace other {
+class Worker {
+public:
+    void OnDone();
+};
+}
+namespace outer {
+namespace inner {
+void helper();
+class Worker {
+public:
+    void OnDone();
+};
+}
+class Worker {
+public:
+    void OnDone();
+    void Arm();
+};
+}
+"#,
+        )
+        .file(
+            "worker.cc",
+            r#"#include "worker.h"
+namespace Worker {
+void OnDone() {}
+}
+namespace other {
+void Worker::OnDone() {}
+}
+namespace outer {
+namespace inner {
+void helper() {}
+void Worker::OnDone() {}
+}
+void Worker::OnDone() {}
+void Worker::Arm() {
+    auto nearest_type = &Worker::OnDone;
+    auto relative_type = &inner::Worker::OnDone;
+    auto relative_function = &inner::helper;
+}
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "outer.Worker.Arm", "outer.Worker.OnDone"),
+        "short owner must resolve at the nearest lexical tier: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "outer.Worker.Arm", "outer::inner.Worker.OnDone"),
+        "relative multi-component owner must retain its lexical namespace prefix: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "outer.Worker.Arm", "outer::inner.helper"),
+        "relative namespace function must resolve through the same lexical tiers: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "outer.Worker.Arm", "Worker.OnDone")
+            && !has_edge(&value, "outer.Worker.Arm", "other.Worker.OnDone"),
+        "nearer lexical owners must block global namespace and unrelated visible types: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn qualified_namespace_function_and_data_member_values_keep_exact_graph_targets() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "worker.h",
+            r#"#pragma once
+namespace demo {
+void OnDone();
+void state();
+class Worker {
+public:
+    int state;
+    void Arm();
+};
+class Other {
+public:
+    int state;
+    void Arm();
+};
+}
+"#,
+        )
+        .file(
+            "worker.cc",
+            r#"#include "worker.h"
+namespace demo {
+void OnDone() {}
+void state() {}
+void Worker::Arm() {
+    auto function_value = &demo::OnDone;
+    auto field_value = &Worker::state;
+}
+void Other::Arm() {
+    auto field_value = &Other::state;
+}
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "demo.Worker.Arm", "demo.OnDone"),
+        "qualified namespace function value should resolve exactly: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "demo.Worker.Arm", "demo.state")
+            && !has_edge(&value, "demo.Other.Arm", "demo.state"),
+        "pointer-to-data-member values must not fan out to a callable namesake: {}",
+        value["edges"]
+    );
+}

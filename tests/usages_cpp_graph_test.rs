@@ -6238,3 +6238,467 @@ void consume() {
 
     assert_success_counts(result, &constructor, 0, 0);
 }
+
+#[test]
+fn authoritative_cpp_usage_resolves_qualified_method_value_to_exact_owner() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "worker.h",
+            r#"#pragma once
+namespace demo {
+class Worker {
+public:
+    void OnDone();
+    void Arm();
+};
+class Other {
+public:
+    void OnDone();
+};
+}
+"#,
+        )
+        .file(
+            "worker.cc",
+            r#"#include "worker.h"
+namespace demo {
+void Worker::OnDone() {}
+void Other::OnDone() {}
+void Worker::Arm() {
+    auto callback = &Worker::OnDone;
+    auto wrong_owner = &Other::OnDone;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Worker.OnDone"
+            && slash_path(unit.source()) == "worker.cc"
+            && !unit.is_synthetic()
+    });
+    let worker = project.file("worker.cc");
+    let source = worker.read_to_string().expect("worker source");
+    let positive = source.find("&Worker::OnDone").expect("Worker method value");
+    let positive_start = positive + "&Worker::".len();
+    let positive_end = positive_start + "OnDone".len();
+    let wrong_owner = source.find("&Other::OnDone").expect("Other method value");
+    let wrong_owner_start = wrong_owner + "&Other::".len();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(worker.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+
+    assert_eq!(
+        query.candidate_files,
+        std::iter::once(worker.clone()).collect(),
+        "authoritative scan must remain limited to worker.cc"
+    );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = query.result
+    else {
+        panic!("expected authoritative C++ method-value success");
+    };
+    let hits = hits_by_overload.get(&target).cloned().unwrap_or_default();
+    assert_eq!(hits.len(), 1, "Worker::OnDone hits: {hits:#?}");
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == worker
+                && hit.start_offset == positive_start
+                && hit.end_offset == positive_end
+        }),
+        "missing exact OnDone member-token hit {positive_start}..{positive_end}: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            !(hit.start_offset <= wrong_owner_start
+                && wrong_owner_start + "OnDone".len() <= hit.end_offset)
+        }),
+        "Other::OnDone must not cross over to Worker::OnDone: {hits:#?}"
+    );
+    assert_eq!(
+        unproven_total_by_overload
+            .get(&target)
+            .copied()
+            .unwrap_or_default(),
+        0,
+        "owner-qualified method values should be proven, not fuzzy"
+    );
+}
+
+#[test]
+fn authoritative_cpp_usage_keeps_overloaded_qualified_method_value_unproven() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "worker.h",
+            r#"#pragma once
+namespace demo {
+class Worker {
+public:
+    void OnDone();
+    void OnDone(int value);
+    void Arm();
+};
+}
+"#,
+        )
+        .file(
+            "worker.cc",
+            r#"#include "worker.h"
+namespace demo {
+void Worker::OnDone() {}
+void Worker::OnDone(int value) {}
+void Worker::Arm() {
+    auto callback = &Worker::OnDone;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Worker.OnDone"
+            && unit.signature() == Some("()")
+            && slash_path(unit.source()) == "worker.cc"
+            && !unit.is_synthetic()
+    });
+    let worker = project.file("worker.cc");
+    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(worker).collect()));
+    let result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+
+    assert_success_counts(result, &target, 0, 1);
+}
+
+#[test]
+fn authoritative_cpp_method_usage_rejects_qualified_namespace_function_value() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "worker.h",
+            r#"#pragma once
+namespace demo {
+void OnDone();
+class Worker {
+public:
+    void OnDone();
+    void Arm();
+};
+}
+"#,
+        )
+        .file(
+            "worker.cc",
+            r#"#include "worker.h"
+namespace demo {
+void OnDone() {}
+void Worker::OnDone() {}
+void Worker::Arm() {
+    auto callback = &demo::OnDone;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Worker.OnDone"
+            && slash_path(unit.source()) == "worker.cc"
+            && !unit.is_synthetic()
+    });
+    let worker = project.file("worker.cc");
+    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(worker).collect()));
+    let result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+
+    assert_success_counts(result, &target, 0, 0);
+}
+
+#[test]
+fn authoritative_cpp_method_values_apply_lexical_type_and_namespace_shadowing() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "worker.h",
+            r#"#pragma once
+namespace Worker {
+void OnDone();
+}
+namespace outer {
+namespace inner {
+void helper();
+}
+class Worker {
+public:
+    void OnDone();
+    void helper();
+    void Arm();
+};
+}
+"#,
+        )
+        .file(
+            "worker.cc",
+            r#"#include "worker.h"
+namespace Worker {
+void OnDone() {}
+}
+namespace outer {
+namespace inner {
+void helper() {}
+}
+void Worker::OnDone() {}
+void Worker::helper() {}
+void Worker::Arm() {
+    auto method_value = &Worker::OnDone;
+    auto function_value = &inner::helper;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let source = project.file("worker.cc");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(source.clone()).collect()));
+    let method = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "outer.Worker.OnDone"
+            && slash_path(unit.source()) == "worker.cc"
+            && !unit.is_synthetic()
+    });
+    let method_result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&method),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+    assert_success_counts(method_result, &method, 1, 0);
+
+    let namesake_method = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "outer.Worker.helper"
+            && slash_path(unit.source()) == "worker.cc"
+            && !unit.is_synthetic()
+    });
+    let namespace_result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&namesake_method),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+    assert_success_counts(namespace_result, &namesake_method, 0, 0);
+}
+
+#[test]
+fn authoritative_cpp_usage_preserves_pointer_to_data_member_reference() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "worker.h",
+            r#"#pragma once
+namespace demo {
+class Worker {
+public:
+    int state;
+    void Arm();
+};
+}
+"#,
+        )
+        .file(
+            "worker.cc",
+            r#"#include "worker.h"
+namespace demo {
+void Worker::Arm() {
+    auto member = &Worker::state;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field
+            && unit.fq_name() == "demo.Worker.state"
+            && slash_path(unit.source()) == "worker.h"
+    });
+    let worker = project.file("worker.cc");
+    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(worker).collect()));
+    let result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+
+    assert_success_counts(result, &target, 1, 0);
+}
+
+#[test]
+fn authoritative_cpp_usage_resolves_leading_global_qualified_method_value() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "worker.h",
+            r#"#pragma once
+namespace demo {
+class Worker {
+public:
+    void OnDone();
+    void Arm();
+};
+}
+"#,
+        )
+        .file(
+            "worker.cc",
+            r#"#include "worker.h"
+namespace demo {
+void Worker::OnDone() {}
+void Worker::Arm() {
+    auto callback = &::demo::Worker::OnDone;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Worker.OnDone"
+            && slash_path(unit.source()) == "worker.cc"
+            && !unit.is_synthetic()
+    });
+    let worker = project.file("worker.cc");
+    let source = worker.read_to_string().expect("worker source");
+    let qualified = source
+        .find("&::demo::Worker::OnDone")
+        .expect("leading-global method value");
+    let start = qualified + "&::demo::Worker::".len();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(worker.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!("expected leading-global method-value success");
+    };
+    let hits = hits_by_overload.get(&target).cloned().unwrap_or_default();
+    assert_eq!(hits.len(), 1, "leading-global hits: {hits:#?}");
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == worker
+                && hit.start_offset == start
+                && hit.end_offset == start + "OnDone".len()
+        }),
+        "missing exact leading-global terminal hit: {hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_usage_covers_qualified_and_short_alias_redeclarations() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "bridge.h",
+            r#"#pragma once
+namespace demo {
+class ArcBluetoothBridge {
+public:
+    using AdapterStateCallback = void (*)(bool);
+    void OnPoweredOn(AdapterStateCallback callback, bool powered);
+    void Arm();
+};
+}
+"#,
+        )
+        .file(
+            "bridge.cc",
+            r#"#include "bridge.h"
+namespace demo {
+void ArcBluetoothBridge::OnPoweredOn(
+    ArcBluetoothBridge::AdapterStateCallback callback,
+    bool powered) {}
+void ArcBluetoothBridge::Arm() {
+    auto callback = &ArcBluetoothBridge::OnPoweredOn;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_all_declarations();
+    let mut targets = declarations
+        .iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Function
+                && unit.fq_name() == "demo.ArcBluetoothBridge.OnPoweredOn"
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    targets.sort_by_key(|unit| unit.is_synthetic());
+    assert_eq!(targets.len(), 2, "physical targets: {targets:#?}");
+    assert!(
+        targets.iter().any(|unit| {
+            unit.signature() == Some("(ArcBluetoothBridge::AdapterStateCallback, bool)")
+        }) && targets
+            .iter()
+            .any(|unit| unit.signature() == Some("(AdapterStateCallback, bool)")),
+        "fixture must preserve qualified-vs-short physical signatures: {targets:#?}"
+    );
+    let source = project.file("bridge.cc");
+    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(source).collect()));
+    let result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(&analyzer, &targets, Some(&provider), 1, 1000)
+        .result;
+
+    assert_success_counts(result, &targets[0], 1, 0);
+}

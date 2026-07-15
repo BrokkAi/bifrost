@@ -22,12 +22,15 @@
 //! return-type inference) is a recall gap, never a wrong edge — mirroring the
 //! receiver shapes the forward C++ scan proves.
 
+use super::extractor::{LexicalScopeResolution, enclosing_lexical_scope_components};
 use super::resolver::{
-    DesignatedInitializerOwner, TargetKind, VisibilityIndex, constructor_style_local_declaration,
-    designated_initializer_owner, extract_variable_name, first_type_child,
-    infer_cpp_initializer_type, is_declaration_name, is_declarator_node, normalize_type_text,
-    out_of_line_member_definition_owner, recovered_macro_function_return_type, type_owner_of,
+    DesignatedInitializerOwner, LexicalCallableValueResolution, TargetKind, VisibilityIndex,
+    VisibleMemberResolution, constructor_style_local_declaration, designated_initializer_owner,
+    extract_variable_name, first_type_child, infer_cpp_initializer_type, is_declaration_name,
+    is_declarator_node, normalize_type_text, out_of_line_member_definition_owner,
+    recovered_macro_function_return_type, type_owner_of,
 };
+use super::syntax::explicit_qualified_callable_value;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
@@ -147,6 +150,16 @@ fn record_reference(
     ctx: &mut CppScan<'_, '_>,
     bindings: &LocalInferenceEngine<CodeUnit>,
 ) {
+    if let Some(value) = explicit_qualified_callable_value(node) {
+        record_qualified_callable_value(
+            value.qualified,
+            value.global,
+            &value.owner_components,
+            value.member,
+            ctx,
+        );
+        return;
+    }
     if matches!(node.kind(), "identifier" | "field_identifier")
         && let Some(designator_owner) =
             designated_initializer_owner(ctx.visibility, ctx.file, ctx.source, node)
@@ -207,6 +220,76 @@ fn record_reference(
         }
         "call_expression" => record_call(node, ctx, bindings),
         _ => {}
+    }
+}
+
+fn record_qualified_callable_value(
+    qualified: Node<'_>,
+    global: bool,
+    owner_components: &[Node<'_>],
+    member_node: Node<'_>,
+    ctx: &mut CppScan<'_, '_>,
+) {
+    let member_name = node_text(member_node, ctx.source);
+    if member_name.is_empty() {
+        return;
+    }
+    let owner_components = owner_components
+        .iter()
+        .map(|component| node_text(*component, ctx.source))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let lexical_scope = if global {
+        Vec::new()
+    } else {
+        match enclosing_lexical_scope_components(
+            qualified,
+            ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            ctx.source,
+        ) {
+            LexicalScopeResolution::Resolved(scope) => scope,
+            LexicalScopeResolution::Ambiguous | LexicalScopeResolution::Missing => {
+                ctx.record_unproven(member_name, member_node);
+                return;
+            }
+        }
+    };
+    let owner = match ctx.visibility.resolve_callable_value_components_lexically(
+        ctx.analyzer,
+        ctx.file,
+        &owner_components,
+        member_name,
+        global,
+        &lexical_scope,
+    ) {
+        LexicalCallableValueResolution::Type(owner) => owner,
+        LexicalCallableValueResolution::FreeFunction(function) => {
+            ctx.record(function.fq_name(), member_node);
+            return;
+        }
+        LexicalCallableValueResolution::Ambiguous | LexicalCallableValueResolution::Missing => {
+            ctx.record_unproven(member_name, member_node);
+            return;
+        }
+    };
+    match ctx
+        .visibility
+        .visible_member_for_owner_name(ctx.file, &owner, member_name)
+    {
+        VisibleMemberResolution::Callable(callables) => {
+            if let Some(callable) = callables.first() {
+                ctx.record(callable.fq_name(), member_node);
+            }
+        }
+        // Fields are intentionally absent from the workspace usage-graph node
+        // catalog. A proven non-callable member is therefore a negative for this
+        // callable edge pass, not an unresolved terminal-name fanout.
+        VisibleMemberResolution::NonCallable => {}
+        VisibleMemberResolution::AmbiguousKind | VisibleMemberResolution::Missing => {
+            ctx.record_unproven(member_name, member_node);
+        }
     }
 }
 

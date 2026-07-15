@@ -8,6 +8,7 @@ use crate::analyzer::usages::cpp_graph::hits::{
     push_self_receiver_hit, push_unproven_hit,
 };
 use crate::analyzer::usages::cpp_graph::resolver::*;
+use crate::analyzer::usages::cpp_graph::syntax::explicit_qualified_callable_value;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, cpp_node_text as node_text};
@@ -710,6 +711,10 @@ fn maybe_record_free_function_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'
 }
 
 fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if let Some(value) = explicit_qualified_callable_value(node) {
+        maybe_record_qualified_method_value_hit(value.qualified, value.member, ctx);
+        return;
+    }
     if node.kind() == "function_definition" {
         maybe_record_method_definition_hit(node, ctx);
         return;
@@ -782,6 +787,99 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         push_unproven_hit(function_terminal_node(function), ctx);
     }
+}
+
+fn maybe_record_qualified_method_value_hit(
+    qualified: Node<'_>,
+    member: Node<'_>,
+    ctx: &mut ScanCtx<'_>,
+) {
+    if !name_matches_callable(node_text(member, ctx.source), &ctx.spec.member_name) {
+        return;
+    }
+    *ctx.raw_match_count += 1;
+    let resolution =
+        qualified_callable_value_resolution(qualified, node_text(member, ctx.source), ctx);
+    match resolution {
+        LexicalCallableValueResolution::Type(resolved_owner) => {
+            let Some(owner) = ctx.spec.owner.as_ref() else {
+                push_unproven_hit(member, ctx);
+                return;
+            };
+            if !receiver_owner_matches_target(&resolved_owner, owner, ctx) {
+                if same_visible_symbol(&resolved_owner, owner) {
+                    push_unproven_hit(member, ctx);
+                }
+                return;
+            }
+            match ctx.visibility.visible_member_for_owner_name(
+                ctx.file,
+                owner,
+                &ctx.spec.member_name,
+            ) {
+                VisibleMemberResolution::Callable(candidates)
+                    if candidates.iter().all(|candidate| {
+                        ctx.target_group.contains(candidate)
+                            || ctx
+                                .target_group
+                                .iter()
+                                .any(|target| same_visible_symbol(candidate, target))
+                    }) =>
+                {
+                    // An explicitly qualified method value remains an external
+                    // reference even when its owner is the enclosing class.
+                    push_hit(member, ctx);
+                }
+                VisibleMemberResolution::NonCallable => {}
+                VisibleMemberResolution::Callable(_)
+                | VisibleMemberResolution::AmbiguousKind
+                | VisibleMemberResolution::Missing => {
+                    push_unproven_hit(member, ctx);
+                }
+            }
+        }
+        LexicalCallableValueResolution::FreeFunction(_) => {}
+        LexicalCallableValueResolution::Ambiguous | LexicalCallableValueResolution::Missing => {
+            push_unproven_hit(member, ctx);
+        }
+    }
+}
+
+fn qualified_callable_value_resolution(
+    qualified: Node<'_>,
+    member_name: &str,
+    ctx: &ScanCtx<'_>,
+) -> LexicalCallableValueResolution {
+    let Some((owner_components, global)) =
+        qualified_callable_owner_components(qualified, ctx.source)
+    else {
+        return LexicalCallableValueResolution::Missing;
+    };
+    let lexical_scope = if global {
+        Vec::new()
+    } else {
+        match enclosing_lexical_scope_components(
+            qualified,
+            ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            ctx.source,
+        ) {
+            LexicalScopeResolution::Resolved(scope) => scope,
+            LexicalScopeResolution::Ambiguous => {
+                return LexicalCallableValueResolution::Ambiguous;
+            }
+            LexicalScopeResolution::Missing => return LexicalCallableValueResolution::Missing,
+        }
+    };
+    ctx.visibility.resolve_callable_value_components_lexically(
+        ctx.analyzer,
+        ctx.file,
+        &owner_components,
+        member_name,
+        global,
+        &lexical_scope,
+    )
 }
 
 fn method_call_may_target(call: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -1564,7 +1662,7 @@ enum QualifiedOwnerResolution {
     Unresolved,
 }
 
-enum LexicalScopeResolution {
+pub(super) enum LexicalScopeResolution {
     Resolved(Vec<String>),
     Ambiguous,
     Missing,
@@ -1589,7 +1687,13 @@ fn qualified_owner_resolution(node: Node<'_>, ctx: &ScanCtx<'_>) -> QualifiedOwn
     let Some((components, global)) = qualified_callable_owner_components(node, ctx.source) else {
         return QualifiedOwnerResolution::Unresolved;
     };
-    let lexical_scope = match enclosing_lexical_scope_components(node, ctx) {
+    let lexical_scope = match enclosing_lexical_scope_components(
+        node,
+        ctx.analyzer,
+        ctx.visibility,
+        ctx.file,
+        ctx.source,
+    ) {
         LexicalScopeResolution::Resolved(scope) => scope,
         LexicalScopeResolution::Ambiguous | LexicalScopeResolution::Missing => {
             return QualifiedOwnerResolution::Unresolved;
@@ -1683,8 +1787,14 @@ fn enclosing_namespace_components(node: Node<'_>, source: &str) -> Vec<String> {
     namespaces.into_iter().flatten().collect()
 }
 
-fn enclosing_lexical_scope_components(node: Node<'_>, ctx: &ScanCtx<'_>) -> LexicalScopeResolution {
-    let namespace = enclosing_namespace_components(node, ctx.source);
+pub(super) fn enclosing_lexical_scope_components(
+    node: Node<'_>,
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+) -> LexicalScopeResolution {
+    let namespace = enclosing_namespace_components(node, source);
     let mut scope = namespace.clone();
     let mut classes = Vec::new();
     let mut function_definition = None;
@@ -1696,7 +1806,7 @@ fn enclosing_lexical_scope_components(node: Node<'_>, ctx: &ScanCtx<'_>) -> Lexi
         ) && let Some(name) = parent.child_by_field_name("name")
         {
             let mut components = Vec::new();
-            if append_cpp_name_components(name, ctx.source, &mut components).is_some() {
+            if append_cpp_name_components(name, source, &mut components).is_some() {
                 classes.push(components);
             }
         }
@@ -1709,17 +1819,12 @@ fn enclosing_lexical_scope_components(node: Node<'_>, ctx: &ScanCtx<'_>) -> Lexi
     if let Some(function) = function_definition.and_then(function_definition_name_node)
         && is_structurally_qualified(function)
     {
-        let Some((owner, global)) = qualified_callable_owner_components(function, ctx.source)
-        else {
+        let Some((owner, global)) = qualified_callable_owner_components(function, source) else {
             return LexicalScopeResolution::Missing;
         };
-        match ctx.visibility.resolve_type_components_lexically(
-            ctx.analyzer,
-            ctx.file,
-            &owner,
-            global,
-            &namespace,
-        ) {
+        match visibility
+            .resolve_type_components_lexically(analyzer, file, &owner, global, &namespace)
+        {
             LexicalTypeResolution::Resolved { components, .. } => scope = components,
             LexicalTypeResolution::Ambiguous => return LexicalScopeResolution::Ambiguous,
             LexicalTypeResolution::Missing => return LexicalScopeResolution::Missing,

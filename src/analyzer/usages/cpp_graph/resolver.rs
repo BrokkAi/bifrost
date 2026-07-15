@@ -37,6 +37,13 @@ pub(super) enum LexicalTypeResolution {
     Missing,
 }
 
+pub(super) enum LexicalCallableValueResolution {
+    Type(CodeUnit),
+    FreeFunction(CodeUnit),
+    Ambiguous,
+    Missing,
+}
+
 pub(super) struct TargetSpec {
     pub(super) target: CodeUnit,
     pub(super) kind: TargetKind,
@@ -301,11 +308,7 @@ impl VisibilityIndex {
         if components.is_empty() {
             return LexicalTypeResolution::Missing;
         }
-        let first_prefix_len = if global { 0 } else { lexical_scope.len() };
-        for prefix_len in (0..=first_prefix_len).rev() {
-            let mut qualified = Vec::with_capacity(prefix_len + components.len());
-            qualified.extend_from_slice(&lexical_scope[..prefix_len]);
-            qualified.extend_from_slice(components);
+        for qualified in lexical_component_tiers(components, global, lexical_scope) {
             let qualified_name = qualified.join("::");
             let candidates = self
                 .type_candidates(file, &qualified_name)
@@ -327,6 +330,61 @@ impl VisibilityIndex {
             };
         }
         LexicalTypeResolution::Missing
+    }
+
+    pub(super) fn resolve_callable_value_components_lexically(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        owner_components: &[String],
+        member_name: &str,
+        global: bool,
+        lexical_scope: &[String],
+    ) -> LexicalCallableValueResolution {
+        if owner_components.is_empty() || member_name.is_empty() {
+            return LexicalCallableValueResolution::Missing;
+        }
+        for qualified_owner in lexical_component_tiers(owner_components, global, lexical_scope) {
+            let owner_name = qualified_owner.join("::");
+            let type_candidates = self
+                .type_candidates(file, &owner_name)
+                .into_iter()
+                .filter(|candidate| cpp_name_for(candidate) == owner_name)
+                .collect::<Vec<_>>();
+            let resolved_type = if type_candidates.is_empty() {
+                None
+            } else {
+                let Some(resolved) = unique_logical_type_candidate(type_candidates) else {
+                    return LexicalCallableValueResolution::Ambiguous;
+                };
+                let Some(unit) = self.canonical_type_unit(analyzer, file, &resolved) else {
+                    return LexicalCallableValueResolution::Ambiguous;
+                };
+                Some(unit)
+            };
+
+            let mut qualified_callable = qualified_owner;
+            qualified_callable.push(member_name.to_string());
+            let callable_name = qualified_callable.join("::");
+            let free_function = self
+                .named_candidates_for_normalized(file, &callable_name, TargetKind::FreeFunction)
+                .into_iter()
+                .find(|candidate| {
+                    cpp_name_for(candidate) == callable_name
+                        && type_owner_of(analyzer, candidate).is_none()
+                })
+                .cloned();
+
+            match (resolved_type, free_function) {
+                (Some(_), Some(_)) => return LexicalCallableValueResolution::Ambiguous,
+                (Some(owner), None) => return LexicalCallableValueResolution::Type(owner),
+                (None, Some(function)) => {
+                    return LexicalCallableValueResolution::FreeFunction(function);
+                }
+                (None, None) => {}
+            }
+        }
+        LexicalCallableValueResolution::Missing
     }
 
     fn resolve_type_for_declaration(
@@ -644,6 +702,30 @@ impl VisibilityIndex {
             .collect()
     }
 
+    pub(super) fn visible_member_for_owner_name(
+        &self,
+        file: &ProjectFile,
+        owner: &CodeUnit,
+        name: &str,
+    ) -> VisibleMemberResolution {
+        let candidates = self.visible_members_for_owner_name(file, owner, name);
+        let mut callables = Vec::new();
+        let mut non_callable = None;
+        for candidate in candidates {
+            if candidate.is_function() {
+                callables.push(candidate.clone());
+            } else if non_callable.is_none() {
+                non_callable = Some(candidate.clone());
+            }
+        }
+        match (callables.is_empty(), non_callable) {
+            (false, None) => VisibleMemberResolution::Callable(callables),
+            (true, Some(_)) => VisibleMemberResolution::NonCallable,
+            (false, Some(_)) => VisibleMemberResolution::AmbiguousKind,
+            (true, None) => VisibleMemberResolution::Missing,
+        }
+    }
+
     fn field_declared_type_fact(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -749,6 +831,27 @@ impl VisibilityIndex {
     fn qualified_candidate_inspections(&self) -> usize {
         self.qualified_candidate_inspections.load(Ordering::Relaxed)
     }
+}
+
+pub(super) enum VisibleMemberResolution {
+    Callable(Vec<CodeUnit>),
+    NonCallable,
+    AmbiguousKind,
+    Missing,
+}
+
+fn lexical_component_tiers<'a>(
+    components: &'a [String],
+    global: bool,
+    lexical_scope: &'a [String],
+) -> impl Iterator<Item = Vec<String>> + 'a {
+    let first_prefix_len = if global { 0 } else { lexical_scope.len() };
+    (0..=first_prefix_len).rev().map(move |prefix_len| {
+        let mut qualified = Vec::with_capacity(prefix_len + components.len());
+        qualified.extend_from_slice(&lexical_scope[..prefix_len]);
+        qualified.extend_from_slice(components);
+        qualified
+    })
 }
 
 fn build_visible_identifier_index(
