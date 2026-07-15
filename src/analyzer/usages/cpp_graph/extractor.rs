@@ -1412,9 +1412,9 @@ fn unanimous_receiver_units(units: Vec<CodeUnit>) -> Vec<CodeUnit> {
 }
 
 fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    let Some(owner) = ctx.spec.owner.as_ref() else {
+    if ctx.spec.owner.is_none() {
         return false;
-    };
+    }
     match node.kind() {
         "field_expression" => node
             .child_by_field_name("argument")
@@ -1423,7 +1423,7 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
                 receiver_is_self_like(receiver) && same_owner_context(receiver, ctx)
                     || receiver_type_units(receiver, ctx.source, ctx)
                         .iter()
-                        .any(|target| same_symbol(target, owner))
+                        .any(|target| receiver_owner_matches_target(target, ctx))
             }),
         "call_expression" => node
             .child_by_field_name("function")
@@ -1440,7 +1440,7 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
                 targets
                     .iter()
                     .filter_map(|target| target.unit.as_ref())
-                    .any(|target| same_symbol(target, owner))
+                    .any(|target| receiver_owner_matches_target(target, ctx))
             }),
         "this" => same_owner_context(node, ctx),
         "qualified_identifier" | "scoped_identifier" | "field_identifier" => {
@@ -1451,6 +1451,13 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             qualified_owner_matches(text, ctx)
         }
     }
+}
+
+fn receiver_owner_matches_target(receiver_owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
+    ctx.spec
+        .target_owners
+        .iter()
+        .any(|target_owner| same_symbol(receiver_owner, target_owner))
 }
 
 fn receiver_is_self_like(node: Node<'_>) -> bool {

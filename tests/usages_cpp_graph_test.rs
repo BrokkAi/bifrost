@@ -1596,6 +1596,174 @@ void Owner::block_shadow() {
 }
 
 #[test]
+fn authoritative_cpp_usage_matches_out_of_line_method_targets_to_visible_declarations() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "graph.h",
+            r#"namespace demo {
+struct Rect {};
+class Graph {
+public:
+    void Layout(Rect& rect, Graph* peer);
+    void Layout(int mode);
+};
+class WrongGraph {
+public:
+    void Layout(Rect& rect, Graph* peer);
+};
+class Page {
+public:
+    void Draw(Rect& rect);
+    void DrawShadowed(WrongGraph cpu_idle_, Rect& rect);
+private:
+    Graph cpu_idle_;
+    Graph cpu_user_;
+    WrongGraph wrong_;
+};
+}
+"#,
+        ),
+        (
+            "graph.cc",
+            r#"#include "graph.h"
+namespace demo {
+struct Rect {};
+class Graph {
+public:
+    void Layout(Rect& rect, Graph* peer);
+    void Layout(int mode);
+};
+void Graph::Layout(Rect& rect, Graph* peer) {}
+void Graph::Layout(int mode) {}
+}
+"#,
+        ),
+        (
+            "consumer.cc",
+            r#"#include "graph.h"
+namespace demo {
+void Page::Draw(Rect& rect) {
+    cpu_idle_.Layout(rect, &cpu_user_); // positive-visible-declaration
+    cpu_idle_.Layout(7); // negative-overload
+    wrong_.Layout(rect, &cpu_user_); // negative-owner
+}
+void Page::DrawShadowed(WrongGraph cpu_idle_, Rect& rect) {
+    cpu_idle_.Layout(rect, &cpu_user_); // negative-parameter-shadow-owner
+}
+}
+"#,
+        ),
+        (
+            "hidden/graph.h",
+            r#"namespace demo {
+struct Rect {};
+class Graph {
+public:
+    void Layout(Rect& rect, Graph* peer);
+    void Layout(int mode);
+};
+}
+"#,
+        ),
+        (
+            "hidden_consumer.cc",
+            r#"#include "hidden/graph.h"
+void hidden_call(demo::Graph& graph, demo::Rect& rect) {
+    graph.Layout(rect, &graph); // negative-hidden-same-fqn-owner
+}
+"#,
+        ),
+    ]);
+
+    let method_in = |path: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Function
+                && unit.fq_name() == "demo.Graph.Layout"
+                && unit
+                    .signature()
+                    .is_some_and(|signature| signature.contains("Rect"))
+                && slash_path(unit.source()) == path
+        })
+    };
+    let implementation = method_in("graph.cc");
+    let declaration = method_in("graph.h");
+    assert_eq!(implementation.signature(), declaration.signature());
+    let owner_in = |path: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.fq_name() == "demo.Graph"
+                && slash_path(unit.source()) == path
+        })
+    };
+    let implementation_owner = owner_in("graph.cc");
+    let declaration_owner = owner_in("graph.h");
+    assert_eq!(implementation_owner.fq_name(), declaration_owner.fq_name());
+    assert_eq!(
+        implementation_owner.signature(),
+        declaration_owner.signature()
+    );
+    assert_ne!(
+        implementation_owner.source(),
+        declaration_owner.source(),
+        "fixture must preserve distinct physical owner declarations: implementation={implementation_owner:#?}, declaration={declaration_owner:#?}"
+    );
+    let targets = [implementation.clone(), declaration];
+    let consumer = project.file("consumer.cc");
+    let hidden_consumer = project.file("hidden_consumer.cc");
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        [consumer.clone(), hidden_consumer.clone()]
+            .into_iter()
+            .collect(),
+    ));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(&analyzer, &targets, Some(&provider), 2, 1000);
+    assert_eq!(
+        query.candidate_files,
+        [consumer.clone(), hidden_consumer.clone()]
+            .into_iter()
+            .collect(),
+        "authoritative scanning must remain confined to consumer files"
+    );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = query.result
+    else {
+        panic!(
+            "expected authoritative out-of-line method success, got {:#?}",
+            query.result
+        );
+    };
+    let hits = hits_by_overload
+        .get(&implementation)
+        .expect("implementation target should own the result bucket");
+
+    assert_eq!(
+        hits.len(),
+        1,
+        "only the matching visible declaration call should be proven: {hits:#?}"
+    );
+    assert!(
+        hits.iter().any(|hit| hit.file == consumer && hit.line == 4),
+        "the production-shaped member receiver should resolve through the visible header declaration: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| hit.file != hidden_consumer),
+        "the unimported same-FQN owner must not match by logical identity alone: {hits:#?}"
+    );
+    assert_eq!(
+        unproven_total_by_overload
+            .get(&implementation)
+            .copied()
+            .unwrap_or_default(),
+        0,
+        "wrong-owner, overload, and shadow calls are proven negatives; the hidden same-FQN call must not enter this target's candidate set"
+    );
+}
+
+#[test]
 fn authoritative_cpp_usage_does_not_choose_an_ambiguous_short_field_type() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
         (

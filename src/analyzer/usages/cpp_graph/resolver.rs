@@ -32,6 +32,7 @@ pub(super) struct TargetSpec {
     pub(super) target: CodeUnit,
     pub(super) kind: TargetKind,
     pub(super) owner: Option<CodeUnit>,
+    pub(super) target_owners: Vec<CodeUnit>,
     pub(super) member_name: String,
     pub(super) owner_fq_name: Option<String>,
     pub(super) owner_cpp_name: Option<String>,
@@ -40,6 +41,31 @@ pub(super) struct TargetSpec {
 }
 
 impl TargetSpec {
+    pub(super) fn from_targets(analyzer: &dyn IAnalyzer, targets: &[CodeUnit]) -> Option<Self> {
+        let target = targets.first()?;
+        let mut spec = Self::from_target(analyzer, target)?;
+        for equivalent in targets
+            .iter()
+            .skip(1)
+            .filter(|candidate| same_logical_symbol(candidate, target))
+        {
+            let owner = if equivalent.is_class() {
+                Some(equivalent.clone())
+            } else {
+                type_owner_of(analyzer, equivalent)
+            };
+            if let Some(owner) = owner
+                && !spec
+                    .target_owners
+                    .iter()
+                    .any(|existing| same_symbol(existing, &owner))
+            {
+                spec.target_owners.push(owner);
+            }
+        }
+        Some(spec)
+    }
+
     pub(super) fn from_target(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> Option<Self> {
         if target.is_class() {
             return Some(Self::new(
@@ -111,10 +137,12 @@ impl TargetSpec {
     ) -> Self {
         let owner_fq_name = owner.as_ref().map(CodeUnit::fq_name);
         let owner_cpp_name = owner.as_ref().map(cpp_name_for);
+        let target_owners = owner.iter().cloned().collect();
         Self {
             target,
             kind,
             owner,
+            target_owners,
             member_name,
             owner_fq_name,
             owner_cpp_name,
