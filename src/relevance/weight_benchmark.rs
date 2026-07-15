@@ -3,17 +3,6 @@ use crate::{AnalyzerConfig, FilesystemProject, WorkspaceAnalyzer};
 use serde_json::json;
 use std::sync::Arc;
 
-const DEFAULT_REPOS: &[&str] = &[
-    "/Users/dave/Workspace/test-repos/cassandra-python-driver",
-    "/Users/dave/Workspace/test-repos/ngx-admin",
-    "/Users/dave/Workspace/test-repos/dbal",
-    "/Users/dave/Workspace/test-repos/jgit",
-    "/Users/dave/Workspace/test-repos/godog",
-    "/Users/dave/Workspace/test-repos/kokkos",
-    "/Users/dave/Workspace/test-repos/lgtm",
-    "/Users/dave/Workspace/test-repos/tsngtest",
-];
-
 #[derive(Clone, Copy)]
 struct Profile {
     name: &'static str,
@@ -150,16 +139,12 @@ impl Metrics {
 #[test]
 #[ignore = "multi-repository calibration benchmark; set BIFROST_USAGE_WEIGHT_BENCH_REPOS"]
 fn benchmark_usage_reference_weight_profiles() {
-    let repos = std::env::var("BIFROST_USAGE_WEIGHT_BENCH_REPOS")
-        .ok()
-        .map(|value| {
-            value
-                .split(':')
-                .filter(|part| !part.is_empty())
-                .map(PathBuf::from)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| DEFAULT_REPOS.iter().map(PathBuf::from).collect());
+    let Some(repos) = std::env::var_os("BIFROST_USAGE_WEIGHT_BENCH_REPOS")
+        .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+    else {
+        eprintln!("skipping benchmark: set BIFROST_USAGE_WEIGHT_BENCH_REPOS");
+        return;
+    };
     let sample_limit = env_usize("BIFROST_USAGE_WEIGHT_BENCH_SAMPLES", 30);
     let commit_limit = env_usize("BIFROST_USAGE_WEIGHT_BENCH_COMMITS", 300);
     let random_seed = env_usize("BIFROST_USAGE_WEIGHT_BENCH_SEED", 781) as u64;

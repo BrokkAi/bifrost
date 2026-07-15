@@ -17,7 +17,7 @@ The result will be observable through a deterministic ignored benchmark over rep
 - [x] (2026-07-15T14:08:00Z) Added a deterministic ignored benchmark that builds each repository graph once and sweeps candidate profiles against bounded recent git co-change targets.
 - [x] (2026-07-15T14:08:00Z) Ran the benchmark across eight usable corpora covering Python, TypeScript, PHP, Java, Go, C++, mixed native/JVM code, and a small Rust workspace; recorded impractical full Rust and C# construction runs.
 - [x] (2026-07-15T14:08:00Z) Inspected deterministic examples and selected the conservative calibrated profile: call 1.5, member 1.25, type 1.0, other 0.875.
-- [ ] Run formatting, focused tests, Clippy, and the full feature-enabled test suite; document and checkpoint every milestone.
+- [x] (2026-07-15T15:02:00Z) Passed formatting, focused graph/relevance tests, all-target/all-feature Clippy, the complete `nlp,python` library and integration suite, and rustdoc; completed the final review and checkpoint.
 
 ## Surprises & Discoveries
 
@@ -73,11 +73,13 @@ The result will be observable through a deterministic ignored benchmark over rep
 
 ## Outcomes & Retrospective
 
-Calibration is in progress. The initial design establishes an independent quantitative signal, retains qualitative inspection, and deliberately postpones public configurability.
+Calibration is complete. Bifrost now distinguishes four broad structured reference kinds internally, applies a conservative empirically selected profile in usage-graph relevance, and retains a deterministic benchmark for future recalibration without expanding the public request schema.
 
 Milestone 1 outcome 2026-07-15T13:28:00Z: `UsageReferenceCounts` now survives from every language scanner through `UsageEdgeWeights` and the dense workspace graph. The public site-bearing graph still emits its unchanged `(path, line)` payload, dead-code consumers sum the four counts, and relevance currently combines them with a uniform profile. Structured classifier and focused graph/relevance tests pass.
 
 Milestone 2 outcome 2026-07-15T14:08:00Z: the ignored benchmark evaluates deterministic random seed files against independent git co-change labels while reusing one expensive graph across all profiles. Eight completed corpora favor a subtle behavioral profile overall. The selected default improves all three macro metrics, preserves type references at full strength, avoids the measured Go regression, and adds no public configuration surface.
+
+Final outcome 2026-07-15T15:02:00Z: the selected call 1.5, member 1.25, type 1.0, other 0.875 defaults passed the entire feature-enabled Rust suite. The benchmark remains explicitly opt-in and accepts an OS-native path list through `BIFROST_USAGE_WEIGHT_BENCH_REPOS`, so it has no user-specific paths and works on Windows as well as Unix-like hosts. The principal follow-up is graph-construction performance on large Rust and C# workspaces; profile application itself is cheap and does not justify a second cache.
 
 ## Context and Orientation
 
@@ -107,7 +109,9 @@ After kind retention, run:
     BIFROST_SEMANTIC_INDEX=off cargo test inverted_edges --lib
     BIFROST_SEMANTIC_INDEX=off cargo test --test usage_graph_test --test usage_graph_identity_test
 
-Run the ignored benchmark using the exact environment and test name added during the benchmark milestone. The command must use repository paths under `/Users/dave/Workspace/test-repos`, must not write into those repositories, and must print one JSON result line per repository plus one aggregate line.
+Run the ignored benchmark using an OS-native path list (colon-separated on macOS/Linux, semicolon-separated on Windows). It reads git history but does not write into the repositories and prints one JSON result line per repository plus one aggregate line:
+
+    BIFROST_USAGE_WEIGHT_BENCH_REPOS=/Users/dave/Workspace/test-repos/cassandra-python-driver:/Users/dave/Workspace/test-repos/ngx-admin:/Users/dave/Workspace/test-repos/dbal:/Users/dave/Workspace/test-repos/jgit:/Users/dave/Workspace/test-repos/godog:/Users/dave/Workspace/test-repos/kokkos:/Users/dave/Workspace/test-repos/lgtm:/Users/dave/Workspace/test-repos/tsngtest BIFROST_USAGE_WEIGHT_BENCH_SAMPLES=20 BIFROST_USAGE_WEIGHT_BENCH_COMMITS=300 BIFROST_USAGE_WEIGHT_BENCH_SEED=781 cargo test benchmark_usage_reference_weight_profiles --lib -- --ignored --nocapture
 
 Before completion, run:
 
@@ -153,6 +157,20 @@ Milestone 1 validation:
     BIFROST_SEMANTIC_INDEX=off cargo test --test usage_graph_test --test usage_graph_identity_test --test most_relevant_files
     test result: ok. 16 + 9 + 27 passed; 0 failed
 
+Final validation:
+
+    cargo fmt --all -- --check
+    passed
+
+    env PATH=/opt/homebrew/bin:/usr/bin:/bin scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
+    passed
+
+    RUSTFLAGS='-Clink-arg=-undefined -Clink-arg=dynamic_lookup' BIFROST_SEMANTIC_INDEX=off cargo test --lib --tests --features nlp,python
+    passed; library result 840 passed, 0 failed, 4 ignored, followed by all integration binaries with 0 failures
+
+    env PATH=/opt/homebrew/bin:/usr/bin:/bin RUSTFLAGS='-Clink-arg=-undefined -Clink-arg=dynamic_lookup' BIFROST_SEMANTIC_INDEX=off scripts/with-isolated-cargo-target.sh cargo test --doc --features nlp,python
+    passed; 0 doc tests, 0 failures
+
 ## Interfaces and Dependencies
 
 Define an internal enum and compact counts in `src/analyzer/usages/inverted_edges.rs`, conceptually:
@@ -168,3 +186,5 @@ Revision note 2026-07-15T13:12:00Z: Created the calibration ExecPlan after inven
 Revision note 2026-07-15T13:28:00Z: Recorded the completed kind-retention milestone, the same-line compatibility rule, and focused validation evidence.
 
 Revision note 2026-07-15T14:08:00Z: Recorded the reproducible benchmark, corpus limitations, profile sweep, selected calibrated defaults, compact counter representation, and decision not to add MCP configuration.
+
+Revision note 2026-07-15T15:02:00Z: Recorded final validation, removed user-specific benchmark defaults in favor of an OS-native environment path list, and closed the calibration outcome.
