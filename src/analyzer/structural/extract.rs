@@ -62,7 +62,6 @@ pub(crate) fn extract_file_facts(
                 range: node_range(node),
                 parent: enclosing,
                 name: None,
-                roles: Vec::new(),
                 subtree_end: fact_id + 1,
             });
             fact_by_ts_node.insert(node.id(), fact_id);
@@ -85,16 +84,25 @@ pub(crate) fn extract_file_facts(
     }
 
     // Pass 2: role extraction, now that every normalized node has a fact id.
+    let mut role_offsets = Vec::with_capacity(nodes.len() + 1);
+    let mut roles = Vec::new();
+    role_offsets.push(0);
     for (node, fact_id) in fact_sources {
+        debug_assert_eq!(fact_id as usize + 1, role_offsets.len());
         let kind = nodes[fact_id as usize].kind;
-        let mut sink = RoleSink::new(&fact_by_ts_node);
+        let mut sink = RoleSink::new(&fact_by_ts_node, &mut roles);
         spec.extract(node, kind, &mut sink);
-        let (name, roles) = sink.into_parts();
-        let fact = &mut nodes[fact_id as usize];
-        fact.name = name;
-        fact.roles = roles;
+        nodes[fact_id as usize].name = sink.into_name();
+        role_offsets
+            .push(u32::try_from(roles.len()).expect("structural role count must fit in a u32"));
     }
 
     let line_starts = compute_line_starts(source);
-    Some(FileFacts::new(source.to_string(), line_starts, nodes))
+    Some(FileFacts::new(
+        source.to_string(),
+        line_starts,
+        nodes,
+        role_offsets,
+        roles,
+    ))
 }

@@ -403,7 +403,7 @@ impl<'a> Renderer<'a> {
             return;
         }
         self.open_nodes += 1;
-        for role in &node.roles {
+        for role in self.facts.roles(id) {
             let mut role_line = format!(
                 "({} :span ({} {})",
                 role.role.label(),

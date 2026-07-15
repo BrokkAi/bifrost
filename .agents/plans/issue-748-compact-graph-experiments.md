@@ -18,8 +18,8 @@ The work happens on branch `748-explore-compact-csrcsc-graph-representations-for
 - [x] (2026-07-15T13:53:57Z) Re-read `.agents/PLANS.md`, issue #748, the current structural fact implementation, the benchmark harness, and the newly merged weighted usage-graph PageRank implementation.
 - [x] (2026-07-15T14:15:00Z) Added a reproducible structural-fact benchmark that reports cold extraction time, warm role-heavy matching time, fact and role counts, retained estimated bytes, process peak RSS, repository identity, and one versioned JSON line.
 - [x] (2026-07-15T14:20:00Z) Captured the unmodified structural-role baseline at three synthetic sizes and on `/Users/dave/Workspace/test-repos/vscode` at `a5914335df0bf1cae7d818a168ef321def9f8572`.
-- [ ] Replace per-node structural role vectors with one contiguous role array and row offsets, preserving source order and all `query_code`, Rune IR, and reference-classification behavior.
-- [ ] Compare the structural-role candidate with its baseline, review it, and either promote it or revert it with the result recorded on issue #748.
+- [x] (2026-07-15T14:29:00Z) Replaced per-node structural role vectors with one contiguous role array and row offsets, appending directly during extraction and preserving source order across `query_code`, Rune IR, reference classification, and structured call-site consumers.
+- [x] (2026-07-15T14:29:00Z) Compared and promoted the structural-role candidate: retained bytes fell 28.9% on `vscode`, optimized warm reads were at parity in a load-matched A/B, and all focused behavior plus warnings-as-errors checks passed.
 - [ ] Prototype a shared file-dependency relation for RQL import traversal and import PageRank, measure forward and reverse reads, and make a promote-or-discard decision.
 - [ ] Prototype compact hierarchy and ownership relations using exact `CodeUnit` identity, measure direct and transitive traversal, and make a promote-or-discard decision.
 - [ ] Adapt the dense-ID `WorkspaceUsageGraph` introduced by #781 to contiguous outgoing and incoming edge storage without reintroducing rich-key construction, then measure graph construction, PageRank, public rendering, and memory.
@@ -45,8 +45,14 @@ The work happens on branch `748-explore-compact-csrcsc-graph-representations-for
 - Observation: structural fact storage is already a large resident cost on a real TypeScript workspace. `vscode` produced 6,276,000 facts and 4,258,462 roles with 1,604,467,430 estimated retained bytes.
   Evidence: the successful repository benchmark raised peak RSS from 888,274,944 bytes after analyzer construction to 2,342,944,768 bytes after fact extraction and 2,744,664,064 bytes after three warm role-heavy queries.
 
-- Observation: this host currently has two Rust 1.96.0 builds with the same commit hash but different LLVM builds. An unconstrained Cargo invocation can compile dependencies with rustup's compiler and the crate with Homebrew's compiler, producing `E0514` even in a fresh isolated target.
-  Evidence: both the shared target and `scripts/with-isolated-cargo-target.sh cargo clippy` failed with incompatible-crate diagnostics; rustup reports LLVM 22.1.2 while `/opt/homebrew/bin/rustc` reports LLVM 22.1.6. Validation commands must pin `RUSTC` to `rustup which rustc` on this host.
+- Observation: this host currently has two Rust 1.96.0 builds with the same commit hash but different LLVM builds. `cargo` and `rustc` resolve through rustup, while `cargo-clippy` and `clippy-driver` resolve through Homebrew, producing `E0514` against rustup-built dependencies.
+  Evidence: rustup reports LLVM 22.1.2 while `/opt/homebrew/bin/rustc` reports LLVM 22.1.6. Tests must pin `RUSTC` to `rustup which rustc`, and Clippy must invoke rustup's `cargo-clippy` binary directly on this host.
+
+- Observation: the compact role rows materially reduce both retained logical bytes and process high-water RSS. On `vscode`, retained facts fell from 1,604,467,430 to 1,140,998,282 bytes, a 28.9% reduction; peak RSS after extraction fell from 2,342,944,768 to 1,973,108,736 bytes, a 15.8% reduction.
+  Evidence: the unchanged repository benchmark extracted the same 6,276,000 facts and 4,258,462 roles from the same `a5914335df0bf1cae7d818a168ef321def9f8572` checkout.
+
+- Observation: debug timings on this host vary substantially with compiler rebuild and background load. The clean real-repository candidate was 6.5% slower to extract and 5.0% slower for the warm role-heavy query than the historical baseline, while analyzer construction—unaffected by role storage—was 13.6% slower in the same comparison.
+  Evidence: the candidate reported 40.956 s analyzer construction, 32.573 s extraction, and 6.691 s matching versus 36.068 s, 30.593 s, and 6.370 s historically. A same-compiler small A/B narrowed the warm-read difference to 7.12 ms versus 6.53 ms, so optimized A/B validation is required before calling this a read regression.
 
 ## Decision Log
 
@@ -70,11 +76,17 @@ The work happens on branch `748-explore-compact-csrcsc-graph-representations-for
   Rationale: file paths, exact `CodeUnit` values, JS/TS defining-file identity, overload groups, and persisted blob-local keys have different equality rules. Dense IDs are snapshot-local indices into domain-owned arenas, not semantic identities by themselves.
   Date/Author: 2026-07-15 / Codex
 
+- Decision: promote compact structural role rows as the first production issue #748 result.
+  Rationale: the representation removes one vector header and allocation per fact, reduces retained `vscode` facts by 28.9% and process high-water RSS by about 15%, preserves exact fact and role counts plus source order, and shows no repeatable optimized warm-read regression. Direct append also avoids a transient flattening allocation.
+  Date/Author: 2026-07-15 / Codex
+
 ## Outcomes & Retrospective
 
-No representation experiment has been promoted yet. Planning and prerequisite verification are complete. The first observable outcome will be a structural-role benchmark that can run unchanged before and after the compact representation, followed by a measured promote-or-discard decision.
+The structural-role experiment is promoted. Planning and prerequisite verification are complete, the representation-neutral benchmark remains available for future layout changes, and the next experiment will determine whether file dependencies justify extracting the first shared compact-relation primitive.
 
 Milestone 1 outcome 2026-07-15T14:20:00Z: the representation-neutral benchmark is implemented and exercises nonzero facts and semantic role edges. Synthetic retained storage scales from 7,844,400 bytes at 36,100 facts to 123,759,200 bytes at 564,400 facts. The real `vscode` run establishes a 1.530 GB retained-storage baseline and proves the role representation is large enough for the pilot to produce a meaningful signal.
+
+Milestone 2 outcome 2026-07-15T14:29:00Z: direct CSR-style extraction removes every per-node role allocation and stores one `u32` offset per fact boundary plus one exact-sized role buffer. At 564,400 generated facts, retained bytes fell from 123,759,200 to 90,357,600 (27.0%). On `vscode`, retained bytes fell by 463,469,148 (28.9%), peak RSS after extraction fell by 369,836,032 (15.8%), and peak RSS after warm matching fell by 414,253,056 (15.1%). In the adjacent optimized large-fixture pair where analyzer setup was load-matched, warm reads were 88.98 ms for compact rows versus 89.53 ms for the baseline. All 86 structural unit tests, the structured call-site test, documented query tests, tutorials, all 57 pipeline tests, formatting, and all-target/all-feature Clippy with warnings denied pass. The candidate is promoted.
 
 ## Context and Orientation
 
@@ -145,6 +157,11 @@ Before a pushed or final checkpoint, run:
 
 Use `scripts/with-isolated-cargo-target.sh` if a matched isolated toolchain is required. Do not use manually named Cargo target directories.
 
+On the current host, the matching Clippy invocation is:
+
+    /Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin/cargo-clippy \
+      clippy --all-targets --all-features -- -D warnings
+
 ## Validation and Acceptance
 
 The structural pilot is behaviorally acceptable only if existing JSON and RQL matching, argument ordering, keyword matching, decorator ranges, Rune IR output, reference-kind classification, cache invalidation, and query budgets remain unchanged. Its benchmark must report nonzero fact and role counts. The same generated source and query must be used before and after the storage change.
@@ -200,4 +217,8 @@ Revision note 2026-07-15T13:53:57Z: Created the issue #748 experiment ExecPlan a
 
 Revision note 2026-07-15T14:20:00Z: Recorded the completed structural benchmark harness, the empty-file repository discovery, and synthetic plus `vscode` baseline evidence before changing role storage.
 
-Revision note 2026-07-15T14:35:00Z: Documented the host's dual-Rust compiler cache incompatibility and the required single-compiler validation workaround.
+Revision note 2026-07-15T14:25:00Z: Documented the host's dual-Rust compiler cache incompatibility and the required single-compiler validation workaround.
+
+Revision note 2026-07-15T14:29:00Z: Recorded the implemented structural-role CSR candidate, its targeted behavior checks, and synthetic plus `vscode` memory results; left promotion pending optimized timing and lint validation.
+
+Revision note 2026-07-15T14:29:00Z: Promoted compact structural role rows after optimized A/B read parity, focused behavior validation, and warnings-as-errors Clippy passed.

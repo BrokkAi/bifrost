@@ -2469,8 +2469,8 @@ fn classify_reference_kind(
         } else {
             Role::Receiver
         };
-        let receiver = node
-            .role_targets(receiver_role)
+        let receiver = facts
+            .role_targets(id as u32, receiver_role)
             .next()
             .map(|role| role.span.text(facts.source()).trim());
         if receiver.is_some_and(|text| matches!(text, "super" | "base")) {
@@ -2497,7 +2497,10 @@ fn classify_reference_kind(
             let fact = facts.node(current);
             if fact.kind == NormalizedKind::Assignment {
                 return Some(
-                    if fact.role_targets(Role::Left).any(|role| covers(role.span)) {
+                    if facts
+                        .role_targets(current, Role::Left)
+                        .any(|role| covers(role.span))
+                    {
                         ReferenceKind::FieldWrite
                     } else {
                         ReferenceKind::FieldRead
@@ -3340,7 +3343,8 @@ fn render_match(
         .collect();
     let node_range = full_detail.then(|| range_for_span(facts, fact.span()));
     let decorator_spans: Vec<_> = if full_detail {
-        fact.role_targets(Role::Decorator)
+        facts
+            .role_targets(fact_match.node, Role::Decorator)
             .map(|target| target.span)
             .collect()
     } else {

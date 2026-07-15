@@ -58,8 +58,6 @@ pub struct NormalizedNode {
     /// The fact's own name span (declared identifier for declarations, the
     /// callee name for calls, field name for field accesses, ...).
     pub name: Option<Span>,
-    /// Role edges in source order (argument order matters for `args`).
-    pub roles: Vec<RoleTarget>,
     /// One-past-the-end fact id for this fact's normalized subtree. Facts are
     /// stored in pre-order, so descendants are exactly
     /// `(self_id + 1)..subtree_end`.
@@ -73,10 +71,6 @@ impl NormalizedNode {
             end_byte: self.range.end_byte,
         }
     }
-
-    pub fn role_targets<'a>(&'a self, role: Role) -> impl Iterator<Item = &'a RoleTarget> + 'a {
-        self.roles.iter().filter(move |target| target.role == role)
-    }
 }
 
 /// All normalized facts for one file. `source` is a private copy so spans stay
@@ -87,14 +81,33 @@ pub struct FileFacts {
     source: String,
     line_starts: Vec<usize>,
     nodes: Vec<NormalizedNode>,
+    /// CSR row boundaries for `roles`; row `i` belongs to fact `i`.
+    role_offsets: Box<[u32]>,
+    /// Role edges grouped by source fact and retained in source order.
+    roles: Box<[RoleTarget]>,
 }
 
 impl FileFacts {
-    pub(crate) fn new(source: String, line_starts: Vec<usize>, nodes: Vec<NormalizedNode>) -> Self {
+    pub(crate) fn new(
+        source: String,
+        line_starts: Vec<usize>,
+        nodes: Vec<NormalizedNode>,
+        role_offsets: Vec<u32>,
+        roles: Vec<RoleTarget>,
+    ) -> Self {
+        assert_eq!(role_offsets.len(), nodes.len() + 1);
+        assert_eq!(role_offsets.first(), Some(&0));
+        assert_eq!(
+            role_offsets.last().copied().map(|value| value as usize),
+            Some(roles.len())
+        );
+        assert!(role_offsets.windows(2).all(|pair| pair[0] <= pair[1]));
         Self {
             source,
             line_starts,
             nodes,
+            role_offsets: role_offsets.into_boxed_slice(),
+            roles: roles.into_boxed_slice(),
         }
     }
 
@@ -110,13 +123,27 @@ impl FileFacts {
         &self.nodes[id as usize]
     }
 
+    /// Semantic role edges for `id`, in their original source order.
+    pub fn roles(&self, id: u32) -> &[RoleTarget] {
+        let row = id as usize;
+        let start = self.role_offsets[row] as usize;
+        let end = self.role_offsets[row + 1] as usize;
+        &self.roles[start..end]
+    }
+
+    pub fn role_targets(&self, id: u32, role: Role) -> impl Iterator<Item = &RoleTarget> {
+        self.roles(id)
+            .iter()
+            .filter(move |target| target.role == role)
+    }
+
     /// Total semantic role edges retained across every fact in this file.
     ///
     /// This is representation-neutral bookkeeping for diagnostics and
     /// memory benchmarks; callers that need the edges themselves should use
     /// the fact-level role accessors.
     pub fn role_count(&self) -> usize {
-        self.nodes.iter().map(|node| node.roles.len()).sum()
+        self.roles.len()
     }
 
     pub fn subtree_end(&self, id: u32) -> u32 {
@@ -136,12 +163,6 @@ impl FileFacts {
     /// Rough heap footprint for the facts-cache weigher; exactness doesn't
     /// matter, monotonicity with actual size does.
     pub fn estimated_bytes(&self) -> u64 {
-        let roles = self.nodes.iter().fold(0_u64, |bytes, node| {
-            bytes.saturating_add(
-                (node.roles.capacity() as u64)
-                    .saturating_mul(std::mem::size_of::<RoleTarget>() as u64),
-            )
-        });
         (self.source.capacity() as u64)
             .saturating_add(
                 (self.line_starts.capacity() as u64)
@@ -151,7 +172,12 @@ impl FileFacts {
                 (self.nodes.capacity() as u64)
                     .saturating_mul(std::mem::size_of::<NormalizedNode>() as u64),
             )
-            .saturating_add(roles)
+            .saturating_add(
+                (self.role_offsets.len() as u64).saturating_mul(std::mem::size_of::<u32>() as u64),
+            )
+            .saturating_add(
+                (self.roles.len() as u64).saturating_mul(std::mem::size_of::<RoleTarget>() as u64),
+            )
     }
 
     /// Whether `ancestor` lies on `node`'s parent chain (strictly above it).
@@ -166,21 +192,21 @@ mod tests {
     use crate::analyzer::Range;
     use crate::analyzer::structural::kinds::{NormalizedKind, Role};
 
-    fn role_target() -> RoleTarget {
+    fn role_target(role: Role, start_byte: usize) -> RoleTarget {
         RoleTarget {
-            role: Role::Callee,
+            role,
             spread: false,
             keyword: None,
             node: None,
             span: Span {
-                start_byte: 0,
-                end_byte: 1,
+                start_byte,
+                end_byte: start_byte + 1,
             },
             name: None,
         }
     }
 
-    fn node(roles: Vec<RoleTarget>) -> NormalizedNode {
+    fn node() -> NormalizedNode {
         NormalizedNode {
             kind: NormalizedKind::Call,
             range: Range {
@@ -191,7 +217,6 @@ mod tests {
             },
             parent: None,
             name: None,
-            roles,
             subtree_end: 1,
         }
     }
@@ -202,23 +227,60 @@ mod tests {
         source.push('x');
         let mut line_starts = Vec::with_capacity(32);
         line_starts.push(0);
-        let mut roles = Vec::with_capacity(16);
-        roles.push(role_target());
         let mut nodes = Vec::with_capacity(8);
-        nodes.push(node(roles));
-        let facts = FileFacts::new(source, line_starts, nodes);
+        nodes.push(node());
+        let roles = vec![role_target(Role::Callee, 0)];
+        let facts = FileFacts::new(source, line_starts, nodes, vec![0, 1], roles);
 
         let length_based = facts.source.len() as u64
             + (facts.line_starts.len() * std::mem::size_of::<usize>()) as u64
             + (facts.nodes.len() * std::mem::size_of::<NormalizedNode>()) as u64
-            + (facts.nodes[0].roles.len() * std::mem::size_of::<RoleTarget>()) as u64;
+            + (facts.role_offsets.len() * std::mem::size_of::<u32>()) as u64
+            + (facts.roles.len() * std::mem::size_of::<RoleTarget>()) as u64;
         let capacity_based = facts.source.capacity() as u64
             + (facts.line_starts.capacity() * std::mem::size_of::<usize>()) as u64
             + (facts.nodes.capacity() * std::mem::size_of::<NormalizedNode>()) as u64
-            + (facts.nodes[0].roles.capacity() * std::mem::size_of::<RoleTarget>()) as u64;
+            + (facts.role_offsets.len() * std::mem::size_of::<u32>()) as u64
+            + (facts.roles.len() * std::mem::size_of::<RoleTarget>()) as u64;
 
         assert!(capacity_based > length_based);
         assert_eq!(facts.estimated_bytes(), capacity_based);
         assert_eq!(facts.role_count(), 1);
+        assert_eq!(facts.roles(0).len(), 1);
+        assert!(std::ptr::eq(facts.roles(0).as_ptr(), facts.roles.as_ptr()));
+        assert_eq!(facts.role_targets(0, Role::Callee).count(), 1);
+    }
+
+    #[test]
+    fn compact_role_rows_preserve_boundaries_and_source_order() {
+        let roles = vec![
+            role_target(Role::Callee, 1),
+            role_target(Role::Arg, 2),
+            role_target(Role::Decorator, 3),
+        ];
+        let facts = FileFacts::new(
+            "abcd".to_owned(),
+            vec![0],
+            vec![node(), node()],
+            vec![0, 2, 3],
+            roles,
+        );
+
+        assert_eq!(
+            facts
+                .roles(0)
+                .iter()
+                .map(|target| (target.role, target.span.start_byte))
+                .collect::<Vec<_>>(),
+            vec![(Role::Callee, 1), (Role::Arg, 2)]
+        );
+        assert_eq!(
+            facts
+                .roles(1)
+                .iter()
+                .map(|target| (target.role, target.span.start_byte))
+                .collect::<Vec<_>>(),
+            vec![(Role::Decorator, 3)]
+        );
     }
 }

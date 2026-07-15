@@ -66,23 +66,25 @@ pub(crate) fn call_site_syntax_for_reference(
     start_byte: usize,
     end_byte: usize,
 ) -> Option<CallSiteSyntax> {
-    let call = facts
+    let (call_id, call) = facts
         .nodes()
         .iter()
-        .filter(|node| node.kind == NormalizedKind::Call)
-        .filter(|node| {
+        .enumerate()
+        .filter(|(_, node)| node.kind == NormalizedKind::Call)
+        .filter(|(_, node)| {
             node.name
                 .is_some_and(|name| name.start_byte <= start_byte && end_byte <= name.end_byte)
         })
-        .min_by_key(|node| node.range.end_byte.saturating_sub(node.range.start_byte))?;
+        .min_by_key(|(_, node)| node.range.end_byte.saturating_sub(node.range.start_byte))?;
+    let call_id = call_id as u32;
     let callee = call.name?;
-    let receiver = call
-        .role_targets(Role::Receiver)
+    let receiver = facts
+        .role_targets(call_id, Role::Receiver)
         .next()
         .map(|target| range_for_span(facts, target.span));
     let mut position = 0;
-    let arguments = call
-        .roles
+    let arguments = facts
+        .roles(call_id)
         .iter()
         .filter_map(|target| match target.role {
             Role::Arg => {
