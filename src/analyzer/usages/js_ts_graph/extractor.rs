@@ -9,7 +9,8 @@ use crate::analyzer::usages::get_definition::js_ts::{
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::usages::js_ts_graph::JsTsReceiverFactProvider;
 use crate::analyzer::usages::js_ts_graph::hits::{
-    record_hit, record_import_hit, record_self_receiver_hit, record_unproven_hit,
+    record_hit, record_import_hit, record_reexport_hit, record_self_receiver_hit,
+    record_unproven_hit,
 };
 use crate::analyzer::usages::js_ts_graph::resolver::{
     JsTsUsageIndex, is_static_member, member_name,
@@ -281,9 +282,10 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         return;
     }
-    // An export specifier's `name` is a value-side reference, whereas its optional
-    // `alias` is a newly declared export name. Handle the former directly rather
-    // than recursively visiting both identifiers.
+    // An export specifier's `name` forwards the referenced symbol, whereas its
+    // optional `alias` declares the outward-facing name. Retain the forwarding
+    // occurrence for IDE references, but classify it separately so agent/search
+    // usage results can omit binding-only noise.
     if kind == "export_specifier" {
         handle_export_specifier(node, ctx);
         return;
@@ -733,7 +735,7 @@ fn handle_export_specifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             .seeds
             .contains(&(ctx.file.clone(), exported_name.to_string()))
     {
-        record_hit(name, ctx);
+        record_reexport_hit(name, ctx);
     }
 }
 
