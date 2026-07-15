@@ -964,7 +964,7 @@ fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     ) || !name_matches_terminal(node_text(node, ctx.source), &ctx.spec.member_name)
         || is_declaration_name(node)
         || is_member_field_declaration_context(node, ctx)
-        || is_field_expression_member_descendant(node)
+        || is_selected_field_expression_member_descendant(node)
         || is_nested_in_qualified_identifier(node)
     {
         return;
@@ -978,20 +978,37 @@ fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn is_field_expression_member_descendant(mut node: Node<'_>) -> bool {
+/// Whether `node` belongs to the selected-member side of any enclosing field
+/// expression. A reference may be nested arbitrarily inside the receiver side
+/// (for example, an argument to a call-built fluent receiver), so direct child
+/// equality is insufficient: classify each ancestor by structured subtree
+/// containment instead.
+fn is_selected_field_expression_member_descendant(mut node: Node<'_>) -> bool {
     while let Some(parent) = node.parent() {
         if parent.kind() == "field_expression" {
+            if parent
+                .child_by_field_name("field")
+                .is_some_and(|field| node_is_within(field, node))
+            {
+                return true;
+            }
             let receiver = parent
                 .child_by_field_name("argument")
                 .or_else(|| parent.child_by_field_name("object"))
                 .or_else(|| parent.named_child(0));
-            if receiver != Some(node) {
+            if !receiver.is_some_and(|receiver| node_is_within(receiver, node)) {
+                // Unknown grammar shape inside a field expression: fail closed
+                // rather than treating it as a receiver reference.
                 return true;
             }
         }
         node = parent;
     }
     false
+}
+
+fn node_is_within(parent: Node<'_>, child: Node<'_>) -> bool {
+    parent.start_byte() <= child.start_byte() && child.end_byte() <= parent.end_byte()
 }
 
 fn global_field_resolves_to_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -1120,13 +1137,16 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     ) || !name_matches_terminal(node_text(node, ctx.source), &ctx.spec.member_name)
         || is_declaration_name(node)
         || is_member_field_declaration_context(node, ctx)
-        || has_ancestor_kind(node, "field_expression")
+        || is_selected_field_expression_member_descendant(node)
         || is_nested_in_qualified_identifier(node)
     {
         return;
     }
     *ctx.raw_match_count += 1;
     let text = node_text(node, ctx.source);
+    if !text.contains("::") && ctx.local_shadows.is_shadowed(text) {
+        return;
+    }
     let qualified_match = text.contains("::")
         && (ctx
             .visibility
@@ -1138,7 +1158,8 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             && owner_is_unscoped_enum(owner, ctx)
             && ctx.visibility.is_visible(ctx.file, &ctx.spec.target)
     });
-    if qualified_match || same_owner_context(node, ctx) || unscoped_enum_match {
+    let unqualified_same_owner = !text.contains("::") && same_owner_context(node, ctx);
+    if qualified_match || unqualified_same_owner || unscoped_enum_match {
         push_hit(node, ctx);
     } else if ctx
         .spec

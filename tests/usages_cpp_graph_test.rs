@@ -1444,6 +1444,158 @@ int read_wrong_qualified_value() {
 }
 
 #[test]
+fn authoritative_cpp_usage_finds_member_fields_nested_beneath_receiver_ancestors() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "model.h",
+            r#"struct Leaf { void touch(); };
+struct Holder {
+    Leaf child;
+    void touch();
+    Holder* operator->();
+    Leaf& operator[](int index);
+};
+enum class Mode { field };
+struct Builder {
+    Builder& set(const Holder& value);
+    Builder& set_mode(Mode value);
+    void finish();
+};
+Builder make_builder();
+struct Owner {
+    inline static Holder field;
+    void exercise();
+    void parameter_shadow(Holder field);
+    void function_shadow();
+    void block_shadow();
+};
+struct WrongOwner { inline static Holder field; };
+struct Container { Holder field; };
+extern Container container;
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"#include "model.h"
+
+void Owner::exercise() {
+    field.touch(); // positive-dot
+    field->touch(); // positive-arrow
+    field[0].touch(); // positive-subscript
+    field.child.touch(); // positive-nested
+    make_builder().set(field).finish(); // positive-fluent-bare-argument
+    make_builder().set(Owner::field).finish(); // positive-fluent-qualified-argument
+
+    make_builder().set_mode(Mode::field).finish(); // negative-enum-owner
+    WrongOwner::field.touch(); // negative-static-owner
+    container.field.touch(); // negative-selected-terminal
+}
+
+void Owner::parameter_shadow(Holder field) {
+    field.touch(); // negative-parameter-shadow
+}
+
+void Owner::function_shadow() {
+    Holder field;
+    field.touch(); // negative-function-shadow
+}
+
+void Owner::block_shadow() {
+    {
+        Holder field;
+        field.touch(); // negative-block-shadow
+    }
+    field.touch(); // positive-after-block-shadow
+}
+"#,
+        ),
+    ]);
+
+    let target = field_definition_with_owner(&analyzer, "Owner", "field");
+    let consumer = project.file("consumer.cpp");
+    let source = consumer.read_to_string().expect("consumer source");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = query.result
+    else {
+        panic!(
+            "expected authoritative member-field receiver success, got {:#?}",
+            query.result
+        );
+    };
+    let hits = hits_by_overload
+        .get(&target)
+        .expect("Owner.field should have a proven-hit bucket");
+    let labeled_field_start = |label: &str| {
+        let line_start = source
+            .find(label)
+            .unwrap_or_else(|| panic!("missing fixture line {label:?}"));
+        line_start
+            + label
+                .rfind("field")
+                .unwrap_or_else(|| panic!("missing field token in fixture line {label:?}"))
+    };
+    let positives = [
+        "    field.touch(); // positive-dot",
+        "    field->touch(); // positive-arrow",
+        "    field[0].touch(); // positive-subscript",
+        "    field.child.touch(); // positive-nested",
+        "    make_builder().set(field).finish(); // positive-fluent-bare-argument",
+        "    make_builder().set(Owner::field).finish(); // positive-fluent-qualified-argument",
+        "    field.touch(); // positive-after-block-shadow",
+    ];
+    let negatives = [
+        "    make_builder().set_mode(Mode::field).finish(); // negative-enum-owner",
+        "    WrongOwner::field.touch(); // negative-static-owner",
+        "    container.field.touch(); // negative-selected-terminal",
+        "    field.touch(); // negative-parameter-shadow",
+        "    field.touch(); // negative-function-shadow",
+        "        field.touch(); // negative-block-shadow",
+    ];
+    let covers = |start: usize| {
+        hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= start
+                && start + "field".len() <= hit.end_offset
+        })
+    };
+    let missing = positives
+        .iter()
+        .filter(|label| !covers(labeled_field_start(label)))
+        .copied()
+        .collect::<Vec<_>>();
+    let false_positives = negatives
+        .iter()
+        .filter(|label| covers(labeled_field_start(label)))
+        .copied()
+        .collect::<Vec<_>>();
+
+    assert!(
+        missing.is_empty() && false_positives.is_empty() && hits.len() == positives.len(),
+        "expected {} exact Owner.field hits; observed {} proven and {} unproven; missing={missing:#?}; false_positives={false_positives:#?}; hits={hits:#?}",
+        positives.len(),
+        hits.len(),
+        unproven_total_by_overload
+            .get(&target)
+            .copied()
+            .unwrap_or_default(),
+    );
+}
+
+#[test]
 fn authoritative_cpp_usage_does_not_choose_an_ambiguous_short_field_type() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
         (
