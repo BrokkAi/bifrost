@@ -76,6 +76,10 @@ resolution work.
   cross-file receiver fallback in the context resolver, reuse binder keys for
   import/local ordering collisions, keep deterministic SQL ordering in SQL,
   strengthen the empty module-result assertion, and remove an unreferenced probe.
+- [x] (2026-07-15) Rebase the reviewed branch onto `origin/master` after the
+  generation-scoped cache migration. Preserve active-generation filtering in
+  the Python exact-FQN query, target the replacement generation-aware index,
+  and adapt the batch-only tests to the new cancellation parameter.
 
 ## Surprises & Discoveries
 
@@ -409,6 +413,11 @@ owns the exact-file decision and delegates cross-file cases to the unchanged gen
 resolver; the bulk export path uses the binder it already needs instead of parsing
 import snippets a second time; and the module-seed regression now states that the
 correct outcome is complete with no invented type hit.
+
+The final rebase keeps master’s cache-generation contract intact. Python’s exact
+path-symbol query now uses `idx_path_symbol_units_lang_generation_exact_fqn` and
+filters the active generation inside the same transaction as the generic query;
+the focused query-plan and batch lifecycle regressions pass on the rebased tree.
 
 ## Context and Orientation
 

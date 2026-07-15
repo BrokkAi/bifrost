@@ -106,7 +106,7 @@ AND EXISTS (
 const EXACT_PATH_SYMBOL_FQN_SQL: &str =
     "SELECT lang, rel_path, blob_oid, kind, package_name, short_name,
            exact_fqn, normalized_fqn
-    FROM path_symbol_units INDEXED BY idx_path_symbol_units_lang_exact_fqn
+    FROM path_symbol_units INDEXED BY idx_path_symbol_units_lang_generation_exact_fqn
     WHERE lang = ?1 AND exact_fqn = ?2
       AND generation = COALESCE(
         (SELECT generation FROM analysis_epochs WHERE lang = ?1), 0
@@ -5173,8 +5173,9 @@ mod tests {
             .unwrap();
 
         assert!(
-            plan.iter()
-                .any(|detail| detail.contains("idx_path_symbol_units_lang_exact_fqn")),
+            plan.iter().any(|detail| {
+                detail.contains("idx_path_symbol_units_lang_generation_exact_fqn")
+            }),
             "expected exact Python lookup to use the FQN index, got {plan:?}"
         );
     }

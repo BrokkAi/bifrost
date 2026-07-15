@@ -929,6 +929,7 @@ mod tests {
                 start_byte: Some(start_byte),
                 end_byte: Some(start_byte + "run".len()),
             }],
+            None,
         );
 
         assert_eq!(outcomes[0].status, DefinitionLookupStatus::Resolved);
@@ -976,7 +977,7 @@ mod tests {
             })
             .collect();
 
-        let outcomes = resolve_definition_requests(analyzer, &mut context, requests);
+        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None);
 
         assert_eq!(
             outcomes[0].definitions[0].fq_name(),
@@ -1036,7 +1037,7 @@ mod tests {
             })
             .collect();
 
-        let outcomes = resolve_definition_requests(analyzer, &mut context, requests);
+        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None);
 
         assert_eq!(outcomes[0].definitions[0].fq_name(), "service.Service.run");
         assert_eq!(outcomes[1].definitions[0].fq_name(), "other.Other.stop");
