@@ -421,13 +421,19 @@ impl<'a> DefinitionBatchContext<'a> {
     }
 
     #[cfg(test)]
-    fn python_build_counts(&self) -> (usize, usize) {
+    fn python_build_counts(&self) -> (usize, usize, usize, usize) {
         (
             self.python_build_counters
                 .context_builds
                 .load(std::sync::atomic::Ordering::Relaxed),
             self.python_build_counters
                 .scope_fact_builds
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.python_build_counters
+                .receiver_type_cache_misses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.python_build_counters
+                .generic_receiver_type_fallbacks
                 .load(std::sync::atomic::Ordering::Relaxed),
         )
     }
@@ -859,6 +865,8 @@ mod tests {
         );
         let file = ProjectFile::new(fixture.project_root(), "app.py");
         let analyzer = fixture.analyzer.analyzer();
+        analyzer.reset_global_usage_definition_index_build_count_for_test();
+        analyzer.reset_full_declaration_scan_count_for_test();
         let mut context = DefinitionBatchContext::new(analyzer, true);
         let requests = ["run", "stop"]
             .into_iter()
@@ -882,7 +890,220 @@ mod tests {
                     .fq_name()
                     .starts_with("service.Service.")
         }));
-        assert_eq!(context.python_build_counts(), (1, 1));
+        assert_eq!(context.python_build_counts(), (1, 1, 1, 0));
+        assert_eq!(
+            analyzer.global_usage_definition_index_build_count_for_test(),
+            0
+        );
+        assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+        assert!(context.python_contexts.is_empty());
+    }
+
+    #[test]
+    fn python_batch_context_resolves_explicit_reexports_without_generic_imports() {
+        let source =
+            "from facade import Service\n\ndef handle(service: Service):\n    service.run()\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Python,
+            &[
+                (
+                    "service.py",
+                    "class Service:\n    def run(self):\n        pass\n",
+                ),
+                ("facade.py", "from service import Service\n"),
+                ("app.py", source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "app.py");
+        let analyzer = fixture.analyzer.analyzer();
+        let mut context = DefinitionBatchContext::new(analyzer, true);
+        let start_byte = source.rfind("run").expect("receiver member in source");
+
+        let outcomes = resolve_definition_requests(
+            analyzer,
+            &mut context,
+            vec![DefinitionLookupRequest {
+                file,
+                line: None,
+                column: None,
+                start_byte: Some(start_byte),
+                end_byte: Some(start_byte + "run".len()),
+            }],
+            None,
+        );
+
+        assert_eq!(outcomes[0].status, DefinitionLookupStatus::Resolved);
+        assert_eq!(outcomes[0].definitions[0].fq_name(), "service.Service.run");
+        assert_eq!(context.python_build_counts(), (1, 1, 1, 0));
+        assert!(context.python_contexts.is_empty());
+    }
+
+    #[test]
+    fn python_batch_context_preserves_reexport_source_order_across_facades() {
+        let source = "from facade_import_wins import Service as ImportedWins\nfrom facade_local_wins import Service as LocalWins\n\ndef handle(imported: ImportedWins, local: LocalWins):\n    imported.leaf_only()\n    local.local_only()\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Python,
+            &[
+                (
+                    "leaf.py",
+                    "class Service:\n    def leaf_only(self):\n        pass\n",
+                ),
+                (
+                    "middle_import_wins.py",
+                    "class Service:\n    pass\n\nfrom leaf import Service\n",
+                ),
+                (
+                    "middle_local_wins.py",
+                    "from leaf import Service\n\nclass Service:\n    def local_only(self):\n        pass\n",
+                ),
+                (
+                    "facade_import_wins.py",
+                    "from middle_import_wins import Service\n",
+                ),
+                (
+                    "facade_local_wins.py",
+                    "from middle_local_wins import Service\n",
+                ),
+                ("app.py", source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "app.py");
+        let analyzer = fixture.analyzer.analyzer();
+        let mut context = DefinitionBatchContext::new(analyzer, true);
+        let requests = ["leaf_only", "local_only"]
+            .into_iter()
+            .map(|needle| {
+                let start_byte = source.rfind(needle).expect("receiver member in source");
+                DefinitionLookupRequest {
+                    file: file.clone(),
+                    line: None,
+                    column: None,
+                    start_byte: Some(start_byte),
+                    end_byte: Some(start_byte + needle.len()),
+                }
+            })
+            .collect();
+
+        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None);
+
+        assert_eq!(
+            outcomes[0].definitions[0].fq_name(),
+            "leaf.Service.leaf_only"
+        );
+        assert_eq!(
+            outcomes[1].definitions[0].fq_name(),
+            "middle_local_wins.Service.local_only"
+        );
+        assert_eq!(context.python_build_counts(), (1, 1, 2, 0));
+        assert!(context.python_contexts.is_empty());
+    }
+
+    #[test]
+    fn python_batch_context_keeps_receiver_types_isolated_by_file() {
+        let source_a =
+            "from service_a import Service\n\ndef handle(service: Service):\n    service.run()\n";
+        let source_b =
+            "from service_b import Service\n\ndef handle(service: Service):\n    service.stop()\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Python,
+            &[
+                (
+                    "service_a.py",
+                    "class Service:\n    def run(self):\n        pass\n",
+                ),
+                (
+                    "service_b.py",
+                    "class Service:\n    def stop(self):\n        pass\n",
+                ),
+                ("app_a.py", source_a),
+                ("app_b.py", source_b),
+            ],
+        );
+        let file_a = ProjectFile::new(fixture.project_root(), "app_a.py");
+        let file_b = ProjectFile::new(fixture.project_root(), "app_b.py");
+        let analyzer = fixture.analyzer.analyzer();
+        let mut context = DefinitionBatchContext::new(analyzer, true);
+        let requests = [(file_a, source_a, "run"), (file_b, source_b, "stop")]
+            .into_iter()
+            .map(|(file, source, needle)| {
+                let start_byte = source.rfind(needle).expect("receiver member in source");
+                DefinitionLookupRequest {
+                    file,
+                    line: None,
+                    column: None,
+                    start_byte: Some(start_byte),
+                    end_byte: Some(start_byte + needle.len()),
+                }
+            })
+            .collect();
+
+        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None);
+
+        assert_eq!(
+            outcomes[0].definitions[0].fq_name(),
+            "service_a.Service.run"
+        );
+        assert_eq!(
+            outcomes[1].definitions[0].fq_name(),
+            "service_b.Service.stop"
+        );
+        assert_eq!(context.python_build_counts(), (2, 2, 2, 0));
+        assert!(context.python_contexts.is_empty());
+    }
+
+    #[test]
+    fn python_batch_receiver_type_cache_bypasses_inserts_at_its_limit() {
+        let source = "from service import Service\nfrom other import Other\n\ndef handle(service: Service, other: Other):\n    service.run()\n    other.stop()\n    service.run()\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Python,
+            &[
+                (
+                    "service.py",
+                    "class Service:\n    def run(self):\n        pass\n",
+                ),
+                (
+                    "other.py",
+                    "class Other:\n    def stop(self):\n        pass\n",
+                ),
+                ("app.py", source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "app.py");
+        let analyzer = fixture.analyzer.analyzer();
+        let py = resolve_analyzer::<PythonAnalyzer>(analyzer).expect("Python analyzer");
+        let mut context = DefinitionBatchContext::new(analyzer, true);
+        let python_context = context.python_context(py, &file);
+        python_context.set_receiver_type_cache_limit(1);
+        let member_offsets = [
+            source
+                .find("service.run")
+                .expect("first service call in source")
+                + "service.".len(),
+            source.find("other.stop").expect("other call in source") + "other.".len(),
+            source
+                .rfind("service.run")
+                .expect("second service call in source")
+                + "service.".len(),
+        ];
+        let requests = member_offsets
+            .into_iter()
+            .zip(["run", "stop", "run"])
+            .map(|(start_byte, needle)| DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(start_byte),
+                end_byte: Some(start_byte + needle.len()),
+            })
+            .collect();
+
+        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None);
+
+        assert_eq!(outcomes[0].definitions[0].fq_name(), "service.Service.run");
+        assert_eq!(outcomes[1].definitions[0].fq_name(), "other.Other.stop");
+        assert_eq!(outcomes[2].definitions[0].fq_name(), "service.Service.run");
+        assert_eq!(python_context.receiver_type_cache_len(), 1);
+        assert_eq!(context.python_build_counts(), (1, 1, 2, 0));
         assert!(context.python_contexts.is_empty());
     }
 

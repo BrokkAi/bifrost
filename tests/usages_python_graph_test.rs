@@ -738,6 +738,45 @@ def run():
 }
 
 #[test]
+fn imported_module_target_retains_complete_usage_result() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "pkg/expression.py",
+            r#"
+class Expression:
+    pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+import pkg.expression as expression
+
+def run():
+    return expression.Expression()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.expression");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should retain the imported module's usage seed");
+    assert!(
+        hits.is_empty(),
+        "module seed should resolve completely without inventing a type hit: {hits:#?}"
+    );
+}
+
+#[test]
 fn from_package_imported_submodule_qualifier_resolves_export_usage() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(

@@ -13,6 +13,7 @@ mod usage_index;
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::build_weighted_cache;
+use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
 };
@@ -130,30 +131,76 @@ impl PythonAnalyzer {
     }
 
     fn resolve_module_code_unit(&self, module_fq: &str) -> Option<CodeUnit> {
+        if let Some(units) = self.inner.forward_path_module_fqn(module_fq) {
+            return units.into_iter().find(|code_unit| code_unit.is_module());
+        }
         self.inner
             .forward_definition_fqn(module_fq)
             .into_iter()
-            .find(|code_unit| code_unit.is_module())
+            .find(CodeUnit::is_module)
     }
 
     pub fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {
         let mut index = ExportIndex::empty();
         let mut events = Vec::new();
+        let declarations = self.inner.top_level_declarations(file);
+        Self::collect_local_export_events(
+            declarations.iter(),
+            |code_unit| {
+                self.inner
+                    .ranges(code_unit)
+                    .iter()
+                    .map(|range| range.start_byte)
+                    .min()
+                    .unwrap_or(usize::MAX)
+            },
+            &mut events,
+        );
 
-        for code_unit in self.inner.top_level_declarations(file) {
-            let identifier = code_unit.identifier().trim();
-            if identifier.is_empty() || identifier.starts_with('_') {
-                continue;
-            }
-            let start_byte = self
-                .inner
-                .ranges(&code_unit)
-                .iter()
-                .map(|range| range.start_byte)
-                .min()
-                .unwrap_or(usize::MAX);
+        if let Ok(source) = file.read_to_string()
+            && let Some(tree) = parse_python_tree(&source)
+        {
+            self.collect_reexport_events(file, tree.root_node(), &source, &mut events, &mut index);
+        } else {
+            let imports = self.inner.import_info_of(file);
+            self.collect_reexport_events_from_imports(file, &imports, &mut events, &mut index);
+        }
+
+        Self::finish_export_index(events, index)
+    }
+
+    pub(super) fn export_index_from_file_state(
+        &self,
+        file: &ProjectFile,
+        state: &FileState,
+        module_name: &str,
+        binder: &ImportBinder,
+    ) -> ExportIndex {
+        let mut index = ExportIndex::empty();
+        let mut events = Vec::new();
+        let mut local_names = Self::collect_local_export_events(
+            state.top_level_declarations.iter(),
+            |code_unit| {
+                state
+                    .ranges
+                    .get(code_unit)
+                    .into_iter()
+                    .flatten()
+                    .map(|range| range.start_byte)
+                    .min()
+                    .unwrap_or(usize::MAX)
+            },
+            &mut events,
+        );
+
+        if !state.top_level_declarations.iter().any(CodeUnit::is_module)
+            && let Some(identifier) = module_name.rsplit('.').next()
+            && !identifier.is_empty()
+            && !identifier.starts_with('_')
+        {
+            local_names.insert(identifier.to_string());
             events.push((
-                start_byte,
+                0,
                 identifier.to_string(),
                 ExportEntry::Local {
                     local_name: identifier.to_string(),
@@ -161,14 +208,50 @@ impl PythonAnalyzer {
             ));
         }
 
-        if let Ok(source) = file.read_to_string()
+        if import_order_requires_source(binder, &local_names)
+            && let Ok(source) = file.read_to_string()
             && let Some(tree) = parse_python_tree(&source)
         {
             self.collect_reexport_events(file, tree.root_node(), &source, &mut events, &mut index);
         } else {
-            self.collect_reexport_events_from_import_info(file, &mut events, &mut index);
+            self.collect_reexport_events_from_imports(
+                file,
+                &state.imports,
+                &mut events,
+                &mut index,
+            );
         }
 
+        Self::finish_export_index(events, index)
+    }
+
+    fn collect_local_export_events<'a>(
+        declarations: impl IntoIterator<Item = &'a CodeUnit>,
+        mut start_byte: impl FnMut(&CodeUnit) -> usize,
+        events: &mut Vec<(usize, String, ExportEntry)>,
+    ) -> HashSet<String> {
+        let mut local_names = HashSet::default();
+        for code_unit in declarations {
+            let identifier = code_unit.identifier().trim();
+            if identifier.is_empty() || identifier.starts_with('_') {
+                continue;
+            }
+            local_names.insert(identifier.to_string());
+            events.push((
+                start_byte(code_unit),
+                identifier.to_string(),
+                ExportEntry::Local {
+                    local_name: identifier.to_string(),
+                },
+            ));
+        }
+        local_names
+    }
+
+    fn finish_export_index(
+        mut events: Vec<(usize, String, ExportEntry)>,
+        mut index: ExportIndex,
+    ) -> ExportIndex {
         events.sort_by_key(|(start_byte, _, _)| *start_byte);
         for (_, exported_name, entry) in events {
             index.exports_by_name.insert(exported_name, entry);
@@ -194,13 +277,14 @@ impl PythonAnalyzer {
         }
     }
 
-    fn collect_reexport_events_from_import_info(
+    fn collect_reexport_events_from_imports(
         &self,
         file: &ProjectFile,
+        imports: &[ImportInfo],
         events: &mut Vec<(usize, String, ExportEntry)>,
         index: &mut ExportIndex,
     ) {
-        for import in self.inner.import_info_of(file) {
+        for import in imports {
             self.record_reexport_event(file, &import.raw_snippet, usize::MAX, events, index);
         }
     }
@@ -398,19 +482,45 @@ impl PythonAnalyzer {
             return None;
         }
 
-        let bindings = self.resolve_import_bindings(code_unit.source());
+        let binder = self.import_binder_of(code_unit.source());
         if let Some((head, tail)) = trimmed.split_once('.') {
-            if let Some(bound) = bindings.get(head)
-                && bound.is_module()
+            if let Some(binding) = binder.bindings.get(head)
+                && binding.kind == ImportKind::Namespace
             {
-                let fq_name = format!("{}.{}", bound.fq_name(), tail);
+                let fq_name = format!("{}.{}", binding.module_specifier, tail);
                 return self.inner.definitions(&fq_name).next();
             }
             return self.inner.definitions(trimmed).next();
         }
 
-        if let Some(bound) = bindings.get(trimmed) {
-            return Some(bound.clone());
+        if let Some(binding) = binder.bindings.get(trimmed) {
+            match binding.kind {
+                ImportKind::Namespace => {
+                    return self.resolve_module_code_unit(&binding.module_specifier);
+                }
+                ImportKind::Named => {
+                    let imported_name = binding.imported_name.as_ref()?;
+                    let fqn = format!("{}.{}", binding.module_specifier, imported_name);
+                    return self
+                        .resolve_exported_fqn(&fqn)
+                        .into_iter()
+                        .next()
+                        .or_else(|| self.inner.definitions(&fqn).next());
+                }
+                _ => {}
+            }
+        }
+
+        if self
+            .inner
+            .import_info_of(code_unit.source())
+            .iter()
+            .any(|import| import.is_wildcard)
+            && let Some(imported) = self
+                .resolve_import_bindings(code_unit.source())
+                .get(trimmed)
+        {
+            return Some(imported.clone());
         }
 
         let local_fq_name = format!("{}.{}", code_unit.package_name(), trimmed);
@@ -502,6 +612,13 @@ impl PythonAnalyzer {
         }
         Some(rendered)
     }
+}
+
+fn import_order_requires_source(binder: &ImportBinder, local_names: &HashSet<String>) -> bool {
+    binder
+        .bindings
+        .keys()
+        .any(|bound_name| local_names.contains(bound_name))
 }
 
 impl IAnalyzer for PythonAnalyzer {

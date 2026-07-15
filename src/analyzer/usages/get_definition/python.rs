@@ -1,7 +1,10 @@
 use super::*;
 use crate::analyzer::BoundedDefinitionLookup;
+use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+const PYTHON_RECEIVER_TYPE_CACHE_LIMIT: usize = 512;
 
 pub(super) fn resolve_python(
     analyzer: &dyn IAnalyzer,
@@ -178,12 +181,28 @@ pub(super) fn parse_python_tree(source: &str) -> Option<Tree> {
 }
 
 pub(super) struct PythonDefinitionContext {
+    file: ProjectFile,
     named: HashMap<String, String>,
     namespace: HashMap<String, String>,
     same_file: HashMap<String, Vec<CodeUnit>>,
     scope_facts: OnceLock<Arc<HashMap<CodeUnit, LocalBindingsSnapshot<String>>>>,
+    receiver_types: Mutex<PythonReceiverTypeCache>,
     #[cfg(test)]
     build_counters: Arc<PythonDefinitionBuildCounters>,
+}
+
+struct PythonReceiverTypeCache {
+    limit: usize,
+    values: HashMap<(String, bool), Option<CodeUnit>>,
+}
+
+impl PythonReceiverTypeCache {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            values: HashMap::default(),
+        }
+    }
 }
 
 impl PythonDefinitionContext {
@@ -223,10 +242,14 @@ impl PythonDefinitionContext {
             sort_units(units);
         }
         Self {
+            file: file.clone(),
             named,
             namespace,
             same_file,
             scope_facts: OnceLock::new(),
+            receiver_types: Mutex::new(PythonReceiverTypeCache::new(
+                PYTHON_RECEIVER_TYPE_CACHE_LIMIT,
+            )),
             #[cfg(test)]
             build_counters,
         }
@@ -258,6 +281,83 @@ impl PythonDefinitionContext {
             .cloned()
     }
 
+    fn receiver_type(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        py: &PythonAnalyzer,
+        support: &dyn BoundedDefinitionLookup,
+        file: &ProjectFile,
+        raw_type: &str,
+        target_self_file: bool,
+    ) -> Option<CodeUnit> {
+        let raw_type = raw_type.trim();
+        if &self.file != file {
+            return self.generic_receiver_type(analyzer, file, raw_type, target_self_file);
+        }
+
+        let key = (raw_type.to_string(), target_self_file);
+        if let Some(cached) = self
+            .receiver_types
+            .lock()
+            .expect("Python receiver type cache mutex poisoned")
+            .values
+            .get(&key)
+        {
+            return cached.clone();
+        }
+
+        #[cfg(test)]
+        self.build_counters
+            .receiver_type_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
+
+        let resolved = self
+            .receiver_type_for_object(py, support, raw_type)
+            .or_else(|| self.generic_receiver_type(analyzer, file, raw_type, target_self_file));
+
+        let mut cache = self
+            .receiver_types
+            .lock()
+            .expect("Python receiver type cache mutex poisoned");
+        if cache.values.len() < cache.limit {
+            cache.values.insert(key, resolved.clone());
+        }
+        resolved
+    }
+
+    fn generic_receiver_type(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        raw_type: &str,
+        target_self_file: bool,
+    ) -> Option<CodeUnit> {
+        #[cfg(test)]
+        self.build_counters
+            .generic_receiver_type_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+        resolve_python_receiver_type(analyzer, file, raw_type, target_self_file)
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_receiver_type_cache_limit(&self, limit: usize) {
+        let mut cache = self
+            .receiver_types
+            .lock()
+            .expect("Python receiver type cache mutex poisoned");
+        cache.limit = limit;
+        cache.values.clear();
+    }
+
+    #[cfg(test)]
+    pub(super) fn receiver_type_cache_len(&self) -> usize {
+        self.receiver_types
+            .lock()
+            .expect("Python receiver type cache mutex poisoned")
+            .values
+            .len()
+    }
+
     fn scope_facts(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -286,6 +386,8 @@ impl PythonDefinitionContext {
 pub(super) struct PythonDefinitionBuildCounters {
     pub(super) context_builds: AtomicUsize,
     pub(super) scope_fact_builds: AtomicUsize,
+    pub(super) receiver_type_cache_misses: AtomicUsize,
+    pub(super) generic_receiver_type_fallbacks: AtomicUsize,
 }
 
 enum PythonReferenceNode<'tree> {
@@ -359,11 +461,7 @@ fn python_fqn_outcome(
     fqn: &str,
     raw: &str,
 ) -> DefinitionLookupOutcome {
-    let candidates = support.fqn(fqn);
-    if !candidates.is_empty() {
-        return candidates_outcome(candidates);
-    }
-    let candidates = py.resolve_exported_fqn(fqn);
+    let candidates = py.resolve_fqn_candidates(fqn, |name| support.fqn(name));
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
@@ -383,10 +481,8 @@ fn python_class_for_fqn(
     support: &dyn BoundedDefinitionLookup,
     fqn: &str,
 ) -> Option<CodeUnit> {
-    support
-        .fqn(fqn)
+    py.resolve_fqn_candidates(fqn, |name| support.fqn(name))
         .into_iter()
-        .chain(py.resolve_exported_fqn(fqn))
         .find(|unit| unit.is_class())
 }
 
@@ -436,6 +532,9 @@ fn python_crosses_unindexed_boundary(support: &dyn BoundedDefinitionLookup, fqn:
 }
 
 fn python_workspace_module_exists(support: &dyn BoundedDefinitionLookup, module: &str) -> bool {
+    if module.is_empty() {
+        return false;
+    }
     support.package_exists(module) || support.fqn_exists(module)
 }
 
@@ -465,13 +564,14 @@ fn python_receiver_type_unit(
                     .resolution_for(receiver)
                     .as_precise()
                     .and_then(|targets| targets.iter().next().cloned())
-                && let Some(unit) = resolve_python_receiver_type(analyzer, file, &raw_type, false)
+                && let Some(unit) =
+                    context.receiver_type(analyzer, py, support, file, &raw_type, false)
             {
                 return Some(unit);
             }
             // A class-name receiver: `ClassName.Nested` / `ClassName.member`
             // accesses a member on the class itself.
-            let class = resolve_python_receiver_type(analyzer, file, receiver, false);
+            let class = context.receiver_type(analyzer, py, support, file, receiver, false);
             if class.is_some() {
                 return class;
             }
@@ -510,7 +610,7 @@ fn python_call_result_type(
     if callee.is_class() {
         return Some(callee);
     }
-    python_callable_return_type(analyzer, &callee)
+    python_callable_return_type(analyzer, py, support, context, &callee)
 }
 
 /// Resolve a call's callee expression to the class or function/method being
@@ -529,7 +629,7 @@ fn python_resolve_callable(
     match function.kind() {
         "identifier" => {
             let name = python_slice(function, source);
-            if let Some(class) = resolve_python_receiver_type(analyzer, file, name, false) {
+            if let Some(class) = context.receiver_type(analyzer, py, support, file, name, false) {
                 return Some(class);
             }
             analyzer
@@ -554,7 +654,13 @@ fn python_resolve_callable(
 /// The declared or inferred return type of a Python function/method: read a
 /// `-> T` annotation, else infer from a `return T(...)` / `return T` in the
 /// body. Resolved in the callable's own file.
-fn python_callable_return_type(analyzer: &dyn IAnalyzer, callable: &CodeUnit) -> Option<CodeUnit> {
+fn python_callable_return_type(
+    analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    context: &PythonDefinitionContext,
+    callable: &CodeUnit,
+) -> Option<CodeUnit> {
     let file = callable.source();
     let source = analyzer.get_source(callable, false)?;
     let tree = parse_python_tree(&source)?;
@@ -562,7 +668,7 @@ fn python_callable_return_type(analyzer: &dyn IAnalyzer, callable: &CodeUnit) ->
 
     if let Some(return_type) = function.child_by_field_name("return_type") {
         let text = python_slice(return_type, &source).trim();
-        if let Some(class) = resolve_python_receiver_type(analyzer, file, text, true) {
+        if let Some(class) = context.receiver_type(analyzer, py, support, file, text, true) {
             return Some(class);
         }
     }
@@ -585,9 +691,9 @@ fn python_callable_return_type(analyzer: &dyn IAnalyzer, callable: &CodeUnit) ->
                 "identifier" => Some(python_slice(value, &source)),
                 _ => None,
             };
-            if let Some(name) = name
-                && let Some(class) = resolve_python_receiver_type(analyzer, file, name, true)
-            {
+            let class = name
+                .and_then(|name| context.receiver_type(analyzer, py, support, file, name, true));
+            if let Some(class) = class {
                 return Some(class);
             }
         }

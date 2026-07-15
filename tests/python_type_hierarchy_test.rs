@@ -1,7 +1,10 @@
+mod common;
+
 use brokk_bifrost::{
-    IAnalyzer, ImportAnalysisProvider, ProjectFile, PythonAnalyzer, TestProject,
+    IAnalyzer, ImportAnalysisProvider, Language, ProjectFile, PythonAnalyzer, TestProject,
     TypeHierarchyProvider,
 };
+use common::InlineTestProject;
 
 fn fixture_project() -> TestProject {
     TestProject::new(
@@ -116,6 +119,28 @@ fn test_relative_import_and_inheritance_cases() {
     let ancestors = analyzer.get_direct_ancestors(&child_decl);
     assert_eq!(1, ancestors.len());
     assert_eq!("mypackage.base.BaseClass", ancestors[0].fq_name());
+}
+
+#[test]
+fn wildcard_import_resolves_base_class() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("base.py", "class Base:\n    pass\n")
+        .file(
+            "child.py",
+            "from base import *\n\nclass Child(Base):\n    pass\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let child = analyzer
+        .get_definitions("child.Child")
+        .into_iter()
+        .next()
+        .expect("Child definition");
+
+    let ancestors = analyzer.get_direct_ancestors(&child);
+
+    assert_eq!(ancestors.len(), 1);
+    assert_eq!(ancestors[0].fq_name(), "base.Base");
 }
 
 #[test]

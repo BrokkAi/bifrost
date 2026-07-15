@@ -163,6 +163,7 @@ pub(super) fn scan_files_for_seeds(
             source_str,
             tree_ref.root_node(),
         );
+        let scope_range_index = build_scope_range_index(analyzer, &scope_facts);
 
         let mut local_hits = BTreeSet::new();
         let mut local_unproven_hits = BTreeSet::new();
@@ -181,6 +182,7 @@ pub(super) fn scan_files_for_seeds(
             member_best_effort_unique: target_self_file && member_unique_in_target_file,
             local_conflicts: &local_conflicts,
             scope_facts: &scope_facts,
+            scope_range_index: &scope_range_index,
             hits: &mut local_hits,
             unproven_hits: &mut local_unproven_hits,
         };
@@ -234,8 +236,67 @@ pub(super) struct ScanCtx<'a> {
     member_best_effort_unique: bool,
     local_conflicts: &'a HashSet<String>,
     scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
+    scope_range_index: &'a [ScopeRangeEntry],
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
     pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
+}
+
+struct ScopeRangeEntry {
+    range: Range,
+    scope: CodeUnit,
+    prefix_max_end: usize,
+}
+
+fn build_scope_range_index(
+    analyzer: &dyn IAnalyzer,
+    scope_facts: &HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
+) -> Vec<ScopeRangeEntry> {
+    let mut entries = scope_facts
+        .keys()
+        .flat_map(|scope| {
+            analyzer
+                .ranges(scope)
+                .into_iter()
+                .map(|range| ScopeRangeEntry {
+                    range,
+                    scope: scope.clone(),
+                    prefix_max_end: 0,
+                })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        left.range
+            .start_byte
+            .cmp(&right.range.start_byte)
+            .then_with(|| right.range.end_byte.cmp(&left.range.end_byte))
+            .then_with(|| left.scope.cmp(&right.scope))
+    });
+    let mut max_end = 0;
+    for entry in &mut entries {
+        max_end = max_end.max(entry.range.end_byte);
+        entry.prefix_max_end = max_end;
+    }
+    entries
+}
+
+fn indexed_scope_facts<'a>(
+    scope_range_index: &[ScopeRangeEntry],
+    scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
+    node: Node<'_>,
+) -> Option<&'a LocalBindingsSnapshot<String>> {
+    let mut cursor =
+        scope_range_index.partition_point(|entry| entry.range.start_byte <= node.start_byte());
+    while cursor > 0 {
+        cursor -= 1;
+        let entry = &scope_range_index[cursor];
+        if entry.prefix_max_end < node.end_byte() {
+            return None;
+        }
+        if entry.range.end_byte >= node.end_byte() {
+            return scope_facts.get(&entry.scope);
+        }
+    }
+    None
 }
 
 /// The per-function receiver-type facts enclosing `node`, if any. Shared by the
@@ -259,7 +320,7 @@ pub(in crate::analyzer::usages) fn enclosing_scope_facts<'a>(
 
 impl ScanCtx<'_> {
     fn scope_facts_for_node(&self, node: Node<'_>) -> Option<&LocalBindingsSnapshot<String>> {
-        enclosing_scope_facts(self.analyzer, self.file, self.scope_facts, node)
+        indexed_scope_facts(self.scope_range_index, self.scope_facts, node)
     }
 
     fn binds_target(&self, ident: &str, node: Node<'_>) -> bool {
@@ -693,7 +754,13 @@ pub(in crate::analyzer::usages) fn collect_scope_facts_from_parsed_source(
 ) -> HashMap<CodeUnit, LocalBindingsSnapshot<String>> {
     let mut factory_return_types = collect_factory_return_types_from_root(root, source);
     collect_imported_factory_return_types(analyzer, py, file, &mut factory_return_types);
-    collect_scope_facts_with_factory_returns(analyzer, file, target_short, &factory_return_types)
+    collect_scope_facts_with_factory_returns(
+        analyzer,
+        file,
+        target_short,
+        source,
+        &factory_return_types,
+    )
 }
 
 fn collect_imported_factory_return_types(
@@ -714,10 +781,7 @@ fn collect_imported_factory_return_types(
             continue;
         };
         let fqn = format!("{}.{}", binding.module_specifier, imported);
-        let units: Vec<CodeUnit> = analyzer
-            .definitions(&fqn)
-            .chain(py.resolve_exported_fqn(&fqn))
-            .collect();
+        let units = py.resolve_fqn_candidates(&fqn, |name| analyzer.definitions(name).collect());
         for unit in units {
             if unit.is_function() {
                 if let Some(return_type) = callable_return_type_name(analyzer, &unit) {
@@ -749,11 +813,7 @@ fn collect_imported_class_method_return_types(
     class_unit: &CodeUnit,
     factory_return_types: &mut HashMap<String, String>,
 ) {
-    let owner_fqn = class_unit.fq_name();
-    for member in analyzer
-        .global_usage_definition_index()
-        .fqn_direct_children(&owner_fqn)
-    {
+    for member in analyzer.direct_children(class_unit) {
         if !member.is_function() {
             continue;
         }
@@ -767,14 +827,18 @@ fn collect_imported_class_method_return_types(
 }
 
 fn callable_return_type_name(analyzer: &dyn IAnalyzer, callable: &CodeUnit) -> Option<String> {
-    let source = analyzer.get_source(callable, false)?;
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_python::LANGUAGE.into())
-        .ok()?;
-    let tree = parser.parse(source.as_str(), None)?;
-    let function = first_function_definition(tree.root_node())?;
-    factory_return_type(function, &source)
+    let source = analyzer.indexed_source(callable.source())?;
+    declaration_source_slices(analyzer, callable, &source)
+        .into_iter()
+        .find_map(|declaration_source| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_python::LANGUAGE.into())
+                .ok()?;
+            let tree = parser.parse(declaration_source, None)?;
+            let function = first_function_definition(tree.root_node())?;
+            factory_return_type(function, declaration_source)
+        })
 }
 
 fn first_function_definition(root: Node<'_>) -> Option<Node<'_>> {
@@ -795,6 +859,7 @@ fn collect_scope_facts_with_factory_returns(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     target_short: &str,
+    source: &str,
     factory_return_types: &HashMap<String, String>,
 ) -> HashMap<CodeUnit, LocalBindingsSnapshot<String>> {
     let declarations = analyzer.declarations(file);
@@ -804,11 +869,11 @@ fn collect_scope_facts_with_factory_returns(
         .iter()
         .filter(|declaration| declaration.is_class())
     {
-        let Some(source) = analyzer.get_source(declaration, false) else {
+        let Some(declaration_source) = declaration_source(analyzer, declaration, source) else {
             continue;
         };
         let facts = collect_scope_facts_from_source(
-            &source,
+            &declaration_source,
             target_short,
             true,
             false,
@@ -826,7 +891,7 @@ fn collect_scope_facts_with_factory_returns(
         .iter()
         .filter(|declaration| declaration.is_function())
     {
-        let Some(source) = analyzer.get_source(declaration, false) else {
+        let Some(declaration_source) = declaration_source(analyzer, declaration, source) else {
             continue;
         };
         let owner = declaration
@@ -834,7 +899,7 @@ fn collect_scope_facts_with_factory_returns(
             .rsplit_once('.')
             .map(|(owner, _)| owner);
         let mut facts = collect_scope_facts_from_source(
-            &source,
+            &declaration_source,
             target_short,
             false,
             false,
@@ -854,11 +919,11 @@ fn collect_scope_facts_with_factory_returns(
     // its bindings must be recorded too, otherwise constructed-local receivers
     // used at module scope resolve to no type.
     for declaration in declarations.iter().filter(|d| d.is_module()) {
-        let Some(source) = analyzer.get_source(declaration, false) else {
+        let Some(declaration_source) = declaration_source(analyzer, declaration, source) else {
             continue;
         };
         let facts = collect_scope_facts_from_source(
-            &source,
+            &declaration_source,
             target_short,
             false,
             true,
@@ -868,6 +933,28 @@ fn collect_scope_facts_with_factory_returns(
         scope_facts.insert(declaration.clone(), facts);
     }
     scope_facts
+}
+
+fn declaration_source(
+    analyzer: &dyn IAnalyzer,
+    declaration: &CodeUnit,
+    file_source: &str,
+) -> Option<String> {
+    let slices = declaration_source_slices(analyzer, declaration, file_source);
+    (!slices.is_empty()).then(|| slices.join("\n\n"))
+}
+
+fn declaration_source_slices<'a>(
+    analyzer: &dyn IAnalyzer,
+    declaration: &CodeUnit,
+    file_source: &'a str,
+) -> Vec<&'a str> {
+    let mut ranges = analyzer.ranges(declaration);
+    ranges.sort_by_key(|range| range.start_byte);
+    ranges
+        .into_iter()
+        .filter_map(|range| file_source.get(range.start_byte..range.end_byte))
+        .collect()
 }
 
 fn collect_scope_facts_from_source(
