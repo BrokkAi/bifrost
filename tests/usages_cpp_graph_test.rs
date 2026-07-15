@@ -5966,15 +5966,24 @@ void consume(char selected) {
 }
 
 #[test]
-fn authoritative_cpp_usage_resolves_constructor_owner_from_full_definition_and_forward_include() {
+fn authoritative_cpp_usage_resolves_constructor_owner_from_malformed_export_definition() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
-        ("widget_fwd.h", "namespace demo { class Widget; }\n"),
+        ("widget_fwd.h", "namespace views { class Widget; }\n"),
         (
             "widget.h",
-            r#"#pragma once
-namespace demo {
-class Widget {
-public:
+            r#"#define VIEWS_EXPORT
+namespace views {
+class VIEWS_EXPORT Widget : public internal::NativeWidgetDelegate,
+                            public ui::EventSource,
+                            public FocusTraversable,
+                            public ui::NativeThemeObserver,
+                            public ui::ColorProviderSource,
+                            public ui::PropertyHandler,
+                            public ui::AXModeObserver,
+                            public ui::metadata::MetaDataProvider {
+    ADVANCED_MEMORY_SAFETY_CHECKS();
+
+ public:
     Widget();
 };
 }
@@ -5984,32 +5993,52 @@ public:
             "widget.cc",
             r#"#include "widget_fwd.h"
 #include "widget.h"
-namespace demo {
-Widget::Widget() = default;
-}
+views::Widget::Widget() = default;
 "#,
         ),
         (
             "consumer.cc",
             r#"#include "widget.h"
 void consume() {
-    auto* widget = new demo::Widget;
+    auto* widget = new views::Widget;
 }
 "#,
         ),
     ]);
 
+    let widget_header = project.file("widget.h");
+    let header_source = widget_header.read_to_string().expect("widget header");
+    let classes: Vec<_> = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.fq_name() == "views.Widget"
+                && unit.source() == &widget_header
+                && !unit.is_synthetic()
+        })
+        .collect();
+    assert_eq!(classes.len(), 1, "Widget class identities: {classes:#?}");
+    let ranges = analyzer.ranges(&classes[0]);
+    assert_eq!(ranges.len(), 1, "Widget class ranges: {ranges:#?}");
+    let expected_start = header_source.find("class VIEWS_EXPORT Widget").unwrap();
+    let prefix = "ADVANCED_MEMORY_SAFETY_CHECKS();";
+    let expected_end =
+        header_source[expected_start..].find(prefix).unwrap() + expected_start + prefix.len();
+    assert_eq!(ranges[0].start_byte, expected_start);
+    assert_eq!(ranges[0].end_byte, expected_end);
+
     let constructor = definition_by(&analyzer, |unit| {
         unit.kind() == CodeUnitType::Function
-            && unit.fq_name() == "demo.Widget.Widget"
+            && unit.fq_name() == "views.Widget.Widget"
             && slash_path(unit.source()) == "widget.cc"
             && !unit.is_synthetic()
     });
     let consumer = project.file("consumer.cc");
     let source = consumer.read_to_string().expect("consumer source");
-    let expression = source.find("new demo::Widget").expect("new expression");
+    let expression = source.find("new views::Widget").expect("new expression");
     let start = expression + "new ".len();
-    let end = start + "demo::Widget".len();
+    let end = start + "views::Widget".len();
     let provider =
         ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
     let query = UsageFinder::new()
@@ -6052,7 +6081,7 @@ void consume() {
             .copied()
             .unwrap_or_default(),
         0,
-        "one full class definition plus a forward declaration should resolve precisely"
+        "the recovered full class definition plus a forward declaration should resolve precisely"
     );
 }
 
