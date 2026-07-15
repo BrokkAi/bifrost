@@ -16,7 +16,7 @@ The first observable improvement is deliberately narrow and urgent: every agent-
 - [x] (2026-07-15 09:53Z) Added the authoritative MCP/RQL availability matrix, changed query-capable host examples from `core` to `symbol|extended`, added host validation callouts, clarified the RQL and VS Code boundaries, and made the smoke queries executable documentation tests.
 - [x] (2026-07-15 09:59Z) Added a first-contact "Choose Bifrost" route by analysis question, interface, and persona; added a source-backed language/capability/precision matrix; updated landing and Start navigation; and inspected desktop and mobile rendering.
 - [x] (2026-07-15 10:02Z) Added a checked-in Python fixture and saved RQL query plus reproducible CLI, agent MCP, and VS Code journeys with one shared `src/app.py:5` expected result; added executable fixture/query drift checks and verified both CLI forms.
-- [ ] Add a static-analysis rule-building guide and an agent-result-safety guide covering result variants, diagnostics, truncation, proof tiers, and provenance.
+- [x] (2026-07-15 10:10Z) Added a production rule-building guide across RQL, JSON, CLI, MCP, Python, and Rust; documented all six terminal result variants, fixtures, CI, and reporting; added a result-safety decision rule to docs, every host page, and reusable agent guidance; verified desktop/mobile rendering.
 - [ ] Correct the known version, traversal, and obsolete tool-name drift and add durable checks where inexpensive.
 - [ ] Add evaluation methodology, workspace/data boundaries, citation, and reproducibility guidance; validate links, rendered pages, and the full site build.
 
@@ -34,6 +34,8 @@ The first observable improvement is deliberately narrow and urgent: every agent-
   Evidence: the first rendered Choose Bifrost preview split the agent row into four cells; changing it to `symbol\|extended` restored the expected three-column row.
 - Observation: The documentation tutorial harness can serve as a reproducibility contract for a published fixture, not only for language cookbooks.
   Evidence: `ten_minute_evaluation_tutorial` compares the checked-in source and RQL files with the rendered docs blocks, executes both RQL and canonical JSON, and asserts the complete `src/app.py:5` result.
+- Observation: The public `CodeQueryResult` currently has six terminal variants across Rust and Python, while older prose describes only three.
+  Evidence: `CodeQueryResultValue` and `_code_query_result_item` both enumerate `structural_match`, `declaration`, `file`, `reference_site`, `call_site`, and `expression_site`; the new rule guide teaches all six and the later drift milestone must update the older Python page.
 
 ## Decision Log
 
@@ -52,7 +54,7 @@ The first observable improvement is deliberately narrow and urgent: every agent-
 
 ## Outcomes & Retrospective
 
-The MCP/RQL contract, persona routing, capability matrix, and evaluator journeys are complete. `mcp.md` now answers availability at first contact, the packaged and manual agent-host setup paths agree on `symbol|extended`, every agent-facing page distinguishes MCP from skills and verifies both inline JSON and saved RQL, and the editor pages clearly identify unsaved RQL execution as an LSP feature. The landing page now routes first to Choose Bifrost; that page selects analysis and interface before installation, and the adjacent capability matrix records language-specific precision and hard product boundaries. A checked-in Python fixture now gives CLI, agent MCP, and VS Code readers the same executable result instead of referring to an unexplained local toy directory. Astro check/build, whitespace validation, executable query parsing, cross-language tutorial coverage, evaluator fixture execution, direct CLI parity, and desktop/mobile rendered previews pass. The builder and result-safety guides remain next.
+The MCP/RQL contract, persona routing, capability matrix, evaluator journeys, production rule workflow, and agent safety decision rule are complete. `mcp.md` now answers availability at first contact, the packaged and manual agent-host setup paths agree on `symbol|extended`, every agent-facing page distinguishes MCP from skills and verifies both inline JSON and saved RQL, and the editor pages clearly identify unsaved RQL execution as an LSP feature. The landing page routes first to Choose Bifrost; that page selects analysis and interface before installation, and the adjacent capability matrix records language-specific precision and hard product boundaries. A checked-in Python fixture gives CLI, agent MCP, and VS Code readers the same executable result. Static-analysis builders now have an end-to-end workflow and exhaustive result-variant contract, while agents have explicit rules for diagnostics, truncation, proof, provenance, and claim wording. Astro check/build, whitespace validation, executable query parsing, cross-language tutorial coverage, evaluator fixture execution, direct CLI parity, and desktop/mobile rendered previews pass. Concrete correctness drift remains next.
 
 ## Context and Orientation
 
@@ -155,3 +157,5 @@ Plan revision note (2026-07-15 09:53Z): Marked the MCP/RQL milestone complete af
 Plan revision note (2026-07-15 09:59Z): Marked persona routing and the capability matrix complete after the site generated 42 pages, cross-language tutorial coverage passed, and desktop/mobile previews confirmed usable routes and scroll-contained wide tables. Recorded and corrected the rendered Markdown pipe issue found during preview.
 
 Plan revision note (2026-07-15 10:02Z): Marked the evaluator milestone complete after adding the published fixture, asserting its source/query blocks against the docs, executing the documented RQL and JSON end to end, verifying saved and inline CLI output, and generating the 43-page site. Left production rule-building and agent result safety as the next milestone.
+
+Plan revision note (2026-07-15 10:10Z): Marked the builder and safety milestone complete after executable rule examples parsed, all host pages linked the safety contract, the reusable agent template gained the same decision rule, the 45-page site built, and desktop/mobile previews confirmed the long guide and wide safety table remain usable. Recorded the older three-variant Python prose as correctness drift for the next milestone.

@@ -36,7 +36,7 @@ Structural matching is syntax-precise: Bifrost matches normalized Tree-sitter no
 
 Graph results preserve a proof tier. Filter to `proven` when an answer must contain only analyzer-established identities. Include `unproven` when a dynamic-language best effort is useful, and describe those candidates as possible rather than exact. A proven edge is precise evidence for that returned edge; it is not by itself proof that all possible runtime edges were found.
 
-A zero-result is conclusive only within the reported capability, workspace, filters, and budgets. Before claiming “no matches” or “all callers,” check `truncated`, capability and execution diagnostics, proof tiers, and `provenance_truncated`. The result-safety guide planned for this documentation expands that decision rule; until then, the JSON reference sections on [diagnostics](/code-query-json/#planner-and-capability-diagnostics) and [limits](/code-query-json/#limits-and-validation-errors) define the contract.
+A zero-result is conclusive only within the reported capability, workspace, filters, and budgets. Before claiming “no matches” or “all callers,” check `truncated`, capability and execution diagnostics, proof tiers, and `provenance_truncated`. [Agent Result Safety](/agent-result-safety/) gives the complete decision rule; the JSON reference sections on [diagnostics](/code-query-json/#planner-and-capability-diagnostics) and [limits](/code-query-json/#limits-and-validation-errors) define the underlying contract.
 
 ## Imports, Types, And Dependencies
 

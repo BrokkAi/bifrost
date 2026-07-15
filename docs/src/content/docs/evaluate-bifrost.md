@@ -137,4 +137,4 @@ This unsaved-buffer behavior is specific to the VS Code language-server request.
 
 All three initial runs should agree on one structural call shape. That result proves the parsed call site exists; it is not yet a claim about every runtime target or caller. For declaration identity and proof tiers, continue with [Reference Traversal](/code-query-tutorials/reference-traversal/). For language-specific boundaries, use the [capability matrix](/capabilities/).
 
-Before treating any larger query as complete, inspect `truncated` and all returned diagnostics. When graph steps are present, also distinguish `proven` from `unproven` edges and check `provenance_truncated`.
+Before treating any larger query as complete, inspect `truncated` and all returned diagnostics. When graph steps are present, also distinguish `proven` from `unproven` edges and check `provenance_truncated`. Continue with [Agent Result Safety](/agent-result-safety/) before using these results in automated claims, or [Build a Static-Analysis Rule](/build-static-analysis-rule/) to productize a query.

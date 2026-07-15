@@ -14,7 +14,7 @@ Bifrost context before planning.
 
 This template is instruction text only. Installing or appending it does not start Bifrost MCP and does not expose `query_code` or any other tool. Configure a query-capable MCP server such as `--mcp "symbol|extended"`, start a fresh agent session, and confirm that `query_code` is advertised before asking the agent to run a query.
 
-MCP accepts canonical JSON inline and saved workspace `.rql` through `query_file`; it does not accept raw inline RQL. See [MCP query and RQL availability](/mcp/#query-and-rql-availability) for setup and validation.
+MCP accepts canonical JSON inline and saved workspace `.rql` through `query_file`; it does not accept raw inline RQL. See [MCP query and RQL availability](/mcp/#query-and-rql-availability) for setup and validation, then use [Agent Result Safety](/agent-result-safety/) for completeness claims.
 
 MCP-capable clients can retrieve the same guidance from the Bifrost server with
 `resources/list` and `resources/read` using this URI:

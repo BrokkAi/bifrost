@@ -78,4 +78,4 @@ Avoid prompts that only ask about `README.md` or docs files; those can pass thro
 
 The configuration above uses `symbol|extended`. In a fresh Antigravity session, confirm that the enabled Bifrost tool list includes `query_code`, then call it with the inline JSON fields `{"match":{"kind":"declaration"},"limit":1}`. To validate saved RQL, check a workspace file named `bifrost-smoke.rql` containing `(limit 1 (declaration))`, then call `query_code` with `{"query_file":"bifrost-smoke.rql"}`.
 
-The inline call is canonical JSON. MCP accepts RQL only from a workspace `.rql` file through `query_file`. The separately installed skills provide guidance but do not expose MCP tools themselves. See [MCP query and RQL availability](/mcp/#query-and-rql-availability) for the full surface matrix.
+The inline call is canonical JSON. MCP accepts RQL only from a workspace `.rql` file through `query_file`. The separately installed skills provide guidance but do not expose MCP tools themselves. See [MCP query and RQL availability](/mcp/#query-and-rql-availability) for the full surface matrix and [Agent Result Safety](/agent-result-safety/) before making completeness claims.

@@ -104,6 +104,8 @@ Call `query_code` with exactly:
 
 Both calls should return a `results` array and a `truncated` field. A workspace with indexed declarations should return one result. If `query_code` is absent, check the configured toolset; if the saved query fails, check that the path is relative to the active workspace and that the agent session started after the configuration change.
 
+Before asking an agent to claim “all callers” or “no matches,” teach it the diagnostic, truncation, proof, and provenance checks in [Agent Result Safety](/agent-result-safety/).
+
 ## Skills Are Separate
 
 MCP setup makes Bifrost tools available to an agent host. Agent Skills are

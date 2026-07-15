@@ -48,7 +48,7 @@ Choose an [LSP integration](/lsp/) for editor navigation. Add MCP separately onl
 
 ### Build a static-analysis integration
 
-Begin with [Code Querying](/code-querying/), use RQL to explore, and inspect its canonical [JSON `CodeQuery`](/code-query-json/) before embedding the query through the CLI, Python, Rust, or MCP. Treat diagnostics, proof, truncation, and provenance as part of the result contract rather than optional metadata.
+Begin with [Build a Static-Analysis Rule](/build-static-analysis-rule/), use RQL to explore, and inspect its canonical [JSON `CodeQuery`](/code-query-json/) before embedding the query through the CLI, Python, Rust, or MCP. Treat diagnostics, proof, truncation, and provenance as part of the result contract rather than optional metadata.
 
 ## Check Suitability Before Installation
 

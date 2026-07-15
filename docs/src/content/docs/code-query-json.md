@@ -144,6 +144,8 @@ With `result_detail: "full"`, results additionally include:
 
 Derived declaration, reference-site, and file results include `provenance`. Each provenance path records the original structural seed and every ordered step result. Declaration-returning reference steps additionally record the exact proving reference site under `via`. Compact mode keeps minimal identities; full mode adds stable IDs and precise ranges. At most sixteen paths are retained per terminal result, with `provenance_truncated: true` when more paths converge.
 
+For completeness claims, result metadata is mandatory: inspect diagnostics, require `truncated: false`, distinguish `proven` from `unproven` graph edges, and check every derived result's `provenance_truncated` field. [Agent Result Safety](/agent-result-safety/) turns those fields into an explicit decision rule.
+
 ## Typed Pipeline Steps
 
 Steps execute in array order and are validated before the workspace is searched:

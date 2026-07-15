@@ -5,6 +5,7 @@ use std::path::Path;
 
 const DOCS: &[&str] = &[
     "docs/src/content/docs/code-querying.md",
+    "docs/src/content/docs/build-static-analysis-rule.md",
     "docs/src/content/docs/code-query-json.md",
     "docs/src/content/docs/mcp.md",
     "docs/src/content/docs/rune-query-language.md",
