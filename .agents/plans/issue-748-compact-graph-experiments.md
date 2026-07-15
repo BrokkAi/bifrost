@@ -21,7 +21,7 @@ The work happens on branch `748-explore-compact-csrcsc-graph-representations-for
 - [x] (2026-07-15T14:29:00Z) Replaced per-node structural role vectors with one contiguous role array and row offsets, appending directly during extraction and preserving source order across `query_code`, Rune IR, reference classification, and structured call-site consumers.
 - [x] (2026-07-15T14:29:00Z) Compared and promoted the structural-role candidate: retained bytes fell 28.9% on `vscode`, optimized warm reads were at parity in a load-matched A/B, and all focused behavior plus warnings-as-errors checks passed.
 - [x] (2026-07-15T14:47:31Z) Added and captured a generated file-dependency baseline that exercises both import-based PageRank and complete reverse RQL traversal with identical files and edges.
-- [ ] Prototype a shared file-dependency relation for RQL import traversal and import PageRank, measure forward and reverse reads, and make a promote-or-discard decision.
+- [x] (2026-07-15T15:11:55Z) Introduced shared compact rows plus directed CSR/CSC storage, migrated import PageRank and completed RQL import graphs, measured alternating optimized A/B binaries, and promoted the candidate.
 - [ ] Prototype compact hierarchy and ownership relations using exact `CodeUnit` identity, measure direct and transitive traversal, and make a promote-or-discard decision.
 - [ ] Adapt the dense-ID `WorkspaceUsageGraph` introduced by #781 to contiguous outgoing and incoming edge storage without reintroducing rich-key construction, then measure graph construction, PageRank, public rendering, and memory.
 - [ ] Run the checked-in performance regression suite on representative pinned repositories, complete final review and CI-equivalent validation, publish the conclusion to #748, and summarize which structures should remain map-based.
@@ -61,6 +61,12 @@ The work happens on branch `748-explore-compact-csrcsc-graph-representations-for
 - Observation: a dense generated dependency graph provides useful end-to-end signal for both consumers. With 1,000 files and 17,982 edges, the pre-change warm median is 132.160 ms for import PageRank and 483.503 ms for complete `importers_of` traversal.
   Evidence: peak RSS rose from 66,453,504 bytes after analyzer construction to 100,499,456 after relevance and 127,320,064 after RQL reverse traversal, leaving measurable room for compact construction and read storage.
 
+- Observation: optimized same-binary A/B measurements were necessary to separate graph-layout effects from compiler and host noise. Across three alternating runs of preserved release test binaries, compact direct PageRank traversal reduced the warm median from 38.618 ms to 17.818 ms (53.9%), while complete RQL reverse traversal remained effectively at parity at 133.480 ms versus 131.658 ms.
+  Evidence: the candidate no longer allocates one weighted adjacency vector per file before PageRank. Median peak RSS after relevance fell from 89,489,408 to 88,522,752 bytes (1.1%), and after RQL traversal from 113,115,136 to 111,935,488 bytes (1.0%).
+
+- Observation: compact storage should be a representation primitive, not a shared graph lifecycle. Relevance still constructs a request-local two-hop graph, while RQL still resolves forward rows incrementally and freezes only after complete or terminally truncated reverse traversal.
+  Evidence: `ImportGraphBuilder::finish` produces the relevance snapshot; `DirectImportGraph::freeze` consumes its incremental forward map only when `ensure_complete_import_graph` reaches a terminal state.
+
 ## Decision Log
 
 - Decision: begin with structural fact roles and keep the first compact representation local to `FileFacts` until its measurements are known.
@@ -87,15 +93,25 @@ The work happens on branch `748-explore-compact-csrcsc-graph-representations-for
   Rationale: the representation removes one vector header and allocation per fact, reduces retained `vscode` facts by 28.9% and process high-water RSS by about 15%, preserves exact fact and role counts plus source order, and shows no repeatable optimized warm-read regression. Direct append also avoids a transient flattening allocation.
   Date/Author: 2026-07-15 / Codex
 
+- Decision: extract and promote crate-private `CompactRows` and `CompactDirectedGraph` primitives after the import experiment proved a second concrete consumer.
+  Rationale: structural roles, request-local import PageRank, and terminal RQL import graphs now share fixed-width row offsets and contiguous values without sharing domain identity or construction policy. The optimized import benchmark shows a material PageRank read improvement, no repeatable RQL read regression, and a small repeatable RSS reduction.
+  Date/Author: 2026-07-15 / Codex
+
+- Decision: make weighted PageRank consume an adjacency view rather than require `Vec<Vec<(usize, f64)>>`.
+  Rationale: usage ranking can retain its weighted vectors until its own experiment, while unweighted compact imports expose CSR/CSC rows directly. This isolates numerical PageRank from storage layout and removes the import path's last per-row reconstruction allocation.
+  Date/Author: 2026-07-15 / Codex
+
 ## Outcomes & Retrospective
 
-The structural-role experiment is promoted. Planning and prerequisite verification are complete, the representation-neutral benchmark remains available for future layout changes, and the next experiment will determine whether file dependencies justify extracting the first shared compact-relation primitive.
+The structural-role and file-dependency experiments are promoted. The latter justifies the first shared crate-private compact-relation primitives while preserving separate construction lifecycles for RQL and relevance. The next experiment evaluates whether exact-identity hierarchy and ownership relations benefit from the same rows or from a simpler single-owner reverse array.
 
 Milestone 1 outcome 2026-07-15T14:20:00Z: the representation-neutral benchmark is implemented and exercises nonzero facts and semantic role edges. Synthetic retained storage scales from 7,844,400 bytes at 36,100 facts to 123,759,200 bytes at 564,400 facts. The real `vscode` run establishes a 1.530 GB retained-storage baseline and proves the role representation is large enough for the pilot to produce a meaningful signal.
 
 Milestone 2 outcome 2026-07-15T14:29:00Z: direct CSR-style extraction removes every per-node role allocation and stores one `u32` offset per fact boundary plus one exact-sized role buffer. At 564,400 generated facts, retained bytes fell from 123,759,200 to 90,357,600 (27.0%). On `vscode`, retained bytes fell by 463,469,148 (28.9%), peak RSS after extraction fell by 369,836,032 (15.8%), and peak RSS after warm matching fell by 414,253,056 (15.1%). In the adjacent optimized large-fixture pair where analyzer setup was load-matched, warm reads were 88.98 ms for compact rows versus 89.53 ms for the baseline. All 86 structural unit tests, the structured call-site test, documented query tests, tutorials, all 57 pipeline tests, formatting, and all-target/all-feature Clippy with warnings denied pass. The candidate is promoted.
 
 Milestone 3 baseline 2026-07-15T14:47:31Z: `tests/measure_file_dependency_graph.rs` generates a Java hub/ring graph whose hub both imports and is imported by every node. This makes forward personalized PageRank and reverse RQL traversal cover the same full graph without depending on Git history. At the default 801 files / 4,800 edges, warm medians are 38.536 ms relevance and 216.907 ms `importers_of`; at 1,000 files / 17,982 edges they are 132.160 ms and 483.503 ms. The harness passes focused all-feature Clippy.
+
+Milestone 3 outcome 2026-07-15T15:11:55Z: `CompactRows<T>` now owns validated contiguous row offsets and values, and `CompactDirectedGraph<K>` adds snapshot-local exact identities with sorted outgoing CSR and incoming CSC. Structural roles reuse the row primitive without changing their measured representation. Relevance emits dense import edges during its existing two-hop exploration and PageRank traverses compact rows directly through a storage-neutral adjacency view. RQL retains its incremental forward map and diagnostics until reverse traversal completes or truncates, then consumes that map into compact forward and reverse rows and drops redundant construction state. Three alternating optimized runs at 1,000 files / 17,982 edges moved median first relevance from 331.219 ms to 312.926 ms, warm relevance from 38.618 ms to 17.818 ms, first RQL traversal from 199.590 ms to 203.174 ms, and warm RQL traversal from 133.480 ms to 131.658 ms. Median peak RSS after relevance fell by 966,656 bytes and after RQL by 1,179,648 bytes. The first-RQL difference is within run variance; warm RQL reads are at parity. Exact output-count assertions, 86 structural tests, four PageRank unit tests, 27 relevance integration tests, 57 query-pipeline tests, formatting, and all-target/all-feature Clippy with warnings denied pass. The candidate is promoted.
 
 ## Context and Orientation
 
@@ -215,6 +231,12 @@ File-dependency baseline at Bifrost commit `df76cfbdb140f54984ec98a5c677b4c4e98d
     BIFROST_FILE_GRAPH_BENCH_FILES=999 BIFROST_FILE_GRAPH_BENCH_FANOUT=16 BIFROST_FILE_GRAPH_BENCH_ITERATIONS=7 BIFROST_SEMANTIC_INDEX=off cargo test --test measure_file_dependency_graph -- --ignored --nocapture
     files=1000 edges=17982 relevance_first_ms=1194.168 relevance_warm_median_ms=132.160 importers_first_ms=825.381 importers_warm_median_ms=483.503 rss_after_analyzer=66453504 rss_after_relevance=100499456 rss_after_importers=127320064
 
+File-dependency optimized A/B at the `868c8d9f49c625be8ca3bbcf9ba9de46f49a666e` baseline and its uncommitted compact candidate, single-threaded release test profile, 1,000 files / 17,982 edges / 15 warm iterations. Each figure below is the median of three alternating preserved-binary process runs:
+
+    baseline relevance_first_ms=331.219 relevance_warm_median_ms=38.618 importers_first_ms=199.590 importers_warm_median_ms=133.480 rss_after_relevance=89489408 rss_after_importers=113115136
+
+    candidate relevance_first_ms=312.926 relevance_warm_median_ms=17.818 importers_first_ms=203.174 importers_warm_median_ms=131.658 rss_after_relevance=88522752 rss_after_importers=111935488
+
 ## Interfaces and Dependencies
 
 The first benchmark may add representation-neutral methods to `FileFacts`:
@@ -241,3 +263,5 @@ Revision note 2026-07-15T14:29:00Z: Recorded the implemented structural-role CSR
 Revision note 2026-07-15T14:29:00Z: Promoted compact structural role rows after optimized A/B read parity, focused behavior validation, and warnings-as-errors Clippy passed.
 
 Revision note 2026-07-15T14:47:31Z: Added the file-dependency benchmark, recorded default and dense baselines, and narrowed the sharing goal to representation mechanics because RQL and relevance require different graph lifecycles.
+
+Revision note 2026-07-15T15:11:55Z: Promoted shared compact rows and directed CSR/CSC after alternating optimized A/B runs showed substantially faster direct PageRank reads, RQL read parity, modest repeatable RSS savings, and focused behavior plus lint validation.

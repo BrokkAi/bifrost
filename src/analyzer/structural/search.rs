@@ -30,6 +30,7 @@ use crate::analyzer::usages::{
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
+use crate::compact_graph::CompactDirectedGraph;
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use crate::text_utils::{compute_line_starts, line_column_for_offset};
@@ -594,7 +595,7 @@ impl PipelineRenderCache {
 #[derive(Debug, Default)]
 struct DirectImportGraph {
     forward: HashMap<ProjectFile, Vec<ProjectFile>>,
-    reverse: HashMap<ProjectFile, Vec<ProjectFile>>,
+    compact: Option<CompactDirectedGraph<ProjectFile>>,
     unsupported: HashSet<ProjectFile>,
     all_files: Vec<ProjectFile>,
     analyzed: HashSet<ProjectFile>,
@@ -614,6 +615,61 @@ impl DirectImportGraph {
             analyzed,
             ..Self::default()
         }
+    }
+
+    fn freeze(&mut self) {
+        if self.compact.is_some() {
+            return;
+        }
+        let nodes = std::mem::take(&mut self.all_files);
+        let index_by_file: HashMap<_, _> = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, file)| (file.clone(), index as u32))
+            .collect();
+        let mut edges = Vec::with_capacity(self.resolved_edges);
+        for (source, targets) in std::mem::take(&mut self.forward) {
+            let Some(source) = index_by_file.get(&source).copied() else {
+                continue;
+            };
+            edges.extend(targets.into_iter().filter_map(|target| {
+                index_by_file
+                    .get(&target)
+                    .copied()
+                    .map(|target| (source, target))
+            }));
+        }
+        self.compact = Some(CompactDirectedGraph::from_indexed_nodes(
+            nodes,
+            index_by_file,
+            edges,
+        ));
+        self.analyzed.clear();
+        self.analyzed.shrink_to_fit();
+    }
+
+    fn imports_of(&self, file: &ProjectFile) -> Vec<ProjectFile> {
+        if let Some(compact) = &self.compact {
+            return compact
+                .node_id(file)
+                .into_iter()
+                .flat_map(|source| compact.outgoing(source))
+                .map(|target| compact.nodes()[*target as usize].clone())
+                .collect();
+        }
+        self.forward.get(file).cloned().unwrap_or_default()
+    }
+
+    fn importers_of(&self, file: &ProjectFile) -> Vec<ProjectFile> {
+        let Some(compact) = &self.compact else {
+            return Vec::new();
+        };
+        compact
+            .node_id(file)
+            .into_iter()
+            .flat_map(|target| compact.incoming(target))
+            .map(|source| compact.nodes()[*source as usize].clone())
+            .collect()
     }
 }
 
@@ -1046,7 +1102,12 @@ fn ensure_complete_import_graph(
     max_files: usize,
     max_edges: usize,
 ) -> bool {
-    if graph.complete || graph.truncated {
+    if graph.complete {
+        graph.freeze();
+        return false;
+    }
+    if graph.truncated {
+        graph.freeze();
         return graph.truncated;
     }
     let files = graph.all_files.clone();
@@ -1054,6 +1115,7 @@ fn ensure_complete_import_graph(
     if !exhausted {
         graph.complete = true;
     }
+    graph.freeze();
     exhausted
 }
 
@@ -1127,20 +1189,8 @@ fn ensure_forward_import_edges(
                 graph.truncated = true;
             }
             graph.resolved_edges += targets.len();
-            for target in &targets {
-                graph
-                    .reverse
-                    .entry(target.clone())
-                    .or_default()
-                    .push(file.clone());
-            }
             graph.forward.insert(file.clone(), targets);
         }
-    }
-
-    for importers in graph.reverse.values_mut() {
-        importers.sort_by_key(rel_path_string);
-        importers.dedup();
     }
     graph.truncated
 }
@@ -1207,11 +1257,8 @@ fn apply_pipeline_step(
                     Vec::new()
                 } else {
                     graph
-                        .forward
-                        .get(file)
+                        .imports_of(file)
                         .into_iter()
-                        .flatten()
-                        .cloned()
                         .map(PipelineValue::File)
                         .map(pipeline_expansion)
                         .collect()
@@ -1219,11 +1266,8 @@ fn apply_pipeline_step(
             }
             (PipelineValue::File(file), QueryStep::ImportersOf) => import_graph
                 .expect("import graph exists for import steps")
-                .reverse
-                .get(file)
+                .importers_of(file)
                 .into_iter()
-                .flatten()
-                .cloned()
                 .map(PipelineValue::File)
                 .map(pipeline_expansion)
                 .collect(),
