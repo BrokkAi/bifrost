@@ -9,7 +9,7 @@
 //! - [`build_enclosers`] / [`EdgeCollector::enclosing`] — attribute a reference to
 //!   its smallest enclosing declaration (the caller), matching
 //!   `IAnalyzer::enclosing_code_unit` but precomputed once per file.
-//! - [`EdgeCollector::record`] — the per-reference rules: drop self-references and
+//! - [`EdgeCollector::record_kind`] — the per-reference rules: drop self-references and
 //!   references inside the callee's own definition, require both endpoints to be
 //!   nodes, count distinct call sites for the cap, and dedup edge weight by
 //!   `(file, line, caller)`.
@@ -24,7 +24,7 @@
 //! every accounting rule — only the key type differs.
 //!
 //! Each language provides only a `scan_file` that walks its AST and calls
-//! [`EdgeCollector::record`]; see the Go implementation in
+//! [`EdgeCollector::record_kind`]; see the Go implementation in
 //! [`super::go_graph`] for the reference shape.
 
 use crate::analyzer::tree_sitter_analyzer::FileState;
@@ -36,7 +36,7 @@ use crate::text_utils::find_line_index_for_offset;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::hash::Hash;
-use tree_sitter::Language as TreeSitterLanguage;
+use tree_sitter::{Language as TreeSitterLanguage, Node};
 
 /// Per-file index of class-like declaration spans, for attributing an
 /// unqualified / `this` / `self` reference to its enclosing class. Sources the
@@ -125,6 +125,164 @@ pub(crate) fn first_precise<T: Clone + Eq + Hash>(
 /// contributes no edges. Tied to the per-symbol scan's guardrail
 /// (`DEFAULT_MAX_USAGES`) so `usage_graph`'s truncation matches `scan_usages`.
 pub(crate) const MAX_CALLSITES: usize = crate::analyzer::usages::DEFAULT_MAX_USAGES;
+
+/// Broad semantic category of a proven usage reference. The categories stay
+/// deliberately small so every supported grammar can classify sites without
+/// inventing language-specific public vocabulary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum UsageReferenceKind {
+    #[default]
+    Other,
+    Type,
+    Member,
+    Call,
+}
+
+/// Distinct source-line counts for one caller/callee pair, split by reference kind.
+/// Summing the fields reproduces the legacy unit-per-line edge weight.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UsageReferenceCounts {
+    pub(crate) calls: usize,
+    pub(crate) members: usize,
+    pub(crate) types: usize,
+    pub(crate) other: usize,
+}
+
+impl UsageReferenceCounts {
+    pub(crate) fn total(self) -> usize {
+        self.calls + self.members + self.types + self.other
+    }
+
+    fn record(&mut self, kind: UsageReferenceKind) {
+        match kind {
+            UsageReferenceKind::Call => self.calls += 1,
+            UsageReferenceKind::Member => self.members += 1,
+            UsageReferenceKind::Type => self.types += 1,
+            UsageReferenceKind::Other => self.other += 1,
+        }
+    }
+}
+
+/// Classify a resolved reference from tree-sitter structure. Language scanners
+/// pass the precise identifier/member/type node they resolved; walking only its
+/// named ancestors keeps this independent of source spelling while covering the
+/// common grammar shapes used by Bifrost's supported languages.
+pub(crate) fn classify_reference_node(node: Node<'_>) -> UsageReferenceKind {
+    if matches!(
+        node.kind(),
+        "type_identifier"
+            | "scoped_type_identifier"
+            | "generic_type"
+            | "template_type"
+            | "predefined_type"
+            | "nullable_type"
+            | "array_type"
+            | "pointer_type"
+            | "reference_type"
+            | "union_type"
+            | "intersection_type"
+            | "type_projection"
+            | "stable_type_identifier"
+    ) {
+        return UsageReferenceKind::Type;
+    }
+
+    let site_start = node.start_byte();
+    let site_end = node.end_byte();
+    let mut current = node;
+    let mut member = false;
+    for _ in 0..4 {
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        let kind = parent.kind();
+        if matches!(
+            kind,
+            "type_annotation"
+                | "generic_type"
+                | "type_arguments"
+                | "type_parameters"
+                | "base_list"
+                | "superclass"
+                | "extends_type_clause"
+                | "implements_clause"
+                | "trait_bounds"
+        ) || field_contains_site(
+            parent,
+            &["type", "return_type", "superclass"],
+            site_start,
+            site_end,
+        ) {
+            return UsageReferenceKind::Type;
+        }
+        if matches!(
+            kind,
+            "member_expression"
+                | "field_expression"
+                | "member_access_expression"
+                | "selector_expression"
+                | "navigation_expression"
+                | "scope_resolution_expression"
+        ) && field_contains_site(parent, &["property", "field", "name"], site_start, site_end)
+        {
+            member = true;
+        }
+        if matches!(
+            kind,
+            "call_expression"
+                | "method_invocation"
+                | "invocation_expression"
+                | "function_call_expression"
+                | "member_call_expression"
+                | "command"
+        ) && field_contains_site(
+            parent,
+            &["function", "name", "method", "call"],
+            site_start,
+            site_end,
+        ) {
+            return UsageReferenceKind::Call;
+        }
+        if matches!(
+            kind,
+            "function_item"
+                | "function_declaration"
+                | "method_declaration"
+                | "method_definition"
+                | "class_declaration"
+        ) {
+            break;
+        }
+        current = parent;
+    }
+
+    if member {
+        UsageReferenceKind::Member
+    } else {
+        UsageReferenceKind::Other
+    }
+}
+
+fn field_contains_site(
+    node: Node<'_>,
+    fields: &[&str],
+    site_start: usize,
+    site_end: usize,
+) -> bool {
+    fields.iter().any(|field| {
+        node.child_by_field_name(field)
+            .is_some_and(|child| child.start_byte() <= site_start && site_end <= child.end_byte())
+    })
+}
+
+impl std::ops::AddAssign for UsageReferenceCounts {
+    fn add_assign(&mut self, rhs: Self) {
+        self.calls += rhs.calls;
+        self.members += rhs.members;
+        self.types += rhs.types;
+        self.other += rhs.other;
+    }
+}
 
 /// A single resolved call site for an edge: a workspace-relative file path and the
 /// 1-based line where a reference to the callee occurs. Lines are 1-based to match
@@ -220,8 +378,9 @@ impl<K: NodeKey> UsageEdges<K> {
 
 /// Aggregated edge weights for callers that do not need per-site locations.
 pub(crate) struct UsageEdgeWeights<K = String> {
-    /// `(caller, callee) -> edge weight` (distinct `(file, line, caller)` sites).
-    pub(crate) edges: BTreeMap<(K, K), usize>,
+    /// `(caller, callee) -> reference-kind counts`, with each distinct
+    /// `(file, line, caller)` site assigned to exactly one kind.
+    pub(crate) edges: BTreeMap<(K, K), UsageReferenceCounts>,
     /// Callees past the call-site cap: `callee -> total call sites`.
     pub(crate) truncated: BTreeMap<K, usize>,
     /// Per-callee count of structurally matching call/member sites whose receiver
@@ -264,8 +423,10 @@ pub(crate) struct PerFileEdges<K = String> {
     /// recorded in the file being scanned, so a single path covers all of this
     /// file's sites; [`merge_and_cap`] pairs it with each line to build `CallSite`s.
     path: String,
-    /// `(caller, callee) -> distinct 1-based lines` (edge weight before the cap).
-    edge_lines: BTreeMap<(K, K), HashSet<usize>>,
+    /// `(caller, callee) -> distinct 1-based lines and their strongest observed
+    /// kind`. A line remains one legacy site even if the scanner resolves the same
+    /// declaration more than once on that line.
+    edge_lines: BTreeMap<(K, K), HashMap<usize, UsageReferenceKind>>,
     /// `callee -> distinct call-site offsets` (for the cap).
     callsites: BTreeMap<K, HashSet<usize>>,
     /// `callee -> distinct unresolved structural member offsets`.
@@ -340,7 +501,7 @@ pub(crate) fn build_file_declarations_from_state<K: NodeKey>(
 }
 
 /// Accumulates one file's edges. A language's `scan_file` walks the AST and calls
-/// [`record`](Self::record) for every reference it resolves to a callee key.
+/// [`record_kind`](Self::record_kind) for every reference it resolves to a callee key.
 pub(crate) struct EdgeCollector<'a, K = String> {
     line_starts: &'a [usize],
     nodes: &'a HashSet<K>,
@@ -385,7 +546,13 @@ impl<'a, K: NodeKey> EdgeCollector<'a, K> {
     /// Record a reference at `[start, end)` that resolves to `callee`. Updates the
     /// per-callee call-site count (for the cap) and, when the site is a real edge,
     /// the `(caller, callee)` weight.
-    pub(crate) fn record(&mut self, callee: K, start: usize, end: usize) {
+    pub(crate) fn record_kind(
+        &mut self,
+        callee: K,
+        kind: UsageReferenceKind,
+        start: usize,
+        end: usize,
+    ) {
         if !self.nodes.contains(&callee) {
             return;
         }
@@ -393,10 +560,17 @@ impl<'a, K: NodeKey> EdgeCollector<'a, K> {
             Some(caller) => caller.clone(),
             None => return,
         };
-        self.record_with_caller(caller, callee, start, end);
+        self.record_with_caller_kind(caller, callee, kind, start, end);
     }
 
-    pub(crate) fn record_with_caller(&mut self, caller: K, callee: K, start: usize, end: usize) {
+    pub(crate) fn record_with_caller_kind(
+        &mut self,
+        caller: K,
+        callee: K,
+        kind: UsageReferenceKind,
+        start: usize,
+        end: usize,
+    ) {
         if !self.nodes.contains(&callee) {
             return;
         }
@@ -427,11 +601,11 @@ impl<'a, K: NodeKey> EdgeCollector<'a, K> {
         }
         // 1-based, matching `scan_usages` hit lines and node `start_line`.
         let line = find_line_index_for_offset(self.line_starts, start) + 1;
-        self.out
-            .edge_lines
-            .entry((caller, callee))
-            .or_default()
-            .insert(line);
+        let line_kinds = self.out.edge_lines.entry((caller, callee)).or_default();
+        line_kinds
+            .entry(line)
+            .and_modify(|existing| *existing = (*existing).max(kind))
+            .or_insert(kind);
     }
 
     pub(crate) fn contains_node(&self, node: &K) -> bool {
@@ -658,7 +832,7 @@ pub(crate) fn merge_and_cap<K: NodeKey>(per_file: Vec<PerFileEdges<K>>) -> Usage
     for file in per_file {
         for (key, lines) in file.edge_lines {
             let sites = edge_sites.entry(key).or_default();
-            sites.extend(lines.into_iter().map(|line| CallSite {
+            sites.extend(lines.into_keys().map(|line| CallSite {
                 path: file.path.clone(),
                 line,
             }));
@@ -695,12 +869,15 @@ pub(crate) fn merge_and_cap<K: NodeKey>(per_file: Vec<PerFileEdges<K>>) -> Usage
 pub(crate) fn merge_weights_and_cap<K: NodeKey>(
     per_file: Vec<PerFileEdges<K>>,
 ) -> UsageEdgeWeights<K> {
-    let mut edge_weights: BTreeMap<(K, K), usize> = BTreeMap::new();
+    let mut edge_weights: BTreeMap<(K, K), UsageReferenceCounts> = BTreeMap::new();
     let mut callsites: BTreeMap<K, usize> = BTreeMap::new();
     let mut unproven_inbound: BTreeMap<K, usize> = BTreeMap::new();
     for file in per_file {
         for (key, lines) in file.edge_lines {
-            *edge_weights.entry(key).or_insert(0) += lines.len();
+            let counts = edge_weights.entry(key).or_default();
+            for kind in lines.into_values() {
+                counts.record(kind);
+            }
         }
         for (callee, sites) in file.callsites {
             *callsites.entry(callee).or_insert(0) += sites.len();
@@ -714,7 +891,7 @@ pub(crate) fn merge_weights_and_cap<K: NodeKey>(
         .into_iter()
         .filter(|(_, total)| *total > MAX_CALLSITES)
         .collect();
-    let edges: BTreeMap<(K, K), usize> = edge_weights
+    let edges: BTreeMap<(K, K), UsageReferenceCounts> = edge_weights
         .into_iter()
         .filter(|((_, callee), _)| !truncated.contains_key(callee))
         .collect();
@@ -730,6 +907,57 @@ pub(crate) fn merge_weights_and_cap<K: NodeKey>(
 mod tests {
     use super::*;
 
+    fn find_node<'tree>(root: Node<'tree>, source: &str, kind: &str, text: &str) -> Node<'tree> {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == kind
+                && source
+                    .get(node.start_byte()..node.end_byte())
+                    .is_some_and(|candidate| candidate == text)
+            {
+                return node;
+            }
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+        panic!("missing {kind} node {text:?}");
+    }
+
+    #[test]
+    fn structured_reference_classifier_distinguishes_rust_kinds() {
+        let source = "fn caller(value: Model) { helper(); value.member; value.run(); OTHER; }";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+
+        assert_eq!(
+            classify_reference_node(find_node(root, source, "type_identifier", "Model")),
+            UsageReferenceKind::Type
+        );
+        assert_eq!(
+            classify_reference_node(find_node(root, source, "identifier", "helper")),
+            UsageReferenceKind::Call
+        );
+        assert_eq!(
+            classify_reference_node(find_node(root, source, "field_identifier", "member")),
+            UsageReferenceKind::Member
+        );
+        assert_eq!(
+            classify_reference_node(find_node(root, source, "field_identifier", "run")),
+            UsageReferenceKind::Call
+        );
+        assert_eq!(
+            classify_reference_node(find_node(root, source, "identifier", "OTHER")),
+            UsageReferenceKind::Other
+        );
+    }
+
     fn per_file_with_edge(path: &str, caller: &str, callee: &str, line: usize) -> PerFileEdges {
         let mut edges = PerFileEdges {
             path: path.to_string(),
@@ -739,7 +967,7 @@ mod tests {
             .edge_lines
             .entry((caller.to_string(), callee.to_string()))
             .or_default()
-            .insert(line);
+            .insert(line, UsageReferenceKind::Other);
         edges
     }
 
@@ -784,7 +1012,10 @@ mod tests {
             merged
                 .edges
                 .get(&("caller".to_string(), "callee".to_string())),
-            Some(&2)
+            Some(&UsageReferenceCounts {
+                other: 2,
+                ..UsageReferenceCounts::default()
+            })
         );
         let weights: Vec<_> = merged
             .edges
@@ -793,7 +1024,35 @@ mod tests {
             .collect();
         assert_eq!(
             weights,
-            vec![("caller".to_string(), "callee".to_string(), 2usize)]
+            vec![(
+                "caller".to_string(),
+                "callee".to_string(),
+                UsageReferenceCounts {
+                    other: 2,
+                    ..UsageReferenceCounts::default()
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn strongest_kind_wins_when_one_edge_repeats_on_a_line() {
+        let mut per_file = per_file_with_edge("a.rs", "caller", "callee", 5);
+        per_file
+            .edge_lines
+            .get_mut(&("caller".to_string(), "callee".to_string()))
+            .unwrap()
+            .insert(5, UsageReferenceKind::Call);
+
+        let merged = merge_weights_and_cap(vec![per_file]);
+        assert_eq!(
+            merged
+                .edges
+                .get(&("caller".to_string(), "callee".to_string())),
+            Some(&UsageReferenceCounts {
+                calls: 1,
+                ..UsageReferenceCounts::default()
+            })
         );
     }
 
@@ -808,7 +1067,7 @@ mod tests {
                 .edge_lines
                 .entry(("caller".to_string(), "callee".to_string()))
                 .or_default()
-                .insert(index + 1);
+                .insert(index + 1, UsageReferenceKind::Other);
             per_file
                 .callsites
                 .entry("callee".to_string())
@@ -826,7 +1085,7 @@ mod tests {
                 .edge_lines
                 .entry(("caller".to_string(), "callee".to_string()))
                 .or_default()
-                .insert(index + 1);
+                .insert(index + 1, UsageReferenceKind::Other);
             weight_file
                 .callsites
                 .entry("callee".to_string())
@@ -879,7 +1138,12 @@ mod tests {
         };
 
         let mut collector = EdgeCollector::new(&line_starts, &nodes, declarations);
-        collector.record(callee.clone(), offset, offset + 2);
+        collector.record_kind(
+            callee.clone(),
+            UsageReferenceKind::Other,
+            offset,
+            offset + 2,
+        );
         let per_file = collector.finish();
 
         let lines = per_file
@@ -887,7 +1151,7 @@ mod tests {
             .get(&(caller, callee))
             .expect("edge recorded");
         assert_eq!(
-            lines.iter().copied().collect::<Vec<_>>(),
+            lines.keys().copied().collect::<Vec<_>>(),
             vec![3],
             "file-scoped record must emit a 1-based line (3), not 0-based (2)"
         );

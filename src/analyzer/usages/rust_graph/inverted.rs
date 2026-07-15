@@ -23,7 +23,8 @@
 
 use super::extractor::{first_generic_type_argument, type_node_last_segment};
 use crate::analyzer::usages::inverted_edges::{
-    EdgeCollector, UsageEdgeBuildOutput, build_edge_output, parse_and_collect,
+    EdgeCollector, UsageEdgeBuildOutput, build_edge_output, classify_reference_node,
+    parse_and_collect,
 };
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
 use crate::analyzer::{
@@ -115,8 +116,12 @@ impl RustScan<'_, '_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.collector
-            .record(callee, node.start_byte(), node.end_byte());
+        self.collector.record_kind(
+            callee,
+            classify_reference_node(node),
+            node.start_byte(),
+            node.end_byte(),
+        );
     }
 
     fn record_unproven(&mut self, name: &str, node: Node<'_>) {

@@ -28,7 +28,7 @@ use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
-    build_file_declarations, build_file_declarations_from_state,
+    build_file_declarations, build_file_declarations_from_state, classify_reference_node,
     parse_and_collect_with_declarations,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
@@ -115,8 +115,12 @@ impl JavaScan<'_, '_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.collector
-            .record(callee, node.start_byte(), node.end_byte());
+        self.collector.record_kind(
+            callee,
+            classify_reference_node(node),
+            node.start_byte(),
+            node.end_byte(),
+        );
     }
 
     fn record_unproven(&mut self, name: &str, node: Node<'_>) {

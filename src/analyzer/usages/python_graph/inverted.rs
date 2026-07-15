@@ -23,7 +23,8 @@ use super::extractor::{
 use super::resolver::resolve_receiver_type;
 use crate::analyzer::PythonAnalyzer;
 use crate::analyzer::usages::inverted_edges::{
-    EdgeCollector, UsageEdgeBuildOutput, build_edge_output, parse_and_collect,
+    EdgeCollector, UsageEdgeBuildOutput, build_edge_output, classify_reference_node,
+    parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::LocalBindingsSnapshot;
 use crate::analyzer::usages::model::ImportKind;
@@ -157,8 +158,12 @@ impl PyScan<'_, '_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.collector
-            .record(callee, node.start_byte(), node.end_byte());
+        self.collector.record_kind(
+            callee,
+            classify_reference_node(node),
+            node.start_byte(),
+            node.end_byte(),
+        );
     }
 
     fn record_unproven_name(&mut self, name: &str, node: Node<'_>) {

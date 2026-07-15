@@ -1303,6 +1303,7 @@ fn analyze_jsts_candidates_with_scoped_usage_graph(
     let mut incoming: BTreeMap<UsageNodeKey, ScopedGraphIncomingUsage> = BTreeMap::new();
     for ((caller, callee), weight) in edges {
         let usage = incoming.entry(callee).or_default();
+        let weight = weight.total();
         usage.total += weight;
         usage.callers.entry(caller).or_insert(weight);
     }

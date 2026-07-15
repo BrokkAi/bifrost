@@ -1,7 +1,7 @@
 //! Compact exact-identity usage graph shared by relevance ranking and graph APIs.
 
 use super::common::language_for_target;
-use super::inverted_edges::{UsageEdgeWeights, UsageNodeKey};
+use super::inverted_edges::{UsageEdgeWeights, UsageNodeKey, UsageReferenceCounts};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeMap;
@@ -177,7 +177,7 @@ impl WorkspaceUsageCatalog {
 pub(crate) struct WorkspaceUsageEdge {
     pub(crate) from: usize,
     pub(crate) to: usize,
-    pub(crate) weight: usize,
+    pub(crate) counts: UsageReferenceCounts,
 }
 
 pub(crate) struct WorkspaceUsageGraph {
@@ -274,14 +274,14 @@ pub(crate) fn build_workspace_usage_graph(
             fqn: key.fqn,
             defining_file: Some(key.file),
         };
-        for ((from, to), weight) in result.edges.edges {
+        for ((from, to), counts) in result.edges.edges {
             let (Some(from), Some(to)) = (
                 catalog.index_of(&convert(from)),
                 catalog.index_of(&convert(to)),
             ) else {
                 continue;
             };
-            edges.push(WorkspaceUsageEdge { from, to, weight });
+            edges.push(WorkspaceUsageEdge { from, to, counts });
         }
         for (key, total) in result.edges.truncated {
             if let Some(index) = catalog.index_of(&convert(key)) {
@@ -306,14 +306,14 @@ fn record_weighted_edges(
     nodes: &mut [WorkspaceUsageNode],
     edges: &mut Vec<WorkspaceUsageEdge>,
 ) {
-    for ((from, to), weight) in result.edges {
+    for ((from, to), counts) in result.edges {
         let (Some(from), Some(to)) = (
             catalog.index_of(&WorkspaceUsageNodeKey::package_scoped(ecosystem, from)),
             catalog.index_of(&WorkspaceUsageNodeKey::package_scoped(ecosystem, to)),
         ) else {
             continue;
         };
-        edges.push(WorkspaceUsageEdge { from, to, weight });
+        edges.push(WorkspaceUsageEdge { from, to, counts });
     }
     for (fqn, total) in result.truncated {
         if let Some(index) =

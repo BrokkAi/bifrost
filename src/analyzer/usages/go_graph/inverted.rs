@@ -24,7 +24,8 @@ use super::extractor::{
 };
 use super::resolver::{GoEdgeIndex, TypeRef, node_text};
 use crate::analyzer::usages::inverted_edges::{
-    EdgeCollector, UsageEdgeBuildOutput, build_edge_output, parse_and_collect,
+    EdgeCollector, UsageEdgeBuildOutput, build_edge_output, classify_reference_node,
+    parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{IAnalyzer, ProjectFile};
@@ -204,8 +205,12 @@ impl FileScan<'_, '_> {
     /// Hand a resolved reference to the shared collector, which applies the
     /// enclosing-caller attribution, cap counting, and edge dedup.
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.collector
-            .record(callee, node.start_byte(), node.end_byte());
+        self.collector.record_kind(
+            callee,
+            classify_reference_node(node),
+            node.start_byte(),
+            node.end_byte(),
+        );
     }
 
     fn record_unproven(&mut self, name: &str, node: Node<'_>) {
@@ -218,8 +223,13 @@ impl FileScan<'_, '_> {
     }
 
     fn record_with_caller(&mut self, caller: String, callee: String, node: Node<'_>) {
-        self.collector
-            .record_with_caller(caller, callee, node.start_byte(), node.end_byte());
+        self.collector.record_with_caller_kind(
+            caller,
+            callee,
+            classify_reference_node(node),
+            node.start_byte(),
+            node.end_byte(),
+        );
     }
 }
 

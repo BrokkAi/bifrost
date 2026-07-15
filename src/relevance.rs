@@ -1,3 +1,4 @@
+use crate::analyzer::usages::inverted_edges::UsageReferenceCounts;
 use crate::analyzer::usages::workspace_graph::{
     WorkspaceUsageCatalog, build_workspace_usage_graph,
 };
@@ -81,6 +82,30 @@ pub enum MostRelevantFilesRankingMode {
     #[default]
     HistoryImports,
     UsageGraph,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UsageReferenceWeights {
+    calls: f64,
+    members: f64,
+    types: f64,
+    other: f64,
+}
+
+impl UsageReferenceWeights {
+    const UNIFORM: Self = Self {
+        calls: 1.0,
+        members: 1.0,
+        types: 1.0,
+        other: 1.0,
+    };
+
+    fn combine(self, counts: UsageReferenceCounts) -> f64 {
+        counts.calls as f64 * self.calls
+            + counts.members as f64 * self.members
+            + counts.types as f64 * self.types
+            + counts.other as f64 * self.other
+    }
 }
 
 pub(crate) fn most_relevant_project_files(
@@ -234,7 +259,7 @@ fn related_files_by_usage(
     }
     let mut outgoing = vec![Vec::new(); graph.nodes.len()];
     for edge in &graph.edges {
-        outgoing[edge.from].push((edge.to, edge.weight as f64));
+        outgoing[edge.from].push((edge.to, UsageReferenceWeights::UNIFORM.combine(edge.counts)));
     }
     for neighbors in &mut outgoing {
         neighbors.sort_by_key(|(target, _)| *target);

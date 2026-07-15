@@ -27,7 +27,7 @@ use crate::analyzer::js_ts::syntax::{
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     EdgeCollector, UsageEdgeBuildOutput, UsageEdgeWeights, UsageNodeKey, build_edge_output,
-    build_edge_weights, collect_file_edges, parse_and_collect,
+    build_edge_weights, classify_reference_node, collect_file_edges, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{ExportEntry, ImportKind};
@@ -261,8 +261,12 @@ impl<'a> ScopedTsScan<'a, '_> {
     }
 
     fn record(&mut self, callee: UsageNodeKey, node: Node<'_>) {
-        self.collector
-            .record(callee, node.start_byte(), node.end_byte());
+        self.collector.record_kind(
+            callee,
+            classify_reference_node(node),
+            node.start_byte(),
+            node.end_byte(),
+        );
     }
 }
 
@@ -595,8 +599,12 @@ impl TsScan<'_, '_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.collector
-            .record(callee, node.start_byte(), node.end_byte());
+        self.collector.record_kind(
+            callee,
+            classify_reference_node(node),
+            node.start_byte(),
+            node.end_byte(),
+        );
     }
 }
 

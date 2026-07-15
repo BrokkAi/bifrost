@@ -33,8 +33,8 @@ use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
-    build_file_declarations, build_file_declarations_from_state, first_precise,
-    parse_and_collect_with_declarations,
+    build_file_declarations, build_file_declarations_from_state, classify_reference_node,
+    first_precise, parse_and_collect_with_declarations,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{CodeUnit, GlobalUsageDefinitionIndex, UsageFactsIndex};
@@ -752,13 +752,22 @@ impl ScalaScan<'_, '_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.collector
-            .record(callee, node.start_byte(), node.end_byte());
+        self.collector.record_kind(
+            callee,
+            classify_reference_node(node),
+            node.start_byte(),
+            node.end_byte(),
+        );
     }
 
     fn record_with_caller(&mut self, caller: String, callee: String, node: Node<'_>) {
-        self.collector
-            .record_with_caller(caller, callee, node.start_byte(), node.end_byte());
+        self.collector.record_with_caller_kind(
+            caller,
+            callee,
+            classify_reference_node(node),
+            node.start_byte(),
+            node.end_byte(),
+        );
     }
 }
 

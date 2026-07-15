@@ -64,9 +64,9 @@ use std::sync::Arc;
 
 pub(in crate::analyzer::usages) use crate::analyzer::js_ts::syntax::compute_import_binder as compute_jsts_import_binder;
 use crate::analyzer::usages::inverted_edges::CallSite;
-use crate::analyzer::usages::inverted_edges::UsageEdgeWeights;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::inverted_edges::UsageNodeKey;
+use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageReferenceCounts};
 pub(crate) use inverted::{JsTsScopedNodeStatus, JsTsScopedUsageEdges};
 
 /// Build the whole JS/TS `caller -> callee` edge set in a single inverted pass per
@@ -321,7 +321,7 @@ impl<'a> UsageEdgeResolver<'a> for JsTsEdgeResolver {
             let result: UsageEdgeWeights =
                 inverted::build_jsts_edges(analyzer, language, nodes, &keep_file);
             for (key, weight) in result.edges {
-                *edges.entry(key).or_insert(0) += weight;
+                *edges.entry(key).or_default() += weight;
             }
             for (callee, total) in result.truncated {
                 *truncated.entry(callee).or_insert(0) += total;
@@ -349,7 +349,7 @@ pub(crate) fn build_jsts_scoped_usage_edges<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync + Copy,
 {
-    let mut edges: std::collections::BTreeMap<(UsageNodeKey, UsageNodeKey), usize> =
+    let mut edges: std::collections::BTreeMap<(UsageNodeKey, UsageNodeKey), UsageReferenceCounts> =
         std::collections::BTreeMap::new();
     let mut truncated: std::collections::BTreeMap<UsageNodeKey, usize> =
         std::collections::BTreeMap::new();
@@ -386,7 +386,7 @@ where
             keep_file,
         );
         for (key, weight) in result.edges.edges {
-            *edges.entry(key).or_insert(0) += weight;
+            *edges.entry(key).or_default() += weight;
         }
         for (callee, total) in result.edges.truncated {
             *truncated.entry(callee).or_insert(0) += total;
