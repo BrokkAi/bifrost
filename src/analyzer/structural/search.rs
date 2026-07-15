@@ -2021,10 +2021,9 @@ fn inbound_reference_expansions(
     let expansions = sites
         .into_iter()
         .filter_map(|site| match step {
-            QueryStep::ReferencesOf(_) => Some(reference_expansion(
-                PipelineValue::ReferenceSite(site.clone()),
-                site,
-            )),
+            QueryStep::ReferencesOf(_) => {
+                Some(pipeline_expansion(PipelineValue::ReferenceSite(site)))
+            }
             QueryStep::UsedBy(_) => site
                 .enclosing
                 .clone()

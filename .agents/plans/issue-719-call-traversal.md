@@ -20,6 +20,7 @@ The public operations are `callers`, `callees`, `call_sites_to`, `call_sites_fro
 - [x] (2026-07-14 18:02Z) Milestone 4: reviewed the relation/query/consumer diff, fixed self-receiver inclusion, canonical PHP formal names, named-value AST extraction, RQL token priority, and stale docs; completed focused and repository-wide validation.
 - [x] (2026-07-15 07:20Z) Ran the Brokk guided review and applied all twelve queued findings: bounded exact incoming discovery, symmetric recursion, correct Python unbound and constructor binding, keyword-variadic binding, cancellation and work budgets, alternate-path provenance, shared structural call facts, schema-owned parameter-name validation, lazy LSP binding, and shared callable-ancestor helpers.
 - [x] (2026-07-15 09:15Z) Fixed the ARM CI call-hierarchy regression for qualified Java constructor calls by preserving the terminal name of `scoped_type_identifier` structural facts; all 182 LSP tests, 57 query-pipeline tests, formatting, and all-feature Clippy pass.
+- [x] (2026-07-15 09:20Z) Restored the documented reference-provenance contract after the generalized `PipelineVia` refactor: `references_of` returns the supporting site directly and no longer duplicates it under `via`, while declaration-producing reference and call traversals retain their supporting sites.
 
 ## Surprises & Discoveries
 
@@ -55,6 +56,9 @@ The public operations are `callers`, `callees`, `call_sites_to`, `call_sites_fro
 
 - Observation: tree-sitter Java does not expose a `name` field on every `scoped_type_identifier` shape, including `new pkg.Service()`.
   Evidence: definition lookup resolved both qualified constructor reference leaves to `pkg.Service`, but the Java structural adapter emitted a call fact without a terminal name, so the shared relation could not correlate either reference with the call. Falling back to the rightmost named AST child restores the exact `Service` span without parsing source text.
+
+- Observation: generalizing provenance from reference-only `via` values to `PipelineVia` accidentally made `references_of` render the same reference site twice: once as the step result and again as `via`.
+  Evidence: both Linux CI jobs and the local executable reference tutorial showed the duplicated field-read site. Keeping `via` on declaration-producing `used_by`, `uses`, `callers`, and `callees` expansions preserves its role as supporting evidence without changing the established `references_of` output contract.
 
 - Observation: the full macOS Python-feature test link needs the same dynamic-lookup flags used by CI, and several unrelated tests need normal user-cache, subprocess, and git/GPG access.
   Evidence: `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup' cargo test --all-features --lib` passed 797 tests outside the sandbox after the sandbox run identified only six environment-restricted failures.
