@@ -13,8 +13,9 @@
 
 use crate::analyzer::usages::{
     ExportEntry, ExportIndex, ImportBinder, ImportEdge, ImportEdgeKind, ImportKind,
+    LocalBindingsSnapshot,
 };
-use crate::analyzer::{BulkFileStateSource, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{BulkFileStateSource, CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashMap;
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -34,9 +35,11 @@ pub(crate) struct PythonUsageIndex {
     star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
     importer_reverse: HashMap<ProjectFile, Vec<ImportEdge>>,
     module_binding_timelines: Mutex<HashMap<ProjectFile, Arc<ModuleBindingTimeline>>>,
+    scope_facts_by_file: Mutex<HashMap<ProjectFile, Arc<PythonScopeFacts>>>,
 }
 
 pub(crate) type ModuleBindingTimeline = HashMap<String, Vec<ModuleBindingEvent>>;
+pub(crate) type PythonScopeFacts = HashMap<CodeUnit, LocalBindingsSnapshot<String>>;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ModuleBindingEvent {
@@ -187,6 +190,7 @@ impl PythonUsageIndex {
             star_reexports,
             importer_reverse,
             module_binding_timelines: Mutex::new(HashMap::default()),
+            scope_facts_by_file: Mutex::new(HashMap::default()),
         }
     }
 
@@ -302,6 +306,30 @@ impl PythonUsageIndex {
             .expect("Python module-binding timeline cache mutex poisoned")
             .entry(file.clone())
             .or_insert_with(|| timeline.clone())
+            .clone()
+    }
+
+    fn scope_facts(
+        &self,
+        file: &ProjectFile,
+        build: impl FnOnce() -> PythonScopeFacts,
+    ) -> Arc<PythonScopeFacts> {
+        if let Some(cached) = self
+            .scope_facts_by_file
+            .lock()
+            .expect("Python scope-facts cache mutex poisoned")
+            .get(file)
+            .cloned()
+        {
+            return cached;
+        }
+
+        let facts = Arc::new(build());
+        self.scope_facts_by_file
+            .lock()
+            .expect("Python scope-facts cache mutex poisoned")
+            .entry(file.clone())
+            .or_insert_with(|| facts.clone())
             .clone()
     }
 }
@@ -424,6 +452,14 @@ impl PythonAnalyzer {
     ) -> Arc<ModuleBindingTimeline> {
         self.usage_index().module_binding_timeline(file, build)
     }
+
+    pub(crate) fn usage_scope_facts(
+        &self,
+        file: &ProjectFile,
+        build: impl FnOnce() -> PythonScopeFacts,
+    ) -> Arc<PythonScopeFacts> {
+        self.usage_index().scope_facts(file, build)
+    }
 }
 
 #[cfg(test)]
@@ -449,5 +485,11 @@ mod tests {
         });
 
         assert!(Arc::ptr_eq(&first, &second));
+
+        let first_facts = index.scope_facts(&file, PythonScopeFacts::default);
+        let second_facts = index.scope_facts(&file, || {
+            panic!("cached scope facts should avoid rebuilding the file")
+        });
+        assert!(Arc::ptr_eq(&first_facts, &second_facts));
     }
 }

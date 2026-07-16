@@ -12,7 +12,7 @@ use crate::analyzer::usages::python_graph::resolver::{
 };
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline,
-    ProjectFile, PythonAnalyzer, Range,
+    ProjectFile, PythonAnalyzer, PythonScopeFacts, Range,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -157,22 +157,31 @@ pub(super) fn scan_files_for_seeds(
             return;
         }
 
-        let edges = py.usage_matching_edges(file, seeds);
-        let raw_module_bindings = py.usage_module_binding_timeline(file, || {
-            collect_module_binding_timeline(tree_ref.root_node(), source_str)
-        });
-        let module_bindings =
-            classify_module_binding_timeline(py, file, raw_module_bindings.as_ref(), seeds);
+        let edges = {
+            let _scope = crate::profiling::scope("python_graph::matching_edges");
+            py.usage_matching_edges(file, seeds)
+        };
+        let module_bindings = {
+            let _scope = crate::profiling::scope("python_graph::module_binding_timeline");
+            let raw_module_bindings = py.usage_module_binding_timeline(file, || {
+                collect_module_binding_timeline(tree_ref.root_node(), source_str)
+            });
+            classify_module_binding_timeline(py, file, raw_module_bindings.as_ref(), seeds, &edges)
+        };
         let target_self_file = *file == target.source();
-        let scope_facts = collect_scope_facts_from_parsed_source(
-            analyzer,
-            py,
-            file,
-            target_short.as_str(),
-            source_str,
-            tree_ref.root_node(),
-        );
-        let scope_range_index = build_scope_range_index(analyzer, &scope_facts);
+        let scope_facts = {
+            let _scope = crate::profiling::scope("python_graph::scope_facts");
+            py.usage_scope_facts(file, || {
+                collect_scope_facts_from_parsed_source(
+                    analyzer,
+                    py,
+                    file,
+                    source_str,
+                    tree_ref.root_node(),
+                )
+            })
+        };
+        let scope_range_index = build_scope_range_index(analyzer, scope_facts.as_ref());
 
         let mut local_hits = BTreeSet::new();
         let mut local_unproven_hits = BTreeSet::new();
@@ -192,13 +201,16 @@ pub(super) fn scan_files_for_seeds(
             target_self_file,
             member_best_effort_unique: target_self_file && member_unique_in_target_file,
             module_bindings: &module_bindings,
-            scope_facts: &scope_facts,
+            scope_facts: scope_facts.as_ref(),
             scope_range_index: &scope_range_index,
             hits: &mut local_hits,
             unproven_hits: &mut local_unproven_hits,
         };
 
-        scan_node(tree_ref.root_node(), &mut scan_ctx);
+        {
+            let _scope = crate::profiling::scope("python_graph::scan_tree");
+            scan_node(tree_ref.root_node(), &mut scan_ctx);
+        }
 
         if !local_hits.is_empty() {
             let mut sink = collected
@@ -292,11 +304,11 @@ fn build_scope_range_index(
     entries
 }
 
-fn indexed_scope_facts<'a>(
-    scope_range_index: &[ScopeRangeEntry],
-    scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
+fn indexed_scope_entry<'entry, 'facts>(
+    scope_range_index: &'entry [ScopeRangeEntry],
+    scope_facts: &'facts HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
     node: Node<'_>,
-) -> Option<&'a LocalBindingsSnapshot<String>> {
+) -> Option<(&'entry CodeUnit, &'facts LocalBindingsSnapshot<String>)> {
     let mut cursor =
         scope_range_index.partition_point(|entry| entry.range.start_byte <= node.start_byte());
     while cursor > 0 {
@@ -306,7 +318,9 @@ fn indexed_scope_facts<'a>(
             return None;
         }
         if entry.range.end_byte >= node.end_byte() {
-            return scope_facts.get(&entry.scope);
+            return scope_facts
+                .get(&entry.scope)
+                .map(|facts| (&entry.scope, facts));
         }
     }
     None
@@ -332,18 +346,29 @@ pub(in crate::analyzer::usages) fn enclosing_scope_facts<'a>(
 }
 
 impl ScanCtx<'_> {
+    fn scope_entry_for_node(
+        &self,
+        node: Node<'_>,
+    ) -> Option<(&CodeUnit, &LocalBindingsSnapshot<String>)> {
+        indexed_scope_entry(self.scope_range_index, self.scope_facts, node)
+    }
+
     fn scope_facts_for_node(&self, node: Node<'_>) -> Option<&LocalBindingsSnapshot<String>> {
-        indexed_scope_facts(self.scope_range_index, self.scope_facts, node)
+        self.scope_entry_for_node(node).map(|(_, facts)| facts)
     }
 
     fn binds_target(&self, ident: &str, node: Node<'_>) -> bool {
-        if let Some(scope_facts) = self.scope_facts_for_node(node)
-            && scope_facts.is_shadowed(ident)
+        let scope_entry = self.scope_entry_for_node(node);
+        if self.target_self_file
+            && ident == self.target_short
+            && scope_entry
+                .is_none_or(|(scope, facts)| scope.is_module() || !facts.is_shadowed(ident))
+        {
+            return true;
+        }
+        if scope_entry.is_some_and(|(scope, facts)| !scope.is_module() && facts.is_shadowed(ident))
         {
             return false;
-        }
-        if self.target_self_file && ident == self.target_short {
-            return true;
         }
         self.module_binding_targets_query(ident, node)
     }
@@ -864,10 +889,16 @@ fn classify_module_binding_timeline(
     file: &ProjectFile,
     timeline: &ModuleBindingTimeline,
     seeds: &BTreeSet<(ProjectFile, String)>,
+    edges: &[ImportEdge],
 ) -> HashMap<String, Vec<ClassifiedModuleBindingEvent>> {
     let mut classified = HashMap::default();
     let mut module_targets: HashMap<String, bool> = HashMap::default();
+    let relevant_locals: HashSet<&str> =
+        edges.iter().map(|edge| edge.local_name.as_str()).collect();
     for (local, events) in timeline {
+        if !relevant_locals.contains(local.as_str()) {
+            continue;
+        }
         let classified_events = events
             .iter()
             .map(|event| {
@@ -1039,19 +1070,12 @@ pub(in crate::analyzer::usages) fn collect_scope_facts_from_parsed_source(
     analyzer: &dyn IAnalyzer,
     py: &PythonAnalyzer,
     file: &ProjectFile,
-    target_short: &str,
     source: &str,
     root: Node<'_>,
-) -> HashMap<CodeUnit, LocalBindingsSnapshot<String>> {
+) -> PythonScopeFacts {
     let mut factory_return_types = collect_factory_return_types_from_root(root, source);
     collect_imported_factory_return_types(analyzer, py, file, &mut factory_return_types);
-    collect_scope_facts_with_factory_returns(
-        analyzer,
-        file,
-        target_short,
-        source,
-        &factory_return_types,
-    )
+    collect_scope_facts_with_factory_returns(analyzer, file, source, &factory_return_types)
 }
 
 fn collect_imported_factory_return_types(
@@ -1149,10 +1173,9 @@ fn first_function_definition(root: Node<'_>) -> Option<Node<'_>> {
 fn collect_scope_facts_with_factory_returns(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
-    target_short: &str,
     source: &str,
     factory_return_types: &HashMap<String, String>,
-) -> HashMap<CodeUnit, LocalBindingsSnapshot<String>> {
+) -> PythonScopeFacts {
     let declarations = analyzer.declarations(file);
     let mut class_facts_by_name: HashMap<String, LocalBindingsSnapshot<String>> =
         HashMap::default();
@@ -1165,9 +1188,7 @@ fn collect_scope_facts_with_factory_returns(
         };
         let facts = collect_scope_facts_from_source(
             &declaration_source,
-            target_short,
             true,
-            false,
             Some(declaration.short_name()),
             factory_return_types,
         );
@@ -1191,8 +1212,6 @@ fn collect_scope_facts_with_factory_returns(
             .map(|(owner, _)| owner);
         let mut facts = collect_scope_facts_from_source(
             &declaration_source,
-            target_short,
-            false,
             false,
             owner,
             factory_return_types,
@@ -1213,14 +1232,8 @@ fn collect_scope_facts_with_factory_returns(
         let Some(declaration_source) = declaration_source(analyzer, declaration, source) else {
             continue;
         };
-        let facts = collect_scope_facts_from_source(
-            &declaration_source,
-            target_short,
-            false,
-            true,
-            None,
-            factory_return_types,
-        );
+        let facts =
+            collect_scope_facts_from_source(&declaration_source, false, None, factory_return_types);
         scope_facts.insert(declaration.clone(), facts);
     }
     scope_facts
@@ -1250,9 +1263,7 @@ fn declaration_source_slices<'a>(
 
 fn collect_scope_facts_from_source(
     source: &str,
-    target_short: &str,
     allow_self_receivers: bool,
-    is_module_scope: bool,
     current_class: Option<&str>,
     factory_return_types: &HashMap<String, String>,
 ) -> LocalBindingsSnapshot<String> {
@@ -1289,16 +1300,6 @@ fn collect_scope_facts_from_source(
                     annotation: None, ..
                 } => {}
                 ScopeFactEvent::Assignment { lhs, rhs } => {
-                    // A module-level assignment of the target's own name is its
-                    // definition, not a shadow that hides an outer binding, so
-                    // it must not block the target's same-file usages. Its RHS
-                    // may still infer a receiver type for ordinary locals, but
-                    // seeding the queried target itself would make
-                    // `is_shadowed(target)` true and hide every later read.
-                    let is_target_module_definition = is_module_scope && lhs == target_short;
-                    if is_target_module_definition {
-                        continue;
-                    }
                     if !engine.is_shadowed(lhs) {
                         engine.declare_shadow(lhs.clone());
                     }

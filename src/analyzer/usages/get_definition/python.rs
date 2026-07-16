@@ -374,7 +374,7 @@ impl PythonDefinitionContext {
                     .scope_fact_builds
                     .fetch_add(1, Ordering::Relaxed);
                 Arc::new(collect_scope_facts_from_parsed_source(
-                    analyzer, py, file, "", source, root,
+                    analyzer, py, file, source, root,
                 ))
             })
             .clone()
