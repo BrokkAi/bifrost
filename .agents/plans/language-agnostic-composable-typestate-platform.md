@@ -26,6 +26,7 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [x] (2026-07-16 10:35+02:00) Made #709 the early public policy/API contract gate for #824 and #825 while keeping #814 through #823 free to build diagnostic-neutral internal analysis services.
 - [x] (2026-07-16 11:43+02:00) Defined and published set-oriented taint policies, compatible multi-policy batching, symbolic taint summaries, broad meeting-point findings, exact cache layers, and evidence-backed CVSS classification across #709, #813, #821, #823, and #824.
 - [x] (2026-07-16 12:39+02:00) Moved the publication thread to neutral branch `dave/composable-typestate-roadmap` and draft PR [#828](https://github.com/BrokkAi/bifrost/pull/828).
+- [x] (2026-07-16 14:39+02:00) Diagnosed #814 in detail and added the focused implementation plan `.agents/plans/issue-814-semantic-ir-contract.md`, including corrected artifact/ID scopes and explicit nested-callable, capture, method-reference, and source-position contracts.
 - [ ] Complete #814: define the language-neutral semantic IR, stable identities, capabilities, uncertainty, and an inspectable renderer.
 - [ ] Complete #815 and the first adapter children: build equivalent per-callable CFGs for TypeScript and Java.
 - [ ] Complete #816 in parallel: expose reusable dispatch, value, heap, and bounded access-path oracles for the reference languages.
@@ -59,6 +60,9 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 
 - Observation: `CodeQuery` is already a typed unary pipeline over syntax, declarations, references, calls, expressions, receiver results, and files. It is not yet a recursive path-query or automaton engine.
   Evidence: `QueryValueKind`, `QueryStep`, and `validate_query_steps` in `src/analyzer/structural/query/ir.rs` enforce one typed transition at a time.
+
+- Observation: `CodeUnit` is not an exhaustive executable-procedure identity for nested callables, and current line metadata is not one uniform durable coordinate contract.
+  Evidence: Java creates synthetic lambda units that call relations exclude, other adapters do not index every nested callable, nested-call traversal is deliberately pruned, and declaration versus call-site `Range` construction uses different line bases.
 
 - Observation: GitHub supports native subissues in this repository, so #814 through #826 can be attached directly to #813 while retaining explicit dependency text in each body.
   Evidence: the live `subIssues` query for #813 returned all thirteen children.
@@ -123,6 +127,18 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 
 - Decision: derive CVSS v4.0 only from explicit metric evidence and publish a numerical score only with a complete Base vector.
   Rationale: source exposure and sink impact can support some metrics, but static reachability alone cannot safely invent every exploitability or vulnerable/subsequent-system impact metric. Each metric records a structured evidence basis and provenance; incomplete Base evidence produces an unrated finding with an `Unscored` assessment. A complete result includes the canonical vector, applicable component scores/severities, nomenclature, and scoring provenance. CVSS severity remains distinct from analyzer certainty and organization-specific risk.
+  Date: 2026-07-16.
+
+- Decision: make `SemanticArtifactKey` identify one mounted source snapshot, with artifact-local `ProcedureId`s and procedure-local block, point, value, allocation, call-site, memory-location, capture, source-mapping, evidence, and gap IDs.
+  Rationale: this matches file-oriented adapter extraction, gives nested callable bodies an exhaustive home, avoids reparsing per callable, and prevents bare dense IDs from crossing provider or oracle boundaries. Provider-boundary handles retain the owning immutable artifact/procedure while hot rows remain compact IDs.
+  Date: 2026-07-16.
+
+- Decision: model nested callable bodies, callable values, capture environments, method references, and invocations separately.
+  Rationale: lexical nesting is not execution; a lambda or method reference creates a callable value and may bind captures or a receiver, while only later invocation creates a call site and eventual ICFG edge. Captures must distinguish value/move semantics from shared or mutable memory locations.
+  Date: 2026-07-16.
+
+- Decision: make semantic source byte spans authoritative and define display line/column coordinates as zero-based, rather than reusing `analyzer::Range` as a durable locator.
+  Rationale: current analyzers construct `Range` lines with different bases, `usize` is not a portable persisted width, and exact anchors need columns as well as bytes.
   Date: 2026-07-16.
 
 ## Outcomes & Retrospective
@@ -276,11 +292,11 @@ This milestone is complete when #813–#826 exist, the plan is committed and lin
 
 Create `src/analyzer/semantic/mod.rs`, `ids.rs`, `ir.rs`, `capabilities.rs`, `provider.rs`, and `render.rs` without expanding `StructuralSpec` into an execution-semantic catch-all. Define typed semantic effects and control edge kinds, source/proof/completeness metadata, and language capability discovery.
 
-Keep three identity layers distinct:
+Keep the durable artifact identity, artifact-local procedure identity, and procedure-local row identities distinct:
 
 1. `SemanticLocator` is a source-facing locator: workspace-relative path, language, enclosing declaration identity, semantic role, and source anchor. It lets findings and overlays refer back to code and may be remapped after an edit, but it is never sufficient to prove cache validity.
-2. `SemanticArtifactKey` owns one immutable materialization: workspace mount identity, source/blob identity, overlay generation when applicable, adapter version, semantic-IR version, configuration, and dependency fingerprint. Changing any validity input creates a different artifact key.
-3. `ProcedureId`, `BlockId`, `ProgramPointId`, `ValueId`, `AllocationId`, `CallSiteId`, and `MemoryLocationId` are typed dense `u32` IDs meaningful only inside the artifact that owns them.
+2. `SemanticArtifactKey` owns one immutable mounted source materialization, normally one file: workspace mount identity, workspace-relative path, language/parser dialect, source/blob identity, an opaque overlay snapshot token when applicable, adapter version, semantic-IR version, semantic configuration, and dependency fingerprint. Changing any validity input creates a different artifact key.
+3. `ProcedureId` is a typed dense `u32` meaningful only inside its artifact. `BlockId`, `ProgramPointId`, `ValueId`, `AllocationId`, `CallSiteId`, `MemoryLocationId`, and related side-table IDs are meaningful only inside one procedure. Provider and oracle boundaries pair them with an owning artifact/procedure handle.
 
 Duplicate blobs mounted at different workspace paths may share content-derived extraction payloads, but their source locators remain distinct. Never serialize a dense ID as a globally meaningful identity without its artifact key.
 
@@ -890,7 +906,7 @@ For benchmark milestones, capture commands and outputs in the issue or an `.agen
 ### Contract and adapter validation
 
 - Equivalent TypeScript and Java fixtures render equivalent neutral semantics where expected.
-- `SemanticLocator` remains source-facing, `SemanticArtifactKey` changes on validity inputs, and dense IDs are deterministic only inside their owning artifact; duplicate names and mounted duplicate blobs remain exact.
+- `SemanticLocator` remains source-facing, `SemanticArtifactKey` changes on validity inputs, `ProcedureId` is deterministic only inside its owning artifact, and procedure-row IDs are deterministic only inside their owning procedure; duplicate names and mounted duplicate blobs remain exact.
 - CFG invariants cover entry/exit, edge endpoints, predecessor/successor symmetry, exceptional exits, disconnected/unreachable nodes, deep nesting, cycles, and deterministic rendering.
 - Unsupported features are capability results, not missing rows that look like “no flow.”
 
@@ -1159,32 +1175,32 @@ The #824 bridge between the public and internal typestate models is explicit:
 
 The initial #709 implementation may execute only `PolicyAnalysis::Match`, but it parses and retains versioned public `TaintPolicySpec` and `TypestatePolicySpec` values without importing `TaintAnalysisPlan`/`ProtocolSpec` or inventing solver semantics. #824 supplies the compilers above plus adapters from `AnalysisRun<FlowFinding>`, `AnalysisRun<TaintFinding>`, and `AnalysisRun<TypestateFinding>` after those clients exist. There is no context-free conversion from `CodeQueryMatch` or an analysis finding into `PolicyFinding`: evaluation always requires a `PolicyDefinition`. Human and SARIF renderers consume only `PolicyRun`/`PolicyFinding`.
 
-The semantic adapter boundary is:
+The semantic adapter boundary materializes a mounted source artifact once and resolves procedures inside it:
 
     trait ProgramSemanticsProvider {
         fn capabilities(&self) -> SemanticCapabilities;
-        fn artifact_key(&self, procedure: &SemanticLocator) -> AnalysisOutcome<SemanticArtifactKey>;
-        fn procedure(
+        fn artifact_key(&self, file: &ProjectFile) -> AnalysisOutcome<SemanticArtifactKey>;
+        fn artifact(
             &self,
             key: &SemanticArtifactKey,
             budget: &mut SemanticBudget,
-        ) -> AnalysisOutcome<Arc<ProcedureSemantics>>;
+        ) -> AnalysisOutcome<Arc<SemanticArtifact>>;
     }
 
-`ProcedureSemantics` owns dense local IDs, source mappings, semantic effects, and an immutable CFG. It does not own solver facts or protocol states.
+`SemanticArtifact` owns a dense procedure table. `ProcedureHandle` retains an `Arc<SemanticArtifact>` plus its artifact-local `ProcedureId`; local value, point, call, and memory IDs cross provider/oracle boundaries only together with that procedure scope. `ProcedureSemantics` owns dense local IDs, source mappings, semantic effects, and an immutable CFG. It does not own solver facts or protocol states.
 
 The interprocedural boundary contains control and call metadata, not value bindings:
 
     trait IcfgProvider {
         fn procedure(
             &self,
-            key: &SemanticArtifactKey,
+            locator: &SemanticLocator,
             budget: &mut SemanticBudget,
-        ) -> AnalysisOutcome<Arc<ProcedureSemantics>>;
+        ) -> AnalysisOutcome<ProcedureHandle>;
 
         fn call_control(
             &self,
-            caller: &SemanticArtifactKey,
+            caller: &ProcedureHandle,
             call: CallSiteId,
             budget: &mut SemanticBudget,
         ) -> AnalysisOutcome<CallControlTargets>;
@@ -1197,7 +1213,7 @@ Value capabilities remain separate even if one implementation serves several tra
     trait DispatchOracle {
         fn callees(
             &self,
-            caller: &SemanticArtifactKey,
+            caller: &ProcedureHandle,
             call: CallSiteId,
             budget: &mut SemanticBudget,
         ) -> AnalysisOutcome<CalleeTargets>;
@@ -1206,9 +1222,9 @@ Value capabilities remain separate even if one implementation serves several tra
     trait ValueFlowOracle {
         fn call_bindings(
             &self,
-            caller: &SemanticArtifactKey,
+            caller: &ProcedureHandle,
             call: CallSiteId,
-            callee: &SemanticArtifactKey,
+            callee: &ProcedureHandle,
             budget: &mut SemanticBudget,
         ) -> AnalysisOutcome<CallBindings>;
     }
@@ -1216,6 +1232,7 @@ Value capabilities remain separate even if one implementation serves several tra
     trait HeapOracle {
         fn locations(
             &self,
+            procedure: &ProcedureHandle,
             value: ValueId,
             max_access_path: usize,
             budget: &mut SemanticBudget,
@@ -1337,3 +1354,5 @@ A `SummaryStore` may memoize any reusable summary type in memory and optionally 
 Public query changes depend on the declarative schema registry in `src/analyzer/structural/query/schema.rs`. Public policy changes depend on the versioned schema and finding model established by #709. Neither side may add private keyword lists, editor-only vocabulary, source-text path parsing, or an implicit conversion from query matches to diagnostics. Existing Rust dependencies should be preferred for the first implementation; any new solver or graph crate requires a measured build/runtime benefit and an explicit Decision Log entry.
 
 Plan revision note (2026-07-16): Initial roadmap written after auditing the post-PR-#802 codebase and creating epic #813 with native subissues #814–#826. The initial plan deliberately makes TypeScript/Java the reference pair, IFDS/IDE the baseline solver shape, compact memory plus selective SQLite the lifecycle policy, dominance optional, and WPDS/SPDS evidence-gated. Draft PR #828 is the current publication thread for the initial checkpoint and subsequent revisions. A later same-day revision made #709 the early public policy/API gate, separated `.rqlp`/`PolicyFinding` from the internal protocol and analysis result models, and required the #825 pilot to validate query, human, and SARIF surfaces from one analysis result. This revision also made `analysis.type: taint` set-oriented end to end: one compatible multi-source/multi-sink batch, stable class-set propagation with bounded origins, symbolic taint summaries and exact cache layers, broad findings before CWE refinement, and evidence-backed CVSS v4.0 variants that never fabricate a score from incomplete Base evidence.
+
+Plan revision note (2026-07-16): Issue #814 diagnosis corrected the original procedure-shaped artifact sketch. A semantic artifact now owns one mounted source snapshot and an artifact-local procedure table; procedure rows own their block, point, value, call, memory, capture, provenance, evidence, and gap IDs. Provider and oracle interfaces use scoped procedure handles. The same revision records nested callable bodies as separate procedures, callable references and captures as creation-time semantics rather than eager calls, and byte-authoritative source positions with explicit zero-based display coordinates. The focused implementation plan is `.agents/plans/issue-814-semantic-ir-contract.md`.
