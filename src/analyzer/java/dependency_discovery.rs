@@ -14,6 +14,10 @@ use std::path::{Component, Path, PathBuf};
 const MAX_BUILD_METADATA_BYTES: usize = 2 * 1024 * 1024;
 const MAX_TOOL_REPORT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_MAVEN_XML_DEPTH: usize = 128;
+const MAX_MAVEN_XML_NODES: usize = 16 * 1024;
+const MAX_MAVEN_PROPERTY_EXPANSION_WORK: usize = 4 * 1024;
+const MAX_MAVEN_EXPANDED_VALUE_BYTES: usize = 64 * 1024;
 
 const GRADLE_INIT_SCRIPT: &str = r#"
 import groovy.json.JsonOutput
@@ -115,15 +119,7 @@ impl DependencyCommandExecutor for SystemDependencyCommandExecutor {
     ) -> Result<Vec<u8>, String> {
         let temporary = tempfile::tempdir().map_err(|err| err.to_string())?;
         let report_path = temporary.path().join("maven-dependencies.txt");
-        let args = [
-            "-o".to_string(),
-            "-B".to_string(),
-            "-ntp".to_string(),
-            "dependency:list".to_string(),
-            "-DincludeScope=test".to_string(),
-            "-DoutputAbsoluteArtifactFilename=true".to_string(),
-            format!("-DoutputFile={}", report_path.display()),
-        ];
+        let args = maven_dependency_list_args(&report_path);
         run_dependency_process(
             executable,
             &args,
@@ -289,29 +285,6 @@ fn discover_maven_pom(
             continue;
         }
 
-        if scope == "system" {
-            let Some(system_path) = dependency.child_text("systemPath") else {
-                continue;
-            };
-            let Some(system_path) = expand_maven_value(system_path, &properties) else {
-                continue;
-            };
-            let path = PathBuf::from(system_path);
-            let path = if path.is_absolute() {
-                path
-            } else if let Some(parent) = file.abs_path().parent() {
-                parent.join(path)
-            } else {
-                path
-            };
-            if path.is_file() {
-                discovered.artifact_paths.push(JavaExternalArtifact {
-                    artifact_path: path,
-                    source_artifact_path: None,
-                });
-            }
-            continue;
-        }
         if !matches!(scope, "compile" | "runtime" | "provided" | "test") {
             continue;
         }
@@ -415,6 +388,19 @@ fn parse_gradle_lockfile(source: &str) -> Vec<JavaMavenCoordinate> {
             Some(JavaMavenCoordinate::new(group_id, artifact_id, version))
         })
         .collect()
+}
+
+fn maven_dependency_list_args(report_path: &Path) -> Vec<String> {
+    vec![
+        "-o".to_string(),
+        "-B".to_string(),
+        "-ntp".to_string(),
+        "dependency:list".to_string(),
+        "-DincludeScope=test".to_string(),
+        "-DoutputAbsoluteArtifactFilename=true".to_string(),
+        "-DappendOutput=true".to_string(),
+        format!("-DoutputFile={}", report_path.display()),
+    ]
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -588,39 +574,97 @@ fn stable_path(path: impl AsRef<Path>) -> PathBuf {
 }
 
 fn expand_maven_value(value: &str, properties: &HashMap<String, String>) -> Option<String> {
-    fn expand(
-        value: &str,
-        properties: &HashMap<String, String>,
-        active: &mut HashSet<String>,
-    ) -> Option<String> {
-        let mut result = String::new();
-        let mut remainder = value.trim();
-        while let Some(start) = remainder.find("${") {
-            result.push_str(&remainder[..start]);
-            let after_start = &remainder[start + 2..];
-            let end = after_start.find('}')?;
-            let key = after_start[..end].trim();
-            if key.is_empty() || !active.insert(key.to_string()) {
-                return None;
-            }
-            let replacement = properties.get(key)?;
-            result.push_str(&expand(replacement, properties, active)?);
-            active.remove(key);
-            remainder = &after_start[end + 1..];
-        }
-        if remainder.contains("${") || remainder.contains('}') {
-            return None;
-        }
-        result.push_str(remainder);
-        Some(result.trim().to_string())
+    enum Work {
+        Value(String),
+        Text(String),
+        Property(String),
+        LeaveProperty(String),
     }
 
-    expand(value, properties, &mut HashSet::default())
+    let mut active = HashSet::default();
+    let mut work = vec![Work::Value(value.trim().to_string())];
+    let mut result = String::new();
+    let mut steps = 0usize;
+    while let Some(next) = work.pop() {
+        steps = steps.checked_add(1)?;
+        if steps > MAX_MAVEN_PROPERTY_EXPANSION_WORK {
+            return None;
+        }
+        match next {
+            Work::LeaveProperty(key) => {
+                active.remove(&key);
+            }
+            Work::Text(text) => {
+                if result.len().checked_add(text.len())? > MAX_MAVEN_EXPANDED_VALUE_BYTES {
+                    return None;
+                }
+                result.push_str(&text);
+            }
+            Work::Property(key) => {
+                if !active.insert(key.clone()) {
+                    return None;
+                }
+                let replacement = properties.get(&key)?.clone();
+                work.push(Work::LeaveProperty(key));
+                work.push(Work::Value(replacement));
+            }
+            Work::Value(value) => {
+                let tokens = maven_value_tokens(&value)?;
+                for token in tokens.into_iter().rev() {
+                    match token {
+                        MavenValueToken::Text(text) => {
+                            work.push(Work::Text(text));
+                        }
+                        MavenValueToken::Property(key) => {
+                            work.push(Work::Property(key));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Some(result.trim().to_string())
+}
+
+enum MavenValueToken {
+    Text(String),
+    Property(String),
+}
+
+fn maven_value_tokens(value: &str) -> Option<Vec<MavenValueToken>> {
+    let mut tokens = Vec::new();
+    let mut remainder = value;
+    while let Some(start) = remainder.find("${") {
+        let text = &remainder[..start];
+        if text.contains('}') {
+            return None;
+        }
+        if !text.is_empty() {
+            tokens.push(MavenValueToken::Text(text.to_string()));
+        }
+        let after_start = &remainder[start + 2..];
+        let end = after_start.find('}')?;
+        let key = after_start[..end].trim();
+        if key.is_empty() {
+            return None;
+        }
+        tokens.push(MavenValueToken::Property(key.to_string()));
+        remainder = &after_start[end + 1..];
+    }
+    if remainder.contains("${") || remainder.contains('}') {
+        return None;
+    }
+    if !remainder.is_empty() {
+        tokens.push(MavenValueToken::Text(remainder.to_string()));
+    }
+    Some(tokens)
 }
 
 fn read_bounded_source(project: &dyn Project, file: &ProjectFile) -> Option<String> {
-    let source = project.read_source(file).ok()?;
-    (source.len() <= MAX_BUILD_METADATA_BYTES).then_some(source)
+    project
+        .read_source_limited(file, MAX_BUILD_METADATA_BYTES)
+        .ok()
+        .flatten()
 }
 
 fn is_maven_pom(file: &ProjectFile) -> bool {
@@ -712,13 +756,24 @@ fn parse_xml(source: &str) -> Option<XmlNode> {
     let mut stack = Vec::<XmlNode>::new();
     let mut root = None;
     let mut buffer = Vec::new();
+    let mut nodes = 0usize;
     loop {
         match reader.read_event_into(&mut buffer).ok()? {
-            Event::Start(start) => stack.push(XmlNode {
-                name: local_xml_name(start.name().as_ref())?,
-                ..XmlNode::default()
-            }),
+            Event::Start(start) => {
+                nodes = nodes.checked_add(1)?;
+                if nodes > MAX_MAVEN_XML_NODES || stack.len() >= MAX_MAVEN_XML_DEPTH {
+                    return None;
+                }
+                stack.push(XmlNode {
+                    name: local_xml_name(start.name().as_ref())?,
+                    ..XmlNode::default()
+                });
+            }
             Event::Empty(empty) => {
+                nodes = nodes.checked_add(1)?;
+                if nodes > MAX_MAVEN_XML_NODES {
+                    return None;
+                }
                 let node = XmlNode {
                     name: local_xml_name(empty.name().as_ref())?,
                     ..XmlNode::default()
@@ -823,6 +878,60 @@ mod tests {
             Some("release-1.2.3".to_string()),
             expand_maven_value("release-${version}", &properties)
         );
+        assert_eq!(
+            Some("1.2.3-1.2.3".to_string()),
+            expand_maven_value("${version}-${version}", &properties)
+        );
+    }
+
+    #[test]
+    fn java_dependency_discovery_bounds_maven_property_expansion() {
+        let mut chain = HashMap::default();
+        for index in 0..=MAX_MAVEN_PROPERTY_EXPANSION_WORK {
+            chain.insert(format!("p{index}"), format!("${{p{}}}", index + 1));
+        }
+        chain.insert(
+            format!("p{}", MAX_MAVEN_PROPERTY_EXPANSION_WORK + 1),
+            "resolved".to_string(),
+        );
+        assert_eq!(None, expand_maven_value("${p0}", &chain));
+
+        let mut branching = HashMap::default();
+        for index in 0..20 {
+            branching.insert(
+                format!("p{index}"),
+                format!("${{p{}}}${{p{}}}", index + 1, index + 1),
+            );
+        }
+        branching.insert("p20".to_string(), "x".to_string());
+        assert_eq!(None, expand_maven_value("${p0}", &branching));
+    }
+
+    #[test]
+    fn java_dependency_discovery_bounds_maven_xml_shape() {
+        let source = format!(
+            "{}{}",
+            "<node>".repeat(MAX_MAVEN_XML_DEPTH + 1),
+            "</node>".repeat(MAX_MAVEN_XML_DEPTH + 1)
+        );
+        assert!(parse_xml(&source).is_none());
+    }
+
+    #[test]
+    fn java_dependency_discovery_skips_system_scope_dependencies() {
+        let project = project(&[(
+            "pom.xml",
+            "<project><dependencies><dependency><groupId>org.example</groupId><artifactId>local</artifactId><version>1</version><scope>system</scope><systemPath>/outside/workspace.jar</systemPath></dependency></dependencies></project>",
+        )]);
+        let discovered = discover_metadata(&project);
+        assert!(discovered.coordinates.is_empty());
+        assert!(discovered.artifact_paths.is_empty());
+    }
+
+    #[test]
+    fn java_dependency_discovery_appends_maven_reactor_reports() {
+        let args = maven_dependency_list_args(Path::new("/tmp/maven-dependencies.txt"));
+        assert!(args.iter().any(|arg| arg == "-DappendOutput=true"));
     }
 
     #[test]

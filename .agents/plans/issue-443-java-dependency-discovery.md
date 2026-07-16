@@ -18,6 +18,7 @@ The observable proof is a temporary Java project containing only an import and a
 - [x] (2026-07-16 15:32Z) Extracted the formatter lifecycle into a shared bounded process runner and added trusted offline Maven/Gradle execution with top-level build-root selection, bounded reports, cross-platform parsers, and injected failure/partial-result tests. Formatter execution and shared descendant-cleanup tests pass.
 - [x] (2026-07-16 15:50Z) Added build-input invalidation for Java snapshots, full-refresh/project-replacement invalidation, Java-only index reuse, and non-Java manifest routing in `MultiAnalyzer`. Generated-JAR rediscovery tests pass for direct and Java-plus-Python multi-analyzer snapshots.
 - [x] (2026-07-16 16:55Z) Completed generated-JAR, parser, injected executor, process-lifecycle, invalidation, and multi-analyzer coverage. Focused discovery and external-resolution tests, the pinned full `nlp,python` suite (including doc tests), formatting, strict all-target/all-feature Clippy, and whitespace validation pass.
+- [x] (2026-07-16 17:20Z) Addressed guided-review hardening findings: metadata reads are bounded before allocation, Maven XML/property work is bounded and iterative, reactor reports append, system-scoped metadata is skipped, and Gradle cache artifacts must use the exact binary/source filename.
 
 ## Surprises & Discoveries
 
@@ -39,6 +40,8 @@ The observable proof is a temporary Java project containing only an import and a
   Evidence: Mixed toolchains produced `E0514` even though both report the same Rust commit. Prepending `/Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin` to `PATH` makes both the full suite (including doc tests) and Clippy use the same toolchain.
 - Observation: The managed isolated-target helper can race Cargo's parallel all-target Clippy subprocesses on this host.
   Evidence: A parallel run removed its target while descendant target checks were still writing dep-info. Re-running the same command with `CARGO_BUILD_JOBS=1` preserved the helper's cleanup contract and passed after 12m19s.
+- Observation: Dependency metadata is workspace-controlled input and must have independent resource bounds even though it is not executed.
+  Evidence: Guided review identified that reading an arbitrary POM before its size check, recursive XML construction, and recursive property substitution could allocate or recurse without a meaningful bound.
 
 ## Decision Log
 
@@ -63,9 +66,9 @@ The observable proof is a temporary Java project containing only an import and a
 
 ## Outcomes & Retrospective
 
-Safe metadata now provides automatic exact dependency awareness from Maven POMs and Gradle lockfiles, while trusted `OfflineBuildTools` mode adds resolved artifacts from installed/configured Maven and Gradle executables. Both paths keep declarations in `JavaExternalDeclarationIndex`; external types remain outside `CodeUnit`, `ProjectFile`, navigation, symbol search, persistence, and usage graphs. Java and multi-language snapshots rediscover lazily after build-input changes while reusing the index for ordinary Java edits.
+Safe metadata now provides automatic exact dependency awareness from Maven POMs and Gradle lockfiles, while trusted `OfflineBuildTools` mode adds resolved artifacts from installed/configured Maven and Gradle executables. Metadata reading, Maven XML construction, and Maven property expansion are bounded; direct system-path dependencies remain explicit-only. Both paths keep declarations in `JavaExternalDeclarationIndex`; external types remain outside `CodeUnit`, `ProjectFile`, navigation, symbol search, persistence, and usage graphs. Java and multi-language snapshots rediscover lazily after build-input changes while reusing the index for ordinary Java edits.
 
-Validation passed: `cargo test java_dependency_discovery --lib` (13 tests), `cargo test --test java_imports_and_hierarchy java_external`, formatter/process lifecycle tests, the full `cargo test --features nlp,python` suite (903 library tests plus integration and doc tests), `cargo fmt --all -- --check`, `git diff --check`, and `scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings` (12m19s). The last two full-suite/lint commands used the pinned Rustup toolchain noted above; the full suite also used the standard macOS PyO3 dynamic-lookup link flags and disabled semantic-model startup.
+Validation passed: `cargo test java_dependency_discovery --lib` (18 tests), `cargo test --test java_imports_and_hierarchy java_external`, formatter/process lifecycle tests, the full `cargo test --features nlp,python` suite (913 library tests plus integration and doc tests), `cargo fmt --all -- --check`, `git diff --check`, and `scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings` (7m59s). The last two full-suite/lint commands used the pinned Rustup toolchain noted above; the full suite also used the standard macOS PyO3 dynamic-lookup link flags and disabled semantic-model startup.
 
 ## Context and Orientation
 
@@ -73,7 +76,7 @@ Validation passed: `cargo test java_dependency_discovery --lib` (13 tests), `car
 
 A build root is a directory from which Maven or Gradle evaluates one project graph. A Maven reactor root is a `pom.xml` not listed as a module of another discovered POM. A Gradle root is a directory containing `settings.gradle` or `settings.gradle.kts`; a standalone `build.gradle` or `build.gradle.kts` is a root only when it has no settings file ancestor inside the active workspace.
 
-Safe metadata discovery reads all ignore-aware project files. For Maven it parses direct dependencies under the project's top-level `dependencies` element, never entries that appear only under `dependencyManagement` or profiles. It accepts dependencies with absent or `jar` type and no classifier, in compile, runtime, provided, or test scope. It expands exact whole-value and embedded `${property}` references from the same POM's `properties` plus `project.groupId`, `project.artifactId`, and `project.version`, rejecting missing or cyclic properties and dependencies without an exact group, artifact, and version. A system-scoped dependency is accepted only as an explicit artifact when its resolved `systemPath` names an existing file.
+Safe metadata discovery reads all ignore-aware project files subject to a size limit. For Maven it parses direct dependencies under the project's top-level `dependencies` element, never entries that appear only under `dependencyManagement` or profiles. It accepts dependencies with absent or `jar` type and no classifier, in compile, runtime, provided, or test scope. It expands exact whole-value and embedded `${property}` references from the same POM's `properties` plus `project.groupId`, `project.artifactId`, and `project.version`, rejecting missing, cyclic, or over-budget expansions and dependencies without an exact group, artifact, and version. System-scoped dependencies are skipped by automatic metadata discovery.
 
 For Gradle, safe metadata discovery reads modern `gradle.lockfile` files and legacy files under `gradle/dependency-locks`. Each non-comment line before `=` must be exactly `group:artifact:version`; malformed and `empty=` lines are ignored. It does not infer which source set owns a coordinate because the existing Java external index is global.
 

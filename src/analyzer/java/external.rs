@@ -519,8 +519,18 @@ fn resolve_gradle_coordinate(
     jars.sort();
     jars.dedup();
 
-    let sources = jars.iter().find(|path| is_source_jar(path)).cloned();
     let expected_binary = format!("{}-{}.jar", coordinate.artifact_id, coordinate.version);
+    let expected_sources = format!(
+        "{}-{}-sources.jar",
+        coordinate.artifact_id, coordinate.version
+    );
+    let sources = jars
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name == expected_sources.as_str())
+        })
+        .cloned();
     let exact_binaries: Vec<_> = jars
         .iter()
         .filter(|path| {
@@ -529,14 +539,7 @@ fn resolve_gradle_coordinate(
         })
         .cloned()
         .collect();
-    let binaries = if exact_binaries.is_empty() {
-        jars.iter()
-            .filter(|path| !is_source_jar(path) && !is_javadoc_jar(path))
-            .cloned()
-            .collect()
-    } else {
-        exact_binaries
-    };
+    let binaries = exact_binaries;
     if binaries.is_empty() {
         return sources
             .into_iter()
@@ -553,12 +556,6 @@ fn resolve_gradle_coordinate(
             source_artifact_path: sources.clone(),
         })
         .collect()
-}
-
-fn is_javadoc_jar(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with("-javadoc.jar"))
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -1082,6 +1079,33 @@ mod tests {
             external.source(),
             JavaExternalDeclarationSource::SourceJar { .. }
         ));
+    }
+
+    #[test]
+    fn java_dependency_discovery_skips_classifier_only_gradle_cache_entries() {
+        let Some(fixture) = ExternalJarFixture::new(false) else {
+            return;
+        };
+        let gradle_cache = fixture.root.join("gradle-cache");
+        let classifier_dir = gradle_cache.join("com.example/external-lib/1.2.3/classifier-hash");
+        fs::create_dir_all(&classifier_dir).unwrap();
+        fs::copy(
+            fixture.binary_jar_path(),
+            classifier_dir.join("external-lib-1.2.3-tests.jar"),
+        )
+        .unwrap();
+
+        let config = JavaExternalDependencies {
+            coordinates: vec![JavaMavenCoordinate::new(
+                "com.example",
+                "external-lib",
+                "1.2.3",
+            )],
+            gradle_cache_roots: vec![gradle_cache],
+            ..JavaExternalDependencies::default()
+        };
+        let index = JavaExternalDeclarationIndex::build(&config, fixture.project_root());
+        assert!(index.is_empty());
     }
 
     #[test]
