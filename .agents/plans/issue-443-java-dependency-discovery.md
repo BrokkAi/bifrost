@@ -17,7 +17,7 @@ The observable proof is a temporary Java project containing only an import and a
 - [x] (2026-07-16 14:43Z) Added public discovery configuration, structural Maven POM parsing, modern and legacy Gradle lock parsing, and exact Maven/Gradle cache lookup. `cargo test java_dependency_discovery --lib` passes all seven focused parser and generated-JAR tests.
 - [x] (2026-07-16 15:32Z) Extracted the formatter lifecycle into a shared bounded process runner and added trusted offline Maven/Gradle execution with top-level build-root selection, bounded reports, cross-platform parsers, and injected failure/partial-result tests. Formatter execution and shared descendant-cleanup tests pass.
 - [x] (2026-07-16 15:50Z) Added build-input invalidation for Java snapshots, full-refresh/project-replacement invalidation, Java-only index reuse, and non-Java manifest routing in `MultiAnalyzer`. Generated-JAR rediscovery tests pass for direct and Java-plus-Python multi-analyzer snapshots.
-- [ ] Add end-to-end and failure-mode coverage, run all required validation, and complete the retrospective.
+- [x] (2026-07-16 16:55Z) Completed generated-JAR, parser, injected executor, process-lifecycle, invalidation, and multi-analyzer coverage. Focused discovery and external-resolution tests, the pinned full `nlp,python` suite (including doc tests), formatting, strict all-target/all-feature Clippy, and whitespace validation pass.
 
 ## Surprises & Discoveries
 
@@ -35,6 +35,10 @@ The observable proof is a temporary Java project containing only an import and a
   Evidence: The shared runner records overflow, discards subsequent bytes, and reports the limit only after EOF; formatter large-stdin/output concurrency and timeout tests still pass after extraction.
 - Observation: Multi-analyzer routing must recognize dependency inputs before Java can decide whether to invalidate its lazy index.
   Evidence: Without the Java-specific `needs_config_update_for` case, `pom.xml` has `Language::None` and would leave the Java delegate unchanged; the Java-plus-Python regression now changes a POM and resolves the newly available dependency type after `MultiAnalyzer::update`.
+- Observation: This host has two Rust 1.96.0 installations with different LLVM builds; Rustup builds dependencies while Homebrew's `cargo-clippy`/`rustdoc` can otherwise compile the crate itself.
+  Evidence: Mixed toolchains produced `E0514` even though both report the same Rust commit. Prepending `/Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin` to `PATH` makes both the full suite (including doc tests) and Clippy use the same toolchain.
+- Observation: The managed isolated-target helper can race Cargo's parallel all-target Clippy subprocesses on this host.
+  Evidence: A parallel run removed its target while descendant target checks were still writing dep-info. Re-running the same command with `CARGO_BUILD_JOBS=1` preserved the helper's cleanup contract and passed after 12m19s.
 
 ## Decision Log
 
@@ -59,7 +63,9 @@ The observable proof is a temporary Java project containing only an import and a
 
 ## Outcomes & Retrospective
 
-Safe metadata provides automatic exact dependency awareness from Maven POMs and Gradle lockfiles, while trusted `OfflineBuildTools` mode adds resolved artifacts from installed/configured Maven and Gradle executables. Both paths keep declarations in `JavaExternalDeclarationIndex`, and Java plus multi-language snapshots now rediscover lazily after build-input changes while reusing the index for ordinary Java edits. Full-suite and lint validation remain.
+Safe metadata now provides automatic exact dependency awareness from Maven POMs and Gradle lockfiles, while trusted `OfflineBuildTools` mode adds resolved artifacts from installed/configured Maven and Gradle executables. Both paths keep declarations in `JavaExternalDeclarationIndex`; external types remain outside `CodeUnit`, `ProjectFile`, navigation, symbol search, persistence, and usage graphs. Java and multi-language snapshots rediscover lazily after build-input changes while reusing the index for ordinary Java edits.
+
+Validation passed: `cargo test java_dependency_discovery --lib` (13 tests), `cargo test --test java_imports_and_hierarchy java_external`, formatter/process lifecycle tests, the full `cargo test --features nlp,python` suite (903 library tests plus integration and doc tests), `cargo fmt --all -- --check`, `git diff --check`, and `scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings` (12m19s). The last two full-suite/lint commands used the pinned Rustup toolchain noted above; the full suite also used the standard macOS PyO3 dynamic-lookup link flags and disabled semantic-model startup.
 
 ## Context and Orientation
 
