@@ -8,6 +8,7 @@ use brokk_bifrost::{
     WorkspaceAnalyzer,
 };
 use common::InlineTestProject;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 fn cpp_analyzer_with_files(
@@ -5743,4 +5744,1599 @@ void MissingContainer::call() {
         "authoritative query must scan only the partial-workspace consumer"
     );
     assert_success_counts(query.result, &target, 0, 1);
+}
+
+#[test]
+fn authoritative_cpp_usage_routes_default_argument_redeclarations_in_either_target_order() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "include/api.h",
+            r#"#pragma once
+namespace demo {
+void route(int required, int optional = 0);
+}
+"#,
+        ),
+        (
+            "src/api.cc",
+            r#"#include "../include/api.h"
+namespace demo {
+void route(int required, int optional) {}
+}
+"#,
+        ),
+        (
+            "app/consumer.cc",
+            r#"#include "../include/api.h"
+void consume() {
+    demo::route(1);
+}
+"#,
+        ),
+    ]);
+
+    let physical_route = |path: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Function
+                && unit.fq_name() == "demo.route"
+                && slash_path(unit.source()) == path
+        })
+    };
+    let implementation = physical_route("src/api.cc");
+    let declaration = physical_route("include/api.h");
+    assert_ne!(implementation.source(), declaration.source());
+    assert_eq!(implementation.fq_name(), declaration.fq_name());
+
+    let consumer = project.file("app/consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let call = source.find("demo::route(1)").expect("route call");
+    let start = call;
+    let end = start + "demo::route".len();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    for targets in [
+        [implementation.clone(), declaration.clone()],
+        [declaration.clone(), implementation.clone()],
+    ] {
+        let query = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(&analyzer, &targets, Some(&provider), 1, 1000);
+        assert_eq!(
+            query.candidate_files,
+            std::iter::once(consumer.clone()).collect(),
+            "authoritative query must scan only the explicit consumer"
+        );
+        let FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } = query.result
+        else {
+            panic!("expected authoritative route success for {targets:#?}");
+        };
+        let hits = hits_by_overload
+            .get(&targets[0])
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(hits.len(), 1, "target-order route hits: {hits:#?}");
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == consumer && hit.start_offset == start && hit.end_offset == end
+            }),
+            "missing exact route terminal {start}..{end}: {hits:#?}"
+        );
+        assert_eq!(
+            unproven_total_by_overload
+                .get(&targets[0])
+                .copied()
+                .unwrap_or_default(),
+            0,
+            "default-argument call should be proven in either physical target order"
+        );
+    }
+
+    for targets in [
+        [implementation.clone(), declaration.clone()],
+        [declaration.clone(), implementation.clone()],
+    ] {
+        let query = UsageFinder::new().query(&analyzer, &targets, 100, 1000);
+        assert!(
+            query.candidate_files.contains(&consumer),
+            "every target must contribute default routing candidates: {targets:#?}, candidates={:#?}",
+            query.candidate_files
+        );
+        let FuzzyResult::Success {
+            hits_by_overload, ..
+        } = query.result
+        else {
+            panic!("expected routed route success for {targets:#?}");
+        };
+        let hits = hits_by_overload
+            .get(&targets[0])
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            hits.len(),
+            1,
+            "queried physical target definitions must not leak into grouped results: {targets:#?}, hits={hits:#?}"
+        );
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == consumer && hit.start_offset == start && hit.end_offset == end
+            }),
+            "later-target routing must reach the exact consumer call: {targets:#?}, hits={hits:#?}"
+        );
+        assert!(
+            hits.iter().all(|hit| hit.file == consumer),
+            "only the consumer call should remain after exact target-group suppression: {targets:#?}, hits={hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn authoritative_cpp_usage_routes_overload_group_in_either_target_order() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "api.h",
+            r#"#pragma once
+namespace demo {
+void choose(int value);
+void choose(const char* value);
+}
+"#,
+        ),
+        (
+            "api.cc",
+            r#"#include "api.h"
+namespace demo {
+void choose(int value) {}
+void choose(const char* value) {}
+}
+"#,
+        ),
+        (
+            "consumer.cc",
+            r#"#include "api.h"
+void consume(char selected) {
+    demo::choose(&selected);
+}
+"#,
+        ),
+    ]);
+
+    let declared_overload = |matches_signature: fn(&str) -> bool| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Function
+                && unit.fq_name() == "demo.choose"
+                && slash_path(unit.source()) == "api.h"
+                && unit.signature().is_some_and(matches_signature)
+        })
+    };
+    let integer = declared_overload(|signature| signature == "(int)");
+    let character_pointer = declared_overload(|signature| signature.contains("char"));
+
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let call = source.find("demo::choose(&selected)").expect("choose call");
+    let start = call;
+    let end = start + "demo::choose".len();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    for targets in [
+        [integer.clone(), character_pointer.clone()],
+        [character_pointer.clone(), integer.clone()],
+    ] {
+        let query = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(&analyzer, &targets, Some(&provider), 1, 1000);
+        assert_eq!(
+            query.candidate_files,
+            std::iter::once(consumer.clone()).collect(),
+            "authoritative query must scan only the explicit consumer"
+        );
+        let FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } = query.result
+        else {
+            panic!("expected authoritative overload-group success for {targets:#?}");
+        };
+        let hits = hits_by_overload
+            .get(&targets[0])
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(hits.len(), 1, "target-order overload hits: {hits:#?}");
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == consumer && hit.start_offset == start && hit.end_offset == end
+            }),
+            "missing exact choose terminal {start}..{end}: {hits:#?}"
+        );
+        assert_eq!(
+            unproven_total_by_overload
+                .get(&targets[0])
+                .copied()
+                .unwrap_or_default(),
+            0,
+            "the selected overload should be proven in either target order"
+        );
+    }
+}
+
+#[test]
+fn authoritative_cpp_usage_resolves_constructor_owner_from_malformed_export_definition() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        ("widget_fwd.h", "namespace views { class Widget; }\n"),
+        (
+            "widget.h",
+            r#"#define VIEWS_EXPORT
+namespace views {
+class VIEWS_EXPORT Widget : public internal::NativeWidgetDelegate,
+                            public ui::EventSource,
+                            public FocusTraversable,
+                            public ui::NativeThemeObserver,
+                            public ui::ColorProviderSource,
+                            public ui::PropertyHandler,
+                            public ui::AXModeObserver,
+                            public ui::metadata::MetaDataProvider {
+    ADVANCED_MEMORY_SAFETY_CHECKS();
+
+ public:
+    Widget();
+};
+}
+"#,
+        ),
+        (
+            "widget.cc",
+            r#"#include "widget_fwd.h"
+#include "widget.h"
+views::Widget::Widget() = default;
+"#,
+        ),
+        (
+            "consumer.cc",
+            r#"#include "widget.h"
+void consume() {
+    auto* widget = new views::Widget;
+}
+"#,
+        ),
+    ]);
+
+    let widget_header = project.file("widget.h");
+    let header_source = widget_header.read_to_string().expect("widget header");
+    let classes: Vec<_> = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.fq_name() == "views.Widget"
+                && unit.source() == &widget_header
+                && !unit.is_synthetic()
+        })
+        .collect();
+    assert_eq!(classes.len(), 1, "Widget class identities: {classes:#?}");
+    let ranges = analyzer.ranges(&classes[0]);
+    assert_eq!(ranges.len(), 1, "Widget class ranges: {ranges:#?}");
+    let expected_start = header_source.find("class VIEWS_EXPORT Widget").unwrap();
+    let prefix = "ADVANCED_MEMORY_SAFETY_CHECKS();";
+    let expected_end =
+        header_source[expected_start..].find(prefix).unwrap() + expected_start + prefix.len();
+    assert_eq!(ranges[0].start_byte, expected_start);
+    assert_eq!(ranges[0].end_byte, expected_end);
+
+    let constructor = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "views.Widget.Widget"
+            && slash_path(unit.source()) == "widget.cc"
+            && !unit.is_synthetic()
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let expression = source.find("new views::Widget").expect("new expression");
+    let start = expression + "new ".len();
+    let end = start + "views::Widget".len();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&constructor),
+            Some(&provider),
+            1,
+            1000,
+        );
+
+    assert_eq!(
+        query.candidate_files,
+        std::iter::once(consumer.clone()).collect(),
+        "authoritative query must scan only the explicit consumer"
+    );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = query.result
+    else {
+        panic!("expected authoritative Widget constructor success");
+    };
+    let hits = hits_by_overload
+        .get(&constructor)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(hits.len(), 1, "Widget constructor hits: {hits:#?}");
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == consumer && hit.start_offset == start && hit.end_offset == end
+        }),
+        "missing exact new-expression type range {start}..{end}: {hits:#?}"
+    );
+    assert_eq!(
+        unproven_total_by_overload
+            .get(&constructor)
+            .copied()
+            .unwrap_or_default(),
+        0,
+        "the recovered full class definition plus a forward declaration should resolve precisely"
+    );
+}
+
+#[test]
+fn authoritative_cpp_usage_resolves_constructor_owner_from_unique_transitive_definition() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        ("widget_fwd.h", "namespace demo { class Widget; }\n"),
+        (
+            "widget.h",
+            r#"namespace demo {
+class Widget {
+public:
+    Widget();
+};
+}
+"#,
+        ),
+        ("bridge.h", "#include \"widget.h\"\n"),
+        (
+            "widget.cc",
+            r#"#include "widget_fwd.h"
+#include "bridge.h"
+namespace demo {
+Widget::Widget() = default;
+}
+"#,
+        ),
+        (
+            "consumer.cc",
+            r#"#include "widget.h"
+void consume() {
+    auto* widget = new demo::Widget;
+}
+"#,
+        ),
+    ]);
+
+    let constructor = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Widget.Widget"
+            && slash_path(unit.source()) == "widget.cc"
+            && !unit.is_synthetic()
+    });
+    let consumer = project.file("consumer.cc");
+    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer).collect()));
+    let result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&constructor),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+
+    assert_success_counts(result, &constructor, 1, 0);
+}
+
+#[test]
+fn authoritative_cpp_usage_keeps_constructor_owner_unresolved_with_only_direct_forwards() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        ("one/widget_fwd.h", "namespace demo { class Widget; }\n"),
+        ("two/widget_fwd.h", "namespace demo { class Widget; }\n"),
+        (
+            "widget.h",
+            r#"namespace demo {
+class Widget {
+public:
+    Widget();
+};
+}
+"#,
+        ),
+        (
+            "widget.cc",
+            r#"#include "one/widget_fwd.h"
+#include "two/widget_fwd.h"
+namespace demo {
+Widget::Widget() = default;
+}
+"#,
+        ),
+        (
+            "consumer.cc",
+            r#"#include "widget.h"
+void consume() {
+    auto* widget = new demo::Widget;
+}
+"#,
+        ),
+    ]);
+
+    let constructor = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Widget.Widget"
+            && slash_path(unit.source()) == "widget.cc"
+            && !unit.is_synthetic()
+    });
+    let consumer = project.file("consumer.cc");
+    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer).collect()));
+    let result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&constructor),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+
+    assert_success_counts(result, &constructor, 0, 0);
+}
+
+#[test]
+fn authoritative_cpp_usage_keeps_constructor_owner_ambiguous_with_two_transitive_definitions() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        ("widget_fwd.h", "namespace demo { class Widget; }\n"),
+        (
+            "one/widget.h",
+            r#"namespace demo {
+class Widget {
+public:
+    Widget();
+};
+}
+"#,
+        ),
+        (
+            "two/widget.h",
+            r#"namespace demo {
+class Widget {
+public:
+    Widget();
+};
+}
+"#,
+        ),
+        (
+            "bridge.h",
+            r#"#include "one/widget.h"
+#include "two/widget.h"
+"#,
+        ),
+        (
+            "widget.cc",
+            r#"#include "widget_fwd.h"
+#include "bridge.h"
+namespace demo {
+Widget::Widget() = default;
+}
+"#,
+        ),
+        (
+            "consumer.cc",
+            r#"#include "one/widget.h"
+void consume() {
+    auto* widget = new demo::Widget;
+}
+"#,
+        ),
+    ]);
+
+    let constructor = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Widget.Widget"
+            && slash_path(unit.source()) == "widget.cc"
+            && !unit.is_synthetic()
+    });
+    let consumer = project.file("consumer.cc");
+    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer).collect()));
+    let result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&constructor),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+
+    assert_success_counts(result, &constructor, 0, 0);
+}
+
+#[test]
+fn authoritative_cpp_usage_resolves_qualified_method_value_to_exact_owner() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "worker.h",
+            r#"#pragma once
+namespace demo {
+class Worker {
+public:
+    void OnDone();
+    void Arm();
+};
+class Other {
+public:
+    void OnDone();
+};
+}
+"#,
+        )
+        .file(
+            "worker.cc",
+            r#"#include "worker.h"
+namespace demo {
+void Worker::OnDone() {}
+void Other::OnDone() {}
+void Worker::Arm() {
+    auto callback = &Worker::OnDone;
+    auto wrong_owner = &Other::OnDone;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Worker.OnDone"
+            && slash_path(unit.source()) == "worker.cc"
+            && !unit.is_synthetic()
+    });
+    let worker = project.file("worker.cc");
+    let source = worker.read_to_string().expect("worker source");
+    let positive = source.find("&Worker::OnDone").expect("Worker method value");
+    let positive_start = positive + "&Worker::".len();
+    let positive_end = positive_start + "OnDone".len();
+    let wrong_owner = source.find("&Other::OnDone").expect("Other method value");
+    let wrong_owner_start = wrong_owner + "&Other::".len();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(worker.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+
+    assert_eq!(
+        query.candidate_files,
+        std::iter::once(worker.clone()).collect(),
+        "authoritative scan must remain limited to worker.cc"
+    );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = query.result
+    else {
+        panic!("expected authoritative C++ method-value success");
+    };
+    let hits = hits_by_overload.get(&target).cloned().unwrap_or_default();
+    assert_eq!(hits.len(), 1, "Worker::OnDone hits: {hits:#?}");
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == worker
+                && hit.start_offset == positive_start
+                && hit.end_offset == positive_end
+        }),
+        "missing exact OnDone member-token hit {positive_start}..{positive_end}: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| {
+            !(hit.start_offset <= wrong_owner_start
+                && wrong_owner_start + "OnDone".len() <= hit.end_offset)
+        }),
+        "Other::OnDone must not cross over to Worker::OnDone: {hits:#?}"
+    );
+    assert_eq!(
+        unproven_total_by_overload
+            .get(&target)
+            .copied()
+            .unwrap_or_default(),
+        0,
+        "owner-qualified method values should be proven, not fuzzy"
+    );
+}
+
+#[test]
+fn authoritative_cpp_usage_keeps_overloaded_qualified_method_value_unproven() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "worker.h",
+            r#"#pragma once
+namespace demo {
+class Worker {
+public:
+    void OnDone();
+    void OnDone(int value);
+    void Arm();
+};
+}
+"#,
+        )
+        .file(
+            "worker.cc",
+            r#"#include "worker.h"
+namespace demo {
+void Worker::OnDone() {}
+void Worker::OnDone(int value) {}
+void Worker::Arm() {
+    auto callback = &Worker::OnDone;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Worker.OnDone"
+            && unit.signature() == Some("()")
+            && slash_path(unit.source()) == "worker.cc"
+            && !unit.is_synthetic()
+    });
+    let worker = project.file("worker.cc");
+    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(worker).collect()));
+    let result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+
+    assert_success_counts(result, &target, 0, 1);
+}
+
+#[test]
+fn authoritative_cpp_method_usage_rejects_qualified_namespace_function_value() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "worker.h",
+            r#"#pragma once
+namespace demo {
+void OnDone();
+class Worker {
+public:
+    void OnDone();
+    void Arm();
+};
+}
+"#,
+        )
+        .file(
+            "worker.cc",
+            r#"#include "worker.h"
+namespace demo {
+void OnDone() {}
+void Worker::OnDone() {}
+void Worker::Arm() {
+    auto callback = &demo::OnDone;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Worker.OnDone"
+            && slash_path(unit.source()) == "worker.cc"
+            && !unit.is_synthetic()
+    });
+    let worker = project.file("worker.cc");
+    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(worker).collect()));
+    let result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+
+    assert_success_counts(result, &target, 0, 0);
+}
+
+#[test]
+fn authoritative_cpp_method_values_apply_lexical_type_and_namespace_shadowing() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "worker.h",
+            r#"#pragma once
+namespace Worker {
+void OnDone();
+}
+namespace outer {
+namespace inner {
+void helper();
+}
+class Worker {
+public:
+    void OnDone();
+    void helper();
+    void Arm();
+};
+}
+"#,
+        )
+        .file(
+            "worker.cc",
+            r#"#include "worker.h"
+namespace Worker {
+void OnDone() {}
+}
+namespace outer {
+namespace inner {
+void helper() {}
+}
+void Worker::OnDone() {}
+void Worker::helper() {}
+void Worker::Arm() {
+    auto method_value = &Worker::OnDone;
+    auto function_value = &inner::helper;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let source = project.file("worker.cc");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(source.clone()).collect()));
+    let method = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "outer.Worker.OnDone"
+            && slash_path(unit.source()) == "worker.cc"
+            && !unit.is_synthetic()
+    });
+    let method_result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&method),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+    assert_success_counts(method_result, &method, 1, 0);
+
+    let namesake_method = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "outer.Worker.helper"
+            && slash_path(unit.source()) == "worker.cc"
+            && !unit.is_synthetic()
+    });
+    let namespace_result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&namesake_method),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+    assert_success_counts(namespace_result, &namesake_method, 0, 0);
+}
+
+#[test]
+fn authoritative_cpp_usage_preserves_pointer_to_data_member_reference() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "worker.h",
+            r#"#pragma once
+namespace demo {
+class Worker {
+public:
+    int state;
+    void Arm();
+};
+}
+"#,
+        )
+        .file(
+            "worker.cc",
+            r#"#include "worker.h"
+namespace demo {
+void Worker::Arm() {
+    auto member = &Worker::state;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field
+            && unit.fq_name() == "demo.Worker.state"
+            && slash_path(unit.source()) == "worker.h"
+    });
+    let worker = project.file("worker.cc");
+    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(worker).collect()));
+    let result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+
+    assert_success_counts(result, &target, 1, 0);
+}
+
+#[test]
+fn authoritative_cpp_usage_resolves_leading_global_qualified_method_value() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "worker.h",
+            r#"#pragma once
+namespace demo {
+class Worker {
+public:
+    void OnDone();
+    void Arm();
+};
+}
+"#,
+        )
+        .file(
+            "worker.cc",
+            r#"#include "worker.h"
+namespace demo {
+void Worker::OnDone() {}
+void Worker::Arm() {
+    auto callback = &::demo::Worker::OnDone;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Worker.OnDone"
+            && slash_path(unit.source()) == "worker.cc"
+            && !unit.is_synthetic()
+    });
+    let worker = project.file("worker.cc");
+    let source = worker.read_to_string().expect("worker source");
+    let qualified = source
+        .find("&::demo::Worker::OnDone")
+        .expect("leading-global method value");
+    let start = qualified + "&::demo::Worker::".len();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(worker.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!("expected leading-global method-value success");
+    };
+    let hits = hits_by_overload.get(&target).cloned().unwrap_or_default();
+    assert_eq!(hits.len(), 1, "leading-global hits: {hits:#?}");
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == worker
+                && hit.start_offset == start
+                && hit.end_offset == start + "OnDone".len()
+        }),
+        "missing exact leading-global terminal hit: {hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_usage_covers_qualified_and_short_alias_redeclarations() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "bridge.h",
+            r#"#pragma once
+namespace demo {
+class ArcBluetoothBridge {
+public:
+    using AdapterStateCallback = void (*)(bool);
+    void OnPoweredOn(AdapterStateCallback callback, bool powered);
+    void Arm();
+};
+}
+"#,
+        )
+        .file(
+            "bridge.cc",
+            r#"#include "bridge.h"
+namespace demo {
+void ArcBluetoothBridge::OnPoweredOn(
+    ArcBluetoothBridge::AdapterStateCallback callback,
+    bool powered) {}
+void ArcBluetoothBridge::Arm() {
+    auto callback = &ArcBluetoothBridge::OnPoweredOn;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_all_declarations();
+    let mut targets = declarations
+        .iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Function
+                && unit.fq_name() == "demo.ArcBluetoothBridge.OnPoweredOn"
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    targets.sort_by_key(|unit| unit.is_synthetic());
+    assert_eq!(targets.len(), 2, "physical targets: {targets:#?}");
+    assert!(
+        targets.iter().any(|unit| {
+            unit.signature() == Some("(ArcBluetoothBridge::AdapterStateCallback, bool)")
+        }) && targets
+            .iter()
+            .any(|unit| unit.signature() == Some("(AdapterStateCallback, bool)")),
+        "fixture must preserve qualified-vs-short physical signatures: {targets:#?}"
+    );
+    let source = project.file("bridge.cc");
+    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(source).collect()));
+    let result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(&analyzer, &targets, Some(&provider), 1, 1000)
+        .result;
+
+    assert_success_counts(result, &targets[0], 1, 0);
+}
+
+#[test]
+fn authoritative_cpp_class_usage_keeps_owner_header_parameter_type() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "owner.h",
+            r#"namespace ns {
+class Owner {
+public:
+    Owner& operator=(const Owner&) = delete;
+};
+}
+"#,
+        ),
+        (
+            "consumer.cc",
+            r#"#include "owner.h"
+void consume(const ns::Owner* value);
+"#,
+        ),
+    ]);
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "ns.Owner" && !unit.is_synthetic()
+    });
+    let owner = project.file("owner.h");
+    let source = owner.read_to_string().expect("owner header");
+    let return_start = source
+        .find("Owner& operator")
+        .expect("operator return type");
+    let return_end = return_start + "Owner".len();
+    let parameter = source.find("const Owner&").expect("operator parameter");
+    let parameter_start = parameter + "const ".len();
+    let parameter_end = parameter_start + "Owner".len();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(owner.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    assert_eq!(
+        query.candidate_files,
+        std::iter::once(owner.clone()).collect(),
+        "authoritative query must scan only owner.h"
+    );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!("expected authoritative owner-header class usage success");
+    };
+    let hits = hits_by_overload.get(&target).cloned().unwrap_or_default();
+    assert_eq!(
+        hits.len(),
+        2,
+        "only the operator return and parameter types are Class usages: {hits:#?}"
+    );
+    assert_eq!(
+        hits.iter()
+            .map(|hit| {
+                assert_eq!(hit.file, owner);
+                (hit.start_offset, hit.end_offset)
+            })
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([(return_start, return_end), (parameter_start, parameter_end),]),
+        "exact Owner type_identifiers must survive while declaration names stay excluded"
+    );
+}
+
+#[test]
+fn authoritative_cpp_class_usage_keeps_consumer_qualified_parameter_type() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "owner.h",
+            r#"namespace ns {
+class Owner {
+public:
+    Owner& operator=(const Owner&) = delete;
+};
+}
+
+"#,
+        ),
+        (
+            "consumer.cc",
+            r#"#include "owner.h"
+void consume(const ns::Owner* value);
+"#,
+        ),
+    ]);
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "ns.Owner" && !unit.is_synthetic()
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let expected_start = source.find("ns::Owner").expect("qualified parameter type");
+    let expected_end = expected_start + "ns::Owner".len();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    assert_eq!(
+        query.candidate_files,
+        std::iter::once(consumer.clone()).collect(),
+        "authoritative query must scan only consumer.cc"
+    );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!("expected authoritative consumer class usage success");
+    };
+    let hits = hits_by_overload.get(&target).cloned().unwrap_or_default();
+    assert_eq!(
+        hits.len(),
+        1,
+        "only the qualified parameter type is a Class usage: {hits:#?}"
+    );
+    let hit = hits.iter().next().expect("one consumer type hit");
+    assert_eq!(hit.file, consumer);
+    assert_eq!(
+        (hit.start_offset, hit.end_offset),
+        (expected_start, expected_end),
+        "the exact ns::Owner type node must be returned, excluding value"
+    );
+}
+
+#[test]
+fn authoritative_cpp_class_usage_distinguishes_named_and_abstract_declarators() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        ("owner.h", "namespace ns { class Owner {}; }\n"),
+        (
+            "consumer.cc",
+            r#"#include "owner.h"
+void named_pointer(const ns::Owner* Owner);
+void unnamed_pointer(const ns::Owner*);
+void named_reference(const ns::Owner& Owner);
+void unnamed_reference(const ns::Owner&);
+void named_array(const ns::Owner Owner[2]);
+void unnamed_array(const ns::Owner [2]);
+void named_function(void (*Owner)(ns::Owner));
+void unnamed_function(void (*)(ns::Owner));
+typedef ns::Owner Owner;
+"#,
+        ),
+    ]);
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "ns.Owner" && !unit.is_synthetic()
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let expected = source
+        .match_indices("ns::Owner")
+        .map(|(start, text)| (start, start + text.len()))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expected.len(), 9, "fixture type occurrences");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!("expected named/abstract declarator class usage success");
+    };
+    let hits = hits_by_overload.get(&target).cloned().unwrap_or_default();
+    assert_eq!(
+        hits.iter()
+            .map(|hit| {
+                assert_eq!(hit.file, consumer);
+                (hit.start_offset, hit.end_offset)
+            })
+            .collect::<BTreeSet<_>>(),
+        expected,
+        "all named/unnamed pointer, reference, array, function, and alias RHS types must hit exactly; actual Owner declarator names must not"
+    );
+}
+
+#[test]
+fn authoritative_cpp_class_usage_resolves_bare_type_in_lexical_namespace() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"#pragma once
+namespace alpha {
+class Value {};
+}
+
+namespace beta {
+class Value {};
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "types.h"
+namespace alpha {
+void consume() {
+    Value local;
+    ::alpha::Value explicit_alpha;
+    beta::Value explicit_beta;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "alpha.Value"
+            && !unit.is_synthetic()
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let bare_start = source.find("Value local").expect("bare lexical type");
+    let bare_end = bare_start + "Value".len();
+    let line_start = source[..bare_start]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let line = source[..bare_start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let column = source[line_start..bare_start].chars().count() + 1;
+    let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+        &analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "consumer.cc".to_string(),
+                line: Some(line),
+                column: Some(column),
+            }],
+        },
+    );
+    let forward_result = &forward.results[0];
+    assert_eq!("resolved", forward_result.status, "{forward_result:#?}");
+    assert!(
+        forward_result
+            .definitions
+            .iter()
+            .any(|definition| definition.fqn.as_deref() == Some("alpha.Value")),
+        "bare Value must forward-resolve through namespace alpha: {forward_result:#?}"
+    );
+    assert!(
+        !forward_result
+            .definitions
+            .iter()
+            .any(|definition| definition.fqn.as_deref() == Some("beta.Value")),
+        "bare Value must not forward-resolve to beta.Value: {forward_result:#?}"
+    );
+
+    let explicit_start = source.find("::alpha::Value").expect("explicit alpha type");
+    let explicit_end = explicit_start + "::alpha::Value".len();
+    let expected = BTreeSet::from([(bare_start, bare_end), (explicit_start, explicit_end)]);
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    assert_eq!(
+        query.candidate_files,
+        std::iter::once(consumer.clone()).collect(),
+        "authoritative query must scan only consumer.cc"
+    );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!("expected authoritative lexical-type usage success");
+    };
+    let hits = hits_by_overload.get(&target).cloned().unwrap_or_default();
+    let actual = hits
+        .iter()
+        .map(|hit| {
+            assert_eq!(hit.file, consumer);
+            (hit.start_offset, hit.end_offset)
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        actual, expected,
+        "bare and explicit alpha types must hit exactly; beta.Value and declarator names must not: {hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_type_resolution_preserves_global_nested_template_and_alias_tiers() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"#pragma once
+class Value {};
+namespace alpha {
+class Value {};
+class Canonical {};
+using Alias = Canonical;
+template <typename T> class Box {};
+class Outer { public: class Inner {}; };
+}
+namespace beta {
+class Value {};
+class Canonical {};
+using Alias = Canonical;
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "types.h"
+namespace alpha {
+void consume() {
+    Value lexical_value;
+    ::Value global_value;
+    ::alpha::Value explicit_alpha;
+    beta::Value explicit_beta;
+    Alias lexical_alias;
+    beta::Alias explicit_beta_alias;
+    Outer::Inner nested_value;
+    Box<Value> templated_value;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let target = |fq_name: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Class && unit.fq_name() == fq_name && !unit.is_synthetic()
+        })
+    };
+    let exact_hits = |target: &CodeUnit| {
+        let result = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(target),
+                Some(&provider),
+                1,
+                1000,
+            )
+            .result;
+        let FuzzyResult::Success {
+            hits_by_overload, ..
+        } = result
+        else {
+            panic!("expected authoritative type usage success for {target:#?}");
+        };
+        hits_by_overload
+            .get(target)
+            .into_iter()
+            .flatten()
+            .map(|hit| {
+                assert_eq!(hit.file, consumer);
+                (hit.start_offset, hit.end_offset)
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    let range = |line: &str, token: &str| {
+        let line_start = source
+            .find(line)
+            .unwrap_or_else(|| panic!("missing fixture line {line}"));
+        let token_start = line
+            .find(token)
+            .unwrap_or_else(|| panic!("missing {token} in {line}"));
+        let start = line_start + token_start;
+        (start, start + token.len())
+    };
+
+    assert_eq!(
+        exact_hits(&target("alpha.Value")),
+        BTreeSet::from([
+            range("Value lexical_value;", "Value"),
+            range("::alpha::Value explicit_alpha;", "::alpha::Value"),
+            range("Box<Value> templated_value;", "Value"),
+        ])
+    );
+    assert_eq!(
+        exact_hits(&target("Value")),
+        BTreeSet::from([range("::Value global_value;", "::Value")])
+    );
+    assert_eq!(
+        exact_hits(&target("alpha.Canonical")),
+        BTreeSet::from([range("Alias lexical_alias;", "Alias")])
+    );
+    assert_eq!(
+        exact_hits(&target("beta.Canonical")),
+        BTreeSet::from([range("beta::Alias explicit_beta_alias;", "beta::Alias",)])
+    );
+    assert_eq!(
+        exact_hits(&target("alpha.Outer$Inner")),
+        BTreeSet::from([range("Outer::Inner nested_value;", "Outer::Inner")])
+    );
+}
+
+#[test]
+fn authoritative_cpp_type_resolution_rejects_ambiguous_nearest_alias_tier() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"class Canonical {};
+using Choice = Canonical;
+namespace alpha { class Canonical {}; }
+"#,
+        )
+        .file(
+            "left.h",
+            r#"#include "types.h"
+namespace alpha { using Choice = Canonical; }
+"#,
+        )
+        .file(
+            "right.h",
+            r#"#include "types.h"
+namespace alpha { using Choice = ::Canonical; }
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "left.h"
+#include "right.h"
+namespace alpha {
+void consume() {
+    Choice ambiguous;
+    ::Canonical global_control;
+    ::alpha::Canonical alpha_control;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let exact_hits = |fq_name: &str| {
+        let target = definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Class && unit.fq_name() == fq_name && !unit.is_synthetic()
+        });
+        let result = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1,
+                1000,
+            )
+            .result;
+        let FuzzyResult::Success {
+            hits_by_overload, ..
+        } = result
+        else {
+            panic!("expected authoritative ambiguous-tier query success");
+        };
+        hits_by_overload
+            .get(&target)
+            .into_iter()
+            .flatten()
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect::<BTreeSet<_>>()
+    };
+    let range = |token: &str| {
+        let start = source
+            .find(token)
+            .unwrap_or_else(|| panic!("missing {token}"));
+        (start, start + token.len())
+    };
+
+    assert_eq!(
+        exact_hits("Canonical"),
+        BTreeSet::from([range("::Canonical")]),
+        "conflicting alpha::Choice must not fall through to global Choice"
+    );
+    assert_eq!(
+        exact_hits("alpha.Canonical"),
+        BTreeSet::from([range("::alpha::Canonical")]),
+        "conflicting alpha::Choice must not choose either canonical owner"
+    );
+}
+
+#[test]
+fn authoritative_cpp_nested_type_keeps_outer_owner_qualifier_usage() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"namespace alpha {
+class Outer {
+public:
+    class Inner {};
+};
+}
+namespace beta {
+class Outer {
+public:
+    class Inner {};
+};
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "types.h"
+namespace alpha {
+void consume() {
+    Outer::Inner value;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "alpha.Outer"
+            && !unit.is_synthetic()
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let expected_start = source.find("Outer::Inner").expect("nested type");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = result
+    else {
+        panic!("expected authoritative outer-owner query success");
+    };
+    let hits = hits_by_overload.get(&target).cloned().unwrap_or_default();
+
+    assert_eq!(
+        hits.len(),
+        1,
+        "only Outer is an outer-owner usage: {hits:#?}"
+    );
+    let hit = hits.iter().next().expect("outer owner hit");
+    assert_eq!(hit.file, consumer);
+    assert_eq!(
+        (hit.start_offset, hit.end_offset),
+        (expected_start, expected_start + "Outer".len()),
+        "nested full-type resolution must retain its exact outer qualifier usage"
+    );
+
+    let beta_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "beta.Outer" && !unit.is_synthetic()
+    });
+    let beta_result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&beta_target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = beta_result
+    else {
+        panic!("expected authoritative beta outer-owner query success");
+    };
+    assert!(
+        hits_by_overload
+            .get(&beta_target)
+            .is_some_and(BTreeSet::is_empty),
+        "lexical alpha Outer qualifier must not leak to beta.Outer: {hits_by_overload:#?}"
+    );
 }

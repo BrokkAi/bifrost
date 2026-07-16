@@ -6,8 +6,8 @@ use crate::analyzer::usages::cpp_graph::extractor::ScanCtx;
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::{
     CallableArity, CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, IncludeTargetIndex, ProjectFile,
-    cpp_include_paths, cpp_node_text as node_text, normalize_cpp_whitespace, resolve_analyzer,
-    resolve_include_targets_with_index,
+    cpp_include_paths, cpp_node_text as node_text, normalize_cpp_whitespace,
+    recovered_exported_class_has_body, resolve_analyzer, resolve_include_targets_with_index,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -32,7 +32,15 @@ pub(super) enum LexicalTypeResolution {
     Resolved {
         unit: CodeUnit,
         components: Vec<String>,
+        candidates: Vec<CodeUnit>,
     },
+    Ambiguous,
+    Missing,
+}
+
+pub(super) enum LexicalCallableValueResolution {
+    Type(CodeUnit),
+    FreeFunction(CodeUnit),
     Ambiguous,
     Missing,
 }
@@ -180,7 +188,7 @@ pub(in crate::analyzer::usages) struct VisibilityIndex {
     alias_source_files: HashSet<ProjectFile>,
     aliases_by_file: OnceLock<HashMap<ProjectFile, Vec<CppAlias>>>,
     field_type_facts: Mutex<HashMap<CodeUnit, Option<DeclaredFieldTypeFact>>>,
-    structured_alias_targets: Mutex<HashMap<CodeUnit, Option<String>>>,
+    structured_alias_targets: Mutex<HashMap<CodeUnit, Option<StructuredAliasTarget>>>,
     #[cfg(test)]
     qualified_candidate_inspections: AtomicUsize,
 }
@@ -189,6 +197,15 @@ pub(in crate::analyzer::usages) struct VisibilityIndex {
 struct DeclaredFieldTypeFact {
     type_text: String,
     indirection: i32,
+}
+
+#[derive(Clone)]
+enum StructuredAliasTarget {
+    Builtin,
+    Named {
+        components: Vec<String>,
+        global: bool,
+    },
 }
 
 struct CppAlias {
@@ -301,11 +318,7 @@ impl VisibilityIndex {
         if components.is_empty() {
             return LexicalTypeResolution::Missing;
         }
-        let first_prefix_len = if global { 0 } else { lexical_scope.len() };
-        for prefix_len in (0..=first_prefix_len).rev() {
-            let mut qualified = Vec::with_capacity(prefix_len + components.len());
-            qualified.extend_from_slice(&lexical_scope[..prefix_len]);
-            qualified.extend_from_slice(components);
+        for qualified in lexical_component_tiers(components, global, lexical_scope) {
             let qualified_name = qualified.join("::");
             let candidates = self
                 .type_candidates(file, &qualified_name)
@@ -315,18 +328,71 @@ impl VisibilityIndex {
             if candidates.is_empty() {
                 continue;
             }
-            let Some(resolved) = unique_logical_type_candidate(candidates) else {
-                return LexicalTypeResolution::Ambiguous;
-            };
-            let Some(unit) = self.canonical_type_unit(analyzer, file, &resolved) else {
+            let Some(unit) = self.unique_canonical_type_candidate(analyzer, file, &candidates)
+            else {
                 return LexicalTypeResolution::Ambiguous;
             };
             return LexicalTypeResolution::Resolved {
                 unit,
                 components: qualified,
+                candidates: candidates.into_iter().cloned().collect(),
             };
         }
         LexicalTypeResolution::Missing
+    }
+
+    pub(super) fn resolve_callable_value_components_lexically(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        owner_components: &[String],
+        member_name: &str,
+        global: bool,
+        lexical_scope: &[String],
+    ) -> LexicalCallableValueResolution {
+        if owner_components.is_empty() || member_name.is_empty() {
+            return LexicalCallableValueResolution::Missing;
+        }
+        for qualified_owner in lexical_component_tiers(owner_components, global, lexical_scope) {
+            let owner_name = qualified_owner.join("::");
+            let type_candidates = self
+                .type_candidates(file, &owner_name)
+                .into_iter()
+                .filter(|candidate| cpp_name_for(candidate) == owner_name)
+                .collect::<Vec<_>>();
+            let resolved_type = if type_candidates.is_empty() {
+                None
+            } else {
+                let Some(unit) =
+                    self.unique_canonical_type_candidate(analyzer, file, &type_candidates)
+                else {
+                    return LexicalCallableValueResolution::Ambiguous;
+                };
+                Some(unit)
+            };
+
+            let mut qualified_callable = qualified_owner;
+            qualified_callable.push(member_name.to_string());
+            let callable_name = qualified_callable.join("::");
+            let free_function = self
+                .named_candidates_for_normalized(file, &callable_name, TargetKind::FreeFunction)
+                .into_iter()
+                .find(|candidate| {
+                    cpp_name_for(candidate) == callable_name
+                        && type_owner_of(analyzer, candidate).is_none()
+                })
+                .cloned();
+
+            match (resolved_type, free_function) {
+                (Some(_), Some(_)) => return LexicalCallableValueResolution::Ambiguous,
+                (Some(owner), None) => return LexicalCallableValueResolution::Type(owner),
+                (None, Some(function)) => {
+                    return LexicalCallableValueResolution::FreeFunction(function);
+                }
+                (None, None) => {}
+            }
+        }
+        LexicalCallableValueResolution::Missing
     }
 
     fn resolve_type_for_declaration(
@@ -360,21 +426,20 @@ impl VisibilityIndex {
         declaration: &CodeUnit,
         raw_name: &str,
     ) -> Option<CodeUnit> {
-        let mut declaration = declaration.clone();
-        let mut raw_name = raw_name.to_string();
+        let mut current =
+            self.resolve_unique_type_for_declaration(visible_from, declaration, raw_name)?;
         let mut seen_aliases = HashSet::default();
         loop {
-            let resolved =
-                self.resolve_unique_type_for_declaration(visible_from, &declaration, &raw_name)?;
-            if let Some(target) = self.structured_alias_target(analyzer, &resolved) {
-                if !seen_aliases.insert(resolved.clone()) {
-                    return None;
-                }
-                raw_name = target;
-                declaration = resolved;
-                continue;
+            let Some(target) = self.structured_alias_target(analyzer, &current) else {
+                return current.is_class().then_some(current);
+            };
+            if matches!(target, StructuredAliasTarget::Builtin) {
+                return current.is_class().then_some(current);
             }
-            return resolved.is_class().then_some(resolved);
+            if !seen_aliases.insert(current.clone()) {
+                return None;
+            }
+            current = self.resolve_structured_alias_target(visible_from, &current, &target)?;
         }
     }
 
@@ -390,11 +455,53 @@ impl VisibilityIndex {
             let Some(target) = self.structured_alias_target(analyzer, &current) else {
                 return current.is_class().then_some(current);
             };
+            if matches!(target, StructuredAliasTarget::Builtin) {
+                return current.is_class().then_some(current);
+            }
             if !seen_aliases.insert(current.clone()) {
                 return None;
             }
-            current = self.resolve_unique_type_for_declaration(visible_from, &current, &target)?;
+            current = self.resolve_structured_alias_target(visible_from, &current, &target)?;
         }
+    }
+
+    fn resolve_structured_alias_target(
+        &self,
+        visible_from: &ProjectFile,
+        declaration: &CodeUnit,
+        target: &StructuredAliasTarget,
+    ) -> Option<CodeUnit> {
+        let StructuredAliasTarget::Named { components, global } = target else {
+            return None;
+        };
+        let qualified = components.join("::");
+        if *global {
+            return unique_logical_type_candidate(self.type_candidates(visible_from, &qualified));
+        }
+        self.resolve_unique_type_for_declaration(visible_from, declaration, &qualified)
+    }
+
+    fn unique_canonical_type_candidate(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        visible_from: &ProjectFile,
+        candidates: &[&CodeUnit],
+    ) -> Option<CodeUnit> {
+        let mut canonical = Vec::new();
+        for candidate in candidates {
+            let resolved = self.canonical_type_unit(analyzer, visible_from, candidate)?;
+            if canonical
+                .iter()
+                .any(|existing| same_visible_symbol(existing, &resolved))
+            {
+                continue;
+            }
+            canonical.push(resolved);
+            if canonical.len() > 1 {
+                return None;
+            }
+        }
+        canonical.pop()
     }
 
     fn resolve_unique_type_for_declaration(
@@ -644,6 +751,30 @@ impl VisibilityIndex {
             .collect()
     }
 
+    pub(super) fn visible_member_for_owner_name(
+        &self,
+        file: &ProjectFile,
+        owner: &CodeUnit,
+        name: &str,
+    ) -> VisibleMemberResolution {
+        let candidates = self.visible_members_for_owner_name(file, owner, name);
+        let mut callables = Vec::new();
+        let mut non_callable = None;
+        for candidate in candidates {
+            if candidate.is_function() {
+                callables.push(candidate.clone());
+            } else if non_callable.is_none() {
+                non_callable = Some(candidate.clone());
+            }
+        }
+        match (callables.is_empty(), non_callable) {
+            (false, None) => VisibleMemberResolution::Callable(callables),
+            (true, Some(_)) => VisibleMemberResolution::NonCallable,
+            (false, Some(_)) => VisibleMemberResolution::AmbiguousKind,
+            (true, None) => VisibleMemberResolution::Missing,
+        }
+    }
+
     fn field_declared_type_fact(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -666,7 +797,11 @@ impl VisibilityIndex {
         decoded
     }
 
-    fn structured_alias_target(&self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<String> {
+    fn structured_alias_target(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+    ) -> Option<StructuredAliasTarget> {
         if let Some(cached) = self
             .structured_alias_targets
             .lock()
@@ -749,6 +884,27 @@ impl VisibilityIndex {
     fn qualified_candidate_inspections(&self) -> usize {
         self.qualified_candidate_inspections.load(Ordering::Relaxed)
     }
+}
+
+pub(super) enum VisibleMemberResolution {
+    Callable(Vec<CodeUnit>),
+    NonCallable,
+    AmbiguousKind,
+    Missing,
+}
+
+fn lexical_component_tiers<'a>(
+    components: &'a [String],
+    global: bool,
+    lexical_scope: &'a [String],
+) -> impl Iterator<Item = Vec<String>> + 'a {
+    let first_prefix_len = if global { 0 } else { lexical_scope.len() };
+    (0..=first_prefix_len).rev().map(move |prefix_len| {
+        let mut qualified = Vec::with_capacity(prefix_len + components.len());
+        qualified.extend_from_slice(&lexical_scope[..prefix_len]);
+        qualified.extend_from_slice(components);
+        qualified
+    })
 }
 
 fn build_visible_identifier_index(
@@ -1334,7 +1490,10 @@ fn decode_field_declared_type_fact(
     None
 }
 
-fn decode_structured_alias_target(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<String> {
+fn decode_structured_alias_target(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+) -> Option<StructuredAliasTarget> {
     let declaration = analyzer.get_source(unit, false)?;
     let mut parser = Parser::new();
     parser
@@ -1381,24 +1540,55 @@ fn decode_structured_alias_target(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> 
                 continue;
             }
         };
-        return structured_alias_type_name(type_node, &declaration);
+        return structured_alias_type_target(type_node, &declaration);
     }
     None
 }
 
-fn structured_alias_type_name(mut type_node: Node<'_>, source: &str) -> Option<String> {
+fn structured_alias_type_target(
+    mut type_node: Node<'_>,
+    source: &str,
+) -> Option<StructuredAliasTarget> {
     while type_node.kind() == "type_descriptor" {
         type_node = type_node.child_by_field_name("type")?;
+    }
+    if type_node.kind() == "primitive_type" {
+        return Some(StructuredAliasTarget::Builtin);
     }
     if matches!(
         type_node.kind(),
         "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
     ) {
-        let name = type_node.child_by_field_name("name")?;
-        return Some(node_text(name, source).to_string());
+        type_node = type_node.child_by_field_name("name")?;
     }
-    let normalized = normalize_type_text(node_text(type_node, source));
-    (!normalized.is_empty()).then_some(normalized)
+    let global = type_node.child_by_field_name("scope").is_none()
+        && type_node.child(0).is_some_and(|child| child.kind() == "::");
+    let mut components = Vec::new();
+    append_structured_type_components(type_node, source, &mut components)?;
+    (!components.is_empty()).then_some(StructuredAliasTarget::Named { components, global })
+}
+
+fn append_structured_type_components(
+    node: Node<'_>,
+    source: &str,
+    out: &mut Vec<String>,
+) -> Option<()> {
+    match node.kind() {
+        "identifier" | "namespace_identifier" | "type_identifier" => {
+            out.push(node_text(node, source).to_string());
+            Some(())
+        }
+        "template_type" => {
+            append_structured_type_components(node.child_by_field_name("name")?, source, out)
+        }
+        "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier" => {
+            if let Some(scope) = node.child_by_field_name("scope") {
+                append_structured_type_components(scope, source, out)?;
+            }
+            append_structured_type_components(node.child_by_field_name("name")?, source, out)
+        }
+        _ => None,
+    }
 }
 
 fn declared_name_indirection(
@@ -1875,21 +2065,121 @@ pub(in crate::analyzer::usages) fn is_declaration_name(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    parent.child_by_field_name("name") == Some(node) && parent.kind() != "template_function"
-        || parent.kind() == "enumerator"
-        || matches!(parent.kind(), "function_declarator" | "init_declarator")
-            && parent
-                .child_by_field_name("declarator")
-                .is_some_and(|declarator| node_contains(declarator, node))
-        || matches!(
-            parent.kind(),
+    if matches!(
+        parent.kind(),
+        "class_specifier"
+            | "struct_specifier"
+            | "union_specifier"
+            | "enum_specifier"
+            | "namespace_definition"
+            | "namespace_alias_definition"
+            | "alias_declaration"
+            | "enumerator"
+    ) && parent
+        .child_by_field_name("name")
+        .is_some_and(|name| same_node(name, node))
+    {
+        return true;
+    }
+
+    let mut current = Some(parent);
+    while let Some(ancestor) = current {
+        let type_definition = ancestor.kind() == "type_definition";
+        if ancestor
+            .child_by_field_name("declarator")
+            .is_some_and(|declarator| {
+                declarator_name_path_contains(declarator, node, type_definition)
+            })
+        {
+            return true;
+        }
+        if matches!(
+            ancestor.kind(),
             "declaration"
                 | "field_declaration"
                 | "parameter_declaration"
                 | "optional_parameter_declaration"
-        ) && parent
+                | "function_definition"
+                | "type_definition"
+                | "alias_declaration"
+                | "class_specifier"
+                | "struct_specifier"
+                | "union_specifier"
+                | "enum_specifier"
+        ) {
+            return false;
+        }
+        current = ancestor.parent();
+    }
+    false
+}
+
+pub(super) fn declarator_name_node(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "identifier"
+        | "field_identifier"
+        | "qualified_identifier"
+        | "scoped_identifier"
+        | "operator_name"
+        | "destructor_name"
+        | "literal_operator_name" => Some(node),
+        _ => node
             .child_by_field_name("declarator")
-            .is_some_and(|declarator| node_contains(declarator, node))
+            .or_else(|| node.child_by_field_name("name"))
+            .or_else(|| node.child_by_field_name("field"))
+            .and_then(declarator_name_node),
+    }
+}
+
+fn declarator_name_path_contains(
+    declarator: Node<'_>,
+    candidate: Node<'_>,
+    allow_type_identifier: bool,
+) -> bool {
+    let Some(name) = declarator_name_leaf(declarator, allow_type_identifier) else {
+        return false;
+    };
+    let mut current = Some(declarator);
+    while let Some(node) = current {
+        if same_node(node, candidate) {
+            return true;
+        }
+        if same_node(node, name) {
+            return false;
+        }
+        current = node
+            .child_by_field_name("declarator")
+            .or_else(|| node.child_by_field_name("name"))
+            .or_else(|| node.child_by_field_name("field"));
+    }
+    false
+}
+
+fn declarator_name_leaf(node: Node<'_>, allow_type_identifier: bool) -> Option<Node<'_>> {
+    match node.kind() {
+        "identifier"
+        | "field_identifier"
+        | "operator_name"
+        | "destructor_name"
+        | "literal_operator_name" => Some(node),
+        "type_identifier" if allow_type_identifier => Some(node),
+        _ => node
+            .child_by_field_name("declarator")
+            .or_else(|| node.child_by_field_name("name"))
+            .or_else(|| node.child_by_field_name("field"))
+            .and_then(|child| declarator_name_leaf(child, allow_type_identifier)),
+    }
+}
+
+/// True when `node` is a component of a larger structured type node whose outer
+/// range is the single reference surfaced to callers.
+pub(super) fn is_nested_type_node(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "qualified_identifier" | "scoped_type_identifier" | "template_type"
+        )
+    })
 }
 
 pub(super) fn out_of_line_member_definition_owner<'tree>(
@@ -1913,10 +2203,6 @@ pub(super) fn out_of_line_member_definition_owner<'tree>(
     };
     let owner = visibility.canonical_type_for_reference(file, lookup)?;
     Some((scope, owner))
-}
-
-fn node_contains(parent: Node<'_>, child: Node<'_>) -> bool {
-    parent.start_byte() <= child.start_byte() && child.end_byte() <= parent.end_byte()
 }
 
 pub(super) fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
@@ -2264,16 +2550,64 @@ pub(super) fn precise_parent_of(
     match directly_included_owner(analyzer, code_unit, &owner_fqn, owner_name) {
         DirectOwnerResolution::Unique(owner) => Some(owner),
         DirectOwnerResolution::Ambiguous => None,
+        DirectOwnerResolution::ForwardsOnly => {
+            visible_full_cpp_owner(analyzer, code_unit, &owner_fqn, owner_name)
+        }
         DirectOwnerResolution::None => fallback.filter(|parent| {
             parent.short_name() == owner_name && parent.package_name() == code_unit.package_name()
         }),
     }
 }
 
+fn visible_full_cpp_owner(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+    owner_fqn: &str,
+    owner_name: &str,
+) -> Option<CodeUnit> {
+    let cpp = resolve_analyzer::<CppAnalyzer>(analyzer)?;
+    let mut visible_files = HashSet::default();
+    collect_include_closure(
+        analyzer,
+        cpp.include_target_index(),
+        code_unit.source(),
+        &mut visible_files,
+        None,
+    );
+    let candidates = analyzer
+        .global_usage_definition_index()
+        .by_fqn(owner_fqn)
+        .iter()
+        .filter(|candidate| {
+            candidate.is_class()
+                && candidate.short_name() == owner_name
+                && candidate.package_name() == code_unit.package_name()
+                && visible_files.contains(candidate.source())
+        });
+    let mut full_definition = None;
+    for candidate in candidates {
+        match cpp_class_declaration_strength(analyzer, candidate) {
+            CppClassDeclarationStrength::Full if full_definition.is_some() => return None,
+            CppClassDeclarationStrength::Full => full_definition = Some(candidate.clone()),
+            CppClassDeclarationStrength::Forward => {}
+            CppClassDeclarationStrength::Unknown => return None,
+        }
+    }
+    full_definition
+}
+
 enum DirectOwnerResolution {
     None,
+    ForwardsOnly,
     Unique(CodeUnit),
     Ambiguous,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CppClassDeclarationStrength {
+    Full,
+    Forward,
+    Unknown,
 }
 
 fn directly_included_owner(
@@ -2296,7 +2630,7 @@ fn directly_included_owner(
             )
         })
         .collect();
-    let mut candidates = analyzer
+    let candidates = analyzer
         .global_usage_definition_index()
         .by_fqn(owner_fqn)
         .iter()
@@ -2306,13 +2640,86 @@ fn directly_included_owner(
                 && candidate.package_name() == code_unit.package_name()
                 && direct_includes.contains(candidate.source())
         });
-    let Some(owner) = candidates.next().cloned() else {
-        return DirectOwnerResolution::None;
-    };
-    if candidates.next().is_some() {
-        DirectOwnerResolution::Ambiguous
-    } else {
+    let mut full_definition = None;
+    let mut saw_forward = false;
+    for candidate in candidates {
+        match cpp_class_declaration_strength(analyzer, candidate) {
+            CppClassDeclarationStrength::Full if full_definition.is_some() => {
+                return DirectOwnerResolution::Ambiguous;
+            }
+            CppClassDeclarationStrength::Full => full_definition = Some(candidate.clone()),
+            CppClassDeclarationStrength::Forward => saw_forward = true,
+            CppClassDeclarationStrength::Unknown => return DirectOwnerResolution::Ambiguous,
+        }
+    }
+    if let Some(owner) = full_definition {
         DirectOwnerResolution::Unique(owner)
+    } else if saw_forward {
+        DirectOwnerResolution::ForwardsOnly
+    } else {
+        DirectOwnerResolution::None
+    }
+}
+
+fn cpp_class_declaration_strength(
+    analyzer: &dyn IAnalyzer,
+    candidate: &CodeUnit,
+) -> CppClassDeclarationStrength {
+    let Some(source) = analyzer.indexed_source(candidate.source()) else {
+        return CppClassDeclarationStrength::Unknown;
+    };
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .is_err()
+    {
+        return CppClassDeclarationStrength::Unknown;
+    }
+    let Some(tree) = parser.parse(&source, None) else {
+        return CppClassDeclarationStrength::Unknown;
+    };
+    let ranges = analyzer.ranges(candidate);
+    let mut saw_forward = false;
+    for range in ranges {
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
+                continue;
+            }
+            if node.start_byte() == range.start_byte && node.end_byte() == range.end_byte {
+                if matches!(
+                    node.kind(),
+                    "class_specifier" | "struct_specifier" | "union_specifier"
+                ) {
+                    if cpp_class_node_has_body(node) {
+                        return CppClassDeclarationStrength::Full;
+                    }
+                    saw_forward = true;
+                } else if let Some(has_body) =
+                    recovered_exported_class_has_body(node, &source, candidate.identifier())
+                {
+                    if has_body {
+                        return CppClassDeclarationStrength::Full;
+                    }
+                    saw_forward = true;
+                }
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+    }
+    if saw_forward {
+        CppClassDeclarationStrength::Forward
+    } else {
+        CppClassDeclarationStrength::Unknown
+    }
+}
+
+fn cpp_class_node_has_body(node: Node<'_>) -> bool {
+    node.child_by_field_name("body").is_some() || {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .any(|child| matches!(child.kind(), "declaration_list" | "field_declaration_list"))
     }
 }
 

@@ -82,6 +82,113 @@ fn new_expression_and_type_reference_edge_to_the_class() {
 }
 
 #[test]
+fn scoped_type_reference_creates_one_workspace_graph_edge() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"#pragma once
+namespace library {
+class Value {};
+}
+"#,
+        )
+        .file(
+            "consumer.cpp",
+            r#"#include "types.h"
+namespace consumer {
+void use() {
+    library::Value value;
+}
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    let edges: Vec<_> = value["edges"]
+        .as_array()
+        .expect("edges array")
+        .iter()
+        .filter(|edge| {
+            edge["from"].as_str() == Some("consumer.use")
+                && edge["to"].as_str() == Some("library.Value")
+        })
+        .collect();
+
+    assert_eq!(
+        edges.len(),
+        1,
+        "scoped type should produce exactly one edge: {}",
+        value["edges"]
+    );
+    assert_eq!(
+        edges[0]["weight"].as_u64(),
+        Some(1),
+        "scoped type's outer and terminal nodes must not be counted twice: {}",
+        edges[0]
+    );
+}
+
+#[test]
+fn lexical_type_references_match_authoritative_namespace_tiers_in_workspace_graph() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"#pragma once
+namespace alpha { class Value {}; }
+namespace beta { class Value {}; }
+"#,
+        )
+        .file(
+            "consumer.cpp",
+            r#"#include "types.h"
+namespace alpha {
+void consume() {
+    Value local;
+    ::alpha::Value explicit_alpha;
+    beta::Value explicit_beta;
+}
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    let edge = |target: &str| {
+        value["edges"]
+            .as_array()
+            .expect("edges array")
+            .iter()
+            .filter(|edge| {
+                edge["from"].as_str() == Some("alpha.consume")
+                    && edge["to"].as_str() == Some(target)
+            })
+            .collect::<Vec<_>>()
+    };
+    let alpha_edges = edge("alpha.Value");
+    let beta_edges = edge("beta.Value");
+
+    assert_eq!(
+        alpha_edges.len(),
+        1,
+        "bare and explicit alpha types must aggregate into one edge: {}",
+        value["edges"]
+    );
+    assert_eq!(
+        alpha_edges[0]["weight"].as_u64(),
+        Some(2),
+        "alpha edge must contain the bare and explicit source lines exactly"
+    );
+    assert_eq!(
+        beta_edges.len(),
+        1,
+        "explicit beta type must keep a separate exact edge: {}",
+        value["edges"]
+    );
+    assert_eq!(beta_edges[0]["weight"].as_u64(), Some(1));
+}
+
+#[test]
 fn out_of_line_member_definition_qualifiers_edge_to_class() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -520,6 +627,200 @@ class Broken {
     assert!(
         has_edge(&value, "example.Kept.run", "example.Service.helper"),
         "filtered C++ edge graph should not require parsing unrelated callers: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn qualified_method_values_create_exact_owner_usage_graph_edges() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "worker.h",
+            r#"#pragma once
+namespace demo {
+class Worker {
+public:
+    void OnDone();
+    void Arm();
+};
+class Other {
+public:
+    void OnDone();
+    void Arm();
+};
+}
+"#,
+        )
+        .file(
+            "worker.cc",
+            r#"#include "worker.h"
+namespace demo {
+void Worker::OnDone() {}
+void Other::OnDone() {}
+void Worker::Arm() {
+    auto callback = &::demo::Worker::OnDone;
+}
+void Other::Arm() {
+    auto callback = &Other::OnDone;
+}
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "demo.Worker.Arm", "demo.Worker.OnDone"),
+        "expected Worker::Arm -> Worker::OnDone method-value edge: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "demo.Other.Arm", "demo.Other.OnDone"),
+        "expected Other::Arm -> Other::OnDone method-value edge: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "demo.Worker.Arm", "demo.Other.OnDone"),
+        "Worker method value must not cross over to Other::OnDone: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "demo.Other.Arm", "demo.Worker.OnDone"),
+        "Other method value must not cross over to Worker::OnDone: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn qualified_callable_values_follow_cpp_lexical_owner_tiers() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "worker.h",
+            r#"#pragma once
+namespace Worker {
+void OnDone();
+}
+namespace other {
+class Worker {
+public:
+    void OnDone();
+};
+}
+namespace outer {
+namespace inner {
+void helper();
+class Worker {
+public:
+    void OnDone();
+};
+}
+class Worker {
+public:
+    void OnDone();
+    void Arm();
+};
+}
+"#,
+        )
+        .file(
+            "worker.cc",
+            r#"#include "worker.h"
+namespace Worker {
+void OnDone() {}
+}
+namespace other {
+void Worker::OnDone() {}
+}
+namespace outer {
+namespace inner {
+void helper() {}
+void Worker::OnDone() {}
+}
+void Worker::OnDone() {}
+void Worker::Arm() {
+    auto nearest_type = &Worker::OnDone;
+    auto relative_type = &inner::Worker::OnDone;
+    auto relative_function = &inner::helper;
+}
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "outer.Worker.Arm", "outer.Worker.OnDone"),
+        "short owner must resolve at the nearest lexical tier: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "outer.Worker.Arm", "outer::inner.Worker.OnDone"),
+        "relative multi-component owner must retain its lexical namespace prefix: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "outer.Worker.Arm", "outer::inner.helper"),
+        "relative namespace function must resolve through the same lexical tiers: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "outer.Worker.Arm", "Worker.OnDone")
+            && !has_edge(&value, "outer.Worker.Arm", "other.Worker.OnDone"),
+        "nearer lexical owners must block global namespace and unrelated visible types: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn qualified_namespace_function_and_data_member_values_keep_exact_graph_targets() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "worker.h",
+            r#"#pragma once
+namespace demo {
+void OnDone();
+void state();
+class Worker {
+public:
+    int state;
+    void Arm();
+};
+class Other {
+public:
+    int state;
+    void Arm();
+};
+}
+"#,
+        )
+        .file(
+            "worker.cc",
+            r#"#include "worker.h"
+namespace demo {
+void OnDone() {}
+void state() {}
+void Worker::Arm() {
+    auto function_value = &demo::OnDone;
+    auto field_value = &Worker::state;
+}
+void Other::Arm() {
+    auto field_value = &Other::state;
+}
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "demo.Worker.Arm", "demo.OnDone"),
+        "qualified namespace function value should resolve exactly: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "demo.Worker.Arm", "demo.state")
+            && !has_edge(&value, "demo.Other.Arm", "demo.state"),
+        "pointer-to-data-member values must not fan out to a callable namesake: {}",
         value["edges"]
     );
 }

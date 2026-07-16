@@ -28,7 +28,9 @@ use cache::{weight_code_unit_set_by_file, weight_project_file_set};
 use clones::{build_clone_candidate_data, refine_cpp_clone_similarity};
 use tests::detect_cpp_test_assertion_smells;
 
-pub(crate) use declarations::{node_text, normalize_cpp_whitespace};
+pub(crate) use declarations::{
+    node_text, normalize_cpp_whitespace, recovered_exported_class_has_body,
+};
 pub(crate) use imports::{
     IncludeTargetIndex, include_paths, resolve_include_targets, resolve_include_targets_with_index,
 };

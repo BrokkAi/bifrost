@@ -54,7 +54,8 @@ pub use config::{
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
     IncludeTargetIndex, include_paths as cpp_include_paths, node_text as cpp_node_text,
-    normalize_cpp_whitespace, resolve_include_targets, resolve_include_targets_with_index,
+    normalize_cpp_whitespace, recovered_exported_class_has_body, resolve_include_targets,
+    resolve_include_targets_with_index,
 };
 pub use csharp::CSharpAnalyzer;
 pub(crate) use csharp::{
