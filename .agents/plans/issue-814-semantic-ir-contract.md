@@ -17,7 +17,7 @@ The observable result is an immutable `SemanticArtifact` API under `brokk_bifros
 - [x] (2026-07-16 15:32+02:00) Implemented the immutable semantic artifact/procedure/event contract and construction-time invariant validation.
 - [x] (2026-07-16 15:32+02:00) Implemented the deterministic bounded semantic IR renderer with artifact/procedure selection and balanced truncation.
 - [x] (2026-07-16 15:32+02:00) Added behavior-focused cross-language, nested callable, value/cell capture, method-reference, invalidation, uncertainty, validation, and renderer tests.
-- [ ] Run formatting, focused tests, full feature tests, clippy, and specialist review; fix all findings and update this plan with evidence.
+- [x] (2026-07-16 18:01+02:00) Ran formatting, focused tests, the full `nlp,python` feature suite, all-target/all-feature clippy, and parallel specialist plus final invariant audits; fixed every accepted finding and checkpointed the reviewed implementation as `648a9fec`.
 
 ## Surprises & Discoveries
 
@@ -44,6 +44,18 @@ The observable result is an immutable `SemanticArtifact` API under `brokk_bifros
 
 - Observation: capability discovery is only trustworthy if artifact construction rejects exact rows for unsupported features and rejects an unsupported gap for a feature advertised as complete.
   Evidence: treating the total capability table as advisory allowed internally contradictory artifacts even though proof/precision uncertainty already has separate gap and evidence dimensions.
+
+- Observation: an optional call continuation cannot distinguish a semantically absent arm from an unknown, unsupported, unproven, or budget-exhausted arm.
+  Evidence: review found that `Option<ProgramPointId>` would force adapters either to erase the reason or fabricate an edge; `ControlContinuation` now carries the exact state and validation requires matching gap/evidence rows.
+
+- Observation: declared callable candidates and resolved runtime targets are different facts, and a same-artifact nested target can be known before its body is present in a partial materialization.
+  Evidence: the reviewed contract separates `declared_targets` from target-resolution evidence and provides `CallableTarget::Unmaterialized(SemanticLocator)` only for an unpublished direct lexical child.
+
+- Observation: limiting only top-level semantic rows does not bound retained payload or rendering work.
+  Evidence: nested candidates, evidence, strings, events, and edge payload can dominate an artifact; construction now charges all retained payload atomically and rendering streams transactionally under an output budget.
+
+- Observation: forward checks on continuation and gap rows are insufficient because unrelated extra edges and reverse contradictions can still make the graph lie.
+  Evidence: the final audits added exact outgoing-topology ownership for invoke/suspend events and reverse validation from each gap/evidence row back to its precise subject.
 
 ## Decision Log
 
@@ -87,9 +99,29 @@ The observable result is an immutable `SemanticArtifact` API under `brokk_bifros
   Rationale: #815 must measure concrete CFG construction and traversal before freezing a representation; #817 owns persistence promotion; #818 owns interprocedural edges.
   Date: 2026-07-16.
 
+- Decision: represent every normal, exceptional, resume, and cancellation arm with `ControlContinuation::{Target, Absent, Unknown, Unsupported, Unproven, ExceededBudget}` and require exact per-arm and total outgoing topology.
+  Rationale: the IR must preserve why control is unavailable without inventing reachability, and an invoke or suspend event must own all and only the edges its target arms declare.
+  Date: 2026-07-16.
+
+- Decision: keep provider operation failure outside semantic uncertainty as `Result<SemanticOutcome<T>, SemanticProviderError>`.
+  Rationale: invalid input, I/O, and artifact-validation failure are not ambiguous program meaning and must not be cached or rendered as semantic partial results.
+  Date: 2026-07-16.
+
+- Decision: require exact subject-scoped gap/evidence correlations, structured work accounting for every retained payload, indexed linear validation, and transactional bounded rendering.
+  Rationale: incomplete artifacts remain honest and resource limits remain enforceable even for adversarial nested payloads, without quadratic validation or partially emitted records.
+  Date: 2026-07-16.
+
+- Decision: compare procedure handles by artifact materialization identity as well as artifact key and local ID, and use the shared `LanguageDialect` plus portable workspace-relative paths.
+  Rationale: distinct partial materializations of one key must not alias, and semantic/Rune identities must agree across platforms and TypeScript dialects.
+  Date: 2026-07-16.
+
 ## Outcomes & Retrospective
 
-No implementation outcome exists yet. At completion, record the public module surface, test evidence, any contract changes discovered during implementation, and the exact handoff to #815/#816/#818. Note whether the file-level artifact and procedure-local row model remained sufficient without premature graph storage.
+Issue #814 is implemented in checkpoint `648a9fec`. The public `analyzer::semantic` module now exposes durable artifact and locator identities, scoped dense IDs and handles, total capability declarations, typed semantic outcomes and operational errors, finite work budgets, immutable artifact/procedure/event topology, construction-time validation, and a deterministic bounded renderer. The file-level artifact with artifact-local procedures and procedure-local rows remained sufficient; no graph storage or persistence representation was frozen prematurely.
+
+The TypeScript and Java fixtures deliberately construct equivalent neutral artifacts rather than claiming real language adapters. They prove the contract for straight-line flow, calls, nested callable bodies, value/cell/receiver captures, bound and unbound method references, partial targets, uncertainty, and rendering. #815 owns real adapter extraction and callable CFG construction; #816 owns dispatch/value/heap refinement and target oracles; #818 owns matched interprocedural call/return edges; #817 may promote storage only after those artifact shapes are measured.
+
+Validation completed with 59 focused semantic unit tests and 10 cross-language contract tests, the full `cargo test --features nlp,python` suite, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt -- --check`, and `git diff --check`. Specialist review and four final invariant audits covered API/identity, nested callables and captures, uncertainty/capabilities, budget/render safety, exact continuation topology, reverse gap contradictions, partial local targets, and invoke/suspend edge ownership.
 
 ## Context and Orientation
 
@@ -221,12 +253,13 @@ The provider boundary must have this shape, allowing naming refinements that pre
         fn artifact_key(
             &self,
             file: &ProjectFile,
-        ) -> SemanticOutcome<SemanticArtifactKey>;
+            budget: &mut SemanticBudget,
+        ) -> Result<SemanticOutcome<SemanticArtifactKey>, SemanticProviderError>;
         fn artifact(
             &self,
             key: &SemanticArtifactKey,
             budget: &mut SemanticBudget,
-        ) -> SemanticOutcome<Arc<SemanticArtifact>>;
+        ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError>;
     }
 
 `SemanticArtifact::procedure_handle` returns a `ProcedureHandle` that owns an `Arc<SemanticArtifact>` plus `ProcedureId`. Procedure-scoped value, point, call, and location handles add their raw local ID without copying the artifact key into hot IR rows.
@@ -244,3 +277,5 @@ Later oracle boundaries must therefore accept a `&ProcedureHandle` plus a local 
 The artifact key, locator, and renderer use stable relative paths and digests; `ProjectFile`, `CodeUnit`, FQN, `Range`, and a bare dense ID are never sufficient durable semantic identity by themselves.
 
 Plan revision note (2026-07-16): Initial issue plan written after live issue/roadmap review and parallel diagnosis of source, call, receiver, identity, storage, nested-callable, capture, and method-reference seams. It corrects the broader roadmap's procedure-shaped artifact sketch to a mounted source artifact with explicitly scoped dense IDs.
+
+Plan revision note (2026-07-16): Closed the implementation milestone at checkpoint `648a9fec` after specialist review and final invariant audits. Review replaced optional continuations with typed states, made invoke/suspend topology exact, correlated gaps and proof evidence in both directions, constrained unmaterialized local targets, separated provider failures from semantic uncertainty, bounded all retained payload and streamed rendering, and scoped handles to materializations. Validation passed 59 focused semantic tests, 10 contract tests, the complete `nlp,python` suite, all-target/all-feature clippy with warnings denied, formatting, and diff checks.

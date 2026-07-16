@@ -27,8 +27,8 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [x] (2026-07-16 11:43+02:00) Defined and published set-oriented taint policies, compatible multi-policy batching, symbolic taint summaries, broad meeting-point findings, exact cache layers, and evidence-backed CVSS classification across #709, #813, #821, #823, and #824.
 - [x] (2026-07-16 12:39+02:00) Moved the publication thread to neutral branch `dave/composable-typestate-roadmap` and draft PR [#828](https://github.com/BrokkAi/bifrost/pull/828).
 - [x] (2026-07-16 14:39+02:00) Diagnosed #814 in detail and added the focused implementation plan `.agents/plans/issue-814-semantic-ir-contract.md`, including corrected artifact/ID scopes and explicit nested-callable, capture, method-reference, and source-position contracts.
-- [x] (2026-07-16 15:32+02:00) Implemented #814's identities, capabilities, outcomes/budgets, immutable artifact/procedure IR, invariant validation, scoped handles, bounded renderer, and TypeScript/Java contract fixtures; final repository gates and specialist review remain.
-- [ ] Complete #814: define the language-neutral semantic IR, stable identities, capabilities, uncertainty, and an inspectable renderer.
+- [x] (2026-07-16 15:32+02:00) Implemented #814's identities, capabilities, outcomes/budgets, immutable artifact/procedure IR, invariant validation, scoped handles, bounded renderer, and TypeScript/Java contract fixtures.
+- [x] (2026-07-16 18:01+02:00) Completed #814 after specialist review and final invariant audits; all focused tests, the complete `nlp,python` suite, all-target/all-feature clippy, formatting, and diff checks passed, and the reviewed implementation was checkpointed as `648a9fec`.
 - [ ] Complete #815 and the first adapter children: build equivalent per-callable CFGs for TypeScript and Java.
 - [ ] Complete #816 in parallel: expose reusable dispatch, value, heap, and bounded access-path oracles for the reference languages.
 - [ ] Complete #818: stitch CFG fragments through existing call relations into a demand-materialized ICFG.
@@ -67,6 +67,12 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 
 - Observation: capture storage crosses procedure scopes in one direction: creation bindings belong to the lexical parent, while the slot loaded by the body belongs to the child procedure.
   Evidence: #814 validation and fixtures require creator-local values/environments to target child-local capture locations, including several static creation sites feeding one body slot.
+
+- Observation: partial semantic artifacts need typed missing-control states and exact reverse correlations, not optional targets plus advisory gaps.
+  Evidence: #814 review introduced typed continuations, exact invoke/suspend outgoing topology, subject-scoped gaps/evidence, and constrained unmaterialized direct-child targets so incomplete adapters cannot fabricate or contradict control flow.
+
+- Observation: semantic resource bounds must cover nested retained payload and streamed output, not merely top-level row counts.
+  Evidence: #814 construction now accounts atomically for every retained entry and owned byte, validation is indexed and linear, and the renderer emits complete records transactionally within its byte budget.
 
 - Observation: GitHub supports native subissues in this repository, so #814 through #826 can be attached directly to #813 while retaining explicit dependency text in each body.
   Evidence: the live `subIssues` query for #813 returned all thirteen children.
@@ -153,6 +159,14 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
   Rationale: current analyzers construct `Range` lines with different bases, `usize` is not a portable persisted width, and exact anchors need columns as well as bytes.
   Date: 2026-07-16.
 
+- Decision: encode unavailable call and async control arms as typed continuations, require exact per-event outgoing topology, and correlate every incomplete subject with exact gap and evidence rows.
+  Rationale: later CFG and ICFG consumers must be able to distinguish absent control from unknown, unsupported, unproven, or exhausted analysis without traversing invented edges.
+  Date: 2026-07-16.
+
+- Decision: separate provider operational failure from semantic uncertainty, bound all retained construction/rendering payload, validate with indexed linear passes, and scope handles to one artifact materialization.
+  Rationale: invalid input or I/O is not program ambiguity; adversarial payload must respect finite budgets; and two partial materializations of one durable key must not alias.
+  Date: 2026-07-16.
+
 ## Outcomes & Retrospective
 
 The planning milestone produced root epic #813, thirteen native subissues, and this repository-local ExecPlan. The issue tree now separates the critical path from parallel and evidence-gated work:
@@ -172,7 +186,9 @@ The planning milestone produced root epic #813, thirteen native subissues, and t
     #709 public policy contract -> #824 stable query/policy adapter -> #825 public pilot
     #826 evaluates WPDS/SPDS after pilot evidence
 
-No implementation milestone is complete yet. Update this section after each issue closes with actual behavior, measurements, architectural deviations, and follow-up issue numbers. In particular, record whether TypeScript/Java remained the right reference pair, which artifacts earned SQLite persistence, and whether #826 concluded that a pushdown extension was justified.
+Issue #814 is the first completed implementation milestone. Checkpoint `648a9fec` provides the immutable language-neutral IR/event contract, durable and dense identities, total capabilities, typed outcomes and errors, finite budgets, provider boundary, invariant validation, scoped handles, and bounded renderer. TypeScript and Java remained the right contract fixtures, but they intentionally build neutral artifacts rather than claiming real adapters. The file-level artifact and procedure-local row model survived review without prematurely selecting CSR/CSC or persistence.
+
+The handoff remains narrow: #815 builds real TypeScript/Java callable CFG adapters, #816 refines dynamic dispatch plus value/heap targets, #818 adds matched ICFG call/return edges, and #817 measures lifecycle/storage before persisting anything. Review made this boundary stricter by introducing typed unavailable continuations, exact invoke/suspend outgoing topology, exact gap/evidence correlations, constrained partial local targets, bounded atomic construction, streaming rendering, and materialization-scoped handles.
 
 ## Context and Orientation
 
@@ -1190,13 +1206,18 @@ The initial #709 implementation may execute only `PolicyAnalysis::Match`, but it
 The semantic adapter boundary materializes a mounted source artifact once and resolves procedures inside it:
 
     trait ProgramSemanticsProvider {
-        fn capabilities(&self) -> SemanticCapabilities;
-        fn artifact_key(&self, file: &ProjectFile) -> AnalysisOutcome<SemanticArtifactKey>;
+        fn language(&self) -> SemanticLanguage;
+        fn capabilities(&self) -> &SemanticCapabilities;
+        fn artifact_key(
+            &self,
+            file: &ProjectFile,
+            budget: &mut SemanticBudget,
+        ) -> Result<SemanticOutcome<SemanticArtifactKey>, SemanticProviderError>;
         fn artifact(
             &self,
             key: &SemanticArtifactKey,
             budget: &mut SemanticBudget,
-        ) -> AnalysisOutcome<Arc<SemanticArtifact>>;
+        ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError>;
     }
 
 `SemanticArtifact` owns a dense procedure table. `ProcedureHandle` retains an `Arc<SemanticArtifact>` plus its artifact-local `ProcedureId`; local value, point, call, and memory IDs cross provider/oracle boundaries only together with that procedure scope. `ProcedureSemantics` owns dense local IDs, source mappings, semantic effects, and an immutable CFG. It does not own solver facts or protocol states.
@@ -1368,3 +1389,5 @@ Public query changes depend on the declarative schema registry in `src/analyzer/
 Plan revision note (2026-07-16): Initial roadmap written after auditing the post-PR-#802 codebase and creating epic #813 with native subissues #814–#826. The initial plan deliberately makes TypeScript/Java the reference pair, IFDS/IDE the baseline solver shape, compact memory plus selective SQLite the lifecycle policy, dominance optional, and WPDS/SPDS evidence-gated. Draft PR #828 is the current publication thread for the initial checkpoint and subsequent revisions. A later same-day revision made #709 the early public policy/API gate, separated `.rqlp`/`PolicyFinding` from the internal protocol and analysis result models, and required the #825 pilot to validate query, human, and SARIF surfaces from one analysis result. This revision also made `analysis.type: taint` set-oriented end to end: one compatible multi-source/multi-sink batch, stable class-set propagation with bounded origins, symbolic taint summaries and exact cache layers, broad findings before CWE refinement, and evidence-backed CVSS v4.0 variants that never fabricate a score from incomplete Base evidence.
 
 Plan revision note (2026-07-16): Issue #814 diagnosis corrected the original procedure-shaped artifact sketch. A semantic artifact now owns one mounted source snapshot and an artifact-local procedure table; procedure rows own their block, point, value, call, memory, capture, provenance, evidence, and gap IDs. Provider and oracle interfaces use scoped procedure handles. The same revision records nested callable bodies as separate procedures, callable references and captures as creation-time semantics rather than eager calls, and byte-authoritative source positions with explicit zero-based display coordinates. The focused implementation plan is `.agents/plans/issue-814-semantic-ir-contract.md`.
+
+Plan revision note (2026-07-16): Completed #814 at reviewed checkpoint `648a9fec`. The final contract uses typed continuations and exact outgoing topology, bidirectional subject-scoped gaps/evidence, direct-child unmaterialized targets, separate provider errors and semantic outcomes, atomic total-payload budgets, indexed validation, streaming bounded rendering, portable shared language/path identity, and materialization-scoped handles. Validation passed 59 semantic unit tests, 10 TypeScript/Java contract tests, the complete `nlp,python` suite, all-target/all-feature clippy with warnings denied, formatting, and diff checks. #815, #816, and #818 retain adapter/CFG, oracle/refinement, and matched-ICFG ownership respectively.
