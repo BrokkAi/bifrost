@@ -10,6 +10,8 @@ Bifrost already answers structural, reference, call, and bounded receiver questi
 
 After the first vertical slice, a rule author should be able to describe a finite-state resource protocol once, select relevant program entities through `CodeQuery` or RQL, run the protocol across matched calls and returns in TypeScript and Java, and receive a bounded source-backed may finding that says which facts and summaries supported it and whether ambiguity or budgets made the analysis incomplete. A trivial one-state client should use the same substrate for direct and indirect data flow, and a source/sink/sanitizer client should use it for taint-style propagation.
 
+The public policy model must also avoid the narrow-rule trap of enumerating every source/sink pair as a separate vulnerability rule and solver run. A taint policy declares sets of attacker-controlled source classes and security-sensitive sink classes, runs one multi-source/multi-sink propagation, and reports a meeting whenever a compatible reached source label arrives at a sink. Specific CWE classifications refine that broad security finding; failure to select a narrow CWE must not suppress the generic vulnerability. Procedure summaries describe propagation independently of concrete seed/sink lists so policies and classifications can reuse the same dynamic-programming work.
+
 The initial target is meet-over-valid-interprocedural-paths analysis. “Valid” means call and return edges are matched rather than traversed as unrelated graph edges. The first solver accepts finite distributive may problems whose reachable facts join with set union, plus bounded-height IDE edge values that satisfy the laws specified below. A must claim requires a separately defined and validated problem; it is not obtained by relabeling a may result. The first platform does not use SMT to prove arbitrary branch feasibility.
 
 The implementation should feel modular in the same way that Boomerang, IDEal, and synchronized pushdown systems separate concerns: language semantics, control-flow construction, dispatch/value oracles, solver mechanics, client rules, summary storage, and query presentation each have an explicit boundary. Bifrost’s usage analysis is an oracle and reusable component in this design, not something to discard and not something to turn into the entire solver.
@@ -22,6 +24,7 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [x] (2026-07-16 09:58+02:00) Wrote this living ExecPlan with architecture, lifecycle, milestone, validation, and recovery contracts.
 - [x] (2026-07-16 10:27+02:00) Published the plan in draft PR [#827](https://github.com/BrokkAi/bifrost/pull/827) from checkpoint commit `41f1e88b`.
 - [x] (2026-07-16 10:35+02:00) Made #709 the early public policy/API contract gate for #824 and #825 while keeping #814 through #823 free to build diagnostic-neutral internal analysis services.
+- [x] (2026-07-16 11:43+02:00) Defined and published set-oriented taint policies, compatible multi-policy batching, symbolic taint summaries, broad meeting-point findings, exact cache layers, and evidence-backed CVSS classification across #709, #813, #821, #823, and #824.
 - [ ] Complete #814: define the language-neutral semantic IR, stable identities, capabilities, uncertainty, and an inspectable renderer.
 - [ ] Complete #815 and the first adapter children: build equivalent per-callable CFGs for TypeScript and Java.
 - [ ] Complete #816 in parallel: expose reusable dispatch, value, heap, and bounded access-path oracles for the reference languages.
@@ -31,7 +34,7 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [ ] Complete #821 and #822: prove simple data-flow/taint reuse, then add the finite-state protocol IR and typestate client.
 - [ ] Complete #823 and #817 promotion work: compose summaries in memory first, then persist only measured expensive and reusable artifacts.
 - [ ] Complete #709 before #824 freezes its public surface: establish `.rqlp`, `PolicyDefinition`, `PolicyFinding`, and shared human/SARIF rendering without waiting for the typestate solver.
-- [ ] Complete #824: expose typed, bounded CFG/data-flow/typestate domains through `CodeQuery` and RQL, then adapt diagnostic-neutral findings to #709's policy boundary.
+- [ ] Complete #824: expose typed, bounded CFG/data-flow/taint/typestate domains through `CodeQuery` and RQL, then adapt diagnostic-neutral findings to #709's policy boundary.
 - [ ] Complete #825: deliver and benchmark one TypeScript/Java resource-lifecycle protocol through internal, query, `.rqlp`, human, and SARIF paths.
 - [ ] Complete #826 only after #825: decide, with evidence, whether WPDS weights or synchronized call/field pushdown precision should be implemented.
 - [ ] Open per-language rollout children under #815 and #816 only after the reference adapters stabilize the neutral contracts.
@@ -98,11 +101,27 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
   Date: 2026-07-16.
 
 - Decision: make #709 a prerequisite for finalizing the stable policy-facing API in #824 and for the public vertical-slice acceptance in #825, but not for semantic IR, CFG/ICFG, solver, or internal typestate milestones.
-  Rationale: policy identity, severity, messages, loading, and human/SARIF rendering should be designed before typestate becomes a public diagnostic surface. Conversely, forcing CFG and tabulation work to wait on a file/reporting format would couple independent concerns and leave #709 guessing at solver internals. #709 owns `.rqlp`, `PolicyDefinition`, public `TypestatePolicySpec`, and `PolicyFinding`; #822 owns the internal `ProtocolSpec` and `TypestateFinding`; #824 owns the compiler/adapter between those models.
+  Rationale: policy identity, severity, messages, loading, and human/SARIF rendering should be designed before taint or typestate becomes a public diagnostic surface. Conversely, forcing CFG and tabulation work to wait on a file/reporting format would couple independent concerns and leave #709 guessing at solver internals. #709 owns `.rqlp`, `PolicyDefinition`, public `TaintPolicySpec`/`TypestatePolicySpec`, and `PolicyFinding`; #821 owns internal taint plans/findings, #822 owns the internal `ProtocolSpec`/`TypestateFinding`, #823 owns reusable summaries, and #824 owns the compilers/adapters between those models.
   Date: 2026-07-16.
 
 - Decision: identify compiled protocols by canonical hash and an execution-scoped `ProtocolHandle`, with human-readable `ProtocolRef` aliases resolved only through an explicit query-analysis context.
   Rationale: a global protocol ID can silently collide when two policies declare different bodies under the same name. Registration must reject one reference mapping to different hashes. Different references may share one hash/compiled automaton, and persisted summaries remain keyed by the canonical hash rather than the alias or handle slot.
+  Date: 2026-07-16.
+
+- Decision: use `analysis.type` as the public `.rqlp` discriminator, with distinct `match`, `taint`, and `typestate` authoring types.
+  Rationale: sources, sinks, sanitizers, protocol automata, and structural-match reporting have different required fields and validation laws. A tagged public union keeps these requirements explicit while lowering each type into diagnostic-neutral internal services.
+  Date: 2026-07-16.
+
+- Decision: evaluate taint policies as sets, not as a Cartesian product of one-source/one-sink rules.
+  Rationale: one solver run can seed every selected source, propagate finite source-class label sets, and observe every selected sink. A meeting is reported when reached labels intersect the sink's accepted labels after sanitizer semantics. This captures broad attacker-controlled-to-sensitive-operation vulnerabilities, shares work, and still retains bounded source-class/origin provenance for classification and witnesses.
+  Date: 2026-07-16.
+
+- Decision: keep `TaintTransferSummary` symbolic and independent of concrete source selectors, sink selectors, policy IDs, classification rules, and CVSS configuration.
+  Rationale: the reusable result is how taint on interface/heap positions and classes moves through a procedure, including sanitization and uncertainty. Concrete seeds, sink observers, finding aggregation, CWE refinement, and scoring are cheap run/presentation overlays. Summary keys include propagation/sanitizer semantics and taxonomy versions only when they change transfer behavior.
+  Date: 2026-07-16.
+
+- Decision: derive CVSS v4.0 only from explicit metric evidence and publish a numerical score only with a complete Base vector.
+  Rationale: source exposure and sink impact can support some metrics, but static reachability alone cannot safely invent every exploitability or vulnerable/subsequent-system impact metric. Each metric records a structured evidence basis and provenance; incomplete Base evidence produces an unrated finding with an `Unscored` assessment. A complete result includes the canonical vector, applicable component scores/severities, nomenclature, and scoring provenance. CVSS severity remains distinct from analyzer certainty and organization-specific risk.
   Date: 2026-07-16.
 
 ## Outcomes & Retrospective
@@ -120,7 +139,7 @@ The planning milestone produced root epic #813, thirteen native subissues, and t
     #816 value/heap oracles feeds #818, #820, #822, and #825
     #817 artifact lifecycle and persistence follows measured artifact shapes
     #819 graph algorithms is non-blocking; dominance is conditional
-    #821 proves simple flow/taint reuse
+    #821 set-oriented taint client -> #823 symbolic summaries -> #824 query/policy adapter
     #709 public policy contract -> #824 stable query/policy adapter -> #825 public pilot
     #826 evaluates WPDS/SPDS after pilot evidence
 
@@ -148,6 +167,10 @@ A summary is a dynamic-programming result for reusing procedure behavior. A lang
 
 A fact is one abstract proposition propagated by the solver, such as “allocation A may be held by local x” or “object A is in protocol state open.” The fact domain is finite for one run because values are interned and every source of growth has a configured bound.
 
+A taint source class is a reusable semantic label such as `attacker_controlled`, not one concrete source/sink pair. A run may retain bounded concrete origin IDs for witnesses while propagating compact sets of source-class IDs. A taint sink declares security impacts and the source labels it accepts.
+
+A taint meeting point is a resolved sink binding where the reached source-label set intersects the sink's accepted-label set after modeled sanitizers and barriers. It is a sink-level finding with aggregated contributing classes/origins, not one separate solver result for every source/sink permutation.
+
 A lattice orders abstract information and defines how paths join. A may problem uses union: an outcome is reachable if any modeled valid path reaches it. A must problem needs a separately validated intersection-like abstraction and can claim an outcome only when every modeled alternative supports it.
 
 A transfer function maps input facts to output facts at a semantic edge. Distributivity means applying the function to a union of facts produces the same result as applying it to each fact separately and unioning the results. IFDS relies on this law. An IDE edge function transforms a bounded abstract value attached to a fact; its value lattice must have finite height so repeated joins terminate.
@@ -157,6 +180,8 @@ A strong update replaces the previous abstract value of one proven-unique memory
 A context abstraction is the bounded distinction the solver retains between callers, for example a call-site or object-sensitive key. It is part of a summary identity. An SCC, or strongly connected component, is a cycle-equivalent group of graph nodes used to reason about recursion. Reverse postorder is a deterministic CFG traversal order that usually accelerates fixed points. Dominance means every path to one node passes through another node.
 
 A packed DTO is a versioned serialization object designed for stable storage rather than Rust’s in-memory layout. An overlay is the analyzer’s unsaved-buffer view and has its own generation. SARIF is the standard JSON result format consumed by code-scanning tools.
+
+CVSS is a standardized vulnerability-severity framework, not a complete organizational risk model. For CVSS v4.0, all Base metrics are required for a Base score. Threat and Environmental metrics can refine severity, while business, regulatory, customer, monetary, safety, and reputation considerations remain separate risk inputs. Published CVSS data includes the vector and score with the applicable nomenclature.
 
 ### Analysis result and soundness contract
 
@@ -176,6 +201,19 @@ The first may client applies these conservative rules:
 - Follow exceptional edges when the adapter declares them complete. If a reachable construct’s exceptional or cleanup semantics are unsupported, the overall result is `inconclusive`.
 - A budget exit or cancellation returns `inconclusive` with the exact exhausted bound. It cannot populate a complete-summary cache.
 
+The set-oriented taint client adds these rules:
+
+- Compile all source selectors into one finite seed set and all sink selectors into one finite observer set. Do not schedule a separate solver run for each pair.
+- Propagate finite source-class label sets with union. Retain concrete source-origin IDs only in a bounded provenance side table used for witnesses and grouping.
+- A sink meeting is a may finding when reached labels intersect the sink's accepted labels. Ambiguous dispatch or incomplete propagation may still produce a partial meeting, but the overall completion remains `inconclusive`.
+- A sink definition identifies the exact dangerous operand or receiver. A database call is not one undifferentiated sink: SQL structure, a safely bound value parameter, a connection selector, and an options object have different semantics.
+- Sanitizers and barriers are typed transfer functions over declared label classes. An unrecognized or partially modeled sanitizer cannot erase taint optimistically.
+- The diagnostic-neutral client aggregates by sink event, semantic scenario, reached source classes, and completion. It does not depend on CWE or CVSS. #824 later projects compatible semantic scenarios into classification/assessment variants and retains bounded contributing origins plus at least one witness per materially distinct class.
+- A broad `attacker_controlled` to `security_sensitive` meeting is reportable even if no more specific CWE rule matches. Specific classification refines rather than creates the underlying security finding.
+- CVSS Base metrics that are not supported by structured evidence or explicit catalog/policy declarations remain unknown. Unknown Base metrics prevent a numerical score; they do not suppress the vulnerability finding.
+- Incomplete source discovery, sink discovery, dispatch, external-call modeling, or transfer propagation makes an empty result `inconclusive`. A complete superset run can answer a subset policy only when it retained the required source classes and sink observations without lossy truncation.
+- Solver completeness and witness/provenance budgets are independent. Truncating stored origins or a displayed path never changes reachability, suppresses a finding, or licenses a complete negative.
+
 Each result also carries `proof` for the structured edges it used, `completeness`, a work report, and optional bounded witness data. These fields are independent: a source-backed witness can be exact while the overall analysis remains inconclusive elsewhere.
 
 ### Existing seams
@@ -190,7 +228,7 @@ Each result also carries `proof` for the structured edges it used, `completeness
 
 `src/analyzer/structural/query/ir.rs` and `schema.rs` are the typed query and declarative vocabulary authorities. `src/analyzer/structural/search.rs` executes bounded transformations and retains provenance. #824 extends these instead of adding a separate graph-query parser.
 
-#709 is the public diagnostic boundary. It owns the versioned `.rqlp` envelope, policy identity and reporting metadata, public analysis-authoring types such as `TypestatePolicySpec`, policy evaluation, `PolicyFinding`, and human/SARIF rendering. An internal `ProtocolSpec`, `TypestateFinding`, or `CodeQueryMatch` remains diagnostic-neutral until #824 lowers/adapts it through that public model.
+#709 is the public diagnostic boundary. It owns the versioned `.rqlp` envelope, policy identity and reporting metadata, public analysis-authoring types such as `TaintPolicySpec` and `TypestatePolicySpec`, classification/scoring declarations, policy evaluation, `PolicyFinding`, and human/SARIF rendering. Internal `TaintFinding`, `ProtocolSpec`, `TypestateFinding`, and `CodeQueryMatch` values remain diagnostic-neutral until #824 lowers/adapts them through that public model.
 
 `src/compact_graph.rs` provides `CompactRows`, `CompactRowsBuilder`, and `CompactDirectedGraph`. `src/analyzer/store/mod.rs`, `src/analyzer/structural/provider.rs`, and `migrations/cache/0007-structural-facts-snapshots.sql` establish generation-aware, corruption-safe, versioned packed persistence with lazy hot hydration.
 
@@ -288,7 +326,15 @@ The kernel supplies deterministic worklists, budgets, cancellation, internal `Ta
 
 Validate the algorithm on tiny generated ICFGs against an intentionally simple exhaustive reference that enumerates only bounded valid paths. Then add deep call chains, recursion, mutual recursion, multiple targets, exceptions, cancellation, and fact-growth cases.
 
-#821 proves reuse with a one-state/direct value-flow client and a source/sink/sanitizer client. Missing generality is fixed at the shared solver/oracle boundary rather than by introducing a second worklist engine.
+#821 proves reuse with a one-state/direct value-flow client and a set-oriented source/sink/sanitizer client. Compile all resolved sources into one seed relation and all resolved sinks into observers for one analysis run. Partition runs only when propagation semantics differ, such as context/access-path precision, external models, unknown-call behavior, sanitizer/transform semantics, or heap abstraction; policy IDs, messages, classifications, and scoring never partition propagation.
+
+Create `src/analyzer/taint/mod.rs`, `model.rs`, `plan.rs`, `client.rs`, `summary.rs`, `finding.rs`, and `provenance.rs`. `model.rs` owns stable source-class, sink-event, sanitizer, transform, and external-model identities; `plan.rs` owns propagation-semantics keys and set-oriented batch partitions; `client.rs` lowers one partition into the shared solver; `summary.rs` owns symbolic transfer summaries; `finding.rs` owns only diagnostic-neutral meetings and proof metadata; and `provenance.rs` keeps concrete origins outside the fixed point.
+
+Use the abstract value/location as the exploded carrier fact and an IDE-style finite `TaintClassSet` bitset as its value. `SourceClassId` distinguishes propagation or sanitization behavior, not each concrete source site. A run-local interner maps stable class IDs to dense bits; any persisted bitset includes a `TaintUniverseHash` and stable IDs because dense bit positions are not durable identities. Concrete `SourceEventKey` origins stay outside the fixed point in a bounded provenance/witness side table.
+
+A meeting-point aggregator groups reached source classes/origins at each sink and hands diagnostic-neutral `TaintFinding` values to #824. A valid meeting agrees on carrier/location, matched call/return context, access-path abstraction, exceptional state, and taint-transform state; sharing only an AST or CFG node is insufficient and would create impossible Frankenpaths. The first implementation remains multi-source forward tabulation. Bidirectional forward/backward meeting is an optimization behind the same semantic key, not a different result contract.
+
+This finite class-set domain does not express relational rules such as “two distinct inputs must meet” or same-origin correlation. Such rules require a separately named and bounded relational client. Missing generality is fixed at the shared solver/oracle boundary rather than by introducing a second worklist engine.
 
 ### Milestone 5: compile finite-state protocols and compose summaries (#822, #823)
 
@@ -298,7 +344,57 @@ The first protocol is a resource lifecycle with states such as `unallocated`, `o
 
 The typestate client adds protocol state to interned facts or associates an equivalent client value through the solver interface. It does not add language branches to the kernel. A degenerate protocol should collapse naturally to reachability/data flow.
 
-#823 adds `SemanticProcedureSummary` and `ProtocolSummary` above the solver’s existing `TabulationEndSummary`; it does not redesign or replace the correctness-critical tabulation cache. `SemanticProcedureSummary` packages reusable client-independent procedure effects. `ProtocolSummary` packages one protocol hash’s entry-state-to-exit-state/effect relation. In-memory dynamic-programming reuse comes first. Each summary records context abstraction, proof, completeness, exceptional effects, and dependency identity. Library summaries are validated and marked as external rather than inferred.
+#823 adds `SemanticProcedureSummary`, `TaintTransferSummary`, and `ProtocolSummary` above the solver’s existing `TabulationEndSummary`; it does not redesign or replace the correctness-critical tabulation cache. `SemanticProcedureSummary` packages reusable client-independent procedure effects. `TaintTransferSummary` symbolically relates taint classes on interface/heap inputs to outputs, escapes, sanitization, and uncertainty without containing concrete source/sink selectors or reporting rules. `ProtocolSummary` packages one protocol hash’s entry-state-to-exit-state/effect relation. In-memory dynamic-programming reuse comes first. Each summary records context abstraction, proof, completeness, exceptional effects, and dependency identity. Library summaries are validated and marked as external rather than inferred.
+
+The taint cache identities are deliberately split:
+
+    CarrierSummaryKey =
+        procedure SemanticArtifactKey
+        + ICFG/call-binding dependency fingerprint
+        + adapter and semantic-IR versions
+        + dispatch/value/heap oracle versions and configuration
+        + context and access-path abstraction
+        + exceptional, escape, and unknown-call semantics
+        + solver-summary schema version
+
+    TaintPropagationEventMatchKey =
+        procedure SemanticArtifactKey
+        + canonical source-generator, sanitizer/transform, and external-model selector hash
+        + matcher/compiler version
+
+    TaintSinkObserverMatchKey =
+        procedure SemanticArtifactKey
+        + canonical sink-selector and dangerous-operand hash
+        + matcher/compiler version
+
+    TaintTransferSummaryKey =
+        CarrierSummaryKey
+        + taint-algebra version
+        + propagation-relevant model hash
+        + TaintPropagationEventMatchKey dependency when local event ports are embedded
+        + callee/SCC summary dependency fingerprint
+
+    BatchRunKey =
+        workspace snapshot and analysis scope
+        + analysis-semantics key
+        + canonical selected SourceClassId universe
+        + canonical selected source-event seeds
+        + canonical selected sink-observer set
+        + completeness-affecting budgets
+
+    FindingProjectionKey =
+        completed BatchRunKey result
+        + per-policy source/sink compatibility selection hash
+        + classification/scorer/version hash
+        + assessment-evidence profile snapshot
+
+The propagation-relevant model hash includes only class behavior, sanitizer/transform rules, and external/unknown-call models that can change transfer. It excludes policy ID, messages, CWE taxonomy, report limits, sink presentation, CVSS, Threat, and Environmental overlays. Concrete source occurrences and the unioned sink-observer set key `BatchRunKey`; changing only sinks can reuse transfer summaries but requires a new run unless a completed run explicitly retained the full pointwise closure needed to apply those observers afterward.
+
+The two model-match keys map reusable model definitions to stable symbolic event ports without letting a sink-only catalog edit invalidate transfer. A `SourceEventKey` is its owning `SemanticArtifactKey`, deterministic local semantic-event ordinal and role, and `SourceClassId`; a `SinkEventKey` uses the same artifact/ordinal/role identity plus its sink-model ID. `TaintUniverseHash` covers canonical stable class IDs and their propagation/sanitization semantics, never run-local dense-bit order. The summary exposes boundary input/output relations plus local source-generator and internal sink-observation ports, so a source and sink wholly inside a summarized callee are not skipped. If source/sanitizer/transform matching is compiled into the summary, that exact `TaintPropagationEventMatchKey` is a dependency; sink-observer matching remains separate and never enters the transfer-summary key.
+
+`TaintFindingKey` is the analyzed workspace snapshot plus stable `SinkEventKey` and semantic-scenario identity. It excludes the optimizer's chosen forward/backward meeting node, concrete origin occurrences, witness/report limits, policy ID, message, CWE, and CVSS. `FindingProjectionKey` caches only a classified/scored semantic projection. A final `PolicyFinding` is either rebuilt cheaply or separately keyed by policy/message/report identity. Its assessment-evidence snapshot includes Threat feed revision/time, Environmental profile, analyst assertions, system-of-interest boundary, affected configuration, and scorer/version so changed evidence cannot reuse stale CVSS.
+
+Recursive SCC summaries publish atomically only after convergence. An incomplete or dependency-stale summary can support an explicitly inconclusive partial finding, but never a complete negative or a complete reusable cache entry.
 
 ### Milestone 6: apply the artifact lifecycle policy (#817)
 
@@ -311,6 +407,7 @@ Maintain an artifact matrix while the preceding milestones establish real data s
 | ICFG stitch relations | Demand materialized generation cache | No | Persist only if repeated call resolution remains a measured bottleneck and invalidation is tractable. |
 | Exploded solver states/worklists | Sparse ephemeral tables | Never by default | Query/client specific; retain only within an analysis session. |
 | Language-semantic summaries | In-memory memoization | Candidate | Promote after cross-query and cross-process reuse is measured. |
+| Symbolic taint-transfer summaries | In-memory memoization keyed by transfer semantics | Candidate | Exclude concrete source/sink sets and classification/CVSS; promote after reuse across materially different policies is measured. |
 | Protocol summaries | In-memory memoization keyed by rule hash | Candidate | Promote only with rule/config/version keys and measurable reuse. |
 | Witness predecessor data | Compact ephemeral parents | No | Reconstruct bounded witnesses; do not serialize full paths. |
 | Query results/truncations | Ephemeral typed rows | No | They are seed-, budget-, and presentation-specific. |
@@ -319,18 +416,20 @@ Every persisted artifact uses a packed versioned DTO, generation/content validat
 
 ### Milestone 7: stabilize the public policy contract and expose typed query facets (#709, #824, #720)
 
-#709 should proceed early and establish the public envelope before #824 freezes stable policy-facing names. It is not a prerequisite for #814 through #823: those milestones operate on diagnostic-neutral semantic facts, `AnalysisRun`, `TypestateFinding`, and witnesses. The dependency is asymmetric: #709 must not encode solver worklists or automaton internals, and #824/#825 must not invent a second policy identity, loading, severity, message, or SARIF model.
+#709 should proceed early and establish the public envelope before #824 freezes stable policy-facing names. It is not a prerequisite for #814 through #823: those milestones operate on diagnostic-neutral semantic facts, `AnalysisRun`, `TaintFinding`, `TypestateFinding`, and witnesses. The dependency is asymmetric: #709 must not encode solver worklists, summary tables, or automaton internals, and #824/#825 must not invent a second policy identity, loading, severity, message, classification, or SARIF model.
 
 #709 owns:
 
 - the versioned `.rqlp` document, explicit workspace-safe loading, and policy identity/metadata;
-- `PolicyDefinition`, a tagged `PolicyAnalysis` boundary and public authoring types such as `TypestatePolicySpec`, designed without exposing solver/client storage types;
-- `PolicyFinding`, stable locations and related locations, result completeness, and human/SARIF rendering;
-- the rule that a `CodeQueryMatch`, `FlowFinding`, or `TypestateFinding` is not itself a diagnostic.
+- `PolicyDefinition`, a tagged `PolicyAnalysis` boundary selected by the public `analysis.type` field, plus authoring types such as `TaintPolicySpec` and `TypestatePolicySpec`, designed without exposing solver/client storage types;
+- `PolicyFinding`, broad and refined classifications, optional evidence-backed CVSS assessment, stable locations and related locations, result completeness, and human/SARIF rendering;
+- the rule that a `CodeQueryMatch`, `FlowFinding`, `TaintFinding`, or `TypestateFinding` is not itself a diagnostic.
+
+#821 owns the internal set-oriented `TaintAnalysisPlan`, `TaintFinding`, and transfer semantics. #823 owns symbolic `TaintTransferSummary`. #824 owns `TaintPolicyCompiler` and finding classification: it expands versioned source/sink catalogs and inline selectors, constructs one bounded seed/observer plan, and maps meeting-point findings into #709's public classification/CVSS model without rerunning propagation per classification.
 
 #822 owns the versioned internal `ProtocolSpec`, automaton compilation, and `TypestateFinding`. #824 owns `TypestatePolicyCompiler`, typed query domains, and adapters from analysis services to query rows and policy findings. The compiler lowers #709's author-facing `TypestatePolicySpec` into #822's internal `ProtocolSpec`; neither model embeds the other. #824 may build internal result domains before #709 closes, but it cannot declare the policy-facing wire shape stable until the #709 envelope and finding model are accepted. #825 requires both paths: diagnostic-neutral query exploration and `.rqlp` policy execution.
 
-Extend `QueryValueKind` and the declarative query schema with source-backed `procedure`, `program_point`, `flow_endpoint`, `typestate_finding`, `typestate_witness`, and `flow_witness` domains. The initial operations are fixed by this plan:
+Extend `QueryValueKind` and the declarative query schema with source-backed `procedure`, `program_point`, `flow_endpoint`, `taint_finding`, `typestate_finding`, `taint_witness`, `typestate_witness`, and `flow_witness` domains. The initial operations are fixed by this plan:
 
 | Operation | Accepted input | Output | Required bound/behavior |
 | --- | --- | --- | --- |
@@ -338,17 +437,19 @@ Extend `QueryValueKind` and the declarative query schema with source-backed `pro
 | `cfg_entry` / `cfg_exits` | procedure | program point | Exits include normal/exceptional kind. |
 | `cfg_successors` / `cfg_predecessors` | program point | program point | Positive finite `depth`, default 1; provenance carries each control edge. |
 | `flows_to` / `flows_from` | expression site, program point, or flow endpoint | flow endpoint | Positive finite `depth` or explicit sink/source selector; valid-path semantics and work budget. |
+| `taint` | structural match, expression site, or flow endpoint | taint finding | Execution-scoped compiled taint plan, one finite multi-source/multi-sink run, solver budget. |
 | `typestate` | structural match, call site, expression site, or flow endpoint | typestate finding | Execution-scoped protocol reference, bind selector, may mode, solver budget. |
-| `witness` | typestate finding or flow endpoint | typed witness | Positive finite maximum steps and bytes. |
+| `witness` | taint finding, typestate finding, or flow endpoint | typed witness | Positive finite maximum steps and bytes. |
 
 Actual/formal/receiver/return bindings appear in flow provenance and solver transfers rather than as control edges. Each operation has a finite work budget, explicit capability diagnostics, deterministic endpoint identity and ordering, cancellation, and proof/completeness semantics. A witness is a bounded supporting derivation, not proof that all alternatives were enumerated. The planner evaluates cheap structural seeds before materializing expensive semantic facets.
 
-Keep two canonical fixtures:
+Keep these canonical fixtures:
 
 - `tests/fixtures/typestate/resource-lifecycle.protocol.json` contains only #822's internal `ProtocolSpec` and can be tested before #709 exists.
 - `tests/fixtures/policies/resource-lifecycle.rqlp` contains #709's public policy envelope, an RQL structural selector, and a public `TypestatePolicySpec`. A #824 conformance test lowers the public rule and requires it to compile to the same internal protocol hash as the #822 fixture without requiring their serialized shapes to match.
+- `tests/fixtures/policies/attacker-controlled-to-sensitive-sinks.rqlp` contains one public `TaintPolicySpec` with source/sink catalog sets plus inline entries. It must compile to one `TaintAnalysisPlan`, not a Cartesian product of pair plans.
 
-The `.rqlp` pilot contract is JSON with RQL used for structural selection. Parsing lowers the selector into canonical `CodeQuery` IR stored by `PolicyDefinition`; the evaluator never reparses selector text during analysis. #709 may choose a different serialization only through its own reviewed schema decision and a corresponding Decision Log update here. The initial public shape is:
+The `.rqlp` pilot contract is JSON with RQL used for structural selection. Parsing lowers each variant's selectors into canonical `CodeQuery` IR stored inside its `PolicyAnalysis` value; the evaluator never reparses selector text during analysis. #709 may choose a different serialization only through its own reviewed schema decision and a corresponding Decision Log update here. The typestate public shape is:
 
 ```json
 {
@@ -358,11 +459,11 @@ The `.rqlp` pilot contract is JSON with RQL used for structural selection. Parsi
     "severity": "error",
     "message": "Resource is used outside its open lifecycle"
   },
-  "selector": {
-    "rql": "(call :callee \"open\")"
-  },
   "analysis": {
-    "kind": "typestate",
+    "type": "typestate",
+    "selector": {
+      "rql": "(call :callee \"open\")"
+    },
     "subject": {"bind": "return_value"},
     "mode": "may",
     "uncertainty": {
@@ -421,6 +522,177 @@ This is a public `TypestatePolicySpec`, not a serialized `ProtocolSpec`. `Typest
 
 When the typestate capability is present, #824 lowers the public rule and registers the internal automaton by canonical hash in `ProtocolRegistry`, receiving an execution-scoped `ProtocolHandle`. `QueryAnalysisContext` maps a human-readable `ProtocolRef` to that handle. A policy uses `policy:<policy-id>`; embeddings may register an explicitly namespaced reference. Registering the same reference with a different hash is an error, while different references may share one compiled hash. Handle slots are never serialized or used as summary keys. There is no implicit directory scan, and `CodeQuery`/RQL cannot load arbitrary protocol paths.
 
+The taint public shape uses the same policy envelope but declares sets rather than a source/sink pair:
+
+```json
+{
+  "schema_version": 1,
+  "policy": {
+    "id": "bifrost.security.attacker-controlled-to-sensitive-sinks",
+    "message": "Attacker-controlled data reaches {{sink.label}}",
+    "severity": {"type": "cvss", "when_unscored": "unrated"}
+  },
+  "analysis": {
+    "type": "taint",
+    "mode": "may",
+    "sources": {
+      "include_sets": ["bifrost.sources.attacker-controlled"],
+      "entries": [
+        {
+          "id": "http-request-parameters",
+          "selector": {"rql": "(call :callee \"requestParameter\")"},
+          "bind": "return_value",
+          "labels": ["attacker_controlled"],
+          "evidence": {
+            "trust_boundary": "external",
+            "system_entry": "vulnerable_system.network_stack"
+          }
+        }
+      ]
+    },
+    "sinks": {
+      "include_sets": [
+        "bifrost.sinks.persistent-data-write",
+        "bifrost.sinks.control-influence"
+      ],
+      "entries": [
+        {
+          "id": "sql-execute",
+          "selector": {"rql": "(call :callee \"execute\")"},
+          "dangerous_operand": {"argument": 0},
+          "accepts": ["attacker_controlled"],
+          "tags": ["security_sensitive", "sql_execution"],
+          "impacts": ["vulnerable_system.integrity"]
+        }
+      ]
+    },
+    "sanitizers": {
+      "include_sets": ["bifrost.sanitizers.default"]
+    },
+    "report_when": {
+      "source_labels": {"any": ["attacker_controlled"]},
+      "sink_tags": {"any": ["security_sensitive"]}
+    }
+  },
+  "classification": {
+    "fallback": {"id": "untrusted-data-to-sensitive-operation"},
+    "refinements": [
+      {
+        "when": {"sink_tags": {"all": ["sql_execution"]}},
+        "cwe": ["CWE-89"]
+      }
+    ],
+    "cvss": {
+      "version": "4.0",
+      "emit": "when_base_complete",
+      "metric_rules": [
+        {
+          "metric": "AV",
+          "value": "N",
+          "when": {
+            "source_evidence": {
+              "system_entry": "vulnerable_system.network_stack"
+            }
+          },
+          "basis": "policy_assertion",
+          "scope": "vulnerable_system",
+          "evidence_refs": ["source:http-request-parameters"],
+          "rationale": "The vulnerable system itself receives the input through its network stack"
+        }
+      ]
+    }
+  },
+  "report": {
+    "witness": {"max_steps": 64, "max_bytes": 16384},
+    "origins_per_finding": 8
+  }
+}
+```
+
+`include_sets` names versioned source, sink, and sanitizer catalogs; `entries` adds policy-local structured selectors. A reusable model pack may be source-only, sink-only, sanitizer-only, or mixed, but a policy composes those packs explicitly and its resolved source and sink sets must both be non-empty. Catalog expansion is deterministic, its version/hash participates in `TaintAnalysisPlan` identity, and duplicate IDs with different definitions are errors unless a versioned precedence rule resolves them. The compiler resolves selectors and bindings to semantic identities before propagation; a same-name text guess never becomes a seed, sink, or sanitizer. Every sink names its dangerous receiver or operand, so an SQL-structure argument is not confused with a safe bound-value parameter.
+
+`TaintCatalogRegistry` owns versioned source, sink, sanitizer/transform, and external-model documents. Built-in catalogs have stable names and content hashes; embedding applications explicitly register bytes or workspace-safe paths under a namespace. There is no implicit directory scan or network load. Canonical composition records catalog versions and content hashes, rejects identity collisions and incompatible class semantics, and produces the exact `TaintPropagationEventMatchKey` and `TaintSinkObserverMatchKey` inputs. A catalog may legitimately omit one or more categories; the non-empty-both-sides requirement applies only after a taint policy is compiled.
+
+`TaintPolicyCompiler` creates one plan containing all seeds, sinks, sanitizer transfers, label IDs, catalog hashes, budgets, and completeness. It must not emit one plan per source/sink pair. The solver propagates compact label sets and consults each procedure's `TaintTransferSummary`; sink observers do not change transfer summaries. Adding a sink or changing CWE/CVSS classification can reuse existing propagation summaries. Changing a sanitizer or label-transfer rule invalidates affected taint summaries because it changes flow semantics.
+
+`TaintBatchPlanner` also accepts several compiled policies. It partitions them by exact propagation semantics plus compatible workspace snapshot, analysis scope, and completeness-affecting budgets, unions compatible source seeds and sink observers, retains each policy's source/sink compatibility projection, and executes one superset run per partition. A broader scope or larger budget can answer a narrower policy only when that substitution is explicitly authorized and the projection retains the narrower policy's completion semantics; otherwise the policies remain separate partitions. A completed superset can answer a subset policy only when all required source classes, matched events, and sink observations remain distinguishable and complete. It then projects diagnostic-neutral meetings back to policy IDs; it never makes message, CWE, CVSS, or other presentation metadata part of solver state. This is the cross-policy counterpart to avoiding the source-by-sink Cartesian product within one policy.
+
+At a sink, a meeting exists when `reached_source_labels ∩ accepted_source_labels` is non-empty. The diagnostic-neutral `TaintFinding` contains the sink, reached classes, bounded contributing origins, proof/completeness, and witnesses. The fallback classification is applied first, so attacker-controlled data reaching an otherwise security-sensitive database/control sink remains a vulnerability even when no specific CWE refinement matches. Refinements add taxonomy such as CWE; they do not decide whether the meeting exists.
+
+CVSS assessment happens after the meeting and classification. The engine accepts metric values with provenance, never an author-supplied numeric score. `CvssMetricEvidence` contains `metric`, `value`, `basis` (`static_witness`, `policy_assertion`, `environment_profile`, `threat_feed`, or `analyst_override`), `evidence_refs`, `rationale`, `assumptions`, `assessor_or_tool`, `assessed_at`, and `system_scope`. Catalog and policy assertions lower to this same record with their content hash and authored provenance; run-scoped Environmental profiles, time-scoped Threat intelligence, and analyst assertions arrive through `AnalysisContext` overlays rather than being embedded as changing facts inside the reusable policy file.
+
+Static evidence may support some metrics but does not get to infer the rest. `AV:N` requires evidence that the vulnerable system itself is bound to a network stack; content delivered as a downloaded file or malicious document does not become `AV:N` merely because a network transported it. A sink may establish which security property can be affected, but does not establish Low/High magnitude, exploit prerequisites, or the vulnerable-versus-subsequent-system boundary without evidence. Conflicting evidence produces explicit assessment variants when each scenario is coherent, otherwise `Unscored`; provider order never silently resolves a conflict.
+
+The CVSS v4.0 Base metrics are `AV`, `AC`, `AT`, `PR`, `UI`, `VC`, `VI`, `VA`, `SC`, `SI`, and `SA`. They have no “Not Defined” value. The result algebra is therefore:
+
+    struct CvssAssessmentSet {
+        variants: Vec<CvssAssessmentVariant>,
+        selected_for_display: Option<CvssAssessmentVariantId>,
+        selection_rationale: Option<String>,
+    }
+
+    struct CvssAssessmentVariant {
+        id: CvssAssessmentVariantId,
+        vulnerability_identity: VulnerabilityIdentity,
+        source_scenarios: Vec<SourceScenarioId>,
+        witness_refs: Vec<WitnessId>,
+        assessment: CvssAssessment,
+    }
+
+    enum CvssAssessment {
+        Scored {
+            version: CvssVersion,
+            nomenclature: CvssNomenclature,
+            vector: String,
+            components: Vec<CvssComponentResult>,
+            metrics: Vec<CvssMetricEvidence>,
+            provenance: CvssAssessmentProvenance,
+        },
+        Unscored {
+            version: CvssVersion,
+            established: Vec<CvssMetricEvidence>,
+            missing_base_metrics: Vec<CvssBaseMetric>,
+            reasons: Vec<IncompleteReason>,
+            provenance: CvssAssessmentProvenance,
+        },
+    }
+
+A scored assessment publishes the canonical vector and nomenclature plus every applicable component result: Base score/severity, Base+Threat when non-default Threat metrics are supplied, and Environmental/final score/severity when Environmental metrics are supplied. `CvssAssessmentProvenance` records scorer/algorithm version, assessment timestamp, system-of-interest boundary, affected configuration, policy/content/analyzer hashes, selected witnesses, assumptions, and FIRST attribution. The engine canonicalizes the vector and recomputes its scores; a supplied vector/score mismatch is rejected.
+
+Unknown Base metrics yield `Unscored`, not `None` metric values or worst-case guesses. `X`/Not Defined is accepted only for the Threat, Environmental/Modified, and Supplemental metrics for which CVSS v4.0 defines it, using the specified defaults; it is rejected for Base metrics. Missing or non-comprehensive threat intelligence remains `E:X`, never `E:U` just because a feed has no match. Threat and Environmental evidence is a time/environment-scoped overlay and never enters reusable flow-summary keys. A reportable affected vulnerability with all vulnerable/subsequent-system impact metrics at None and a computed Base score of 0.0 is contradictory evidence: return a diagnostic `Unscored` assessment or revisit the security classification rather than silently publishing it. CVSS severity, analyzer certainty, and organization-specific risk remain separate fields.
+
+When several source classes reach one sink, group scenarios only when they represent the same vulnerability identity and their system boundary, prerequisite evidence, completion, classification, and complete CVSS vector match; retain all contributing source classes and bounded witnesses. Different metric vectors remain assessment variants. Never union CIA impacts across mutually incompatible witnesses, sum or average scores, or splice exploitability metrics from one path with impacts from an incompatible path. An explicit vulnerability chain preserves its component vulnerability identities. If a UI displays one score, it may select the highest defensible complete variant while preserving every variant and identifying the supporting witness and assumptions.
+
+The diagnostic-neutral taint query consumes an execution-scoped compiled plan reference. It can restrict which already-declared sink observers are projected, but it cannot introduce text-matched seeds or load a policy/model file:
+
+```json
+{
+  "schema_version": 3,
+  "languages": ["typescript"],
+  "match": {"kind": "call", "callee": {"name": "execute"}},
+  "steps": [
+    {
+      "op": "taint",
+      "plan_ref": "policy:bifrost.security.attacker-controlled-to-sensitive-sinks",
+      "at": "sink"
+    },
+    {"op": "witness"}
+  ]
+}
+```
+
+The equivalent diagnostic-neutral RQL is:
+
+```lisp
+(witness
+  (taint :plan-ref "policy:bifrost.security.attacker-controlled-to-sensitive-sinks"
+         :at sink
+    (language typescript
+      (call :callee "execute"))))
+```
+
+The result contains sink identity, reached source classes, bounded origins, proof/completeness, and a witness, but no policy message, CWE, severity, or CVSS. `PolicyEvaluator` supplies those only when projecting the same `TaintFinding` through its `PolicyDefinition`.
+
 The diagnostic-neutral JSON query increments `CodeQuery` to schema version 3 and introduces `typestate` followed by `witness`. Its `QueryAnalysisContext` must resolve the reference before validation/execution:
 
 ```json
@@ -476,7 +748,7 @@ For a `use()` after `close()`, the typed analysis result has this minimum observ
 
 `protocol_hash` is serialized as exactly 64 lowercase hexadecimal characters; the illustrative value above is replaced by the fixture's actual canonical hash in gold output.
 
-Evaluating the `.rqlp` policy maps that result into a `PolicyFinding` with `policy_id`, severity, message, primary/related locations, analysis kind, proof/completeness, and the bounded witness. The same `PolicyFinding` feeds human and SARIF renderers; renderers never reinterpret raw query matches or solver facts.
+Evaluating the `.rqlp` policy maps that result into a `PolicyFinding` with `policy_id`, severity/unrated state, message, primary/related locations, analysis type, classification, optional CVSS assessment, proof/completeness, and the bounded witness. The same `PolicyFinding` feeds human and SARIF renderers; renderers never reinterpret raw query matches or solver facts.
 
 Changing either pilot wire shape requires an entry in the Decision Log plus canonical policy, JSON query, RQL lowering, validation, rendering, editor, and end-to-end test updates. Java uses the same policy/protocol definition with only the analyzed fixture changing.
 
@@ -527,20 +799,25 @@ The reference implementation creates this repository-relative module and test la
     src/analyzer/java/semantic.rs
     src/analyzer/dataflow/
       mod.rs problem.rs tabulation.rs summary.rs outcome.rs witness.rs
+    src/analyzer/taint/
+      mod.rs model.rs plan.rs client.rs summary.rs finding.rs provenance.rs
     src/analyzer/typestate/
       mod.rs protocol.rs client.rs summary.rs
     src/analyzer/policy/
-      mod.rs definition.rs evaluator.rs finding.rs
+      mod.rs definition.rs evaluator.rs finding.rs catalog.rs taint.rs classification.rs cvss.rs
       render/mod.rs render/human.rs render/sarif.rs
     tests/
       semantic_ir_contract.rs semantic_cfg_contract.rs
       semantic_oracle_contract.rs icfg_contract.rs
       semantic_graph_algorithms.rs dataflow_tabulation.rs
-      dataflow_clients.rs typestate_protocol.rs analysis_summaries.rs
-      semantic_artifact_store.rs static_analysis_policy.rs
+      dataflow_clients.rs taint_policy_sets.rs taint_summary_reuse.rs
+      typestate_protocol.rs analysis_summaries.rs semantic_artifact_store.rs
+      static_analysis_policy.rs cvss_classification.rs
+      code_query_taint.rs policy_taint_integration.rs
       code_query_typestate.rs policy_typestate_integration.rs typestate_pilot.rs
     tests/fixtures/typestate/resource-lifecycle.protocol.json
     tests/fixtures/policies/resource-lifecycle.rqlp
+    tests/fixtures/policies/attacker-controlled-to-sensitive-sinks.rqlp
 
 Each milestone creates and runs its named behavior test. A missing test binary is not a passing milestone.
 
@@ -564,15 +841,15 @@ Expected: `test result: ok`; returns resume only at their originating call sites
 
 For #820 and #821:
 
-    cargo test --test dataflow_tabulation --test dataflow_clients
+    cargo test --test dataflow_tabulation --test dataflow_clients --test taint_policy_sets --test taint_summary_reuse
 
-Expected: `test result: ok`; bounded exhaustive-reference cases match tabulation, distributivity/property tests pass, recursion converges, and direct/taint clients share the kernel.
+Expected: `test result: ok`; bounded exhaustive-reference cases match tabulation, distributivity/property tests pass, recursion converges, and direct/taint clients share the kernel. One multi-source/multi-sink run has the same meetings as the union of bounded per-pair reference runs without executing the Cartesian product; equivalent origins aggregate; incomplete discovery cannot produce a complete negative; and witness limits do not change reachability.
 
 For #822 and #823:
 
-    cargo test --test typestate_protocol --test analysis_summaries
+    cargo test --test typestate_protocol --test analysis_summaries --test taint_summary_reuse
 
-Expected: `test result: ok`; the canonical protocol validates, TypeScript and Java share its hash, internal tabulation summaries remain distinct from semantic/protocol summaries, and incomplete summaries are not reused as complete.
+Expected: `test result: ok`; the canonical protocol validates, TypeScript and Java share its hash, internal tabulation summaries remain distinct from semantic/taint/protocol summaries, and incomplete summaries are not reused as complete. Taint transfer summaries are reused when only sink selection, message, CWE refinement, or CVSS evidence changes, and are invalidated when sanitizer, transform, heap/access-path, or unknown-call semantics change.
 
 For #817 after an artifact is promoted:
 
@@ -582,9 +859,9 @@ Expected: `test result: ok`; version, corruption, generation, overlay, dependenc
 
 For #709 and #824:
 
-    cargo test --test static_analysis_policy --test code_query_typestate --test policy_typestate_integration
+    cargo test --test static_analysis_policy --test taint_policy_sets --test cvss_classification --test code_query_taint --test policy_taint_integration --test code_query_typestate --test policy_typestate_integration
 
-Expected: `test result: ok`; the policy envelope and `PolicyFinding` contract pass independently, the schema-version-3 JSON and RQL examples lower to one diagnostic-neutral query, invalid domain transitions have path-specific errors, and the policy adapter maps the typed result into matching human/SARIF findings.
+Expected: `test result: ok`; the policy envelope and `PolicyFinding` contract pass independently, `analysis.type` selects `match`, `taint`, or `typestate`, and the schema-version-3 JSON and RQL examples lower to diagnostic-neutral queries. The taint fixture compiles to one plan, keeps a broad finding when no CWE refinement matches, rejects missing/conflicting catalog sides and ambiguous sink operands, maps incomplete Base evidence to `Unscored`, computes scores rather than accepting authored numbers, and preserves metric provenance and compatible assessment variants in matching human/SARIF findings.
 
 For #825:
 
@@ -626,11 +903,21 @@ For benchmark milestones, capture commands and outputs in the issue or an `.agen
 - Deep and cyclic fixtures remain stack-safe.
 - Non-distributive clients cannot silently use the IFDS contract.
 
-### Typestate and client validation
+### Taint, typestate, and client validation
 
 - One resource protocol definition runs on both reference languages.
 - Valid, use-before-open, use-after-close, double-close, leak/escape, alias, helper, branch, recursion, ambiguous dispatch, unsupported, and exceptional cases have gold outcomes.
 - A one-state/direct-flow client and taint client run through the same ICFG and solver.
+- One set-oriented taint run matches the bounded per-pair reference union while performing shared propagation. Different source classes meet the same sink without creating duplicate source-instance-by-sink findings.
+- A three-source/four-sink fixture invokes one solver run, and several compatible policies union into one batch partition before projecting findings back to each policy. Incompatible transfer semantics form distinct partitions.
+- Selective sanitization removes only the declared compatible classes. Changing run-local dense-bit order preserves stable class identities, and persisted universes remap through `TaintUniverseHash` rather than reusing raw bit positions.
+- A broad attacker-controlled-to-security-sensitive meeting remains a finding without a narrow CWE refinement. The sink identifies its dangerous operand, and a safely bound value does not inherit the SQL-structure sink rule.
+- Meeting tests reject same-node intersections with incompatible carriers, call/return contexts, access paths, exceptional states, or transform states.
+- Source/sink discovery gaps, unknown calls, lossy class truncation, or incomplete summaries prevent a complete negative. Bounded origins and witnesses never truncate reachability.
+- Flow summaries are reused across sink, message, classification, and CVSS-only policy changes; transfer-changing sanitizer, model, context, heap, and access-path changes invalidate the affected summaries.
+- Cache tests cover safe hits for reporting-only changes and safe misses for artifact, matcher, sanitizer/transform, oracle, external-model, context/access-path, exceptional/unknown-call, and callee/SCC dependency changes.
+- CVSS conformance tests use official FIRST v4.0 reference vectors to cover canonical metric order and score recomputation; all 11 Base metrics; one missing Base metric becoming `Unscored`; rejection of Base `X`; valid Not-Defined defaults outside Base; `E:X` versus evidence-backed `E:U`; and Base, Base+Threat, Environmental, and final component publication for `CVSS-B`, `CVSS-BT`, `CVSS-BE`, and `CVSS-BTE`.
+- Assessment tests distinguish a network-bound vulnerable system (`AV:N`) from a downloaded file/document case, turn contradictory/conflicting evidence into variants or `Unscored`, group identical coherent scenarios, retain different vectors, and justify any highest-score display selection. CVSS severity, analyzer certainty, and organizational risk remain distinct.
 - Witnesses are source-backed, bounded, context-respecting, and labeled with proof/completeness.
 
 ### Storage and performance validation
@@ -643,16 +930,19 @@ For benchmark milestones, capture commands and outputs in the issue or an `.agen
 ### Query and product validation
 
 - Typed validation rejects incompatible query-domain compositions before execution.
+- At least one JSON and one RQL query returns a set-oriented taint finding with reached source classes, a bounded origin set, completeness, and a witness.
 - At least one JSON and one RQL query returns a typestate finding and bounded witness.
-- `.rqlp` loading is owned by `PolicyRegistry`; `CodeQuery`/RQL cannot load arbitrary protocol paths, and traversal, oversized-file, or duplicate-policy-ID attempts fail deterministically.
+- `.rqlp` loading is owned by `PolicyRegistry` and taint model catalogs by `TaintCatalogRegistry`; `CodeQuery`/RQL cannot load arbitrary policy, catalog, model, or protocol paths, and traversal, oversized-file, identity-collision, or duplicate-policy-ID attempts fail deterministically.
 - The public `TypestatePolicySpec` lowers to the same canonical internal hash as the independently serialized #822 protocol fixture; their wire shapes are not required to match.
 - Registering one `ProtocolRef` with two different hashes fails deterministically; different references for the same hash share the compiled automaton, and stale handles fail after their context generation changes.
 - A raw query/analysis finding has no policy severity or diagnostic message; only `PolicyEvaluator` produces `PolicyFinding`.
+- One `.rqlp` taint policy composes versioned source/sink catalogs, compiles to one analysis plan, and produces equivalent broad/refined classifications and scored/unscored assessment data in human and SARIF output.
+- Human and SARIF renderers preserve vector, all applicable component scores/severities, nomenclature, `Scored`/`Unscored`, missing metrics/reasons, provenance, completion/certainty, all assessment variants, and the chosen display variant. Neither renderer recomputes or reinterprets CVSS.
 - One `.rqlp` typestate policy produces equivalent human and SARIF policy identity, primary location, related witness locations, and completeness.
 - Set composition, policy conversion, ordering, limits, truncation, diagnostics, and capability behavior are deterministic.
 - Every new public term has schema, parser/decoder, validation-range, hover/completion, grammar, execution, and documentation coverage.
 
-The epic is accepted when #825 demonstrates the root issue’s end-to-end criteria with reproducible correctness and performance evidence. Full language rollout and #826 are follow-on outcomes, not blockers for the first platform milestone unless the pilot proves the baseline architecture unsound.
+The epic is accepted when #821/#823/#824 demonstrate the set-oriented taint, summary-reuse, query, and policy criteria above and #825 demonstrates the typestate criteria with reproducible correctness and performance evidence. Full language rollout and #826 are follow-on outcomes, not blockers for the first platform milestone unless either client proves the baseline architecture unsound.
 
 ## Idempotence and Recovery
 
@@ -700,6 +990,12 @@ Existing integration anchors:
 - SQLite-backed compact structural snapshots PR #802
 - Store failure reporting #695
 
+Normative CVSS references checked for the policy/scoring contract:
+
+- FIRST CVSS v4.0 Specification Document, document version 1.2: https://www.first.org/cvss/v4.0/specification-document
+- FIRST CVSS v4.0 User Guide: https://www.first.org/cvss/v4.0/user-guide
+- FIRST CVSS v4.0 Data Representations: https://www.first.org/cvss/data-representations
+
 Add the merged commit here after publication completes. Add benchmark tables or links to `.agents/docs/` notes after each experimental milestone; include a recommendation, not only raw percentages.
 
 ## Interfaces and Dependencies
@@ -740,14 +1036,14 @@ The solver returns findings separately from run completion:
     struct PolicyDefinition {
         schema_version: PolicySchemaVersion,
         metadata: PolicyMetadata,
-        selector: CodeQuery,
         analysis: PolicyAnalysis,
+        classification: Option<PolicyClassificationSpec>,
         report: PolicyReportOptions,
     }
 
     enum PolicyAnalysis {
-        Match,
-        DataFlow(DataFlowPolicySpec),
+        Match(MatchPolicySpec),
+        Taint(TaintPolicySpec),
         Typestate(TypestatePolicySpec),
     }
 
@@ -761,10 +1057,14 @@ The solver returns findings separately from run completion:
 
     struct PolicyFinding {
         policy_id: PolicyId,
-        severity: PolicySeverity,
+        severity: FindingSeverity,
         message: String,
-        analysis_kind: PolicyAnalysisKind,
+        analysis_type: PolicyAnalysisType,
+        classification: FindingClassification,
+        analysis_evidence: PolicyFindingEvidence,
+        cvss: Option<CvssAssessmentSet>,
         certainty: FindingCertainty,
+        organizational_risk: Option<OrganizationalRiskAssessment>,
         primary: SourceLocation,
         related: Vec<RelatedLocation>,
         proof: ProofMetadata,
@@ -780,6 +1080,61 @@ The solver returns findings separately from run completion:
             budget: &mut PolicyBudget,
         ) -> PolicyRun;
     }
+
+`PolicyAnalysis` is serialized as an internally tagged union selected by exactly `analysis.type`; variant-specific selectors stay inside `MatchPolicySpec`, `TaintPolicySpec`, or `TypestatePolicySpec`. `classification` is optional: taint policies normally supply fallback/refinement/scoring rules, while structural or typestate policies may use only fixed reporting metadata. `FindingSeverity` is either a fixed policy severity, a severity derived from the selected complete CVSS variant, or `Unrated`. It never stores analyzer certainty or organizational risk. `PolicyFindingEvidence::Taint` retains the stable sink event, reached source classes, bounded contributing origins, semantic scenario identities, and witness references used by classification and scoring.
+
+The #821/#823/#824 taint bridge is also explicit:
+
+    struct TaintAnalysisPlan {
+        semantics_key: TaintPropagationSemanticsKey,
+        universe: TaintUniverse,
+        seeds: Vec<SourceEventKey>,
+        sink_observers: Vec<SinkObserver>,
+        propagation_event_matches: Vec<TaintPropagationEventMatchKey>,
+        sink_observer_matches: Vec<TaintSinkObserverMatchKey>,
+        budgets: TaintBudgets,
+        discovery: DiscoveryCompleteness,
+    }
+
+    struct TaintFinding {
+        key: TaintFindingKey,
+        sink: SinkEventKey,
+        scenario: TaintSemanticScenario,
+        reached_source_classes: TaintClassSet,
+        contributing_origins: BoundedOrigins,
+        proof: ProofMetadata,
+        completeness: FindingCompleteness,
+        witness_refs: Vec<WitnessId>,
+    }
+
+    struct TaintTransferSummary {
+        key: TaintTransferSummaryKey,
+        boundary_relation: SymbolicTaintRelation,
+        local_source_ports: Vec<SymbolicSourcePort>,
+        internal_sink_ports: Vec<SymbolicSinkObservation>,
+        exceptional_and_escape_effects: TaintEffects,
+        proof: ProofMetadata,
+        completeness: SummaryCompleteness,
+    }
+
+    trait TaintPolicyCompiler {
+        fn compile(
+            &self,
+            policy_id: &PolicyId,
+            spec: &TaintPolicySpec,
+            context: &mut QueryAnalysisContext,
+            budget: &mut SemanticBudget,
+        ) -> AnalysisOutcome<CompiledTaintPolicy>;
+    }
+
+    trait TaintBatchPlanner {
+        fn partition(
+            &self,
+            policies: &[CompiledTaintPolicy],
+        ) -> AnalysisOutcome<Vec<TaintBatchPartition>>;
+    }
+
+`CompiledTaintPolicy` contains one policy's set-oriented plan plus its compatibility, classification, scoring, and reporting projection. `TaintBatchPlanner` groups equal propagation-semantics keys only when workspace snapshot, scope, and completeness-affecting budgets are also compatible, unions seeds/observers while preserving stable class and event identities, and returns a projection map from each batch meeting to the policies it can answer. It does not union incompatible sanitizer, transform, heap, access-path, context, external-model, exceptional, unknown-call, scope, or completion semantics.
 
 The #824 bridge between the public and internal typestate models is explicit:
 
@@ -801,7 +1156,7 @@ The #824 bridge between the public and internal typestate models is explicit:
 
 `ProtocolHandle` is opaque and valid only for one `QueryAnalysisContext`; it contains a context generation, dense slot, and canonical hash. Registration atomically binds `ProtocolRef("policy:<policy-id>")` to the handle and rejects an existing reference with a different hash. Protocol summaries and persisted artifacts key on the hash plus solver/configuration inputs, never the reference or dense slot.
 
-The initial #709 implementation may execute only `PolicyAnalysis::Match`, but it parses and retains a versioned public `TypestatePolicySpec` without importing `ProtocolSpec` or inventing solver semantics. #824 supplies the compiler above plus adapters from `AnalysisRun<FlowFinding>` and `AnalysisRun<TypestateFinding>` after those clients exist. There is no context-free conversion from `CodeQueryMatch` or an analysis finding into `PolicyFinding`: evaluation always requires a `PolicyDefinition`. Human and SARIF renderers consume only `PolicyRun`/`PolicyFinding`.
+The initial #709 implementation may execute only `PolicyAnalysis::Match`, but it parses and retains versioned public `TaintPolicySpec` and `TypestatePolicySpec` values without importing `TaintAnalysisPlan`/`ProtocolSpec` or inventing solver semantics. #824 supplies the compilers above plus adapters from `AnalysisRun<FlowFinding>`, `AnalysisRun<TaintFinding>`, and `AnalysisRun<TypestateFinding>` after those clients exist. There is no context-free conversion from `CodeQueryMatch` or an analysis finding into `PolicyFinding`: evaluation always requires a `PolicyDefinition`. Human and SARIF renderers consume only `PolicyRun`/`PolicyFinding`.
 
 The semantic adapter boundary is:
 
@@ -919,7 +1274,33 @@ An IDE client extends that contract:
         type EdgeFunction: Clone + Eq;
 
         fn lattice_height_bound(&self) -> usize;
+        fn initial_value(&self, seed: Self::Fact) -> Self::Value;
         fn identity_edge(&self) -> Self::EdgeFunction;
+        fn normal_edge_function(
+            &self,
+            edge: ControlEdgeId,
+            fact: Self::Fact,
+        ) -> Self::EdgeFunction;
+        fn call_edge_function(
+            &self,
+            call: &CallTransfer,
+            fact: Self::Fact,
+        ) -> Self::EdgeFunction;
+        fn return_edge_function(
+            &self,
+            ret: &ReturnTransfer,
+            fact: Self::Fact,
+        ) -> Self::EdgeFunction;
+        fn call_to_return_edge_function(
+            &self,
+            call: &CallTransfer,
+            fact: Self::Fact,
+        ) -> Self::EdgeFunction;
+        fn exceptional_edge_function(
+            &self,
+            edge: ControlEdgeId,
+            fact: Self::Fact,
+        ) -> Self::EdgeFunction;
         fn compose(
             &self,
             first: &Self::EdgeFunction,
@@ -947,10 +1328,11 @@ Summary ownership is explicit:
 
 - `TabulationEndSummary` is private to `dataflow::tabulation` and required for IFDS/IDE correctness and recursion convergence.
 - `SemanticProcedureSummary` is a reusable client-independent projection owned by `dataflow::summary`.
+- `TaintTransferSummary` is owned by `taint::summary`; it carries symbolic boundary transfer plus local source and internal sink ports, keyed by exact propagation and dependency semantics.
 - `ProtocolSummary` is owned by `typestate::summary` and includes the protocol hash.
 
-A `SummaryStore` may memoize either reusable type in memory and optionally SQLite, but the solver accepts an in-memory implementation and does not require persistence to be correct. Incomplete `TabulationEndSummary` values never enter a complete reusable summary.
+A `SummaryStore` may memoize any reusable summary type in memory and optionally SQLite, but the solver accepts an in-memory implementation and does not require persistence to be correct. Incomplete `TabulationEndSummary`, `TaintTransferSummary`, or recursive-SCC values never enter a complete reusable summary; SCC members publish atomically after convergence.
 
 Public query changes depend on the declarative schema registry in `src/analyzer/structural/query/schema.rs`. Public policy changes depend on the versioned schema and finding model established by #709. Neither side may add private keyword lists, editor-only vocabulary, source-text path parsing, or an implicit conversion from query matches to diagnostics. Existing Rust dependencies should be preferred for the first implementation; any new solver or graph crate requires a measured build/runtime benefit and an explicit Decision Log entry.
 
-Plan revision note (2026-07-16): Initial roadmap written after auditing the post-PR-#802 codebase and creating epic #813 with native subissues #814–#826. The initial plan deliberately makes TypeScript/Java the reference pair, IFDS/IDE the baseline solver shape, compact memory plus selective SQLite the lifecycle policy, dominance optional, and WPDS/SPDS evidence-gated. Draft PR #827 and its initial checkpoint commit were added after publication. A later same-day revision made #709 the early public policy/API gate, separated `.rqlp`/`PolicyFinding` from the internal protocol and analysis result models, and required the #825 pilot to validate query, human, and SARIF surfaces from one analysis result.
+Plan revision note (2026-07-16): Initial roadmap written after auditing the post-PR-#802 codebase and creating epic #813 with native subissues #814–#826. The initial plan deliberately makes TypeScript/Java the reference pair, IFDS/IDE the baseline solver shape, compact memory plus selective SQLite the lifecycle policy, dominance optional, and WPDS/SPDS evidence-gated. Draft PR #827 and its initial checkpoint commit were added after publication. A later same-day revision made #709 the early public policy/API gate, separated `.rqlp`/`PolicyFinding` from the internal protocol and analysis result models, and required the #825 pilot to validate query, human, and SARIF surfaces from one analysis result. This revision also made `analysis.type: taint` set-oriented end to end: one compatible multi-source/multi-sink batch, stable class-set propagation with bounded origins, symbolic taint summaries and exact cache layers, broad findings before CWE refinement, and evidence-backed CVSS v4.0 variants that never fabricate a score from incomplete Base evidence.
