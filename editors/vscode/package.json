@@ -287,6 +287,7 @@
   },
   "scripts": {
     "compile": "node esbuild.mjs",
+    "license:prepare": "node ../../scripts/prepare-vscode-license-artifacts.mjs",
     "compile:test": "tsc -p tsconfig.test.json",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"*.{json,mjs,md}\" \"syntaxes/*.json\"",
     "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"*.{json,mjs,md}\" \"syntaxes/*.json\"",
@@ -294,9 +295,9 @@
     "lint:fix": "npm run lint -- --fix",
     "typecheck": "tsc -p tsconfig.test.json --noEmit && tsc -p tsconfig.tools.json",
     "watch": "node esbuild.mjs --watch",
-    "test": "npm run format:check && npm run typecheck && npm run lint && npm run compile && npm run test:unit",
+    "test": "npm run format:check && npm run typecheck && npm run lint && npm run compile && npm run license:prepare && npm run test:unit",
     "test:unit": "npm run compile:test && node --test out-test/test/*.test.js",
-    "vscode:prepublish": "npm run compile"
+    "vscode:prepublish": "npm run compile && npm run license:prepare"
   },
   "dependencies": {
     "extract-zip": "^2.0.1",
