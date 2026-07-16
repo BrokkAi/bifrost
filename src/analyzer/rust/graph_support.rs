@@ -399,7 +399,13 @@ impl RustAnalyzer {
         &self,
         file: &ProjectFile,
     ) -> Arc<RustReferenceContext> {
-        Arc::new(self.build_reference_context(file, true))
+        if let Some(cached) = self.forward_reference_contexts.get(file) {
+            return cached;
+        }
+        let context = Arc::new(self.build_reference_context(file, true));
+        self.forward_reference_contexts
+            .insert(file.clone(), context.clone());
+        context
     }
 
     fn build_reference_context(&self, file: &ProjectFile, forward: bool) -> RustReferenceContext {
@@ -1283,4 +1289,29 @@ fn trait_reference_matches(
                 .into_iter()
                 .any(|file| file == *trait_owner.source())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::Language;
+    use crate::test_support::AnalyzerFixture;
+
+    #[test]
+    fn forward_reference_context_is_reused_within_analyzer_generation() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[
+                ("src/lib.rs", "pub mod exports;\n"),
+                ("src/exports.rs", "pub use std::collections::HashMap;\n"),
+            ],
+        );
+        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
+        let file = ProjectFile::new(fixture.project_root(), "src/exports.rs");
+
+        let first = analyzer.forward_reference_context_of(&file);
+        let second = analyzer.forward_reference_context_of(&file);
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
 }
