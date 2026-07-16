@@ -548,7 +548,7 @@ object Target {
             r#"
 package example
 
-import example.Target.*
+import Target.*
 
 class Consumer {
   def call(): Int = run()

@@ -90,9 +90,17 @@ impl ScalaDeadCodeBulkContext {
         let Some(owner_fq_name) = spec.owner_fq_name.as_deref() else {
             return false;
         };
-        self.wildcard_owner_imports.contains(owner_fq_name)
-            || self.direct_member_imports.contains(&spec.target_fq_name)
+        let normalized_owner = scala_normalized_fq_name(owner_fq_name);
+        normalized_import_paths_contain(&self.wildcard_owner_imports, &normalized_owner)
+            || normalized_import_paths_contain(&self.direct_member_imports, &spec.target_fq_name)
     }
+}
+
+fn normalized_import_paths_contain(paths: &HashSet<String>, target_fq_name: &str) -> bool {
+    paths.contains(target_fq_name)
+        || target_fq_name
+            .match_indices('.')
+            .any(|(separator, _)| paths.contains(&target_fq_name[separator + 1..]))
 }
 
 pub(crate) fn dead_code_bulk_eligibility(
@@ -194,16 +202,85 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn scala_inverted_keeps_companion_bare_field_owners_exact() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = ProjectFile::new(root.clone(), "app/CompanionFields.scala");
+        file.write(
+            r#"package app
+import svc.Service
+
+class Obj {
+  def classRead: Int = field
+  def classShadow: Int = { val field: Int = 4; field }
+  val field: Int = 1
+}
+object Obj {
+  def objectRead: Int = field
+  def objectShadow: Int = { val field: Int = 5; field }
+  val field: Int = 2
+}
+object Sibling {
+  val field: Int = 3
+  def siblingRead: Int = field
+}
+class Params(val first: Int, var second: Int) {
+  def read: Int = first + second
+  def shadow(first: Int): Int = first
+}
+class ScopeLeak {
+  { val Service: Int = 0 }
+  def call: Int = Service.run()
+}
+"#,
+        )
+        .unwrap();
+        let service_file = ProjectFile::new(root.clone(), "svc/Service.scala");
+        service_file
+            .write("package svc\nobject Service { def run(): Int = 1 }\n")
+            .unwrap();
+        let project = TestProject::new(root, Language::Scala);
+        let analyzer = ScalaAnalyzer::new(Arc::new(project));
+        let nodes: HashSet<String> = analyzer
+            .all_declarations()
+            .map(|unit| unit.fq_name())
+            .collect();
+        let edges = build_scala_usage_edges(&analyzer, &nodes, |_| true)
+            .expect("Scala inverted edge build should succeed");
+
+        let has_edge = |caller: &str, callee: &str| {
+            edges
+                .edges
+                .contains_key(&(caller.to_string(), callee.to_string()))
+        };
+        assert!(has_edge("app.Obj$.objectRead", "app.Obj$.field"));
+        assert!(!has_edge("app.Obj.classRead", "app.Obj$.field"));
+        assert!(!has_edge("app.Sibling$.siblingRead", "app.Obj$.field"));
+        assert!(has_edge("app.Obj.classRead", "app.Obj.field"));
+        assert!(!has_edge("app.Obj$.objectRead", "app.Obj.field"));
+        assert!(!has_edge("app.Obj.classShadow", "app.Obj.field"));
+        assert!(!has_edge("app.Obj$.objectShadow", "app.Obj$.field"));
+        assert!(has_edge("app.Params.read", "app.Params.first"));
+        assert!(has_edge("app.Params.read", "app.Params.second"));
+        assert!(!has_edge("app.Params.shadow", "app.Params.first"));
+        assert!(has_edge("app.ScopeLeak.call", "svc.Service$.run"));
+    }
+
+    #[test]
     fn scala_usage_graph_bulk_fetch_bypasses_lru_and_preserves_point_entry() {
         const FILE_COUNT: usize = 132;
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         for index in 0..FILE_COUNT {
             let file = ProjectFile::new(root.clone(), format!("C{index}.scala"));
-            file.write(format!(
-                "package bulk\n\nclass C{index} {{\n  def run(): Unit = ()\n}}\n"
-            ))
-            .unwrap();
+            let source = if index == 0 {
+                "package bulk\n\ntrait Base\n\nobject Extensions {\n  extension (value: String) def run(): Unit = ()\n}\n\nclass C0 extends Base\n".to_string()
+            } else {
+                format!(
+                    "package bulk\n\nimport bulk.Extensions.run\n\nclass C{index} extends Base\n"
+                )
+            };
+            file.write(source).unwrap();
         }
 
         let project = TestProject::new(root, Language::Scala);
@@ -219,12 +296,8 @@ mod tests {
             .all_declarations()
             .map(|unit| unit.fq_name())
             .collect();
-        let edges = build_scala_usage_edges(&analyzer, &nodes, |_| true)
+        let _edges = build_scala_usage_edges(&analyzer, &nodes, |_| true)
             .expect("scala usage graph should build");
-        assert!(
-            edges.edges.is_empty(),
-            "fixture has no calls, only exercises graph file-state reads"
-        );
         assert_eq!(
             analyzer.full_hydration_count_for_test(),
             lru_after_warm,

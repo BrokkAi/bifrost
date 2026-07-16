@@ -43,7 +43,7 @@ pub(super) fn extract_scala_supertypes(
             Some(ScalaSupertypeFact {
                 raw: node_text(parent, source).to_string(),
                 lookup_path: ScalaSupertypeLookupPath {
-                    segments: lookup_path_segments(lookup_node, source),
+                    segments: scala_type_lookup_segments(lookup_node, source),
                 },
             })
         })
@@ -51,7 +51,7 @@ pub(super) fn extract_scala_supertypes(
         .collect()
 }
 
-fn lookup_path_segments(node: Node<'_>, source: &str) -> Vec<String> {
+pub(crate) fn scala_type_lookup_segments(node: Node<'_>, source: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {

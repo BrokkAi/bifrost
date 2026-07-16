@@ -1,5 +1,140 @@
-use crate::analyzer::{ImportInfo, scala_parenthesized_arity};
-use tree_sitter::Node;
+use crate::analyzer::scala::scala_type_lookup_segments;
+use crate::analyzer::{CallableArity, ImportInfo, scala_parenthesized_arity};
+use crate::hash::{HashMap, HashSet};
+use tree_sitter::{Node, Parser};
+
+#[derive(Default)]
+pub(crate) struct ScalaSourceFacts {
+    pub(crate) callable_alternatives_by_range:
+        HashMap<(usize, usize), ScalaCallableSourceAlternative>,
+    pub(crate) stable_owner_ranges: HashSet<(usize, usize)>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ScalaCallableSourceAlternative {
+    pub(crate) shape: Vec<CallableArity>,
+    pub(crate) extension_receiver_type_path: Option<Vec<String>>,
+    pub(crate) return_type_path: Option<Vec<String>>,
+}
+
+pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_scala::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(source, None)?;
+    let mut facts = ScalaSourceFacts::default();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "function_definition" | "function_declaration" => {
+                let mut cursor = node.walk();
+                let shape = node
+                    .named_children(&mut cursor)
+                    .filter(|child| child.kind() == "parameters")
+                    .map(callable_arity_for_parameters)
+                    .collect();
+                facts.callable_alternatives_by_range.insert(
+                    (node.start_byte(), node.end_byte()),
+                    ScalaCallableSourceAlternative {
+                        shape,
+                        extension_receiver_type_path: enclosing_extension_receiver_type_path(
+                            node, source,
+                        ),
+                        return_type_path: node
+                            .child_by_field_name("return_type")
+                            .map(|return_type| scala_type_lookup_segments(return_type, source))
+                            .filter(|segments| !segments.is_empty()),
+                    },
+                );
+            }
+            "class_definition" => {
+                let mut cursor = node.walk();
+                let lists = node
+                    .named_children(&mut cursor)
+                    .filter(|child| child.kind() == "class_parameters")
+                    .map(callable_arity_for_parameters)
+                    .collect::<Vec<_>>();
+                if !lists.is_empty() {
+                    facts.callable_alternatives_by_range.insert(
+                        (node.start_byte(), node.end_byte()),
+                        ScalaCallableSourceAlternative {
+                            shape: lists,
+                            extension_receiver_type_path: None,
+                            return_type_path: None,
+                        },
+                    );
+                }
+            }
+            "object_definition" | "enum_definition" => {
+                facts
+                    .stable_owner_ranges
+                    .insert((node.start_byte(), node.end_byte()));
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    Some(facts)
+}
+
+fn enclosing_extension_receiver_type_path(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        if ancestor.kind() == "extension_definition" {
+            let parameters = ancestor.child_by_field_name("parameters")?;
+            let mut cursor = parameters.walk();
+            return parameters
+                .named_children(&mut cursor)
+                .find(|parameter| matches!(parameter.kind(), "parameter" | "class_parameter"))
+                .and_then(|parameter| parameter.child_by_field_name("type"))
+                .map(|type_node| scala_type_lookup_segments(type_node, source))
+                .filter(|segments| !segments.is_empty());
+        }
+        if matches!(
+            ancestor.kind(),
+            "function_definition" | "function_declaration"
+        ) {
+            return None;
+        }
+        current = ancestor.parent();
+    }
+    None
+}
+
+fn callable_arity_for_parameters(parameters: Node<'_>) -> CallableArity {
+    let mut total = 0usize;
+    let mut required = 0usize;
+    let mut repeated = false;
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if !matches!(parameter.kind(), "parameter" | "class_parameter") {
+            continue;
+        }
+        total += 1;
+        let is_repeated = parameter
+            .child_by_field_name("type")
+            .is_some_and(contains_repeated_parameter_type);
+        repeated |= is_repeated;
+        if parameter.child_by_field_name("default_value").is_none() && !is_repeated {
+            required += 1;
+        }
+    }
+    CallableArity::new(required, total, repeated)
+}
+
+fn contains_repeated_parameter_type(node: Node<'_>) -> bool {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "repeated_parameter_type" {
+            return true;
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    false
+}
 
 pub(super) fn parenthesized_arity(source: &str) -> Option<usize> {
     scala_parenthesized_arity(source)
@@ -50,6 +185,125 @@ pub(crate) fn is_type_like_reference(node: Node<'_>, source: &str) -> bool {
                 "type" | "generic_type" | "parameterized_type" | "extends_clause"
             )
         })
+}
+
+pub(crate) fn is_scala_object_reference(node: Node<'_>) -> bool {
+    is_singleton_type_reference(node)
+        || is_stable_type_qualifier(node)
+        || is_extractor_reference(node)
+        || is_infix_pattern_operator(node)
+        || is_field_expression_value(node)
+        || is_bare_term_reference(node)
+}
+
+pub(crate) fn is_scala_class_reference(node: Node<'_>, source: &str) -> bool {
+    is_type_like_reference(node, source)
+        && !is_singleton_type_reference(node)
+        && !is_stable_type_qualifier(node)
+        && !is_extractor_reference(node)
+        && !is_infix_pattern_operator(node)
+        && !node.parent().is_some_and(|parent| {
+            parent.kind() == "call_expression"
+                && parent.child_by_field_name("function") == Some(node)
+        })
+}
+
+fn is_singleton_type_reference(node: Node<'_>) -> bool {
+    node.parent()
+        .is_some_and(|parent| parent.kind() == "singleton_type")
+}
+
+fn is_stable_type_qualifier(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "stable_type_identifier"
+            && parent.child_by_field_name("name") != Some(node)
+    })
+}
+
+fn is_extractor_reference(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "case_class_pattern"
+            && parent
+                .named_child(0)
+                .is_some_and(|constructor| constructor == node)
+    })
+}
+
+fn is_infix_pattern_operator(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "infix_pattern" && parent.child_by_field_name("operator") == Some(node)
+    })
+}
+
+pub(crate) fn is_terminal_stable_field_reference(node: Node<'_>) -> bool {
+    let Some(field) = node.parent().filter(|parent| {
+        parent.kind() == "field_expression" && parent.child_by_field_name("field") == Some(node)
+    }) else {
+        return false;
+    };
+    !field.parent().is_some_and(|parent| {
+        parent.kind() == "call_expression" && parent.child_by_field_name("function") == Some(field)
+    })
+}
+
+/// Resolve a stable object path from its tree-sitter structure. The root and
+/// each child segment are resolved independently so callers never infer object
+/// identity by splitting source text.
+pub(crate) fn resolve_stable_object_expression<T>(
+    mut node: Node<'_>,
+    source: &str,
+    mut resolve_root: impl FnMut(&str) -> Option<T>,
+    mut resolve_child: impl FnMut(&T, &str) -> Option<T>,
+) -> Option<T> {
+    let mut fields = Vec::new();
+    while node.kind() == "field_expression" {
+        fields.push(node.child_by_field_name("field")?);
+        node = node.child_by_field_name("value")?;
+    }
+    if !matches!(node.kind(), "identifier" | "type_identifier") {
+        return None;
+    }
+    let root = node_text(node, source).trim();
+    if root.is_empty() {
+        return None;
+    }
+    let mut resolved = resolve_root(root)?;
+    for field in fields.into_iter().rev() {
+        let field = node_text(field, source).trim();
+        if field.is_empty() {
+            return None;
+        }
+        resolved = resolve_child(&resolved, field)?;
+    }
+    Some(resolved)
+}
+
+fn is_bare_term_reference(node: Node<'_>) -> bool {
+    if node.kind() != "identifier" {
+        return false;
+    }
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    match parent.kind() {
+        "class_definition"
+        | "object_definition"
+        | "trait_definition"
+        | "enum_definition"
+        | "function_definition"
+        | "function_declaration"
+        | "parameter"
+        | "class_parameter"
+        | "type_parameters"
+        | "import_declaration"
+        | "stable_type_identifier"
+        | "singleton_type"
+        | "case_class_pattern"
+        | "infix_pattern" => false,
+        "val_definition" | "var_definition" => parent.child_by_field_name("pattern") != Some(node),
+        "field_expression" => parent.child_by_field_name("field") != Some(node),
+        _ => true,
+    }
 }
 
 pub(crate) fn is_field_expression_value(node: Node<'_>) -> bool {
@@ -128,26 +382,48 @@ pub(crate) fn stable_type_qualifier(node: Node<'_>, source: &str) -> Option<Stri
 }
 
 pub(crate) fn call_arity_for_reference(node: Node<'_>) -> Option<usize> {
+    call_arities_for_reference(node).and_then(|arities| arities.first().copied())
+}
+
+pub(crate) fn call_arities_for_reference(node: Node<'_>) -> Option<Vec<usize>> {
     let parent = node.parent()?;
     if parent.kind() == "infix_expression" && parent.child_by_field_name("operator") == Some(node) {
-        return Some(1);
+        return Some(vec![1]);
     }
-    let call = if parent.kind() == "call_expression"
-        && parent.child_by_field_name("function") == Some(node)
+    let mut expression = field_expression_for_member(node).unwrap_or(node);
+    if expression.parent().is_some_and(|generic| {
+        generic.kind() == "generic_function"
+            && generic.child_by_field_name("function") == Some(expression)
+    }) {
+        expression = expression.parent()?;
+    }
+    let mut arities = Vec::new();
+    if let Some(instance) = expression
+        .parent()
+        .filter(|parent| parent.kind() == "instance_expression")
     {
-        parent
-    } else {
-        let field = field_expression_for_member(node)?;
-        let call = field.parent()?;
-        if call.kind() == "call_expression" && call.child_by_field_name("function") == Some(field) {
-            call
-        } else {
-            return None;
+        let arguments = instance.child_by_field_name("arguments").or_else(|| {
+            let mut cursor = instance.walk();
+            instance
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "arguments")
+        })?;
+        let mut cursor = arguments.walk();
+        arities.push(arguments.named_children(&mut cursor).count());
+        expression = instance;
+    }
+    while let Some(call) = expression.parent() {
+        if call.kind() != "call_expression"
+            || call.child_by_field_name("function") != Some(expression)
+        {
+            break;
         }
-    };
-    let arguments = call.child_by_field_name("arguments")?;
-    let mut cursor = arguments.walk();
-    Some(arguments.named_children(&mut cursor).count())
+        let arguments = call.child_by_field_name("arguments")?;
+        let mut cursor = arguments.walk();
+        arities.push(arguments.named_children(&mut cursor).count());
+        expression = call;
+    }
+    (!arities.is_empty()).then_some(arities)
 }
 
 pub(crate) fn infix_receiver_for_operator(node: Node<'_>) -> Option<Node<'_>> {

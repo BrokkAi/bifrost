@@ -36,6 +36,756 @@ fn hit_snippets(result: FuzzyResult) -> Vec<String> {
 }
 
 #[test]
+fn scala_usage_finder_distinguishes_class_and_object_identity_roles() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "app/Token.scala",
+            r#"
+package app
+
+class Token
+
+object Token {
+  class Nested
+  def unapply(value: String): Option[String] = Some(value)
+}
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"
+package app
+
+object Use {
+  val bareObject = Token
+  val singleton: Token.type = Token
+  val nestedType: Token.Nested = new Token.Nested
+  val classType: Token = new Token
+
+  def extracted(value: String): String = value match {
+    case Token(found) => found
+    case _ => value
+  }
+}
+"#,
+        ),
+        (
+            "other/Token.scala",
+            r#"
+package other
+
+class Token
+object Token {
+  class Nested
+  def unapply(value: String): Option[String] = Some(value)
+}
+
+object Use {
+  val bareObject = Token
+  val singleton: Token.type = Token
+  val nestedType: Token.Nested = new Token.Nested
+  val classType: Token = new Token
+  def extracted(value: String): String = value match { case Token(found) => found }
+}
+"#,
+        ),
+    ]);
+
+    let object = definition(&analyzer, "app.Token$");
+    let object_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&object)));
+    for expected in [
+        "val bareObject = Token",
+        "val singleton: Token.type = Token",
+        "val nestedType: Token.Nested",
+        "new Token.Nested",
+        "case Token(found)",
+    ] {
+        assert_hit_contains(&object_hits, expected);
+    }
+    assert_no_hit_contains(&object_hits, "val classType: Token = new Token");
+    assert!(
+        object_hits
+            .iter()
+            .all(|hit| hit.file.rel_path() != "other/Token.scala"),
+        "unrelated companion object leaked: {object_hits:#?}"
+    );
+
+    let class = definition(&analyzer, "app.Token");
+    let class_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&class)));
+    assert_hit_contains(&class_hits, "val classType: Token = new Token");
+    assert_no_hit_contains(&class_hits, "val bareObject = Token");
+    assert_no_hit_contains(&class_hits, "Token.type");
+    assert_no_hit_contains(&class_hits, "Token.Nested");
+    assert_no_hit_contains(&class_hits, "case Token(found)");
+    assert!(
+        class_hits
+            .iter()
+            .all(|hit| hit.file.rel_path() != "other/Token.scala"),
+        "unrelated class leaked: {class_hits:#?}"
+    );
+}
+
+#[test]
+fn scala_usage_finder_preserves_exact_companion_nested_and_ambiguous_object_roles() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "app/Owners.scala",
+            r#"package app
+class Token { def make(): Token = this }
+object Token { def make(): Token = new Token }
+object Outer {
+  def make(): Int = 1
+  object Inner { def make(): Int = 2 }
+}
+object Shared
+class Holder { val Shared: Int = 1 }
+object Use {
+  val made = Token.make()
+  val nested = Outer.Inner
+  val nestedCall = Outer.Inner.make()
+  val unqualifiedNested = Inner
+  def instanceField(holder: Holder): Int = holder.Shared
+}
+"#,
+        ),
+        (
+            "left/Shared.scala",
+            "package left\nobject Shared { def make(): Int = 1 }\n",
+        ),
+        (
+            "right/Shared.scala",
+            "package right\nobject Shared { def make(): Int = 2 }\n",
+        ),
+        (
+            "app/Ambiguous.scala",
+            "package app\nimport left._\nimport right._\nobject Ambiguous {\n  val value = Shared\n  val call = Shared.make()\n}\n",
+        ),
+        (
+            "app/Explicit.scala",
+            "package app\nimport left.Shared\nimport right._\nobject Explicit { val call = Shared.make() }\n",
+        ),
+    ]);
+    let object_make = definition(&analyzer, "app.Token$.make");
+    let object_make_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&object_make)));
+    assert_hit_contains(&object_make_hits, "Token.make()");
+    let class_make = definition(&analyzer, "app.Token.make");
+    let class_make_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&class_make)));
+    assert_no_hit_contains(&class_make_hits, "val made = Token.make()");
+    let inner = definition(&analyzer, "app.Outer$.Inner$");
+    let inner_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&inner)));
+    assert_hit_contains(&inner_hits, "val nested = Outer.Inner");
+    assert_no_hit_contains(&inner_hits, "val unqualifiedNested = Inner");
+    let inner_make = definition(&analyzer, "app.Outer$.Inner$.make");
+    let inner_make_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&inner_make)));
+    assert_hit_contains(&inner_make_hits, "Outer.Inner.make()");
+    let outer_make = definition(&analyzer, "app.Outer$.make");
+    let outer_make_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&outer_make)));
+    assert_no_hit_contains(&outer_make_hits, "Outer.Inner.make()");
+    let shared = definition(&analyzer, "app.Shared$");
+    let shared_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&shared)));
+    assert_no_hit_contains(&shared_hits, "holder.Shared");
+    let left = definition(&analyzer, "left.Shared$");
+    let left_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&left)));
+    assert!(
+        left_hits
+            .iter()
+            .all(|hit| hit.file.rel_path() != "app/Ambiguous.scala"),
+        "ambiguous wildcard object leaked: {left_hits:#?}"
+    );
+    assert_hit_contains(&left_hits, "object Explicit { val call = Shared.make() }");
+}
+
+#[test]
+fn scala_usage_finder_applies_compilation_unit_import_precedence() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "app/Shared.scala",
+            "package app\nobject Shared { def make(): Int = 0 }\n",
+        ),
+        (
+            "left/Shared.scala",
+            "package left\nobject Shared { def make(): Int = 1 }\n",
+        ),
+        (
+            "app/WildcardWins.scala",
+            "package app\nimport left._\nobject WildcardWins { val call = Shared.make() }\n",
+        ),
+    ]);
+    let left = definition(&analyzer, "left.Shared$.make");
+    let left_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&left)));
+    assert!(
+        left_hits
+            .iter()
+            .any(|hit| hit.file.rel_path() == "app/WildcardWins.scala"),
+        "wildcard import should beat another file in the same package: {left_hits:#?}"
+    );
+    let package = definition(&analyzer, "app.Shared$.make");
+    let package_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&package)));
+    assert!(
+        package_hits
+            .iter()
+            .all(|hit| hit.file.rel_path() != "app/WildcardWins.scala"),
+        "same-package declaration from another file must lose to wildcard import: {package_hits:#?}"
+    );
+
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "left/Shared.scala",
+            "package left\nobject Shared { def make(): Int = 1 }\n",
+        ),
+        (
+            "app/LocalWins.scala",
+            "package app\nimport left.Shared\nobject Shared { def make(): Int = 2 }\nobject LocalWins { val call = Shared.make() }\n",
+        ),
+    ]);
+    let local = definition(&analyzer, "app.Shared$.make");
+    let local_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&local)));
+    assert_hit_contains(&local_hits, "object LocalWins { val call = Shared.make() }");
+    let imported = definition(&analyzer, "left.Shared$.make");
+    let imported_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&imported)));
+    assert_no_hit_contains(
+        &imported_hits,
+        "object LocalWins { val call = Shared.make() }",
+    );
+}
+
+#[test]
+fn scala_usage_finder_keeps_companion_bare_field_owners_exact() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/CompanionFields.scala",
+        r#"package app
+class Obj {
+  val field: Int = 1
+  def classRead: Int = field
+}
+object Obj {
+  val field: Int = 2
+  def objectRead: Int = field
+}
+object Sibling {
+  val field: Int = 3
+  def siblingRead: Int = field
+}
+"#,
+    )]);
+    let object_field = definition(&analyzer, "app.Obj$.field");
+    let object_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&object_field)),
+    );
+    assert!(
+        object_hits
+            .iter()
+            .any(|hit| hit.enclosing.fq_name() == "app.Obj$.objectRead"),
+        "object bare read should resolve to the exact object field: {object_hits:#?}"
+    );
+    for enclosing in ["app.Obj.classRead", "app.Sibling$.siblingRead"] {
+        assert_no_hit_in_enclosing(&object_hits, enclosing);
+    }
+
+    let class_field = definition(&analyzer, "app.Obj.field");
+    let class_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&class_field)));
+    assert!(
+        class_hits
+            .iter()
+            .any(|hit| hit.enclosing.fq_name() == "app.Obj.classRead"),
+        "class bare read should resolve to the exact class field: {class_hits:#?}"
+    );
+    assert_no_hit_in_enclosing(&class_hits, "app.Obj$.objectRead");
+}
+
+#[test]
+fn scala_usage_finder_resolves_outer_stable_fields_in_nested_and_anonymous_scopes() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Container.scala",
+        r#"
+package app
+
+class Service { def run(): Int = 1 }
+class OtherService { def run(): Int = 2 }
+
+class Container(val service: Service) {
+  class Nested {
+    val nestedRead = service.run()
+    val explicitOuterRead = Container.this.service.run()
+  }
+
+  val anonymous = new Runnable {
+    def run(): Unit = {
+      val anonymousRead = service.run()
+    }
+  }
+
+  def shadowed(service: OtherService): Int = service.run()
+  def localShadow(): Int = {
+    val service = new OtherService
+    service.run()
+  }
+}
+"#,
+    )]);
+
+    let service = definition(&analyzer, "app.Container.service");
+    let service_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&service)));
+    assert_hit_contains(&service_hits, "val nestedRead = service.run()");
+    assert_hit_contains(&service_hits, "Container.this.service.run()");
+    assert_hit_contains(&service_hits, "val anonymousRead = service.run()");
+    assert_no_hit_contains(&service_hits, "def shadowed(service: OtherService)");
+    assert_no_hit_contains(&service_hits, "val service = new OtherService");
+}
+
+#[test]
+fn scala_usage_finder_resolves_infix_extractor_object_identity() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "app/Extractors.scala",
+            r#"
+package app
+
+object Pair {
+  def unapply(value: (String, String)): Option[(String, String)] = Some(value)
+}
+
+object Use {
+  def extract(value: (String, String)): String = value match {
+    case left Pair right => left + right
+    case _ => ""
+  }
+}
+"#,
+        ),
+        (
+            "other/Extractors.scala",
+            r#"
+package other
+
+object Pair {
+  def unapply(value: (String, String)): Option[(String, String)] = Some(value)
+}
+
+object Use {
+  def extract(value: (String, String)): String = value match {
+    case left Pair right => left + right
+    case _ => ""
+  }
+}
+"#,
+        ),
+    ]);
+
+    let pair = definition(&analyzer, "app.Pair$");
+    let pair_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&pair)));
+    assert_hit_contains(&pair_hits, "case left Pair right");
+    assert!(
+        pair_hits
+            .iter()
+            .all(|hit| hit.file.rel_path() != "other/Extractors.scala"),
+        "unrelated infix extractor leaked: {pair_hits:#?}"
+    );
+}
+
+#[test]
+fn scala_usage_finder_resolves_modified_constructor_parameter_as_inherited_member() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "app/Services.scala",
+            r#"
+package app
+
+class Service { def run(): Int = 1 }
+
+class Base(protected val service: Service)
+
+class Child(provided: Service) extends Base(provided) {
+  val inheritedRead = this.service.run()
+  class Nested {
+    val nestedInheritedRead = service.run()
+  }
+}
+"#,
+        ),
+        (
+            "other/Services.scala",
+            r#"
+package other
+
+class Service { def run(): Int = 1 }
+class Base(protected val service: Service)
+class Child(service: Service) extends Base(service) {
+  val inheritedRead = this.service.run()
+}
+"#,
+        ),
+    ]);
+
+    let service = definition(&analyzer, "app.Base.service");
+    let service_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&service)));
+    assert_hit_contains(&service_hits, "val inheritedRead = this.service.run()");
+    assert_hit_contains(&service_hits, "val nestedInheritedRead = service.run()");
+    assert!(
+        service_hits
+            .iter()
+            .all(|hit| hit.file.rel_path() != "other/Services.scala"),
+        "unrelated inherited constructor parameter leaked: {service_hits:#?}"
+    );
+}
+
+#[test]
+fn scala_usage_finder_applies_compound_callable_shapes_conservatively() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "app/Unary.scala",
+            r#"
+package app
+
+def dispatch(value: Int): Int = value
+"#,
+        ),
+        (
+            "app/Binary.scala",
+            r#"
+package app
+
+def dispatch(value: Int, enabled: Boolean): Int = value
+"#,
+        ),
+        (
+            "app/Api.scala",
+            r#"
+package app
+
+class Api {
+  def defaulted(value: Int, label: String = "default"): Int = value
+  def gather(values: Int*): Int = values.size
+  def curried(value: Int)(label: String): Int = value
+  def later(value: Int): Int = value
+}
+
+object Use {
+  def exercise(api: Api): Unit = {
+    dispatch(1)
+    dispatch(1, true)
+    dispatch()
+    dispatch(1, true, false)
+
+    api.defaulted(1)
+    api.defaulted(1, "named")
+    api.defaulted()
+    api.defaulted(1, "named", "extra")
+
+    api.gather()
+    api.gather(1, 2, 3)
+
+    api.curried(1)("named")
+    api.curried()("missing")
+    api.curried(1)("too", "many")
+
+    val unapplied: Int => Int = api.later
+    api.later(1)
+    api.later()
+    api.later(1, 2)
+  }
+}
+"#,
+        ),
+        (
+            "other/Unary.scala",
+            r#"
+package other
+
+def dispatch(value: Int): Int = value
+"#,
+        ),
+        (
+            "other/Binary.scala",
+            r#"
+package other
+
+def dispatch(value: Int, enabled: Boolean): Int = value
+"#,
+        ),
+        (
+            "other/Api.scala",
+            r#"
+package other
+
+class Api {
+  def defaulted(value: Int, label: String = "default"): Int = value
+  def gather(values: Int*): Int = values.size
+  def curried(value: Int)(label: String): Int = value
+  def later(value: Int): Int = value
+}
+
+object Use {
+  def exercise(api: Api): Unit = {
+    dispatch(1)
+    api.defaulted(1)
+    api.gather(1)
+    api.curried(1)("other")
+    val unapplied: Int => Int = api.later
+  }
+}
+"#,
+        ),
+    ]);
+
+    let mut dispatches = analyzer.get_definitions("app.dispatch");
+    dispatches.sort_by_key(|unit| analyzer.signatures(unit).join("\n"));
+    assert_eq!(dispatches.len(), 2, "expected both dispatch overloads");
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = UsageFinder::new().find_usages_default(&analyzer, &dispatches)
+    else {
+        panic!("expected dispatch usage success");
+    };
+    for dispatch in &dispatches {
+        let signature = analyzer.signatures(dispatch).join("\n");
+        let bucket = hits_by_overload
+            .get(dispatch)
+            .unwrap_or_else(|| panic!("missing dispatch bucket for {signature}"));
+        let bucket = bucket.iter().cloned().collect::<Vec<_>>();
+        if signature.contains("enabled: Boolean") {
+            assert_hit_contains(&bucket, "dispatch(1, true)");
+            assert_no_hit_contains(&bucket, "dispatch(1)");
+        } else {
+            assert_hit_contains(&bucket, "dispatch(1)");
+            assert_no_hit_contains(&bucket, "dispatch(1, true)");
+        }
+        assert_no_hit_contains(&bucket, "dispatch()");
+        assert_no_hit_contains(&bucket, "dispatch(1, true, false)");
+        assert!(
+            bucket
+                .iter()
+                .all(|hit| !hit.file.rel_path().starts_with("other/")),
+            "unrelated overload owner leaked: {bucket:#?}"
+        );
+    }
+
+    for (target, expected_hits, rejected_hits) in [
+        (
+            "app.Api.defaulted",
+            vec!["api.defaulted(1)", "api.defaulted(1, \"named\")"],
+            vec!["api.defaulted()", "api.defaulted(1, \"named\", \"extra\")"],
+        ),
+        (
+            "app.Api.gather",
+            vec!["api.gather()", "api.gather(1, 2, 3)"],
+            vec![],
+        ),
+        (
+            "app.Api.curried",
+            vec!["api.curried(1)(\"named\")"],
+            vec![
+                "api.curried()(\"missing\")",
+                "api.curried(1)(\"too\", \"many\")",
+            ],
+        ),
+        (
+            "app.Api.later",
+            vec!["api.later", "api.later(1)"],
+            vec!["api.later()", "api.later(1, 2)"],
+        ),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        for expected in expected_hits {
+            assert_hit_contains(&target_hits, expected);
+        }
+        for rejected in rejected_hits {
+            assert_no_hit_contains(&target_hits, rejected);
+        }
+        assert!(
+            target_hits
+                .iter()
+                .all(|hit| hit.file.rel_path() != "other/Api.scala"),
+            "unrelated callable owner leaked for {target:?}: {target_hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn scala_usage_finder_matches_all_same_file_overloads_and_curried_constructor_lists() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Calls.scala",
+        r#"package app
+class Api {
+  def route(value: Int, label: String): Int = value
+  def route(value: Int): Int = value
+  def flip(value: Int): Int = value
+  def flip(value: Int, label: String): Int = value
+}
+class Curried(value: Int)(label: String = "default")
+object Use {
+  def calls(api: Api): Unit = {
+    api.route(1)
+    api.route(1, "two")
+    api.route()
+    api.route(1, "two", "three")
+    val routePartial: Int => Int = api.route
+    api.flip(1)
+    api.flip(1, "two")
+    api.flip()
+    api.flip(1, "two", "three")
+    val flipPartial: Int => Int = api.flip
+    new Curried(1)()
+    new Curried()("missing")
+    new Curried(1)("too", "many")
+  }
+}
+"#,
+    )]);
+    for method in ["route", "flip"] {
+        let target = definition(&analyzer, &format!("app.Api.{method}"));
+        let method_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&method_hits, &format!("api.{method}(1)"));
+        assert_hit_contains(&method_hits, &format!("api.{method}(1, \"two\")"));
+        assert_no_hit_contains(&method_hits, &format!("api.{method}()"));
+        assert_no_hit_contains(
+            &method_hits,
+            &format!("api.{method}(1, \"two\", \"three\")"),
+        );
+        assert_no_hit_contains(&method_hits, &format!("val {method}Partial"));
+    }
+    let constructor = definition(&analyzer, "app.Curried.Curried");
+    let constructor_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&constructor)));
+    assert_hit_contains(&constructor_hits, "new Curried(1)()");
+    assert_no_hit_contains(&constructor_hits, "new Curried()(\"missing\")");
+    assert_no_hit_contains(&constructor_hits, "new Curried(1)(\"too\", \"many\")");
+}
+
+#[test]
+fn scala_usage_finder_keeps_overload_shape_receiver_and_return_facts_aligned() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Aligned.scala",
+        r#"package app
+class A { def run(): Int = 1 }
+class B { def run(): Int = 2 }
+object Factory {
+  def make(value: Int): A = new A
+  def make(value: Int, label: String): B = new B
+}
+object Extensions {
+  extension (value: A) def tag(number: Int): Int = number
+  extension (value: B) def tag(number: Int, label: String): Int = number
+}
+object Use {
+  import Extensions._
+  def returnA(): Int = Factory.make(1).run()
+  def returnB(): Int = Factory.make(1, "b").run()
+  def extensionA(value: A): Int = value.tag(1)
+  def extensionB(value: B): Int = value.tag(1, "b")
+  def wrongShapeA(value: A): Int = value.tag(1, "bad")
+  def wrongShapeB(value: B): Int = value.tag(1)
+  def unappliedA(value: A) = value.tag
+}
+"#,
+    )]);
+    let a_run = definition(&analyzer, "app.A.run");
+    let a_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&a_run)));
+    assert_hit_contains(&a_hits, "def returnA(): Int = Factory.make(1).run()");
+    assert_no_hit_contains(&a_hits, "def returnB(): Int = Factory.make(1, \"b\").run()");
+    let b_run = definition(&analyzer, "app.B.run");
+    let b_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&b_run)));
+    assert_hit_contains(&b_hits, "def returnB(): Int = Factory.make(1, \"b\").run()");
+    assert_no_hit_contains(&b_hits, "def returnA(): Int = Factory.make(1).run()");
+
+    let tag = definition(&analyzer, "app.Extensions$.tag");
+    let tag_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&tag)));
+    assert_hit_contains(&tag_hits, "def extensionA(value: A): Int = value.tag(1)");
+    assert_hit_contains(
+        &tag_hits,
+        "def extensionB(value: B): Int = value.tag(1, \"b\")",
+    );
+    assert_no_hit_contains(&tag_hits, "def wrongShapeA");
+    assert_no_hit_contains(&tag_hits, "def wrongShapeB");
+    assert_no_hit_contains(&tag_hits, "def unappliedA");
+}
+
+#[test]
+fn scala_usage_finder_fails_closed_for_ambiguous_declaration_type_paths() {
+    let consumer_source = r#"package app
+import left._
+import right._
+
+object Factory {
+  def make(): A = ???
+  def makeNested(): A.Nested = ???
+  def makeProven(): proven.Service = ???
+}
+
+object Use {
+  def call(): Int = Factory.make().run()
+  def nestedCall(): Int = Factory.makeNested().run()
+  def provenCall(): Int = Factory.makeProven().run()
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "A.scala",
+            "class A { def run(): Int = 0; class Nested { def run(): Int = 0 } }\n",
+        ),
+        (
+            "left/A.scala",
+            "package left\nclass A { def run(): Int = 1; class Nested { def run(): Int = 1 } }\n",
+        ),
+        (
+            "right/A.scala",
+            "package right\nclass A { def run(): Int = 2; class Nested { def run(): Int = 2 } }\n",
+        ),
+        (
+            "proven/Service.scala",
+            "package proven\nclass Service { def run(): Int = 3 }\n",
+        ),
+        ("app/AmbiguousReturn.scala", consumer_source),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = ScalaUsageGraphStrategy::new();
+
+    for run_fqn in ["A.run", "left.A.run", "right.A.run"] {
+        let run = definition(&analyzer, run_fqn);
+        let run_hits =
+            hits(strategy.find_usages(&analyzer, std::slice::from_ref(&run), &candidates, 1000));
+        assert_no_hit_contains(&run_hits, "Factory.make().run()");
+    }
+    for run_fqn in ["A.Nested.run", "left.A.Nested.run", "right.A.Nested.run"] {
+        let run = definition(&analyzer, run_fqn);
+        let run_hits =
+            hits(strategy.find_usages(&analyzer, std::slice::from_ref(&run), &candidates, 1000));
+        assert_no_hit_contains(&run_hits, "Factory.makeNested().run()");
+    }
+    let proven_run = definition(&analyzer, "proven.Service.run");
+    let proven_hits = hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&proven_run),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&proven_hits, "Factory.makeProven().run()");
+}
+
+#[test]
 fn scala_overload_query_preserves_exact_hit_buckets() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (
@@ -2021,7 +2771,7 @@ extension (target: Target) {
         &candidates,
         1000,
     ));
-    assert_no_hit_in_enclosing(&target_run_hits, "app.Consumer.overriddenMember");
+    assert_hit_line(&target_run_hits, line_of(consumer_source, "target.run(1)"));
     assert_no_hit_in_enclosing(&target_run_hits, "app.Consumer.extensionMember");
     assert_no_hit_contains(&target_run_hits, "item.run()");
 }

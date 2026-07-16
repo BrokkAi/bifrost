@@ -1,14 +1,13 @@
 use super::extractor::scan_file;
 use super::inverted::{self, ProjectTypes};
 use super::resolver::TargetSpec;
-use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
-    BulkFileStateSource, CodeUnit, IAnalyzer, ImportInfo, Language, ProjectFile, ScalaAnalyzer,
+    BulkFileStateSource, CodeUnit, IAnalyzer, Language, ProjectFile, ScalaAnalyzer,
     resolve_analyzer,
 };
 use crate::hash::HashMap;
@@ -18,9 +17,6 @@ use std::collections::BTreeSet;
 pub(super) struct ScalaEdgeGraph {
     pub(super) files: Vec<ProjectFile>,
     pub(super) types: ProjectTypes,
-    pub(super) package_by_file: HashMap<ProjectFile, String>,
-    pub(super) imports_by_file: HashMap<ProjectFile, Vec<ImportInfo>>,
-    pub(super) file_states: HashMap<ProjectFile, FileState>,
 }
 
 pub(crate) struct ScalaQueryResolver<'a> {
@@ -123,52 +119,36 @@ impl<'a> UsageEdgeResolver<'a> for ScalaEdgeResolver<'a> {
             .ok()?
             .into_iter()
             .collect();
-        let file_states = scala.bulk_file_states(files.clone(), BulkFileStateSource::Omit);
-        let types = ProjectTypes::build_from_file_states(scala, &file_states);
+        let file_states = scala.bulk_file_states(files.clone(), BulkFileStateSource::Include);
+        let types = ProjectTypes::build_from_file_states(scala, file_states);
 
         Some(Self {
             scala,
-            graph: ScalaEdgeGraph {
-                files,
-                types,
-                package_by_file: self::package_by_file(&file_states),
-                imports_by_file: file_states
-                    .iter()
-                    .map(|(file, state)| (file.clone(), state.imports.clone()))
-                    .collect(),
-                file_states,
-            },
+            graph: ScalaEdgeGraph { files, types },
         })
     }
 
     fn build_edges<F>(
         &self,
-        analyzer: &dyn IAnalyzer,
+        _analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,
         keep_file: F,
     ) -> UsageEdges
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_scala_edges(analyzer, self.scala, &self.graph, nodes, keep_file)
+        inverted::build_scala_edges(self.scala, &self.graph, nodes, keep_file)
     }
 
     fn build_edge_weights<F>(
         &self,
-        analyzer: &dyn IAnalyzer,
+        _analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,
         keep_file: F,
     ) -> UsageEdgeWeights
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_scala_edges(analyzer, self.scala, &self.graph, nodes, keep_file)
+        inverted::build_scala_edges(self.scala, &self.graph, nodes, keep_file)
     }
-}
-
-fn package_by_file(states: &HashMap<ProjectFile, FileState>) -> HashMap<ProjectFile, String> {
-    states
-        .iter()
-        .map(|(file, state)| (file.clone(), state.package_name.clone()))
-        .collect()
 }

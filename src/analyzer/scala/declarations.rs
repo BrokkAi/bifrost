@@ -206,9 +206,7 @@ impl<'a> ScalaVisitor<'a> {
             self.parsed.set_scala_trait(code_unit.clone());
         }
 
-        if node.kind() == "class_definition"
-            && node.child_by_field_name("class_parameters").is_some()
-        {
+        if node.kind() == "class_definition" && !scala_class_parameter_lists(node).is_empty() {
             let constructor = CodeUnit::new(
                 self.file.clone(),
                 CodeUnitType::Function,
@@ -247,46 +245,41 @@ impl<'a> ScalaVisitor<'a> {
         package_name: &str,
         parent: &CodeUnit,
     ) {
-        let Some(parameters) = node.child_by_field_name("class_parameters") else {
-            return;
-        };
         let is_case_class = scala_is_case_class_definition(node, self.source);
-        let mut cursor = parameters.walk();
-        for parameter in parameters.named_children(&mut cursor) {
-            if parameter.kind() != "class_parameter" {
-                continue;
+        for parameters in scala_class_parameter_lists(node) {
+            let mut cursor = parameters.walk();
+            for parameter in parameters.named_children(&mut cursor) {
+                if parameter.kind() != "class_parameter" {
+                    continue;
+                }
+                if !is_case_class && scala_class_parameter_field_keyword(parameter).is_none() {
+                    continue;
+                }
+                let Some(name_node) = parameter.child_by_field_name("name") else {
+                    continue;
+                };
+                let name = scala_node_text(name_node, self.source).trim();
+                if name.is_empty() {
+                    continue;
+                }
+                let code_unit = CodeUnit::new(
+                    self.file.clone(),
+                    CodeUnitType::Field,
+                    package_name.to_string(),
+                    format!("{}.{}", parent.short_name(), name),
+                );
+                self.parsed.add_code_unit(
+                    code_unit.clone(),
+                    parameter,
+                    self.source,
+                    Some(parent.clone()),
+                    None,
+                );
+                self.parsed.add_signature(
+                    code_unit,
+                    scala_class_parameter_field_signature(parameter, self.source, name),
+                );
             }
-            let parameter_text = scala_node_text(parameter, self.source).trim_start();
-            if !is_case_class
-                && !parameter_text.starts_with("val ")
-                && !parameter_text.starts_with("var ")
-            {
-                continue;
-            }
-            let Some(name_node) = parameter.child_by_field_name("name") else {
-                continue;
-            };
-            let name = scala_node_text(name_node, self.source).trim();
-            if name.is_empty() {
-                continue;
-            }
-            let code_unit = CodeUnit::new(
-                self.file.clone(),
-                CodeUnitType::Field,
-                package_name.to_string(),
-                format!("{}.{}", parent.short_name(), name),
-            );
-            self.parsed.add_code_unit(
-                code_unit.clone(),
-                parameter,
-                self.source,
-                Some(parent.clone()),
-                None,
-            );
-            self.parsed.add_signature(
-                code_unit,
-                scala_class_parameter_field_signature(parameter, self.source, name),
-            );
         }
     }
 
@@ -602,10 +595,10 @@ fn scala_type_signature(node: Node<'_>, source: &str) -> String {
         .child_by_field_name("type_parameters")
         .map(|child| scala_node_text(child, source).trim().to_string())
         .unwrap_or_default();
-    let class_params = node
-        .child_by_field_name("class_parameters")
-        .map(|child| scala_node_text(child, source).trim().to_string())
-        .unwrap_or_default();
+    let class_params = scala_class_parameter_lists(node)
+        .into_iter()
+        .map(|child| scala_node_text(child, source).trim())
+        .collect::<String>();
     format!(
         "{}{} {}{}{} {{",
         scala_modifier_prefix(node, source),
@@ -623,10 +616,10 @@ fn scala_primary_constructor_signature(node: Node<'_>, source: &str) -> String {
         .or_else(|| scala_type_declaration_name_node(node))
         .map(|name| scala_node_text(name, source).trim())
         .unwrap_or("");
-    let params = node
-        .child_by_field_name("class_parameters")
-        .map(|child| scala_node_text(child, source).trim().to_string())
-        .unwrap_or_default();
+    let params = scala_class_parameter_lists(node)
+        .into_iter()
+        .map(|child| scala_node_text(child, source).trim())
+        .collect::<String>();
     format!("def {name}{params} = {{...}}")
 }
 
@@ -635,10 +628,18 @@ fn scala_class_signature_metadata(
     node: Node<'_>,
     source: &str,
 ) -> SignatureMetadata {
-    let Some(parameters_node) = node.child_by_field_name("class_parameters") else {
+    let parameter_nodes = scala_class_parameter_lists(node);
+    if parameter_nodes.is_empty() {
         return SignatureMetadata::new(signature, Vec::new());
-    };
-    scala_signature_metadata_for_parameter_nodes(signature, &[parameters_node], source)
+    }
+    scala_signature_metadata_for_parameter_nodes(signature, &parameter_nodes, source)
+}
+
+fn scala_class_parameter_lists(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() == "class_parameters")
+        .collect()
 }
 
 fn scala_function_signature(node: Node<'_>, source: &str) -> String {
@@ -814,14 +815,7 @@ fn scala_field_signature(node: Node<'_>, source: &str, name: &str) -> String {
 }
 
 fn scala_class_parameter_field_signature(node: Node<'_>, source: &str, name: &str) -> String {
-    let keyword = if scala_node_text(node, source)
-        .trim_start()
-        .starts_with("var ")
-    {
-        "var"
-    } else {
-        "val"
-    };
+    let keyword = scala_class_parameter_field_keyword(node).unwrap_or("val");
     let type_text = node
         .child_by_field_name("type")
         .map(|child| format!(": {}", scala_node_text(child, source).trim()))
@@ -831,6 +825,16 @@ fn scala_class_parameter_field_signature(node: Node<'_>, source: &str, name: &st
         .map(|child| format!(" = {}", scala_node_text(child, source).trim()))
         .unwrap_or_default();
     format!("{keyword} {name}{type_text}{default_value}")
+}
+
+pub(crate) fn scala_class_parameter_field_keyword(node: Node<'_>) -> Option<&'static str> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find_map(|child| match child.kind() {
+            "val" => Some("val"),
+            "var" => Some("var"),
+            _ => None,
+        })
 }
 
 fn scala_modifier_prefix(node: Node<'_>, source: &str) -> String {

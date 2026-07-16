@@ -7501,7 +7501,7 @@ mod tests {
         let scala_file = write_file(
             root,
             "src/main/scala/app/Demo.scala",
-            "package app\ntrait Runnable\nclass Worker extends Runnable\n",
+            "package app\ntrait Runnable { def run(first: Int = 0)(rest: String*): Int }\nclass Worker extends Runnable\n",
         );
 
         assert_round_trip(&RubyAdapter, "ruby", &ruby_file);
