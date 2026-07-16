@@ -563,6 +563,7 @@ fn run_engine(
     let workspace = match cache_mode {
         CacheMode::Persisted => {
             WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
+                .map_err(|error| format!("failed to build persisted analyzer: {error}"))?
         }
         CacheMode::Ephemeral => WorkspaceAnalyzer::build(project, AnalyzerConfig::default()),
     };

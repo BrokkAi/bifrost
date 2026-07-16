@@ -165,12 +165,14 @@ struct WorkspaceSession {
 /// of the type, including for direct callers such as the code-query REPL.
 struct WorkspaceQueryScope {
     snapshot: Arc<WorkspaceAnalyzer>,
+    context: Arc<crate::analyzer::AnalyzerQueryContext>,
 }
 
 impl WorkspaceQueryScope {
     fn new(snapshot: Arc<WorkspaceAnalyzer>) -> Self {
-        snapshot.begin_query();
-        Self { snapshot }
+        let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        snapshot.begin_query(&context);
+        Self { snapshot, context }
     }
 
     fn arc(&self) -> &Arc<WorkspaceAnalyzer> {
@@ -188,7 +190,7 @@ impl Deref for WorkspaceQueryScope {
 
 impl Drop for WorkspaceQueryScope {
     fn drop(&mut self) {
-        self.snapshot.end_query();
+        self.snapshot.end_query(&self.context);
     }
 }
 
@@ -333,7 +335,8 @@ impl SearchToolsService {
     pub fn new_manual_for_project(project: Arc<dyn Project>) -> Result<Self, String> {
         let root = project.root().to_path_buf();
         let workspace =
-            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
+                .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
         let session = assemble_session(project, workspace, UpdateStrategy::Manual, false);
         Ok(Self {
             root: RwLock::new(root),
@@ -874,7 +877,8 @@ impl SearchToolsService {
                     let workspace = WorkspaceAnalyzer::build_persisted(
                         Arc::clone(&project),
                         AnalyzerConfig::default(),
-                    );
+                    )
+                    .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
                     Ok(assemble_session(
                         project,
                         workspace,
@@ -1556,7 +1560,8 @@ fn build_persisted_workspace(
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
     let project = build_project(root)?;
     let workspace =
-        WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+        WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
+            .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
     Ok((project, workspace))
 }
 

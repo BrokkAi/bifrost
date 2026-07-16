@@ -11,6 +11,22 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+fn build_persisted(project: Arc<dyn Project>, config: AnalyzerConfig) -> WorkspaceAnalyzer {
+    WorkspaceAnalyzer::build_persisted(project, config).expect("persisted analyzer should build")
+}
+
+fn build_persisted_with_progress<F>(
+    project: Arc<dyn Project>,
+    config: AnalyzerConfig,
+    progress: F,
+) -> WorkspaceAnalyzer
+where
+    F: Fn(BuildProgressEvent) + Send + Sync + 'static,
+{
+    WorkspaceAnalyzer::build_persisted_with_progress(project, config, progress)
+        .expect("persisted analyzer should build")
+}
+
 fn write_file(root: &Path, rel: &str, body: &str) {
     let abs = root.join(rel);
     if let Some(parent) = abs.parent() {
@@ -79,18 +95,41 @@ fn parsed_file_count(events: &[BuildProgressEvent]) -> usize {
         .count()
 }
 
+#[test]
+fn persisted_build_reports_cache_open_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(root, "example.py", "def example():\n    return 1\n");
+    init_git_repo(root);
+    fs::write(root.join(".brokk"), "not a directory").unwrap();
+    let project = python_project(root);
+
+    let error = match WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default()) {
+        Ok(_) => panic!("persisted build unexpectedly fell back to an in-memory store"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("opening the persisted analyzer store"),
+        "missing persisted-store context: {message}"
+    );
+    assert!(
+        message.contains(".brokk") || message.contains("bifrost_cache.db"),
+        "missing failed cache path: {message}"
+    );
+}
+
 fn assert_warm_multilanguage_definition_query(
     project: Arc<dyn Project>,
     query: brokk_bifrost::searchtools::DefinitionReferenceQuery,
     expected_fqn: &str,
 ) {
-    let _cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let _cold = build_persisted(Arc::clone(&project), AnalyzerConfig::default());
     let warm_events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let warm =
-        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
-            let events = Arc::clone(&warm_events);
-            move |event| events.lock().unwrap().push(event)
-        });
+    let warm = build_persisted_with_progress(project, AnalyzerConfig::default(), {
+        let events = Arc::clone(&warm_events);
+        move |event| events.lock().unwrap().push(event)
+    });
     let analyzer = warm.analyzer();
     assert_eq!(parsed_file_count(&warm_events.lock().unwrap()), 0);
     analyzer.reset_global_usage_definition_index_build_count_for_test();
@@ -140,13 +179,12 @@ fn assert_warm_multilanguage_type_query(
     query: brokk_bifrost::searchtools::TypeReferenceQuery,
     expected_fqn: &str,
 ) {
-    let _cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let _cold = build_persisted(Arc::clone(&project), AnalyzerConfig::default());
     let warm_events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let warm =
-        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
-            let events = Arc::clone(&warm_events);
-            move |event| events.lock().unwrap().push(event)
-        });
+    let warm = build_persisted_with_progress(project, AnalyzerConfig::default(), {
+        let events = Arc::clone(&warm_events);
+        move |event| events.lock().unwrap().push(event)
+    });
     let analyzer = warm.analyzer();
     assert_eq!(parsed_file_count(&warm_events.lock().unwrap()), 0);
     analyzer.reset_global_usage_definition_index_build_count_for_test();
@@ -184,13 +222,12 @@ fn assert_warm_multilanguage_no_definition_query(
     project: Arc<dyn Project>,
     query: brokk_bifrost::searchtools::DefinitionReferenceQuery,
 ) {
-    let _cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let _cold = build_persisted(Arc::clone(&project), AnalyzerConfig::default());
     let warm_events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let warm =
-        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
-            let events = Arc::clone(&warm_events);
-            move |event| events.lock().unwrap().push(event)
-        });
+    let warm = build_persisted_with_progress(project, AnalyzerConfig::default(), {
+        let events = Arc::clone(&warm_events);
+        move |event| events.lock().unwrap().push(event)
+    });
     let analyzer = warm.analyzer();
     assert_eq!(parsed_file_count(&warm_events.lock().unwrap()), 0);
     analyzer.reset_global_usage_definition_index_build_count_for_test();
@@ -530,13 +567,12 @@ fn warm_multilanguage_javascript_type_query_stays_bounded_when_unsupported() {
     let repo = init_git_repo(root);
     commit_all(&repo, "init");
     let project = language_python_project(root, Language::JavaScript);
-    let _cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let _cold = build_persisted(Arc::clone(&project), AnalyzerConfig::default());
     let warm_events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let warm =
-        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
-            let events = Arc::clone(&warm_events);
-            move |event| events.lock().unwrap().push(event)
-        });
+    let warm = build_persisted_with_progress(project, AnalyzerConfig::default(), {
+        let events = Arc::clone(&warm_events);
+        move |event| events.lock().unwrap().push(event)
+    });
     let analyzer = warm.analyzer();
     assert_eq!(parsed_file_count(&warm_events.lock().unwrap()), 0);
     analyzer.reset_global_usage_definition_index_build_count_for_test();
@@ -643,13 +679,12 @@ using ScopedJavaGlobalRef = jni_zero::ScopedJavaGlobalRef<T>;
     commit_all(&repo, "init");
     let project = language_python_project(root, Language::Cpp);
 
-    let _cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let _cold = build_persisted(Arc::clone(&project), AnalyzerConfig::default());
     let warm_events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let warm =
-        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
-            let events = Arc::clone(&warm_events);
-            move |event| events.lock().unwrap().push(event)
-        });
+    let warm = build_persisted_with_progress(project, AnalyzerConfig::default(), {
+        let events = Arc::clone(&warm_events);
+        move |event| events.lock().unwrap().push(event)
+    });
     assert_eq!(
         parsed_file_count(&warm_events.lock().unwrap()),
         0,
@@ -1027,7 +1062,7 @@ fn scala_dirty_owner_overlay_supplies_live_ancestor_facts() {
     let repo = init_git_repo(root);
     commit_all(&repo, "initial owner");
     let project = language_python_project(root, Language::Scala);
-    let _cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let _cold = build_persisted(Arc::clone(&project), AnalyzerConfig::default());
 
     write_file(
         root,
@@ -1035,11 +1070,10 @@ fn scala_dirty_owner_overlay_supplies_live_ancestor_facts() {
         "package lib\nclass Base { def replacement: Int = 2 }\n",
     );
     let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let warm =
-        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
-            let events = Arc::clone(&events);
-            move |event| events.lock().unwrap().push(event)
-        });
+    let warm = build_persisted_with_progress(project, AnalyzerConfig::default(), {
+        let events = Arc::clone(&events);
+        move |event| events.lock().unwrap().push(event)
+    });
     assert_eq!(parsed_file_count(&events.lock().unwrap()), 1);
     let analyzer = warm.analyzer();
     analyzer.reset_global_usage_definition_index_build_count_for_test();
@@ -1094,7 +1128,7 @@ fn scala_stale_owner_blob_is_excluded_from_ancestor_facts() {
     let repo = init_git_repo(root);
     commit_all(&repo, "initial owner");
     let project = language_python_project(root, Language::Scala);
-    let _cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let _cold = build_persisted(Arc::clone(&project), AnalyzerConfig::default());
 
     write_file(
         root,
@@ -1103,11 +1137,10 @@ fn scala_stale_owner_blob_is_excluded_from_ancestor_facts() {
     );
     commit_all(&repo, "replace owner blob");
     let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let warm =
-        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
-            let events = Arc::clone(&events);
-            move |event| events.lock().unwrap().push(event)
-        });
+    let warm = build_persisted_with_progress(project, AnalyzerConfig::default(), {
+        let events = Arc::clone(&events);
+        move |event| events.lock().unwrap().push(event)
+    });
     assert_eq!(parsed_file_count(&events.lock().unwrap()), 1);
     let analyzer = warm.analyzer();
     analyzer.reset_global_usage_definition_index_build_count_for_test();
@@ -1163,13 +1196,12 @@ fn warm_scala_class_and_singleton_type_batch_is_candidate_bounded() {
     let repo = init_git_repo(root);
     commit_all(&repo, "init");
     let project = language_python_project(root, Language::Scala);
-    let _cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let _cold = build_persisted(Arc::clone(&project), AnalyzerConfig::default());
     let warm_events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let warm =
-        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
-            let events = Arc::clone(&warm_events);
-            move |event| events.lock().unwrap().push(event)
-        });
+    let warm = build_persisted_with_progress(project, AnalyzerConfig::default(), {
+        let events = Arc::clone(&warm_events);
+        move |event| events.lock().unwrap().push(event)
+    });
     let analyzer = warm.analyzer();
     assert_eq!(parsed_file_count(&warm_events.lock().unwrap()), 0);
     analyzer.reset_global_usage_definition_index_build_count_for_test();
@@ -1303,14 +1335,14 @@ fn csharp_package_existence_ignores_stale_complete_blobs() {
         Language::CSharp,
     ));
 
-    let _cold = WorkspaceAnalyzer::build_persisted(project.clone(), AnalyzerConfig::default());
+    let _cold = build_persisted(project.clone(), AnalyzerConfig::default());
     write_file(
         root,
         "Types.cs",
         "namespace Replacement { public class NewType {} }\n",
     );
     commit_all(&repo, "replace namespace");
-    let warm = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default());
+    let warm = build_persisted(project, AnalyzerConfig::default());
 
     let type_line = caller.lines().nth(1).unwrap();
     let result = brokk_bifrost::searchtools::get_definitions_by_location(
@@ -1341,25 +1373,20 @@ fn git_blob_store_warm_build_hydrates_without_reparse() {
     let project = python_project(root);
 
     let cold_events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let cold = WorkspaceAnalyzer::build_persisted_with_progress(
-        Arc::clone(&project),
-        AnalyzerConfig::default(),
-        {
-            let events = Arc::clone(&cold_events);
-            move |event| events.lock().unwrap().push(event)
-        },
-    );
+    let cold = build_persisted_with_progress(Arc::clone(&project), AnalyzerConfig::default(), {
+        let events = Arc::clone(&cold_events);
+        move |event| events.lock().unwrap().push(event)
+    });
     let cold_names = declaration_names(cold.analyzer());
     assert!(cold_names.contains("alpha.Alpha"));
     assert!(cold_names.contains("beta.beta"));
     assert_eq!(parsed_file_count(&cold_events.lock().unwrap()), 2);
 
     let warm_events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let warm =
-        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
-            let events = Arc::clone(&warm_events);
-            move |event| events.lock().unwrap().push(event)
-        });
+    let warm = build_persisted_with_progress(project, AnalyzerConfig::default(), {
+        let events = Arc::clone(&warm_events);
+        move |event| events.lock().unwrap().push(event)
+    });
     assert_eq!(cold_names, declaration_names(warm.analyzer()));
     assert_eq!(parsed_file_count(&warm_events.lock().unwrap()), 0);
 }
@@ -1374,15 +1401,14 @@ fn dirty_file_reconcile_parses_only_changed_blob() {
     commit_all(&repo, "init");
     let project = python_project(root);
 
-    let _ = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let _ = build_persisted(Arc::clone(&project), AnalyzerConfig::default());
     write_file(root, "alpha.py", "class Renamed:\n    pass\n");
 
     let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let rebuilt =
-        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
-            let events = Arc::clone(&events);
-            move |event| events.lock().unwrap().push(event)
-        });
+    let rebuilt = build_persisted_with_progress(project, AnalyzerConfig::default(), {
+        let events = Arc::clone(&events);
+        move |event| events.lock().unwrap().push(event)
+    });
     let names = declaration_names(rebuilt.analyzer());
     assert!(names.contains("alpha.Renamed"));
     assert!(!names.contains("alpha.Alpha"));
@@ -1400,10 +1426,10 @@ fn deleted_file_is_removed_from_live_results() {
     commit_all(&repo, "init");
     let project = python_project(root);
 
-    let _ = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let _ = build_persisted(Arc::clone(&project), AnalyzerConfig::default());
     fs::remove_file(root.join("beta.py")).unwrap();
 
-    let rebuilt = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default());
+    let rebuilt = build_persisted(project, AnalyzerConfig::default());
     let names = declaration_names(rebuilt.analyzer());
     assert!(names.contains("alpha.Alpha"));
     assert!(!names.contains("beta.beta"));
@@ -1438,14 +1464,11 @@ fn plain_build_reparses_while_persisted_build_hydrates_parse_errors() {
     );
 
     let cold_events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let persisted_first = WorkspaceAnalyzer::build_persisted_with_progress(
-        Arc::clone(&project),
-        AnalyzerConfig::default(),
-        {
+    let persisted_first =
+        build_persisted_with_progress(Arc::clone(&project), AnalyzerConfig::default(), {
             let events = Arc::clone(&cold_events);
             move |event| events.lock().unwrap().push(event)
-        },
-    );
+        });
     assert!(
         !persisted_first
             .analyzer()
@@ -1456,11 +1479,10 @@ fn plain_build_reparses_while_persisted_build_hydrates_parse_errors() {
     assert_eq!(parsed_file_count(&cold_events.lock().unwrap()), 1);
 
     let warm_events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let persisted_second =
-        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
-            let events = Arc::clone(&warm_events);
-            move |event| events.lock().unwrap().push(event)
-        });
+    let persisted_second = build_persisted_with_progress(project, AnalyzerConfig::default(), {
+        let events = Arc::clone(&warm_events);
+        move |event| events.lock().unwrap().push(event)
+    });
     assert!(
         persisted_second.analyzer().parse_errors(&file).is_none(),
         "warm persisted build must hydrate and leave parse_errors unknown"

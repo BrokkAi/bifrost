@@ -319,16 +319,16 @@ impl TypeAliasProvider for MultiAnalyzer {
 impl TestDetectionProvider for MultiAnalyzer {}
 
 impl IAnalyzer for MultiAnalyzer {
-    fn begin_query(&self) {
+    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.delegates
             .values()
-            .for_each(|delegate| delegate.analyzer().begin_query());
+            .for_each(|delegate| delegate.analyzer().begin_query(context));
     }
 
-    fn end_query(&self) {
+    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.delegates
             .values()
-            .for_each(|delegate| delegate.analyzer().end_query());
+            .for_each(|delegate| delegate.analyzer().end_query(context));
     }
 
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {

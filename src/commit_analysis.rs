@@ -601,10 +601,8 @@ fn build_analyzer(root: &Path, files: &[PathBuf]) -> Result<WorkspaceAnalyzer, S
         root.to_path_buf(),
         files.iter().cloned(),
     ));
-    Ok(WorkspaceAnalyzer::build_persisted(
-        project,
-        AnalyzerConfig::default(),
-    ))
+    WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
+        .map_err(|error| format!("Failed to build persisted commit analyzer: {error}"))
 }
 
 fn symbol_snapshot_map(

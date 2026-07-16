@@ -227,12 +227,12 @@ impl JavaAnalyzer {
 }
 
 impl IAnalyzer for JavaAnalyzer {
-    fn begin_query(&self) {
-        self.inner.begin_query();
+    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.begin_query(context);
     }
 
-    fn end_query(&self) {
-        self.inner.end_query();
+    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.end_query(context);
     }
 
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {

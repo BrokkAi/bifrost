@@ -13875,10 +13875,12 @@ fn cpp_exact_fqn_candidate_ordering_does_not_hydrate_hidden_duplicate_files() {
         .expect("fixture commit");
 
     let cold_workspace =
-        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default());
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("persisted analyzer should build");
     drop(cold_workspace);
     let warm_workspace =
-        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default());
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("persisted analyzer should reopen");
     let analyzer = warm_workspace.analyzer();
 
     analyzer.reset_candidate_hydration_count_for_test();

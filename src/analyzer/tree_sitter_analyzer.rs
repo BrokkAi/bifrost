@@ -68,26 +68,27 @@ pub(crate) struct StructuralSnapshotKey {
 }
 
 pub(crate) fn default_store_context(project: &dyn Project) -> AnalyzerStoreContext {
-    store_context(project, false)
+    let store = AnalyzerStore::open_in_memory().expect("failed to open in-memory analyzer store");
+    store_context_from_store(project, store)
 }
 
-pub(crate) fn persistent_store_context(project: &dyn Project) -> AnalyzerStoreContext {
-    store_context(project, true)
-}
-
-fn store_context(project: &dyn Project, persisted: bool) -> AnalyzerStoreContext {
-    let store = if persisted {
-        match project.persistence_root() {
-            Some(root) => AnalyzerStore::open_for_workspace(root)
-                .or_else(|_| AnalyzerStore::open_in_memory())
-                .expect("failed to open analyzer store"),
-            None => {
-                AnalyzerStore::open_in_memory().expect("failed to open in-memory analyzer store")
-            }
-        }
-    } else {
-        AnalyzerStore::open_in_memory().expect("failed to open in-memory analyzer store")
+pub(crate) fn persistent_store_context(
+    project: &dyn Project,
+) -> std::result::Result<AnalyzerStoreContext, StoreError> {
+    let store = match project.persistence_root() {
+        Some(root) => AnalyzerStore::open_for_workspace(root).map_err(|error| {
+            error.context(format!(
+                "opening the persisted analyzer store at {}",
+                crate::analyzer::store::analyzer_db_path(root).display()
+            ))
+        })?,
+        None => AnalyzerStore::open_in_memory()
+            .map_err(|error| error.context("opening the in-memory analyzer store"))?,
     };
+    Ok(store_context_from_store(project, store))
+}
+
+fn store_context_from_store(project: &dyn Project, store: AnalyzerStore) -> AnalyzerStoreContext {
     let liveness = gitblob::discover(project.root())
         .and_then(|repo| Liveness::new(repo).ok())
         .map(Arc::new);
@@ -528,7 +529,7 @@ type SummaryFileProjectionCache = BoundedFileCache<SummaryFileProjection>;
 
 #[derive(Debug, Default)]
 struct QueryReadCache {
-    depth: usize,
+    contexts: Vec<Arc<crate::analyzer::AnalyzerQueryContext>>,
     live_oids: HashMap<ProjectFile, Option<Oid>>,
     file_states: HashMap<FileStateCacheKey, Arc<FileState>>,
 }
@@ -546,24 +547,30 @@ struct DefinitionSortCandidate {
 }
 
 impl QueryReadCache {
-    fn begin(&mut self) {
-        if self.depth == 0 {
+    fn begin(&mut self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        if self.contexts.is_empty() {
             self.live_oids.clear();
             self.file_states.clear();
         }
-        self.depth += 1;
+        if !self
+            .contexts
+            .iter()
+            .any(|active| Arc::ptr_eq(active, context))
+        {
+            self.contexts.push(Arc::clone(context));
+        }
     }
 
-    fn end(&mut self) {
-        self.depth = self.depth.saturating_sub(1);
-        if self.depth == 0 {
+    fn end(&mut self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.contexts.retain(|active| !Arc::ptr_eq(active, context));
+        if self.contexts.is_empty() {
             self.live_oids.clear();
             self.file_states.clear();
         }
     }
 
     fn is_active(&self) -> bool {
-        self.depth > 0
+        !self.contexts.is_empty()
     }
 
     fn file_state(&self, key: &FileStateCacheKey) -> Option<Arc<FileState>> {
@@ -2947,9 +2954,13 @@ where
         .collect()
     }
 
-    fn sql_path_symbol_units(&self, fq_name: &str, normalized: &str) -> Option<Vec<CodeUnit>> {
+    fn sql_path_symbol_units(
+        &self,
+        fq_name: &str,
+        normalized: &str,
+    ) -> std::result::Result<Vec<CodeUnit>, StoreError> {
         if !self.adapter.has_path_synthetic_module_units() {
-            return Some(Vec::new());
+            return Ok(Vec::new());
         }
 
         let rows = self
@@ -2961,7 +2972,7 @@ where
                 fq_name,
                 normalized,
             )
-            .ok()?;
+            .map_err(|error| error.context("querying path-backed definition candidates"))?;
         let snapshot = self.live_snapshot();
         let mut units = Vec::with_capacity(rows.len());
         for (lang, row) in rows {
@@ -2988,7 +2999,7 @@ where
         }
         units.sort_by_cached_key(|unit| self.definition_sort_key_for_unit(unit));
         units.dedup();
-        Some(units)
+        Ok(units)
     }
 
     fn live_path_symbol_unit(
@@ -3302,13 +3313,24 @@ where
     }
 
     pub(crate) fn forward_definition_fqn(&self, fq_name: &str) -> Vec<CodeUnit> {
-        self.sql_bounded_definitions_vec(fq_name)
-            .unwrap_or_default()
+        match self.sql_bounded_definitions_vec(fq_name) {
+            Ok(definitions) => definitions,
+            Err(error) => {
+                self.record_store_error(error);
+                Vec::new()
+            }
+        }
     }
 
     pub(crate) fn forward_path_module_fqn(&self, fq_name: &str) -> Option<Vec<CodeUnit>> {
         let normalized = self.adapter.normalize_full_name(fq_name);
-        self.sql_path_symbol_units(fq_name, &normalized)
+        match self.sql_path_symbol_units(fq_name, &normalized) {
+            Ok(units) => Some(units),
+            Err(error) => {
+                self.record_store_error(error);
+                None
+            }
+        }
     }
 
     pub(crate) fn forward_file_identifier(
@@ -3644,13 +3666,16 @@ where
         )
     }
 
-    fn sql_definitions_vec(&self, fq_name: &str) -> Option<Vec<CodeUnit>> {
+    fn sql_definitions_vec(&self, fq_name: &str) -> std::result::Result<Vec<CodeUnit>, StoreError> {
         self.sql_definitions_query_count
             .fetch_add(1, Ordering::Relaxed);
         self.sql_definition_candidates_vec(fq_name, false)
     }
 
-    fn sql_bounded_definitions_vec(&self, fq_name: &str) -> Option<Vec<CodeUnit>> {
+    fn sql_bounded_definitions_vec(
+        &self,
+        fq_name: &str,
+    ) -> std::result::Result<Vec<CodeUnit>, StoreError> {
         self.sql_definition_candidates_vec(fq_name, true)
     }
 
@@ -3658,7 +3683,7 @@ where
         &self,
         fq_name: &str,
         include_definition_lookup_units: bool,
-    ) -> Option<Vec<CodeUnit>> {
+    ) -> std::result::Result<Vec<CodeUnit>, StoreError> {
         let normalized = self.adapter.normalize_full_name(fq_name);
         let langs = self.storage_language_keys_for_queries();
         let candidate_names = self.definition_candidate_short_names(fq_name);
@@ -3684,7 +3709,9 @@ where
                             &short_name,
                         )
                 };
-                rows.extend(candidates.ok()?);
+                rows.extend(candidates.map_err(|error| {
+                    error.context(format!("querying definition candidates for `{fq_name}`"))
+                })?);
             }
             rows
         };
@@ -3736,12 +3763,10 @@ where
                 true
             }
         });
-        Some(
-            matches
-                .into_iter()
-                .map(|candidate| candidate.unit)
-                .collect(),
-        )
+        Ok(matches
+            .into_iter()
+            .map(|candidate| candidate.unit)
+            .collect())
     }
 
     fn sql_lookup_candidates_by_short_name(&self, symbol: &str) -> Option<BTreeSet<CodeUnit>> {
@@ -4357,6 +4382,18 @@ impl<A> TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
 {
+    fn record_store_error(&self, error: StoreError) {
+        let contexts = self
+            .query_read_cache
+            .lock()
+            .expect("query read cache mutex poisoned")
+            .contexts
+            .clone();
+        for context in contexts {
+            context.record_store_error(error.clone());
+        }
+    }
+
     fn child_first_start(&self, child: &CodeUnit) -> usize {
         <Self as crate::analyzer::IAnalyzer>::ranges(self, child)
             .into_iter()
@@ -4379,8 +4416,15 @@ where
     }
 
     fn global_usage_definition_index_handle(&self) -> &Arc<GlobalUsageDefinitionIndex> {
-        self.try_global_usage_definition_index_handle()
-            .unwrap_or(&self.global_usage_definition_fallback)
+        match self.try_global_usage_definition_index_handle() {
+            Ok(index) => index,
+            Err(error) => {
+                self.record_store_error(
+                    error.context("building the global usage definition index"),
+                );
+                &self.global_usage_definition_fallback
+            }
+        }
     }
 
     fn try_global_usage_definition_index_handle(
@@ -4409,8 +4453,13 @@ where
     }
 
     fn usage_facts_index_handle(&self) -> &Arc<UsageFactsIndex> {
-        self.try_usage_facts_index_handle()
-            .unwrap_or(&self.usage_facts_fallback)
+        match self.try_usage_facts_index_handle() {
+            Ok(index) => index,
+            Err(error) => {
+                self.record_store_error(error.context("building the usage facts index"));
+                &self.usage_facts_fallback
+            }
+        }
     }
 
     fn try_usage_facts_index_handle(
@@ -4499,20 +4548,20 @@ impl<A> crate::analyzer::IAnalyzer for TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
 {
-    fn begin_query(&self) {
+    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         let mut cache = self
             .query_read_cache
             .lock()
             .expect("query read cache mutex poisoned");
-        cache.begin();
+        cache.begin(context);
     }
 
-    fn end_query(&self) {
+    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         let mut cache = self
             .query_read_cache
             .lock()
             .expect("query read cache mutex poisoned");
-        cache.end();
+        cache.end(context);
     }
 
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
@@ -4719,11 +4768,14 @@ where
     }
 
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
-        Box::new(
-            self.sql_definitions_vec(fq_name)
-                .unwrap_or_default()
-                .into_iter(),
-        )
+        let definitions = match self.sql_definitions_vec(fq_name) {
+            Ok(definitions) => definitions,
+            Err(error) => {
+                self.record_store_error(error);
+                Vec::new()
+            }
+        };
+        Box::new(definitions.into_iter())
     }
 
     fn global_usage_definition_index(&self) -> &GlobalUsageDefinitionIndex {
@@ -6379,6 +6431,8 @@ mod tests {
             .store
             .ensure_language_epoch_value("java", "cutover-before-lazy-read")
             .unwrap();
+        let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&context);
 
         assert!(analyzer.global_usage_definition_index.get().is_none());
         assert!(analyzer.usage_facts_index.get().is_none());
@@ -6387,6 +6441,10 @@ mod tests {
 
         assert!(definitions.fqn("Model").is_empty());
         assert!(facts.facts("Model").is_empty());
+        let error = context
+            .store_error()
+            .expect("stale lazy index build should report its store error");
+        assert!(error.to_string().contains("stale analyzer generation"));
         assert!(
             analyzer.global_usage_definition_index.get().is_none(),
             "stale read must not permanently cache an incomplete definition index"
@@ -6395,6 +6453,37 @@ mod tests {
             analyzer.usage_facts_index.get().is_none(),
             "stale read must not permanently cache incomplete usage facts"
         );
+        analyzer.end_query(&context);
+    }
+
+    #[test]
+    fn stale_definition_query_records_failure_while_healthy_miss_does_not() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::write(root.join("Model.java"), "class Model {}\n").unwrap();
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
+        let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
+
+        let healthy = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&healthy);
+        assert!(analyzer.definitions("Missing").next().is_none());
+        assert!(healthy.store_error().is_none());
+        analyzer.end_query(&healthy);
+
+        analyzer
+            .store_context
+            .store
+            .ensure_language_epoch_value("java", "cutover-before-definition-read")
+            .unwrap();
+        let stale = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&stale);
+        assert!(analyzer.definitions("Model").next().is_none());
+        let error = stale
+            .store_error()
+            .expect("stale definition query should report its store error");
+        assert!(error.to_string().contains("querying definition candidates"));
+        assert!(error.to_string().contains("stale analyzer generation"));
+        analyzer.end_query(&stale);
     }
 
     #[test]
@@ -6468,22 +6557,24 @@ mod tests {
         let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
         analyzer.reset_full_hydration_count_for_test();
 
-        analyzer.begin_query();
+        let outer = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        let inner = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&outer);
         for file in &files {
             assert!(analyzer.fetch_file_state(file).is_some());
         }
-        analyzer.begin_query();
+        analyzer.begin_query(&inner);
         for file in &files {
             assert!(analyzer.fetch_file_state(file).is_some());
         }
-        analyzer.end_query();
+        analyzer.end_query(&inner);
 
         assert_eq!(
             analyzer.full_hydration_count_for_test(),
             TRANSIENT_FILE_STATE_CACHE_CAPACITY + 1
         );
 
-        analyzer.end_query();
+        analyzer.end_query(&outer);
         assert!(analyzer.fetch_file_state(&files[0]).is_some());
         assert_eq!(
             analyzer.full_hydration_count_for_test(),
