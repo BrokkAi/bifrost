@@ -1,6 +1,7 @@
 name: Benchmark
 
 on:
+  pull_request:
   schedule:
     - cron: '17 9 * * *'
   workflow_dispatch:

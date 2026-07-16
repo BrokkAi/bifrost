@@ -36,7 +36,7 @@ fn benchmark_workflow_enforces_actionable_regressions_by_default() {
     assert!(workflow.contains("  schedule:\n"));
     assert!(workflow.contains("  workflow_dispatch:\n"));
     assert!(!workflow.contains("  push:\n"));
-    assert!(!workflow.contains("  pull_request:\n"));
+    assert!(workflow.contains("  pull_request:\n"));
 
     let strict_input = workflow
         .split_once("      strict_compare:\n")
