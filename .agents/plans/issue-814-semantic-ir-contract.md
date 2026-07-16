@@ -13,10 +13,10 @@ The observable result is an immutable `SemanticArtifact` API under `brokk_bifros
 - [x] (2026-07-16 14:39+02:00) Read issue #814, parent epic #813, downstream issues #815, #816, #817, #818, and #822, the merged durable roadmap, and the relevant existing source/storage contracts.
 - [x] (2026-07-16 14:39+02:00) Diagnosed structural facts, Rune IR, call relations, receiver analysis, compact graph storage, analyzer providers, nested callable indexing, overlays, and source-range conventions.
 - [x] (2026-07-16 14:39+02:00) Resolved the artifact and dense-ID scopes, nested procedure model, callable-reference model, capture model, and source-position convention in this plan.
-- [ ] Implement durable and dense identities, total capabilities, typed outcomes, budgets, and the provider boundary.
-- [ ] Implement the immutable semantic artifact/procedure/event contract and invariant validation.
-- [ ] Implement the deterministic bounded semantic IR renderer.
-- [ ] Add behavior-focused cross-language, nested callable, capture, method-reference, invalidation, uncertainty, validation, and renderer tests.
+- [x] (2026-07-16 15:32+02:00) Implemented durable and dense identities, total capabilities, typed outcomes, finite atomic budgets, and the standalone provider boundary.
+- [x] (2026-07-16 15:32+02:00) Implemented the immutable semantic artifact/procedure/event contract and construction-time invariant validation.
+- [x] (2026-07-16 15:32+02:00) Implemented the deterministic bounded semantic IR renderer with artifact/procedure selection and balanced truncation.
+- [x] (2026-07-16 15:32+02:00) Added behavior-focused cross-language, nested callable, value/cell capture, method-reference, invalidation, uncertainty, validation, and renderer tests.
 - [ ] Run formatting, focused tests, full feature tests, clippy, and specialist review; fix all findings and update this plan with evidence.
 
 ## Surprises & Discoveries
@@ -35,6 +35,15 @@ The observable result is an immutable `SemanticArtifact` API under `brokk_bifros
 
 - Observation: overlay state has no public revision token suitable for semantic identity. Analyzer storage generations are language-epoch guards, not overlay revisions.
   Evidence: `OverlayProject` exposes overlay presence and snapshotting, while liveness owns an internal generation counter.
+
+- Observation: a capture destination cannot be creator-procedure-local. The nested body must own the capture slot that its load/store events address, while creation-site source values, source locations, callable values, and environment allocations remain creator-local.
+  Evidence: the initial validation sketch made both `CaptureId` and its destination `MemoryLocationId` outer-local, which left the child body no legal procedure-local ID for the captured storage.
+
+- Observation: removing a generic oracle-defined memory escape hatch exposed a required neutral case rather than a language-specific exception: mutable lexical captures need a creator-local lexical-cell location.
+  Evidence: value snapshots can use `CaptureSource::Value`, but JavaScript/Python-style shared cells and Rust/C++ reference captures require `CaptureSource::Location` without pretending that a local binding is a field, static, or indexed location.
+
+- Observation: capability discovery is only trustworthy if artifact construction rejects exact rows for unsupported features and rejects an unsupported gap for a feature advertised as complete.
+  Evidence: treating the total capability table as advisory allowed internally contradictory artifacts even though proof/precision uncertainty already has separate gap and evidence dimensions.
 
 ## Decision Log
 
@@ -60,6 +69,18 @@ The observable result is an immutable `SemanticArtifact` API under `brokk_bifros
 
 - Decision: semantic source positions use checked `u32` half-open byte spans as authoritative coordinates and carry explicit zero-based line and UTF-8-byte-column positions for display. They do not reuse `analyzer::Range` as durable identity.
   Rationale: bytes are unambiguous for tree-sitter and storage, fixed-width integers are portable, columns are required for exact anchors, and one explicit base avoids current line-number drift.
+  Date: 2026-07-16.
+
+- Decision: capture bindings are creator-local rows whose `(target, destination)` pair scopes the destination into the child procedure. Child-local capture slots name their lexical parent but do not back-reference one creation row.
+  Rationale: one static body slot may be populated by several static callable-creation sites and by many runtime environment instances. The relation is many bindings to one child slot, not one outer binding to one globally reusable local ID.
+  Date: 2026-07-16.
+
+- Decision: represent promoted lexical storage explicitly as `LexicalCell` and keep it distinct from field, static, index, and child capture-slot memory.
+  Rationale: location-backed captures need a principled abstract address for a local or parameter cell; encoding it as an indexed access or a language-defined string would hide the exact semantic distinction the neutral contract is meant to preserve.
+  Date: 2026-07-16.
+
+- Decision: validate artifact rows/events against the total capability table while keeping support independent from proof and precision.
+  Rationale: unsupported features cannot emit exact-looking facts, but a completely supported feature may still produce ambiguity, unknown targets, unproven evidence, or budget exhaustion when the program itself or the bounded analysis prevents a unique answer.
   Date: 2026-07-16.
 
 - Decision: #814 defines validated plain immutable topology and side-table contracts but does not choose CSR, CSC, persistence, adapter extraction, or ICFG topology.

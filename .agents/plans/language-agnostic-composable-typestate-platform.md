@@ -27,6 +27,7 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [x] (2026-07-16 11:43+02:00) Defined and published set-oriented taint policies, compatible multi-policy batching, symbolic taint summaries, broad meeting-point findings, exact cache layers, and evidence-backed CVSS classification across #709, #813, #821, #823, and #824.
 - [x] (2026-07-16 12:39+02:00) Moved the publication thread to neutral branch `dave/composable-typestate-roadmap` and draft PR [#828](https://github.com/BrokkAi/bifrost/pull/828).
 - [x] (2026-07-16 14:39+02:00) Diagnosed #814 in detail and added the focused implementation plan `.agents/plans/issue-814-semantic-ir-contract.md`, including corrected artifact/ID scopes and explicit nested-callable, capture, method-reference, and source-position contracts.
+- [x] (2026-07-16 15:32+02:00) Implemented #814's identities, capabilities, outcomes/budgets, immutable artifact/procedure IR, invariant validation, scoped handles, bounded renderer, and TypeScript/Java contract fixtures; final repository gates and specialist review remain.
 - [ ] Complete #814: define the language-neutral semantic IR, stable identities, capabilities, uncertainty, and an inspectable renderer.
 - [ ] Complete #815 and the first adapter children: build equivalent per-callable CFGs for TypeScript and Java.
 - [ ] Complete #816 in parallel: expose reusable dispatch, value, heap, and bounded access-path oracles for the reference languages.
@@ -63,6 +64,9 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 
 - Observation: `CodeUnit` is not an exhaustive executable-procedure identity for nested callables, and current line metadata is not one uniform durable coordinate contract.
   Evidence: Java creates synthetic lambda units that call relations exclude, other adapters do not index every nested callable, nested-call traversal is deliberately pruned, and declaration versus call-site `Range` construction uses different line bases.
+
+- Observation: capture storage crosses procedure scopes in one direction: creation bindings belong to the lexical parent, while the slot loaded by the body belongs to the child procedure.
+  Evidence: #814 validation and fixtures require creator-local values/environments to target child-local capture locations, including several static creation sites feeding one body slot.
 
 - Observation: GitHub supports native subissues in this repository, so #814 through #826 can be attached directly to #813 while retaining explicit dependency text in each body.
   Evidence: the live `subIssues` query for #813 returned all thirteen children.
@@ -135,6 +139,14 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 
 - Decision: model nested callable bodies, callable values, capture environments, method references, and invocations separately.
   Rationale: lexical nesting is not execution; a lambda or method reference creates a callable value and may bind captures or a receiver, while only later invocation creates a call site and eventual ICFG edge. Captures must distinguish value/move semantics from shared or mutable memory locations.
+  Date: 2026-07-16.
+
+- Decision: scope capture bindings to the creator and capture slots to the child, with explicit lexical cells for location-backed local captures.
+  Rationale: procedure-local dense IDs remain compact and safe, multiple creation sites can populate one static child slot, and mutable lexical captures no longer need to masquerade as indexed or language-defined memory.
+  Date: 2026-07-16.
+
+- Decision: make semantic capability declarations construction invariants rather than renderer-only metadata.
+  Rationale: exact rows for an unsupported feature and unsupported gaps for a complete feature are contradictions; ambiguity, unknown facts, unproven facts, and exhaustion remain separate proof/completeness outcomes.
   Date: 2026-07-16.
 
 - Decision: make semantic source byte spans authoritative and define display line/column coordinates as zero-based, rather than reusing `analyzer::Range` as a durable locator.

@@ -25,6 +25,7 @@ pub(crate) mod reference_candidates;
 mod ruby;
 mod rust;
 mod scala;
+pub mod semantic;
 pub(crate) mod semantic_diagnostics;
 mod source_content;
 pub mod store;
