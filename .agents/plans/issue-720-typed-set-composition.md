@@ -16,7 +16,7 @@ The behavior is visible through ordinary `query_code` execution and the executab
 - [x] (2026-07-16 09:45Z) Implemented shared-context recursive execution, typed endpoint set algebra, nested branch provenance/diagnostics, fair immediate-branch budgets, root-only limits, cancellation propagation, truncation, and identical canonical-seed reuse.
 - [x] (2026-07-16 11:20Z) Updated Rust text output, Python request/result models, VS Code provenance types, and focused public-client coverage.
 - [x] (2026-07-16 11:30Z) Added the executable JSON/RQL set-composition cookbook, updated query references and navigation, built and link-checked all docs, and visually verified the styled page and formatted exact outputs.
-- [ ] Run focused tests, formatting, strict all-feature Clippy, the full `nlp,python` suite, Python and VS Code tests, and docs check/build; review the complete diff and resolve findings.
+- [x] (2026-07-16 12:45Z) Completed adversarial diff review and final validation: formatting and diff checks, strict all-target/all-feature Clippy, the complete Rust `nlp` suite, the supported Python extension suite, VS Code tests, and Astro check/build all pass. The rendered cookbook was rechecked in the in-app browser.
 
 ## Surprises & Discoveries
 
@@ -37,6 +37,12 @@ The behavior is visible through ordinary `query_code` execution and the executab
 
 - Observation: Running Rust integration tests with the `python` feature directly does not link on this macOS extension-module configuration because Cargo attempts to build the `cdylib` without Python symbols.
   Evidence: `cargo test --test code_query_docs --test code_query_tutorials --features nlp,python` failed while linking `libbrokk_bifrost.dylib`; the supported `scripts/test_python.sh` path built the wheel and passed all 41 Python tests, while the two Rust docs suites passed without that feature combination.
+
+- Observation: This machine had a stale Homebrew `cargo-clippy` ahead of the rustup toolchain in `PATH`, which initially produced an incompatible-rustc error rather than a project diagnostic.
+  Evidence: rerunning with `/Users/dave/.cargo/bin` first exposed one real `large_enum_variant` warning; boxing the seed variant fixed it, and `cargo clippy --all-targets --all-features -- -D warnings` then passed.
+
+- Observation: Several full-suite tests need process-control, GPG, and linked-worktree access unavailable in the managed sandbox.
+  Evidence: the sandboxed `cargo test --features nlp` run passed 876 library tests but reported six permission/environment failures; the exact full command outside the sandbox passed every non-ignored unit, integration, and doc test.
 
 ## Decision Log
 
@@ -78,11 +84,13 @@ The behavior is visible through ordinary `query_code` execution and the executab
 
 ## Outcomes & Retrospective
 
-Milestones 1 and 2 are complete. Schema-version-2 JSON and RQL now express recursive `union`, `intersect`, and `except` nodes, allow ordinary typed steps after composition, and reject mixed sources, too few branches, branch-local output controls, incompatible domains, and inconsistent named captures at exact paths. Live source validation, hover metadata, TextMate highlighting, REPL summaries, and the MCP schema all recognize the new vocabulary.
+All four milestones are complete. Schema-version-2 JSON and RQL now express recursive `union`, `intersect`, and `except` nodes, allow ordinary typed steps after composition, and reject mixed sources, too few branches, branch-local output controls, incompatible domains, and inconsistent named captures at exact paths. Live source validation, hover metadata, TextMate highlighting, REPL summaries, and the MCP schema all recognize the new vocabulary.
 
-The executor now evaluates recursive plans over internal typed rows in one shared request context. Union, intersection, and subtraction use existing exact `PipelineKey` identities and deterministic operand order; union/intersection aggregate capped branch-labeled provenance, subtraction retains the first branch's evidence, nested paths are preserved, fair quotas reserve work for later operands, and the public result limit is applied only after composition. Identical canonical seeds reuse structural rows without rescanning files. The complete 66-test pipeline integration suite passes, including new set algebra, nesting, common suffix, provenance, cache reuse, fairness, diagnostic attribution, and global-limit coverage.
+The executor now evaluates recursive plans over internal typed rows in one shared request context. Union, intersection, and subtraction use existing exact `PipelineKey` identities and deterministic operand order; union/intersection aggregate capped branch-labeled provenance, subtraction retains the first branch's evidence, nested paths are preserved, fair quotas reserve work for later operands, and the public result limit is applied only after composition. Identical canonical seeds reuse structural rows without rescanning files. The complete 68-test pipeline integration suite passes, including new set algebra, nesting, common suffix, provenance, cache reuse, fairness, diagnostic attribution, and global-limit coverage.
 
-Milestone 3 is complete. Python callers can choose exactly one of `pattern`, `union`, `intersect`, or `except_`, and both Python and VS Code surface typed branch provenance. Human Rust/REPL output labels contributing branches and branch diagnostics. The new cookbook executes import-graph union, intersection, and subtraction in equivalent JSON and RQL and asserts the complete serialized results. All 41 Python tests, 54 VS Code tests, 68 pipeline tests, 3 query-doc tests, and 21 executable tutorial tests pass; focused coverage now exercises exact composition identity in all seven terminal domains, branch capability diagnostics, and cancellation. Astro check/build and all 4,270 internal link checks pass, and the rendered page was inspected in the in-app browser with readable formatted outputs and the expected navigation placement.
+Python callers can choose exactly one of `pattern`, `union`, `intersect`, or `except_`, and both Python and VS Code surface typed branch provenance. Human Rust/REPL output labels contributing branches and branch diagnostics. The new cookbook executes import-graph union, intersection, and subtraction in equivalent JSON and RQL and asserts the complete serialized results. All 41 Python tests, 54 VS Code tests, 68 pipeline tests, 3 query-doc tests, and 21 executable tutorial tests pass; focused coverage exercises exact composition identity in all seven terminal domains, branch capability diagnostics, and cancellation. Astro check/build and all 4,270 internal link checks pass, and the rendered page was inspected in the in-app browser with readable formatted outputs and the expected navigation placement.
+
+Final repository validation is green. `cargo fmt --all`, strict all-target/all-feature Clippy, and the full `cargo test --features nlp` matrix pass; the latter includes 882 library tests plus every non-ignored binary, integration, and doc test. The Python feature is validated through the repository's supported wheel-building script because a direct combined Rust `nlp,python` test build attempts to link the extension `cdylib` without Python symbols on this host. No compatibility fallback or text parser was introduced, and the final Clippy-driven boxing change keeps the recursive source enum compact without suppressing the lint.
 
 ## Context and Orientation
 
@@ -106,7 +114,7 @@ Milestone 2 refactors execution around internal recursive rows and shared reques
 
 Milestone 3 completes public surfaces and executable documentation. Extend the Python client with mutually exclusive `match`, `union`, `intersect`, and `except_` request construction and parse branch-labeled provenance/diagnostics. Update Rust exports, CLI/RQL help, VS Code types and rendering where needed, JSON/RQL reference pages, overview/safety/limits text, Python docs, and the new cookbook. The cookbook must execute at least one semantic graph composition and exact expected output for union, intersection, and except in both syntaxes. Add public-contract tests rather than exact registry-order mirrors. Run Rust docs/tutorial tests, Python tests, VS Code tests, Astro check/build, start a fresh docs preview, and inspect the new page and navigation. Update the plan, review, and commit the milestone.
 
-Milestone 4 performs adversarial final review and complete validation. Inspect for implicit cross-domain conversion, rendered-string identities, lost or mislabeled provenance, unfair or multiplicative budgets, duplicate parsing, nondeterministic HashMap iteration, recursion in untrusted plan traversal, branch-local limits that change set semantics, cancellation leaks, diagnostic drift, source-diagnostic gaps, unsupported recursive MCP schema, Python keyword mistakes, and stale documentation. Fix every finding and add regressions. Run all focused suites, `cargo fmt`, strict all-target/all-feature Clippy, the full `cargo test --features nlp,python` matrix, Python and VS Code checks, docs check/build, and `git diff --check`. Record exact evidence and the final retrospective, then commit the reviewed checkpoint without pushing or opening a pull request.
+Milestone 4 performs adversarial final review and complete validation. Inspect for implicit cross-domain conversion, rendered-string identities, lost or mislabeled provenance, unfair or multiplicative budgets, duplicate parsing, nondeterministic HashMap iteration, recursion in untrusted plan traversal, branch-local limits that change set semantics, cancellation leaks, diagnostic drift, source-diagnostic gaps, unsupported recursive MCP schema, Python keyword mistakes, and stale documentation. Fix every finding and add regressions. Run all focused suites, `cargo fmt`, strict all-target/all-feature Clippy, the full Rust `cargo test --features nlp` matrix, the supported Python extension suite, VS Code checks, docs check/build, and `git diff --check`. Record exact evidence and the final retrospective, then commit the reviewed checkpoint without pushing or opening a pull request.
 
 ## Concrete Steps
 
@@ -128,7 +136,8 @@ Run final repository gates:
 
     cargo fmt
     cargo clippy --all-targets --all-features -- -D warnings
-    cargo test --features nlp,python
+    cargo test --features nlp
+    scripts/test_python.sh
     npm --prefix docs run check
     npm --prefix docs run build
     git diff --check
@@ -187,3 +196,5 @@ Revision note (2026-07-16): Completed Milestone 1. The final frontend shape keep
 Revision note (2026-07-16): Completed Milestone 2. Recursive execution shares structural and semantic caches and global counters, partitions remaining work across immediate branches with roll-forward, combines exact typed endpoint keys before rendering, labels nested provenance and diagnostics, and preserves the existing plain-leaf response shape.
 
 Revision note (2026-07-16): Completed Milestone 3. Public clients expose set plans and branch paths, textual result surfaces identify branch provenance, and a rendered, executable cookbook documents exact import-graph set algebra plus completeness rules.
+
+Revision note (2026-07-16): Completed Milestone 4. Adversarial review found and fixed the recursive source enum's Clippy size warning. Strict all-feature linting, the full supported Rust and Python test matrices, client tests, docs checks, link validation, and visual QA are green; direct combined Rust `nlp,python` testing is recorded as a host extension-linking limitation rather than silently treated as coverage.

@@ -212,7 +212,7 @@ fn decode_plan(
                 "pattern must not be empty",
             ));
         }
-        CodeQueryPlanSource::Seed(CodeQuerySeed {
+        CodeQueryPlanSource::Seed(Box::new(CodeQuerySeed {
             where_globs: fields
                 .where_globs
                 .map(|value| decode_globs(value, &child_path(path, "where")))
@@ -226,7 +226,7 @@ fn decode_plan(
             root: root_pattern,
             inside,
             not_inside,
-        })
+        }))
     } else {
         for (label, value) in [
             ("where", fields.where_globs),

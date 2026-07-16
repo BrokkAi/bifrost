@@ -360,7 +360,7 @@ pub struct CodeQuerySeed {
 /// The source of values entering one typed pipeline suffix.
 #[derive(Debug, Clone)]
 pub enum CodeQueryPlanSource {
-    Seed(CodeQuerySeed),
+    Seed(Box<CodeQuerySeed>),
     Set {
         op: SetOperator,
         branches: Vec<CodeQueryPlan>,
