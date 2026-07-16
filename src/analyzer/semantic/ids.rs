@@ -1,11 +1,11 @@
 //! Durable semantic identities and artifact-local dense IDs.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::analyzer::Language;
+pub use crate::analyzer::LanguageDialect as SemanticLanguage;
 
 /// A failed conversion from a collection index to a fixed-width dense ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +178,22 @@ typed_digests! {
     WorkspaceMountId,
 }
 
+/// Domain separator for the language-neutral semantic IR schema fingerprint.
+pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic-ir";
+
+/// Current language-neutral semantic IR schema revision.
+pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 1;
+
+impl SemanticIrVersion {
+    /// The contract-owned fingerprint shared by every language adapter that
+    /// emits the current semantic IR schema.
+    pub fn current() -> Self {
+        let mut digest = LengthDelimitedDigest::new(SEMANTIC_IR_SCHEMA_DOMAIN);
+        digest.push(&SEMANTIC_IR_SCHEMA_VERSION.to_le_bytes());
+        Self::from_digest(digest.finish())
+    }
+}
+
 /// The version of one language adapter's execution semantics.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AdapterSemanticsVersion {
@@ -241,6 +257,9 @@ pub enum WorkspaceRelativePathError {
     CurrentComponent,
     EmptyComponent,
     NonUtf8,
+    InvalidCharacter,
+    TrailingDotOrSpace,
+    ReservedDeviceName,
 }
 
 impl fmt::Display for WorkspaceRelativePathError {
@@ -253,6 +272,15 @@ impl fmt::Display for WorkspaceRelativePathError {
             Self::CurrentComponent => "workspace-relative path must not contain `.`",
             Self::EmptyComponent => "workspace-relative path must not contain empty components",
             Self::NonUtf8 => "workspace-relative path must be valid UTF-8",
+            Self::InvalidCharacter => {
+                "workspace-relative path contains a character that is not portable to Windows"
+            }
+            Self::TrailingDotOrSpace => {
+                "workspace-relative path component must not end in a dot or space"
+            }
+            Self::ReservedDeviceName => {
+                "workspace-relative path contains a reserved Windows device name"
+            }
         };
         formatter.write_str(message)
     }
@@ -261,12 +289,13 @@ impl fmt::Display for WorkspaceRelativePathError {
 impl std::error::Error for WorkspaceRelativePathError {}
 
 impl WorkspaceRelativePath {
+    /// Parse an already portable slash-canonical path.
     pub fn new(path: impl AsRef<str>) -> Result<Self, WorkspaceRelativePathError> {
         let path = path.as_ref();
         if path.is_empty() {
             return Err(WorkspaceRelativePathError::Empty);
         }
-        if path.starts_with('/') || path.starts_with('\\') {
+        if path.starts_with('/') {
             return Err(WorkspaceRelativePathError::Absolute);
         }
         let bytes = path.as_bytes();
@@ -275,26 +304,40 @@ impl WorkspaceRelativePath {
         }
 
         let mut normalized = String::with_capacity(path.len());
-        for (index, component) in path.split(['/', '\\']).enumerate() {
-            if component.is_empty() {
-                return Err(WorkspaceRelativePathError::EmptyComponent);
-            }
-            match component {
-                "." => return Err(WorkspaceRelativePathError::CurrentComponent),
-                ".." => return Err(WorkspaceRelativePathError::ParentComponent),
-                _ => {}
-            }
-            if index > 0 {
-                normalized.push('/');
-            }
-            normalized.push_str(component);
+        for component in path.split('/') {
+            push_portable_component(&mut normalized, component)?;
         }
         Ok(Self(normalized.into_boxed_str()))
     }
 
+    /// Convert a native relative path through platform-aware components, then
+    /// store it in the portable slash-canonical form.
     pub fn try_from_path(path: &Path) -> Result<Self, WorkspaceRelativePathError> {
-        let path = path.to_str().ok_or(WorkspaceRelativePathError::NonUtf8)?;
-        Self::new(path)
+        if path.as_os_str().is_empty() {
+            return Err(WorkspaceRelativePathError::Empty);
+        }
+
+        let mut normalized = String::new();
+        for component in path.components() {
+            match component {
+                Component::Prefix(_) => return Err(WorkspaceRelativePathError::Prefix),
+                Component::RootDir => return Err(WorkspaceRelativePathError::Absolute),
+                Component::ParentDir => {
+                    return Err(WorkspaceRelativePathError::ParentComponent);
+                }
+                Component::CurDir => return Err(WorkspaceRelativePathError::CurrentComponent),
+                Component::Normal(component) => {
+                    let component = component
+                        .to_str()
+                        .ok_or(WorkspaceRelativePathError::NonUtf8)?;
+                    push_portable_component(&mut normalized, component)?;
+                }
+            }
+        }
+        if normalized.is_empty() {
+            return Err(WorkspaceRelativePathError::Empty);
+        }
+        Ok(Self(normalized.into_boxed_str()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -304,6 +347,64 @@ impl WorkspaceRelativePath {
     pub fn as_path(&self) -> &Path {
         Path::new(self.as_str())
     }
+}
+
+fn push_portable_component(
+    normalized: &mut String,
+    component: &str,
+) -> Result<(), WorkspaceRelativePathError> {
+    validate_portable_component(component)?;
+    if !normalized.is_empty() {
+        normalized.push('/');
+    }
+    normalized.push_str(component);
+    Ok(())
+}
+
+fn validate_portable_component(component: &str) -> Result<(), WorkspaceRelativePathError> {
+    if component.is_empty() {
+        return Err(WorkspaceRelativePathError::EmptyComponent);
+    }
+    match component {
+        "." => return Err(WorkspaceRelativePathError::CurrentComponent),
+        ".." => return Err(WorkspaceRelativePathError::ParentComponent),
+        _ => {}
+    }
+
+    if component.chars().any(|character| {
+        character <= '\u{1f}' || matches!(character, '<' | '>' | ':' | '"' | '\\' | '|' | '?' | '*')
+    }) {
+        return Err(WorkspaceRelativePathError::InvalidCharacter);
+    }
+    if component.ends_with('.') || component.ends_with(' ') {
+        return Err(WorkspaceRelativePathError::TrailingDotOrSpace);
+    }
+    if is_reserved_windows_device_name(component) {
+        return Err(WorkspaceRelativePathError::ReservedDeviceName);
+    }
+    Ok(())
+}
+
+fn is_reserved_windows_device_name(component: &str) -> bool {
+    let basename = component
+        .split_once('.')
+        .map_or(component, |(basename, _)| basename)
+        .trim_end_matches(['.', ' ']);
+    let basename = basename.to_ascii_uppercase();
+    if matches!(
+        basename.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    ["COM", "LPT"].into_iter().any(|prefix| {
+        basename.strip_prefix(prefix).is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+    })
 }
 
 impl TryFrom<&Path> for WorkspaceRelativePath {
@@ -337,35 +438,6 @@ impl AsRef<Path> for WorkspaceRelativePath {
 impl fmt::Display for WorkspaceRelativePath {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
-    }
-}
-
-/// The source language plus parser dialect when one language has several grammars.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum SemanticLanguage {
-    Standard(Language),
-    TypeScriptTsx,
-}
-
-impl SemanticLanguage {
-    pub const fn language(self) -> Language {
-        match self {
-            Self::Standard(language) => language,
-            Self::TypeScriptTsx => Language::TypeScript,
-        }
-    }
-
-    pub fn stable_label(self) -> &'static str {
-        match self {
-            Self::TypeScriptTsx => "typescript-tsx",
-            Self::Standard(language) => language.config_label(),
-        }
-    }
-}
-
-impl fmt::Display for SemanticLanguage {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.stable_label())
     }
 }
 
@@ -438,6 +510,7 @@ pub enum SourceSpanError {
     ReversedBytes,
     ReversedLines,
     ReversedColumn,
+    InconsistentCoordinates,
 }
 
 impl fmt::Display for SourceSpanError {
@@ -446,6 +519,9 @@ impl fmt::Display for SourceSpanError {
             Self::ReversedBytes => "source span end byte precedes its start byte",
             Self::ReversedLines => "source span end line precedes its start line",
             Self::ReversedColumn => "single-line source span end column precedes its start column",
+            Self::InconsistentCoordinates => {
+                "source span byte offsets disagree with its zero-based line and UTF-8 byte-column coordinates"
+            }
         };
         formatter.write_str(message)
     }
@@ -458,11 +534,21 @@ impl SourceSpan {
         if end.byte_offset < start.byte_offset {
             return Err(SourceSpanError::ReversedBytes);
         }
+        if end.byte_offset == start.byte_offset
+            && (end.line != start.line || end.byte_column != start.byte_column)
+        {
+            return Err(SourceSpanError::InconsistentCoordinates);
+        }
         if end.line < start.line {
             return Err(SourceSpanError::ReversedLines);
         }
         if end.line == start.line && end.byte_column < start.byte_column {
             return Err(SourceSpanError::ReversedColumn);
+        }
+        if end.line == start.line
+            && end.byte_offset - start.byte_offset != end.byte_column - start.byte_column
+        {
+            return Err(SourceSpanError::InconsistentCoordinates);
         }
         Ok(Self { start, end })
     }
@@ -828,8 +914,10 @@ impl LengthDelimitedDigest {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::path::Path;
 
     use super::*;
+    use crate::analyzer::Language;
 
     #[test]
     fn dense_ids_are_fixed_width_checked_and_not_interchangeable() {
@@ -851,8 +939,8 @@ mod tests {
     }
 
     #[test]
-    fn workspace_paths_are_utf8_relative_and_platform_neutral() {
-        let path = WorkspaceRelativePath::new(r"src\nested\main.ts").unwrap();
+    fn workspace_path_strings_are_slash_canonical_and_relative() {
+        let path = WorkspaceRelativePath::new("src/nested/main.ts").unwrap();
         assert_eq!(path.as_str(), "src/nested/main.ts");
 
         for invalid in [
@@ -867,6 +955,105 @@ mod tests {
         for invalid in ["src/../main.ts", "src/./main.ts", "src//main.ts", "src/"] {
             assert!(WorkspaceRelativePath::new(invalid).is_err(), "{invalid:?}");
         }
+        assert_eq!(
+            WorkspaceRelativePath::new(r"src\nested\main.ts"),
+            Err(WorkspaceRelativePathError::InvalidCharacter)
+        );
+    }
+
+    #[test]
+    fn native_paths_use_platform_components_without_aliasing_unix_backslashes() {
+        let native = Path::new("src").join("nested").join("main.ts");
+        assert_eq!(
+            WorkspaceRelativePath::try_from_path(&native)
+                .unwrap()
+                .as_str(),
+            "src/nested/main.ts"
+        );
+
+        #[cfg(windows)]
+        assert_eq!(
+            WorkspaceRelativePath::try_from_path(Path::new(r"src\nested\main.ts"))
+                .unwrap()
+                .as_str(),
+            "src/nested/main.ts"
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            WorkspaceRelativePath::try_from_path(Path::new(r"src\nested\main.ts")),
+            Err(WorkspaceRelativePathError::InvalidCharacter)
+        );
+    }
+
+    #[test]
+    fn workspace_paths_reject_windows_unsafe_components() {
+        for (invalid, expected) in [
+            (
+                "src/main.ts:stream",
+                WorkspaceRelativePathError::InvalidCharacter,
+            ),
+            ("src/name?.ts", WorkspaceRelativePathError::InvalidCharacter),
+            ("src/name*.ts", WorkspaceRelativePathError::InvalidCharacter),
+            (
+                "src/name|pipe.ts",
+                WorkspaceRelativePathError::InvalidCharacter,
+            ),
+            (
+                "src/control\u{1f}.ts",
+                WorkspaceRelativePathError::InvalidCharacter,
+            ),
+            (
+                "src/trailing.",
+                WorkspaceRelativePathError::TrailingDotOrSpace,
+            ),
+            (
+                "src/trailing ",
+                WorkspaceRelativePathError::TrailingDotOrSpace,
+            ),
+            ("src/CON", WorkspaceRelativePathError::ReservedDeviceName),
+            (
+                "src/con.txt",
+                WorkspaceRelativePathError::ReservedDeviceName,
+            ),
+            (
+                "src/AUX .md",
+                WorkspaceRelativePathError::ReservedDeviceName,
+            ),
+            (
+                "src/lPt9.log",
+                WorkspaceRelativePathError::ReservedDeviceName,
+            ),
+            (
+                "src/COM¹.log",
+                WorkspaceRelativePathError::ReservedDeviceName,
+            ),
+        ] {
+            assert_eq!(
+                WorkspaceRelativePath::new(invalid),
+                Err(expected),
+                "{invalid:?}"
+            );
+        }
+
+        for valid in [
+            "src/console.rs",
+            "src/com10.txt",
+            "src/auxiliary",
+            "src/trailing .txt",
+        ] {
+            assert!(WorkspaceRelativePath::new(valid).is_ok(), "{valid:?}");
+        }
+    }
+
+    #[test]
+    fn current_semantic_ir_version_is_stable_and_nonzero() {
+        let current = SemanticIrVersion::current();
+        assert_eq!(
+            current.to_string(),
+            "c8a782f30e4b3d05460e191490eedfac3f0e166b012a4fa451ee2cd42c82db32"
+        );
+        assert_ne!(current.as_bytes(), &[0_u8; 32]);
+        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 1);
     }
 
     fn digest(label: &str) -> StableDigest {
@@ -1103,5 +1290,23 @@ mod tests {
             SourceSpan::new(end, start),
             Err(SourceSpanError::ReversedBytes)
         );
+    }
+
+    #[test]
+    fn source_spans_require_coordinate_consistency() {
+        let start = SourcePosition::new(4, 2, 4);
+        for end in [
+            SourcePosition::new(4, 2, 5),
+            SourcePosition::new(4, 3, 0),
+            SourcePosition::new(9, 2, 8),
+        ] {
+            assert_eq!(
+                SourceSpan::new(start, end),
+                Err(SourceSpanError::InconsistentCoordinates)
+            );
+        }
+
+        assert!(SourceSpan::new(start, SourcePosition::new(6, 2, 6)).is_ok());
+        assert!(SourceSpan::new(start, SourcePosition::new(9, 3, 1)).is_ok());
     }
 }

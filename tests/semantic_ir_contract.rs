@@ -323,6 +323,7 @@ fn nested_lambda_is_a_separate_procedure_with_explicit_capture_binding() {
     let callable = CallableValue {
         kind: CallableReferenceKind::Lambda,
         targets: CallableTargetResolution::Proven(CallableTarget::Local(ProcedureId::new(1))),
+        target_evidence: EVIDENCE,
         bound_receiver: None,
         environment: Some(AllocationId::new(0)),
     };
@@ -459,6 +460,7 @@ fn nested_lambda_is_a_separate_procedure_with_explicit_capture_binding() {
                     targets: CallableTargetResolution::Proven(CallableTarget::Local(
                         ProcedureId::new(1),
                     )),
+                    target_evidence: EVIDENCE,
                     bound_receiver: None,
                     environment: Some(AllocationId::new(1)),
                 },
@@ -589,6 +591,7 @@ fn bound_and_unbound_method_references_are_not_invocations() {
                 callable: CallableValue {
                     kind: CallableReferenceKind::BoundMethod,
                     targets: local_target.clone(),
+                    target_evidence: EVIDENCE,
                     bound_receiver: Some(ValueId::new(0)),
                     environment: None,
                 },
@@ -598,6 +601,7 @@ fn bound_and_unbound_method_references_are_not_invocations() {
                 callable: CallableValue {
                     kind: CallableReferenceKind::UnboundMethod,
                     targets: local_target,
+                    target_evidence: EVIDENCE,
                     bound_receiver: None,
                     environment: None,
                 },
@@ -717,6 +721,7 @@ fn ambiguous_callable_reference_keeps_candidates_and_an_explicit_gap() {
                         CallableTarget::Local(ProcedureId::new(1)),
                         CallableTarget::Local(ProcedureId::new(2)),
                     ])),
+                    target_evidence: EVIDENCE,
                     bound_receiver: None,
                     environment: None,
                 },
@@ -739,8 +744,10 @@ fn ambiguous_callable_reference_keeps_candidates_and_an_explicit_gap() {
     chooser.gaps.push(SemanticGap {
         id: SemanticGapId::new(0),
         point: BODY,
+        subject: SemanticGapSubject::Value(ValueId::new(0)),
         capability: SemanticCapability::CallableReferences,
         kind: SemanticGapKind::Ambiguous,
+        budget: None,
         detail: "both declarations remain viable".into(),
         source: SOURCE,
         evidence: EVIDENCE,
@@ -817,8 +824,10 @@ fn explicit_gap_does_not_fabricate_a_call_or_control_edge() {
         SemanticGap {
             id: SemanticGapId::new(0),
             point: BODY,
+            subject: SemanticGapSubject::Point,
             capability: SemanticCapability::Calls,
             kind: SemanticGapKind::Unknown,
+            budget: None,
             detail: "call target cannot be established".into(),
             source: SOURCE,
             evidence: EVIDENCE,
@@ -826,8 +835,10 @@ fn explicit_gap_does_not_fabricate_a_call_or_control_edge() {
         SemanticGap {
             id: SemanticGapId::new(1),
             point: BODY,
+            subject: SemanticGapSubject::Point,
             capability: SemanticCapability::ExceptionalControlFlow,
             kind: SemanticGapKind::Unsupported,
+            budget: None,
             detail: "adapter does not expose exceptional flow".into(),
             source: SOURCE,
             evidence: EVIDENCE,
@@ -835,8 +846,10 @@ fn explicit_gap_does_not_fabricate_a_call_or_control_edge() {
         SemanticGap {
             id: SemanticGapId::new(2),
             point: BODY,
+            subject: SemanticGapSubject::Point,
             capability: SemanticCapability::AsyncSuspendResume,
             kind: SemanticGapKind::Unsupported,
+            budget: None,
             detail: "adapter does not expose async suspension".into(),
             source: SOURCE,
             evidence: EVIDENCE,

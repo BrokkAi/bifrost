@@ -1,98 +1,71 @@
 //! Total per-language semantic capability discovery.
 
-/// One independently discoverable execution-semantic feature.
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum SemanticCapability {
-    Procedures,
-    EntryBoundary,
-    NormalExitBoundary,
-    ExceptionalExitBoundary,
-    BasicBlocks,
-    ProgramPoints,
-    NormalControlFlow,
-    ExceptionalControlFlow,
-    CleanupControlFlow,
-    Assignments,
-    Values,
-    Allocations,
-    LocalFlow,
-    ParameterFlow,
-    ReceiverFlow,
-    ReturnFlow,
-    FieldMemory,
-    StaticMemory,
-    IndexMemory,
-    Calls,
-    NormalCallContinuation,
-    ExceptionalCallContinuation,
-    Captures,
-    CallableReferences,
-    AsyncSuspendResume,
+macro_rules! count_capabilities {
+    ($($capability:ident),* $(,)?) => {
+        <[()]>::len(&[$(count_capabilities!(@unit $capability)),*])
+    };
+    (@unit $capability:ident) => { () };
 }
 
-impl SemanticCapability {
-    pub const ALL: [Self; 25] = [
-        Self::Procedures,
-        Self::EntryBoundary,
-        Self::NormalExitBoundary,
-        Self::ExceptionalExitBoundary,
-        Self::BasicBlocks,
-        Self::ProgramPoints,
-        Self::NormalControlFlow,
-        Self::ExceptionalControlFlow,
-        Self::CleanupControlFlow,
-        Self::Assignments,
-        Self::Values,
-        Self::Allocations,
-        Self::LocalFlow,
-        Self::ParameterFlow,
-        Self::ReceiverFlow,
-        Self::ReturnFlow,
-        Self::FieldMemory,
-        Self::StaticMemory,
-        Self::IndexMemory,
-        Self::Calls,
-        Self::NormalCallContinuation,
-        Self::ExceptionalCallContinuation,
-        Self::Captures,
-        Self::CallableReferences,
-        Self::AsyncSuspendResume,
-    ];
-
-    pub const fn index(self) -> usize {
-        self as usize
-    }
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Procedures => "procedures",
-            Self::EntryBoundary => "entry_boundary",
-            Self::NormalExitBoundary => "normal_exit_boundary",
-            Self::ExceptionalExitBoundary => "exceptional_exit_boundary",
-            Self::BasicBlocks => "basic_blocks",
-            Self::ProgramPoints => "program_points",
-            Self::NormalControlFlow => "normal_control_flow",
-            Self::ExceptionalControlFlow => "exceptional_control_flow",
-            Self::CleanupControlFlow => "cleanup_control_flow",
-            Self::Assignments => "assignments",
-            Self::Values => "values",
-            Self::Allocations => "allocations",
-            Self::LocalFlow => "local_flow",
-            Self::ParameterFlow => "parameter_flow",
-            Self::ReceiverFlow => "receiver_flow",
-            Self::ReturnFlow => "return_flow",
-            Self::FieldMemory => "field_memory",
-            Self::StaticMemory => "static_memory",
-            Self::IndexMemory => "index_memory",
-            Self::Calls => "calls",
-            Self::NormalCallContinuation => "normal_call_continuation",
-            Self::ExceptionalCallContinuation => "exceptional_call_continuation",
-            Self::Captures => "captures",
-            Self::CallableReferences => "callable_references",
-            Self::AsyncSuspendResume => "async_suspend_resume",
+/// Declare the capability enum, stable order, ordinal mapping, and labels once.
+///
+/// The generated count also sizes the total support table, so adding a variant
+/// cannot silently omit it from iteration or leave it outside table storage.
+macro_rules! semantic_capabilities {
+    ($($capability:ident => $label:literal),+ $(,)?) => {
+        /// One independently discoverable execution-semantic feature.
+        #[repr(u8)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum SemanticCapability {
+            $($capability),+
         }
-    }
+
+        impl SemanticCapability {
+            pub const COUNT: usize = count_capabilities!($($capability),+);
+
+            pub const ALL: [Self; Self::COUNT] = [
+                $(Self::$capability),+
+            ];
+
+            pub const fn index(self) -> usize {
+                self as usize
+            }
+
+            pub const fn label(self) -> &'static str {
+                match self {
+                    $(Self::$capability => $label),+
+                }
+            }
+        }
+    };
+}
+
+semantic_capabilities! {
+    Procedures => "procedures",
+    EntryBoundary => "entry_boundary",
+    NormalExitBoundary => "normal_exit_boundary",
+    ExceptionalExitBoundary => "exceptional_exit_boundary",
+    BasicBlocks => "basic_blocks",
+    ProgramPoints => "program_points",
+    NormalControlFlow => "normal_control_flow",
+    ExceptionalControlFlow => "exceptional_control_flow",
+    CleanupControlFlow => "cleanup_control_flow",
+    Assignments => "assignments",
+    Values => "values",
+    Allocations => "allocations",
+    LocalFlow => "local_flow",
+    ParameterFlow => "parameter_flow",
+    ReceiverFlow => "receiver_flow",
+    ReturnFlow => "return_flow",
+    FieldMemory => "field_memory",
+    StaticMemory => "static_memory",
+    IndexMemory => "index_memory",
+    Calls => "calls",
+    NormalCallContinuation => "normal_call_continuation",
+    ExceptionalCallContinuation => "exceptional_call_continuation",
+    Captures => "captures",
+    CallableReferences => "callable_references",
+    AsyncSuspendResume => "async_suspend_resume",
 }
 
 /// Whether an adapter completely, partially, or not at all supports a feature.
@@ -117,13 +90,13 @@ impl CapabilitySupport {
 /// A total capability table. Every undeclared feature is explicitly unsupported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticCapabilities {
-    support: [CapabilitySupport; SemanticCapability::ALL.len()],
+    support: [CapabilitySupport; SemanticCapability::COUNT],
 }
 
 impl Default for SemanticCapabilities {
     fn default() -> Self {
         Self {
-            support: [CapabilitySupport::Unsupported; SemanticCapability::ALL.len()],
+            support: [CapabilitySupport::Unsupported; SemanticCapability::COUNT],
         }
     }
 }
@@ -220,13 +193,73 @@ mod tests {
     }
 
     #[test]
-    fn iteration_order_is_deterministic_and_labels_are_unique() {
+    fn registry_ordinals_labels_and_storage_are_exhaustive() {
+        let expected = [
+            (SemanticCapability::Procedures, "procedures"),
+            (SemanticCapability::EntryBoundary, "entry_boundary"),
+            (
+                SemanticCapability::NormalExitBoundary,
+                "normal_exit_boundary",
+            ),
+            (
+                SemanticCapability::ExceptionalExitBoundary,
+                "exceptional_exit_boundary",
+            ),
+            (SemanticCapability::BasicBlocks, "basic_blocks"),
+            (SemanticCapability::ProgramPoints, "program_points"),
+            (SemanticCapability::NormalControlFlow, "normal_control_flow"),
+            (
+                SemanticCapability::ExceptionalControlFlow,
+                "exceptional_control_flow",
+            ),
+            (
+                SemanticCapability::CleanupControlFlow,
+                "cleanup_control_flow",
+            ),
+            (SemanticCapability::Assignments, "assignments"),
+            (SemanticCapability::Values, "values"),
+            (SemanticCapability::Allocations, "allocations"),
+            (SemanticCapability::LocalFlow, "local_flow"),
+            (SemanticCapability::ParameterFlow, "parameter_flow"),
+            (SemanticCapability::ReceiverFlow, "receiver_flow"),
+            (SemanticCapability::ReturnFlow, "return_flow"),
+            (SemanticCapability::FieldMemory, "field_memory"),
+            (SemanticCapability::StaticMemory, "static_memory"),
+            (SemanticCapability::IndexMemory, "index_memory"),
+            (SemanticCapability::Calls, "calls"),
+            (
+                SemanticCapability::NormalCallContinuation,
+                "normal_call_continuation",
+            ),
+            (
+                SemanticCapability::ExceptionalCallContinuation,
+                "exceptional_call_continuation",
+            ),
+            (SemanticCapability::Captures, "captures"),
+            (
+                SemanticCapability::CallableReferences,
+                "callable_references",
+            ),
+            (
+                SemanticCapability::AsyncSuspendResume,
+                "async_suspend_resume",
+            ),
+        ];
         let capabilities = SemanticCapabilities::default();
         let iterated = capabilities
             .iter()
             .map(|(capability, _)| capability)
             .collect::<Vec<_>>();
         assert_eq!(iterated, SemanticCapability::ALL);
+        assert_eq!(expected.len(), SemanticCapability::COUNT);
+        assert_eq!(SemanticCapability::ALL.len(), SemanticCapability::COUNT);
+        assert_eq!(capabilities.support.len(), SemanticCapability::COUNT);
+
+        for (ordinal, (capability, label)) in expected.into_iter().enumerate() {
+            assert_eq!(capability.index(), ordinal);
+            assert_eq!(SemanticCapability::ALL[capability.index()], capability);
+            assert_eq!(capability.label(), label);
+        }
 
         let mut labels = SemanticCapability::ALL
             .into_iter()

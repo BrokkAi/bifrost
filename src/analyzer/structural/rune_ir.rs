@@ -8,12 +8,12 @@
 use super::CodeQuery;
 use super::extract::extract_file_facts;
 use super::facts::FileFacts;
+#[cfg(test)]
 use crate::analyzer::Language;
+pub use crate::analyzer::LanguageDialect as RuneIrLanguage;
 use crate::analyzer::common::is_unparseable_source;
-use crate::analyzer::{ParserFlavor, parser_flavor_for_path, parser_language_for_flavor};
 use std::fmt;
 use std::ops::Range;
-use std::path::Path;
 
 const TRUNCATION_RESERVE: usize = 96;
 const MIN_OUTPUT_BYTES: usize = 64;
@@ -36,74 +36,6 @@ impl Default for RuneIrLimits {
             max_source_bytes: 64 * 1024,
             max_output_bytes: 256 * 1024,
         }
-    }
-}
-
-/// The parser flavor used to extract Rune IR from a source snippet.
-///
-/// Most languages have one grammar. TypeScript is the exception because `.ts`
-/// and `.tsx` files use distinct tree-sitter grammars while sharing the same
-/// normalized structural adapter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuneIrLanguage {
-    Standard(Language),
-    TypeScriptTsx,
-}
-
-impl RuneIrLanguage {
-    pub fn from_config_label(label: &str) -> Option<Self> {
-        let normalized = label
-            .trim()
-            .trim_start_matches('.')
-            .to_ascii_lowercase()
-            .replace(['_', '-'], "");
-        if matches!(normalized.as_str(), "tsx" | "typescriptreact") {
-            return Some(Self::TypeScriptTsx);
-        }
-        Language::from_config_label(label).map(Self::Standard)
-    }
-
-    pub fn for_path(language: Language, path: &Path) -> Self {
-        if parser_flavor_for_path(language, path) == ParserFlavor::TypeScriptTsx {
-            Self::TypeScriptTsx
-        } else {
-            Self::Standard(language)
-        }
-    }
-
-    pub fn language(self) -> Language {
-        match self {
-            Self::Standard(language) => language,
-            Self::TypeScriptTsx => Language::TypeScript,
-        }
-    }
-
-    pub fn config_label(self) -> &'static str {
-        match self {
-            Self::Standard(language) => language.config_label(),
-            Self::TypeScriptTsx => "tsx",
-        }
-    }
-
-    pub fn config_labels() -> impl Iterator<Item = &'static str> {
-        Language::ANALYZABLE
-            .iter()
-            .map(|language| language.config_label())
-            .chain(std::iter::once("tsx"))
-    }
-
-    fn parser_language(self) -> Option<tree_sitter::Language> {
-        let flavor = match self {
-            Self::Standard(_) => ParserFlavor::Default,
-            Self::TypeScriptTsx => ParserFlavor::TypeScriptTsx,
-        };
-        parser_language_for_flavor(self.language(), flavor)
-    }
-}
-
-impl From<Language> for RuneIrLanguage {
-    fn from(language: Language) -> Self {
-        Self::Standard(language)
     }
 }
 
@@ -588,6 +520,24 @@ mod tests {
         assert!(rendered.rune_ir.starts_with("(function"), "{rendered:?}");
         assert!(rendered.rune_ir.contains(":name \"View\""));
         assert_eq!(rendered.starter_rql, "(function :name \"View\")");
+    }
+
+    #[test]
+    fn shared_language_dialect_preserves_rune_labels_and_stable_identity() {
+        let tsx = RuneIrLanguage::from_config_label("typescript-tsx").unwrap();
+        assert_eq!(tsx, RuneIrLanguage::TypeScriptTsx);
+        assert_eq!(tsx.language(), Language::TypeScript);
+        assert_eq!(tsx.config_label(), "tsx");
+        assert_eq!(tsx.stable_label(), "typescript-tsx");
+        assert_eq!(
+            RuneIrLanguage::for_path(Language::TypeScript, std::path::Path::new("View.tsx")),
+            RuneIrLanguage::TypeScriptTsx
+        );
+        assert_eq!(
+            RuneIrLanguage::for_path(Language::TypeScript, std::path::Path::new("View.TSX")),
+            RuneIrLanguage::TypeScriptTsx
+        );
+        assert!(RuneIrLanguage::config_labels().any(|label| label == "tsx"));
     }
 
     #[test]
