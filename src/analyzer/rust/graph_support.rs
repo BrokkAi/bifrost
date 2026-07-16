@@ -1319,5 +1319,11 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert!(analyzer.export_indexes.get(&file).is_some());
+
+        let updated = analyzer.update(&BTreeSet::from([file.clone()]));
+        let after_noop_update = updated.forward_reference_context_of(&file);
+
+        assert!(Arc::ptr_eq(&first, &after_noop_update));
+        assert!(updated.export_indexes.get(&file).is_some());
     }
 }

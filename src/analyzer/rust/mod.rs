@@ -61,6 +61,16 @@ pub struct RustAnalyzer {
 crate::analyzer::impl_forward_query_provider!(RustAnalyzer);
 
 impl RustAnalyzer {
+    fn indexed_sources_unchanged(&self, changed_files: &BTreeSet<ProjectFile>) -> bool {
+        changed_files.iter().all(|file| {
+            self.inner
+                .project()
+                .read_source(file)
+                .ok()
+                .is_some_and(|source| self.inner.indexed_source_matches(file, &source))
+        })
+    }
+
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
@@ -289,6 +299,10 @@ impl IAnalyzer for RustAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        if self.indexed_sources_unchanged(changed_files) {
+            return self.clone();
+        }
+
         Self {
             inner: self.inner.update(changed_files),
             memo_budget: self.memo_budget,

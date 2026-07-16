@@ -19,6 +19,7 @@ The result is observable in two ways. Focused `bifrost_benchmark` runs for `clic
 - [x] (2026-07-16 10:59Z) Added `post_to_slack` with schedule-preserving conditions shared by both Slack steps; workflow policy tests pass.
 - [x] (2026-07-16 11:24Z) Ran focused local benchmarks for all three repositories. Strict comparisons pass for warmed focused reports: Click scan 2261.8 ms and dead code 1484.5 ms; Gin scan 738.8 ms; Serde definition 19.0 ms on the final repeat.
 - [x] (2026-07-16 11:39Z) Passed `cargo fmt --all -- --check`, the workflow policy suite, and isolated `cargo clippy --all-targets --all-features -- -D warnings` with one consistent rustup toolchain.
+- [x] (2026-07-16 11:59Z) Diagnosed the first hosted run's sole residual regression with a silent profiled dispatch, preserved Rust caches across no-op watcher updates, and passed the focused cache test, 111 Rust usage tests, 477 definition tests, and a 22.6 ms local Serde strict comparison.
 - [ ] Review, commit each completed milestone, push the branch, run the silent benchmark path, and open a ready-for-review pull request.
 
 ## Surprises & Discoveries
@@ -43,6 +44,12 @@ The result is observable in two ways. Focused `bifrost_benchmark` runs for `clic
 
 - Observation: `origin/master` advanced by one unrelated documentation commit after implementation began.
   Evidence: The refreshed remote is one commit ahead at `91ccc876`, which only adds `.agents/plans/language-agnostic-composable-typestate-platform.md` and does not overlap this change.
+
+- Observation: The first full hosted run repaired Click and Gin but still rebuilt the Rust reference context on every Serde definition iteration.
+  Evidence: Run `29495001649` passed Click at 2317.5/1391.2 milliseconds and Gin at 774.9 milliseconds, but Serde remained at 641.3 milliseconds. Profile run `29495817073`, dispatched with `post_to_slack=false`, showed seven unchanged watcher files entering each query, `TreeSitterAnalyzer::Rust::analyze_files[0]`, and 588-591 milliseconds rebuilding the dropped reference context.
+
+- Observation: Avoiding a Rust analyzer generation change when every reported file still matches its indexed source preserves the expensive caches without weakening real update behavior.
+  Evidence: The cache-identity test retains the same `Arc` across a no-op update, all Rust usage and definition tests pass, and the focused Serde median is 22.6 milliseconds with no strict regression.
 
 ## Decision Log
 
@@ -72,7 +79,7 @@ The result is observable in two ways. Focused `bifrost_benchmark` runs for `clic
 
 ## Outcomes & Retrospective
 
-All four reported latency regressions are repaired locally without changing the blessed baseline. Focused strict comparisons pass at 2261.8 milliseconds for Click `scan_usages`, 1484.5 milliseconds for Click `dead_code_smells`, 738.8 milliseconds for Gin `scan_usages`, and 19.0 milliseconds for Serde JSON `get_definition`. The language-specific suites, workflow policy tests, formatting check, and isolated all-target/all-feature Clippy gate pass. Publication and the GitHub-hosted silent benchmark remain in progress; their URLs and hosted results will be recorded here after the temporary PR trigger completes.
+All four reported latency regressions are repaired locally without changing the blessed baseline. Focused strict comparisons pass at 2261.8 milliseconds for Click `scan_usages`, 1484.5 milliseconds for Click `dead_code_smells`, 738.8 milliseconds for Gin `scan_usages`, and 22.6 milliseconds for Serde JSON `get_definition` after the hosted no-op watcher path was reproduced and fixed. The language-specific suites, workflow policy tests, formatting check, and final isolated all-target/all-feature Clippy gate pass. The second full hosted benchmark remains in progress.
 
 ## Context and Orientation
 
