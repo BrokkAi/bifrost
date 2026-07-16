@@ -80,6 +80,7 @@ export default defineConfig({
             { label: 'Codex', slug: 'codex' },
             { label: 'Claude Code', slug: 'claude-code' },
             { label: 'Cursor', slug: 'cursor' },
+            { label: 'OpenCode', slug: 'opencode' },
             { label: 'Zed Agent', slug: 'zed-mcp' },
             { label: 'Amp', slug: 'amp' },
             { label: 'Antigravity', slug: 'antigravity' },
