@@ -41,8 +41,8 @@ use crate::analyzer::usage_facts::CallableFacts;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
-    build_file_declarations, build_file_declarations_from_state, classify_reference_node,
-    first_precise, parse_source_and_collect_with_declarations,
+    build_file_declarations_from_state, classify_reference_node, first_precise,
+    parse_source_and_collect_with_declarations,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{
@@ -74,8 +74,8 @@ pub(crate) struct ProjectTypes {
     package_types_by_package: Mutex<HashMap<String, PackageTypeEntries>>,
     package_objects_by_package: Mutex<HashMap<String, PackageTypeEntries>>,
     source_facts_by_file: Mutex<HashMap<ProjectFile, ScalaSourceFactsCell>>,
+    bulk_file_states: Option<HashMap<ProjectFile, FileState>>,
     callable_alternatives_by_unit: Mutex<HashMap<CodeUnit, CallableAlternativesCell>>,
-    declaration_ranges: Option<HashMap<CodeUnit, Vec<Range>>>,
     extension_methods_by_owner_member:
         Mutex<HashMap<ExtensionOwnerMemberKey, ExtensionMethodEntries>>,
     override_targets_by_method: Mutex<HashMap<String, OverrideTargetEntries>>,
@@ -92,8 +92,8 @@ impl ProjectTypes {
             package_types_by_package: Mutex::new(HashMap::default()),
             package_objects_by_package: Mutex::new(HashMap::default()),
             source_facts_by_file: Mutex::new(HashMap::default()),
+            bulk_file_states: None,
             callable_alternatives_by_unit: Mutex::new(HashMap::default()),
-            declaration_ranges: None,
             extension_methods_by_owner_member: Mutex::new(HashMap::default()),
             override_targets_by_method: Mutex::new(HashMap::default()),
         }
@@ -101,7 +101,7 @@ impl ProjectTypes {
 
     pub(crate) fn build_from_file_states(
         scala: &ScalaAnalyzer,
-        file_states: &HashMap<ProjectFile, FileState>,
+        file_states: HashMap<ProjectFile, FileState>,
     ) -> Self {
         let mut declarations = Vec::new();
         let mut seen = HashSet::default();
@@ -157,24 +157,24 @@ impl ProjectTypes {
             package_types_by_package: Mutex::new(HashMap::default()),
             package_objects_by_package: Mutex::new(HashMap::default()),
             source_facts_by_file: Mutex::new(HashMap::default()),
+            bulk_file_states: Some(file_states),
             callable_alternatives_by_unit: Mutex::new(HashMap::default()),
-            declaration_ranges: Some(
-                file_states
-                    .values()
-                    .flat_map(|state| {
-                        state
-                            .ranges
-                            .iter()
-                            .map(|(unit, ranges)| (unit.clone(), ranges.clone()))
-                    })
-                    .collect(),
-            ),
             extension_methods_by_owner_member: Mutex::new(HashMap::default()),
             override_targets_by_method: Mutex::new(HashMap::default()),
         };
-        types.direct_ancestors_by_owner =
-            Some(types.build_direct_ancestors_from_file_states(scala, file_states));
+        let direct_ancestors_by_owner = types.build_direct_ancestors_from_file_states(
+            scala,
+            types
+                .bulk_file_states
+                .as_ref()
+                .expect("bulk Scala file states were just installed"),
+        );
+        types.direct_ancestors_by_owner = Some(direct_ancestors_by_owner);
         types
+    }
+
+    fn bulk_file_state(&self, file: &ProjectFile) -> Option<&FileState> {
+        self.bulk_file_states.as_ref()?.get(file)
     }
 
     fn build_direct_ancestors_from_file_states(
@@ -710,8 +710,8 @@ impl ProjectTypes {
             if !exact.is_empty() {
                 return Arc::new(exact);
             }
-            let mut fallback = scala
-                .signature_metadata(target)
+            let mut fallback = self
+                .signature_metadata_for(scala, target)
                 .into_iter()
                 .filter_map(|metadata| {
                     metadata.callable_arity().map(|arity| CallableAlternative {
@@ -761,10 +761,29 @@ impl ProjectTypes {
     }
 
     fn declaration_ranges_for(&self, scala: &ScalaAnalyzer, target: &CodeUnit) -> Vec<Range> {
-        self.declaration_ranges
-            .as_ref()
-            .and_then(|ranges| ranges.get(target).cloned())
-            .unwrap_or_else(|| scala.ranges(target))
+        match &self.bulk_file_states {
+            Some(states) => states
+                .get(target.source())
+                .and_then(|state| state.ranges.get(target))
+                .cloned()
+                .unwrap_or_default(),
+            None => scala.ranges(target),
+        }
+    }
+
+    fn signature_metadata_for(
+        &self,
+        scala: &ScalaAnalyzer,
+        target: &CodeUnit,
+    ) -> Vec<crate::analyzer::SignatureMetadata> {
+        match &self.bulk_file_states {
+            Some(states) => states
+                .get(target.source())
+                .and_then(|state| state.signature_metadata.get(target))
+                .cloned()
+                .unwrap_or_default(),
+            None => scala.signature_metadata(target),
+        }
     }
 
     fn source_facts_for_file(
@@ -781,13 +800,23 @@ impl ProjectTypes {
             .clone();
         cell.get_or_init(|| {
             Arc::new(
-                scala
-                    .indexed_source(file)
+                self.source_for_file(scala, file)
                     .and_then(|source| scala_source_facts(&source))
                     .unwrap_or_default(),
             )
         })
         .clone()
+    }
+
+    fn source_for_file(&self, scala: &ScalaAnalyzer, file: &ProjectFile) -> Option<String> {
+        match &self.bulk_file_states {
+            Some(states) => states
+                .get(file)
+                .map(|state| state.source.as_str())
+                .filter(|source| !source.is_empty())
+                .map(str::to_owned),
+            None => scala.indexed_source(file),
+        }
     }
 
     fn direct_extension_method(
@@ -990,13 +1019,25 @@ impl NameResolver {
         file: &ProjectFile,
         types: &ProjectTypes,
     ) -> Self {
-        Self::for_file_with_facts(
-            scala,
-            Some(file),
-            package_name_of(scala, file).as_deref(),
-            &scala.import_info_of(file),
-            types,
-        )
+        match &types.bulk_file_states {
+            Some(states) => match states.get(file) {
+                Some(state) => Self::for_file_with_facts(
+                    scala,
+                    Some(file),
+                    Some(&state.package_name),
+                    &state.imports,
+                    types,
+                ),
+                None => Self::for_file_with_facts(scala, Some(file), None, &[], types),
+            },
+            None => Self::for_file_with_facts(
+                scala,
+                Some(file),
+                package_name_of(scala, file).as_deref(),
+                &scala.import_info_of(file),
+                types,
+            ),
+        }
     }
 
     pub(crate) fn for_file_with_facts(
@@ -1010,14 +1051,27 @@ impl NameResolver {
     }
 
     fn for_file_types(scala: &ScalaAnalyzer, file: &ProjectFile, types: &ProjectTypes) -> Self {
-        Self::for_file_with_facts_impl(
-            scala,
-            Some(file),
-            package_name_of(scala, file).as_deref(),
-            &scala.import_info_of(file),
-            types,
-            false,
-        )
+        match &types.bulk_file_states {
+            Some(states) => match states.get(file) {
+                Some(state) => Self::for_file_with_facts_impl(
+                    scala,
+                    Some(file),
+                    Some(&state.package_name),
+                    &state.imports,
+                    types,
+                    false,
+                ),
+                None => Self::for_file_with_facts_impl(scala, Some(file), None, &[], types, false),
+            },
+            None => Self::for_file_with_facts_impl(
+                scala,
+                Some(file),
+                package_name_of(scala, file).as_deref(),
+                &scala.import_info_of(file),
+                types,
+                false,
+            ),
+        }
     }
 
     fn for_file_with_facts_impl(
@@ -1282,7 +1336,6 @@ fn simple_type_name(type_text: &str) -> Option<&str> {
 /// over the workspace.
 /// `nodes`/`keep_file` mirror the Go builder.
 pub(super) fn build_scala_edges<Output, F>(
-    analyzer: &dyn IAnalyzer,
     scala: &ScalaAnalyzer,
     graph: &ScalaEdgeGraph,
     nodes: &HashSet<String>,
@@ -1294,15 +1347,11 @@ where
 {
     let language = tree_sitter_scala::LANGUAGE.into();
     build_edge_output(&graph.files, keep_file, |file| {
-        let state = graph.file_states.get(file);
-        let declarations = state
-            .map(build_file_declarations_from_state)
-            .unwrap_or_else(|| build_file_declarations(analyzer, file));
-        let class_ranges = state
-            .map(ClassRangeIndex::build_from_state)
-            .unwrap_or_else(|| ClassRangeIndex::build(analyzer, file));
+        let state = graph.types.bulk_file_state(file)?;
+        let declarations = build_file_declarations_from_state(state);
+        let class_ranges = ClassRangeIndex::build_from_state(state);
         parse_source_and_collect_with_declarations(
-            analyzer.indexed_source(file)?,
+            graph.types.source_for_file(scala, file)?,
             file,
             nodes,
             &language,
@@ -1311,12 +1360,8 @@ where
                 let resolver = NameResolver::for_file_with_facts(
                     scala,
                     Some(file),
-                    graph.package_by_file.get(file).map(String::as_str),
-                    graph
-                        .imports_by_file
-                        .get(file)
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]),
+                    Some(&state.package_name),
+                    &state.imports,
                     &graph.types,
                 );
                 let factory_returns = collect_factory_return_types(

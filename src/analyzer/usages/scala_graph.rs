@@ -265,10 +265,14 @@ class ScopeLeak {
         let root = temp.path().canonicalize().unwrap();
         for index in 0..FILE_COUNT {
             let file = ProjectFile::new(root.clone(), format!("C{index}.scala"));
-            file.write(format!(
-                "package bulk\n\nclass C{index} {{\n  def run(): Unit = ()\n}}\n"
-            ))
-            .unwrap();
+            let source = if index == 0 {
+                "package bulk\n\ntrait Base\n\nobject Extensions {\n  extension (value: String) def run(): Unit = ()\n}\n\nclass C0 extends Base\n".to_string()
+            } else {
+                format!(
+                    "package bulk\n\nimport bulk.Extensions.run\n\nclass C{index} extends Base\n"
+                )
+            };
+            file.write(source).unwrap();
         }
 
         let project = TestProject::new(root, Language::Scala);
@@ -284,12 +288,8 @@ class ScopeLeak {
             .all_declarations()
             .map(|unit| unit.fq_name())
             .collect();
-        let edges = build_scala_usage_edges(&analyzer, &nodes, |_| true)
+        let _edges = build_scala_usage_edges(&analyzer, &nodes, |_| true)
             .expect("scala usage graph should build");
-        assert!(
-            edges.edges.is_empty(),
-            "fixture has no calls, only exercises graph file-state reads"
-        );
         assert_eq!(
             analyzer.full_hydration_count_for_test(),
             lru_after_warm,
