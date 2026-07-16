@@ -772,21 +772,28 @@ fn direct_composite_literal_type_for_key(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn keyed_element_for_key(node: Node<'_>) -> Option<Node<'_>> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if parent.kind() == "keyed_element" {
-            let key = parent.child_by_field_name("key")?;
-            if same_node(key, node) {
-                return Some(parent);
-            }
-            let mut cursor = key.walk();
-            let mut children = key.named_children(&mut cursor);
-            return children
-                .next()
-                .filter(|child| same_node(*child, node) && children.next().is_none())
-                .map(|_| parent);
+    let parent = node.parent()?;
+    let keyed = if parent.kind() == "keyed_element" {
+        parent
+    } else {
+        let keyed = parent
+            .parent()
+            .filter(|ancestor| ancestor.kind() == "keyed_element")?;
+        let key = keyed.child_by_field_name("key")?;
+        if !same_node(key, parent) {
+            return None;
         }
-        current = parent.parent();
+        keyed
+    };
+
+    let key = keyed.child_by_field_name("key")?;
+    if same_node(key, node) {
+        return Some(keyed);
     }
-    None
+    let mut cursor = key.walk();
+    let mut children = key.named_children(&mut cursor);
+    children
+        .next()
+        .filter(|child| same_node(*child, node) && children.next().is_none())
+        .map(|_| keyed)
 }

@@ -13,10 +13,12 @@
 
 use crate::analyzer::usages::{
     ExportEntry, ExportIndex, ImportBinder, ImportEdge, ImportEdgeKind, ImportKind,
+    LocalBindingsSnapshot,
 };
-use crate::analyzer::{BulkFileStateSource, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{BulkFileStateSource, CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashMap;
 use std::collections::{BTreeSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use super::PythonAnalyzer;
 use super::declarations::python_module_name;
@@ -32,6 +34,27 @@ pub(crate) struct PythonUsageIndex {
     reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
     star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
     importer_reverse: HashMap<ProjectFile, Vec<ImportEdge>>,
+    module_binding_timelines: Mutex<HashMap<ProjectFile, Arc<ModuleBindingTimeline>>>,
+    scope_facts_by_file: Mutex<HashMap<ProjectFile, Arc<PythonScopeFacts>>>,
+}
+
+pub(crate) type ModuleBindingTimeline = HashMap<String, Vec<ModuleBindingEvent>>;
+pub(crate) type PythonScopeFacts = HashMap<CodeUnit, LocalBindingsSnapshot<String>>;
+
+#[derive(Clone, Debug)]
+pub(crate) struct ModuleBindingEvent {
+    pub(crate) visible_from: usize,
+    pub(crate) kind: ModuleBindingEventKind,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ModuleBindingEventKind {
+    ImportModule(String),
+    FromImport {
+        module: String,
+        imported_name: String,
+    },
+    Other,
 }
 
 /// Resolve a module specifier to the files defining it: a leading-dot specifier
@@ -166,6 +189,8 @@ impl PythonUsageIndex {
             reexport_edges,
             star_reexports,
             importer_reverse,
+            module_binding_timelines: Mutex::new(HashMap::default()),
+            scope_facts_by_file: Mutex::new(HashMap::default()),
         }
     }
 
@@ -258,6 +283,54 @@ impl PythonUsageIndex {
         module_specifier: &str,
     ) -> Vec<ProjectFile> {
         resolve_module(&self.module_index, importing_file, module_specifier)
+    }
+
+    fn module_binding_timeline(
+        &self,
+        file: &ProjectFile,
+        build: impl FnOnce() -> ModuleBindingTimeline,
+    ) -> Arc<ModuleBindingTimeline> {
+        if let Some(cached) = self
+            .module_binding_timelines
+            .lock()
+            .expect("Python module-binding timeline cache mutex poisoned")
+            .get(file)
+            .cloned()
+        {
+            return cached;
+        }
+
+        let timeline = Arc::new(build());
+        self.module_binding_timelines
+            .lock()
+            .expect("Python module-binding timeline cache mutex poisoned")
+            .entry(file.clone())
+            .or_insert_with(|| timeline.clone())
+            .clone()
+    }
+
+    fn scope_facts(
+        &self,
+        file: &ProjectFile,
+        build: impl FnOnce() -> PythonScopeFacts,
+    ) -> Arc<PythonScopeFacts> {
+        if let Some(cached) = self
+            .scope_facts_by_file
+            .lock()
+            .expect("Python scope-facts cache mutex poisoned")
+            .get(file)
+            .cloned()
+        {
+            return cached;
+        }
+
+        let facts = Arc::new(build());
+        self.scope_facts_by_file
+            .lock()
+            .expect("Python scope-facts cache mutex poisoned")
+            .entry(file.clone())
+            .or_insert_with(|| facts.clone())
+            .clone()
     }
 }
 
@@ -370,5 +443,53 @@ impl PythonAnalyzer {
     ) -> Vec<ProjectFile> {
         self.usage_index()
             .resolve_module_files(importing_file, module_specifier)
+    }
+
+    pub(crate) fn usage_module_binding_timeline(
+        &self,
+        file: &ProjectFile,
+        build: impl FnOnce() -> ModuleBindingTimeline,
+    ) -> Arc<ModuleBindingTimeline> {
+        self.usage_index().module_binding_timeline(file, build)
+    }
+
+    pub(crate) fn usage_scope_facts(
+        &self,
+        file: &ProjectFile,
+        build: impl FnOnce() -> PythonScopeFacts,
+    ) -> Arc<PythonScopeFacts> {
+        self.usage_index().scope_facts(file, build)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_binding_timeline_is_reused_within_index_generation() {
+        let root = tempfile::tempdir().expect("temporary project root");
+        let file = ProjectFile::new(root.path(), "consumer.py");
+        let index = PythonUsageIndex::default();
+        let first = index.module_binding_timeline(&file, || {
+            ModuleBindingTimeline::from_iter([(
+                "target".to_string(),
+                vec![ModuleBindingEvent {
+                    visible_from: 12,
+                    kind: ModuleBindingEventKind::Other,
+                }],
+            )])
+        });
+        let second = index.module_binding_timeline(&file, || {
+            panic!("cached timeline should avoid rebuilding the file")
+        });
+
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let first_facts = index.scope_facts(&file, PythonScopeFacts::default);
+        let second_facts = index.scope_facts(&file, || {
+            panic!("cached scope facts should avoid rebuilding the file")
+        });
+        assert!(Arc::ptr_eq(&first_facts, &second_facts));
     }
 }

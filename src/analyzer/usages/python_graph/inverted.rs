@@ -30,6 +30,7 @@ use crate::analyzer::usages::local_inference::LocalBindingsSnapshot;
 use crate::analyzer::usages::model::ImportKind;
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use tree_sitter::Node;
 
 /// Build the whole Python `caller -> callee` edge set in a single inverted pass.
@@ -45,6 +46,8 @@ where
 {
     let files: Vec<ProjectFile> = py.get_analyzed_files().into_iter().collect();
     let language = tree_sitter_python::LANGUAGE.into();
+    let canonical_namespace_candidates: Mutex<HashMap<String, Arc<Vec<String>>>> =
+        Mutex::new(HashMap::default());
     build_edge_output(&files, keep_file, |file| {
         // Parse on demand and drop the tree when this closure returns, so live trees
         // are bounded by the worker count rather than the workspace size (#200).
@@ -60,7 +63,7 @@ where
             // node-membership check downstream disambiguates which applies.
             let binder = py.import_binder_of(file);
             let mut named: HashMap<String, String> = HashMap::default();
-            let mut namespace: HashMap<String, String> = HashMap::default();
+            let mut namespace: HashMap<String, NamespaceBinding> = HashMap::default();
             for (local, binding) in &binder.bindings {
                 match binding.kind {
                     ImportKind::Named => {
@@ -72,7 +75,16 @@ where
                         }
                     }
                     ImportKind::Namespace => {
-                        namespace.insert(local.clone(), binding.module_specifier.clone());
+                        let module = binding.module_specifier.clone();
+                        let workspace_module =
+                            !py.usage_resolve_module_files(file, &module).is_empty();
+                        namespace.insert(
+                            local.clone(),
+                            NamespaceBinding {
+                                module,
+                                workspace_module,
+                            },
+                        );
                     }
                     ImportKind::Default | ImportKind::CommonJsRequire | ImportKind::Glob => {}
                 }
@@ -86,14 +98,15 @@ where
             // Per-function receiver-type facts (typed params + `x = Foo()`),
             // computed by the same routine the forward scan uses, so a typed
             // `recv.method` resolves to the receiver's class fqn.
-            let scope_facts = collect_scope_facts_from_parsed_source(
-                analyzer,
-                py,
-                file,
-                "",
-                source,
-                parsed.tree.root_node(),
-            );
+            let scope_facts = py.usage_scope_facts(file, || {
+                collect_scope_facts_from_parsed_source(
+                    analyzer,
+                    py,
+                    file,
+                    source,
+                    parsed.tree.root_node(),
+                )
+            });
 
             let mut ctx = PyScan {
                 analyzer,
@@ -104,7 +117,8 @@ where
                 named,
                 namespace,
                 same_file,
-                scope_facts: &scope_facts,
+                scope_facts: scope_facts.as_ref(),
+                canonical_namespace_candidates: &canonical_namespace_candidates,
                 collector,
             };
             scan_tree(parsed.tree.root_node(), &mut ctx);
@@ -119,10 +133,16 @@ struct PyScan<'a, 'b> {
     file: &'a ProjectFile,
     source: &'a str,
     named: HashMap<String, String>,
-    namespace: HashMap<String, String>,
+    namespace: HashMap<String, NamespaceBinding>,
     same_file: HashMap<String, String>,
     scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
+    canonical_namespace_candidates: &'a Mutex<HashMap<String, Arc<Vec<String>>>>,
     collector: &'a mut EdgeCollector<'b>,
+}
+
+struct NamespaceBinding {
+    module: String,
+    workspace_module: bool,
 }
 
 impl PyScan<'_, '_> {
@@ -133,7 +153,7 @@ impl PyScan<'_, '_> {
             return Some(fqn.clone());
         }
         if let Some(fqn) = self.namespace.get(text) {
-            return Some(fqn.clone());
+            return Some(fqn.module.clone());
         }
         if let Some(fqn) = self.same_file.get(text) {
             return Some(fqn.clone());
@@ -173,6 +193,32 @@ impl PyScan<'_, '_> {
     fn record_unproven_name(&mut self, name: &str, node: Node<'_>) {
         self.collector
             .record_unproven_name(name, node.start_byte(), node.end_byte());
+    }
+
+    fn canonical_namespace_candidates(&self, direct: &str) -> Arc<Vec<String>> {
+        if let Some(cached) = self
+            .canonical_namespace_candidates
+            .lock()
+            .expect("Python namespace candidate cache mutex poisoned")
+            .get(direct)
+            .cloned()
+        {
+            return cached;
+        }
+
+        let resolved: Arc<Vec<String>> = Arc::new(
+            self.py
+                .resolve_fqn_candidates(direct, |name| self.analyzer.definitions(name).collect())
+                .into_iter()
+                .map(|unit| unit.fq_name())
+                .collect(),
+        );
+        self.canonical_namespace_candidates
+            .lock()
+            .expect("Python namespace candidate cache mutex poisoned")
+            .entry(direct.to_string())
+            .or_insert_with(|| resolved.clone())
+            .clone()
     }
 }
 
@@ -303,13 +349,10 @@ fn handle_attribute<'a>(
     // module prefix plus the accessed attribute. A local of the same name as the
     // module shadows the import.
     if !is_shadowed(scopes, object_text)
-        && let Some(module) = ctx.namespace.get(object_text)
+        && let Some(binding) = ctx.namespace.get(object_text)
     {
-        let module = module.clone();
-        let workspace_module = !ctx
-            .py
-            .usage_resolve_module_files(ctx.file, &module)
-            .is_empty();
+        let module = binding.module.clone();
+        let workspace_module = binding.workspace_module;
         if ctx.nodes.contains(&module) {
             ctx.record(module.clone(), object);
         }
@@ -319,11 +362,8 @@ fn handle_attribute<'a>(
             return;
         }
         if workspace_module {
-            for resolved in ctx
-                .py
-                .resolve_fqn_candidates(&direct, |name| ctx.analyzer.definitions(name).collect())
-            {
-                ctx.record(resolved.fq_name(), attribute);
+            for resolved in ctx.canonical_namespace_candidates(&direct).iter() {
+                ctx.record(resolved.clone(), attribute);
             }
         }
         return;

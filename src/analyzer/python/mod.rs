@@ -43,6 +43,9 @@ use imports::{
 };
 use tests::detect_python_test_assertion_smells;
 use usage_index::PythonUsageIndex;
+pub(crate) use usage_index::{
+    ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline, PythonScopeFacts,
+};
 
 #[derive(Clone)]
 pub struct PythonAnalyzer {
