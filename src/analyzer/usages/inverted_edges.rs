@@ -29,7 +29,9 @@
 
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
-use crate::analyzer::usages::parsed_tree::{ParsedTreeFile, parse_tree_sitter_file};
+use crate::analyzer::usages::parsed_tree::{
+    ParsedTreeFile, parse_tree_sitter_file, parse_tree_sitter_source,
+};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::find_line_index_for_offset;
@@ -823,6 +825,27 @@ where
     S: FnOnce(&ParsedTreeFile, &mut EdgeCollector),
 {
     let parsed = parse_tree_sitter_file(file, language)?;
+    Some(collect_file_edges_with_declarations(
+        file,
+        nodes,
+        &parsed.line_starts,
+        declarations,
+        |collector| scan(&parsed, collector),
+    ))
+}
+
+pub(crate) fn parse_source_and_collect_with_declarations<S>(
+    source: String,
+    file: &ProjectFile,
+    nodes: &HashSet<String>,
+    language: &TreeSitterLanguage,
+    declarations: FileDeclarations,
+    scan: S,
+) -> Option<PerFileEdges>
+where
+    S: FnOnce(&ParsedTreeFile, &mut EdgeCollector),
+{
+    let parsed = parse_tree_sitter_source(source, language)?;
     Some(collect_file_edges_with_declarations(
         file,
         nodes,

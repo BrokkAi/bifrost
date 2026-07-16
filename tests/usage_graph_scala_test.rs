@@ -290,6 +290,443 @@ class Broken {
 }
 
 #[test]
+fn ordered_parameter_lists_gate_scala_inverted_callable_edges() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "example/Calls.scala",
+            r#"package example
+
+class Api {
+  def curried(value: Int)(label: String = "default"): Int = value
+  def gathered(prefix: Int = 0)(values: String*): Int = prefix
+}
+
+class Consumer(api: Api) {
+  def validCurried(): Int = api.curried(1)()
+  def invalidFirstList(): Int = api.curried()("missing")
+  def invalidSecondList(): Int = api.curried(1)("too", "many")
+  def partialUnique(): String => Int = api.curried(1)
+  def validDefaultsAndRepeated(): Int = api.gathered()("one", "two")
+  def invalidDefaultedList(): Int = api.gathered(1, 2)("one")
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(
+            &value,
+            "example.Consumer.validCurried",
+            "example.Api.curried"
+        ),
+        "valid ordered call lists should resolve: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "example.Consumer.partialUnique",
+            "example.Api.curried"
+        ),
+        "a unique callable may be structurally unapplied after a valid prefix: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(
+            &value,
+            "example.Consumer.invalidFirstList",
+            "example.Api.curried"
+        ),
+        "invalid first list must not resolve: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(
+            &value,
+            "example.Consumer.invalidSecondList",
+            "example.Api.curried"
+        ),
+        "invalid second list must not resolve: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "example.Consumer.validDefaultsAndRepeated",
+            "example.Api.gathered"
+        ),
+        "defaults and repeated parameters must apply independently per list: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(
+            &value,
+            "example.Consumer.invalidDefaultedList",
+            "example.Api.gathered"
+        ),
+        "an invalid defaulted list must fail closed before the repeated list: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn scala_inverted_type_edges_preserve_class_and_object_identity_roles() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "example/Token.scala",
+            r#"package example
+
+class Token
+object Token {
+  class Nested
+  def unapply(value: (String, String)): Option[(String, String)] = Some(value)
+}
+
+class Consumer {
+  def classOnly(value: Token): Token = new Token
+  def objectBare(): Token.type = Token
+  def nestedOwner(): Token.Nested = new Token.Nested
+  def extractor(value: String): String = value match {
+    case Token(found) => found
+    case _ => value
+  }
+  def infixExtractor(value: (String, String)): String = value match {
+    case left Token right => left + right
+    case _ => ""
+  }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "example.Consumer.classOnly", "example.Token"),
+        "class type/construction roles should edge to the class: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "example.Consumer.classOnly", "example.Token$"),
+        "class-only roles must not edge to the companion object: {}",
+        value["edges"]
+    );
+    for caller in [
+        "example.Consumer.objectBare",
+        "example.Consumer.nestedOwner",
+        "example.Consumer.extractor",
+        "example.Consumer.infixExtractor",
+    ] {
+        assert!(
+            has_edge(&value, caller, "example.Token$"),
+            "object role in {caller} should edge to the companion object: {}",
+            value["edges"]
+        );
+        assert!(
+            !has_edge(&value, caller, "example.Token"),
+            "object role in {caller} must not edge to the class: {}",
+            value["edges"]
+        );
+    }
+}
+
+#[test]
+fn scala_inverted_companion_nested_and_wildcard_object_roles_are_exact() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Owners.scala",
+            r#"package app
+class Token { def make(): Token = this }
+object Token { def make(): Token = new Token }
+object Outer {
+  def make(): Int = 1
+  object Inner { def make(): Int = 2 }
+}
+object Shared
+class Holder { val Shared: Int = 1 }
+object Use {
+  def companion(): Token = Token.make()
+  def nested(): Outer.Inner.type = Outer.Inner
+  def nestedCall(): Int = Outer.Inner.make()
+  def unqualifiedNested = Inner
+  def instanceField(holder: Holder): Int = holder.Shared
+}
+"#,
+        )
+        .file("left/Shared.scala", "package left\nobject Shared { def make(): Int = 1 }\n")
+        .file("right/Shared.scala", "package right\nobject Shared { def make(): Int = 2 }\n")
+        .file(
+            "app/Ambiguous.scala",
+            "package app\nimport left._\nimport right._\nobject Ambiguous {\n  def bare(): Shared.type = Shared\n  def call(): Int = Shared.make()\n}\n",
+        )
+        .file(
+            "app/Explicit.scala",
+            "package app\nimport left.Shared\nimport right._\nobject Explicit { def call(): Int = Shared.make() }\n",
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "app.Use$.companion", "app.Token$.make"),
+        "{}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$.companion", "app.Token.make"),
+        "{}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "app.Use$.nested", "app.Outer$.Inner$"),
+        "{}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "app.Use$.nestedCall", "app.Outer$.Inner$.make"),
+        "{}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$.nestedCall", "app.Outer$.make"),
+        "{}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$.unqualifiedNested", "app.Outer$.Inner$"),
+        "{}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$.instanceField", "app.Shared$"),
+        "{}",
+        value["edges"]
+    );
+    for callee in ["left.Shared$", "right.Shared$"] {
+        assert!(
+            !has_edge(&value, "app.Ambiguous$.bare", callee),
+            "{callee}: {}",
+            value["edges"]
+        );
+    }
+    for callee in ["left.Shared$.make", "right.Shared$.make"] {
+        assert!(
+            !has_edge(&value, "app.Ambiguous$.call", callee),
+            "{callee}: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        has_edge(&value, "app.Explicit$.call", "left.Shared$.make"),
+        "{}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn scala_inverted_applies_compilation_unit_import_precedence() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Shared.scala",
+            "package app\nobject Shared { def make(): Int = 0 }\n",
+        )
+        .file(
+            "left/Shared.scala",
+            "package left\nobject Shared { def make(): Int = 1 }\n",
+        )
+        .file(
+            "app/WildcardWins.scala",
+            "package app\nimport left._\nobject WildcardWins { def call(): Int = Shared.make() }\n",
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "app.WildcardWins$.call", "left.Shared$.make"),
+        "{}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.WildcardWins$.call", "app.Shared$.make"),
+        "{}",
+        value["edges"]
+    );
+
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "left/Shared.scala",
+            "package left\nobject Shared { def make(): Int = 1 }\n",
+        )
+        .file(
+            "app/LocalWins.scala",
+            "package app\nimport left.Shared\nobject Shared { def make(): Int = 2 }\nobject LocalWins { def call(): Int = Shared.make() }\n",
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "app.LocalWins$.call", "app.Shared$.make"),
+        "{}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.LocalWins$.call", "left.Shared$.make"),
+        "{}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn scala_inverted_matches_all_same_file_overloads_and_curried_constructor_lists() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Calls.scala",
+            r#"package app
+class Api {
+  def route(value: Int, label: String): Int = value
+  def route(value: Int): Int = value
+  def flip(value: Int): Int = value
+  def flip(value: Int, label: String): Int = value
+}
+class Curried(value: Int)(label: String = "default")
+class Use(api: Api) {
+  def routeOne(): Int = api.route(1)
+  def routeTwo(): Int = api.route(1, "two")
+  def routeNone(): Int = api.route()
+  def routeThree(): Int = api.route(1, "two", "three")
+  def routePartial(): Int => Int = api.route
+  def flipOne(): Int = api.flip(1)
+  def flipTwo(): Int = api.flip(1, "two")
+  def flipNone(): Int = api.flip()
+  def flipThree(): Int = api.flip(1, "two", "three")
+  def flipPartial(): Int => Int = api.flip
+  def validConstructor(): Any = new Curried(1)()
+  def invalidFirstConstructor(): Any = new Curried()("missing")
+  def invalidLaterConstructor(): Any = new Curried(1)("too", "many")
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+    for (method, valid, invalid) in [
+        (
+            "route",
+            ["app.Use.routeOne", "app.Use.routeTwo"],
+            [
+                "app.Use.routeNone",
+                "app.Use.routeThree",
+                "app.Use.routePartial",
+            ],
+        ),
+        (
+            "flip",
+            ["app.Use.flipOne", "app.Use.flipTwo"],
+            [
+                "app.Use.flipNone",
+                "app.Use.flipThree",
+                "app.Use.flipPartial",
+            ],
+        ),
+    ] {
+        for caller in valid {
+            assert!(
+                has_edge(&value, caller, &format!("app.Api.{method}")),
+                "{}",
+                value["edges"]
+            );
+        }
+        for caller in invalid {
+            assert!(
+                !has_edge(&value, caller, &format!("app.Api.{method}")),
+                "{}",
+                value["edges"]
+            );
+        }
+    }
+    assert!(
+        has_edge(&value, "app.Use.validConstructor", "app.Curried"),
+        "{}",
+        value["edges"]
+    );
+    for caller in [
+        "app.Use.invalidFirstConstructor",
+        "app.Use.invalidLaterConstructor",
+    ] {
+        assert!(
+            !has_edge(&value, caller, "app.Curried"),
+            "{}",
+            value["edges"]
+        );
+    }
+}
+
+#[test]
+fn scala_inverted_keeps_overload_shape_receiver_and_return_facts_aligned() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Aligned.scala",
+            r#"package app
+class A { def run(): Int = 1 }
+class B { def run(): Int = 2 }
+object Factory {
+  def make(value: Int): A = new A
+  def make(value: Int, label: String): B = new B
+}
+object Extensions {
+  extension (value: A) def tag(number: Int): Int = number
+  extension (value: B) def tag(number: Int, label: String): Int = number
+}
+object Use {
+  import Extensions._
+  def returnA(): Int = Factory.make(1).run()
+  def returnB(): Int = Factory.make(1, "b").run()
+  def extensionA(value: A): Int = value.tag(1)
+  def extensionB(value: B): Int = value.tag(1, "b")
+  def wrongShapeA(value: A): Int = value.tag(1, "bad")
+  def wrongShapeB(value: B): Int = value.tag(1)
+  def unappliedA(value: A) = value.tag
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "app.Use$.returnA", "app.A.run"),
+        "{}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$.returnA", "app.B.run"),
+        "{}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "app.Use$.returnB", "app.B.run"),
+        "{}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$.returnB", "app.A.run"),
+        "{}",
+        value["edges"]
+    );
+    for caller in ["app.Use$.extensionA", "app.Use$.extensionB"] {
+        assert!(
+            has_edge(&value, caller, "app.Extensions$.tag"),
+            "{caller}: {}",
+            value["edges"]
+        );
+    }
+    for caller in [
+        "app.Use$.wrongShapeA",
+        "app.Use$.wrongShapeB",
+        "app.Use$.unappliedA",
+    ] {
+        assert!(
+            !has_edge(&value, caller, "app.Extensions$.tag"),
+            "{caller}: {}",
+            value["edges"]
+        );
+    }
+}
+
+#[test]
 fn object_sensitive_factory_receiver_resolves_only_constructed_type() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
@@ -419,6 +856,68 @@ object App {
             "example.Renderer.render"
         ),
         "overloads and unrelated same-name methods must not edge to the trait method: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn scala_inverted_fails_closed_for_ambiguous_declaration_type_paths() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "A.scala",
+            "class A { def run(): Int = 0; class Nested { def run(): Int = 0 } }\n",
+        )
+        .file(
+            "left/A.scala",
+            "package left\nclass A { def run(): Int = 1; class Nested { def run(): Int = 1 } }\n",
+        )
+        .file(
+            "right/A.scala",
+            "package right\nclass A { def run(): Int = 2; class Nested { def run(): Int = 2 } }\n",
+        )
+        .file(
+            "proven/Service.scala",
+            "package proven\nclass Service { def run(): Int = 3 }\n",
+        )
+        .file(
+            "app/AmbiguousReturn.scala",
+            r#"package app
+import left._
+import right._
+
+object Factory {
+  def make(): A = ???
+  def makeNested(): A.Nested = ???
+  def makeProven(): proven.Service = ???
+}
+
+object Use {
+  def call(): Int = Factory.make().run()
+  def nestedCall(): Int = Factory.makeNested().run()
+  def provenCall(): Int = Factory.makeProven().run()
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+
+    for run_fqn in ["A.run", "left.A.run", "right.A.run"] {
+        assert!(
+            !has_edge(&value, "app.Use$.call", run_fqn),
+            "ambiguous declaration return type must not resolve to {run_fqn}: {}",
+            value["edges"]
+        );
+    }
+    for run_fqn in ["A.Nested.run", "left.A.Nested.run", "right.A.Nested.run"] {
+        assert!(
+            !has_edge(&value, "app.Use$.nestedCall", run_fqn),
+            "ambiguous qualified declaration return type must not resolve to {run_fqn}: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        has_edge(&value, "app.Use$.provenCall", "proven.Service.run"),
+        "a structurally proven package prefix should resolve: {}",
         value["edges"]
     );
 }

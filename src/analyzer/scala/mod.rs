@@ -31,7 +31,8 @@ use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::ScalaAdapter;
 use clones::{build_scala_clone_candidate_data, refine_scala_clone_similarity};
-pub(crate) use supertypes::ScalaSupertypeLookupPath;
+pub(crate) use declarations::scala_class_parameter_field_keyword;
+pub(crate) use supertypes::{ScalaSupertypeLookupPath, scala_type_lookup_segments};
 use tests::detect_scala_test_assertion_smells;
 
 pub(crate) fn scala_normalize_full_name(fq_name: &str) -> String {
@@ -178,6 +179,8 @@ impl ScalaAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
+        clone.project_types = Arc::new(OnceLock::new());
+        clone.project_types_build_count = Arc::new(AtomicUsize::new(0));
         clone
     }
 
@@ -645,5 +648,94 @@ impl IAnalyzer for ScalaAnalyzer {
 
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
+    }
+}
+
+#[cfg(test)]
+mod overlay_usage_tests {
+    use super::*;
+    use crate::analyzer::usages::{UsageFinder, scala_graph::build_scala_usage_edges};
+    use crate::analyzer::{OverlayProject, TestProject};
+
+    #[test]
+    fn cloned_overlay_rebuilds_scala_source_facts_for_targeted_and_inverted_ranges() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), "app/Calls.scala");
+        std::fs::create_dir_all(file.abs_path().parent().expect("source parent"))
+            .expect("source directory");
+        file.write(
+            r#"package app
+class Api { def choose(value: Int): Int = value }
+class Use(api: Api) { def call(): Int = api.choose(1) }
+"#,
+        )
+        .expect("disk Scala source");
+
+        let disk_project: Arc<dyn Project> =
+            Arc::new(TestProject::new(root.clone(), Language::Scala));
+        let disk = ScalaAnalyzer::new(Arc::clone(&disk_project));
+        let disk_target = disk
+            .get_definitions("app.Api.choose")
+            .into_iter()
+            .next()
+            .expect("disk target");
+        let disk_hits = UsageFinder::new()
+            .find_usages_default(&disk, std::slice::from_ref(&disk_target))
+            .into_either()
+            .expect("disk usages");
+        assert!(
+            disk_hits
+                .iter()
+                .any(|hit| hit.snippet.contains("api.choose(1)"))
+        );
+        assert!(
+            disk.project_types.get().is_some(),
+            "disk cache should be warm"
+        );
+
+        let overlay_source = r#"package app
+// This overlay shifts every exact declaration range and changes the callable shape.
+class Api { def choose(value: Int)(label: String): Int = value }
+class Use(api: Api) { def call(): Int = api.choose(1)("overlay") }
+"#;
+        let overlay = Arc::new(OverlayProject::new(Arc::clone(&disk_project)));
+        assert!(overlay.set(file.abs_path(), overlay_source.to_string()));
+        let snapshot = disk.clone_with_project(Arc::clone(&overlay) as Arc<dyn Project>);
+        assert!(
+            snapshot.project_types.get().is_none(),
+            "an overlay clone needs an independent source-facts generation"
+        );
+        let overlay_target = snapshot
+            .get_definitions("app.Api.choose")
+            .into_iter()
+            .next()
+            .expect("overlay target");
+        let overlay_hits = UsageFinder::new()
+            .find_usages_default(&snapshot, std::slice::from_ref(&overlay_target))
+            .into_either()
+            .expect("overlay usages");
+        assert!(
+            overlay_hits
+                .iter()
+                .any(|hit| hit.snippet.contains("api.choose(1)(\"overlay\")")),
+            "targeted lookup must use overlay ranges and callable facts: {overlay_hits:#?}"
+        );
+
+        let nodes = snapshot
+            .get_all_declarations()
+            .into_iter()
+            .map(|unit| unit.fq_name())
+            .collect();
+        let edges = build_scala_usage_edges(&snapshot, &nodes, |_| true)
+            .expect("Scala inverted edge build");
+        assert!(
+            edges
+                .edges
+                .keys()
+                .any(|(caller, callee)| caller == "app.Use.call" && callee == "app.Api.choose"),
+            "inverted lookup must use overlay ranges and callable facts: {:?}",
+            edges.edges.keys().collect::<Vec<_>>()
+        );
     }
 }

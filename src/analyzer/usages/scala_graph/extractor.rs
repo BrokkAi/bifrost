@@ -1,3 +1,4 @@
+use super::inverted::{NameResolver, ProjectTypes};
 use crate::analyzer::scala::imports::parse_scala_import_infos;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
@@ -11,11 +12,12 @@ use crate::analyzer::usages::scala_graph::resolver::{
     scala_literal_type_name, scala_normalized_fq_name, scala_resolve_declared_type,
 };
 use crate::analyzer::usages::scala_graph::syntax::{
-    call_arity_for_reference, has_ancestor_kind, has_member_qualifier, infix_receiver_for_operator,
-    is_assignment_lhs, is_constructor_like_reference, is_field_expression_value,
-    is_identifier_node, is_owner_qualified_this, is_type_like_reference, member_qualifier,
+    call_arities_for_reference, has_ancestor_kind, has_member_qualifier,
+    infix_receiver_for_operator, is_assignment_lhs, is_constructor_like_reference,
+    is_identifier_node, is_owner_qualified_this, is_scala_class_reference,
+    is_scala_object_reference, is_terminal_stable_field_reference, member_qualifier,
     member_qualifier_node, named_argument_invocation_owner, node_text, parenthesized_arity,
-    terminal_invocation_owner_name,
+    resolve_stable_object_expression, terminal_invocation_owner_name,
 };
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ProjectFile, Range, ScalaAnalyzer, TypeHierarchyProvider,
@@ -23,6 +25,7 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use tree_sitter::{Node, Parser};
 
 pub(super) fn scan_file(
@@ -37,7 +40,7 @@ pub(super) fn scan_file(
     if *limit_exceeded {
         return;
     }
-    let Ok(source) = file.read_to_string() else {
+    let Some(source) = analyzer.indexed_source(file) else {
         return;
     };
     if source.is_empty() {
@@ -54,7 +57,9 @@ pub(super) fn scan_file(
         return;
     };
     let line_starts = compute_line_starts(&source);
-    let visibility = Visibility::for_file(scala, file, spec);
+    let types = scala.project_types();
+    let name_resolver = NameResolver::for_file(scala, file, &types);
+    let visibility = Visibility::for_file(scala, file, spec, &name_resolver);
     let file_package = package_name_of(scala, file).unwrap_or_default();
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     let mut ctx = ScanCtx {
@@ -65,6 +70,8 @@ pub(super) fn scan_file(
         source: &source,
         line_starts: &line_starts,
         spec,
+        types,
+        name_resolver,
         visibility,
         bindings: &mut bindings,
         hits,
@@ -83,6 +90,8 @@ pub(super) struct ScanCtx<'a> {
     pub(super) source: &'a str,
     pub(super) line_starts: &'a [usize],
     pub(super) spec: &'a TargetSpec,
+    pub(super) types: Arc<ProjectTypes>,
+    pub(super) name_resolver: NameResolver,
     pub(super) visibility: Visibility,
     pub(super) bindings: &'a mut LocalInferenceEngine<String>,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
@@ -404,9 +413,44 @@ fn seed_parameter_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn seed_class_parameter_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if let Some(parameters) = node.child_by_field_name("class_parameters") {
-        seed_parameters(parameters, ctx);
+    let enclosing_owner = node
+        .child_by_field_name("name")
+        .and_then(|name| enclosing_owner_fq_name(name, ctx));
+    let mut cursor = node.walk();
+    for parameters in node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "class_parameters")
+    {
+        let mut parameter_cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut parameter_cursor) {
+            if parameter.kind() != "class_parameter" {
+                continue;
+            }
+            let Some(name_node) = parameter.child_by_field_name("name") else {
+                continue;
+            };
+            let name = node_text(name_node, ctx.source).trim();
+            if name.is_empty() {
+                continue;
+            }
+            if class_parameter_is_field(parameter)
+                && name == ctx.spec.member_name
+                && let Some(owner) = enclosing_owner.as_deref()
+            {
+                ctx.bindings
+                    .seed_symbol(name.to_string(), scala_normalized_fq_name(owner));
+            } else {
+                seed_parameter(parameter, ctx);
+            }
+        }
     }
+}
+
+fn class_parameter_is_field(parameter: Node<'_>) -> bool {
+    let mut cursor = parameter.walk();
+    parameter
+        .children(&mut cursor)
+        .any(|child| matches!(child.kind(), "val" | "var"))
 }
 
 fn seed_parameters(parameters: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -470,29 +514,28 @@ fn call_initializer_return_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<St
         ),
         _ => return None,
     };
-    if !matches!(owner_node.kind(), "identifier" | "type_identifier") {
-        return None;
-    }
-    let owner_name = node_text(owner_node, ctx.source).trim();
     let member_name = node_text(member_node, ctx.source).trim();
-    if owner_name.is_empty() || member_name.is_empty() {
+    if member_name.is_empty() {
         return None;
     }
-    let owner = scala_resolve_declared_type(ctx.scala, ctx.file, ctx.file_package, owner_name)?;
-    let member_fqn = format!("{owner}.{member_name}");
-    let call_arity = call_arity_for_reference(member_node);
-    let has_applicable_member = ctx.scala.definitions(&member_fqn).any(|unit| {
-        unit.is_function()
-            && call_arity.is_none_or(|arity| method_call_arity_applies(ctx.scala, &unit, arity))
-    });
-    has_applicable_member
-        .then(|| {
-            ctx.scala
-                .usage_facts_index_shared()
-                .callable_return_type(&member_fqn)
-                .map(str::to_string)
-        })
-        .flatten()
+    let owner = if owner_node.kind() == "field_expression" {
+        stable_object_expression_fqn(owner_node, ctx)
+    } else if matches!(owner_node.kind(), "identifier" | "type_identifier") {
+        let owner_name = node_text(owner_node, ctx.source).trim();
+        ctx.name_resolver
+            .resolve_object(owner_name)
+            .or_else(|| ctx.name_resolver.resolve(owner_name))
+    } else {
+        None
+    }?;
+    let call_arities = call_arities_for_reference(member_node);
+    ctx.types.member_return_type_for_owner_member(
+        ctx.scala,
+        &ctx.name_resolver,
+        &owner,
+        member_name,
+        call_arities.as_deref(),
+    )
 }
 
 fn seed_value_definition_from_text(text: &str, ctx: &mut ScanCtx<'_>) {
@@ -572,6 +615,12 @@ fn constructor_type_name(value_text: &str) -> Option<&str> {
 fn pattern_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
     match node.kind() {
         "identifier" | "operator_identifier" => {
+            if node.parent().is_some_and(|parent| {
+                parent.kind() == "infix_pattern"
+                    && parent.child_by_field_name("operator") == Some(node)
+            }) {
+                return Vec::new();
+            }
             let name = node_text(node, source).trim();
             if name.is_empty() {
                 Vec::new()
@@ -620,13 +669,24 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
     let proven = match ctx.spec.kind {
         TargetKind::Type => {
-            ctx.visibility.type_names.contains(text)
-                && (is_type_like_reference(node, ctx.source) || is_field_expression_value(node))
+            let terminal_object_matches = is_terminal_stable_field_reference(node)
+                && node
+                    .parent()
+                    .and_then(|expression| stable_object_expression_fqn(expression, ctx))
+                    .is_some_and(|fqn| fqn == ctx.spec.target.fq_name());
+            (is_scala_class_reference(node, ctx.source)
+                && !ctx.spec.is_object_type
+                && ctx.visibility.class_type_name_matches(text)
+                || is_scala_object_reference(node)
+                    && (ctx.spec.is_object_type || ctx.spec.accepts_object_roles)
+                    && ctx.visibility.object_type_name_matches(text)
+                || terminal_object_matches)
                 && !type_reference_is_locally_bound(text, ctx)
         }
         TargetKind::Constructor => {
-            ctx.visibility.type_names.contains(text)
+            ctx.visibility.class_type_name_matches(text)
                 && is_constructor_like_reference(node, ctx.source)
+                && member_call_arity_matches(node, ctx)
         }
         TargetKind::Method => member_reference_is_proven(node, text, ctx),
         TargetKind::Field => {
@@ -673,6 +733,12 @@ fn type_reference_is_locally_bound(text: &str, ctx: &ScanCtx<'_>) -> bool {
 
 fn seed_value_binding_identifier(node: Node<'_>, text: &str, ctx: &mut ScanCtx<'_>) -> bool {
     if is_direct_owner_field_declaration_identifier(node, ctx) {
+        return true;
+    }
+    if node.parent().is_some_and(|parent| {
+        matches!(parent.kind(), "parameter" | "class_parameter")
+            && parent.child_by_field_name("name") == Some(node)
+    }) {
         return true;
     }
     if node.parent().is_some_and(|parent| {
@@ -764,6 +830,17 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
             && enclosing_matches_owner(node, ctx)
             && member_call_arity_matches(node, ctx);
     };
+    if qualifier_node.kind() == "field_expression"
+        && let Some(owner_fq_name) = stable_object_expression_fqn(qualifier_node, ctx)
+    {
+        return ctx.spec.owner_fq_matches(&owner_fq_name) && member_call_arity_matches(node, ctx);
+    }
+    if qualifier_node.kind() == "call_expression"
+        && let Some(owner_fq_name) = call_initializer_return_owner(qualifier_node, ctx)
+    {
+        return ctx.spec.receiver_owner_fq_matches(&owner_fq_name)
+            && member_call_arity_matches(node, ctx);
+    }
     if is_owner_qualified_this(qualifier_node, ctx.source) {
         return owner_qualified_this_matches(qualifier_node, ctx)
             && member_call_arity_matches(node, ctx);
@@ -786,6 +863,19 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
     receiver_binding_matches(node, qualifier, ctx)
 }
 
+fn stable_object_expression_fqn(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
+    resolve_stable_object_expression(
+        node,
+        ctx.source,
+        |root| {
+            (ctx.bindings.resolve_symbol(root).is_unknown() && !ctx.bindings.is_shadowed(root))
+                .then(|| ctx.name_resolver.resolve_object(root))
+                .flatten()
+        },
+        |owner, member| ctx.types.exact_nested_object(ctx.scala, owner, member),
+    )
+}
+
 fn owner_qualified_this_matches(qualifier_node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     let qualifier = node_text(qualifier_node, ctx.source).trim();
     let Some(owner_name) = qualifier.strip_suffix(".this") else {
@@ -802,7 +892,6 @@ fn extension_member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCt
         || !target_is_extension(ctx.spec)
         || !ctx.visibility.direct_member_names.contains(text)
         || !has_member_qualifier(node)
-        || !member_call_arity_matches(node, ctx)
     {
         return false;
     }
@@ -814,7 +903,11 @@ fn extension_member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCt
     if qualifier.is_empty() || is_unresolved_local_shadow(ctx, qualifier) {
         return false;
     }
-    extension_receiver_matches(qualifier_node, call_arity_for_reference(node), ctx)
+    extension_receiver_matches(
+        qualifier_node,
+        call_arities_for_reference(node).as_deref(),
+        ctx,
+    )
 }
 
 fn target_is_extension(spec: &TargetSpec) -> bool {
@@ -823,28 +916,38 @@ fn target_is_extension(spec: &TargetSpec) -> bool {
 
 fn extension_receiver_matches(
     qualifier_node: Node<'_>,
-    call_arity: Option<usize>,
+    call_arities: Option<&[usize]>,
     ctx: &ScanCtx<'_>,
 ) -> bool {
     let Some(receiver_owner) = extension_receiver_type(qualifier_node, ctx) else {
         return false;
     };
-    if !scala_extension_receiver_matches_resolved(
-        ctx.spec.extension_receiver_type.as_deref(),
-        Some(&receiver_owner),
-        |type_text| {
-            ctx.visibility
-                .owner_fq_name_for(type_text)
-                .map(str::to_string)
-                .or_else(|| scala_builtin_type_name(type_text).map(str::to_string))
-        },
-    ) {
+    let matching_alternatives = ctx
+        .spec
+        .callable_alternatives
+        .iter()
+        .filter(|alternative| {
+            scala_extension_receiver_matches_resolved(
+                alternative.extension_receiver_type.as_deref(),
+                Some(&receiver_owner),
+                |type_text| {
+                    ctx.name_resolver
+                        .resolve(type_text)
+                        .or_else(|| scala_builtin_type_name(type_text).map(str::to_string))
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let unique_callable = ctx.spec.unapplied_reference_is_unambiguous;
+    if !matching_alternatives.iter().any(|alternative| {
+        callable_shape_matches(&alternative.shape, call_arities, unique_callable)
+    }) {
         return false;
     }
     !receiver_has_member(
         &receiver_owner,
         ctx.spec.member_name.as_str(),
-        call_arity,
+        call_arities.and_then(|arities| arities.first().copied()),
         ctx,
     )
 }
@@ -972,8 +1075,20 @@ fn receiver_binding_matches(node: Node<'_>, qualifier: &str, ctx: &ScanCtx<'_>) 
 }
 
 fn enclosing_matches_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    enclosing_owner_fq_name(node, ctx)
-        .is_some_and(|owner_fq_name| ctx.spec.receiver_owner_fq_matches(owner_fq_name.as_str()))
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    };
+    let mut current = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
+    while let Some(unit) = current {
+        if unit.is_class() && ctx.spec.receiver_owner_fq_matches(&unit.fq_name()) {
+            return true;
+        }
+        current = ctx.analyzer.parent_of(&unit);
+    }
+    false
 }
 
 fn enclosing_owner_fq_name(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
@@ -994,20 +1109,53 @@ fn enclosing_owner_fq_name(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> 
 }
 
 fn member_call_arity_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    if ctx.spec.kind != TargetKind::Method {
+    if !matches!(ctx.spec.kind, TargetKind::Method | TargetKind::Constructor) {
         return true;
     }
-    match call_arity_for_reference(node) {
-        Some(call_arity) => ctx
+    let fallback_shape;
+    let fallback_shapes;
+    let shapes = if ctx.spec.callable_alternatives.is_empty() {
+        fallback_shape = ctx
             .spec
             .callable_arity
-            .is_none_or(|arity| arity.accepts(call_arity)),
-        None => {
-            ctx.spec
-                .callable_arity
-                .is_none_or(|arity| arity.total() == 0)
-                || ctx.spec.unapplied_reference_is_unambiguous
+            .map(|arity| vec![arity])
+            .unwrap_or_default();
+        fallback_shapes = vec![fallback_shape];
+        fallback_shapes.as_slice()
+    } else {
+        return ctx.spec.callable_alternatives.iter().any(|alternative| {
+            callable_shape_matches(
+                &alternative.shape,
+                call_arities_for_reference(node).as_deref(),
+                ctx.spec.unapplied_reference_is_unambiguous,
+            )
+        });
+    };
+    let call_arities = call_arities_for_reference(node);
+    shapes.iter().any(|declared| {
+        callable_shape_matches(
+            declared,
+            call_arities.as_deref(),
+            ctx.spec.unapplied_reference_is_unambiguous,
+        )
+    })
+}
+
+fn callable_shape_matches(
+    declared: &[crate::analyzer::CallableArity],
+    call_arities: Option<&[usize]>,
+    unique_callable: bool,
+) -> bool {
+    match call_arities {
+        Some(actual) => {
+            actual.len() <= declared.len()
+                && (actual.len() == declared.len() || unique_callable)
+                && actual
+                    .iter()
+                    .zip(declared)
+                    .all(|(actual, declared)| declared.accepts(*actual))
         }
+        None => declared.first().is_none_or(|arity| arity.total() == 0) || unique_callable,
     }
 }
 

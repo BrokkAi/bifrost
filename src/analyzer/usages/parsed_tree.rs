@@ -29,6 +29,13 @@ pub(crate) fn parse_tree_sitter_file(
     language: &TreeSitterLanguage,
 ) -> Option<ParsedTreeFile> {
     let source = file.read_to_string().ok()?;
+    parse_tree_sitter_source(source, language)
+}
+
+pub(crate) fn parse_tree_sitter_source(
+    source: String,
+    language: &TreeSitterLanguage,
+) -> Option<ParsedTreeFile> {
     if source.is_empty() {
         return None;
     }
