@@ -279,6 +279,7 @@ public:
 };
 using HandlerAlias = ConsoleHandler;
 }
+
 namespace other {
 struct OtherSink {};
 class ConsoleHandler {
@@ -327,6 +328,39 @@ std::string HandlerAlias::alias_handle(const std::string& value) { return value;
             "parity.ConsoleHandler"
         ),
         "expected alias-qualified method definition qualifier to edge to ConsoleHandler: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn nested_out_of_line_definition_qualifiers_edge_to_each_owner_type() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "owners.h",
+            r#"namespace n {
+struct Outer {
+    struct Inner { void f(); };
+};
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "owners.h"
+void n::Outer::Inner::f() {}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "n::Outer.Inner.f", "n.Outer"),
+        "the outer qualifier must retain its own type edge: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "n::Outer.Inner.f", "n.Outer$Inner"),
+        "the innermost qualifier must retain its own type edge: {}",
         value["edges"]
     );
 }
@@ -491,6 +525,198 @@ void caller() {
         "static factory return must not resolve Service in the caller namespace: {}",
         value["edges"]
     );
+}
+
+#[test]
+fn method_return_receiver_chain_resolves_terminal_method() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "receiver.h",
+            r#"#pragma once
+namespace demo {
+#define DEMO_EXPORT
+struct T {
+    void m();
+    T* get();
+};
+struct Other { void m(); };
+struct AmbiguousFactory {
+    T* get(int value = 0);
+    Other* get(double value = 0);
+};
+namespace left { struct Result { void m(); }; }
+namespace right { struct Result { void m(); }; }
+struct SameNameFactory { Result* get(); };
+struct MacroFactory { DEMO_EXPORT T* get(); };
+void run();
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "receiver.h"
+namespace demo {
+void T::m() {}
+demo::T* T::get() { return this; }
+void run() {
+    T local;
+    T* p = &local;
+    p->m();
+    p->get()->m();
+    AmbiguousFactory factory;
+    factory.get()->m();
+    SameNameFactory named_factory;
+    named_factory.get()->m();
+    MacroFactory macro_factory;
+    macro_factory.get()->m();
+    Other wrong;
+    wrong.m();
+}
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    let terminal_edges = value["edges"]
+        .as_array()
+        .expect("edges array")
+        .iter()
+        .filter(|edge| {
+            edge["from"].as_str() == Some("demo.run") && edge["to"].as_str() == Some("demo.T.m")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminal_edges.len(),
+        1,
+        "direct and chained calls must aggregate into one exact edge: {}",
+        value["edges"]
+    );
+    assert_eq!(terminal_edges[0]["weight"].as_u64(), Some(2));
+    assert!(
+        !has_edge(&value, "demo.run", "demo.left.Result.m")
+            && !has_edge(&value, "demo.run", "demo.right.Result.m"),
+        "an ambiguous unqualified persisted return type must not choose a same-spelling owner: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn using_enum_owner_is_a_type_reference_in_workspace_graph() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "consumer.cc",
+            r#"namespace demo {
+enum class Color { Red, Blue };
+void use() {
+    using enum Color;
+    int value = Red;
+}
+
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "demo.use", "demo.Color"),
+        "the enum owner token in a using-enum declaration must retain its type edge: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn inherited_bare_calls_edge_to_unique_ancestor_method() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "consumer.cc",
+            r#"namespace demo {
+struct Base { void inherited(); };
+struct OtherBase { void inherited(); };
+struct Inline : Base {
+    void body() { inherited(); }
+};
+struct OutOfLine : Base { void body(); };
+void OutOfLine::body() { inherited(); }
+struct Multiple : Base, OtherBase {
+    void body() { inherited(); }
+};
+struct LeftDiamond : Base {};
+struct RightDiamond : Base {};
+struct Diamond : LeftDiamond, RightDiamond {
+    void body() { inherited(); }
+};
+struct DeepBranch : Base {};
+struct NearBranch : OtherBase {};
+struct DepthSkew : DeepBranch, NearBranch {
+    void body() { inherited(); }
+};
+struct Composite : DeepBranch, NearBranch {};
+struct NestedDepthSkew : Composite {
+    void body() { inherited(); }
+};
+struct Override : Base {
+    void inherited();
+    void body() { inherited(); }
+};
+struct Shadowed : Base {
+    void parameter(void (*inherited)()) { inherited(); }
+    void local() {
+        auto inherited = []() {};
+        inherited();
+    }
+};
+void Base::inherited() {}
+void OtherBase::inherited() {}
+void Override::inherited() {}
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "demo.Inline.body", "demo.Base.inherited"),
+        "inline inherited call must edge to the unique ancestor method: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "demo.OutOfLine.body", "demo.Base.inherited"),
+        "out-of-line inherited call must edge to the unique ancestor method: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "demo.Multiple.body", "demo.Base.inherited")
+            && !has_edge(&value, "demo.Multiple.body", "demo.OtherBase.inherited"),
+        "ambiguous multiple-inheritance calls must fail closed: {}",
+        value["edges"]
+    );
+    for caller in [
+        "demo.Diamond.body",
+        "demo.DepthSkew.body",
+        "demo.NestedDepthSkew.body",
+    ] {
+        assert!(
+            !has_edge(&value, caller, "demo.Base.inherited")
+                && !has_edge(&value, caller, "demo.OtherBase.inherited"),
+            "competing base-subobject lookup must fail closed for {caller}: {}",
+            value["edges"]
+        );
+    }
+    for caller in [
+        "demo.Override.body",
+        "demo.Shadowed.parameter",
+        "demo.Shadowed.local",
+    ] {
+        assert!(
+            !has_edge(&value, caller, "demo.Base.inherited"),
+            "override and lexical callable shadows must suppress inherited edges for {caller}: {}",
+            value["edges"]
+        );
+    }
+    // Inherited fields remain targeted UsageFinder-only: the workspace graph's callable/type
+    // catalog deliberately does not contain fields, so no symmetric field edge is expected here.
 }
 
 #[test]

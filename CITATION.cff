@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use Bifrost, please cite the software using these metadata and record the exact version and commit used."
-title: "Bifrost: Tree-sitter-backed multi-language code analyzer"
+title: "Bifrost: Multi-language static analysis for agents, editors, and large repositories"
 type: software
 abstract: "Bifrost is a Rust-based multi-language static analysis toolbox for code intelligence, coding agents, editors, and large repositories."
 authors:

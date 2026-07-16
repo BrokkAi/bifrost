@@ -36,6 +36,9 @@ pub(super) struct ScanCtx<'a> {
     pub(super) target_group: &'a HashSet<CodeUnit>,
     pub(super) bindings: LocalInferenceEngine<CppScanBinding>,
     local_shadows: LocalInferenceEngine<()>,
+    using_enum_owners: ScopedUsingEnumOwners,
+    semantic_using_enum_owners: SemanticUsingEnumOwners,
+    needs_using_enum_member_resolution: bool,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
     pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
     pub(super) raw_match_count: &'a mut usize,
@@ -43,6 +46,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) limit_exceeded: &'a mut bool,
     pub(super) enclosing_cache: RefCell<HashMap<(usize, usize), EnclosingContext>>,
     pub(super) enclosing_owner_cache: RefCell<HashMap<CodeUnit, Option<CodeUnit>>>,
+    member_owner_cache: RefCell<HashMap<CodeUnit, EnclosingMemberOwnerResolution>>,
 }
 
 #[derive(Clone, Default)]
@@ -79,6 +83,7 @@ pub(super) fn scan_file(
         return;
     };
     let line_starts = compute_line_starts(&source);
+    let needs_using_enum_member_resolution = spec.enum_owner_kind == EnumOwnerKind::Scoped;
     let mut ctx = ScanCtx {
         analyzer,
         visibility,
@@ -89,6 +94,9 @@ pub(super) fn scan_file(
         target_group,
         bindings: LocalInferenceEngine::new(LocalInferenceConfig::default()),
         local_shadows: LocalInferenceEngine::new(LocalInferenceConfig::default()),
+        using_enum_owners: ScopedUsingEnumOwners::new(),
+        semantic_using_enum_owners: SemanticUsingEnumOwners::new(),
+        needs_using_enum_member_resolution,
         hits: state.hits,
         unproven_hits: state.unproven_hits,
         raw_match_count: state.raw_match_count,
@@ -96,8 +104,99 @@ pub(super) fn scan_file(
         limit_exceeded: state.limit_exceeded,
         enclosing_cache: RefCell::new(HashMap::default()),
         enclosing_owner_cache: RefCell::new(HashMap::default()),
+        member_owner_cache: RefCell::new(HashMap::default()),
     };
+    if needs_using_enum_member_resolution {
+        collect_semantic_using_enums(tree.root_node(), &mut ctx);
+    }
     scan_node(tree.root_node(), &mut ctx);
+}
+
+enum UsingEnumDeclarationScope {
+    Block,
+    Class(CodeUnit),
+    Namespace(Vec<String>),
+    UnsupportedClass,
+}
+
+fn using_enum_declaration_scope(node: Node<'_>, ctx: &ScanCtx<'_>) -> UsingEnumDeclarationScope {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "compound_statement"
+                | "function_definition"
+                | "lambda_expression"
+                | "for_statement"
+                | "while_statement"
+                | "if_statement"
+        ) {
+            return UsingEnumDeclarationScope::Block;
+        }
+        if matches!(
+            parent.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        ) {
+            let resolution = enclosing_lexical_scope_components(
+                node,
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+            );
+            if let LexicalScopeResolution::Resolved(components) = resolution
+                && let LexicalTypeResolution::Resolved { unit, .. } =
+                    ctx.visibility.resolve_type_components_lexically(
+                        ctx.analyzer,
+                        ctx.file,
+                        &components,
+                        true,
+                        &[],
+                    )
+            {
+                return UsingEnumDeclarationScope::Class(unit);
+            }
+            return UsingEnumDeclarationScope::UnsupportedClass;
+        }
+        current = parent.parent();
+    }
+    UsingEnumDeclarationScope::Namespace(enclosing_namespace_components(node, ctx.source))
+}
+
+fn collect_semantic_using_enums(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "using_declaration"
+            && let LexicalTypeResolution::Resolved { unit, .. } =
+                resolve_using_enum_declaration_owner(
+                    node,
+                    ctx.analyzer,
+                    ctx.visibility,
+                    ctx.file,
+                    ctx.source,
+                )
+        {
+            match using_enum_declaration_scope(node, ctx) {
+                UsingEnumDeclarationScope::Block => {}
+                UsingEnumDeclarationScope::Class(class) => {
+                    ctx.semantic_using_enum_owners.import_class(class, unit);
+                }
+                UsingEnumDeclarationScope::Namespace(namespace) => {
+                    ctx.semantic_using_enum_owners.import_namespace(
+                        namespace,
+                        node.start_byte(),
+                        unit,
+                    );
+                }
+                UsingEnumDeclarationScope::UnsupportedClass => {}
+            }
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
 }
 
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -113,9 +212,18 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             | "while_statement"
             | "if_statement"
     );
+    let enters_using_enum_scope = ctx.needs_using_enum_member_resolution
+        && (enters_scope
+            || matches!(
+                node.kind(),
+                "namespace_definition" | "class_specifier" | "struct_specifier" | "union_specifier"
+            ));
     if enters_scope {
         ctx.bindings.enter_scope();
         ctx.local_shadows.enter_scope();
+    }
+    if enters_using_enum_scope {
+        ctx.using_enum_owners.enter_scope();
     }
 
     seed_declarations(node, ctx);
@@ -133,13 +241,35 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         ctx.bindings.exit_scope();
         ctx.local_shadows.exit_scope();
     }
+    if enters_using_enum_scope {
+        ctx.using_enum_owners.exit_scope();
+    }
 }
 
 fn seed_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     match node.kind() {
         "parameter_declaration" | "optional_parameter_declaration" => seed_typed_binding(node, ctx),
         "declaration" | "field_declaration" => seed_variable_declaration(node, ctx),
+        "using_declaration" => seed_using_enum(node, ctx),
         _ => {}
+    }
+}
+
+fn seed_using_enum(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if !ctx.needs_using_enum_member_resolution {
+        return;
+    }
+    if let LexicalTypeResolution::Resolved { unit, .. } = resolve_using_enum_declaration_owner(
+        node,
+        ctx.analyzer,
+        ctx.visibility,
+        ctx.file,
+        ctx.source,
+    ) && matches!(
+        using_enum_declaration_scope(node, ctx),
+        UsingEnumDeclarationScope::Block
+    ) {
+        ctx.using_enum_owners.import(unit);
     }
 }
 
@@ -309,6 +439,21 @@ fn maybe_record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if node.kind() == "using_declaration" {
+        if let LexicalTypeResolution::Resolved { unit, .. } = resolve_using_enum_declaration_owner(
+            node,
+            ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            ctx.source,
+        ) && same_visible_symbol(&unit, &ctx.spec.target)
+            && let Some(type_node) = using_enum_declaration_type_node(node)
+        {
+            *ctx.raw_match_count += 1;
+            push_type_hit(type_node, ctx);
+        }
+        return;
+    }
     let recovered_return_type = recovered_macro_function_return_type(node).is_some();
     if !recovered_return_type
         && !matches!(
@@ -318,16 +463,41 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
+    if !recovered_return_type
+        && matches!(node.kind(), "qualified_identifier" | "scoped_identifier")
+        && let Some(owners) = out_of_line_member_definition_owner(
+            ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            ctx.source,
+            node,
+        )
+    {
+        *ctx.raw_match_count += 1;
+        for (owner_node, owner) in owners.owners {
+            if same_visible_symbol(&owner, &ctx.spec.target) {
+                push_hit(owner_node, ctx);
+            }
+        }
+        return;
+    }
     if !recovered_return_type && is_nested_type_node(node) {
         return;
     }
     if !recovered_return_type && is_declaration_name(node) {
-        if let Some((scope, owner)) =
-            out_of_line_member_definition_owner(ctx.visibility, ctx.file, ctx.source, node)
-            && same_visible_symbol(&owner, &ctx.spec.target)
-        {
-            *ctx.raw_match_count += 1;
-            push_hit(scope, ctx);
+        if let Some(owners) = out_of_line_member_definition_owner(
+            ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            ctx.source,
+            node,
+        ) {
+            for (owner_node, owner) in owners.owners {
+                if same_visible_symbol(&owner, &ctx.spec.target) {
+                    *ctx.raw_match_count += 1;
+                    push_hit(owner_node, ctx);
+                }
+            }
         }
         return;
     }
@@ -795,6 +965,13 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !callable_node_matches(function, &ctx.spec.member_name, ctx.source) {
         return;
     }
+    if function.kind() == "identifier"
+        && ctx
+            .local_shadows
+            .is_shadowed(node_text(function, ctx.source))
+    {
+        return;
+    }
     *ctx.raw_match_count += 1;
     if let Some(expected) = ctx.spec.callable_arity
         && !expected.accepts(call_arity(node))
@@ -824,11 +1001,26 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
     } else if same_owner_context(function, ctx) {
         push_self_receiver_hit(function_terminal_node(function), ctx);
+    } else if function.kind() == "identifier" && resolves_to_lexical_free_function(function, ctx) {
+        // A visible namespace/free function is a proven negative once the
+        // enclosing structured owner and its hierarchy contain no such member.
     } else if !receiver_has_known_non_target(function, ctx)
         && !known_non_target_owner_context(function, ctx)
     {
         push_unproven_hit(function_terminal_node(function), ctx);
     }
+}
+
+fn resolves_to_lexical_free_function(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let name = node_text(node, ctx.source);
+    let namespace = enclosing_namespace_components(node, ctx.source).join(".");
+    ctx.visibility
+        .visible_identifier_candidates(ctx.file, name)
+        .any(|unit| {
+            unit.is_function()
+                && type_owner_of(ctx.analyzer, unit).is_none()
+                && unit.package_name() == namespace
+        })
 }
 
 fn maybe_record_qualified_method_value_hit(
@@ -1303,45 +1495,144 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if ctx.local_shadows.is_shadowed(text) {
         return;
     }
-    let unscoped_enum_match = ctx.spec.owner.as_ref().is_some_and(|owner| {
-        owner_is_unscoped_enum(owner, ctx) && ctx.visibility.is_visible(ctx.file, &ctx.spec.target)
-    });
-    let unqualified_same_owner = same_owner_context(node, ctx);
-    if unqualified_same_owner || unscoped_enum_match {
+    let unscoped_enum_match = ctx.spec.enum_owner_kind == EnumOwnerKind::Unscoped
+        && ctx.visibility.is_visible(ctx.file, &ctx.spec.target);
+    let owner_context = structured_owner_context_resolution(node, ctx);
+    if matches!(owner_context, StructuredOwnerContextResolution::Target) || unscoped_enum_match {
         push_hit(node, ctx);
-    } else if ctx
-        .spec
-        .owner
-        .as_ref()
-        .is_some_and(|owner| owner_is_scoped_enum(owner, ctx))
+    } else if let Some(target_owner) = (ctx.spec.enum_owner_kind == EnumOwnerKind::Scoped)
+        .then_some(ctx.spec.owner.as_ref())
+        .flatten()
     {
-        // Scoped enum values must be qualified, so an unqualified same-name value is not this target.
-    } else if !known_non_target_owner_context(node, ctx) {
+        let resolution =
+            match resolve_active_using_enum_member(node, ctx) {
+                ActiveUsingEnumMemberResolution::Block(resolution) => resolution,
+                ActiveUsingEnumMemberResolution::Class(resolution) => {
+                    if direct_class_member_shadows(node, ctx) {
+                        return;
+                    }
+                    resolution
+                }
+                ActiveUsingEnumMemberResolution::Namespace(resolution) => {
+                    if let Some(owner) = structured_enclosing_owner(node, ctx) {
+                        if direct_class_member_shadows(node, ctx) {
+                            return;
+                        }
+                        let complete_same_file_leaf =
+                            owner.source() == ctx.file
+                                && ctx.analyzer.type_hierarchy_provider().is_some_and(
+                                    |hierarchy| hierarchy.get_direct_ancestors(&owner).is_empty(),
+                                );
+                        if !complete_same_file_leaf {
+                            push_unproven_hit(node, ctx);
+                            return;
+                        }
+                    }
+                    match owner_context {
+                        StructuredOwnerContextResolution::Target
+                        | StructuredOwnerContextResolution::NonTarget => return,
+                        StructuredOwnerContextResolution::Ambiguous => {
+                            push_unproven_hit(node, ctx);
+                            return;
+                        }
+                        StructuredOwnerContextResolution::Missing => {}
+                    }
+                    if namespace_value_shadows(node, ctx) {
+                        return;
+                    }
+                    resolution
+                }
+                ActiveUsingEnumMemberResolution::Missing => {
+                    if direct_class_member_shadows(node, ctx)
+                        || (structured_enclosing_owner(node, ctx).is_none()
+                            && namespace_value_shadows(node, ctx))
+                    {
+                        return;
+                    }
+                    UsingEnumMemberResolution::Missing
+                }
+            };
+        match resolution {
+            UsingEnumMemberResolution::Resolved { owner, member }
+                if same_visible_symbol(&owner, target_owner)
+                    && same_visible_symbol(&member, &ctx.spec.target) =>
+            {
+                push_hit(node, ctx);
+            }
+            UsingEnumMemberResolution::Resolved { .. } => {}
+            UsingEnumMemberResolution::Ambiguous | UsingEnumMemberResolution::Missing => {
+                push_unproven_hit(node, ctx)
+            }
+        }
+    } else if !matches!(owner_context, StructuredOwnerContextResolution::NonTarget) {
         push_unproven_hit(node, ctx);
     }
 }
 
+enum ActiveUsingEnumMemberResolution {
+    Block(UsingEnumMemberResolution),
+    Class(UsingEnumMemberResolution),
+    Namespace(UsingEnumMemberResolution),
+    Missing,
+}
+
+fn direct_class_member_shadows(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    structured_enclosing_owner(node, ctx).is_some_and(|owner| {
+        ctx.visibility
+            .visible_members_for_owner_name(ctx.file, &owner, &ctx.spec.member_name)
+            .into_iter()
+            .next()
+            .is_some()
+    })
+}
+
+fn resolve_active_using_enum_member(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> ActiveUsingEnumMemberResolution {
+    let block =
+        ctx.using_enum_owners
+            .resolve_member(ctx.visibility, ctx.file, &ctx.spec.member_name);
+    if !matches!(block, UsingEnumMemberResolution::Missing) {
+        return ActiveUsingEnumMemberResolution::Block(block);
+    }
+    let class = structured_enclosing_owner(node, ctx);
+    let namespace = enclosing_namespace_components(node, ctx.source);
+    match ctx.semantic_using_enum_owners.resolve_member(
+        ctx.visibility,
+        ctx.file,
+        class.as_ref(),
+        &namespace,
+        node.start_byte(),
+        &ctx.spec.member_name,
+    ) {
+        SemanticUsingEnumMemberResolution::Class(resolution) => {
+            ActiveUsingEnumMemberResolution::Class(resolution)
+        }
+        SemanticUsingEnumMemberResolution::Namespace(resolution) => {
+            ActiveUsingEnumMemberResolution::Namespace(resolution)
+        }
+        SemanticUsingEnumMemberResolution::Missing => ActiveUsingEnumMemberResolution::Missing,
+    }
+}
+
+fn namespace_value_shadows(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let namespace = enclosing_namespace_components(node, ctx.source).join("::");
+    !matches!(
+        resolve_namespace_value(
+            ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            &namespace,
+            &ctx.spec.member_name,
+            node.start_byte(),
+        ),
+        NamespaceValueResolution::Missing
+    )
+}
+
 fn is_nested_in_qualified_identifier(node: Node<'_>) -> bool {
     node.kind() != "qualified_identifier" && has_ancestor_kind(node, "qualified_identifier")
-}
-
-fn owner_is_scoped_enum(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
-    owner
-        .signature()
-        .is_some_and(|signature| signature.starts_with("enum class "))
-        || ctx
-            .analyzer
-            .get_source(owner, false)
-            .is_some_and(|source| source.trim_start().starts_with("enum class "))
-}
-
-fn owner_is_unscoped_enum(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
-    owner.signature().is_some_and(|signature| {
-        signature.starts_with("enum ") && !signature.starts_with("enum class ")
-    }) || ctx.analyzer.get_source(owner, false).is_some_and(|source| {
-        let trimmed = source.trim_start();
-        trimmed.starts_with("enum ") && !trimmed.starts_with("enum class ")
-    })
 }
 
 fn receiver_type_units(node: Node<'_>, source: &str, ctx: &ScanCtx<'_>) -> Vec<CodeUnit> {
@@ -1603,6 +1894,22 @@ fn receiver_owner_matches_target(
             && same_logical_symbol(receiver_owner, target_owner)
 }
 
+fn receiver_owner_is_known_non_target(
+    receiver_owner: &CodeUnit,
+    target_owner: &CodeUnit,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    if receiver_owner_matches_target(receiver_owner, target_owner, ctx) {
+        return false;
+    }
+    if !same_logical_symbol(receiver_owner, target_owner) {
+        return true;
+    }
+    !ctx.target_group.iter().any(|target| {
+        same_logical_symbol(target, &ctx.spec.target) && target.source() == target_owner.source()
+    })
+}
+
 fn receiver_is_self_like(node: Node<'_>) -> bool {
     let mut current = node;
     loop {
@@ -1650,7 +1957,7 @@ fn receiver_has_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
                 !units.is_empty()
                     && units
                         .iter()
-                        .all(|target| !same_visible_symbol(target, owner))
+                        .all(|target| receiver_owner_is_known_non_target(target, owner, ctx))
             }),
         "call_expression" => node
             .child_by_field_name("function")
@@ -1671,7 +1978,7 @@ fn receiver_has_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
                 !units.is_empty()
                     && units
                         .iter()
-                        .all(|target| !same_visible_symbol(target, owner))
+                        .all(|target| receiver_owner_is_known_non_target(target, owner, ctx))
             }),
         "this" => known_non_target_owner_context(node, ctx),
         "qualified_identifier" | "scoped_identifier" | "field_identifier" => {
@@ -1803,42 +2110,6 @@ fn qualified_owner_terminal_scope_node(mut node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-fn append_cpp_name_components(node: Node<'_>, source: &str, out: &mut Vec<String>) -> Option<()> {
-    match node.kind() {
-        "identifier"
-        | "field_identifier"
-        | "namespace_identifier"
-        | "type_identifier"
-        | "operator_name"
-        | "destructor_name" => {
-            out.push(node_text(node, source).to_string());
-            Some(())
-        }
-        "template_type" | "template_function" => {
-            append_cpp_name_components(node.child_by_field_name("name")?, source, out)
-        }
-        "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier" => {
-            if let Some(scope) = node.child_by_field_name("scope") {
-                append_cpp_name_components(scope, source, out)?;
-            }
-            append_cpp_name_components(node.child_by_field_name("name")?, source, out)
-        }
-        "nested_namespace_specifier" => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                append_cpp_name_components(child, source, out)?;
-            }
-            Some(())
-        }
-        _ => None,
-    }
-}
-
-fn is_globally_qualified_cpp_name(node: Node<'_>) -> bool {
-    node.child_by_field_name("scope").is_none()
-        && node.child(0).is_some_and(|child| child.kind() == "::")
-}
-
 fn type_reference_components(node: Node<'_>, source: &str) -> Option<(Vec<String>, bool)> {
     if !matches!(
         node.kind(),
@@ -1855,7 +2126,7 @@ fn type_reference_components(node: Node<'_>, source: &str) -> Option<(Vec<String
     (!components.is_empty()).then_some((components, is_globally_qualified_cpp_name(node)))
 }
 
-fn enclosing_namespace_components(node: Node<'_>, source: &str) -> Vec<String> {
+pub(super) fn enclosing_namespace_components(node: Node<'_>, source: &str) -> Vec<String> {
     let mut namespaces = Vec::new();
     let mut current = node.parent();
     while let Some(parent) = current {
@@ -1967,6 +2238,43 @@ pub(super) fn resolve_type_node_lexically(
     )
 }
 
+pub(super) fn resolve_using_enum_declaration_owner(
+    node: Node<'_>,
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+) -> LexicalTypeResolution {
+    let Some(type_node) = using_enum_declaration_type_node(node) else {
+        return LexicalTypeResolution::Missing;
+    };
+    let mut components = Vec::new();
+    if append_cpp_name_components(type_node, source, &mut components).is_none()
+        || components.is_empty()
+    {
+        return LexicalTypeResolution::Missing;
+    }
+    resolve_type_components_lexically_at(
+        type_node,
+        &components,
+        is_globally_qualified_cpp_name(type_node),
+        analyzer,
+        visibility,
+        file,
+        source,
+    )
+}
+
+pub(super) fn using_enum_declaration_type_node(node: Node<'_>) -> Option<Node<'_>> {
+    (node.kind() == "using_declaration"
+        && (0..node.child_count()).any(|index| {
+            node.child(index)
+                .is_some_and(|child| child.kind() == "enum")
+        }))
+    .then(|| node.named_child(0))
+    .flatten()
+}
+
 fn resolve_type_components_lexically_at(
     node: Node<'_>,
     components: &[String],
@@ -1997,90 +2305,92 @@ fn resolve_type_components_lexically_at(
 }
 
 fn same_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    if let Some(matches) = out_of_line_owner_context_matches_target(node, ctx) {
-        return matches;
-    }
-    if let Some(owner_text) = textual_owner_context(node, ctx) {
-        return ctx
-            .spec
-            .owner_cpp_name
-            .as_deref()
-            .is_some_and(|target_owner| {
-                owner_text == target_owner
-                    || ctx
-                        .spec
-                        .owner
-                        .as_ref()
-                        .is_some_and(|owner| owner_text == owner.identifier())
-            });
-    }
-    let context = enclosing_context(node, ctx);
-    let Some(owner) = context.owner.as_ref() else {
-        return false;
-    };
-    ctx.spec
-        .owner_fq_name
-        .as_ref()
-        .is_some_and(|target_owner| target_owner == &owner.fq_name())
+    matches!(
+        structured_owner_context_resolution(node, ctx),
+        StructuredOwnerContextResolution::Target
+    )
 }
 
 fn known_non_target_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    if let Some(matches) = out_of_line_owner_context_matches_target(node, ctx) {
-        return !matches;
-    }
-    let Some(owner_text) = textual_owner_context(node, ctx) else {
-        return false;
-    };
-    ctx.spec
-        .owner_cpp_name
-        .as_deref()
-        .is_some_and(|target_owner| {
-            owner_text != target_owner
-                && ctx
-                    .spec
-                    .owner
-                    .as_ref()
-                    .is_none_or(|owner| owner_text != owner.identifier())
-        })
+    matches!(
+        structured_owner_context_resolution(node, ctx),
+        StructuredOwnerContextResolution::NonTarget
+    )
 }
 
-fn out_of_line_owner_context_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<bool> {
-    let target_owner = ctx.spec.owner.as_ref()?;
+#[derive(Clone, Copy)]
+enum StructuredOwnerContextResolution {
+    Target,
+    NonTarget,
+    Ambiguous,
+    Missing,
+}
+
+fn structured_owner_context_resolution(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> StructuredOwnerContextResolution {
+    let Some(target_owner) = ctx.spec.owner.as_ref() else {
+        return StructuredOwnerContextResolution::Missing;
+    };
+    let Some(enclosing_owner) = structured_enclosing_owner(node, ctx) else {
+        return StructuredOwnerContextResolution::Missing;
+    };
+    if receiver_owner_matches_target(&enclosing_owner, target_owner, ctx) {
+        return StructuredOwnerContextResolution::Target;
+    }
+    let cached = ctx
+        .member_owner_cache
+        .borrow()
+        .get(&enclosing_owner)
+        .cloned();
+    let member_owner = if let Some(cached) = cached {
+        cached
+    } else {
+        let resolved = resolve_enclosing_member_owner(
+            ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            &enclosing_owner,
+            &ctx.spec.member_name,
+        );
+        ctx.member_owner_cache
+            .borrow_mut()
+            .insert(enclosing_owner, resolved.clone());
+        resolved
+    };
+    match member_owner {
+        EnclosingMemberOwnerResolution::Owner(owner)
+            if receiver_owner_matches_target(&owner, target_owner, ctx) =>
+        {
+            StructuredOwnerContextResolution::Target
+        }
+        EnclosingMemberOwnerResolution::Owner(_) => StructuredOwnerContextResolution::NonTarget,
+        EnclosingMemberOwnerResolution::Ambiguous => StructuredOwnerContextResolution::Ambiguous,
+        EnclosingMemberOwnerResolution::Missing => StructuredOwnerContextResolution::Missing,
+    }
+}
+
+fn structured_enclosing_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
     let mut current = node.parent();
     while let Some(parent) = current {
         if parent.kind() == "function_definition" {
             let function = function_definition_name_node(parent)?;
-            let (_, owner) = out_of_line_member_definition_owner(
+            if let Some(owners) = out_of_line_member_definition_owner(
+                ctx.analyzer,
                 ctx.visibility,
                 ctx.file,
                 ctx.source,
                 function,
-            )?;
-            return Some(same_visible_symbol(&owner, target_owner));
+            ) && let Some((_, owner)) = owners.innermost()
+            {
+                return Some(owner.clone());
+            }
+            break;
         }
         current = parent.parent();
     }
-    None
-}
-
-fn textual_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
-    let before = &ctx.source[..node.start_byte()];
-    textual_owner_context_at(before)
-}
-
-fn textual_owner_context_at(before: &str) -> Option<String> {
-    let brace = before.rfind('{')?;
-    let header_start = before[..brace]
-        .rfind(['\n', ';', '}'])
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let header = before[header_start..brace].trim();
-    let qualifier_end = header.rfind("::")?;
-    let qualifier_prefix = header[..qualifier_end].trim_end();
-    let qualifier_start = qualifier_prefix
-        .rfind(|ch: char| !(ch == '_' || ch == ':' || ch.is_ascii_alphanumeric()))
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let qualifier = qualifier_prefix[qualifier_start..].trim();
-    (!qualifier.is_empty()).then(|| normalize_cpp_reference_text(qualifier))
+    enclosing_context(node, ctx)
+        .owner
+        .filter(|owner| owner.is_class())
 }

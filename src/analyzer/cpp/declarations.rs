@@ -1937,8 +1937,10 @@ fn cpp_signature_metadata(
     function_declarator: Node<'_>,
     source: &str,
 ) -> SignatureMetadata {
+    let return_type_text = cpp_callable_return_type_text(function_declarator, source);
     let Some(parameters_node) = function_declarator.child_by_field_name("parameters") else {
-        return SignatureMetadata::new(signature, Vec::new());
+        return SignatureMetadata::new(signature, Vec::new())
+            .with_return_type_text(return_type_text);
     };
     let callable_arity = cpp_callable_arity(parameters_node, source);
     let parameter_text = normalize_cpp_whitespace(node_text(parameters_node, source));
@@ -1947,7 +1949,9 @@ fn cpp_signature_metadata(
         .get(search_from..)
         .and_then(|suffix| suffix.find(&parameter_text))
     else {
-        return SignatureMetadata::new(signature, Vec::new()).with_callable_arity(callable_arity);
+        return SignatureMetadata::new(signature, Vec::new())
+            .with_callable_arity(callable_arity)
+            .with_return_type_text(return_type_text);
     };
     let parameters_start = search_from + relative_start;
     let parameters_end = parameters_start + parameter_text.len();
@@ -1967,7 +1971,72 @@ fn cpp_signature_metadata(
             Some(ParameterMetadata::new(label, start_byte, end_byte))
         })
         .collect();
-    SignatureMetadata::new(signature, parameters).with_callable_arity(callable_arity)
+    SignatureMetadata::new(signature, parameters)
+        .with_callable_arity(callable_arity)
+        .with_return_type_text(return_type_text)
+}
+
+fn cpp_callable_return_type_text(function_declarator: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = function_declarator.walk();
+    if let Some(trailing) = function_declarator
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "trailing_return_type")
+        && let Some(type_descriptor) = trailing.named_child(0)
+    {
+        let text = normalize_cpp_whitespace(node_text(type_descriptor, source));
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+
+    let mut current = function_declarator;
+    let mut indirection = String::new();
+    while let Some(parent) = current.parent() {
+        if matches!(
+            parent.kind(),
+            "function_definition" | "declaration" | "field_declaration"
+        ) {
+            let type_node = parent.child_by_field_name("type")?;
+            if cpp_export_macro_token(node_text(type_node, source))
+                && (0..parent.named_child_count()).any(|index| {
+                    parent
+                        .named_child(index)
+                        .is_some_and(|child| child.kind() == "ERROR")
+                })
+            {
+                // Export/decorator macros commonly occupy the grammar's `type`
+                // field and leave the semantic return type in an ERROR sibling.
+                // Do not persist the macro token as a return type. The malformed
+                // declaration does not carry enough structured evidence here.
+                return None;
+            }
+            let base = normalize_cpp_whitespace(node_text(type_node, source));
+            return (!base.is_empty()).then(|| format!("{base}{indirection}"));
+        }
+        let wraps_current_declarator = parent.child_by_field_name("declarator") == Some(current)
+            || (matches!(parent.kind(), "pointer_declarator" | "reference_declarator")
+                && parent.named_child_count() == 1
+                && parent.named_child(0) == Some(current));
+        if wraps_current_declarator {
+            match parent.kind() {
+                "pointer_declarator" => indirection.push('*'),
+                "reference_declarator" => {
+                    let reference = parent
+                        .children(&mut parent.walk())
+                        .find(|child| !child.is_named())
+                        .map(|child| node_text(child, source))
+                        .unwrap_or("&");
+                    indirection.push_str(reference);
+                }
+                "init_declarator" | "parenthesized_declarator" => {}
+                _ => return None,
+            }
+            current = parent;
+            continue;
+        }
+        return None;
+    }
+    None
 }
 
 fn cpp_callable_arity(parameters_node: Node<'_>, source: &str) -> CallableArity {

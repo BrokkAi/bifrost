@@ -4,7 +4,7 @@ use crate::path_normalization::NormalizePath;
 use crate::util::throttled_log::ThrottledLog;
 use ignore::{WalkBuilder, WalkState};
 use std::collections::{BTreeSet, HashMap};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -73,6 +73,26 @@ pub trait Project: Send + Sync {
     /// pushed in by `textDocument/did{Open,Change}` notifications.
     fn read_source(&self, file: &ProjectFile) -> io::Result<String> {
         file.read_to_string()
+    }
+
+    /// Read source only when it fits in `max_bytes`, without allocating the
+    /// rest of an oversized on-disk file. `None` means the source exceeded
+    /// the caller's limit.
+    fn read_source_limited(
+        &self,
+        file: &ProjectFile,
+        max_bytes: usize,
+    ) -> io::Result<Option<String>> {
+        let mut source = Vec::with_capacity(max_bytes.saturating_add(1));
+        std::fs::File::open(file.abs_path())?
+            .take(max_bytes.saturating_add(1) as u64)
+            .read_to_end(&mut source)?;
+        if source.len() > max_bytes {
+            return Ok(None);
+        }
+        String::from_utf8(source)
+            .map(Some)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
     }
 
     /// True when an in-memory overlay is shadowing `file`'s disk content.
@@ -715,6 +735,22 @@ impl Project for OverlayProject {
         self.delegate.read_source(file)
     }
 
+    fn read_source_limited(
+        &self,
+        file: &ProjectFile,
+        max_bytes: usize,
+    ) -> io::Result<Option<String>> {
+        if let Some(text) = self
+            .overlays
+            .read()
+            .expect("overlay lock poisoned")
+            .get(&file.abs_path())
+        {
+            return Ok((text.len() <= max_bytes).then(|| text.to_string()));
+        }
+        self.delegate.read_source_limited(file, max_bytes)
+    }
+
     fn has_overlay(&self, file: &ProjectFile) -> bool {
         self.overlays
             .read()
@@ -746,6 +782,16 @@ mod tests {
         }
         std::fs::write(&abs, contents).unwrap();
         ProjectFile::new(root.to_path_buf(), PathBuf::from(rel))
+    }
+
+    #[test]
+    fn default_limited_source_read_rejects_before_allocating_the_full_file() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = write_file(&root, "large.txt", &"x".repeat(1025));
+        let project = TestProject::new(&root, Language::Java);
+
+        assert_eq!(None, project.read_source_limited(&file, 1024).unwrap());
     }
 
     #[cfg(windows)]

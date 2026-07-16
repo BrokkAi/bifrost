@@ -10,6 +10,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  licenses:
+    name: dependency licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Install pinned license tools
+        run: |
+          cargo install --locked cargo-about --version 0.9.1 --features cli
+          cargo install --locked cargo-deny --version 0.20.2
+
+      - name: Check all-feature license policy
+        run: cargo deny --config licenses/deny.toml --locked check licenses
+
+      - name: Check shipped Rust notice report
+        run: |
+          cargo about generate --offline --config licenses/about.toml --features python --locked --fail licenses/about.hbs -o /tmp/THIRD_PARTY_LICENSES.html
+          cmp licenses/THIRD_PARTY_LICENSES.html /tmp/THIRD_PARTY_LICENSES.html
+          node scripts/generate-supplemental-third-party-notices.mjs /tmp/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt
+          cmp licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt /tmp/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt
+
   fmt:
     name: fmt
     runs-on: ubuntu-latest
@@ -45,6 +76,17 @@ jobs:
       - name: Check extension
         run: npm test
         working-directory: editors/vscode
+
+      - name: Package and inspect extension notices
+        shell: bash
+        working-directory: editors/vscode
+        run: |
+          npx --no-install vsce package --out /tmp/bifrost-ci.vsix
+          unzip -Z1 /tmp/bifrost-ci.vsix > /tmp/bifrost-vsix-files.txt
+          grep -Fx 'extension/LICENSE.md' /tmp/bifrost-vsix-files.txt
+          grep -Fx 'extension/GPL-3.0.md' /tmp/bifrost-vsix-files.txt
+          grep -Fx 'extension/SOURCE.md' /tmp/bifrost-vsix-files.txt
+          grep -Fx 'extension/THIRD_PARTY_LICENSES.txt' /tmp/bifrost-vsix-files.txt
 
   rust:
     name: rust (${{ matrix.target }})
@@ -150,6 +192,7 @@ jobs:
         uses: astral-sh/setup-uv@v7
         with:
           python-version: '3.12'
+          enable-cache: false
 
       - name: cargo test
         if: matrix.can-test

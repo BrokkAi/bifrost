@@ -1083,6 +1083,70 @@ fn cpp_signature_metadata_records_optional_and_variadic_callable_arity() {
 }
 
 #[test]
+fn cpp_signature_metadata_persists_structured_return_types_for_declarations_and_definitions() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "returns.hpp",
+            r#"#define BASE_EXPORT
+struct T {
+    T* pointer();
+    T& reference();
+    auto trailing() -> T*;
+    BASE_EXPORT T* exported();
+};
+"#,
+        )
+        .file(
+            "returns.cc",
+            r#"#include "returns.hpp"
+T* T::pointer() { return this; }
+T& T::reference() { return *this; }
+auto T::trailing() -> T* { return this; }
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+
+    for (name, expected) in [("pointer", "T*"), ("reference", "T&"), ("trailing", "T*")] {
+        let callables = analyzer
+            .get_all_declarations()
+            .iter()
+            .filter(|unit| unit.is_function() && unit.fq_name() == format!("T.{name}"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            callables.len(),
+            2,
+            "fixture must retain declaration and definition for {name}: {callables:#?}"
+        );
+        for callable in callables {
+            let return_types = analyzer
+                .signature_metadata(&callable)
+                .iter()
+                .filter_map(|metadata| metadata.return_type_text().map(str::to_owned))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                return_types,
+                BTreeSet::from([expected.to_owned()]),
+                "persisted return type for {callable:#?}"
+            );
+        }
+    }
+    let exported = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .find(|unit| unit.is_function() && unit.fq_name() == "T.exported")
+        .expect("macro-decorated exported declaration");
+    assert!(
+        analyzer
+            .signature_metadata(&exported)
+            .iter()
+            .all(|metadata| metadata.return_type_text().is_none()),
+        "the export macro token must not be persisted as the callable return type"
+    );
+}
+
+#[test]
 fn cpp_signature_metadata_anchors_multi_declarator_parameters() {
     let project = inline_cpp_project(&[(
         "multi.hpp",

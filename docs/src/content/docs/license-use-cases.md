@@ -112,7 +112,9 @@ or modified fork, plan for all of the following:
 6. Do not forbid modification of the Bifrost portion or reverse engineering done
    to debug those modifications.
 7. Review the licenses and notices for dependencies and other bundled components;
-   the Bifrost license does not replace their terms.
+   the Bifrost license does not replace their terms. Bifrost's official artifact
+   scopes and generated reports are described in [Third-Party
+   Notices](/third-party-notices/).
 
 Source generally needs to be offered to the people who receive the binary; the
 LGPL does not require every private fork to be published to the whole world.

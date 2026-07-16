@@ -79,6 +79,7 @@ fn java_external_type_resolution_uses_exact_maven_coordinate_without_workspace_d
                 repository_roots: vec![root.join("m2")],
                 ..JavaExternalDependencies::default()
             },
+            ..JavaAnalyzerConfig::default()
         },
         ..AnalyzerConfig::default()
     };

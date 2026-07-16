@@ -67,8 +67,17 @@ pub(crate) struct ParsedRql {
     pub(crate) incomplete: Option<ParseError>,
 }
 
+pub(crate) struct ParsedRqlDocument {
+    pub(crate) exprs: Vec<Expr>,
+    pub(crate) incomplete: Option<ParseError>,
+}
+
 pub(crate) fn parse_rql(source: &str) -> Result<ParsedRql, ParseError> {
     Parser::new(source).parse()
+}
+
+pub(crate) fn parse_rql_document(source: &str) -> Result<ParsedRqlDocument, ParseError> {
+    Parser::new(source).parse_document()
 }
 
 struct Parser<'a> {
@@ -101,6 +110,24 @@ impl<'a> Parser<'a> {
         }
         Ok(ParsedRql {
             expr: Some(expr),
+            incomplete: self.incomplete,
+        })
+    }
+
+    fn parse_document(mut self) -> Result<ParsedRqlDocument, ParseError> {
+        let mut exprs = Vec::new();
+        loop {
+            self.skip_trivia();
+            if self.pos == self.source.len() {
+                break;
+            }
+            exprs.push(self.expr(0)?);
+            if self.incomplete.is_some() {
+                break;
+            }
+        }
+        Ok(ParsedRqlDocument {
+            exprs,
             incomplete: self.incomplete,
         })
     }

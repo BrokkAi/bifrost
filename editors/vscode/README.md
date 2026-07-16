@@ -115,6 +115,12 @@ that language mode, with canonical normalized kinds, roles, metadata, spans,
 strings, and comments highlighted. The preview headings begin with `;`, so
 saved previews remain valid Rune IR documents.
 
+VS Code's **Format Document** command uses the Bifrost LSP formatter for both
+`.rql` and saved `.rune` files. S-expressions stay compact while they fit within
+120 columns; longer forms put their entries on indented lines and keep
+`:property value` pairs together when they fit. Incomplete expressions are left
+unchanged.
+
 For large repositories, scope indexing before starting the server:
 
 ```json

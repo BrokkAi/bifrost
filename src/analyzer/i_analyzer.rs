@@ -1,4 +1,5 @@
 use crate::analyzer::common::display_identifier_for_target;
+use crate::analyzer::store::StoreError;
 use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder};
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
@@ -11,15 +12,45 @@ use crate::analyzer::{
 use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// Failure state for one top-level analyzer request.
+///
+/// The analyzer trait intentionally retains best-effort collection-returning APIs, so persisted
+/// implementations record storage failures here before returning their compatibility fallback.
+/// Service boundaries inspect the context before presenting a successful response.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct AnalyzerQueryContext {
+    first_store_error: Mutex<Option<StoreError>>,
+}
+
+impl AnalyzerQueryContext {
+    pub(crate) fn record_store_error(&self, error: StoreError) {
+        let mut slot = self
+            .first_store_error
+            .lock()
+            .expect("analyzer query error mutex poisoned");
+        if slot.is_none() {
+            *slot = Some(error);
+        }
+    }
+
+    pub(crate) fn store_error(&self) -> Option<StoreError> {
+        self.first_store_error
+            .lock()
+            .expect("analyzer query error mutex poisoned")
+            .clone()
+    }
+}
 
 pub trait IAnalyzer: Send + Sync + Any {
     /// Starts a top-level query boundary. Persisted analyzers use this to
     /// memoize filesystem liveness checks for the duration of one request.
-    fn begin_query(&self) {}
+    fn begin_query(&self, _context: &Arc<AnalyzerQueryContext>) {}
 
     /// Ends a top-level query boundary and releases request-scoped memoized state.
-    fn end_query(&self) {}
+    fn end_query(&self, _context: &Arc<AnalyzerQueryContext>) {}
 
     fn top_level_declarations(&self, _file: &ProjectFile) -> Vec<CodeUnit> {
         Vec::new()
@@ -573,18 +604,20 @@ pub trait IAnalyzer: Send + Sync + Any {
 /// Releases request-scoped analyzer memoization on every return path.
 pub(crate) struct AnalyzerQueryScope<'a> {
     analyzer: &'a dyn IAnalyzer,
+    context: Arc<AnalyzerQueryContext>,
 }
 
 impl<'a> AnalyzerQueryScope<'a> {
     pub(crate) fn new(analyzer: &'a dyn IAnalyzer) -> Self {
-        analyzer.begin_query();
-        Self { analyzer }
+        let context = Arc::new(AnalyzerQueryContext::default());
+        analyzer.begin_query(&context);
+        Self { analyzer, context }
     }
 }
 
 impl Drop for AnalyzerQueryScope<'_> {
     fn drop(&mut self) {
-        self.analyzer.end_query();
+        self.analyzer.end_query(&self.context);
     }
 }
 

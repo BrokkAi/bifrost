@@ -363,7 +363,8 @@ fn structural_facts_cold_extraction_and_warm_persisted_hydration() {
 
     let rss_start = peak_rss_bytes();
     let cold_build_started = Instant::now();
-    let cold_workspace = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), config.clone());
+    let cold_workspace = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), config.clone())
+        .expect("persisted analyzer should build");
     let cold_build_ms = cold_build_started.elapsed().as_secs_f64() * 1_000.0;
     let cold = materialize(cold_workspace.analyzer(), file_count, iterations);
     drop(cold_workspace);
@@ -373,7 +374,8 @@ fn structural_facts_cold_extraction_and_warm_persisted_hydration() {
     let rss_after_cold = peak_rss_bytes();
 
     let warm_build_started = Instant::now();
-    let warm_workspace = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), config);
+    let warm_workspace = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), config)
+        .expect("persisted analyzer should reopen");
     let warm_build_ms = warm_build_started.elapsed().as_secs_f64() * 1_000.0;
     let warm = materialize(warm_workspace.analyzer(), file_count, iterations);
     drop(warm_workspace);

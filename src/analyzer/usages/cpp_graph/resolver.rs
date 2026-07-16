@@ -45,15 +45,234 @@ pub(super) enum LexicalCallableValueResolution {
     Missing,
 }
 
+pub(super) enum UsingEnumMemberResolution {
+    Resolved { owner: CodeUnit, member: CodeUnit },
+    Ambiguous,
+    Missing,
+}
+
+pub(super) enum NamespaceValueResolution {
+    Resolved,
+    Ambiguous,
+    Missing,
+}
+
+pub(super) fn resolve_namespace_value(
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    namespace: &str,
+    name: &str,
+    before_byte: usize,
+) -> NamespaceValueResolution {
+    let mut matches = Vec::new();
+    for candidate in visibility.visible_identifier_candidates(file, name) {
+        if type_owner_of(analyzer, candidate).is_some()
+            || candidate.package_name() != namespace
+            || (candidate.source() == file
+                && !analyzer
+                    .ranges(candidate)
+                    .iter()
+                    .any(|range| range.start_byte < before_byte))
+            || matches
+                .iter()
+                .any(|existing| same_visible_symbol(existing, candidate))
+        {
+            continue;
+        }
+        matches.push(candidate.clone());
+        if matches.len() > 1 {
+            return NamespaceValueResolution::Ambiguous;
+        }
+    }
+    matches
+        .pop()
+        .map(|_| NamespaceValueResolution::Resolved)
+        .unwrap_or(NamespaceValueResolution::Missing)
+}
+
+pub(super) struct ScopedUsingEnumOwners {
+    scopes: Vec<Vec<CodeUnit>>,
+}
+
+/// Same-file class and namespace imports collected by the targeted scanner's AST prepass.
+/// Cross-file and inherited class imports are deliberately not inferred without persisted
+/// evidence; a missing imported enumerator therefore remains unproven rather than being
+/// misresolved.
+pub(super) struct SemanticUsingEnumOwners {
+    class_imports: HashMap<CodeUnit, Vec<CodeUnit>>,
+    namespace_imports: HashMap<Vec<String>, Vec<(usize, CodeUnit)>>,
+}
+
+pub(super) enum SemanticUsingEnumMemberResolution {
+    Class(UsingEnumMemberResolution),
+    Namespace(UsingEnumMemberResolution),
+    Missing,
+}
+
+impl SemanticUsingEnumOwners {
+    pub(super) fn new() -> Self {
+        Self {
+            class_imports: HashMap::default(),
+            namespace_imports: HashMap::default(),
+        }
+    }
+
+    pub(super) fn import_class(&mut self, class: CodeUnit, enum_owner: CodeUnit) {
+        let imports = self.class_imports.entry(class).or_default();
+        if !imports
+            .iter()
+            .any(|existing| same_visible_symbol(existing, &enum_owner))
+        {
+            imports.push(enum_owner);
+        }
+    }
+
+    pub(super) fn import_namespace(
+        &mut self,
+        namespace: Vec<String>,
+        declaration_byte: usize,
+        enum_owner: CodeUnit,
+    ) {
+        let imports = self.namespace_imports.entry(namespace).or_default();
+        if !imports
+            .iter()
+            .any(|(_, existing)| same_visible_symbol(existing, &enum_owner))
+        {
+            imports.push((declaration_byte, enum_owner));
+        }
+    }
+
+    pub(super) fn resolve_member(
+        &self,
+        visibility: &VisibilityIndex,
+        file: &ProjectFile,
+        class: Option<&CodeUnit>,
+        namespace: &[String],
+        before_byte: usize,
+        name: &str,
+    ) -> SemanticUsingEnumMemberResolution {
+        if let Some(class) = class
+            && let Some((_, imports)) = self
+                .class_imports
+                .iter()
+                .find(|(owner, _)| same_visible_symbol(owner, class))
+        {
+            let resolution =
+                resolve_using_enum_member_for_owners(visibility, file, imports.iter(), name);
+            if !matches!(resolution, UsingEnumMemberResolution::Missing) {
+                return SemanticUsingEnumMemberResolution::Class(resolution);
+            }
+        }
+        for prefix_len in (0..=namespace.len()).rev() {
+            let Some(imports) = self.namespace_imports.get(&namespace[..prefix_len]) else {
+                continue;
+            };
+            let owners = imports
+                .iter()
+                .filter(|(declaration_byte, _)| *declaration_byte < before_byte)
+                .map(|(_, owner)| owner);
+            let resolution = resolve_using_enum_member_for_owners(visibility, file, owners, name);
+            if !matches!(resolution, UsingEnumMemberResolution::Missing) {
+                return SemanticUsingEnumMemberResolution::Namespace(resolution);
+            }
+        }
+        SemanticUsingEnumMemberResolution::Missing
+    }
+}
+
+fn resolve_using_enum_member_for_owners<'a>(
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    owners: impl IntoIterator<Item = &'a CodeUnit>,
+    name: &str,
+) -> UsingEnumMemberResolution {
+    let mut matches: Vec<(CodeUnit, CodeUnit)> = Vec::new();
+    for owner in owners {
+        for member in visibility.visible_members_for_owner_name(file, owner, name) {
+            if !member.is_field()
+                || matches.iter().any(|(existing_owner, existing_member)| {
+                    same_visible_symbol(existing_owner, owner)
+                        && same_visible_symbol(existing_member, member)
+                })
+            {
+                continue;
+            }
+            matches.push((owner.clone(), member.clone()));
+        }
+    }
+    match matches.len() {
+        0 => UsingEnumMemberResolution::Missing,
+        1 => {
+            let (owner, member) = matches.pop().expect("one using-enum match");
+            UsingEnumMemberResolution::Resolved { owner, member }
+        }
+        _ => UsingEnumMemberResolution::Ambiguous,
+    }
+}
+
+impl ScopedUsingEnumOwners {
+    pub(super) fn new() -> Self {
+        Self {
+            scopes: vec![Vec::new()],
+        }
+    }
+
+    pub(super) fn enter_scope(&mut self) {
+        self.scopes.push(Vec::new());
+    }
+
+    pub(super) fn exit_scope(&mut self) {
+        if self.scopes.len() > 1 {
+            self.scopes.pop();
+        }
+    }
+
+    pub(super) fn import(&mut self, owner: CodeUnit) {
+        let scope = self
+            .scopes
+            .last_mut()
+            .expect("using-enum scope stack is never empty");
+        if !scope
+            .iter()
+            .any(|existing| same_visible_symbol(existing, &owner))
+        {
+            scope.push(owner);
+        }
+    }
+
+    pub(super) fn resolve_member(
+        &self,
+        visibility: &VisibilityIndex,
+        file: &ProjectFile,
+        name: &str,
+    ) -> UsingEnumMemberResolution {
+        for scope in self.scopes.iter().rev() {
+            let resolution =
+                resolve_using_enum_member_for_owners(visibility, file, scope.iter(), name);
+            if !matches!(resolution, UsingEnumMemberResolution::Missing) {
+                return resolution;
+            }
+        }
+        UsingEnumMemberResolution::Missing
+    }
+}
+
 pub(super) struct TargetSpec {
     pub(super) target: CodeUnit,
     pub(super) kind: TargetKind,
     pub(super) owner: Option<CodeUnit>,
     pub(super) member_name: String,
-    pub(super) owner_fq_name: Option<String>,
-    pub(super) owner_cpp_name: Option<String>,
     pub(super) callable_arity: Option<CallableArity>,
     pub(super) param_types: Option<Vec<String>>,
+    pub(super) enum_owner_kind: EnumOwnerKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum EnumOwnerKind {
+    Scoped,
+    Unscoped,
+    NonEnum,
 }
 
 impl TargetSpec {
@@ -81,14 +300,20 @@ impl TargetSpec {
             } else {
                 TargetKind::GlobalField
             };
-            return Some(Self::new(
+            let enum_owner_kind = owner
+                .as_ref()
+                .map(|owner| classify_enum_owner(analyzer, owner))
+                .unwrap_or(EnumOwnerKind::NonEnum);
+            let mut spec = Self::new(
                 target.clone(),
                 kind,
                 owner,
                 target.identifier().to_string(),
                 None,
                 None,
-            ));
+            );
+            spec.enum_owner_kind = enum_owner_kind;
+            return Some(spec);
         }
 
         if target.is_function() {
@@ -126,19 +351,39 @@ impl TargetSpec {
         callable_arity: Option<CallableArity>,
         param_types: Option<Vec<String>>,
     ) -> Self {
-        let owner_fq_name = owner.as_ref().map(CodeUnit::fq_name);
-        let owner_cpp_name = owner.as_ref().map(cpp_name_for);
         Self {
             target,
             kind,
             owner,
             member_name,
-            owner_fq_name,
-            owner_cpp_name,
             callable_arity,
             param_types,
+            enum_owner_kind: EnumOwnerKind::NonEnum,
         }
     }
+}
+
+fn classify_enum_owner(analyzer: &dyn IAnalyzer, owner: &CodeUnit) -> EnumOwnerKind {
+    let classify = |source: &str| {
+        let source = source.trim_start();
+        if source.starts_with("enum class ") || source.starts_with("enum struct ") {
+            Some(EnumOwnerKind::Scoped)
+        } else if source.starts_with("enum ") {
+            Some(EnumOwnerKind::Unscoped)
+        } else {
+            None
+        }
+    };
+    owner
+        .signature()
+        .and_then(classify)
+        .or_else(|| {
+            analyzer
+                .get_source(owner, false)
+                .as_deref()
+                .and_then(classify)
+        })
+        .unwrap_or(EnumOwnerKind::NonEnum)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -893,6 +1138,82 @@ pub(super) enum VisibleMemberResolution {
     Missing,
 }
 
+#[derive(Clone)]
+pub(super) enum EnclosingMemberOwnerResolution {
+    Owner(CodeUnit),
+    Ambiguous,
+    Missing,
+}
+
+pub(super) fn resolve_enclosing_member_owner(
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    enclosing_owner: &CodeUnit,
+    member_name: &str,
+) -> EnclosingMemberOwnerResolution {
+    let Some(hierarchy) = analyzer.type_hierarchy_provider() else {
+        return EnclosingMemberOwnerResolution::Missing;
+    };
+    let resolve_level = |frontier: &[CodeUnit]| {
+        let mut member_owners = Vec::new();
+        for owner in frontier {
+            for member in visibility.visible_members_for_owner_name(file, owner, member_name) {
+                let Some(member_owner) = type_owner_of(analyzer, member) else {
+                    return EnclosingMemberOwnerResolution::Ambiguous;
+                };
+                if !member_owners
+                    .iter()
+                    .any(|existing| same_visible_symbol(existing, &member_owner))
+                {
+                    member_owners.push(member_owner);
+                }
+            }
+        }
+        match member_owners.len() {
+            0 => EnclosingMemberOwnerResolution::Missing,
+            1 => EnclosingMemberOwnerResolution::Owner(member_owners.pop().unwrap()),
+            _ => EnclosingMemberOwnerResolution::Ambiguous,
+        }
+    };
+    let direct = resolve_level(std::slice::from_ref(enclosing_owner));
+    if !matches!(direct, EnclosingMemberOwnerResolution::Missing) {
+        return direct;
+    }
+    let mut stack = hierarchy.get_direct_ancestors(enclosing_owner);
+    let mut propagated_counts: HashMap<CodeUnit, u8> = HashMap::default();
+    let mut path_matches = Vec::new();
+    while let Some(owner) = stack.pop() {
+        // Persisted hierarchy edges do not encode virtual-base or base-subobject paths.
+        // Propagate at most two occurrences of each owner: that preserves the distinction
+        // between one and multiple resolving base paths without exponential diamond walks.
+        let propagated = propagated_counts.entry(owner.clone()).or_default();
+        if *propagated == 2 {
+            continue;
+        }
+        *propagated += 1;
+        match resolve_level(std::slice::from_ref(&owner)) {
+            EnclosingMemberOwnerResolution::Owner(owner) => {
+                path_matches.push(owner);
+                if path_matches.len() == 2 {
+                    return EnclosingMemberOwnerResolution::Ambiguous;
+                }
+            }
+            EnclosingMemberOwnerResolution::Ambiguous => {
+                return EnclosingMemberOwnerResolution::Ambiguous;
+            }
+            EnclosingMemberOwnerResolution::Missing => {
+                stack.extend(hierarchy.get_direct_ancestors(&owner));
+            }
+        }
+    }
+    match path_matches.len() {
+        0 => EnclosingMemberOwnerResolution::Missing,
+        1 => EnclosingMemberOwnerResolution::Owner(path_matches.pop().unwrap()),
+        _ => unreachable!("base-path matches are capped at one before returning"),
+    }
+}
+
 fn lexical_component_tiers<'a>(
     components: &'a [String],
     global: bool,
@@ -1138,22 +1459,37 @@ fn unanimous_return_binding(
 ) -> Option<CppScanBinding> {
     let mut resolved_return: Option<CppScanBinding> = None;
     for function in candidates {
-        let return_text = cpp_function_return_type_text(analyzer, function)?;
-        let indirection =
-            crate::analyzer::usages::cpp_call_match::cpp_type_text_pointer_depth(&return_text);
-        let name = normalize_cpp_type_name(&return_text);
-        let binding = CppScanBinding::from_type_name(
-            name.clone(),
-            visibility.resolve_type_for_declaration(file, function, &name),
-            indirection,
-        );
-        if let Some(existing) = resolved_return.as_ref()
-            && (existing.type_name != binding.type_name
-                || existing.indirection != binding.indirection)
-        {
-            return None;
+        let metadata = analyzer.signature_metadata(function);
+        let return_types = if metadata.is_empty() {
+            vec![cpp_function_return_type_text(analyzer, function)?]
+        } else {
+            metadata
+                .iter()
+                .map(|metadata| metadata.return_type_text().map(str::to_string))
+                .collect::<Option<Vec<_>>>()?
+        };
+        for return_text in return_types {
+            let indirection =
+                crate::analyzer::usages::cpp_call_match::cpp_type_text_pointer_depth(&return_text);
+            let name = normalize_cpp_type_name(&return_text);
+            let binding = CppScanBinding::from_type_name(
+                name.clone(),
+                visibility
+                    .resolve_unique_canonical_type_for_declaration(analyzer, file, function, &name),
+                indirection,
+            );
+            if let Some(existing) = resolved_return.as_ref()
+                && (existing.indirection != binding.indirection
+                    || match (&existing.unit, &binding.unit) {
+                        (Some(left), Some(right)) => !same_visible_symbol(left, right),
+                        (None, None) => existing.type_name != binding.type_name,
+                        (Some(_), None) | (None, Some(_)) => true,
+                    })
+            {
+                return None;
+            }
+            resolved_return = Some(binding);
         }
-        resolved_return = Some(binding);
     }
     resolved_return
 }
@@ -2183,27 +2519,148 @@ pub(super) fn is_nested_type_node(node: Node<'_>) -> bool {
     })
 }
 
+pub(super) struct OutOfLineMemberDefinitionOwners<'tree> {
+    pub(super) owners: Vec<(Node<'tree>, CodeUnit)>,
+    innermost: Option<(Node<'tree>, CodeUnit)>,
+}
+
+impl OutOfLineMemberDefinitionOwners<'_> {
+    pub(super) fn innermost(&self) -> Option<(Node<'_>, &CodeUnit)> {
+        self.innermost.as_ref().map(|(node, owner)| (*node, owner))
+    }
+}
+
 pub(super) fn out_of_line_member_definition_owner<'tree>(
+    analyzer: &dyn IAnalyzer,
     visibility: &VisibilityIndex,
     file: &ProjectFile,
     source: &str,
     node: Node<'tree>,
-) -> Option<(Node<'tree>, CodeUnit)> {
-    if node.kind() != "qualified_identifier" || !has_ancestor_kind(node, "function_definition") {
+) -> Option<OutOfLineMemberDefinitionOwners<'tree>> {
+    if !matches!(node.kind(), "qualified_identifier" | "scoped_identifier")
+        || !has_ancestor_kind(node, "function_definition")
+        || !is_function_declarator_name_root(node)
+    {
         return None;
     }
-    let scope = node.child_by_field_name("scope")?;
-    let text = node_text(scope, source);
-    let qualified;
-    let lookup = if text.contains("::") {
-        text
-    } else {
-        let namespace = enclosing_namespace_context(scope, source)?;
-        qualified = format!("{namespace}::{text}");
-        qualified.as_str()
-    };
-    let owner = visibility.canonical_type_for_reference(file, lookup)?;
-    Some((scope, owner))
+    let mut component_nodes = cpp_name_component_nodes(node)?;
+    component_nodes.pop()?;
+    if component_nodes.is_empty() {
+        return None;
+    }
+    let components = component_nodes
+        .iter()
+        .map(|component| node_text(*component, source).to_string())
+        .collect::<Vec<_>>();
+    let global = is_globally_qualified_cpp_name(node);
+    let lexical_scope = enclosing_namespace_components(node, source)?;
+    let mut owners = Vec::new();
+    let mut innermost = None;
+    for component_count in 1..=components.len() {
+        if let LexicalTypeResolution::Resolved { unit, .. } = visibility
+            .resolve_type_components_lexically(
+                analyzer,
+                file,
+                &components[..component_count],
+                global,
+                &lexical_scope,
+            )
+            && !owners
+                .iter()
+                .any(|(_, existing)| same_visible_symbol(existing, &unit))
+        {
+            if component_count == components.len() {
+                innermost = Some((component_nodes[component_count - 1], unit.clone()));
+            }
+            owners.push((component_nodes[component_count - 1], unit));
+        }
+    }
+    (!owners.is_empty()).then_some(OutOfLineMemberDefinitionOwners { owners, innermost })
+}
+
+fn is_function_declarator_name_root(node: Node<'_>) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "function_declarator" {
+            return parent.child_by_field_name("declarator") == Some(current);
+        }
+        if matches!(
+            parent.kind(),
+            "pointer_declarator" | "reference_declarator" | "parenthesized_declarator"
+        ) && parent.child_by_field_name("declarator") == Some(current)
+        {
+            current = parent;
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
+pub(super) fn append_cpp_name_components(
+    node: Node<'_>,
+    source: &str,
+    out: &mut Vec<String>,
+) -> Option<()> {
+    out.extend(
+        cpp_name_component_nodes(node)?
+            .into_iter()
+            .map(|component| node_text(component, source).to_string()),
+    );
+    Some(())
+}
+
+fn cpp_name_component_nodes(node: Node<'_>) -> Option<Vec<Node<'_>>> {
+    let mut components = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        match current.kind() {
+            "identifier"
+            | "field_identifier"
+            | "namespace_identifier"
+            | "type_identifier"
+            | "operator_name"
+            | "destructor_name" => components.push(current),
+            "template_type" | "template_function" => {
+                stack.push(current.child_by_field_name("name")?);
+            }
+            "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier" => {
+                stack.push(current.child_by_field_name("name")?);
+                if let Some(scope) = current.child_by_field_name("scope") {
+                    stack.push(scope);
+                }
+            }
+            "nested_namespace_specifier" => {
+                for index in (0..current.named_child_count()).rev() {
+                    stack.push(current.named_child(index)?);
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(components)
+}
+
+pub(super) fn is_globally_qualified_cpp_name(node: Node<'_>) -> bool {
+    node.child_by_field_name("scope").is_none()
+        && node.child(0).is_some_and(|child| child.kind() == "::")
+}
+
+fn enclosing_namespace_components(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    let mut namespaces = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "namespace_definition"
+            && let Some(name) = parent.child_by_field_name("name")
+        {
+            let mut components = Vec::new();
+            append_cpp_name_components(name, source, &mut components)?;
+            namespaces.push(components);
+        }
+        current = parent.parent();
+    }
+    namespaces.reverse();
+    Some(namespaces.into_iter().flatten().collect())
 }
 
 pub(super) fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
@@ -2363,6 +2820,14 @@ pub(in crate::analyzer::usages) fn cpp_function_return_type_text(
     analyzer: &dyn IAnalyzer,
     function: &CodeUnit,
 ) -> Option<String> {
+    let metadata = analyzer.signature_metadata(function);
+    if !metadata.is_empty() {
+        let first = metadata.first()?.return_type_text()?;
+        return metadata
+            .iter()
+            .all(|metadata| metadata.return_type_text() == Some(first))
+            .then(|| first.to_string());
+    }
     let signature = cpp_function_signature_text(analyzer, function)?;
     cpp_function_return_type_text_from_signature(&signature)
 }

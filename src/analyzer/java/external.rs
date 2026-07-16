@@ -2,7 +2,11 @@ use super::declarations::{
     class_like_body_children_rev, determine_package_name, is_class_like_declaration_kind,
     node_text, normalize_java_full_name, parse_tree,
 };
-use crate::analyzer::{JavaExternalArtifact, JavaExternalDependencies, JavaMavenCoordinate};
+use super::dependency_discovery::{discover_build_tools, discover_metadata};
+use crate::analyzer::{
+    JavaAnalyzerConfig, JavaDependencyDiscoveryMode, JavaExternalArtifact,
+    JavaExternalDependencies, JavaMavenCoordinate, Project,
+};
 use crate::hash::HashMap;
 use jclassfile::attributes::{Attribute, NestedClassFlags};
 use jclassfile::class_file::{ClassFile, ClassFlags};
@@ -69,8 +73,26 @@ struct ResolvedJavaArtifact {
 }
 
 impl JavaExternalDeclarationIndex {
+    #[cfg(test)]
     pub(crate) fn build(config: &JavaExternalDependencies, project_root: &Path) -> Self {
         let artifacts = resolve_configured_artifacts(config, project_root);
+        Self::build_from_artifacts(artifacts)
+    }
+
+    pub(crate) fn build_for_project(config: &JavaAnalyzerConfig, project: &dyn Project) -> Self {
+        let mut dependencies = config.external_dependencies.clone();
+        if config.dependency_discovery.mode != JavaDependencyDiscoveryMode::Disabled {
+            discover_metadata(project).merge_into(&mut dependencies);
+        }
+        if config.dependency_discovery.mode == JavaDependencyDiscoveryMode::OfflineBuildTools {
+            discover_build_tools(project, &config.dependency_discovery)
+                .merge_into(&mut dependencies);
+        }
+        let artifacts = resolve_configured_artifacts(&dependencies, project.root());
+        Self::build_from_artifacts(artifacts)
+    }
+
+    fn build_from_artifacts(artifacts: Vec<ResolvedJavaArtifact>) -> Self {
         let mut index = Self::default();
         for artifact in artifacts {
             if is_source_jar(&artifact.artifact_path) {
@@ -315,15 +337,34 @@ fn resolve_configured_artifacts(
     }
 
     let repository_roots = repository_roots(config);
+    let gradle_cache_roots = gradle_cache_roots(config);
     for coordinate in &config.coordinates {
+        let mut resolved = false;
         for root in &repository_roots {
             if let Some(artifact) = resolve_coordinate(root, coordinate) {
                 artifacts.push(artifact);
+                resolved = true;
                 break;
+            }
+        }
+        if !resolved {
+            for root in &gradle_cache_roots {
+                let gradle_artifacts = resolve_gradle_coordinate(root, coordinate);
+                if !gradle_artifacts.is_empty() {
+                    artifacts.extend(gradle_artifacts);
+                    break;
+                }
             }
         }
     }
 
+    let mut seen = crate::hash::HashSet::default();
+    artifacts.retain(|artifact| {
+        seen.insert((
+            artifact.artifact_path.clone(),
+            artifact.source_artifact_path.clone(),
+        ))
+    });
     artifacts
 }
 
@@ -410,6 +451,111 @@ fn repository_roots(config: &JavaExternalDependencies) -> Vec<PathBuf> {
     home_dir()
         .map(|home| vec![home.join(".m2").join("repository")])
         .unwrap_or_default()
+}
+
+fn gradle_cache_roots(config: &JavaExternalDependencies) -> Vec<PathBuf> {
+    if !config.gradle_cache_roots.is_empty() {
+        return config.gradle_cache_roots.clone();
+    }
+
+    std::env::var_os("GRADLE_USER_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|root| root.join("caches").join("modules-2").join("files-2.1"))
+        .or_else(|| {
+            home_dir().map(|home| {
+                home.join(".gradle")
+                    .join("caches")
+                    .join("modules-2")
+                    .join("files-2.1")
+            })
+        })
+        .into_iter()
+        .collect()
+}
+
+fn resolve_gradle_coordinate(
+    cache_root: &Path,
+    coordinate: &JavaMavenCoordinate,
+) -> Vec<ResolvedJavaArtifact> {
+    if !is_safe_maven_coordinate(coordinate) {
+        return Vec::new();
+    }
+    let Ok(cache_root) = cache_root.canonicalize() else {
+        return Vec::new();
+    };
+    let coordinate_directory = cache_root
+        .join(&coordinate.group_id)
+        .join(&coordinate.artifact_id)
+        .join(&coordinate.version);
+    let Ok(hash_directories) = coordinate_directory.read_dir() else {
+        return Vec::new();
+    };
+
+    let mut jars = Vec::new();
+    for hash_directory in hash_directories.filter_map(Result::ok) {
+        let Ok(file_type) = hash_directory.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Ok(entries) = hash_directory.path().read_dir() else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "jar") {
+                continue;
+            }
+            let Some(path) = canonical_file_under(&cache_root, &path) else {
+                continue;
+            };
+            if path.is_file() {
+                jars.push(path);
+            }
+        }
+    }
+    jars.sort();
+    jars.dedup();
+
+    let expected_binary = format!("{}-{}.jar", coordinate.artifact_id, coordinate.version);
+    let expected_sources = format!(
+        "{}-{}-sources.jar",
+        coordinate.artifact_id, coordinate.version
+    );
+    let sources = jars
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name == expected_sources.as_str())
+        })
+        .cloned();
+    let exact_binaries: Vec<_> = jars
+        .iter()
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name == expected_binary.as_str())
+        })
+        .cloned()
+        .collect();
+    let binaries = exact_binaries;
+    if binaries.is_empty() {
+        return sources
+            .into_iter()
+            .map(|artifact_path| ResolvedJavaArtifact {
+                artifact_path,
+                source_artifact_path: None,
+            })
+            .collect();
+    }
+    binaries
+        .into_iter()
+        .map(|artifact_path| ResolvedJavaArtifact {
+            artifact_path,
+            source_artifact_path: sources.clone(),
+        })
+        .collect()
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -704,12 +850,15 @@ fn enclosing_type_fqns(external_type: &JavaExternalType) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::analyzer::{
-        AnalyzerConfig, JavaAnalyzer, JavaExternalArtifact, JavaExternalDependencies,
-        JavaMavenCoordinate, Language, Project, ProjectFile, TestProject,
+        AnalyzerConfig, AnalyzerDelegate, IAnalyzer, JavaAnalyzer, JavaExternalArtifact,
+        JavaExternalDependencies, JavaMavenCoordinate, Language, MultiAnalyzer, Project,
+        ProjectFile, PythonAnalyzer, TestProject, resolve_analyzer,
     };
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::io::Write;
     use std::process::Command;
+    use std::sync::Arc;
     use zip::write::SimpleFileOptions;
 
     const GROUP_PATH: &str = "com/example/external-lib/1.2.3";
@@ -845,6 +994,260 @@ mod tests {
     }
 
     #[test]
+    fn java_dependency_discovery_indexes_exact_maven_pom_coordinate() {
+        let Some(fixture) = ExternalJarFixture::new(true) else {
+            return;
+        };
+        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
+        app.write(
+            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
+        )
+        .unwrap();
+        ProjectFile::new(fixture.project_root().to_path_buf(), "pom.xml")
+            .write(
+                "<project><groupId>app</groupId><artifactId>app</artifactId><version>1</version><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>",
+            )
+            .unwrap();
+        let config = AnalyzerConfig {
+            java: JavaAnalyzerConfig {
+                external_dependencies: JavaExternalDependencies {
+                    repository_roots: vec![fixture.maven_repository_root()],
+                    ..JavaExternalDependencies::default()
+                },
+                ..JavaAnalyzerConfig::default()
+            },
+            ..AnalyzerConfig::default()
+        };
+        let analyzer = JavaAnalyzer::from_project_with_config(
+            TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
+            config,
+        );
+        assert!(analyzer.is_known_type_name_in_file(&app, "ExternalService"));
+    }
+
+    #[test]
+    fn java_dependency_discovery_indexes_only_locked_gradle_coordinate_directory() {
+        let Some(fixture) = ExternalJarFixture::new(true) else {
+            return;
+        };
+        let gradle_cache = fixture.root.join("gradle-cache");
+        let locked_dir = gradle_cache.join("com.example/external-lib/1.2.3/binary-hash");
+        let source_dir = gradle_cache.join("com.example/external-lib/1.2.3/source-hash");
+        let unrelated_dir = gradle_cache.join("unrelated/example/9.9.9/hash");
+        fs::create_dir_all(&locked_dir).unwrap();
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&unrelated_dir).unwrap();
+        fs::copy(fixture.binary_jar_path(), locked_dir.join(BINARY_JAR)).unwrap();
+        fs::copy(fixture.source_jar_path(), source_dir.join(SOURCE_JAR)).unwrap();
+        fs::copy(
+            fixture.binary_jar_path(),
+            unrelated_dir.join("example-9.9.9.jar"),
+        )
+        .unwrap();
+
+        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
+        app.write(
+            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
+        )
+        .unwrap();
+        ProjectFile::new(fixture.project_root().to_path_buf(), "gradle.lockfile")
+            .write("com.example:external-lib:1.2.3=compileClasspath\n")
+            .unwrap();
+        let config = AnalyzerConfig {
+            java: JavaAnalyzerConfig {
+                external_dependencies: JavaExternalDependencies {
+                    repository_roots: vec![fixture.root.join("empty-maven")],
+                    gradle_cache_roots: vec![gradle_cache],
+                    ..JavaExternalDependencies::default()
+                },
+                ..JavaAnalyzerConfig::default()
+            },
+            ..AnalyzerConfig::default()
+        };
+        let analyzer = JavaAnalyzer::from_project_with_config(
+            TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
+            config,
+        );
+        let resolution = analyzer
+            .resolve_type_name_with_external(&app, "ExternalService")
+            .unwrap();
+        let crate::analyzer::java::imports::JavaTypeResolution::External(external) = resolution
+        else {
+            panic!("dependency should resolve externally");
+        };
+        assert!(matches!(
+            external.source(),
+            JavaExternalDeclarationSource::SourceJar { .. }
+        ));
+    }
+
+    #[test]
+    fn java_dependency_discovery_skips_classifier_only_gradle_cache_entries() {
+        let Some(fixture) = ExternalJarFixture::new(false) else {
+            return;
+        };
+        let gradle_cache = fixture.root.join("gradle-cache");
+        let classifier_dir = gradle_cache.join("com.example/external-lib/1.2.3/classifier-hash");
+        fs::create_dir_all(&classifier_dir).unwrap();
+        fs::copy(
+            fixture.binary_jar_path(),
+            classifier_dir.join("external-lib-1.2.3-tests.jar"),
+        )
+        .unwrap();
+
+        let config = JavaExternalDependencies {
+            coordinates: vec![JavaMavenCoordinate::new(
+                "com.example",
+                "external-lib",
+                "1.2.3",
+            )],
+            gradle_cache_roots: vec![gradle_cache],
+            ..JavaExternalDependencies::default()
+        };
+        let index = JavaExternalDeclarationIndex::build(&config, fixture.project_root());
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn java_dependency_discovery_disabled_keeps_metadata_out_of_index() {
+        let Some(fixture) = ExternalJarFixture::new(false) else {
+            return;
+        };
+        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
+        app.write(
+            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
+        )
+        .unwrap();
+        ProjectFile::new(fixture.project_root().to_path_buf(), "pom.xml")
+            .write(
+                "<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>",
+            )
+            .unwrap();
+        let config = AnalyzerConfig {
+            java: JavaAnalyzerConfig {
+                external_dependencies: JavaExternalDependencies {
+                    repository_roots: vec![fixture.maven_repository_root()],
+                    ..JavaExternalDependencies::default()
+                },
+                dependency_discovery: crate::analyzer::JavaDependencyDiscoveryConfig {
+                    mode: crate::analyzer::JavaDependencyDiscoveryMode::Disabled,
+                    ..crate::analyzer::JavaDependencyDiscoveryConfig::default()
+                },
+            },
+            ..AnalyzerConfig::default()
+        };
+        let analyzer = JavaAnalyzer::from_project_with_config(
+            TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
+            config,
+        );
+        assert!(!analyzer.is_known_type_name_in_file(&app, "ExternalService"));
+    }
+
+    #[test]
+    fn java_dependency_discovery_invalidates_only_for_build_inputs() {
+        let Some(fixture) = ExternalJarFixture::new(false) else {
+            return;
+        };
+        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
+        app.write(
+            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
+        )
+        .unwrap();
+        let pom = ProjectFile::new(fixture.project_root().to_path_buf(), "pom.xml");
+        pom.write("<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId></dependency></dependencies></project>")
+            .unwrap();
+        let config = AnalyzerConfig {
+            java: JavaAnalyzerConfig {
+                external_dependencies: JavaExternalDependencies {
+                    repository_roots: vec![fixture.maven_repository_root()],
+                    ..JavaExternalDependencies::default()
+                },
+                ..JavaAnalyzerConfig::default()
+            },
+            ..AnalyzerConfig::default()
+        };
+        let analyzer = JavaAnalyzer::from_project_with_config(
+            TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
+            config,
+        );
+        assert!(!analyzer.is_known_type_name_in_file(&app, "ExternalService"));
+        let initial_index = analyzer.external_index.clone();
+
+        pom.write("<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>")
+            .unwrap();
+        let updated = analyzer.update(&BTreeSet::from([pom.clone()]));
+        assert!(!Arc::ptr_eq(&initial_index, &updated.external_index));
+        assert!(updated.is_known_type_name_in_file(&app, "ExternalService"));
+
+        app.write(
+            "package app; import com.example.dep.ExternalService; class App { ExternalService changed; }",
+        )
+        .unwrap();
+        let java_only = updated.update(&BTreeSet::from([app]));
+        assert!(Arc::ptr_eq(
+            &updated.external_index,
+            &java_only.external_index
+        ));
+        let refreshed = java_only.update_all();
+        assert!(!Arc::ptr_eq(
+            &java_only.external_index,
+            &refreshed.external_index
+        ));
+    }
+
+    #[test]
+    fn java_dependency_discovery_routes_manifest_changes_through_multi_analyzer() {
+        let Some(fixture) = ExternalJarFixture::new(false) else {
+            return;
+        };
+        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
+        app.write(
+            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
+        )
+        .unwrap();
+        ProjectFile::new(fixture.project_root().to_path_buf(), "tool.py")
+            .write("def tool():\n    pass\n")
+            .unwrap();
+        let pom = ProjectFile::new(fixture.project_root().to_path_buf(), "pom.xml");
+        pom.write("<project/>").unwrap();
+        let project = TestProject::with_languages(
+            fixture.project_root().to_path_buf(),
+            BTreeSet::from([Language::Java, Language::Python]),
+        );
+        let config = AnalyzerConfig {
+            java: JavaAnalyzerConfig {
+                external_dependencies: JavaExternalDependencies {
+                    repository_roots: vec![fixture.maven_repository_root()],
+                    ..JavaExternalDependencies::default()
+                },
+                ..JavaAnalyzerConfig::default()
+            },
+            ..AnalyzerConfig::default()
+        };
+        let multi = MultiAnalyzer::new(BTreeMap::from([
+            (
+                Language::Java,
+                AnalyzerDelegate::Java(JavaAnalyzer::from_project_with_config(
+                    project.clone(),
+                    config,
+                )),
+            ),
+            (
+                Language::Python,
+                AnalyzerDelegate::Python(PythonAnalyzer::from_project(project)),
+            ),
+        ]));
+        let java = resolve_analyzer::<JavaAnalyzer>(&multi).unwrap();
+        assert!(!java.is_known_type_name_in_file(&app, "ExternalService"));
+
+        pom.write("<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>")
+            .unwrap();
+        let updated = multi.update(&BTreeSet::from([pom]));
+        let java = resolve_analyzer::<JavaAnalyzer>(&updated).unwrap();
+        assert!(java.is_known_type_name_in_file(&app, "ExternalService"));
+    }
+
+    #[test]
     fn java_external_declaration_indexes_explicit_source_artifact_path() {
         let Some(fixture) = ExternalJarFixture::new(true) else {
             return;
@@ -964,6 +1367,7 @@ mod tests {
         let config = AnalyzerConfig {
             java: crate::analyzer::JavaAnalyzerConfig {
                 external_dependencies: fixture.coordinate_config(),
+                ..crate::analyzer::JavaAnalyzerConfig::default()
             },
             ..AnalyzerConfig::default()
         };
@@ -1168,6 +1572,14 @@ mod tests {
 
         fn source_jar_path(&self) -> PathBuf {
             self.root.join("m2").join(GROUP_PATH).join(SOURCE_JAR)
+        }
+
+        fn binary_jar_path(&self) -> PathBuf {
+            self.root.join("m2").join(GROUP_PATH).join(BINARY_JAR)
+        }
+
+        fn maven_repository_root(&self) -> PathBuf {
+            self.root.join("m2")
         }
 
         fn coordinate_config(&self) -> JavaExternalDependencies {

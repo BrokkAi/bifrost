@@ -42,7 +42,7 @@ import type { RqlQueryDocument, RqlQueryResponse, RqlQueryResultItem } from "./r
 import { queryResultRange, runRqlQuery } from "./rql_query";
 import { RqlQueryResultsProvider } from "./rql_results";
 import type { RuneIrRange, RuneIrResponse } from "./rune_ir";
-import { RUNE_IR_SOURCE_LANGUAGE_IDS, showRuneIr } from "./rune_ir";
+import { RUNE_IR_LANGUAGE_ID, RUNE_IR_SOURCE_LANGUAGE_IDS, showRuneIr } from "./rune_ir";
 import type { WireDiagnostic, WireHover } from "./rql_validation";
 import {
   RQL_QUERY_HOVER_METHOD,
@@ -350,7 +350,8 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
   const clientOptions: LanguageClientOptions = {
     documentSelector: [
       ...RUNE_IR_SOURCE_LANGUAGE_IDS.map((language) => ({ scheme: "file", language })),
-      { scheme: "file", language: RQL_LANGUAGE_ID }
+      { scheme: "file", language: RQL_LANGUAGE_ID },
+      { scheme: "file", language: RUNE_IR_LANGUAGE_ID }
     ],
     outputChannel,
     initializationOptions,

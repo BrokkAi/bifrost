@@ -177,7 +177,8 @@ fn same_blob_ts_and_tsx_are_separate_store_entries() {
                 parsed_events.fetch_add(1, Ordering::Relaxed);
             }
         },
-    );
+    )
+    .expect("persisted analyzer should build");
 
     assert_eq!(
         parsed.load(Ordering::Relaxed),

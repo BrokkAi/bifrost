@@ -71,7 +71,7 @@ impl CppAnalyzer {
         config: AnalyzerConfig,
         store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
-    ) -> Self {
+    ) -> Result<Self, crate::analyzer::store::StoreError> {
         let memo_budget = config.memo_cache_budget_bytes();
         let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             project,
@@ -79,8 +79,8 @@ impl CppAnalyzer {
             config,
             store_context,
             progress,
-        );
-        Self::from_inner(inner, memo_budget)
+        )?;
+        Ok(Self::from_inner(inner, memo_budget))
     }
 
     fn from_inner(inner: TreeSitterAnalyzer<CppAdapter>, memo_budget: u64) -> Self {
@@ -189,12 +189,12 @@ impl CppAnalyzer {
 }
 
 impl IAnalyzer for CppAnalyzer {
-    fn begin_query(&self) {
-        self.inner.begin_query();
+    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.begin_query(context);
     }
 
-    fn end_query(&self) {
-        self.inner.end_query();
+    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.end_query(context);
     }
 
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
