@@ -132,8 +132,8 @@ Codex to use generic subagents with the matching prompt. Do not edit
 node scripts/generate-codex-skill-bundle.mjs
 ```
 
-Hosts such as Zed and Antigravity can also load generic Agent Skills directly
-from filesystem roots such as `~/.agents/skills` and
+Hosts such as OpenCode, Zed, and Antigravity can also load generic Agent Skills
+directly from filesystem roots such as `~/.agents/skills` and
 `<worktree>/.agents/skills`. For those hosts, install Bifrost's generic skills
 with the Bifrost CLI instead of copying directories by hand:
 

@@ -8,7 +8,12 @@ description = "Fast, structured code search and analysis for Python, backed by a
 readme = "bifrost_searchtools/README.md"
 requires-python = ">=3.12"
 license = "LGPL-3.0-or-later"
-license-files = ["LICENSE.md"]
+license-files = [
+    "LICENSE.md",
+    "SOURCE.md",
+    "THIRD_PARTY_LICENSES.html",
+    "SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt",
+]
 authors = [{ name = "Brokk" }]
 keywords = [
     "code-analysis",

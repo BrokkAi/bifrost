@@ -7,8 +7,17 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/BrokkAi/bifrost/actions/workflows/ci.yml"><img src="https://github.com/BrokkAi/bifrost/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/BrokkAi/bifrost/releases/latest"><img src="https://img.shields.io/github/v/release/BrokkAi/bifrost" alt="Latest release"></a>
+  <a href="https://crates.io/crates/brokk-bifrost"><img src="https://img.shields.io/crates/v/brokk-bifrost" alt="crates.io"></a>
+  <a href="https://pypi.org/project/brokk-bifrost-searchtools/"><img src="https://img.shields.io/pypi/v/brokk-bifrost-searchtools" alt="PyPI"></a>
+  <a href="LICENSE.md"><img src="https://img.shields.io/github/license/BrokkAi/bifrost" alt="LGPL-3.0-or-later"></a>
+</p>
+
+<p align="center">
+  <a href="#run-your-first-query">Quickstart</a> ·
   <a href="https://brokkai.github.io/bifrost/">Documentation</a> ·
-  <a href="https://github.com/BrokkAi/bifrost">GitHub</a> ·
+  <a href="https://brokkai.github.io/bifrost/evaluate-bifrost/">Ten-minute evaluation</a> ·
   <a href="https://discord.gg/geYkWUeH">Discord</a>
 </p>
 
@@ -38,31 +47,78 @@ right interface for your workflow, and the [Language and Analysis
 Capabilities](https://brokkai.github.io/bifrost/capabilities/) matrix for
 language-by-language support, precision tiers, and current analysis boundaries.
 
-## License and Commercial Use
+## Run Your First Query
 
-Bifrost is licensed under `LGPL-3.0-or-later`. You may use it in research,
-internal systems, hosted services, and commercial products. The integration and
-distribution boundary determines what you need to share:
+Install the released CLI, clone the small verified evaluation fixture, and run
+its saved RQL query:
 
-- A separate application that invokes Bifrost through its CLI, MCP, or LSP
-  process can normally keep its own license. If you bundle the Bifrost artifact,
-  you still need to provide its notices, license texts, and corresponding source.
-- A proprietary application may link to Bifrost under the LGPL, but users must
-  be able to replace or relink the Bifrost portion and debug their modifications.
-- You may keep a private fork private. If you distribute a modified Bifrost
-  binary or fork, recipients must get the corresponding source and LGPL rights.
-- Running Bifrost only on your servers does not by itself trigger a network
-  source-release requirement; distributing an on-premise binary or container
-  does.
+```bash
+cargo install brokk-bifrost --locked
+git clone --depth 1 https://github.com/BrokkAi/bifrost.git
+cd bifrost/docs/fixtures/ten-minute-evaluation
+bifrost --root . --query-file queries/find-audit.rql
+```
 
-Read [License and Use Cases](https://brokkai.github.io/bifrost/license-use-cases/)
-for researcher, MCP server, code-agent, and RQL dashboard examples, practical
-distribution steps, and limitations. That guide is an orientation, not legal
-advice; the [license text](LICENSE.md) controls.
+The result identifies the normalized Python call and its exact source location:
+
+```json
+{
+  "isError": false,
+  "structuredContent": {
+    "results": [
+      {
+        "enclosing_symbol": "src.app.handle",
+        "end_line": 5,
+        "kind": "call",
+        "language": "python",
+        "path": "src/app.py",
+        "result_type": "structural_match",
+        "start_line": 5,
+        "text": "audit(value)"
+      }
+    ],
+    "truncated": false
+  }
+}
+```
+
+Continue with the [ten-minute
+evaluation](https://brokkai.github.io/bifrost/evaluate-bifrost/) to run the same
+query through the CLI, an MCP-connected coding agent, and VS Code.
+
+## See Bifrost in Action
+
+### Turn Source into a Query in VS Code
+
+<p align="center">
+  <a href="https://brokkai.github.io/bifrost/rune-ir/">
+    <img src="docs/src/assets/bifrost-vscode-query-playground.gif" alt="Selecting Python source in VS Code, inspecting its normalized Rune IR, using the generated starter RQL, and browsing the exact query result" width="900">
+  </a>
+</p>
+
+Select a source construct and run **Bifrost: Show Rune IR** to inspect its
+language-neutral `.rune` form and get a conservative starter RQL query. Run that
+query from the editor, browse typed results grouped by file, and jump to the
+exact source range. The extension also provides definitions, references, hover,
+rename, symbols, hierarchy, diagnostics, completion, and other LSP features.
+
+### Use the Same Analyzer from the CLI
+
+<p align="center">
+  <a href="https://brokkai.github.io/bifrost/cli/">
+    <img src="docs/src/assets/bifrost-cli-query.gif" alt="Running a saved RQL query with the Bifrost CLI and receiving an exact structured match" width="900">
+  </a>
+</p>
+
+Run saved RQL or JSON queries directly, or call the same named tools exposed over
+MCP for shell scripts and reproducible analysis workflows.
 
 ## Language Coverage
 
-Bifrost includes analyzers for C, C++, C#, Go, Java, JavaScript, PHP, Python, Ruby, Rust, Scala, and TypeScript.
+Bifrost includes analyzers for C, C++, C#, Go, Java, JavaScript, PHP, Python,
+Ruby, Rust, Scala, and TypeScript. See the [capability
+matrix](https://brokkai.github.io/bifrost/capabilities/) for the supported
+analysis and precision boundaries in each language.
 
 ## Documentation
 
@@ -71,17 +127,14 @@ The public documentation site lives in [`docs/`](docs/) and is published at
 
 Useful starting points:
 
-- [Overview](docs/src/content/docs/overview.md)
-- [License and use cases](docs/src/content/docs/license-use-cases.md)
+- [Choose the right Bifrost interface](docs/src/content/docs/choose-bifrost.md)
+- [Third-party notices](docs/src/content/docs/third-party-notices.md)
 - [Install Bifrost](docs/src/content/docs/install.md)
+- [Evaluate Bifrost in ten minutes](docs/src/content/docs/evaluate-bifrost.md)
 - [MCP server and toolsets](docs/src/content/docs/mcp.md)
 - [LSP server](docs/src/content/docs/lsp.md)
 - [CLI usage](docs/src/content/docs/cli.md)
 - [Code querying](docs/src/content/docs/code-querying.md)
-- [Rust library usage](docs/src/content/docs/rust-library.md)
-- [Python client usage](docs/src/content/docs/python-client.md)
-- [Semantic search](docs/src/content/docs/semantic-search.md)
-- [Citing Bifrost](docs/src/content/docs/cite-bifrost.md)
 
 Run the docs site locally with:
 
@@ -94,6 +147,16 @@ npm run dev
 GitHub Pages publication is handled by `.github/workflows/docs.yml`. Release tag
 builds publish both the latest docs site and a versioned snapshot under
 `versions/<tag>/`.
+
+## License and Commercial Use
+
+Bifrost is licensed under `LGPL-3.0-or-later` and may be used in research,
+internal systems, hosted services, and commercial products. The integration and
+distribution boundary determines your obligations. Read [License and Use
+Cases](https://brokkai.github.io/bifrost/license-use-cases/) for practical
+subprocess, linked-library, hosted-service, and redistribution examples. That
+guide is an orientation, not legal advice; the [license text](LICENSE.md)
+controls.
 
 ## Contributing
 

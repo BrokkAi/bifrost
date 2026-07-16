@@ -1,6 +1,6 @@
 use brokk_bifrost::reference_differential::{
-    ExactReferenceSite, ReferenceDifferentialConfig, ReferenceDifferentialReport,
-    run_reference_differential,
+    ExactReferenceSite, ReferenceDifferentialConfig, ReferenceDifferentialProgress,
+    ReferenceDifferentialReport, run_reference_differential_with_progress,
 };
 use brokk_bifrost::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
 use git2::{Repository, StatusOptions};
@@ -26,6 +26,7 @@ const DEFAULT_MAX_SITES: usize = 10_000;
 const DEFAULT_MAX_CANDIDATES_PER_FILE: usize = 50_000;
 const DEFAULT_MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_MAX_TARGETS: usize = 1_000;
+const DEFAULT_TARGET_PARALLELISM: usize = 8;
 const DEFAULT_MAX_USAGE_FILES: usize = 1_000;
 const DEFAULT_MAX_USAGES: usize = 100_000;
 
@@ -65,6 +66,7 @@ struct EngineOptions {
     max_candidates_per_file: usize,
     max_source_bytes: usize,
     max_targets: usize,
+    parallelism: usize,
     max_usage_files: usize,
     max_usages: usize,
     seed: u64,
@@ -81,6 +83,7 @@ impl Default for EngineOptions {
             max_candidates_per_file: DEFAULT_MAX_CANDIDATES_PER_FILE,
             max_source_bytes: DEFAULT_MAX_SOURCE_BYTES,
             max_targets: DEFAULT_MAX_TARGETS,
+            parallelism: DEFAULT_TARGET_PARALLELISM,
             max_usage_files: DEFAULT_MAX_USAGE_FILES,
             max_usages: DEFAULT_MAX_USAGES,
             seed: 0,
@@ -118,6 +121,7 @@ impl EngineOptions {
             max_candidates_per_file: self.max_candidates_per_file,
             max_source_bytes: self.max_source_bytes,
             max_targets: self.max_targets,
+            parallelism: self.parallelism,
             max_usage_files: self.max_usage_files,
             max_usages: self.max_usages,
             seed: self.seed,
@@ -289,6 +293,7 @@ fn parse_engine_option(
             options.max_source_bytes = take_positive_usize(args, index, option)?
         }
         "--max-targets" => options.max_targets = take_positive_usize(args, index, option)?,
+        "--jobs" => options.parallelism = take_positive_usize(args, index, option)?,
         "--max-usage-files" => options.max_usage_files = take_positive_usize(args, index, option)?,
         "--max-usages" => options.max_usages = take_positive_usize(args, index, option)?,
         "--seed" => {
@@ -556,6 +561,8 @@ fn run_engine(
     config: &ReferenceDifferentialConfig,
     cache_mode: CacheMode,
 ) -> Result<ReferenceDifferentialReport, String> {
+    let started = Instant::now();
+    eprintln!("progress phase=workspace status=started elapsed=0.0s");
     let project: Arc<dyn Project> = Arc::new(
         FilesystemProject::new(root.to_path_buf())
             .map_err(|err| format!("failed to open project: {err}"))?,
@@ -567,7 +574,49 @@ fn run_engine(
         }
         CacheMode::Ephemeral => WorkspaceAnalyzer::build(project, AnalyzerConfig::default()),
     };
-    run_reference_differential(workspace.analyzer(), config)
+    eprintln!(
+        "progress phase=workspace status=completed elapsed={:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+    run_reference_differential_with_progress(workspace.analyzer(), config, &|event| match event {
+        ReferenceDifferentialProgress::Inventory {
+            eligible_files,
+            audited_files,
+        } => eprintln!(
+            "progress phase=inventory eligible_files={eligible_files} audited_files={audited_files} elapsed={:.1}s",
+            started.elapsed().as_secs_f64()
+        ),
+        ReferenceDifferentialProgress::Sampling {
+            sampled_sites,
+            structured_candidates,
+        } => eprintln!(
+            "progress phase=sampling sampled_sites={sampled_sites} structured_candidates={structured_candidates} elapsed={:.1}s",
+            started.elapsed().as_secs_f64()
+        ),
+        ReferenceDifferentialProgress::ForwardResolution {
+            resolved_sites,
+            distinct_targets,
+        } => eprintln!(
+            "progress phase=forward resolved_sites={resolved_sites} distinct_targets={distinct_targets} elapsed={:.1}s",
+            started.elapsed().as_secs_f64()
+        ),
+        ReferenceDifferentialProgress::ForwardFile {
+            completed,
+            total,
+            path,
+        } => eprintln!(
+            "progress phase=forward completed={completed} total={total} file={path} elapsed={:.1}s",
+            started.elapsed().as_secs_f64()
+        ),
+        ReferenceDifferentialProgress::InverseTarget {
+            completed,
+            total,
+            target,
+        } => eprintln!(
+            "progress phase=inverse completed={completed} total={total} target={target} elapsed={:.1}s",
+            started.elapsed().as_secs_f64()
+        ),
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -1020,6 +1069,9 @@ fn print_common_options() {
     );
     println!(
         "  --max-targets N          Distinct inverse target groups (default: {DEFAULT_MAX_TARGETS})"
+    );
+    println!(
+        "  --jobs N                 Parallel forward-file and inverse-target queries (default: {DEFAULT_TARGET_PARALLELISM})"
     );
     println!(
         "  --max-usage-files N      Files per inverse target query (default: {DEFAULT_MAX_USAGE_FILES})"
