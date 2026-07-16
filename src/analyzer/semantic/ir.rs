@@ -2614,15 +2614,12 @@ fn validate_call_site(
     }
     let normal = call_site.normal_continuation.target();
     let exceptional = call_site.exceptional_continuation.target();
-    if normal == Some(call_site.point)
-        || exceptional == Some(call_site.point)
-        || normal.is_some_and(|normal| exceptional == Some(normal))
-    {
+    if normal == Some(call_site.point) || exceptional == Some(call_site.point) {
         return Err(SemanticIrError::procedure(
             id,
             SemanticIrErrorKind::CallContract,
             format!(
-                "call site {} point and available normal/exceptional continuations must be distinct",
+                "call site {} cannot continue at its own invocation point",
                 call_site.id
             ),
         ));
@@ -3155,17 +3152,11 @@ fn validate_events(
                     }
                     let normal = normal_resume.target();
                     let exceptional = exceptional_resume.target();
-                    if normal == Some(point.id)
-                        || exceptional == Some(point.id)
-                        || normal.is_some_and(|normal| exceptional == Some(normal))
-                    {
+                    if normal == Some(point.id) || exceptional == Some(point.id) {
                         return Err(SemanticIrError::procedure(
                             id,
                             SemanticIrErrorKind::AsyncContract,
-                            format!(
-                                "suspend point {} and its available resume points must be distinct",
-                                point.id
-                            ),
+                            format!("suspend point {} cannot resume at itself", point.id),
                         ));
                     }
                     if suspends
@@ -3382,11 +3373,11 @@ fn validate_callable_value(
         "callable target",
     )?;
     if creation {
-        if callable.targets.candidates().len() != 1 {
+        if callable.targets.candidates().len() > 1 {
             return Err(SemanticIrError::procedure(
                 id,
                 SemanticIrErrorKind::CallableContract,
-                "callable creation must identify exactly one nested executable body",
+                "callable creation cannot identify more than one nested executable body",
             ));
         }
         for target in callable.targets.candidates() {
@@ -4869,6 +4860,110 @@ mod tests {
     }
 
     #[test]
+    fn callable_creation_preserves_target_uncertainty_without_a_locator() {
+        let key = key();
+        let mut budget = SemanticBudget::uniform(1).unwrap();
+        budget
+            .charge(SemanticWork {
+                procedures: 1,
+                ..SemanticWork::default()
+            })
+            .unwrap();
+        let exceeded = budget
+            .charge(SemanticWork {
+                procedures: 1,
+                ..SemanticWork::default()
+            })
+            .unwrap_err();
+        let cases = [
+            (
+                CallableTargetResolution::Unknown,
+                SemanticGapKind::Unknown,
+                None,
+            ),
+            (
+                CallableTargetResolution::Unsupported,
+                SemanticGapKind::Unsupported,
+                None,
+            ),
+            (
+                CallableTargetResolution::ExceededBudget(Box::new([])),
+                SemanticGapKind::ExceededBudget,
+                Some(exceeded),
+            ),
+        ];
+
+        let mut capability_builder = SemanticCapabilities::builder();
+        for capability in [
+            SemanticCapability::Procedures,
+            SemanticCapability::EntryBoundary,
+            SemanticCapability::NormalExitBoundary,
+            SemanticCapability::ExceptionalExitBoundary,
+            SemanticCapability::BasicBlocks,
+            SemanticCapability::ProgramPoints,
+            SemanticCapability::NormalControlFlow,
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticCapability::Values,
+        ] {
+            capability_builder = capability_builder.complete(capability);
+        }
+        let semantic_capabilities = capability_builder
+            .partial(SemanticCapability::CallableReferences)
+            .build();
+
+        for (targets, gap_kind, budget) in cases {
+            let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+            let source = SourceMappingId::new(0);
+            let evidence = EvidenceId::new(0);
+            parts.values.push(SemanticValue {
+                id: ValueId::new(0),
+                kind: SemanticValueKind::Callable,
+                source,
+                evidence,
+            });
+            parts.gaps.push(SemanticGap {
+                id: SemanticGapId::new(0),
+                point: ProgramPointId::new(0),
+                subject: SemanticGapSubject::Value(ValueId::new(0)),
+                capability: SemanticCapability::CallableReferences,
+                kind: gap_kind,
+                budget,
+                detail: "nested body target is unavailable".into(),
+                source,
+                evidence,
+            });
+            let mut events = parts.points[0].events.to_vec();
+            events.extend([
+                SemanticEvent::new(
+                    SemanticEffect::CallableCreation {
+                        result: ValueId::new(0),
+                        callable: CallableValue {
+                            kind: CallableReferenceKind::Lambda,
+                            targets,
+                            target_evidence: evidence,
+                            bound_receiver: None,
+                            environment: None,
+                        },
+                    },
+                    source,
+                    evidence,
+                ),
+                SemanticEvent::new(
+                    SemanticEffect::Gap {
+                        gap: SemanticGapId::new(0),
+                    },
+                    source,
+                    evidence,
+                ),
+            ]);
+            parts.points[0].events = events.into_boxed_slice();
+
+            SemanticArtifact::try_new(key.clone(), semantic_capabilities.clone(), vec![parts])
+                .expect("a known creation event may retain typed target uncertainty");
+        }
+    }
+
+    #[test]
     fn budget_limited_same_artifact_target_remains_explicitly_unmaterialized() {
         let key = key();
         let omitted = procedure_locator(&key, "omitted", 7);
@@ -5374,6 +5469,52 @@ mod tests {
         .expect_err("proven declared targets cannot also carry an unknown gap");
         assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
 
+        let mut converged = parts.clone();
+        converged.call_sites[0].exceptional_continuation =
+            ControlContinuation::Target(ProgramPointId::new(1));
+        let exceptional_event = converged.points[2]
+            .events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::CallContinuation {
+                        kind: CallContinuationKind::Exceptional,
+                        ..
+                    }
+                )
+            })
+            .cloned()
+            .expect("fixture has an exceptional continuation event");
+        converged.points[2].events = converged.points[2]
+            .events
+            .iter()
+            .filter(|event| {
+                !matches!(
+                    event.effect,
+                    SemanticEffect::CallContinuation {
+                        kind: CallContinuationKind::Exceptional,
+                        ..
+                    }
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let mut joined_events = converged.points[1].events.to_vec();
+        joined_events.push(exceptional_event);
+        converged.points[1].events = joined_events.into_boxed_slice();
+        converged
+            .control_edges
+            .iter_mut()
+            .filter(|edge| {
+                edge.source_point == ProgramPointId::new(0)
+                    && edge.kind == ControlEdgeKind::Exceptional
+            })
+            .for_each(|edge| edge.target_point = ProgramPointId::new(1));
+        SemanticArtifact::try_new(key.clone(), semantic_capabilities.clone(), vec![converged])
+            .expect("normal and exceptional call arms may converge on one typed join point");
+
         let artifact = SemanticArtifact::try_new(key, semantic_capabilities, vec![parts])
             .expect("matched call continuations are valid");
 
@@ -5594,6 +5735,61 @@ mod tests {
         )
         .expect_err("an async-suspend point cannot carry an unrelated outgoing edge kind");
         assert_eq!(error.kind(), SemanticIrErrorKind::ControlFlowContract);
+
+        let mut converged = parts.clone();
+        let SemanticEffect::AsyncSuspend {
+            exceptional_resume, ..
+        } = &mut converged.points[0].events[1].effect
+        else {
+            panic!("fixture async suspend event moved");
+        };
+        *exceptional_resume = ControlContinuation::Target(ProgramPointId::new(1));
+        let exceptional_event = converged.points[2]
+            .events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::AsyncResume {
+                        kind: AsyncResumeKind::Exceptional,
+                        ..
+                    }
+                )
+            })
+            .cloned()
+            .expect("fixture has an exceptional resume event");
+        converged.points[2].events = converged.points[2]
+            .events
+            .iter()
+            .filter(|event| {
+                !matches!(
+                    event.effect,
+                    SemanticEffect::AsyncResume {
+                        kind: AsyncResumeKind::Exceptional,
+                        ..
+                    }
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let mut joined_events = converged.points[1].events.to_vec();
+        joined_events.push(exceptional_event);
+        converged.points[1].events = joined_events.into_boxed_slice();
+        converged
+            .control_edges
+            .iter_mut()
+            .filter(|edge| {
+                edge.source_point == ProgramPointId::new(0)
+                    && edge.kind == ControlEdgeKind::AsyncExceptional
+            })
+            .for_each(|edge| edge.target_point = ProgramPointId::new(1));
+        SemanticArtifact::try_new(
+            key.clone(),
+            capabilities(&[SemanticCapability::AsyncSuspendResume]),
+            vec![converged],
+        )
+        .expect("normal and exceptional async arms may converge on one typed join point");
 
         SemanticArtifact::try_new(
             key,

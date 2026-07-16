@@ -1,3 +1,4 @@
+pub(crate) mod bounded_output;
 mod capabilities;
 mod clone_detection;
 pub mod cognitive_complexity;

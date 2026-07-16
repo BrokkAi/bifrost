@@ -1,12 +1,5 @@
 //! Total per-language semantic capability discovery.
 
-macro_rules! count_capabilities {
-    ($($capability:ident),* $(,)?) => {
-        <[()]>::len(&[$(count_capabilities!(@unit $capability)),*])
-    };
-    (@unit $capability:ident) => { () };
-}
-
 /// Declare the capability enum, stable order, ordinal mapping, and labels once.
 ///
 /// The generated count also sizes the total support table, so adding a variant
@@ -21,7 +14,7 @@ macro_rules! semantic_capabilities {
         }
 
         impl SemanticCapability {
-            pub const COUNT: usize = count_capabilities!($($capability),+);
+            pub const COUNT: usize = count_idents!($($capability),+);
 
             pub const ALL: [Self; Self::COUNT] = [
                 $(Self::$capability),+

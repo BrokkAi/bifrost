@@ -9,13 +9,6 @@ use super::capabilities::{SemanticCapabilities, SemanticCapability};
 use super::ids::{SemanticArtifactKey, SemanticLanguage};
 use super::ir::{SemanticArtifact, SemanticIrError};
 
-macro_rules! count_budget_dimensions {
-    ($($dimension:ident),* $(,)?) => {
-        <[()]>::len(&[$(count_budget_dimensions!(@unit $dimension)),*])
-    };
-    (@unit $dimension:ident) => { () };
-}
-
 /// Declare every independently bounded semantic-materialization dimension once.
 ///
 /// The registry generates the public dimension enum and its stable order together
@@ -31,7 +24,7 @@ macro_rules! semantic_budget_dimensions {
         }
 
         impl SemanticBudgetDimension {
-            pub const ALL: [Self; count_budget_dimensions!($($dimension),+)] = [
+            pub const ALL: [Self; count_idents!($($dimension),+)] = [
                 $(Self::$dimension),+
             ];
 
