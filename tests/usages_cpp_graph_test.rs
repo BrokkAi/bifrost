@@ -596,6 +596,48 @@ fn assert_success_counts(
     );
 }
 
+fn authoritative_exact_ranges(
+    analyzer: &CppAnalyzer,
+    targets: &[CodeUnit],
+    candidate: &ProjectFile,
+) -> BTreeSet<(usize, usize)> {
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(candidate.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(analyzer, targets, Some(&provider), 1, 1000);
+    assert_eq!(
+        query.candidate_files,
+        std::iter::once(candidate.clone()).collect(),
+        "authoritative query must remain limited to the explicit consumer"
+    );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!("expected authoritative C++ success");
+    };
+    hits_by_overload
+        .values()
+        .flatten()
+        .map(|hit| {
+            assert_eq!(&hit.file, candidate);
+            (hit.start_offset, hit.end_offset)
+        })
+        .collect()
+}
+
+fn fixture_token_range(source: &str, labeled_line: &str, token: &str) -> (usize, usize) {
+    let line_start = source
+        .find(labeled_line)
+        .unwrap_or_else(|| panic!("missing fixture line {labeled_line:?}"));
+    let token_start = labeled_line
+        .find(token)
+        .unwrap_or_else(|| panic!("missing token {token:?} in fixture line {labeled_line:?}"));
+    let start = line_start + token_start;
+    (start, start + token.len())
+}
+
 #[test]
 fn usage_finder_routes_cpp_targets_through_graph_strategy() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
@@ -7467,6 +7509,947 @@ struct Params {
         exact_hits(&template_target),
         BTreeSet::from([(template_start, template_start + template_alias.len(),)]),
         "qualified template alias must hit the canonical template exactly and exclude java_ref"
+    );
+}
+
+#[test]
+fn authoritative_cpp_nested_out_of_line_owner_token_resolves_as_nested_class() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "owners.h",
+            r#"#pragma once
+namespace n {
+struct Outer {
+    void g();
+    struct Inner {
+        void f();
+    };
+};
+struct Wrong {
+    struct Inner { void f(); };
+};
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "owners.h"
+void n::Outer::Inner::f() {} // positive-definition
+void n::Wrong::Inner::f() {} // negative-wrong-owner
+void n::Outer::Missing::f() { g(); } // negative-missing-terminal-owner-body
+void consume(n::Outer::Inner* value) {} // positive-ordinary-type-control
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let inner_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "n.Outer$Inner"
+            && slash_path(unit.source()) == "owners.h"
+            && !unit.is_synthetic()
+    });
+    let outer_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "n.Outer"
+            && slash_path(unit.source()) == "owners.h"
+            && !unit.is_synthetic()
+    });
+    let g_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "n.Outer.g"
+            && slash_path(unit.source()) == "owners.h"
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let positive = fixture_token_range(
+        &source,
+        "void n::Outer::Inner::f() {} // positive-definition",
+        "Inner",
+    );
+    let line_start = source[..positive.0]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let line = source[..positive.0]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let column = source[line_start..positive.0].chars().count() + 1;
+    let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+        &analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "consumer.cc".to_string(),
+                line: Some(line),
+                column: Some(column),
+            }],
+        },
+    );
+    assert_eq!(forward.results[0].status, "resolved", "{forward:#?}");
+    assert!(
+        forward.results[0]
+            .definitions
+            .iter()
+            .any(|definition| definition.fqn.as_deref() == Some("n.Outer$Inner")),
+        "the nested owner token must forward-resolve as Inner: {forward:#?}"
+    );
+    let outer = fixture_token_range(
+        &source,
+        "void n::Outer::Inner::f() {} // positive-definition",
+        "Outer",
+    );
+    let outer_column = source[line_start..outer.0].chars().count() + 1;
+    let outer_forward = brokk_bifrost::searchtools::get_definitions_by_location(
+        &analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "consumer.cc".to_string(),
+                line: Some(line),
+                column: Some(outer_column),
+            }],
+        },
+    );
+    assert_eq!(
+        outer_forward.results[0].status, "resolved",
+        "{outer_forward:#?}"
+    );
+    assert!(
+        outer_forward.results[0]
+            .definitions
+            .iter()
+            .any(|definition| definition.fqn.as_deref() == Some("n.Outer")),
+        "the outer owner token must forward-resolve as Outer: {outer_forward:#?}"
+    );
+
+    let ordinary_control = fixture_token_range(
+        &source,
+        "void consume(n::Outer::Inner* value) {} // positive-ordinary-type-control",
+        "n::Outer::Inner",
+    );
+    let wrong_owner = fixture_token_range(
+        &source,
+        "void n::Wrong::Inner::f() {} // negative-wrong-owner",
+        "Inner",
+    );
+    let hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&inner_target), &consumer);
+    let outer_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&outer_target), &consumer);
+    let g_hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&g_target), &consumer);
+    let covers =
+        |range: (usize, usize)| hits.iter().any(|hit| hit.0 <= range.0 && range.1 <= hit.1);
+    let expected = [positive, ordinary_control];
+    let no_extra_hits = hits.iter().all(|hit| {
+        expected
+            .iter()
+            .any(|range| hit.0 <= range.0 && range.1 <= hit.1)
+    });
+    assert!(
+        expected.iter().copied().all(covers) && no_extra_hits && !covers(wrong_owner),
+        "nested owner and ordinary type must be the only span-tolerant exact hits; actual={hits:#?}, expected={expected:#?}, wrong_owner={wrong_owner:?}"
+    );
+    let malformed_outer = fixture_token_range(
+        &source,
+        "void n::Outer::Missing::f() { g(); } // negative-missing-terminal-owner-body",
+        "Outer",
+    );
+    let ordinary_outer = fixture_token_range(
+        &source,
+        "void consume(n::Outer::Inner* value) {} // positive-ordinary-type-control",
+        "Outer",
+    );
+    assert_eq!(
+        outer_hits,
+        BTreeSet::from([outer, malformed_outer, ordinary_outer]),
+        "each structurally resolved outer owner qualifier must be emitted as an exact inverse reference"
+    );
+    assert!(
+        g_hits.is_empty(),
+        "a missing terminal owner must not attribute its function body to the last resolved prefix: {g_hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_method_return_receiver_chain_resolves_terminal_method() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "receiver.h",
+            r#"#pragma once
+namespace demo {
+struct T {
+    void m();
+    T* get();
+};
+struct Other { void m(); };
+struct AmbiguousFactory {
+    T* get(int value = 0);
+    Other* get(double value = 0);
+};
+void run();
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "receiver.h"
+namespace demo {
+void T::m() {}
+demo::T* T::get() { return this; }
+void run() {
+    T local;
+    T* p = &local;
+    p->m(); // positive-pointer
+    p->get()->m(); // positive-pointer-return-chain
+    Other wrong;
+    wrong.m(); // negative-wrong-owner
+    AmbiguousFactory factory;
+    factory.get()->m(); // negative-ambiguous-return-owner
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.T.m"
+            && slash_path(unit.source()) == "consumer.cc"
+            && !unit.is_synthetic()
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let terminal = |line: &str, expression_through_m: &str| {
+        let expression = fixture_token_range(&source, line, expression_through_m);
+        (expression.1 - "m".len(), expression.1)
+    };
+    let expected = BTreeSet::from([
+        terminal("    p->m(); // positive-pointer", "p->m"),
+        terminal(
+            "    p->get()->m(); // positive-pointer-return-chain",
+            "p->get()->m",
+        ),
+    ]);
+    let wrong = terminal("    wrong.m(); // negative-wrong-owner", "wrong.m");
+    let hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &consumer);
+    assert_eq!(
+        hits, expected,
+        "direct pointer control and method-return receiver chain must be the only exact hits; wrong_owner={wrong:?}"
+    );
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let ambiguous = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+    let FuzzyResult::Success {
+        unproven_total_by_overload,
+        ..
+    } = ambiguous
+    else {
+        panic!("expected ambiguous receiver return to remain a successful conservative scan");
+    };
+    assert_eq!(
+        unproven_total_by_overload
+            .get(&target)
+            .copied()
+            .unwrap_or_default(),
+        1,
+        "the conflicting same-arity return owners must retain the terminal m as unproven"
+    );
+}
+
+#[test]
+fn authoritative_cpp_ambiguous_same_spelling_return_owner_fails_closed() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "receiver.h",
+            r#"#pragma once
+namespace left { struct Result { void m(); }; }
+namespace right { struct Result { void m(); }; }
+namespace api { struct Factory { Result* get(); }; }
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "receiver.h"
+void run(api::Factory& factory) {
+    factory.get()->m();
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.fq_name() == "left.Result.m"
+    });
+    let consumer = project.file("consumer.cc");
+    assert!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &consumer).is_empty(),
+        "an ambiguous unqualified persisted return type must not choose the first same-spelling owner"
+    );
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+    let FuzzyResult::Success {
+        unproven_total_by_overload,
+        ..
+    } = result
+    else {
+        panic!("expected conservative same-spelling return-owner scan");
+    };
+    assert_eq!(
+        unproven_total_by_overload
+            .get(&target)
+            .copied()
+            .unwrap_or_default(),
+        1,
+        "the ambiguous same-spelling return owner must retain the terminal call as unproven"
+    );
+}
+
+#[test]
+fn authoritative_cpp_macro_decorated_return_metadata_fails_closed() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "receiver.h",
+            r#"#pragma once
+#define API_EXPORT
+namespace demo {
+struct T { void m(); };
+struct Factory { API_EXPORT T* get(); };
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "receiver.h"
+void run(demo::Factory& factory) {
+    factory.get()->m();
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.fq_name() == "demo.T.m"
+    });
+    let consumer = project.file("consumer.cc");
+    assert!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &consumer).is_empty(),
+        "macro decoration must not resurrect an untrusted persisted return type"
+    );
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+    let FuzzyResult::Success {
+        unproven_total_by_overload,
+        ..
+    } = result
+    else {
+        panic!("expected conservative macro-return scan");
+    };
+    assert_eq!(
+        unproven_total_by_overload
+            .get(&target)
+            .copied()
+            .unwrap_or_default(),
+        1,
+        "the terminal call must remain unproven when structured return metadata is absent"
+    );
+}
+
+#[test]
+fn authoritative_cpp_structured_owner_context_covers_inherited_calls_and_fields() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "consumer.cc",
+            r#"namespace demo {
+void inherited();
+int field;
+struct Base {
+    void inherited();
+    int field;
+};
+struct OtherBase {
+    void inherited();
+    int field;
+};
+struct Derived : Base {
+    void inline_body() {
+        inherited(); // positive-inline-inherited-call
+        field = 1; // positive-inline-inherited-field
+    }
+    void out_of_line();
+    void shadowed(void (*inherited)(), int field) {
+        inherited(); // negative-parameter-shadow-call
+        field = 2; // negative-parameter-shadow-field
+    }
+};
+void Derived::out_of_line() {
+    inherited(); // positive-out-of-line-inherited-call
+    field = 3; // positive-out-of-line-inherited-field
+}
+void free_body() {
+    inherited(); // negative-namespace-free-call
+    field = 4; // negative-namespace-free-field
+}
+struct Wrong : OtherBase {
+    void body() {
+        inherited(); // negative-wrong-owner-call
+        field = 5; // negative-wrong-owner-field
+    }
+};
+struct Override : Base {
+    void inherited();
+    int field;
+    void body() {
+        inherited(); // negative-override-call
+        field = 6; // negative-override-field
+    }
+};
+struct Multiple : Base, OtherBase {
+    void body() {
+        inherited(); // negative-multiple-inheritance-call
+        field = 7; // negative-multiple-inheritance-field
+    }
+};
+struct LeftDiamond : Base {};
+struct RightDiamond : Base {};
+struct Diamond : LeftDiamond, RightDiamond {
+    void body() {
+        inherited(); // negative-nonvirtual-diamond-call
+    }
+};
+struct DeepBranch : Base {};
+struct NearBranch : OtherBase {};
+struct DepthSkew : DeepBranch, NearBranch {
+    void body() {
+        inherited(); // negative-depth-skew-call
+    }
+};
+struct Composite : DeepBranch, NearBranch {};
+struct NestedDepthSkew : Composite {
+    void body() {
+        inherited(); // negative-nested-depth-skew-call
+    }
+};
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let method = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.fq_name() == "demo.Base.inherited"
+    });
+    let field = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field && unit.fq_name() == "demo.Base.field"
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let method_expected = BTreeSet::from([
+        fixture_token_range(
+            &source,
+            "        inherited(); // positive-inline-inherited-call",
+            "inherited",
+        ),
+        fixture_token_range(
+            &source,
+            "    inherited(); // positive-out-of-line-inherited-call",
+            "inherited",
+        ),
+    ]);
+    let field_expected = BTreeSet::from([
+        fixture_token_range(
+            &source,
+            "        field = 1; // positive-inline-inherited-field",
+            "field",
+        ),
+        fixture_token_range(
+            &source,
+            "    field = 3; // positive-out-of-line-inherited-field",
+            "field",
+        ),
+    ]);
+    let method_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&method), &consumer);
+    let field_hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&field), &consumer);
+
+    assert!(
+        method_hits == method_expected && field_hits == field_expected,
+        "method and field scanning must share the same structured owner context; method actual={method_hits:#?}, expected={method_expected:#?}; field actual={field_hits:#?}, expected={field_expected:#?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_using_enum_is_lexical_source_ordered_and_shadow_aware() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "consumer.cc",
+            r#"namespace demo {
+enum class Color { Red, Blue };
+enum class Other { Red, Blue };
+enum struct Shade { Dark };
+int Red = 0; // block using-enum imports below must outrank this namespace value
+int qualified = Color::Red; // positive-qualified-control
+void source_order() {
+    int before = Red; // negative-before-using-enum
+    using enum Color;
+    int after = Red; // positive-after-using-enum
+}
+void nested_scope() {
+    {
+        using enum Color;
+        int inside = Blue; // positive-inside-using-enum
+    }
+    int outside = Blue; // negative-outside-using-enum
+}
+void shadowed() {
+    using enum Color;
+    int Red = 0;
+    int value = Red; // negative-local-shadow
+}
+void wrong_enum() {
+    using enum Other;
+    int value = Red; // negative-wrong-enum
+}
+void ambiguous_enum() {
+    using enum Color;
+    using enum Other;
+    int value = Red; // negative-ambiguous-enum
+}
+void enum_struct_control() {
+    int before = Dark; // negative-enum-struct-before-import
+    using enum Shade;
+    int value = Dark; // positive-enum-struct-import
+}
+int enum_struct_outside = Dark; // negative-enum-struct-outside-import
+struct ClassShadow {
+    using enum Color;
+    using enum Other;
+    int Red;
+    int read() { return Red; } // negative-class-member-shadow
+};
+namespace nested {
+using enum demo::Color;
+using enum demo::Other;
+int Red = 0;
+int read() { return Red; } // negative-namespace-value-shadow
+}
+struct CompleteClass {
+    int early() { return Blue; } // positive-complete-class-late-import
+    using enum Color;
+    int out();
+};
+struct BaseShadow { int Red; };
+struct DerivedImport : BaseShadow {
+    using enum Color;
+    int read() { return Red; } // positive-derived-import-beats-inherited-member
+};
+struct DirectBlockImport {
+    int Red;
+    int read() {
+        using enum Color;
+        return Red; // positive-block-import-beats-direct-member
+    }
+};
+struct InheritedBlockImport : BaseShadow {
+    int read() {
+        using enum Color;
+        return Red; // positive-block-import-beats-inherited-member
+    }
+};
+namespace inherited_namespace {
+using enum demo::Color;
+struct Base { int Red; };
+struct Derived : Base {
+    int read() { return Red; } // negative-namespace-import-loses-to-inherited-member
+};
+}
+struct {
+    using enum Color;
+    int read() { return Red; } // negative-unsupported-anonymous-class-import
+} anonymous_holder;
+int after_anonymous = Red; // negative-anonymous-class-import-must-not-leak
+int CompleteClass::out() { return Red; } // positive-out-of-line-class-import
+namespace reopened { using enum demo::Color; }
+namespace reopened {
+int value = Red; // positive-reopened-namespace-import
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let red = field_definition_with_owner(&analyzer, "Color", "Red");
+    let blue = field_definition_with_owner(&analyzer, "Color", "Blue");
+    let dark = field_definition_with_owner(&analyzer, "Shade", "Dark");
+    let color = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "demo.Color"
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let red_hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&red), &consumer);
+    let blue_hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&blue), &consumer);
+    let color_hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&color), &consumer);
+    let dark_hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&dark), &consumer);
+    let covers = |hits: &BTreeSet<(usize, usize)>, range: (usize, usize)| {
+        hits.iter().any(|hit| hit.0 <= range.0 && range.1 <= hit.1)
+    };
+    let qualified = fixture_token_range(
+        &source,
+        "int qualified = Color::Red; // positive-qualified-control",
+        "Red",
+    );
+    let after = fixture_token_range(
+        &source,
+        "    int after = Red; // positive-after-using-enum",
+        "Red",
+    );
+    let before = fixture_token_range(
+        &source,
+        "    int before = Red; // negative-before-using-enum",
+        "Red",
+    );
+    let inside = fixture_token_range(
+        &source,
+        "        int inside = Blue; // positive-inside-using-enum",
+        "Blue",
+    );
+    let outside = fixture_token_range(
+        &source,
+        "    int outside = Blue; // negative-outside-using-enum",
+        "Blue",
+    );
+    let shadow = fixture_token_range(
+        &source,
+        "    int value = Red; // negative-local-shadow",
+        "Red",
+    );
+    let wrong = fixture_token_range(
+        &source,
+        "    int value = Red; // negative-wrong-enum",
+        "Red",
+    );
+    let imported_owner = fixture_token_range(&source, "    using enum Color;", "Color");
+    let ambiguous = fixture_token_range(
+        &source,
+        "    int value = Red; // negative-ambiguous-enum",
+        "Red",
+    );
+    let class_shadow = fixture_token_range(
+        &source,
+        "    int read() { return Red; } // negative-class-member-shadow",
+        "Red",
+    );
+    let namespace_shadow = fixture_token_range(
+        &source,
+        "int read() { return Red; } // negative-namespace-value-shadow",
+        "Red",
+    );
+    let complete_class = fixture_token_range(
+        &source,
+        "    int early() { return Blue; } // positive-complete-class-late-import",
+        "Blue",
+    );
+    let out_of_line_class = fixture_token_range(
+        &source,
+        "int CompleteClass::out() { return Red; } // positive-out-of-line-class-import",
+        "Red",
+    );
+    let reopened_namespace = fixture_token_range(
+        &source,
+        "int value = Red; // positive-reopened-namespace-import",
+        "Red",
+    );
+    let derived_import = fixture_token_range(
+        &source,
+        "    int read() { return Red; } // positive-derived-import-beats-inherited-member",
+        "Red",
+    );
+    let direct_block_import = fixture_token_range(
+        &source,
+        "        return Red; // positive-block-import-beats-direct-member",
+        "Red",
+    );
+    let inherited_block_import = fixture_token_range(
+        &source,
+        "        return Red; // positive-block-import-beats-inherited-member",
+        "Red",
+    );
+    let enum_struct = fixture_token_range(
+        &source,
+        "    int value = Dark; // positive-enum-struct-import",
+        "Dark",
+    );
+    let enum_struct_before = fixture_token_range(
+        &source,
+        "    int before = Dark; // negative-enum-struct-before-import",
+        "Dark",
+    );
+    let enum_struct_outside = fixture_token_range(
+        &source,
+        "int enum_struct_outside = Dark; // negative-enum-struct-outside-import",
+        "Dark",
+    );
+    let inherited_namespace_shadow = fixture_token_range(
+        &source,
+        "    int read() { return Red; } // negative-namespace-import-loses-to-inherited-member",
+        "Red",
+    );
+    let anonymous_class = fixture_token_range(
+        &source,
+        "    int read() { return Red; } // negative-unsupported-anonymous-class-import",
+        "Red",
+    );
+    let anonymous_leak = fixture_token_range(
+        &source,
+        "int after_anonymous = Red; // negative-anonymous-class-import-must-not-leak",
+        "Red",
+    );
+
+    let positives_hold = covers(&red_hits, qualified)
+        && covers(&red_hits, after)
+        && covers(&red_hits, out_of_line_class)
+        && covers(&red_hits, reopened_namespace)
+        && covers(&red_hits, derived_import)
+        && covers(&red_hits, direct_block_import)
+        && covers(&red_hits, inherited_block_import)
+        && covers(&blue_hits, inside)
+        && covers(&blue_hits, complete_class)
+        && covers(&dark_hits, enum_struct);
+    let negatives_hold = !covers(&red_hits, before)
+        && !covers(&red_hits, shadow)
+        && !covers(&red_hits, wrong)
+        && !covers(&red_hits, ambiguous)
+        && !covers(&red_hits, class_shadow)
+        && !covers(&red_hits, namespace_shadow)
+        && !covers(&red_hits, inherited_namespace_shadow)
+        && !covers(&red_hits, anonymous_class)
+        && !covers(&red_hits, anonymous_leak)
+        && !covers(&dark_hits, enum_struct_before)
+        && !covers(&dark_hits, enum_struct_outside)
+        && !covers(&blue_hits, outside);
+    let red_expected = [
+        qualified,
+        after,
+        out_of_line_class,
+        reopened_namespace,
+        derived_import,
+        direct_block_import,
+        inherited_block_import,
+    ];
+    let red_has_no_extras = red_hits.iter().all(|hit| {
+        red_expected
+            .iter()
+            .any(|range| hit.0 <= range.0 && range.1 <= hit.1)
+    });
+    let blue_expected = [inside, complete_class];
+    let blue_has_no_extras = blue_hits.iter().all(|hit| {
+        blue_expected
+            .iter()
+            .any(|range| hit.0 <= range.0 && range.1 <= hit.1)
+    });
+    let dark_has_no_extras = dark_hits
+        .iter()
+        .all(|hit| hit.0 <= enum_struct.0 && enum_struct.1 <= hit.1);
+    assert!(
+        positives_hold
+            && negatives_hold
+            && red_has_no_extras
+            && blue_has_no_extras
+            && dark_has_no_extras,
+        "using enum must be lexical, source ordered, shadow aware, and ambiguity safe; Red actual={red_hits:#?}, expected qualified={qualified:?} plus after={after:?}; Blue actual={blue_hits:#?}, expected inside={inside:?}; negative ranges before={before:?}, shadow={shadow:?}, wrong={wrong:?}, ambiguous={ambiguous:?}, class={class_shadow:?}, namespace={namespace_shadow:?}, outside={outside:?}"
+    );
+    assert!(
+        covers(&color_hits, imported_owner),
+        "the structured using-enum declaration must also retain its enum-owner type reference; actual={color_hits:#?}, expected owner token={imported_owner:?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_using_enum_ambiguity_is_unproven_unless_a_closer_name_shadows_it() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "enums.h",
+            r#"#pragma once
+namespace demo {
+enum class Color { Red };
+enum class Other { Red };
+}
+"#,
+        )
+        .file(
+            "ambiguous.cc",
+            r#"#include "enums.h"
+namespace demo {
+void read() {
+    using enum Color;
+    using enum Other;
+    int value = Red;
+}
+}
+"#,
+        )
+        .file(
+            "shadowed.cc",
+            r#"#include "enums.h"
+namespace demo {
+struct Holder {
+    using enum Color;
+    using enum Other;
+    int Red;
+    int read() { return Red; }
+};
+namespace nested {
+using enum demo::Color;
+using enum demo::Other;
+int Red = 0;
+int read() { return Red; }
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = field_definition_with_owner(&analyzer, "Color", "Red");
+    let unproven_total = |file: ProjectFile| {
+        let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(file).collect()));
+        let result = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1,
+                1000,
+            )
+            .result;
+        let FuzzyResult::Success {
+            unproven_total_by_overload,
+            ..
+        } = result
+        else {
+            panic!("expected conservative using-enum ambiguity scan");
+        };
+        unproven_total_by_overload
+            .get(&target)
+            .copied()
+            .unwrap_or_default()
+    };
+    assert_eq!(unproven_total(project.file("ambiguous.cc")), 1);
+    assert_eq!(
+        unproven_total(project.file("shadowed.cc")),
+        0,
+        "closer class and namespace declarations must suppress lower-tier import ambiguity"
+    );
+}
+
+#[test]
+fn authoritative_cpp_cross_file_class_using_enum_stays_unproven_over_lower_tiers() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"#pragma once
+namespace demo {
+enum class Color { Red };
+enum class Other { Red };
+struct Base { int Red; };
+struct Derived : Base {
+    using enum Color;
+    int read();
+};
+struct MissingDerived : Base {
+    using enum Color;
+    int read();
+};
+struct ImportedBase { using enum Color; };
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "types.h"
+namespace demo {
+using enum Other;
+int Derived::read() { return Red; }
+struct LocalDerived : ImportedBase {
+    int read() { return Red; }
+};
+}
+"#,
+        )
+        .file(
+            "missing.cc",
+            r#"#include "types.h"
+namespace demo {
+int MissingDerived::read() { return Red; }
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = field_definition_with_owner(&analyzer, "Color", "Red");
+    let unproven_total = |file: ProjectFile| {
+        assert!(
+            authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &file).is_empty(),
+            "unseen class-tier import evidence must not be replaced by namespace or inherited lookup"
+        );
+        let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(file).collect()));
+        let result = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1,
+                1000,
+            )
+            .result;
+        let FuzzyResult::Success {
+            unproven_total_by_overload,
+            ..
+        } = result
+        else {
+            panic!("expected conservative cross-file class using-enum scan");
+        };
+        unproven_total_by_overload
+            .get(&target)
+            .copied()
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        unproven_total(project.file("consumer.cc")),
+        2,
+        "OOL and inherited external class imports must remain unproven when class evidence is cross-file"
+    );
+    assert_eq!(
+        unproven_total(project.file("missing.cc")),
+        1,
+        "Active Missing must remain unproven over an inherited same-name field"
     );
 }
 

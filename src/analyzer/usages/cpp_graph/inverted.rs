@@ -14,24 +14,26 @@
 //!   and gives `Owner.m`;
 //! - `X::m(..)` (`qualified_identifier`) resolves `X` and gives `Owner.m`;
 //! - a bare `m(..)` is a free function (`Namespace.m`); `this->m(..)` and other
-//!   unqualified member calls attribute to the enclosing class.
+//!   unqualified member calls attribute to the enclosing class;
+//! - a chained receiver (`p->get()->m()`) follows the uniquely resolved persisted
+//!   callable return type before recording `Owner.m`.
 //!
 //! The enclosing class is taken from a per-file class-range index (the analyzer's
 //! own fqns), so `this->`/unqualified calls attribute to the right class without
-//! re-deriving the namespace. A receiver that can't be typed (method chains,
-//! return-type inference) is a recall gap, never a wrong edge — mirroring the
-//! receiver shapes the forward C++ scan proves.
+//! re-deriving the namespace. Ambiguous receiver or return identities fail closed.
 
 use super::extractor::{
     LexicalScopeResolution, enclosing_lexical_scope_components, resolve_type_node_lexically,
+    resolve_using_enum_declaration_owner, using_enum_declaration_type_node,
 };
 use super::resolver::{
-    DesignatedInitializerOwner, LexicalCallableValueResolution, LexicalTypeResolution, TargetKind,
-    VisibilityIndex, VisibleMemberResolution, constructor_style_local_declaration,
-    designated_initializer_owner, extract_variable_name, first_type_child,
+    DesignatedInitializerOwner, EnclosingMemberOwnerResolution, LexicalCallableValueResolution,
+    LexicalTypeResolution, TargetKind, VisibilityIndex, VisibleMemberResolution,
+    constructor_style_local_declaration, declarator_name_node, designated_initializer_owner,
+    extract_variable_name, first_type_child, infer_cpp_initializer_binding,
     infer_cpp_initializer_type, is_declaration_name, is_declarator_node, is_nested_type_node,
     normalize_type_text, out_of_line_member_definition_owner, recovered_macro_function_return_type,
-    type_owner_of,
+    resolve_enclosing_member_owner, same_visible_symbol, type_owner_of,
 };
 use super::syntax::explicit_qualified_callable_value;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
@@ -41,7 +43,7 @@ use crate::analyzer::usages::inverted_edges::{
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, cpp_node_text as node_text};
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
 /// Build the whole C++ `caller -> callee` edge set in a single inverted pass over
@@ -66,6 +68,7 @@ where
                 file,
                 source: parsed.source.as_str(),
                 class_ranges: ClassRangeIndex::build(analyzer, file),
+                enclosing_member_cache: HashMap::default(),
                 collector,
             };
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -80,6 +83,7 @@ struct CppScan<'a, 'b> {
     file: &'a ProjectFile,
     source: &'a str,
     class_ranges: ClassRangeIndex,
+    enclosing_member_cache: HashMap<CodeUnit, HashMap<String, EnclosingMemberOwnerResolution>>,
     collector: &'a mut EdgeCollector<'b>,
 }
 
@@ -153,6 +157,24 @@ fn record_reference(
     ctx: &mut CppScan<'_, '_>,
     bindings: &LocalInferenceEngine<CodeUnit>,
 ) {
+    if node.kind() == "using_declaration" {
+        let Some(type_node) = using_enum_declaration_type_node(node) else {
+            return;
+        };
+        match resolve_using_enum_declaration_owner(
+            node,
+            ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            ctx.source,
+        ) {
+            LexicalTypeResolution::Resolved { unit, .. } => ctx.record(unit.fq_name(), type_node),
+            LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => {
+                ctx.record_unproven(node_text(type_node, ctx.source), type_node);
+            }
+        }
+        return;
+    }
     if let Some(value) = explicit_qualified_callable_value(node) {
         record_qualified_callable_value(
             value.qualified,
@@ -192,10 +214,16 @@ fn record_reference(
         // is itself one of these nodes), so there is no separate construction case.
         "type_identifier" | "qualified_identifier" | "scoped_type_identifier" | "template_type" => {
             if is_declaration_name(node) {
-                if let Some((scope, owner)) =
-                    out_of_line_member_definition_owner(ctx.visibility, ctx.file, ctx.source, node)
-                {
-                    ctx.record(owner.fq_name(), scope);
+                if let Some(owners) = out_of_line_member_definition_owner(
+                    ctx.analyzer,
+                    ctx.visibility,
+                    ctx.file,
+                    ctx.source,
+                    node,
+                ) {
+                    for (owner_node, owner) in owners.owners {
+                        ctx.record(owner.fq_name(), owner_node);
+                    }
                 }
                 return;
             }
@@ -340,6 +368,39 @@ fn record_call(
             if name.is_empty() {
                 return;
             }
+            if bindings.is_shadowed(name) {
+                return;
+            }
+            if let Some(enclosing_owner) = enclosing_callable_owner(function, ctx) {
+                match resolve_enclosing_member_owner_cached(ctx, &enclosing_owner, name) {
+                    EnclosingMemberOwnerResolution::Owner(owner)
+                        if !same_visible_symbol(&owner, &enclosing_owner) =>
+                    {
+                        match ctx
+                            .visibility
+                            .visible_member_for_owner_name(ctx.file, &owner, name)
+                        {
+                            VisibleMemberResolution::Callable(callables) => {
+                                if let Some(callable) = callables.first() {
+                                    ctx.record(callable.fq_name(), function);
+                                }
+                            }
+                            VisibleMemberResolution::AmbiguousKind => {
+                                ctx.record_unproven(name, function);
+                            }
+                            VisibleMemberResolution::NonCallable
+                            | VisibleMemberResolution::Missing => {}
+                        }
+                        return;
+                    }
+                    EnclosingMemberOwnerResolution::Owner(_) => return,
+                    EnclosingMemberOwnerResolution::Ambiguous => {
+                        ctx.record_unproven(name, function);
+                        return;
+                    }
+                    EnclosingMemberOwnerResolution::Missing => {}
+                }
+            }
             // Free function in the visible set.
             if let Some(unit) =
                 ctx.visibility
@@ -350,11 +411,65 @@ fn record_call(
                 }
                 ctx.record(unit.fq_name(), function);
             }
-            // Otherwise this is an unqualified member call (`this`/inherited).
-            // That belongs to editor references, not the usage_graph edge surface.
+            // Direct/self member calls are intentionally omitted above; unique inherited
+            // callable owners are recorded, while an unresolved bare name adds no edge.
         }
         _ => {}
     }
+}
+
+fn resolve_enclosing_member_owner_cached(
+    ctx: &mut CppScan<'_, '_>,
+    enclosing_owner: &CodeUnit,
+    name: &str,
+) -> EnclosingMemberOwnerResolution {
+    if let Some(cached) = ctx
+        .enclosing_member_cache
+        .get(enclosing_owner)
+        .and_then(|by_name| by_name.get(name))
+        .cloned()
+    {
+        return cached;
+    }
+    let resolution = resolve_enclosing_member_owner(
+        ctx.analyzer,
+        ctx.visibility,
+        ctx.file,
+        enclosing_owner,
+        name,
+    );
+    ctx.enclosing_member_cache
+        .entry(enclosing_owner.clone())
+        .or_default()
+        .insert(name.to_string(), resolution.clone());
+    resolution
+}
+
+fn enclosing_callable_owner(node: Node<'_>, ctx: &CppScan<'_, '_>) -> Option<CodeUnit> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "function_definition" {
+            let declarator = parent.child_by_field_name("declarator")?;
+            let function = declarator_name_node(declarator)?;
+            if let Some(owners) = out_of_line_member_definition_owner(
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+                function,
+            ) && let Some((_, owner)) = owners.innermost()
+            {
+                return Some(owner.clone());
+            }
+            break;
+        }
+        current = parent.parent();
+    }
+    ctx.enclosing_class(node.start_byte()).and_then(|fqn| {
+        ctx.analyzer
+            .definitions(fqn)
+            .find(|candidate| candidate.is_class())
+    })
 }
 
 fn receiver_is_self_like(receiver: Node<'_>) -> bool {
@@ -412,38 +527,57 @@ fn receiver_type_fqn(
     ctx: &CppScan<'_, '_>,
     bindings: &LocalInferenceEngine<CodeUnit>,
 ) -> Option<String> {
+    receiver_type_unit(receiver, ctx, bindings, 32).map(|unit| unit.fq_name())
+}
+
+fn receiver_type_unit(
+    receiver: Node<'_>,
+    ctx: &CppScan<'_, '_>,
+    bindings: &LocalInferenceEngine<CodeUnit>,
+    remaining_call_depth: usize,
+) -> Option<CodeUnit> {
     match receiver.kind() {
         "identifier" => {
             let name = node_text(receiver, ctx.source);
             // A typed local resolves to its type; otherwise the name may itself be a
             // type, unless it is a known (shadowed) untyped local — never reinterpret
             // a value as a static type.
-            binding_type(bindings, name).or_else(|| {
+            first_precise(bindings, name).or_else(|| {
                 (!bindings.is_shadowed(name))
                     .then(|| ctx.resolve_type(name))
                     .flatten()
-                    .map(|unit| unit.fq_name())
             })
         }
-        "this" => ctx
-            .enclosing_class(receiver.start_byte())
-            .map(str::to_string),
+        "this" => ctx.enclosing_class(receiver.start_byte()).and_then(|fqn| {
+            ctx.analyzer
+                .definitions(fqn)
+                .find(|candidate| candidate.is_class())
+        }),
         // `(*p).m()` / `(p).m()` unwrap to the inner receiver.
         "parenthesized_expression" | "pointer_expression" => receiver
             .child_by_field_name("argument")
             .or_else(|| receiver.named_child(0))
-            .and_then(|inner| receiver_type_fqn(inner, ctx, bindings)),
+            .and_then(|inner| receiver_type_unit(inner, ctx, bindings, remaining_call_depth)),
+        "call_expression" if remaining_call_depth > 0 => infer_cpp_initializer_binding(
+            ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            ctx.source,
+            receiver,
+            Some(&|inner, _source| {
+                receiver_type_unit(inner, ctx, bindings, remaining_call_depth - 1)
+                    .into_iter()
+                    .collect()
+            }),
+        )
+        .and_then(|binding| binding.unit),
         _ => None,
     }
 }
 
-fn binding_type(bindings: &LocalInferenceEngine<CodeUnit>, name: &str) -> Option<String> {
-    first_precise(bindings, name).map(|unit| unit.fq_name())
-}
-
 fn seed_declaration(
     node: Node<'_>,
-    ctx: &CppScan<'_, '_>,
+    ctx: &mut CppScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
     match node.kind() {
