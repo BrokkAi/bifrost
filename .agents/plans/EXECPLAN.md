@@ -10,7 +10,7 @@ After this change, this repository will contain a Rust library that reproduces t
 
 ## Progress
 
-- [x] (2026-03-24T21:05Z) Read `.agents/PLANS.md`, `analyzer.txt`, and the Brokk analyzer sources and tests under `../brokk`.
+- [x] (2026-03-24T21:05Z) Read `.agents/PLANS.md`, a generated summary of the Brokk analyzer API, and the Brokk analyzer sources and tests under `../brokk`.
 - [x] (2026-03-24T21:05Z) Fixed the v1 scope to `JavaAnalyzer + TreeSitterAnalyzer + IAnalyzer`, single-threaded, in-memory snapshots with update support, and no persisted state I/O or `MultiAnalyzer`.
 - [x] (2026-03-24T21:05Z) Decided to vendor Brokk's `treesitter/` query files and `testcode-*` fixture directories unchanged.
 - [x] (2026-03-24T21:19Z) Initialized the Rust crate and copied the Brokk resource trees into `resources/treesitter/` and `tests/fixtures/`.
