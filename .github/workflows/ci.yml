@@ -36,7 +36,7 @@ jobs:
 
       - name: Check shipped Rust notice report
         run: |
-          cargo about generate --config licenses/about.toml --features python --locked --fail licenses/about.hbs -o /tmp/THIRD_PARTY_LICENSES.html
+          cargo about generate --offline --config licenses/about.toml --features python --locked --fail licenses/about.hbs -o /tmp/THIRD_PARTY_LICENSES.html
           cmp licenses/THIRD_PARTY_LICENSES.html /tmp/THIRD_PARTY_LICENSES.html
           node scripts/generate-supplemental-third-party-notices.mjs /tmp/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt
           cmp licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt /tmp/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt
