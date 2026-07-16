@@ -21,6 +21,7 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [x] (2026-07-16 09:52+02:00) Cross-linked #813 with the existing structural-query epic #328, policy issue #709, and typed set-composition issue #720.
 - [x] (2026-07-16 09:58+02:00) Wrote this living ExecPlan with architecture, lifecycle, milestone, validation, and recovery contracts.
 - [x] (2026-07-16 10:27+02:00) Published the plan in draft PR [#827](https://github.com/BrokkAi/bifrost/pull/827) from checkpoint commit `41f1e88b`.
+- [x] (2026-07-16 10:35+02:00) Made #709 the early public policy/API contract gate for #824 and #825 while keeping #814 through #823 free to build diagnostic-neutral internal analysis services.
 - [ ] Complete #814: define the language-neutral semantic IR, stable identities, capabilities, uncertainty, and an inspectable renderer.
 - [ ] Complete #815 and the first adapter children: build equivalent per-callable CFGs for TypeScript and Java.
 - [ ] Complete #816 in parallel: expose reusable dispatch, value, heap, and bounded access-path oracles for the reference languages.
@@ -29,8 +30,9 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [ ] Complete #820: implement an iterative, summary-driven IFDS/IDE-shaped solver with budgets, cancellation, uncertainty, and witnesses.
 - [ ] Complete #821 and #822: prove simple data-flow/taint reuse, then add the finite-state protocol IR and typestate client.
 - [ ] Complete #823 and #817 promotion work: compose summaries in memory first, then persist only measured expensive and reusable artifacts.
-- [ ] Complete #824: expose typed, bounded CFG/data-flow/typestate domains through `CodeQuery` and RQL.
-- [ ] Complete #825: deliver and benchmark one TypeScript/Java resource-lifecycle protocol end to end.
+- [ ] Complete #709 before #824 freezes its public surface: establish `.rqlp`, `PolicyDefinition`, `PolicyFinding`, and shared human/SARIF rendering without waiting for the typestate solver.
+- [ ] Complete #824: expose typed, bounded CFG/data-flow/typestate domains through `CodeQuery` and RQL, then adapt diagnostic-neutral findings to #709's policy boundary.
+- [ ] Complete #825: deliver and benchmark one TypeScript/Java resource-lifecycle protocol through internal, query, `.rqlp`, human, and SARIF paths.
 - [ ] Complete #826 only after #825: decide, with evidence, whether WPDS weights or synchronized call/field pushdown precision should be implemented.
 - [ ] Open per-language rollout children under #815 and #816 only after the reference adapters stabilize the neutral contracts.
 
@@ -95,6 +97,14 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
   Rationale: #328 owns structural querying, #709 owns policy/SARIF presentation, and #720 owns typed set algebra. The new epic supplies semantic-analysis domains that integrate with each boundary.
   Date: 2026-07-16.
 
+- Decision: make #709 a prerequisite for finalizing the stable policy-facing API in #824 and for the public vertical-slice acceptance in #825, but not for semantic IR, CFG/ICFG, solver, or internal typestate milestones.
+  Rationale: policy identity, severity, messages, loading, and human/SARIF rendering should be designed before typestate becomes a public diagnostic surface. Conversely, forcing CFG and tabulation work to wait on a file/reporting format would couple independent concerns and leave #709 guessing at solver internals. #709 owns `.rqlp`, `PolicyDefinition`, public `TypestatePolicySpec`, and `PolicyFinding`; #822 owns the internal `ProtocolSpec` and `TypestateFinding`; #824 owns the compiler/adapter between those models.
+  Date: 2026-07-16.
+
+- Decision: identify compiled protocols by canonical hash and an execution-scoped `ProtocolHandle`, with human-readable `ProtocolRef` aliases resolved only through an explicit query-analysis context.
+  Rationale: a global protocol ID can silently collide when two policies declare different bodies under the same name. Registration must reject one reference mapping to different hashes. Different references may share one hash/compiled automaton, and persisted summaries remain keyed by the canonical hash rather than the alias or handle slot.
+  Date: 2026-07-16.
+
 ## Outcomes & Retrospective
 
 The planning milestone produced root epic #813, thirteen native subissues, and this repository-local ExecPlan. The issue tree now separates the critical path from parallel and evidence-gated work:
@@ -111,7 +121,7 @@ The planning milestone produced root epic #813, thirteen native subissues, and t
     #817 artifact lifecycle and persistence follows measured artifact shapes
     #819 graph algorithms is non-blocking; dominance is conditional
     #821 proves simple flow/taint reuse
-    #824 exposes typed query facets
+    #709 public policy contract -> #824 stable query/policy adapter -> #825 public pilot
     #826 evaluates WPDS/SPDS after pilot evidence
 
 No implementation milestone is complete yet. Update this section after each issue closes with actual behavior, measurements, architectural deviations, and follow-up issue numbers. In particular, record whether TypeScript/Java remained the right reference pair, which artifacts earned SQLite persistence, and whether #826 concluded that a pushdown extension was justified.
@@ -180,6 +190,8 @@ Each result also carries `proof` for the structured edges it used, `completeness
 
 `src/analyzer/structural/query/ir.rs` and `schema.rs` are the typed query and declarative vocabulary authorities. `src/analyzer/structural/search.rs` executes bounded transformations and retains provenance. #824 extends these instead of adding a separate graph-query parser.
 
+#709 is the public diagnostic boundary. It owns the versioned `.rqlp` envelope, policy identity and reporting metadata, public analysis-authoring types such as `TypestatePolicySpec`, policy evaluation, `PolicyFinding`, and human/SARIF rendering. An internal `ProtocolSpec`, `TypestateFinding`, or `CodeQueryMatch` remains diagnostic-neutral until #824 lowers/adapts it through that public model.
+
 `src/compact_graph.rs` provides `CompactRows`, `CompactRowsBuilder`, and `CompactDirectedGraph`. `src/analyzer/store/mod.rs`, `src/analyzer/structural/provider.rs`, and `migrations/cache/0007-structural-facts-snapshots.sql` establish generation-aware, corruption-safe, versioned packed persistence with lazy hot hydration.
 
 ### Architectural flow
@@ -205,9 +217,13 @@ Each result also carries `proof` for the structured edges it used, `completeness
     direct flow    taint       typestate FSA
        +------------+-------------+
                     |
-       typed findings and witnesses
+    diagnostic-neutral findings and witnesses
                     |
-      CodeQuery/RQL -> policy/SARIF
+       +------------+-------------+
+       |                          |
+  CodeQuery/RQL exploration    #709 PolicyEvaluator
+                                  |
+                         PolicyFinding -> human/SARIF
 
 Storage is orthogonal to this flow. Mutable builders construct facts; immutable compact snapshots serve hot reads; SQLite stores only versioned artifacts that demonstrate expensive reconstruction and meaningful reuse.
 
@@ -301,7 +317,18 @@ Maintain an artifact matrix while the preceding milestones establish real data s
 
 Every persisted artifact uses a packed versioned DTO, generation/content validation, corruption-as-miss behavior, lazy hydration, payload cost accounting, cascade cleanup, and tests for source, adapter, solver, configuration, protocol, dependency, and overlay changes. Coordinate visible store failures with #695.
 
-### Milestone 7: expose typed query and policy boundaries (#824, #720, #709)
+### Milestone 7: stabilize the public policy contract and expose typed query facets (#709, #824, #720)
+
+#709 should proceed early and establish the public envelope before #824 freezes stable policy-facing names. It is not a prerequisite for #814 through #823: those milestones operate on diagnostic-neutral semantic facts, `AnalysisRun`, `TypestateFinding`, and witnesses. The dependency is asymmetric: #709 must not encode solver worklists or automaton internals, and #824/#825 must not invent a second policy identity, loading, severity, message, or SARIF model.
+
+#709 owns:
+
+- the versioned `.rqlp` document, explicit workspace-safe loading, and policy identity/metadata;
+- `PolicyDefinition`, a tagged `PolicyAnalysis` boundary and public authoring types such as `TypestatePolicySpec`, designed without exposing solver/client storage types;
+- `PolicyFinding`, stable locations and related locations, result completeness, and human/SARIF rendering;
+- the rule that a `CodeQueryMatch`, `FlowFinding`, or `TypestateFinding` is not itself a diagnostic.
+
+#822 owns the versioned internal `ProtocolSpec`, automaton compilation, and `TypestateFinding`. #824 owns `TypestatePolicyCompiler`, typed query domains, and adapters from analysis services to query rows and policy findings. The compiler lowers #709's author-facing `TypestatePolicySpec` into #822's internal `ProtocolSpec`; neither model embeds the other. #824 may build internal result domains before #709 closes, but it cannot declare the policy-facing wire shape stable until the #709 envelope and finding model are accepted. #825 requires both paths: diagnostic-neutral query exploration and `.rqlp` policy execution.
 
 Extend `QueryValueKind` and the declarative query schema with source-backed `procedure`, `program_point`, `flow_endpoint`, `typestate_finding`, `typestate_witness`, and `flow_witness` domains. The initial operations are fixed by this plan:
 
@@ -311,18 +338,17 @@ Extend `QueryValueKind` and the declarative query schema with source-backed `pro
 | `cfg_entry` / `cfg_exits` | procedure | program point | Exits include normal/exceptional kind. |
 | `cfg_successors` / `cfg_predecessors` | program point | program point | Positive finite `depth`, default 1; provenance carries each control edge. |
 | `flows_to` / `flows_from` | expression site, program point, or flow endpoint | flow endpoint | Positive finite `depth` or explicit sink/source selector; valid-path semantics and work budget. |
-| `typestate` | structural match, call site, expression site, or flow endpoint | typestate finding | Protocol ID, bind selector, may mode, solver budget. |
+| `typestate` | structural match, call site, expression site, or flow endpoint | typestate finding | Execution-scoped protocol reference, bind selector, may mode, solver budget. |
 | `witness` | typestate finding or flow endpoint | typed witness | Positive finite maximum steps and bytes. |
 
-The JSON `protocol_files` field and RQL `with-protocol` wrapper load protocol documents before typed step validation; they are query wrappers, not pipeline value transitions.
+Actual/formal/receiver/return bindings appear in flow provenance and solver transfers rather than as control edges. Each operation has a finite work budget, explicit capability diagnostics, deterministic endpoint identity and ordering, cancellation, and proof/completeness semantics. A witness is a bounded supporting derivation, not proof that all alternatives were enumerated. The planner evaluates cheap structural seeds before materializing expensive semantic facets.
 
-Actual/formal/receiver/return bindings appear in flow provenance and solver transfers rather than as control edges. New names or different type transitions require a Decision Log update and the complete schema/editor test surface.
+Keep two canonical fixtures:
 
-Each operation has a finite work budget, explicit capability diagnostics, deterministic endpoint identity and ordering, cancellation, and proof/completeness semantics. A witness is a bounded supporting derivation, not proof that all alternatives were enumerated. The planner evaluates cheap structural seeds before materializing expensive semantic facets.
+- `tests/fixtures/typestate/resource-lifecycle.protocol.json` contains only #822's internal `ProtocolSpec` and can be tested before #709 exists.
+- `tests/fixtures/policies/resource-lifecycle.rqlp` contains #709's public policy envelope, an RQL structural selector, and a public `TypestatePolicySpec`. A #824 conformance test lowers the public rule and requires it to compile to the same internal protocol hash as the #822 fixture without requiring their serialized shapes to match.
 
-For the pilot, use this concrete author-to-query contract. Store the canonical protocol document at `tests/fixtures/typestate/resource-lifecycle.rqlp`. The file is JSON so it can share the canonical schema/validation path with #709; RQL remains the query expression language and may gain authoring sugar later.
-
-`typestate::protocol::ProtocolRegistry` loads only files explicitly named by the query or bytes explicitly registered by an embedding application. JSON schema version 3 adds a top-level `protocol_files` array of workspace-relative paths. RQL adds a `(with-protocol "path" query)` wrapper. File loading rejects paths outside the workspace, duplicate protocol IDs, files above the configured byte limit, and parse/validation errors. The registry keys compiled protocols by canonical protocol hash. There is no implicit directory scan.
+The `.rqlp` pilot contract is JSON with RQL used for structural selection. Parsing lowers the selector into canonical `CodeQuery` IR stored by `PolicyDefinition`; the evaluator never reparses selector text during analysis. #709 may choose a different serialization only through its own reviewed schema decision and a corresponding Decision Log update here. The initial public shape is:
 
 ```json
 {
@@ -332,77 +358,80 @@ For the pilot, use this concrete author-to-query contract. Store the canonical p
     "severity": "error",
     "message": "Resource is used outside its open lifecycle"
   },
-  "protocol": {
-    "states": ["unallocated", "open", "closed", "error"],
-    "initial_state": "unallocated",
-    "error_states": ["error"],
-    "on_unknown": "inconclusive",
-    "on_escape": "inconclusive",
-    "events": [
-      {
-        "name": "acquire",
-        "declarations": {
-          "languages": ["typescript", "java"],
-          "match": {"kind": "method", "name": "open"},
-          "inside": {"kind": "class", "name": "Resource"},
-          "steps": [{"op": "enclosing_decl"}]
+  "selector": {
+    "rql": "(call :callee \"open\")"
+  },
+  "analysis": {
+    "kind": "typestate",
+    "subject": {"bind": "return_value"},
+    "mode": "may",
+    "uncertainty": {
+      "unknown_call": "inconclusive",
+      "escape": "inconclusive"
+    },
+    "automaton": {
+      "initial": "unallocated",
+      "error": ["error"],
+      "events": {
+        "acquire": {
+          "calls": {
+            "languages": ["typescript", "java"],
+            "match": {"kind": "method", "name": "open"},
+            "inside": {"kind": "class", "name": "Resource"},
+            "steps": [{"op": "enclosing_decl"}]
+          },
+          "subject": "return_value"
         },
-        "at_calls": true,
-        "bind": "return_value"
-      },
-      {
-        "name": "use",
-        "declarations": {
-          "languages": ["typescript", "java"],
-          "match": {"kind": "method", "name": "use"},
-          "inside": {"kind": "class", "name": "Resource"},
-          "steps": [{"op": "enclosing_decl"}]
+        "use": {
+          "calls": {
+            "languages": ["typescript", "java"],
+            "match": {"kind": "method", "name": "use"},
+            "inside": {"kind": "class", "name": "Resource"},
+            "steps": [{"op": "enclosing_decl"}]
+          },
+          "subject": "receiver"
         },
-        "at_calls": true,
-        "bind": "receiver"
-      },
-      {
-        "name": "close",
-        "declarations": {
-          "languages": ["typescript", "java"],
-          "match": {"kind": "method", "name": "close"},
-          "inside": {"kind": "class", "name": "Resource"},
-          "steps": [{"op": "enclosing_decl"}]
+        "close": {
+          "calls": {
+            "languages": ["typescript", "java"],
+            "match": {"kind": "method", "name": "close"},
+            "inside": {"kind": "class", "name": "Resource"},
+            "steps": [{"op": "enclosing_decl"}]
+          },
+          "subject": "receiver"
         },
-        "at_calls": true,
-        "bind": "receiver"
+        "scope_exit": {"semantic_event": "procedure_exit", "subject": "tracked_object"}
       },
-      {"name": "scope_exit", "semantic_event": "procedure_exit", "bind": "tracked_object"}
-    ],
-    "transitions": [
-      {"from": "unallocated", "event": "acquire", "to": "open"},
-      {"from": "open", "event": "use", "to": "open"},
-      {"from": "open", "event": "close", "to": "closed"},
-      {"from": "unallocated", "event": "use", "to": "error"},
-      {"from": "unallocated", "event": "close", "to": "error"},
-      {"from": "closed", "event": "use", "to": "error"},
-      {"from": "closed", "event": "close", "to": "error"},
-      {"from": "open", "event": "scope_exit", "to": "error"},
-      {"from": "closed", "event": "scope_exit", "to": "closed"}
-    ]
+      "transitions": {
+        "unallocated": {"acquire": "open", "use": "error", "close": "error"},
+        "open": {"use": "open", "close": "closed", "scope_exit": "error"},
+        "closed": {"use": "error", "close": "error", "scope_exit": "closed"}
+      }
+    }
+  },
+  "report": {
+    "witness": {"max_steps": 64, "max_bytes": 16384}
   }
 }
 ```
 
-The declaration selectors are structural seeds that must resolve to exact indexed declarations before they become protocol events. A same-name method outside `Resource`, an unresolved call, or a name-only guess never fires an exact transition.
+This is a public `TypestatePolicySpec`, not a serialized `ProtocolSpec`. `TypestatePolicyCompiler` infers and validates the public state/event names, resolves each `calls` selector to exact indexed declarations, lowers author-facing subject bindings and uncertainty choices to typed internal events, and produces #822's canonical `ProtocolSpec`. A same-name method outside `Resource`, an unresolved call, or a name-only guess never fires an exact transition.
 
-The canonical JSON invocation increments `CodeQuery` to schema version 3 and introduces `typestate` followed by `witness`:
+`PolicyRegistry` loads only explicitly requested `.rqlp` paths or bytes supplied by an embedding application. It rejects paths outside the workspace, duplicate policy IDs, oversized files, and parse/validation errors. It can parse and retain a typestate analysis before the compiler capability exists; evaluation then returns `unsupported`, not a partly interpreted rule.
+
+When the typestate capability is present, #824 lowers the public rule and registers the internal automaton by canonical hash in `ProtocolRegistry`, receiving an execution-scoped `ProtocolHandle`. `QueryAnalysisContext` maps a human-readable `ProtocolRef` to that handle. A policy uses `policy:<policy-id>`; embeddings may register an explicitly namespaced reference. Registering the same reference with a different hash is an error, while different references may share one compiled hash. Handle slots are never serialized or used as summary keys. There is no implicit directory scan, and `CodeQuery`/RQL cannot load arbitrary protocol paths.
+
+The diagnostic-neutral JSON query increments `CodeQuery` to schema version 3 and introduces `typestate` followed by `witness`. Its `QueryAnalysisContext` must resolve the reference before validation/execution:
 
 ```json
 {
   "schema_version": 3,
-  "protocol_files": ["tests/fixtures/typestate/resource-lifecycle.rqlp"],
   "languages": ["typescript"],
   "match": {"kind": "call", "callee": {"name": "open"}},
   "steps": [
     {
       "op": "typestate",
-      "protocol": "bifrost.test.resource-lifecycle",
+      "protocol_ref": "policy:bifrost.test.resource-lifecycle",
       "bind": "return_value",
       "mode": "may"
     },
@@ -411,25 +440,25 @@ The canonical JSON invocation increments `CodeQuery` to schema version 3 and int
 }
 ```
 
-The equivalent RQL is:
+The equivalent diagnostic-neutral RQL is:
 
 ```lisp
-(with-protocol "tests/fixtures/typestate/resource-lifecycle.rqlp"
-  (witness
-    (typestate :protocol "bifrost.test.resource-lifecycle"
-               :bind return-value
-               :mode may
-      (language typescript
-        (call :callee "open")))))
+(witness
+  (typestate :protocol-ref "policy:bifrost.test.resource-lifecycle"
+             :bind return-value
+             :mode may
+    (language typescript
+      (call :callee "open"))))
 ```
 
-For a `use()` after `close()`, the typed result has this minimum observable shape; exact line/column values come from the fixture:
+For a `use()` after `close()`, the typed analysis result has this minimum observable shape. It deliberately carries no severity or diagnostic message:
 
 ```json
 {
   "results": [{
     "result_type": "typestate_witness",
-    "protocol_id": "bifrost.test.resource-lifecycle",
+    "protocol_ref": "policy:bifrost.test.resource-lifecycle",
+    "protocol_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     "outcome": "complete_finding",
     "certainty": "may",
     "error_state": "error",
@@ -445,13 +474,17 @@ For a `use()` after `close()`, the typed result has this minimum observable shap
 }
 ```
 
-Changing this pilot wire shape requires an entry in the Decision Log plus canonical JSON, RQL lowering, validation, rendering, editor, and end-to-end test updates. Java uses the same protocol and query shape with only the language/fixture path changed.
+`protocol_hash` is serialized as exactly 64 lowercase hexadecimal characters; the illustrative value above is replaced by the fixture's actual canonical hash in gold output.
 
-All vocabulary enters through `src/analyzer/structural/query/schema.rs`, then receives canonical IR, JSON and RQL decoding, validation ranges, hover/completion, rendering, TextMate grammar updates, execution tests, and executable documentation recipes. #720 combines only compatible typed endpoints. #709 maps stable findings into policy identity, severity, messages, and SARIF rather than treating every query match as a diagnostic.
+Evaluating the `.rqlp` policy maps that result into a `PolicyFinding` with `policy_id`, severity, message, primary/related locations, analysis kind, proof/completeness, and the bounded witness. The same `PolicyFinding` feeds human and SARIF renderers; renderers never reinterpret raw query matches or solver facts.
+
+Changing either pilot wire shape requires an entry in the Decision Log plus canonical policy, JSON query, RQL lowering, validation, rendering, editor, and end-to-end test updates. Java uses the same policy/protocol definition with only the analyzed fixture changing.
+
+All query vocabulary enters through `src/analyzer/structural/query/schema.rs`, then receives canonical IR, JSON and RQL decoding, validation ranges, hover/completion, rendering, TextMate grammar updates, execution tests, and executable documentation recipes. All policy vocabulary enters through #709's declarative policy schema rather than private lists in #824. #720 combines only compatible typed endpoints.
 
 ### Milestone 8: run the cross-language pilot and decide extensions (#825, #826)
 
-Build equivalent TypeScript and Java inline projects plus a larger representative or generated corpus. The resource protocol exercises allocation/open, use, close, aliases, factories, helpers, actual/formal and return flow, branches, recursion-safe summaries, multiple targets, normal exits, and an exceptional path. Gold expectations distinguish complete-no-finding, complete-finding, inconclusive, and unsupported results.
+Build equivalent TypeScript and Java inline projects plus a larger representative or generated corpus. The resource protocol exercises allocation/open, use, close, aliases, factories, helpers, actual/formal and return flow, branches, recursion-safe summaries, multiple targets, normal exits, and an exceptional path. Gold expectations distinguish complete-no-finding, complete-finding, inconclusive, and unsupported results. Run the same analysis through internal APIs, diagnostic-neutral JSON/RQL exploration, and #709's `.rqlp` policy evaluator; require the human and SARIF renderers to agree on policy identity, primary location, related witness locations, and completeness.
 
 Record true/false positives and negatives, abstention, cold construction, warm in-process summary reuse, warm cross-process hydration for promoted artifacts, retained bytes or RSS, graph/fact/summary counts, query latency, witness payload, hit/miss rates, and targeted invalidation. Every report includes the Bifrost commit, fixture revision, features, environment, and machine metadata.
 
@@ -496,14 +529,18 @@ The reference implementation creates this repository-relative module and test la
       mod.rs problem.rs tabulation.rs summary.rs outcome.rs witness.rs
     src/analyzer/typestate/
       mod.rs protocol.rs client.rs summary.rs
+    src/analyzer/policy/
+      mod.rs definition.rs evaluator.rs finding.rs
+      render/mod.rs render/human.rs render/sarif.rs
     tests/
       semantic_ir_contract.rs semantic_cfg_contract.rs
       semantic_oracle_contract.rs icfg_contract.rs
       semantic_graph_algorithms.rs dataflow_tabulation.rs
       dataflow_clients.rs typestate_protocol.rs analysis_summaries.rs
-      semantic_artifact_store.rs code_query_typestate.rs
-      typestate_pilot.rs
-    tests/fixtures/typestate/resource-lifecycle.rqlp
+      semantic_artifact_store.rs static_analysis_policy.rs
+      code_query_typestate.rs policy_typestate_integration.rs typestate_pilot.rs
+    tests/fixtures/typestate/resource-lifecycle.protocol.json
+    tests/fixtures/policies/resource-lifecycle.rqlp
 
 Each milestone creates and runs its named behavior test. A missing test binary is not a passing milestone.
 
@@ -543,17 +580,17 @@ For #817 after an artifact is promoted:
 
 Expected: `test result: ok`; version, corruption, generation, overlay, dependency, rule-hash, concurrent access, and GC cases either hydrate the exact artifact or produce a safe miss.
 
-For #824:
+For #709 and #824:
 
-    cargo test --test code_query_typestate
+    cargo test --test static_analysis_policy --test code_query_typestate --test policy_typestate_integration
 
-Expected: `test result: ok`; the schema-version-3 JSON and RQL examples above lower to one canonical query, invalid domain transitions have path-specific errors, and output matches the minimum tagged result shape.
+Expected: `test result: ok`; the policy envelope and `PolicyFinding` contract pass independently, the schema-version-3 JSON and RQL examples lower to one diagnostic-neutral query, invalid domain transitions have path-specific errors, and the policy adapter maps the typed result into matching human/SARIF findings.
 
 For #825:
 
     cargo test --test typestate_pilot
 
-Expected: `test result: ok`; both languages produce gold complete-finding, complete-no-finding, inconclusive, and unsupported cases, including helper, alias, recursion, and exceptional flow. The ignored benchmark mode prints one machine-readable record containing commit, fixture, counts, cold/warm elapsed times, memory, summary hits, and invalidation result.
+Expected: `test result: ok`; both languages produce gold complete-finding, complete-no-finding, inconclusive, and unsupported cases, including helper, alias, recursion, and exceptional flow. The same result is available through internal, query, and `.rqlp` policy paths, with equivalent human/SARIF identity and locations. The ignored benchmark mode prints one machine-readable record containing commit, fixture, counts, cold/warm elapsed times, memory, summary hits, and invalidation result.
 
 Focused tests should prove behavior rather than mirror implementation-shaped registry lists.
 
@@ -607,7 +644,11 @@ For benchmark milestones, capture commands and outputs in the issue or an `.agen
 
 - Typed validation rejects incompatible query-domain compositions before execution.
 - At least one JSON and one RQL query returns a typestate finding and bounded witness.
-- Explicit protocol files load identically through JSON `protocol_files`, RQL `with-protocol`, and the embedding registry; traversal or duplicate-ID attempts fail deterministically.
+- `.rqlp` loading is owned by `PolicyRegistry`; `CodeQuery`/RQL cannot load arbitrary protocol paths, and traversal, oversized-file, or duplicate-policy-ID attempts fail deterministically.
+- The public `TypestatePolicySpec` lowers to the same canonical internal hash as the independently serialized #822 protocol fixture; their wire shapes are not required to match.
+- Registering one `ProtocolRef` with two different hashes fails deterministically; different references for the same hash share the compiled automaton, and stale handles fail after their context generation changes.
+- A raw query/analysis finding has no policy severity or diagnostic message; only `PolicyEvaluator` produces `PolicyFinding`.
+- One `.rqlp` typestate policy produces equivalent human and SARIF policy identity, primary location, related witness locations, and completeness.
 - Set composition, policy conversion, ordering, limits, truncation, diagnostics, and capability behavior are deterministic.
 - Every new public term has schema, parser/decoder, validation-range, hover/completion, grammar, execution, and documentation coverage.
 
@@ -693,6 +734,74 @@ The solver returns findings separately from run completion:
     }
 
 `Complete` plus non-empty `findings` renders as `complete_finding`. `Complete` plus empty `findings` renders as `complete_no_finding`. The other variants render as specified in the soundness contract and may include partial findings.
+
+#709 establishes the public policy boundary independently of any one analysis client:
+
+    struct PolicyDefinition {
+        schema_version: PolicySchemaVersion,
+        metadata: PolicyMetadata,
+        selector: CodeQuery,
+        analysis: PolicyAnalysis,
+        report: PolicyReportOptions,
+    }
+
+    enum PolicyAnalysis {
+        Match,
+        DataFlow(DataFlowPolicySpec),
+        Typestate(TypestatePolicySpec),
+    }
+
+    struct PolicyRun {
+        policy_id: PolicyId,
+        completion: AnalysisCompletion,
+        findings: Vec<PolicyFinding>,
+        diagnostics: Vec<PolicyDiagnostic>,
+        work: WorkReport,
+    }
+
+    struct PolicyFinding {
+        policy_id: PolicyId,
+        severity: PolicySeverity,
+        message: String,
+        analysis_kind: PolicyAnalysisKind,
+        certainty: FindingCertainty,
+        primary: SourceLocation,
+        related: Vec<RelatedLocation>,
+        proof: ProofMetadata,
+        completeness: FindingCompleteness,
+        witness: Option<BoundedWitness>,
+    }
+
+    trait PolicyEvaluator {
+        fn evaluate(
+            &self,
+            policy: &PolicyDefinition,
+            context: &AnalysisContext,
+            budget: &mut PolicyBudget,
+        ) -> PolicyRun;
+    }
+
+The #824 bridge between the public and internal typestate models is explicit:
+
+    struct CompiledPolicyProtocol {
+        reference: ProtocolRef,
+        handle: ProtocolHandle,
+        hash: [u8; 32],
+    }
+
+    trait TypestatePolicyCompiler {
+        fn compile(
+            &self,
+            policy_id: &PolicyId,
+            spec: &TypestatePolicySpec,
+            context: &mut QueryAnalysisContext,
+            budget: &mut SemanticBudget,
+        ) -> AnalysisOutcome<CompiledPolicyProtocol>;
+    }
+
+`ProtocolHandle` is opaque and valid only for one `QueryAnalysisContext`; it contains a context generation, dense slot, and canonical hash. Registration atomically binds `ProtocolRef("policy:<policy-id>")` to the handle and rejects an existing reference with a different hash. Protocol summaries and persisted artifacts key on the hash plus solver/configuration inputs, never the reference or dense slot.
+
+The initial #709 implementation may execute only `PolicyAnalysis::Match`, but it parses and retains a versioned public `TypestatePolicySpec` without importing `ProtocolSpec` or inventing solver semantics. #824 supplies the compiler above plus adapters from `AnalysisRun<FlowFinding>` and `AnalysisRun<TypestateFinding>` after those clients exist. There is no context-free conversion from `CodeQueryMatch` or an analysis finding into `PolicyFinding`: evaluation always requires a `PolicyDefinition`. Human and SARIF renderers consume only `PolicyRun`/`PolicyFinding`.
 
 The semantic adapter boundary is:
 
@@ -842,6 +951,6 @@ Summary ownership is explicit:
 
 A `SummaryStore` may memoize either reusable type in memory and optionally SQLite, but the solver accepts an in-memory implementation and does not require persistence to be correct. Incomplete `TabulationEndSummary` values never enter a complete reusable summary.
 
-Public query changes depend on the declarative schema registry in `src/analyzer/structural/query/schema.rs`. Do not add private keyword lists, editor-only vocabulary, or source-text path parsing. Existing Rust dependencies should be preferred for the first implementation; any new solver or graph crate requires a measured build/runtime benefit and an explicit Decision Log entry.
+Public query changes depend on the declarative schema registry in `src/analyzer/structural/query/schema.rs`. Public policy changes depend on the versioned schema and finding model established by #709. Neither side may add private keyword lists, editor-only vocabulary, source-text path parsing, or an implicit conversion from query matches to diagnostics. Existing Rust dependencies should be preferred for the first implementation; any new solver or graph crate requires a measured build/runtime benefit and an explicit Decision Log entry.
 
-Plan revision note (2026-07-16): Initial roadmap written after auditing the post-PR-#802 codebase and creating epic #813 with native subissues #814–#826. The initial plan deliberately makes TypeScript/Java the reference pair, IFDS/IDE the baseline solver shape, compact memory plus selective SQLite the lifecycle policy, dominance optional, and WPDS/SPDS evidence-gated. Draft PR #827 and its initial checkpoint commit were added after publication.
+Plan revision note (2026-07-16): Initial roadmap written after auditing the post-PR-#802 codebase and creating epic #813 with native subissues #814–#826. The initial plan deliberately makes TypeScript/Java the reference pair, IFDS/IDE the baseline solver shape, compact memory plus selective SQLite the lifecycle policy, dominance optional, and WPDS/SPDS evidence-gated. Draft PR #827 and its initial checkpoint commit were added after publication. A later same-day revision made #709 the early public policy/API gate, separated `.rqlp`/`PolicyFinding` from the internal protocol and analysis result models, and required the #825 pilot to validate query, human, and SARIF surfaces from one analysis result.
