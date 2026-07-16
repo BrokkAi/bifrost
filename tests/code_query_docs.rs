@@ -11,6 +11,7 @@ const DOCS: &[&str] = &[
     "docs/src/content/docs/rune-query-language.md",
     "docs/src/content/docs/code-query-tutorials/index.md",
     "docs/src/content/docs/code-query-tutorials/import-traversal.md",
+    "docs/src/content/docs/code-query-tutorials/set-composition.md",
     "docs/src/content/docs/code-query-tutorials/receiver-traversal.md",
     "docs/src/content/docs/code-query-tutorials/python.md",
     "docs/src/content/docs/code-query-tutorials/java.md",

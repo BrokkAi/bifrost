@@ -4503,8 +4503,15 @@ impl CodeQueryResult {
                     }
                 }
                 if !result.provenance.is_empty() {
+                    let mut branch_labels = Vec::new();
+                    for trace in &result.provenance {
+                        let label = format_branch_path(&trace.branch);
+                        if !label.is_empty() && !branch_labels.contains(&label) {
+                            branch_labels.push(label);
+                        }
+                    }
                     out.push_str(&format!(
-                        "  provenance: {} path{}{}\n",
+                        "  provenance: {} path{}{}{}\n",
                         result.provenance.len(),
                         if result.provenance.len() == 1 {
                             ""
@@ -4515,13 +4522,26 @@ impl CodeQueryResult {
                             " (truncated)"
                         } else {
                             ""
-                        }
+                        },
+                        if branch_labels.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; branches {}", branch_labels.join(", "))
+                        },
                     ));
                 }
             }
         }
         for diagnostic in &self.diagnostics {
-            out.push_str(&format!("note: {}\n", diagnostic.message));
+            if diagnostic.branch.is_empty() {
+                out.push_str(&format!("note: {}\n", diagnostic.message));
+            } else {
+                out.push_str(&format!(
+                    "note [branch {}]: {}\n",
+                    format_branch_path(&diagnostic.branch),
+                    diagnostic.message
+                ));
+            }
         }
         out
     }
@@ -4547,6 +4567,14 @@ fn line_span_label(start_line: usize, end_line: usize) -> String {
 
 fn is_false(value: &bool) -> bool {
     !value
+}
+
+fn format_branch_path(branch: &[usize]) -> String {
+    branch
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 #[cfg(test)]
@@ -4644,5 +4672,38 @@ export function caller() {
             file_result.results[0].value,
             CodeQueryResultValue::File { ref value } if value.path == "app.ts"
         ));
+    }
+
+    #[test]
+    fn cancelled_composed_query_retains_no_partial_rows() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(root.clone(), PathBuf::from("app.ts"));
+        file.write("function alpha() {}\nfunction beta() {}\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let query = CodeQuery::from_json(&json!({
+            "union": [
+                { "match": { "kind": "function", "name": "alpha" } },
+                { "match": { "kind": "function", "name": "beta" } }
+            ]
+        }))
+        .expect("query");
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        let result = execute_with_cancellation(
+            &analyzer,
+            &query,
+            CodeQueryExecutionLimits::default(),
+            &cancellation,
+        );
+
+        assert!(result.results.is_empty());
+        assert!(result.truncated);
+        assert_eq!(result.diagnostics.len(), 1);
+        assert!(result.diagnostics[0].branch.is_empty());
+        assert!(result.diagnostics[0].message.contains("cancelled"));
     }
 }

@@ -186,8 +186,11 @@ class SearchToolsClient:
 
     def query_code(
         self,
-        pattern: dict[str, Any],
+        pattern: dict[str, Any] | None = None,
         *,
+        union: list[dict[str, Any]] | None = None,
+        intersect: list[dict[str, Any]] | None = None,
+        except_: list[dict[str, Any]] | None = None,
         inside: dict[str, Any] | None = None,
         not_inside: dict[str, Any] | None = None,
         where: list[str] | None = None,
@@ -199,17 +202,40 @@ class SearchToolsClient:
     ) -> CodeQueryResult:
         """Query normalized code structure across supported languages.
 
-        Version 2 starts with normalized syntactic structure and optionally
+        Version 2 starts with normalized syntactic structure or a typed set of
+        complete query branches, then optionally
         applies typed semantic ``steps`` such as ``enclosing_decl``, ``file_of``,
         ``imports_of``, ``supertypes``, ``subtypes``, ``members``, and ``owner``.
         Hierarchy steps are direct by default and accept a positive ``depth`` or
         ``transitive=True``. Declaration results are limited to declarations
-        indexed by the workspace analyzer. ``pattern`` is sent as the tool's
-        ``match`` object. ``where`` accepts project-relative globs or absolute
+        indexed by the workspace analyzer. Pass exactly one of ``pattern``,
+        ``union``, ``intersect``, or ``except_``. Set operands are complete
+        canonical query-plan dictionaries and must produce the same typed
+        domain. ``pattern`` is sent as the tool's ``match`` object. Structural
+        scope arguments apply only with ``pattern``. ``where`` accepts project-relative globs or absolute
         in-workspace paths/globs. ``result_detail="full"`` adds stable IDs and
         precise ranges; compact mode retains minimal pipeline provenance.
         """
-        arguments: dict[str, Any] = {"match": pattern}
+        sources = {
+            "match": pattern,
+            "union": union,
+            "intersect": intersect,
+            "except": except_,
+        }
+        selected = [(name, value) for name, value in sources.items() if value is not None]
+        if len(selected) != 1:
+            raise ValueError(
+                "query_code requires exactly one of pattern, union, intersect, or except_"
+            )
+        source_name, source_value = selected[0]
+        if source_name != "match" and any(
+            value is not None for value in (inside, not_inside, where, languages)
+        ):
+            raise ValueError(
+                "inside, not_inside, where, and languages apply only to a pattern query; "
+                "put structural scope fields inside each set branch"
+            )
+        arguments: dict[str, Any] = {source_name: source_value}
         if inside is not None:
             arguments["inside"] = inside
         if not_inside is not None:

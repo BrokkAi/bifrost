@@ -127,6 +127,11 @@ fn receiver_traversal_tutorial() {
 }
 
 #[test]
+fn set_composition_tutorial() {
+    verify_tutorial("docs/src/content/docs/code-query-tutorials/set-composition.md");
+}
+
+#[test]
 fn ten_minute_evaluation_tutorial() {
     let relative = "docs/src/content/docs/evaluate-bifrost.md";
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));

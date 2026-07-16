@@ -146,6 +146,26 @@ Every derived result includes `provenance`. Each provenance path records the ori
 
 For completeness claims, result metadata is mandatory: inspect diagnostics, require `truncated: false`, distinguish `proven` from `unproven` graph edges, and check every derived result's `provenance_truncated` field. [Agent Result Safety](/agent-result-safety/) turns those fields into an explicit decision rule.
 
+## Typed Set Composition
+
+At every query-plan node, use exactly one source field: `match`, `union`, `intersect`, or `except`. Set fields contain between two and sixteen complete child plans. Every child must end in exactly the same typed domain; Bifrost rejects incompatible branches before workspace execution with a path such as `union[1].steps[0]`.
+
+```json
+{
+  "union": [
+    {"match":{"kind":"class","name":"Legacy"},"steps":[{"op":"enclosing_decl"}]},
+    {"match":{"kind":"class","name":"Replacement"},"steps":[{"op":"enclosing_decl"}]}
+  ],
+  "steps": [{"op":"file_of"}]
+}
+```
+
+`union` retains the first appearance of each exact typed endpoint in branch order. `intersect` retains endpoints present in every branch, in the first branch's order. `except` retains first-branch endpoints absent from every later branch. Endpoint identity comes from structured ranges and declaration/site identities, never rendered text.
+
+Union and intersection merge at most sixteen provenance traces in branch order. A trace or diagnostic inside composition includes a zero-based `branch` path; plain leaf queries omit it. Except retains provenance only from its positive first branch. Root-only `limit`, `result_detail`, and `schema_version` fields cannot appear inside operands, while structural `where`, `languages`, `inside`, and `not_inside` belong inside the branch containing `match`.
+
+The public `limit` applies after the complete root set and common suffix. Execution budgets are shared across the request and fairly reserve work for later immediate operands. An incomplete operand sets `truncated: true` and produces a branch-labeled diagnostic rather than claiming a complete set. See the executable [Typed Set Composition](/code-query-tutorials/set-composition/) cookbook.
+
 ## Typed Pipeline Steps
 
 Steps execute in array order and are validated before the workspace is searched:
@@ -399,6 +419,8 @@ Version 2 enforces these budgets:
 | Name predicate source (exact or regex) and text regex source | `4096` bytes |
 | Capture label | `128` bytes |
 | Pipeline steps | `16` |
+| Set operands at one node | `16` |
+| Query-plan nodes / composition depth | `64` nodes / `16` levels |
 | Seed and edge rows per execution | `50000` |
 | Provenance paths per terminal result | `16` |
 

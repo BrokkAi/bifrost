@@ -885,8 +885,15 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                 }
             }
             if !result.provenance.is_empty() {
+                let mut branch_labels = Vec::new();
+                for trace in &result.provenance {
+                    let label = format_branch_path(&trace.branch);
+                    if !label.is_empty() && !branch_labels.contains(&label) {
+                        branch_labels.push(label);
+                    }
+                }
                 out.push_str(&format!(
-                    "  provenance: {} path{}{}\n",
+                    "  provenance: {} path{}{}{}\n",
                     result.provenance.len(),
                     if result.provenance.len() == 1 {
                         ""
@@ -897,16 +904,26 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         " (truncated)"
                     } else {
                         ""
-                    }
+                    },
+                    if branch_labels.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; branches {}", branch_labels.join(", "))
+                    },
                 ));
             }
         }
     }
 
     for diagnostic in &output.diagnostics {
+        let label = if diagnostic.branch.is_empty() {
+            "note:".to_string()
+        } else {
+            format!("note [branch {}]:", format_branch_path(&diagnostic.branch))
+        };
         out.push_str(&format!(
             "{} {}\n",
-            paint(Style::new().fg(Color::Yellow), "note:", use_color),
+            paint(Style::new().fg(Color::Yellow), &label, use_color),
             sanitize_terminal_text(&diagnostic.message)
         ));
     }
@@ -970,6 +987,14 @@ fn render_code_query_match(out: &mut String, matched: &CodeQueryMatch, use_color
             )
         ));
     }
+}
+
+fn format_branch_path(branch: &[usize]) -> String {
+    branch
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn sanitize_terminal_text(text: &str) -> String {

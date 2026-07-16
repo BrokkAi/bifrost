@@ -2821,3 +2821,151 @@ fn global_result_limit_is_applied_after_set_composition() {
         .collect::<Vec<_>>();
     assert_eq!(names, ["gamma", "alpha"], "{result}");
 }
+
+#[test]
+fn set_composition_uses_exact_identity_for_every_typed_terminal_domain() {
+    let project = InlineTestProject::new()
+        .file(
+            "app.ts",
+            r#"class Service { run(payload: string) {} }
+function target(payload: string) {}
+export function caller() {
+    const service = new Service();
+    service.run("member");
+    target("input");
+}
+"#,
+        )
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let cases = [
+        (
+            "structural_match",
+            json!({ "match": { "kind": "function", "name": "target" } }),
+        ),
+        (
+            "declaration",
+            json!({
+                "match": { "kind": "function", "name": "target" },
+                "steps": [{ "op": "enclosing_decl" }]
+            }),
+        ),
+        (
+            "file",
+            json!({
+                "match": { "kind": "function", "name": "target" },
+                "steps": [{ "op": "file_of" }]
+            }),
+        ),
+        (
+            "reference_site",
+            json!({
+                "match": { "kind": "function", "name": "target" },
+                "steps": [
+                    { "op": "enclosing_decl" },
+                    { "op": "references_of", "proof": "proven" }
+                ]
+            }),
+        ),
+        (
+            "call_site",
+            json!({
+                "match": { "kind": "function", "name": "target" },
+                "steps": [
+                    { "op": "enclosing_decl" },
+                    { "op": "call_sites_to", "proof": "proven" }
+                ]
+            }),
+        ),
+        (
+            "expression_site",
+            json!({
+                "match": { "kind": "function", "name": "target" },
+                "steps": [
+                    { "op": "enclosing_decl" },
+                    { "op": "call_sites_to", "proof": "proven" },
+                    { "op": "call_input", "parameter_index": 0 }
+                ]
+            }),
+        ),
+        (
+            "receiver_analysis",
+            json!({
+                "match": { "kind": "call", "callee": { "name": "run" } },
+                "steps": [{ "op": "receiver_targets" }]
+            }),
+        ),
+    ];
+
+    for (expected_type, branch) in cases {
+        let query = CodeQuery::from_json(&json!({
+            "union": [branch.clone(), branch]
+        }))
+        .unwrap_or_else(|error| panic!("{expected_type} query: {error}"));
+        let value = serialized(&execute(workspace.analyzer(), &query));
+        let results = value["results"].as_array().unwrap();
+        assert!(!results.is_empty(), "{expected_type}: {value}");
+        assert!(
+            results
+                .iter()
+                .all(|result| result["result_type"] == expected_type),
+            "{expected_type}: {value}"
+        );
+        for result in results {
+            let branches = result["provenance"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|trace| trace["branch"].clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                branches,
+                [json!([0]), json!([1])],
+                "{expected_type}: {value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn composed_capability_diagnostics_identify_their_branch() {
+    let result = serialized(&run(
+        &[
+            ("app.py", "audit(payload=\"ok\")\n"),
+            ("app.js", "audit({ payload: 'unsupported' });\n"),
+        ],
+        json!({
+            "union": [
+                {
+                    "languages": ["python"],
+                    "match": {
+                        "kind": "call",
+                        "callee": { "name": "audit" },
+                        "kwargs": { "payload": { "capture": "value" } }
+                    }
+                },
+                {
+                    "languages": ["javascript"],
+                    "match": {
+                        "kind": "call",
+                        "callee": { "name": "audit" },
+                        "kwargs": { "payload": { "capture": "value" } }
+                    }
+                }
+            ]
+        }),
+    ));
+
+    assert_eq!(result["results"].as_array().unwrap().len(), 1, "{result}");
+    assert_eq!(result["results"][0]["provenance"][0]["branch"], json!([0]));
+    assert!(
+        result["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["branch"] == json!([1])
+                && diagnostic["language"] == "javascript"
+                && diagnostic["message"].as_str().unwrap().contains("kwargs")),
+        "{result}"
+    );
+}
