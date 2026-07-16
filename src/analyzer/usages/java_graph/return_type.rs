@@ -204,7 +204,7 @@ fn java_declared_type_fqn(
         LexicalTypeResolution::Resolved(unit) => Some(unit.fq_name()),
         LexicalTypeResolution::Blocked => None,
         LexicalTypeResolution::NotFound => java
-            .resolve_type_name_in_file(file, &components.join("."))
+            .resolve_usage_type_name(file, &components.join("."))
             .map(|unit| unit.fq_name()),
     }
 }

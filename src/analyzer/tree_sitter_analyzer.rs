@@ -985,8 +985,10 @@ pub struct TreeSitterAnalyzer<A> {
     source_snapshot_file_states: Arc<Mutex<FileStateCache>>,
     summary_file_projections: Arc<Mutex<SummaryFileProjectionCache>>,
     global_usage_definition_index: Arc<OnceLock<Arc<GlobalUsageDefinitionIndex>>>,
+    global_usage_definition_index_init: Arc<Mutex<()>>,
     global_usage_definition_fallback: Arc<GlobalUsageDefinitionIndex>,
     usage_facts_index: Arc<OnceLock<Arc<UsageFactsIndex>>>,
+    usage_facts_index_init: Arc<Mutex<()>>,
     usage_facts_fallback: Arc<UsageFactsIndex>,
     full_hydration_count: Arc<AtomicUsize>,
     bulk_hydration_count: Arc<AtomicUsize>,
@@ -1014,8 +1016,12 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             source_snapshot_file_states: Arc::clone(&self.source_snapshot_file_states),
             summary_file_projections: Arc::clone(&self.summary_file_projections),
             global_usage_definition_index: Arc::clone(&self.global_usage_definition_index),
+            global_usage_definition_index_init: Arc::clone(
+                &self.global_usage_definition_index_init,
+            ),
             global_usage_definition_fallback: Arc::clone(&self.global_usage_definition_fallback),
             usage_facts_index: Arc::clone(&self.usage_facts_index),
+            usage_facts_index_init: Arc::clone(&self.usage_facts_index_init),
             usage_facts_fallback: Arc::clone(&self.usage_facts_fallback),
             full_hydration_count: Arc::clone(&self.full_hydration_count),
             bulk_hydration_count: Arc::clone(&self.bulk_hydration_count),
@@ -1175,8 +1181,10 @@ where
                 SUMMARY_FILE_PROJECTION_CACHE_CAPACITY,
             ))),
             global_usage_definition_index: Arc::new(OnceLock::new()),
+            global_usage_definition_index_init: Arc::new(Mutex::new(())),
             global_usage_definition_fallback: Arc::new(GlobalUsageDefinitionIndex::default()),
             usage_facts_index: Arc::new(OnceLock::new()),
+            usage_facts_index_init: Arc::new(Mutex::new(())),
             usage_facts_fallback: Arc::new(UsageFactsIndex::default()),
             full_hydration_count: Arc::new(AtomicUsize::new(0)),
             bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
@@ -1291,8 +1299,10 @@ where
                 SUMMARY_FILE_PROJECTION_CACHE_CAPACITY,
             ))),
             global_usage_definition_index: Arc::new(OnceLock::new()),
+            global_usage_definition_index_init: Arc::new(Mutex::new(())),
             global_usage_definition_fallback: Arc::new(GlobalUsageDefinitionIndex::default()),
             usage_facts_index: Arc::new(OnceLock::new()),
+            usage_facts_index_init: Arc::new(Mutex::new(())),
             usage_facts_fallback: Arc::new(UsageFactsIndex::default()),
             full_hydration_count: Arc::new(AtomicUsize::new(0)),
             bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
@@ -4389,6 +4399,13 @@ where
         if let Some(index) = self.global_usage_definition_index.get() {
             return Ok(index);
         }
+        let _init = self
+            .global_usage_definition_index_init
+            .lock()
+            .expect("definition index initialization lock poisoned");
+        if let Some(index) = self.global_usage_definition_index.get() {
+            return Ok(index);
+        }
         let _scope = profiling::scope("TreeSitterAnalyzer::global_usage_definition_index_build");
         let build_count = self
             .global_usage_definition_index_build_count
@@ -4401,7 +4418,9 @@ where
             ));
         }
         let built = Arc::new(self.sql_global_usage_definition_index()?);
-        let _ = self.global_usage_definition_index.set(built);
+        self.global_usage_definition_index
+            .set(built)
+            .expect("definition index initialization is serialized");
         Ok(self
             .global_usage_definition_index
             .get()
@@ -4419,8 +4438,17 @@ where
         if let Some(index) = self.usage_facts_index.get() {
             return Ok(index);
         }
+        let _init = self
+            .usage_facts_index_init
+            .lock()
+            .expect("usage facts initialization lock poisoned");
+        if let Some(index) = self.usage_facts_index.get() {
+            return Ok(index);
+        }
         let built = Arc::new(self.build_usage_facts_index()?);
-        let _ = self.usage_facts_index.set(built);
+        self.usage_facts_index
+            .set(built)
+            .expect("usage facts initialization is serialized");
         Ok(self
             .usage_facts_index
             .get()
@@ -5163,7 +5191,7 @@ mod tests {
     use crate::analyzer::{AnalyzerConfig, IAnalyzer, JavaAnalyzer, Language, TestProject};
     use git2::{ObjectType, Oid};
     use std::path::{Path, PathBuf};
-    use std::sync::{Condvar, RwLock};
+    use std::sync::{Barrier, Condvar, RwLock};
 
     #[derive(Clone)]
     struct CountingOverlayProject {
@@ -6448,6 +6476,50 @@ mod tests {
         assert_eq!(updated_definitions.fqn("demo.Service.after").len(), 1);
         assert!(updated_facts.facts("demo.Service.before").is_empty());
         assert!(!updated_facts.facts("demo.Service.after").is_empty());
+    }
+
+    #[test]
+    fn concurrent_clones_build_shared_usage_indices_once() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/demo/Service.java");
+        file.write("package demo; class Service { String call() { return \"ok\"; } }\n")
+            .expect("java source");
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
+        let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
+        analyzer.reset_global_usage_definition_index_build_count_for_test();
+        analyzer.reset_full_declaration_scan_count_for_test();
+        let barrier = Arc::new(Barrier::new(32));
+
+        let handles = std::thread::scope(|scope| {
+            (0..32)
+                .map(|_| {
+                    let clone = analyzer.clone();
+                    let barrier = Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        (
+                            clone.global_usage_definition_index_shared(),
+                            clone.usage_facts_index_shared(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().expect("index worker"))
+                .collect::<Vec<_>>()
+        });
+
+        for (definitions, facts) in &handles[1..] {
+            assert!(Arc::ptr_eq(&handles[0].0, definitions));
+            assert!(Arc::ptr_eq(&handles[0].1, facts));
+        }
+        assert_eq!(
+            analyzer.global_usage_definition_index_build_count_for_test(),
+            1
+        );
+        assert_eq!(analyzer.full_declaration_scan_count_for_test(), 1);
     }
 
     #[test]

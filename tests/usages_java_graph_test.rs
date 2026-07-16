@@ -376,9 +376,10 @@ fn java_type_usage_scan_filters_unrelated_ast_names_before_definition_lookup() {
     ));
 
     assert_eq!(1, type_hits.len());
-    assert!(
-        analyzer.definition_query_count_for_test() <= 2,
-        "unrelated type AST names must not trigger definition lookups"
+    assert_eq!(
+        0,
+        analyzer.definition_query_count_for_test(),
+        "usage scanning must resolve type names from the in-memory definition index"
     );
 }
 
