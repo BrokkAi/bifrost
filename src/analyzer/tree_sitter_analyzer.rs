@@ -1014,7 +1014,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             state: Arc::clone(&self.state),
             structural_cache: Arc::clone(&self.structural_cache),
             store_context: self.store_context.clone(),
-            query_read_cache: Arc::clone(&self.query_read_cache),
+            query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
             #[cfg(test)]
             live_oid_validation_counts: Arc::clone(&self.live_oid_validation_counts),
             transient_file_states: Arc::clone(&self.transient_file_states),
@@ -1042,7 +1042,6 @@ impl<A> TreeSitterAnalyzer<A> {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut snapshot = self.clone();
         snapshot.project = project;
-        snapshot.query_read_cache = Arc::new(Mutex::new(QueryReadCache::default()));
         snapshot
     }
 }

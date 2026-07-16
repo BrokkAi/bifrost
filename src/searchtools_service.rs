@@ -177,30 +177,36 @@ enum SessionWatcher {
 /// Returning this from `snapshot_for_query` makes the cleanup obligation part
 /// of the type, including for direct callers such as the code-query REPL.
 struct WorkspaceQueryScope {
+    source_snapshot: Arc<WorkspaceAnalyzer>,
     snapshot: Arc<WorkspaceAnalyzer>,
     context: Arc<crate::analyzer::AnalyzerQueryContext>,
 }
 
 impl WorkspaceQueryScope {
-    fn new(snapshot: Arc<WorkspaceAnalyzer>) -> Self {
+    fn new(source_snapshot: Arc<WorkspaceAnalyzer>) -> Self {
         let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
-        Self::with_context(snapshot, context)
+        Self::with_context(source_snapshot, context)
     }
 
     fn with_context(
-        snapshot: Arc<WorkspaceAnalyzer>,
+        source_snapshot: Arc<WorkspaceAnalyzer>,
         context: Arc<crate::analyzer::AnalyzerQueryContext>,
     ) -> Self {
+        let snapshot = Arc::new(source_snapshot.as_ref().clone());
         snapshot.begin_query(&context);
-        Self { snapshot, context }
+        Self {
+            source_snapshot,
+            snapshot,
+            context,
+        }
     }
 
     fn arc(&self) -> &Arc<WorkspaceAnalyzer> {
-        &self.snapshot
+        &self.source_snapshot
     }
 
-    fn scope_snapshot(&self, snapshot: Arc<WorkspaceAnalyzer>) -> Self {
-        Self::with_context(snapshot, Arc::clone(&self.context))
+    fn scope_snapshot(&self, source_snapshot: Arc<WorkspaceAnalyzer>) -> Self {
+        Self::with_context(source_snapshot, Arc::clone(&self.context))
     }
 
     fn finish<T>(
@@ -1988,8 +1994,7 @@ mod analyzer_failure_boundary_tests {
     use serde_json::json;
     use std::collections::BTreeSet;
 
-    #[test]
-    fn multi_language_store_failure_replaces_false_empty_tool_success() {
+    fn multi_language_service() -> (tempfile::TempDir, PathBuf, SearchToolsService) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join("Model.java"), "class Model {}\n").unwrap();
@@ -2000,13 +2005,11 @@ mod analyzer_failure_boundary_tests {
             BTreeSet::from([Language::Java, Language::Python]),
         ));
         let service = SearchToolsService::new_manual_for_project(project).unwrap();
+        (temp, root, service)
+    }
 
-        let healthy = service
-            .call_tool_value("get_symbol_locations", json!({"symbols": ["Model"]}))
-            .unwrap();
-        assert_eq!(healthy["locations"][0]["symbol"], "Model");
-
-        let connection = rusqlite::Connection::open(analyzer_db_path(&root)).unwrap();
+    fn make_java_store_stale(root: &Path) {
+        let connection = rusqlite::Connection::open(analyzer_db_path(root)).unwrap();
         assert_eq!(
             connection
                 .execute(
@@ -2016,6 +2019,18 @@ mod analyzer_failure_boundary_tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn multi_language_store_failure_replaces_false_empty_tool_success() {
+        let (_temp, root, service) = multi_language_service();
+
+        let healthy = service
+            .call_tool_value("get_symbol_locations", json!({"symbols": ["Model"]}))
+            .unwrap();
+        assert_eq!(healthy["locations"][0]["symbol"], "Model");
+
+        make_java_store_stale(&root);
 
         let error = service
             .call_tool_value("get_symbol_locations", json!({"symbols": ["Model"]}))
@@ -2035,6 +2050,66 @@ mod analyzer_failure_boundary_tests {
         assert!(error.message.contains("search_symbols"));
         assert!(error.message.contains("searching symbol candidates"));
         assert!(error.message.contains("stale analyzer generation"));
+    }
+
+    #[test]
+    fn overlapping_query_scopes_do_not_share_store_failures() {
+        let (_temp, root, service) = multi_language_service();
+
+        let failing_scope = service.snapshot_for_query().unwrap();
+        let unaffected_scope = service.snapshot_for_query().unwrap();
+
+        make_java_store_stale(&root);
+
+        let definitions: Vec<_> = failing_scope.analyzer().definitions("Model").collect();
+        assert!(definitions.is_empty());
+        assert!(failing_scope.context.store_error().is_some());
+        assert!(
+            unaffected_scope.context.store_error().is_none(),
+            "a store failure must be attributed only to the request that observed it"
+        );
+
+        unaffected_scope
+            .finish("unaffected_request", Ok(()))
+            .unwrap();
+        let error = failing_scope.finish("failing_request", Ok(())).unwrap_err();
+        assert_eq!(error.code, SearchToolsServiceErrorCode::Internal);
+        assert!(error.message.contains("failing_request"));
+        assert!(error.message.contains("stale analyzer generation"));
+    }
+
+    #[test]
+    fn failed_merged_index_build_is_not_published_to_other_requests() {
+        let (_temp, root, service) = multi_language_service();
+        make_java_store_stale(&root);
+
+        let first_scope = service.snapshot_for_query().unwrap();
+        first_scope.analyzer().global_usage_definition_index();
+        assert!(first_scope.context.store_error().is_some());
+        assert_eq!(
+            first_scope
+                .analyzer()
+                .global_usage_definition_index_build_count_for_test(),
+            1
+        );
+        assert!(
+            first_scope
+                .finish("first_failed_index_build", Ok(()))
+                .is_err()
+        );
+
+        let retry_scope = service.snapshot_for_query().unwrap();
+        retry_scope.analyzer().global_usage_definition_index();
+        assert!(
+            retry_scope.context.store_error().is_some(),
+            "a failed request must not publish its incomplete merged index"
+        );
+        assert_eq!(
+            retry_scope
+                .analyzer()
+                .global_usage_definition_index_build_count_for_test(),
+            2
+        );
     }
 
     #[test]

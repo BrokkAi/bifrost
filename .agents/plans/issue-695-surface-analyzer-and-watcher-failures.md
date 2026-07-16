@@ -28,6 +28,8 @@ After this change, persisted-store opening and query failures will reach the too
 - [x] (2026-07-16 15:41Z) Passed isolated `cargo clippy --all-targets --all-features -- -D warnings` and the complete `cargo test --features nlp,python` suite. The full suite required external host access for process-spawn, uv-cache, GPG, and linked-worktree tests; its final isolated run exited successfully and removed its target.
 - [x] (2026-07-16 15:41Z) Passed `cargo fmt --all -- --check` and `git diff --check`, inspected the final changed-file list and issue diff, and confirmed only issue-plan and implementation files remain modified for the final checkpoint.
 - [x] (2026-07-16 15:41Z) Committed the reviewed final milestone on the issue branch after all gates passed.
+- [x] (2026-07-16 16:19Z) Guided review found that broadcasting a store failure to every overlapping context could fail an unrelated request and expose another request's symbol or path. Replaced shared query caches with lightweight request-local analyzer clones, retained single-flight successful merged indexes without publishing failed builds, and added deterministic overlap, cache-reuse, failed-publication, and concurrent-first-use regressions.
+- [x] (2026-07-16 16:29Z) Passed all 17 SearchTools service unit tests, the focused multi-analyzer tests, `cargo fmt --all -- --check`, `git diff --check`, isolated warnings-denied all-target/all-feature clippy, and the complete isolated `cargo test --features nlp,python` suite. Final architecture and operational re-review found no remaining actionable issues.
 
 ## Surprises & Discoveries
 
@@ -58,8 +60,8 @@ After this change, persisted-store opening and query failures will reach the too
   Rationale: Empty results are legitimate for unsupported analyzers and successful misses, while converting the entire analyzer trait and hundreds of semantic call sites would obscure the narrow failure boundary. A query context preserves existing internal APIs but prevents the service from returning a successful false-empty response after any affected store access failed.
   Date/Author: 2026-07-16 / Codex
 
-- Decision: Register every active context with each concrete tree-sitter analyzer and record a store failure into all overlapping contexts.
-  Rationale: Workspace snapshots can be queried concurrently. A single global last-error slot could attribute a failure to the wrong request or let one request clear another's error. Conservatively failing every overlapping query that shared the degraded analyzer is safer than emitting a false success.
+- Decision: Give every SearchTools query a lightweight analyzer clone with independent request caches and record failures only in contexts registered on that clone.
+  Rationale: Sharing active contexts across concurrent requests could fail a healthy request and disclose another request's symbol or path in the error. Clones continue sharing immutable runtime state and successfully published indexes, while request caches remain isolated so Rayon-backed work stays concurrent without cross-request attribution. Multi-analyzer merged-index construction checks the local request context before publishing, preventing a degraded request from poisoning the shared cache without rebuilding the whole index on every healthy request.
   Date/Author: 2026-07-16 / Codex
 
 - Decision: Keep the existing empty lazy-index fallback only as an internal compatibility value, while recording its underlying error and leaving the `OnceLock` unset.
@@ -86,8 +88,8 @@ After this change, persisted-store opening and query failures will reach the too
   Rationale: Exactly one concurrent first request must publish the service's initialization outcome. Releasing the mutex before construction allowed a successful session and a retained failure to race, poisoning an otherwise usable service.
   Date/Author: 2026-07-16 / Codex
 
-- Decision: Keep LSP analyzer scopes best-effort and retain conservative failure attribution across overlapping SearchTools queries.
-  Rationale: This issue's reportable contract is the SearchTools service boundary; the plan explicitly leaves LSP callers best-effort. Broadcasting a store failure to overlapping contexts can conservatively fail an unrelated request, but it guarantees a degraded shared analyzer cannot emit false success and avoids unreliable thread-local attribution across nested and Rayon-backed analyzer work.
+- Decision: Keep LSP analyzer scopes best-effort while isolating every overlapping SearchTools query through a request-local analyzer clone.
+  Rationale: This issue's reportable contract is the SearchTools service boundary; LSP callers remain best-effort. Request-local clones preserve concurrent and Rayon-backed analysis while ensuring only the query that observes a degraded store can fail at the service boundary.
   Date/Author: 2026-07-16 / Codex
 
 ## Outcomes & Retrospective
@@ -96,7 +98,7 @@ Milestone 1 prevents persisted analyzer construction from silently degrading to 
 
 Milestone 2 makes every production `WatchFiles` session contain a successfully started watcher. Eager construction fails immediately; lazy and deferred construction retain the failure so repeated calls remain explicit; manual construction never invokes the starter. Activation now builds the analyzer, starts the candidate watcher, and prepares semantic state before replacing the session and root. An injected activation failure leaves both the old root and a real `list_symbols` query intact.
 
-Milestone 3 closes the main tool dispatch, direct code-query, refreshed symbol-source, and semantic snapshot paths over one shared request context. Store failures from definition lookup, symbol search, declaration scans, hierarchy lookup, file/import hydration, and lazy derived indexes now reach that boundary. Analyzer epoch publication is fallible through every persisted language wrapper, and concurrent lazy service startup publishes exactly one outcome. Specialist re-review found no remaining high or critical issue in the accepted scope. Formatting, warnings-denied all-feature clippy, and the complete `nlp,python` suite pass. All three milestones are complete and checkpointed on the issue branch.
+Milestone 3 closes the main tool dispatch, direct code-query, refreshed symbol-source, and semantic snapshot paths over one shared request context. Store failures from definition lookup, symbol search, declaration scans, hierarchy lookup, file/import hydration, and lazy derived indexes now reach that boundary. Analyzer epoch publication is fallible through every persisted language wrapper, and concurrent lazy service startup publishes exactly one outcome. Guided review identified and fixed cross-request failure attribution: SearchTools requests now use isolated query caches, while successfully built immutable indexes remain shared and single-flight and failed merged-index builds remain local and retryable. Final specialist re-review found no actionable issue. Formatting, warnings-denied all-feature clippy, and the complete `nlp,python` suite pass. All three milestones and the review follow-up are complete on the issue branch.
 
 ## Context and Orientation
 
@@ -104,7 +106,7 @@ Milestone 3 closes the main tool dispatch, direct code-query, refreshed symbol-s
 
 `src/analyzer/tree_sitter_analyzer.rs` implements store-backed analyzer operations. `QueryReadCache` currently tracks a nesting depth plus request-lived OID and hydrated-file caches. The resultless `IAnalyzer` compatibility surface lives in `src/analyzer/i_analyzer.rs`; concrete language wrappers forward its query lifecycle methods to their inner `TreeSitterAnalyzer`. `src/analyzer/multi_analyzer.rs` fans lifecycle calls out to all active language delegates, and `src/analyzer/workspace.rs` is the service-facing wrapper.
 
-A query context in this plan means a thread-safe object created for one top-level tool or LSP request. It remembers the first analyzer storage error observed while that request is active. A tree-sitter analyzer keeps the contexts of all requests currently using its request cache. When a store-backed compatibility method must return an empty fallback, it also records the contextualized `StoreError` into each active context. LSP callers may continue to use best-effort results, but `SearchToolsService` must inspect the context before returning a successful tool response.
+A query context in this plan means a thread-safe object created for one top-level tool or LSP request. It remembers the first analyzer storage error observed while that request is active. SearchTools creates a lightweight analyzer clone per request, so each tree-sitter analyzer keeps only contexts using that request's cache. When a store-backed compatibility method must return an empty fallback, it records the contextualized `StoreError` into the active context on that clone. LSP callers may continue to use best-effort results, but `SearchToolsService` must inspect the context before returning a successful tool response.
 
 `src/searchtools_service.rs` owns `SearchToolsService`, `WorkspaceSession`, `WorkspaceQueryScope`, and `UpdateStrategy`. A `WorkspaceSession` currently stores `watcher: Option<ProjectChangeWatcher>`. `maybe_start_watcher` maps `ProjectChangeWatcher::start` through `.ok()`, so `None` represents both deliberate manual mode and failed automatic startup. `assemble_session` is consequently infallible, and that assumption reaches eager, transient, lazy, deferred, and workspace-activation paths.
 
@@ -116,7 +118,7 @@ A query context in this plan means a thread-safe object created for one top-leve
 
 Add `AnalyzerQueryContext` in `src/analyzer/i_analyzer.rs`. It should own a mutex-protected first `StoreError`, expose crate-internal record and inspect methods, and be shareable through `Arc`. Change `IAnalyzer::begin_query` and `end_query` to accept the same shared context. Default implementations remain no-ops, which preserves legitimate unsupported and empty analyzers. Update `AnalyzerQueryScope`, `WorkspaceAnalyzer`, `MultiAnalyzer`, and every language wrapper that currently forwards the no-argument lifecycle methods.
 
-In `TreeSitterAnalyzer`, replace `QueryReadCache::depth` with explicit active contexts or add an adjacent context collection while preserving the existing nested cache lifetime. Beginning a query registers the context and clears request caches only on the first active context; ending it removes that exact context using `Arc::ptr_eq` and clears caches when none remain. Add a helper that attaches the operation name to a `StoreError` and records the first failure into every active context.
+In `TreeSitterAnalyzer`, replace `QueryReadCache::depth` with explicit active contexts or add an adjacent context collection while preserving the existing nested cache lifetime. Beginning a query registers the context and clears request caches only on the first active context; ending it removes that exact context using `Arc::ptr_eq` and clears caches when none remain. SearchTools must clone the workspace analyzer at the request boundary so overlapping requests do not share this cache. Add a helper that attaches the operation name to a `StoreError` and records the first failure into the active context.
 
 Make the internal definition candidate family result-bearing: `sql_definition_candidates_vec`, `sql_definitions_vec`, and `sql_bounded_definitions_vec` should return `Result<Vec<CodeUnit>, StoreError>` rather than using `Option` for both failure and absence. The resultless `IAnalyzer::definitions` adapter may retain an empty compatibility fallback only after recording the error. Apply the same explicit match-and-record behavior to `global_usage_definition_index_handle` and `usage_facts_index_handle`; do not initialize their `OnceLock` values on failure. Audit the store-backed helpers used by these three families and replace only equivalent `StoreError`-to-empty conversions. Do not convert parsing, filesystem discovery, unsupported-language behavior, or semantic best-effort resolution into storage failures.
 
@@ -269,7 +271,7 @@ In `src/analyzer/i_analyzer.rs`, provide a crate-internal context with this conc
 
 Exact visibility may be adjusted to satisfy the public trait's visibility rules, but the context must not become a user-facing protocol type.
 
-In `src/analyzer/tree_sitter_analyzer.rs`, the internal definition candidate methods must return `Result<Vec<CodeUnit>, StoreError>`. The compatibility trait methods may retain their existing resultless signatures only while recording failures into every active context.
+In `src/analyzer/tree_sitter_analyzer.rs`, the internal definition candidate methods must return `Result<Vec<CodeUnit>, StoreError>`. The compatibility trait methods may retain their existing resultless signatures only while recording failures into the active request context.
 
 In `src/analyzer/workspace.rs`, persisted builders must return `Result<WorkspaceAnalyzer, StoreError>` or a repository-standard contextual wrapper that retains `StoreError`. Transient builders remain infallible except for their existing project setup boundaries.
 
