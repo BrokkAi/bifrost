@@ -69,7 +69,7 @@ impl PhpAnalyzer {
         config: AnalyzerConfig,
         store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
-    ) -> Self {
+    ) -> Result<Self, crate::analyzer::store::StoreError> {
         let memo_budget = config.memo_cache_budget_bytes();
         let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             project,
@@ -77,8 +77,8 @@ impl PhpAnalyzer {
             config,
             store_context,
             progress,
-        );
-        Self::from_inner(inner, memo_budget)
+        )?;
+        Ok(Self::from_inner(inner, memo_budget))
     }
 
     fn from_inner(inner: TreeSitterAnalyzer<PhpAdapter>, memo_budget: u64) -> Self {

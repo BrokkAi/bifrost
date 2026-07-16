@@ -1089,6 +1089,7 @@ where
 
     pub fn new_with_config(project: Arc<dyn Project>, adapter: A, config: AnalyzerConfig) -> Self {
         Self::new_internal(project, adapter, config, None, None)
+            .expect("failed to initialize in-memory analyzer store")
     }
 
     pub(crate) fn new_with_config_storage_context_and_progress(
@@ -1097,7 +1098,7 @@ where
         config: AnalyzerConfig,
         store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
-    ) -> Self {
+    ) -> std::result::Result<Self, StoreError> {
         Self::new_internal(project, adapter, config, progress, Some(store_context))
     }
 
@@ -1118,6 +1119,7 @@ where
         F: Fn(BuildProgressEvent) + Send + Sync + 'static,
     {
         Self::new_internal(project, adapter, config, Some(Arc::new(progress)), None)
+            .expect("failed to initialize in-memory analyzer store")
     }
 
     fn new_internal(
@@ -1126,7 +1128,7 @@ where
         config: AnalyzerConfig,
         progress: Option<BuildProgress>,
         store_context: Option<AnalyzerStoreContext>,
-    ) -> Self {
+    ) -> std::result::Result<Self, StoreError> {
         let adapter = Arc::new(adapter);
         let mut store_context =
             store_context.unwrap_or_else(|| default_store_context(project.as_ref()));
@@ -1144,7 +1146,7 @@ where
         let generations = store_context
             .store
             .ensure_language_epoch_values(&epochs)
-            .unwrap_or_else(|error| panic!("failed to publish analyzer epochs: {error}"));
+            .map_err(|error| error.context("publishing analyzer epochs"))?;
         store_context.generations = Arc::new(generations);
         let state = {
             let _scope = profiling::scope(format!(
@@ -1164,7 +1166,7 @@ where
         state.seed_snapshot_file_states(&mut source_snapshot_file_states);
 
         let structural_cache = Arc::new(Self::build_structural_cache(&config));
-        Self {
+        Ok(Self {
             project,
             adapter,
             config,
@@ -1193,7 +1195,7 @@ where
             global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
             workspace_path_scan_count: Arc::new(AtomicUsize::new(0)),
             _state: PhantomData,
-        }
+        })
     }
 
     /// The structural facts cache takes a slice of the shared memo budget,
@@ -2465,6 +2467,9 @@ where
                 Some(state)
             }
             Err(err) => {
+                self.record_store_error(
+                    err.clone().context("retrying a deferred parsed-blob write"),
+                );
                 let mut dirty_file_states = self
                     .state
                     .dirty_file_states
@@ -2526,17 +2531,17 @@ where
         self.full_hydration_count.fetch_add(1, Ordering::Relaxed);
         let source = self.source_for_oid(file, oid)?;
         let mut state = match self
-            .store_context
-            .store
-            .hydrate_file_state_with_source(
-                oid,
-                &storage_key,
-                self.store_context.generations[&storage_key],
-                self.adapter.as_ref(),
-                file,
-                &source,
+            .store_query_or_record(
+                self.store_context.store.hydrate_file_state_with_source(
+                    oid,
+                    &storage_key,
+                    self.store_context.generations[&storage_key],
+                    self.adapter.as_ref(),
+                    file,
+                    &source,
+                ),
+                format!("hydrating file state for `{file}`"),
             )
-            .ok()
             .flatten()
         {
             Some(state) => state,
@@ -2607,13 +2612,14 @@ where
         }
 
         let mut states = self
-            .store_context
-            .store
-            .hydrate_file_states_by_key(
-                &entries,
-                self.store_context.generations.as_ref(),
-                self.adapter.as_ref(),
-                &source_by_file,
+            .store_query_or_record(
+                self.store_context.store.hydrate_file_states_by_key(
+                    &entries,
+                    self.store_context.generations.as_ref(),
+                    self.adapter.as_ref(),
+                    &source_by_file,
+                ),
+                "hydrating file states",
             )
             .unwrap_or_default();
         self.bulk_hydration_count
@@ -2685,12 +2691,13 @@ where
             return out;
         }
         let mut facts: HashMap<ProjectFile, ImportFileFacts> = self
-            .store_context
-            .store
-            .hydrate_import_facts_by_key(
-                &entries,
-                self.store_context.generations.as_ref(),
-                self.adapter.as_ref(),
+            .store_query_or_record(
+                self.store_context.store.hydrate_import_facts_by_key(
+                    &entries,
+                    self.store_context.generations.as_ref(),
+                    self.adapter.as_ref(),
+                ),
+                "hydrating import facts",
             )
             .unwrap_or_default()
             .into_iter()
@@ -2907,9 +2914,13 @@ where
             .map(|(_, oid, storage_key)| (*oid, storage_key.clone()))
             .collect::<Vec<_>>();
         let present = self
-            .store_context
-            .store
-            .parsed_blob_keys_at_generations(&keys, self.store_context.generations.as_ref())
+            .store_query_or_record(
+                self.store_context.store.parsed_blob_keys_at_generations(
+                    &keys,
+                    self.store_context.generations.as_ref(),
+                ),
+                "checking analyzed live files",
+            )
             .unwrap_or_default();
         for (project_file, oid, storage_key) in persisted_candidates {
             if present.contains(&(oid, storage_key)) {
@@ -3031,8 +3042,10 @@ where
         &self,
         keep: impl FnMut(&CodeUnit) -> bool,
     ) -> Option<Vec<CodeUnit>> {
-        self.try_sql_nonpersisted_workspace_declarations_vec_matching(keep)
-            .ok()
+        self.store_query_or_record(
+            self.try_sql_nonpersisted_workspace_declarations_vec_matching(keep),
+            "querying non-persisted workspace declarations",
+        )
     }
 
     fn try_sql_nonpersisted_workspace_declarations_vec_matching(
@@ -3380,19 +3393,22 @@ where
         for lang in self.storage_language_keys_for_queries() {
             let mut after: Option<(String, Oid, i64)> = None;
             loop {
-                let rows = self
-                    .store_context
-                    .store
-                    .declaration_rows_by_package_prefix_page(
-                        &lang,
-                        self.store_context.generations[&lang],
-                        prefix,
-                        after.as_ref().map(|(qualifier, oid, unit_key)| {
-                            (qualifier.as_str(), *oid, *unit_key)
-                        }),
-                        PAGE_SIZE,
-                    )
-                    .unwrap_or_default();
+                let Some(rows) = self.store_query_or_record(
+                    self.store_context
+                        .store
+                        .declaration_rows_by_package_prefix_page(
+                            &lang,
+                            self.store_context.generations[&lang],
+                            prefix,
+                            after.as_ref().map(|(qualifier, oid, unit_key)| {
+                                (qualifier.as_str(), *oid, *unit_key)
+                            }),
+                            PAGE_SIZE,
+                        ),
+                    format!("querying declaration package prefix `{prefix}`"),
+                ) else {
+                    return false;
+                };
                 let Some(last) = rows.last() else {
                     break;
                 };
@@ -3426,16 +3442,19 @@ where
         let mut parser = Self::build_parser(self.adapter.parser_language());
         let state = Self::analyze_source(&mut parser, self.adapter.as_ref(), file, source)?;
         let storage_key = self.adapter.storage_language_key_for_file(file);
-        self.store_context
-            .store
-            .write_parsed_blob_at_generation(
+        self.store_query_or_record(
+            self.store_context.store.write_parsed_blob_at_generation(
                 oid,
                 &storage_key,
                 self.store_context.generations[&storage_key],
                 self.adapter.as_ref(),
                 &state,
-            )
-            .ok()?;
+            ),
+            format!(
+                "persisting live analyzer state for {}",
+                file.rel_path().display()
+            ),
+        )?;
         if let Some(liveness) = self.store_context.liveness.as_ref() {
             liveness.refresh_overlay([live_entry.clone()]).ok()?;
         }
@@ -3446,14 +3465,15 @@ where
     fn sql_all_declarations_vec(&self) -> Option<Vec<CodeUnit>> {
         self.full_declaration_scan_count
             .fetch_add(1, Ordering::Relaxed);
-        let rows = self
-            .store_context
-            .store
-            .declaration_candidate_rows_for_langs(
-                &self.storage_language_keys_for_queries(),
-                self.store_context.generations.as_ref(),
-            )
-            .ok()?;
+        let rows = self.store_query_or_record(
+            self.store_context
+                .store
+                .declaration_candidate_rows_for_langs(
+                    &self.storage_language_keys_for_queries(),
+                    self.store_context.generations.as_ref(),
+                ),
+            "scanning all declarations",
+        )?;
         let mut units = self.resolve_candidate_rows(rows);
         units.extend(self.dirty_units_matching(false, |_| true));
         units.extend(self.sql_nonpersisted_workspace_declarations_vec_matching(|_| true)?);
@@ -3466,14 +3486,15 @@ where
     fn sql_all_declarations_with_primary_ranges_vec(
         &self,
     ) -> Option<Vec<(CodeUnit, Option<Range>)>> {
-        let rows = self
-            .store_context
-            .store
-            .declaration_candidate_rows_with_primary_ranges_for_langs(
-                &self.storage_language_keys_for_queries(),
-                self.store_context.generations.as_ref(),
-            )
-            .ok()?;
+        let rows = self.store_query_or_record(
+            self.store_context
+                .store
+                .declaration_candidate_rows_with_primary_ranges_for_langs(
+                    &self.storage_language_keys_for_queries(),
+                    self.store_context.generations.as_ref(),
+                ),
+            "scanning declarations with primary ranges",
+        )?;
         let resolver = QueryResolver::from_snapshot(
             self.adapter.as_ref(),
             self.project.root(),
@@ -3513,15 +3534,16 @@ where
         &self,
         kind: CodeUnitType,
     ) -> Option<Vec<HierarchyDeclarationFacts>> {
-        let rows = self
-            .store_context
-            .store
-            .declaration_candidate_rows_with_primary_ranges_by_kind_for_langs(
-                &self.storage_language_keys_for_queries(),
-                self.store_context.generations.as_ref(),
-                kind,
-            )
-            .ok()?;
+        let rows = self.store_query_or_record(
+            self.store_context
+                .store
+                .declaration_candidate_rows_with_primary_ranges_by_kind_for_langs(
+                    &self.storage_language_keys_for_queries(),
+                    self.store_context.generations.as_ref(),
+                    kind,
+                ),
+            format!("querying {kind:?} hierarchy declarations"),
+        )?;
         let resolver = QueryResolver::from_snapshot(
             self.adapter.as_ref(),
             self.project.root(),
@@ -3597,11 +3619,12 @@ where
             .iter()
             .filter_map(|facts| facts.storage_key.clone())
             .collect::<Vec<_>>();
-        let persisted = self
-            .store_context
-            .store
-            .hierarchy_facts_by_keys(&keys, self.store_context.generations.as_ref())
-            .ok()?;
+        let persisted = self.store_query_or_record(
+            self.store_context
+                .store
+                .hierarchy_facts_by_keys(&keys, self.store_context.generations.as_ref()),
+            "hydrating hierarchy declaration facts",
+        )?;
         for facts in facts {
             let Some(storage_key) = facts.storage_key.as_ref() else {
                 continue;
@@ -3780,14 +3803,16 @@ where
         let mut rows = Vec::new();
         for short_name in &candidate_names {
             rows.extend(
-                self.store_context
-                    .store
-                    .declaration_candidate_rows_by_short_name_for_langs(
-                        &langs,
-                        self.store_context.generations.as_ref(),
-                        short_name,
-                    )
-                    .ok()?,
+                self.store_query_or_record(
+                    self.store_context
+                        .store
+                        .declaration_candidate_rows_by_short_name_for_langs(
+                            &langs,
+                            self.store_context.generations.as_ref(),
+                            short_name,
+                        ),
+                    format!("querying declaration candidates for `{symbol}`"),
+                )?,
             );
         }
 
@@ -3810,12 +3835,15 @@ where
     pub(crate) fn lookup_declarations_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
         let langs = self.storage_language_keys_for_queries();
         let rows = self
-            .store_context
-            .store
-            .declaration_candidate_rows_by_identifier_for_langs(
-                &langs,
-                self.store_context.generations.as_ref(),
-                identifier,
+            .store_query_or_record(
+                self.store_context
+                    .store
+                    .declaration_candidate_rows_by_identifier_for_langs(
+                        &langs,
+                        self.store_context.generations.as_ref(),
+                        identifier,
+                    ),
+                format!("querying declarations by identifier `{identifier}`"),
             )
             .unwrap_or_default();
         let mut matches: BTreeSet<_> = self
@@ -3850,13 +3878,16 @@ where
             fqn.to_string()
         };
         let rows = self
-            .store_context
-            .store
-            .declaration_candidate_rows_by_lookup_key_for_langs(
-                &self.storage_language_keys_for_queries(),
-                self.store_context.generations.as_ref(),
-                key,
-                &lookup,
+            .store_query_or_record(
+                self.store_context
+                    .store
+                    .declaration_candidate_rows_by_lookup_key_for_langs(
+                        &self.storage_language_keys_for_queries(),
+                        self.store_context.generations.as_ref(),
+                        key,
+                        &lookup,
+                    ),
+                format!("querying declarations by persisted name `{lookup}`"),
             )
             .unwrap_or_default();
         let mut matches: BTreeSet<_> = self.resolve_candidate_rows(rows).into_iter().collect();
@@ -3888,14 +3919,17 @@ where
         name: &str,
     ) -> BTreeSet<CodeUnit> {
         let exact_rows = self
-            .store_context
-            .store
-            .declaration_member_rows_for_owner_for_langs(
-                &self.storage_language_keys_for_queries(),
-                self.store_context.generations.as_ref(),
-                owner_fqn,
-                false,
-                name,
+            .store_query_or_record(
+                self.store_context
+                    .store
+                    .declaration_member_rows_for_owner_for_langs(
+                        &self.storage_language_keys_for_queries(),
+                        self.store_context.generations.as_ref(),
+                        owner_fqn,
+                        false,
+                        name,
+                    ),
+                format!("querying members named `{name}` for `{owner_fqn}`"),
             )
             .unwrap_or_default();
         let mut matches: BTreeSet<_> = self
@@ -3917,14 +3951,17 @@ where
 
         let normalized_owner = self.adapter.normalize_full_name(owner_fqn);
         let normalized_rows = self
-            .store_context
-            .store
-            .declaration_member_rows_for_owner_for_langs(
-                &self.storage_language_keys_for_queries(),
-                self.store_context.generations.as_ref(),
-                &normalized_owner,
-                true,
-                name,
+            .store_query_or_record(
+                self.store_context
+                    .store
+                    .declaration_member_rows_for_owner_for_langs(
+                        &self.storage_language_keys_for_queries(),
+                        self.store_context.generations.as_ref(),
+                        &normalized_owner,
+                        true,
+                        name,
+                    ),
+                format!("querying normalized members named `{name}` for `{owner_fqn}`"),
             )
             .unwrap_or_default();
         matches.extend(self.resolve_candidate_rows(normalized_rows));
@@ -3953,12 +3990,15 @@ where
             return true;
         }
         let rows = self
-            .store_context
-            .store
-            .declaration_rows_by_package_for_langs(
-                &self.storage_language_keys_for_queries(),
-                self.store_context.generations.as_ref(),
-                package,
+            .store_query_or_record(
+                self.store_context
+                    .store
+                    .declaration_rows_by_package_for_langs(
+                        &self.storage_language_keys_for_queries(),
+                        self.store_context.generations.as_ref(),
+                        package,
+                    ),
+                format!("querying declarations in package `{package}`"),
             )
             .unwrap_or_default();
         self.resolve_candidate_rows(rows)
@@ -3994,23 +4034,27 @@ where
             .persisted_content_qualifier_supports_substring_search()
             && literal_ascii_search_substring(&pattern).is_some()
         {
-            self.store_context
-                .store
-                .declaration_candidate_rows_by_literal_substring_for_langs(
-                    &storage_languages,
-                    self.store_context.generations.as_ref(),
-                    &pattern,
-                )
-                .ok()?
+            self.store_query_or_record(
+                self.store_context
+                    .store
+                    .declaration_candidate_rows_by_literal_substring_for_langs(
+                        &storage_languages,
+                        self.store_context.generations.as_ref(),
+                        &pattern,
+                    ),
+                format!("searching definitions for `{pattern}`"),
+            )?
         } else {
-            self.store_context
-                .store
-                .declaration_candidate_rows_by_pattern_for_langs(
-                    &storage_languages,
-                    self.store_context.generations.as_ref(),
-                    &pattern,
-                )
-                .ok()?
+            self.store_query_or_record(
+                self.store_context
+                    .store
+                    .declaration_candidate_rows_by_pattern_for_langs(
+                        &storage_languages,
+                        self.store_context.generations.as_ref(),
+                        &pattern,
+                    ),
+                format!("searching definitions for `{pattern}`"),
+            )?
         };
         let mut out: BTreeSet<_> = self
             .resolve_candidate_rows(rows)
@@ -4055,15 +4099,16 @@ where
             .case_insensitive(true)
             .build()
             .ok()?;
-        let rows = self
-            .store_context
-            .store
-            .search_candidate_rows_by_pattern_for_langs(
-                &self.storage_language_keys_for_queries(),
-                self.store_context.generations.as_ref(),
-                &pattern,
-            )
-            .ok()?;
+        let rows = self.store_query_or_record(
+            self.store_context
+                .store
+                .search_candidate_rows_by_pattern_for_langs(
+                    &self.storage_language_keys_for_queries(),
+                    self.store_context.generations.as_ref(),
+                    &pattern,
+                ),
+            format!("searching symbol candidates for `{pattern}`"),
+        )?;
         let resolver = QueryResolver::from_snapshot(
             self.adapter.as_ref(),
             self.project.root(),
@@ -4132,23 +4177,23 @@ where
             return Some(content_qualifier);
         }
         let storage_key = self.adapter.storage_language_key_for_file(file);
-        self.store_context
-            .store
-            .content_package(
+        self.store_query_or_record(
+            self.store_context.store.content_package(
                 oid,
                 &storage_key,
                 self.store_context.generations[&storage_key],
-            )
-            .ok()
-            .flatten()
-            .or_else(|| {
-                self.source_snapshot_file_state(file)
-                    .map(|state| state.content_qualifier.clone())
-            })
-            .or_else(|| {
-                self.fetch_file_state(file)
-                    .map(|state| state.content_qualifier.clone())
-            })
+            ),
+            format!("querying the content qualifier for `{file}`"),
+        )
+        .flatten()
+        .or_else(|| {
+            self.source_snapshot_file_state(file)
+                .map(|state| state.content_qualifier.clone())
+        })
+        .or_else(|| {
+            self.fetch_file_state(file)
+                .map(|state| state.content_qualifier.clone())
+        })
     }
 
     pub(crate) fn ruby_method_dispatch_mode(
@@ -4168,24 +4213,24 @@ where
             return imports;
         }
         let storage_key = self.adapter.storage_language_key_for_file(file);
-        self.store_context
-            .store
-            .hydrate_import_infos_by_key(
+        self.store_query_or_record(
+            self.store_context.store.hydrate_import_infos_by_key(
                 &[(file.clone(), oid, storage_key)],
                 self.store_context.generations.as_ref(),
                 self.adapter.as_ref(),
-            )
-            .ok()
-            .and_then(|mut imports| imports.remove(file))
-            .or_else(|| {
-                self.source_snapshot_file_state(file)
-                    .map(|state| state.imports.clone())
-            })
-            .or_else(|| {
-                self.fetch_file_state(file)
-                    .map(|state| state.imports.clone())
-            })
-            .unwrap_or_default()
+            ),
+            format!("hydrating imports for `{file}`"),
+        )
+        .and_then(|mut imports| imports.remove(file))
+        .or_else(|| {
+            self.source_snapshot_file_state(file)
+                .map(|state| state.imports.clone())
+        })
+        .or_else(|| {
+            self.fetch_file_state(file)
+                .map(|state| state.imports.clone())
+        })
+        .unwrap_or_default()
     }
 
     pub(crate) fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
@@ -4234,11 +4279,14 @@ where
 
     pub(crate) fn class_declarations_in_package(&self, package_name: &str) -> Vec<CodeUnit> {
         let rows = self
-            .store_context
-            .store
-            .declaration_candidate_rows_for_langs(
-                &self.storage_language_keys_for_queries(),
-                self.store_context.generations.as_ref(),
+            .store_query_or_record(
+                self.store_context
+                    .store
+                    .declaration_candidate_rows_for_langs(
+                        &self.storage_language_keys_for_queries(),
+                        self.store_context.generations.as_ref(),
+                    ),
+                format!("querying class declarations in package `{package_name}`"),
             )
             .unwrap_or_default()
             .into_iter()
@@ -4391,6 +4439,20 @@ where
             .clone();
         for context in contexts {
             context.record_store_error(error.clone());
+        }
+    }
+
+    fn store_query_or_record<T>(
+        &self,
+        result: std::result::Result<T, StoreError>,
+        operation: impl std::fmt::Display,
+    ) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(error) => {
+                self.record_store_error(error.context(operation));
+                None
+            }
         }
     }
 
@@ -4597,16 +4659,16 @@ where
         }
         let storage_key = self.adapter.storage_language_key_for_file(file);
         let projection = self
-            .store_context
-            .store
-            .summary_file_projection(
-                oid,
-                &storage_key,
-                self.store_context.generations[&storage_key],
-                self.adapter.as_ref(),
-                file,
+            .store_query_or_record(
+                self.store_context.store.summary_file_projection(
+                    oid,
+                    &storage_key,
+                    self.store_context.generations[&storage_key],
+                    self.adapter.as_ref(),
+                    file,
+                ),
+                format!("hydrating summary projection for `{file}`"),
             )
-            .ok()
             .flatten()?;
         let projection = Arc::new(projection);
         self.summary_file_projections
@@ -4640,12 +4702,13 @@ where
             let key = Self::transient_cache_key(oid, file);
             self.retry_dirty_file_state(&key, &storage_key).is_some()
                 || self
-                    .store_context
-                    .store
-                    .contains_parsed_blob_at_generation(
-                        oid,
-                        &storage_key,
-                        self.store_context.generations[&storage_key],
+                    .store_query_or_record(
+                        self.store_context.store.contains_parsed_blob_at_generation(
+                            oid,
+                            &storage_key,
+                            self.store_context.generations[&storage_key],
+                        ),
+                        format!("checking whether `{file}` is analyzed"),
                     )
                     .unwrap_or(false)
         }
@@ -5526,6 +5589,51 @@ mod tests {
     }
 
     #[test]
+    fn persisted_epoch_publication_failure_is_returned_from_analyzer_construction() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let db = root.join("analyzer.db");
+        drop(AnalyzerStore::open_persistent(&db).expect("initialize persistent store"));
+        let conn = crate::cache_db::open_unified_connection(&db).expect("open test connection");
+        conn.execute_batch(
+            "CREATE TRIGGER fail_epoch_publication
+             BEFORE INSERT ON analysis_epochs
+             BEGIN
+                 SELECT RAISE(FAIL, 'forced epoch publication failure');
+             END;",
+        )
+        .expect("install epoch failure trigger");
+        drop(conn);
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Java));
+        let store_context = AnalyzerStoreContext {
+            store: Arc::new(AnalyzerStore::open_persistent(&db).expect("reopen persistent store")),
+            gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
+            liveness: None,
+            live_paths: Arc::new(LivePathMap::default()),
+            generations: Arc::new(HashMap::default()),
+        };
+
+        let error = match TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            project,
+            JavaAdapter,
+            AnalyzerConfig::default(),
+            store_context,
+            None,
+        ) {
+            Ok(_) => panic!("epoch publication failure should be returned"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("publishing analyzer epochs"));
+        assert!(
+            error
+                .to_string()
+                .contains("forced epoch publication failure")
+        );
+    }
+
+    #[test]
     fn reconcile_persists_fast_parse_before_blocked_slow_parse_is_released() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -5578,7 +5686,10 @@ mod tests {
             *released.lock().expect("parse release mutex poisoned") = true;
             wake.notify_all();
         }
-        build.join().expect("analyzer build should finish");
+        build
+            .join()
+            .expect("analyzer build should finish")
+            .expect("analyzer epochs should initialize");
 
         assert!(
             persistence_starts_before_release > 0,
@@ -5609,7 +5720,8 @@ mod tests {
             },
             store_context,
             None,
-        );
+        )
+        .expect("analyzer epochs should initialize");
 
         assert_eq!(store.parsed_blob_transaction_starts_for_test(), 5);
         assert_eq!(analyzer.state.persistence_stats.transactions, 5);
@@ -5665,7 +5777,8 @@ mod tests {
             },
             store_context,
             Some(progress),
-        );
+        )
+        .expect("analyzer epochs should initialize");
         *PREPARATION_FAILURE_PATH
             .lock()
             .expect("preparation failure path mutex poisoned") = None;
@@ -6697,7 +6810,8 @@ mod tests {
             config.clone(),
             store_context.clone(),
             None,
-        );
+        )
+        .expect("analyzer epochs should initialize");
         store.reset_parsed_blob_point_contains_queries_for_test();
         let warm_parse_count = Arc::new(AtomicUsize::new(0));
         let warm_progress_count = Arc::clone(&warm_parse_count);
@@ -6711,7 +6825,8 @@ mod tests {
                     warm_progress_count.fetch_add(1, Ordering::Relaxed);
                 }
             })),
-        );
+        )
+        .expect("analyzer epochs should initialize");
         let warm_point_queries = store.parsed_blob_point_contains_queries_for_test();
         assert_eq!(warm.get_definitions("dup_a.shared.Shared").len(), 1);
         assert_eq!(warm.get_definitions("dup_b.shared.Shared").len(), 1);
@@ -6731,7 +6846,8 @@ mod tests {
                     progress_count.fetch_add(1, Ordering::Relaxed);
                 }
             })),
-        );
+        )
+        .expect("analyzer epochs should initialize");
         let recovery_point_queries = store.parsed_blob_point_contains_queries_for_test();
 
         assert_eq!(

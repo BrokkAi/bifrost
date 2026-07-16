@@ -122,7 +122,7 @@ impl RustAnalyzer {
         config: AnalyzerConfig,
         store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
-    ) -> Self {
+    ) -> Result<Self, crate::analyzer::store::StoreError> {
         let memo_budget = config.memo_cache_budget_bytes();
         let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             project,
@@ -130,8 +130,8 @@ impl RustAnalyzer {
             config,
             store_context,
             progress,
-        );
-        Self {
+        )?;
+        Ok(Self {
             inner,
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
@@ -147,7 +147,7 @@ impl RustAnalyzer {
             usage_index: Arc::new(OnceLock::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
-        }
+        })
     }
 
     pub fn from_project<P>(project: P) -> Self

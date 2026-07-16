@@ -324,7 +324,7 @@ impl TypescriptAnalyzer {
         config: AnalyzerConfig,
         store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
-    ) -> Self {
+    ) -> Result<Self, crate::analyzer::store::StoreError> {
         let memo_budget = config.memo_cache_budget_bytes();
         let alias_resolver = Arc::new(AliasResolver::new(project.root().to_path_buf()));
         let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
@@ -333,8 +333,8 @@ impl TypescriptAnalyzer {
             config,
             store_context,
             progress,
-        );
-        Self {
+        )?;
+        Ok(Self {
             inner,
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 3, weight_code_unit_set),
@@ -345,7 +345,7 @@ impl TypescriptAnalyzer {
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             jsts_usage_index: Arc::new(PoolSafeMemo::new()),
             alias_resolver,
-        }
+        })
     }
 
     pub fn from_project<P>(project: P) -> Self

@@ -106,7 +106,7 @@ impl JavaAnalyzer {
         config: AnalyzerConfig,
         store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
-    ) -> Self {
+    ) -> Result<Self, crate::analyzer::store::StoreError> {
         let memo_budget = config.memo_cache_budget_bytes();
         let external_dependencies = config.java.external_dependencies.clone();
         let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
@@ -115,13 +115,13 @@ impl JavaAnalyzer {
             config,
             store_context,
             progress,
-        );
-        Self {
+        )?;
+        Ok(Self {
             inner,
             memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
             external_dependencies,
             external_index: Arc::new(std::sync::OnceLock::new()),
-        }
+        })
     }
 
     pub fn from_project<P>(project: P) -> Self

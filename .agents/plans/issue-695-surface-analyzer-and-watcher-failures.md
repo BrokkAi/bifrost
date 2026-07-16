@@ -21,8 +21,13 @@ After this change, persisted-store opening and query failures will reach the too
 - [x] (2026-07-16 14:29Z) Committed the reviewed analyzer/store milestone as `88bb1d3a` (`fix: surface persisted analyzer failures`).
 - [x] (2026-07-16 14:36Z) Replaced optional watcher state with explicit disabled/active state, injected watcher startup per service, made eager/lazy/deferred session assembly fallible, retained lazy/deferred failures, and made workspace activation transactional.
 - [x] (2026-07-16 14:36Z) Passed five deterministic watcher-failure tests, all 12 service unit tests, both real polling-watcher tests, and all six activation integration tests; the linked-worktree activation tests required access to the primary checkout's shared `.brokk` cache.
-- [ ] Commit the reviewed watcher/session milestone checkpoint.
-- [ ] Run formatting, all-target/all-feature clippy, the full `nlp,python` test suite, inspect the final diff, and perform the required post-milestone review.
+- [x] (2026-07-16 14:37Z) Committed the reviewed watcher/session milestone as `70bcb14c` (`fix: fail watcher-backed session startup`).
+- [x] (2026-07-16 15:01Z) Closed every reportable SearchTools boundary over the analyzer query context and added a real multi-language service regression proving stale definition and symbol-search queries return `Internal` instead of false-empty success.
+- [x] (2026-07-16 15:01Z) Fixed the specialist-review findings: serialized concurrent lazy initialization, recorded the remaining store-backed search/declaration/hydration failures, and propagated analyzer epoch-publication failures instead of panicking. Both reviewing agents confirmed no high or critical findings remain in those scopes.
+- [x] (2026-07-16 15:01Z) Passed `cargo fmt --all`, `cargo check --all-targets`, the deterministic epoch-publication regression, both analyzer failure-boundary tests, and all 15 `searchtools_service::` unit tests.
+- [x] (2026-07-16 15:41Z) Passed isolated `cargo clippy --all-targets --all-features -- -D warnings` and the complete `cargo test --features nlp,python` suite. The full suite required external host access for process-spawn, uv-cache, GPG, and linked-worktree tests; its final isolated run exited successfully and removed its target.
+- [x] (2026-07-16 15:41Z) Passed `cargo fmt --all -- --check` and `git diff --check`, inspected the final changed-file list and issue diff, and confirmed only issue-plan and implementation files remain modified for the final checkpoint.
+- [x] (2026-07-16 15:41Z) Committed the reviewed final milestone on the issue branch after all gates passed.
 
 ## Surprises & Discoveries
 
@@ -43,6 +48,9 @@ After this change, persisted-store opening and query failures will reach the too
 
 - Observation: On this macOS host, `cargo test --features nlp,python` requires dynamic lookup for PyO3 extension-module symbols.
   Evidence: the first isolated run failed at link time on unresolved `_Py*` symbols. Repeating it with `RUSTFLAGS='-Clink-arg=-undefined -Clink-arg=dynamic_lookup'` and `BIFROST_SEMANTIC_INDEX=off` linked and passed all 39 analyzer-persistence tests. This matches existing repository ExecPlan guidance for the same host.
+
+- Observation: The shell initially resolved a non-rustup compiler whose metadata was incompatible with cached dependencies, and an interrupted isolated clippy build exhausted the filesystem.
+  Evidence: the first clippy attempt failed with Rust `E0514`; pinning `PATH` to `/Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin` fixed the toolchain mismatch. `scripts/cleanup-bifrost-tmp.sh --apply --include-unmanaged` then removed reviewed stale build targets and restored more than 40 GiB before validation resumed.
 
 ## Decision Log
 
@@ -74,11 +82,21 @@ After this change, persisted-store opening and query failures will reach the too
   Rationale: A per-instance dependency can fail eager, lazy, deferred, and activation paths deterministically without relying on platform watcher limits or global mutable hooks that race under parallel tests.
   Date/Author: 2026-07-16 / Codex
 
+- Decision: Serialize lazy workspace construction under the existing pending-build mutex.
+  Rationale: Exactly one concurrent first request must publish the service's initialization outcome. Releasing the mutex before construction allowed a successful session and a retained failure to race, poisoning an otherwise usable service.
+  Date/Author: 2026-07-16 / Codex
+
+- Decision: Keep LSP analyzer scopes best-effort and retain conservative failure attribution across overlapping SearchTools queries.
+  Rationale: This issue's reportable contract is the SearchTools service boundary; the plan explicitly leaves LSP callers best-effort. Broadcasting a store failure to overlapping contexts can conservatively fail an unrelated request, but it guarantees a degraded shared analyzer cannot emit false success and avoids unreliable thread-local attribution across nested and Rayon-backed analyzer work.
+  Date/Author: 2026-07-16 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 prevents persisted analyzer construction from silently degrading to memory and retains the failed database path in its error. Store-backed definition, path-module, global-definition-index, and usage-facts compatibility paths record their first `StoreError` in every active request context without poisoning their retryable lazy cells. Healthy missing symbols and unsupported analyzers still return empty results without an error.
 
-Milestone 2 makes every production `WatchFiles` session contain a successfully started watcher. Eager construction fails immediately; lazy and deferred construction retain the failure so repeated calls remain explicit; manual construction never invokes the starter. Activation now builds the analyzer, starts the candidate watcher, and prepares semantic state before replacing the session and root. An injected activation failure leaves both the old root and a real `list_symbols` query intact. The remaining work is closing every service response boundary over the analyzer query context, followed by full gates and specialist review.
+Milestone 2 makes every production `WatchFiles` session contain a successfully started watcher. Eager construction fails immediately; lazy and deferred construction retain the failure so repeated calls remain explicit; manual construction never invokes the starter. Activation now builds the analyzer, starts the candidate watcher, and prepares semantic state before replacing the session and root. An injected activation failure leaves both the old root and a real `list_symbols` query intact.
+
+Milestone 3 closes the main tool dispatch, direct code-query, refreshed symbol-source, and semantic snapshot paths over one shared request context. Store failures from definition lookup, symbol search, declaration scans, hierarchy lookup, file/import hydration, and lazy derived indexes now reach that boundary. Analyzer epoch publication is fallible through every persisted language wrapper, and concurrent lazy service startup publishes exactly one outcome. Specialist re-review found no remaining high or critical issue in the accepted scope. Formatting, warnings-denied all-feature clippy, and the complete `nlp,python` suite pass. All three milestones are complete and checkpointed on the issue branch.
 
 ## Context and Orientation
 
@@ -205,6 +223,23 @@ The watcher milestone proof is:
 
     cargo test --test searchtools_service activate_workspace
     test result: ok. 6 passed; 0 failed; 0 ignored
+
+The final service-boundary and initialization proof is:
+
+    cargo test --lib searchtools_service::
+    test result: ok. 15 passed; 0 failed; 0 ignored
+
+    test analyzer::tree_sitter_analyzer::tests::persisted_epoch_publication_failure_is_returned_from_analyzer_construction ... ok
+    test searchtools_service::analyzer_failure_boundary_tests::multi_language_store_failure_replaces_false_empty_tool_success ... ok
+    test searchtools_service::watcher_startup_tests::concurrent_lazy_first_use_publishes_one_session_outcome ... ok
+
+The final repository gates are:
+
+    env PATH=/Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin:$PATH scripts/with-isolated-cargo-target.sh cargo clippy --all-targets --all-features -- -D warnings
+    Finished `dev` profile; exit 0
+
+    env PATH=/Users/dave/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin:$PATH RUSTFLAGS='-Clink-arg=-undefined -Clink-arg=dynamic_lookup' BIFROST_SEMANTIC_INDEX=off scripts/with-isolated-cargo-target.sh cargo test --features nlp,python
+    Doc-tests brokk_bifrost: ok; command exit 0; isolated target removed
 
 The source proof for watcher failure erasure is:
 

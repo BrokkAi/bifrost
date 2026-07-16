@@ -184,12 +184,39 @@ struct WorkspaceQueryScope {
 impl WorkspaceQueryScope {
     fn new(snapshot: Arc<WorkspaceAnalyzer>) -> Self {
         let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        Self::with_context(snapshot, context)
+    }
+
+    fn with_context(
+        snapshot: Arc<WorkspaceAnalyzer>,
+        context: Arc<crate::analyzer::AnalyzerQueryContext>,
+    ) -> Self {
         snapshot.begin_query(&context);
         Self { snapshot, context }
     }
 
     fn arc(&self) -> &Arc<WorkspaceAnalyzer> {
         &self.snapshot
+    }
+
+    fn scope_snapshot(&self, snapshot: Arc<WorkspaceAnalyzer>) -> Self {
+        Self::with_context(snapshot, Arc::clone(&self.context))
+    }
+
+    fn finish<T>(
+        self,
+        operation: &str,
+        result: Result<T, SearchToolsServiceError>,
+    ) -> Result<T, SearchToolsServiceError> {
+        match result {
+            Err(error) => Err(error),
+            Ok(value) => match self.context.store_error() {
+                Some(error) => Err(SearchToolsServiceError::internal(format!(
+                    "Analyzer store failure while running `{operation}`: {error}"
+                ))),
+                None => Ok(value),
+            },
+        }
     }
 }
 
@@ -461,7 +488,7 @@ impl SearchToolsService {
             let _scope = profiling::scope("SearchToolsService::snapshot_for_query");
             self.snapshot_for_query()?
         };
-        match name {
+        let result = (|| match name {
             "search_symbols" => Self::decode_render_and_run(
                 &snapshot,
                 arguments,
@@ -662,7 +689,8 @@ impl SearchToolsService {
             _ => Err(SearchToolsServiceError::unknown_tool(format!(
                 "Unknown tool: {name}"
             ))),
-        }
+        })();
+        snapshot.finish(name, result)
     }
 
     pub fn query_code_result(
@@ -671,7 +699,8 @@ impl SearchToolsService {
     ) -> Result<crate::analyzer::structural::CodeQueryResult, SearchToolsServiceError> {
         let arguments = self.normalize_arguments_for_current_workspace("query_code", arguments)?;
         let snapshot = self.snapshot_for_query()?;
-        Self::query_code_result_for_snapshot(&snapshot, arguments)
+        let result = Self::query_code_result_for_snapshot(&snapshot, arguments);
+        snapshot.finish("query_code", result)
     }
 
     fn query_code_result_for_snapshot(
@@ -1015,7 +1044,6 @@ impl SearchToolsService {
                 }
             }
         }
-        drop(pending);
         if let Some(err) = self
             .build_error
             .lock()
@@ -1056,6 +1084,7 @@ impl SearchToolsService {
                 *guard = Some(session);
             }
         }
+        drop(pending);
         Ok(())
     }
 
@@ -1263,10 +1292,14 @@ impl SearchToolsService {
             };
 
             if !Arc::ptr_eq(initial_snapshot.arc(), &final_snapshot) {
+                let final_snapshot = initial_snapshot.scope_snapshot(final_snapshot);
                 result = get_symbol_sources(final_snapshot.analyzer(), params);
+                let output = Self::symbol_sources_output(result, render_options);
+                return final_snapshot.finish("get_symbol_sources", output);
             }
         }
-        Self::symbol_sources_output(result, render_options)
+        let output = Self::symbol_sources_output(result, render_options);
+        initial_snapshot.finish("get_symbol_sources", output)
     }
 
     fn symbol_sources_output(
@@ -1286,15 +1319,17 @@ impl SearchToolsService {
     #[cfg(feature = "nlp")]
     fn semantic_snapshot_for_query(
         &self,
-    ) -> Result<(Arc<WorkspaceAnalyzer>, Option<Arc<SemanticIndexer>>), SearchToolsServiceError>
-    {
+    ) -> Result<(WorkspaceQueryScope, Option<Arc<SemanticIndexer>>), SearchToolsServiceError> {
         let mut guard = self.write_session()?;
         let session = guard.as_mut().ok_or_else(Self::closed_error)?;
         match self.update_strategy {
             UpdateStrategy::WatchFiles => Self::apply_watcher_delta(session),
             UpdateStrategy::Manual => {}
         }
-        Ok((Arc::clone(&session.snapshot), session.semantic.clone()))
+        Ok((
+            WorkspaceQueryScope::new(Arc::clone(&session.snapshot)),
+            session.semantic.clone(),
+        ))
     }
 
     fn apply_watcher_delta(session: &mut WorkspaceSession) {
@@ -1519,17 +1554,18 @@ impl SearchToolsService {
         render_options: RenderOptions,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
         let (snapshot, semantic) = self.semantic_snapshot_for_query()?;
-        let Some(indexer) = semantic else {
-            return Err(SearchToolsServiceError::invalid_params(
+        let result = match semantic {
+            Some(indexer) => Self::decode_render_and_try_run(
+                &snapshot,
+                arguments,
+                render_options,
+                move |workspace, params| semantic_search(workspace, &indexer, params),
+            ),
+            None => Err(SearchToolsServiceError::invalid_params(
                 "semantic_search is disabled for this session (set BIFROST_SEMANTIC_INDEX=auto to enable it)",
-            ));
+            )),
         };
-        Self::decode_render_and_try_run(
-            &snapshot,
-            arguments,
-            render_options,
-            move |workspace, params| semantic_search(workspace, &indexer, params),
-        )
+        snapshot.finish("semantic_search", result)
     }
 
     #[cfg(feature = "nlp")]
@@ -1541,12 +1577,13 @@ impl SearchToolsService {
             SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
         })?;
         let (snapshot, semantic) = self.semantic_snapshot_for_query()?;
-        let Some(indexer) = semantic else {
-            return Err(SearchToolsServiceError::invalid_params(
+        let result = match semantic {
+            Some(indexer) => Self::structured_only(indexer.status(&snapshot)),
+            None => Err(SearchToolsServiceError::invalid_params(
                 "semantic_search_status is disabled for this session (set BIFROST_SEMANTIC_INDEX=auto to enable it)",
-            ));
+            )),
         };
-        Self::structured_only(indexer.status(&snapshot))
+        snapshot.finish("semantic_search_status", result)
     }
 
     #[cfg(not(feature = "nlp"))]
@@ -1758,7 +1795,9 @@ fn active_workspace_result(root: &Path) -> Result<ToolOutput, SearchToolsService
 mod watcher_startup_tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     const WATCHER_FAILURE: &str = "injected watcher startup failure";
 
@@ -1819,6 +1858,46 @@ mod watcher_startup_tests {
                 .call_tool_value("get_active_workspace", json!({}))
                 .unwrap_err();
             assert_watcher_error(&error);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn concurrent_lazy_first_use_publishes_one_session_outcome() {
+        const CALLERS: usize = 8;
+        let (_temp, root) = workspace("Concurrent.java", "class Concurrent {}\n");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let starter: WatcherStarter = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |project| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(50));
+                ProjectChangeWatcher::start_polling_for_tests(project)
+            })
+        };
+        let service = Arc::new(
+            SearchToolsService::new_lazy_with_strategy_and_watcher_starter(
+                root,
+                UpdateStrategy::WatchFiles,
+                false,
+                starter,
+            )
+            .unwrap(),
+        );
+        let barrier = Arc::new(Barrier::new(CALLERS));
+
+        let handles = (0..CALLERS)
+            .map(|_| {
+                let service = Arc::clone(&service);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    service.call_tool_value("get_active_workspace", json!({}))
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            assert!(handle.join().unwrap().is_ok());
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -1898,6 +1977,83 @@ mod watcher_startup_tests {
             .call_tool_value("list_symbols", json!({"file_patterns": ["Old.java"]}))
             .unwrap();
         assert_eq!(symbols["files"][0]["path"], "Old.java");
+    }
+}
+
+#[cfg(test)]
+mod analyzer_failure_boundary_tests {
+    use super::*;
+    use crate::analyzer::store::{StoreError, analyzer_db_path};
+    use crate::analyzer::{Language, TestProject};
+    use serde_json::json;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn multi_language_store_failure_replaces_false_empty_tool_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("Model.java"), "class Model {}\n").unwrap();
+        std::fs::write(root.join("helper.py"), "def helper():\n    return 1\n").unwrap();
+        git2::Repository::init(&root).unwrap();
+        let project: Arc<dyn Project> = Arc::new(TestProject::with_languages(
+            root.clone(),
+            BTreeSet::from([Language::Java, Language::Python]),
+        ));
+        let service = SearchToolsService::new_manual_for_project(project).unwrap();
+
+        let healthy = service
+            .call_tool_value("get_symbol_locations", json!({"symbols": ["Model"]}))
+            .unwrap();
+        assert_eq!(healthy["locations"][0]["symbol"], "Model");
+
+        let connection = rusqlite::Connection::open(analyzer_db_path(&root)).unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE analysis_epochs SET generation = generation + 1 WHERE lang = 'java'",
+                    [],
+                )
+                .unwrap(),
+            1
+        );
+
+        let error = service
+            .call_tool_value("get_symbol_locations", json!({"symbols": ["Model"]}))
+            .unwrap_err();
+        assert_eq!(error.code, SearchToolsServiceErrorCode::Internal);
+        assert!(error.message.contains("get_symbol_locations"));
+        assert!(error.message.contains("querying definition candidates"));
+        assert!(error.message.contains("stale analyzer generation"));
+
+        let error = service
+            .call_tool_value(
+                "search_symbols",
+                json!({"patterns": ["Model"], "include_tests": true, "limit": 5}),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, SearchToolsServiceErrorCode::Internal);
+        assert!(error.message.contains("search_symbols"));
+        assert!(error.message.contains("searching symbol candidates"));
+        assert!(error.message.contains("stale analyzer generation"));
+    }
+
+    #[test]
+    fn query_finish_preserves_handler_error_over_recorded_store_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("Model.java"), "class Model {}\n").unwrap();
+        let (_project, workspace) = build_transient_workspace(root).unwrap();
+        let scope = WorkspaceQueryScope::new(Arc::new(workspace));
+        scope
+            .context
+            .record_store_error(StoreError::new("injected store failure"));
+
+        let result: Result<(), SearchToolsServiceError> = Err(
+            SearchToolsServiceError::invalid_params("original handler failure"),
+        );
+        let error = scope.finish("test_operation", result).unwrap_err();
+        assert_eq!(error.code, SearchToolsServiceErrorCode::InvalidParams);
+        assert_eq!(error.message, "original handler failure");
     }
 }
 

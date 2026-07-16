@@ -171,6 +171,7 @@ impl WorkspaceAnalyzer {
     pub fn build(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let store_context = crate::analyzer::default_store_context(project.as_ref());
         Self::build_filtered(project, config, None, store_context, None)
+            .expect("failed to initialize in-memory workspace analyzer")
     }
 
     pub fn build_for_languages(
@@ -180,6 +181,7 @@ impl WorkspaceAnalyzer {
     ) -> Self {
         let store_context = crate::analyzer::default_store_context(project.as_ref());
         Self::build_filtered(project, config, Some(languages), store_context, None)
+            .expect("failed to initialize in-memory workspace analyzer")
     }
 
     pub fn build_persisted(
@@ -187,13 +189,7 @@ impl WorkspaceAnalyzer {
         config: AnalyzerConfig,
     ) -> Result<Self, StoreError> {
         let store_context = crate::analyzer::persistent_store_context(project.as_ref())?;
-        Ok(Self::build_filtered(
-            project,
-            config,
-            None,
-            store_context,
-            None,
-        ))
+        Self::build_filtered(project, config, None, store_context, None)
     }
 
     /// Progress-reporting variant of `build_persisted`.
@@ -206,13 +202,13 @@ impl WorkspaceAnalyzer {
         F: Fn(crate::analyzer::BuildProgressEvent) + Send + Sync + 'static,
     {
         let store_context = crate::analyzer::persistent_store_context(project.as_ref())?;
-        Ok(Self::build_filtered(
+        Self::build_filtered(
             project,
             config,
             None,
             store_context,
             Some(Arc::new(progress)),
-        ))
+        )
     }
 
     fn build_filtered(
@@ -221,7 +217,7 @@ impl WorkspaceAnalyzer {
         requested_languages: Option<&BTreeSet<Language>>,
         store_context: crate::analyzer::AnalyzerStoreContext,
         progress: Option<BuildProgress>,
-    ) -> Self {
+    ) -> Result<Self, StoreError> {
         let _scope = profiling::scope("WorkspaceAnalyzer::build");
         let mut delegates = BTreeMap::new();
         let project_languages = project.analyzer_languages();
@@ -247,7 +243,7 @@ impl WorkspaceAnalyzer {
                             cfg,
                             store_context,
                             progress.as_ref().map(Arc::clone),
-                        ))
+                        )?)
                     };
                 }
                 match language {
@@ -268,13 +264,13 @@ impl WorkspaceAnalyzer {
             delegates.insert(language, delegate);
         }
 
-        match delegates.len() {
+        Ok(match delegates.len() {
             0 => Self::Empty(EmptyAnalyzer::new(project)),
             1 => Self::Single(Box::new(
                 delegates.into_values().next().expect("checked len"),
             )),
             _ => Self::Multi(Box::new(MultiAnalyzer::new(delegates))),
-        }
+        })
     }
 
     pub fn analyzer(&self) -> &dyn IAnalyzer {
