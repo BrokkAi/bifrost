@@ -32,7 +32,7 @@ pub struct ReferenceDifferentialConfig {
     pub max_candidates_per_file: usize,
     pub max_source_bytes: usize,
     pub max_targets: usize,
-    pub target_parallelism: usize,
+    pub parallelism: usize,
     pub max_usage_files: usize,
     pub max_usages: usize,
     pub seed: u64,
@@ -49,7 +49,7 @@ impl Default for ReferenceDifferentialConfig {
             max_candidates_per_file: 20_000,
             max_source_bytes: 2 * 1024 * 1024,
             max_targets: 1_000,
-            target_parallelism: 8,
+            parallelism: 8,
             max_usage_files: 1_000,
             max_usages: 100_000,
             seed: 0,
@@ -196,6 +196,11 @@ pub enum ReferenceDifferentialProgress {
         resolved_sites: usize,
         distinct_targets: usize,
     },
+    ForwardFile {
+        completed: usize,
+        total: usize,
+        path: String,
+    },
     InverseTarget {
         completed: usize,
         total: usize,
@@ -241,6 +246,13 @@ struct PreparedInverseGroup {
     candidate_files: HashSet<ProjectFile>,
 }
 
+struct ForwardFileResult {
+    records: Vec<ReferenceDifferentialSite>,
+    resolved: Vec<ResolvedSite>,
+    forward: ForwardStatusCounts,
+    file_errors: Vec<ReferenceDifferentialFileError>,
+}
+
 /// Audit structured source references against the inverse usage resolver.
 ///
 /// The caller owns workspace construction and persistence. This function reads only
@@ -259,6 +271,11 @@ pub fn run_reference_differential_with_progress(
     progress: &(dyn Fn(ReferenceDifferentialProgress) + Sync),
 ) -> Result<ReferenceDifferentialReport, String> {
     validate_config(config)?;
+    let worker_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(config.parallelism)
+        .thread_name(|index| format!("reference-differential-{index}"))
+        .build()
+        .map_err(|err| format!("failed to build differential worker pool: {err}"))?;
     let requested_language = corpus_language(&config.corpus_language)?;
     let mut summary = ReferenceDifferentialSummary::default();
     let mut file_errors = Vec::new();
@@ -288,8 +305,14 @@ pub fn run_reference_differential_with_progress(
         structured_candidates: summary.structured_candidates,
     });
 
-    let (mut records, resolved) =
-        forward_resolve_sites(analyzer, sampled, config, &mut summary, &mut file_errors);
+    let (mut records, resolved) = forward_resolve_sites(
+        analyzer,
+        sampled,
+        &worker_pool,
+        &mut summary,
+        &mut file_errors,
+        progress,
+    );
     let groups = resolved_groups(resolved);
     summary.distinct_targets = groups.len();
     progress(ReferenceDifferentialProgress::ForwardResolution {
@@ -304,6 +327,7 @@ pub fn run_reference_differential_with_progress(
         &mut records,
         &mut summary,
         progress,
+        &worker_pool,
     )?;
     recompute_classifications(&records, &mut summary.classifications);
 
@@ -403,7 +427,7 @@ fn validate_config(config: &ReferenceDifferentialConfig) -> Result<(), String> {
         ("max_candidates_per_file", config.max_candidates_per_file),
         ("max_source_bytes", config.max_source_bytes),
         ("max_targets", config.max_targets),
-        ("target_parallelism", config.target_parallelism),
+        ("parallelism", config.parallelism),
         ("max_usage_files", config.max_usage_files),
         ("max_usages", config.max_usages),
     ] {
@@ -586,121 +610,164 @@ fn collect_sampled_sites(
 fn forward_resolve_sites(
     analyzer: &dyn IAnalyzer,
     sampled: Vec<SampledSite>,
-    _config: &ReferenceDifferentialConfig,
+    worker_pool: &rayon::ThreadPool,
     summary: &mut ReferenceDifferentialSummary,
     file_errors: &mut Vec<ReferenceDifferentialFileError>,
+    progress: &(dyn Fn(ReferenceDifferentialProgress) + Sync),
 ) -> (Vec<ReferenceDifferentialSite>, Vec<ResolvedSite>) {
     let _scope = crate::profiling::scope("reference_differential::forward_resolve_sites");
     let mut by_file: BTreeMap<ProjectFile, Vec<SampledSite>> = BTreeMap::new();
     for site in sampled {
         by_file.entry(site.file.clone()).or_default().push(site);
     }
+    let by_file = by_file.into_iter().collect::<Vec<_>>();
+    let total = by_file.len();
+    let completed = Mutex::new(0usize);
+    let file_results = worker_pool.install(|| {
+        by_file
+            .par_iter()
+            .map(|(file, sites)| {
+                let path = rel_path_string(file);
+                let result = forward_resolve_file(analyzer, file, sites, &path);
+                let mut completed = completed.lock().expect("forward progress lock poisoned");
+                *completed += 1;
+                progress(ReferenceDifferentialProgress::ForwardFile {
+                    completed: *completed,
+                    total,
+                    path,
+                });
+                result
+            })
+            .collect::<Vec<_>>()
+    });
+
     let mut records = Vec::new();
     let mut resolved = Vec::new();
-    for (file, sites) in by_file {
-        let path = rel_path_string(&file);
-        let Some(source) = analyzer.indexed_source(&file).map(Arc::new) else {
-            file_errors.push(file_error(
-                &path,
+    for result in file_results {
+        let record_offset = records.len();
+        summary.forward.merge(&result.forward);
+        file_errors.extend(result.file_errors);
+        resolved.extend(result.resolved.into_iter().map(|mut site| {
+            site.record_index += record_offset;
+            site
+        }));
+        records.extend(result.records);
+    }
+    (records, resolved)
+}
+
+fn forward_resolve_file(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    sites: &[SampledSite],
+    path: &str,
+) -> ForwardFileResult {
+    let Some(source) = analyzer.indexed_source(file).map(Arc::new) else {
+        return ForwardFileResult {
+            records: Vec::new(),
+            resolved: Vec::new(),
+            forward: ForwardStatusCounts::default(),
+            file_errors: vec![file_error(
+                path,
                 "indexed_source_missing",
                 "source disappeared before forward lookup",
-            ));
-            continue;
+            )],
         };
-        let requests = sites
+    };
+    let mut records = Vec::with_capacity(sites.len());
+    let mut resolved = Vec::new();
+    let mut forward = ForwardStatusCounts::default();
+    let file_errors = Vec::new();
+    let requests = sites
+        .iter()
+        .map(|site| DefinitionLookupRequest {
+            file: file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(site.range.start_byte),
+            end_byte: Some(site.range.end_byte),
+        })
+        .collect();
+    let outcomes =
+        resolve_definition_batch_with_source(analyzer, requests, file.clone(), Arc::clone(&source));
+    for (site, outcome) in sites.iter().cloned().zip(outcomes) {
+        forward.increment(outcome.status);
+        let csharp_nameof_member = outcome.status == DefinitionLookupStatus::Resolved
+            && site.csharp_nameof_argument
+            && !outcome.definitions.is_empty()
+            && outcome.definitions.iter().all(|target| {
+                matches!(target.kind(), CodeUnitType::Field | CodeUnitType::Function)
+            });
+        let reference = outcome.reference.as_ref();
+        let text = reference
+            .map(|reference| reference.text.clone())
+            .unwrap_or_else(|| source[site.range.start_byte..site.range.end_byte].to_string());
+        let stable_targets = outcome
+            .definitions
             .iter()
-            .map(|site| DefinitionLookupRequest {
-                file: file.clone(),
-                line: None,
-                column: None,
-                start_byte: Some(site.range.start_byte),
-                end_byte: Some(site.range.end_byte),
+            .map(stable_declaration_identity)
+            .collect();
+        let diagnostics = outcome
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| ReferenceDiagnostic {
+                kind: diagnostic.kind,
+                message: diagnostic.message,
             })
             .collect();
-        let outcomes = resolve_definition_batch_with_source(
-            analyzer,
-            requests,
-            file.clone(),
-            Arc::clone(&source),
-        );
-        for (site, outcome) in sites.into_iter().zip(outcomes) {
-            summary.forward.increment(outcome.status);
-            let csharp_nameof_member = outcome.status == DefinitionLookupStatus::Resolved
-                && site.csharp_nameof_argument
-                && !outcome.definitions.is_empty()
-                && outcome.definitions.iter().all(|target| {
-                    matches!(target.kind(), CodeUnitType::Field | CodeUnitType::Function)
+        let record_index = records.len();
+        records.push(ReferenceDifferentialSite {
+            path: path.to_string(),
+            start_byte: site.range.start_byte,
+            end_byte: site.range.end_byte,
+            line: site.range.start_line + 1,
+            text,
+            source_evidence: source_evidence(&source, site.range.start_byte, site.range.end_byte),
+            forward_status: outcome.status.as_str().to_string(),
+            targets: stable_targets,
+            classification: if csharp_nameof_member {
+                ReferenceClassification::EditorOnly
+            } else {
+                ReferenceClassification::Inconclusive
+            },
+            note: if csharp_nameof_member {
+                Some("C# nameof member navigation is excluded from runtime usage".to_string())
+            } else {
+                (outcome.status != DefinitionLookupStatus::Resolved)
+                    .then(|| format!("forward lookup returned {}", outcome.status.as_str()))
+            },
+            inverse_hit: None,
+            diagnostics,
+        });
+        if outcome.status == DefinitionLookupStatus::Resolved {
+            let mut targets = outcome.definitions;
+            targets.sort();
+            targets.dedup();
+            if targets.is_empty() {
+                records[record_index].note =
+                    Some("resolved forward lookup returned no targets".to_string());
+            } else if csharp_nameof_member {
+                continue;
+            } else if analyzer
+                .enclosing_code_unit(file, &site.range)
+                .is_some_and(|enclosing| targets.contains(&enclosing))
+            {
+                records[record_index].note =
+                    Some("reference is enclosed by its own target declaration".to_string());
+            } else {
+                resolved.push(ResolvedSite {
+                    record_index,
+                    targets,
                 });
-            let reference = outcome.reference.as_ref();
-            let text = reference
-                .map(|reference| reference.text.clone())
-                .unwrap_or_else(|| source[site.range.start_byte..site.range.end_byte].to_string());
-            let stable_targets = outcome
-                .definitions
-                .iter()
-                .map(stable_declaration_identity)
-                .collect();
-            let diagnostics = outcome
-                .diagnostics
-                .into_iter()
-                .map(|diagnostic| ReferenceDiagnostic {
-                    kind: diagnostic.kind,
-                    message: diagnostic.message,
-                })
-                .collect();
-            let record_index = records.len();
-            records.push(ReferenceDifferentialSite {
-                path: path.clone(),
-                start_byte: site.range.start_byte,
-                end_byte: site.range.end_byte,
-                line: site.range.start_line + 1,
-                text,
-                source_evidence: source_evidence(
-                    &source,
-                    site.range.start_byte,
-                    site.range.end_byte,
-                ),
-                forward_status: outcome.status.as_str().to_string(),
-                targets: stable_targets,
-                classification: if csharp_nameof_member {
-                    ReferenceClassification::EditorOnly
-                } else {
-                    ReferenceClassification::Inconclusive
-                },
-                note: if csharp_nameof_member {
-                    Some("C# nameof member navigation is excluded from runtime usage".to_string())
-                } else {
-                    (outcome.status != DefinitionLookupStatus::Resolved)
-                        .then(|| format!("forward lookup returned {}", outcome.status.as_str()))
-                },
-                inverse_hit: None,
-                diagnostics,
-            });
-            if outcome.status == DefinitionLookupStatus::Resolved {
-                let mut targets = outcome.definitions;
-                targets.sort();
-                targets.dedup();
-                if targets.is_empty() {
-                    records[record_index].note =
-                        Some("resolved forward lookup returned no targets".to_string());
-                } else if csharp_nameof_member {
-                    continue;
-                } else if analyzer
-                    .enclosing_code_unit(&file, &site.range)
-                    .is_some_and(|enclosing| targets.contains(&enclosing))
-                {
-                    records[record_index].note =
-                        Some("reference is enclosed by its own target declaration".to_string());
-                } else {
-                    resolved.push(ResolvedSite {
-                        record_index,
-                        targets,
-                    });
-                }
             }
         }
     }
-    (records, resolved)
+    ForwardFileResult {
+        records,
+        resolved,
+        forward,
+        file_errors,
+    }
 }
 
 fn csharp_is_nameof_argument(
@@ -764,6 +831,7 @@ fn resolved_groups(resolved: Vec<ResolvedSite>) -> Vec<ResolvedGroup> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compare_inverse(
     analyzer: &dyn IAnalyzer,
     audited_files: &[ProjectFile],
@@ -772,6 +840,7 @@ fn compare_inverse(
     records: &mut [ReferenceDifferentialSite],
     summary: &mut ReferenceDifferentialSummary,
     progress: &(dyn Fn(ReferenceDifferentialProgress) + Sync),
+    worker_pool: &rayon::ThreadPool,
 ) -> Result<(), String> {
     let files_by_path: HashMap<String, ProjectFile> = audited_files
         .iter()
@@ -832,14 +901,9 @@ fn compare_inverse(
     }
 
     let total = prepared.len();
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(config.target_parallelism.min(total))
-        .thread_name(|index| format!("reference-differential-{index}"))
-        .build()
-        .map_err(|err| format!("failed to build inverse target worker pool: {err}"))?;
     let records = Mutex::new(records);
     let completed = Mutex::new(0usize);
-    pool.install(|| {
+    worker_pool.install(|| {
         prepared.par_iter().for_each(|prepared| {
             let target = prepared
                 .group
@@ -1064,6 +1128,16 @@ impl ForwardStatusCounts {
             DefinitionLookupStatus::InvalidLocation => self.invalid_location += 1,
             DefinitionLookupStatus::NotFound => self.not_found += 1,
         }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.resolved += other.resolved;
+        self.no_definition += other.no_definition;
+        self.unresolvable_import_boundary += other.unresolvable_import_boundary;
+        self.ambiguous += other.ambiguous;
+        self.unsupported_language += other.unsupported_language;
+        self.invalid_location += other.invalid_location;
+        self.not_found += other.not_found;
     }
 }
 

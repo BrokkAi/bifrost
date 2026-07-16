@@ -66,7 +66,7 @@ struct EngineOptions {
     max_candidates_per_file: usize,
     max_source_bytes: usize,
     max_targets: usize,
-    target_parallelism: usize,
+    parallelism: usize,
     max_usage_files: usize,
     max_usages: usize,
     seed: u64,
@@ -83,7 +83,7 @@ impl Default for EngineOptions {
             max_candidates_per_file: DEFAULT_MAX_CANDIDATES_PER_FILE,
             max_source_bytes: DEFAULT_MAX_SOURCE_BYTES,
             max_targets: DEFAULT_MAX_TARGETS,
-            target_parallelism: DEFAULT_TARGET_PARALLELISM,
+            parallelism: DEFAULT_TARGET_PARALLELISM,
             max_usage_files: DEFAULT_MAX_USAGE_FILES,
             max_usages: DEFAULT_MAX_USAGES,
             seed: 0,
@@ -121,7 +121,7 @@ impl EngineOptions {
             max_candidates_per_file: self.max_candidates_per_file,
             max_source_bytes: self.max_source_bytes,
             max_targets: self.max_targets,
-            target_parallelism: self.target_parallelism,
+            parallelism: self.parallelism,
             max_usage_files: self.max_usage_files,
             max_usages: self.max_usages,
             seed: self.seed,
@@ -293,7 +293,7 @@ fn parse_engine_option(
             options.max_source_bytes = take_positive_usize(args, index, option)?
         }
         "--max-targets" => options.max_targets = take_positive_usize(args, index, option)?,
-        "--jobs" => options.target_parallelism = take_positive_usize(args, index, option)?,
+        "--jobs" => options.parallelism = take_positive_usize(args, index, option)?,
         "--max-usage-files" => options.max_usage_files = take_positive_usize(args, index, option)?,
         "--max-usages" => options.max_usages = take_positive_usize(args, index, option)?,
         "--seed" => {
@@ -597,6 +597,14 @@ fn run_engine(
             distinct_targets,
         } => eprintln!(
             "progress phase=forward resolved_sites={resolved_sites} distinct_targets={distinct_targets} elapsed={:.1}s",
+            started.elapsed().as_secs_f64()
+        ),
+        ReferenceDifferentialProgress::ForwardFile {
+            completed,
+            total,
+            path,
+        } => eprintln!(
+            "progress phase=forward completed={completed} total={total} file={path} elapsed={:.1}s",
             started.elapsed().as_secs_f64()
         ),
         ReferenceDifferentialProgress::InverseTarget {
@@ -1062,7 +1070,7 @@ fn print_common_options() {
         "  --max-targets N          Distinct inverse target groups (default: {DEFAULT_MAX_TARGETS})"
     );
     println!(
-        "  --jobs N                 Parallel inverse target queries (default: {DEFAULT_TARGET_PARALLELISM})"
+        "  --jobs N                 Parallel forward-file and inverse-target queries (default: {DEFAULT_TARGET_PARALLELISM})"
     );
     println!(
         "  --max-usage-files N      Files per inverse target query (default: {DEFAULT_MAX_USAGE_FILES})"

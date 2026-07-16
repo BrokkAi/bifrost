@@ -99,10 +99,7 @@ fn run_repo_writes_completed_jsonl_report_for_tiny_project() {
     assert!(record["bifrost_version"].is_string(), "{record}");
     assert!(record["bifrost_head"].is_string(), "{record}");
     assert!(record["report"]["summary"].is_object(), "{record}");
-    assert_eq!(
-        record["report"]["config"]["target_parallelism"], 2,
-        "{record}"
-    );
+    assert_eq!(record["report"]["config"]["parallelism"], 2, "{record}");
     assert!(fixture.root.join(".brokk/bifrost_cache.db").is_file());
 
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
@@ -112,6 +109,14 @@ fn run_repo_writes_completed_jsonl_report_for_tiny_project() {
     );
     assert!(stderr.contains("progress phase=inventory"), "{stderr}");
     assert!(stderr.contains("progress phase=sampling"), "{stderr}");
+    assert!(
+        stderr.contains("progress phase=forward completed=1 total=2"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("progress phase=forward completed=2 total=2"),
+        "{stderr}"
+    );
     assert!(stderr.contains("progress phase=forward"), "{stderr}");
     assert!(
         stderr.contains("progress phase=inverse completed=1 total=2"),
@@ -192,9 +197,14 @@ impl TinyRepoFixture {
         fs::create_dir_all(&root).expect("repo root");
         fs::write(
             root.join("lib.rs"),
-            "pub fn first() {}\npub fn second() {}\npub fn caller() { first(); second(); }\n",
+            "mod helpers;\npub fn second() {}\npub fn caller() { second(); }\n",
         )
         .expect("rust source");
+        fs::write(
+            root.join("helpers.rs"),
+            "pub fn first() {}\npub fn caller() { first(); }\n",
+        )
+        .expect("rust helper source");
         init_repo(&root);
         let output = temp.path().join("report.jsonl");
         Self {
