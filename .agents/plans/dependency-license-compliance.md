@@ -53,6 +53,9 @@ A reviewer can see the result by generating the Rust and npm notice reports, pac
 - Observation: The already-published v0.8.4 artifacts retain the gaps this plan fixes for future builds.
   Evidence: the downloaded x86_64 Linux release archive contains only the executable, `README.md`, and the old `LICENSE.md`; the published VSIX contains only `extension/LICENSE.md` among legal/source files; and the published PyPI wheel contains only `LICENSE.md` plus its generated SBOM. Repository workflow changes do not retroactively alter those downloads.
 
+- Observation: `cargo-about` preserves CRLF bytes embedded in one upstream crate's license text, while Git's default text normalization rewrote those lines when the generated HTML was committed.
+  Evidence: a clean regeneration differed only by 591 carriage returns inside the `proc-macro-error` Apache license block. Marking `THIRD_PARTY_LICENSES.html -text` in `.gitattributes` preserves the generator's exact bytes and makes the CI freshness comparison meaningful.
+
 ## Decision Log
 
 - Decision: Treat the request as both an audit and a request to remediate confirmed documentation and artifact gaps.
@@ -179,3 +182,5 @@ Plan revision note (2026-07-16): Recorded the `cargo-about` 0.9.1 `cli` feature 
 Plan revision note (2026-07-16): Added the supplemental audit layer after finding that Cargo wrapper metadata omits Moka's separate notice, libgit2's GPLv2 linking exception, and other nested native/data notices; recorded completed implementation and artifact-level validation.
 
 Plan revision note (2026-07-16): Corrected the README duplicate reported during diff review, removed unrelated Markdown/YAML formatting churn, updated the VSIX generation steps to match the implementation, and recorded the user's authorization to publish a PR.
+
+Plan revision note (2026-07-16): Rebased onto current `origin/master` and preserved cargo-about's mixed upstream line endings so the generated-report freshness gate is byte-stable.
