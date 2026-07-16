@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use once_cell::sync::Lazy;
-use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
+#[cfg(test)]
 use rusqlite_migration::{M, Migrations};
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -14,7 +15,6 @@ pub const LEGACY_SEMANTIC_DB_FILE_NAME: &str = "semantic_cache.db";
 pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 
 const BASELINE_MIGRATION_VERSION: i64 = 1;
-#[cfg(test)]
 const CURRENT_MIGRATION_VERSION: i64 = 7;
 const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
 const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
@@ -28,17 +28,18 @@ const ANALYZER_BLOB_PAYLOAD_COSTS_SQL: &str =
     include_str!("../migrations/cache/0006-analyzer-blob-payload-costs.sql");
 const STRUCTURAL_FACTS_SNAPSHOTS_SQL: &str =
     include_str!("../migrations/cache/0007-structural-facts-snapshots.sql");
-static CACHE_MIGRATIONS: Lazy<Migrations<'static>> = Lazy::new(|| {
-    Migrations::new(vec![
-        M::up(CURRENT_BASELINE_SQL),
-        M::up(PATH_SYMBOL_UNITS_SQL),
-        M::up(FORWARD_FACTS_SQL),
-        M::up(ANALYZER_GENERATIONS_SQL),
-        M::up(ANALYZER_BLOB_CASCADE_COSTS_SQL),
-        M::up(ANALYZER_BLOB_PAYLOAD_COSTS_SQL),
-        M::up(STRUCTURAL_FACTS_SNAPSHOTS_SQL),
-    ])
-});
+const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
+    CURRENT_BASELINE_SQL,
+    PATH_SYMBOL_UNITS_SQL,
+    FORWARD_FACTS_SQL,
+    ANALYZER_GENERATIONS_SQL,
+    ANALYZER_BLOB_CASCADE_COSTS_SQL,
+    ANALYZER_BLOB_PAYLOAD_COSTS_SQL,
+    STRUCTURAL_FACTS_SNAPSHOTS_SQL,
+];
+#[cfg(test)]
+static CACHE_MIGRATIONS: Lazy<Migrations<'static>> =
+    Lazy::new(|| Migrations::new(CACHE_MIGRATION_SQL.into_iter().map(M::up).collect()));
 static BASELINE_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|| {
     let conn = Connection::open_in_memory().expect("open baseline schema connection");
     conn.execute_batch(CURRENT_BASELINE_SQL)
@@ -164,10 +165,90 @@ fn reject_symlink(path: &Path, label: &str) -> Result<()> {
 
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     assert_sqlite_version(conn)?;
-    prepare_baseline_migration(conn)?;
-    CACHE_MIGRATIONS
-        .to_latest(conn)
-        .map_err(|err| format!("cache DB migration error: {err}"))
+    migrate_with_sql(conn, &CACHE_MIGRATION_SQL)
+}
+
+fn migrate_with_sql(conn: &mut Connection, migrations: &[&str]) -> Result<()> {
+    // Ordinary migrations keep FK enforcement enabled because their DELETEs rely on
+    // cascades. Rebuilding an invalid schema needs it disabled, but SQLite cannot
+    // change foreign_keys inside a transaction. The first locked pass makes no
+    // changes when it detects that case; after toggling, the repair pass reacquires
+    // the write lock and re-inspects before rebuilding and migrating atomically.
+    if matches!(
+        migrate_with_sql_locked(conn, migrations, false)?,
+        LockedMigrationOutcome::Complete
+    ) {
+        return Ok(());
+    }
+
+    conn.pragma_update(None, "foreign_keys", "OFF")
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    let result = match migrate_with_sql_locked(conn, migrations, true) {
+        Ok(LockedMigrationOutcome::Complete) => Ok(()),
+        Ok(LockedMigrationOutcome::RebuildRequired) => {
+            Err("cache DB schema rebuild was not applied".to_string())
+        }
+        Err(err) => Err(err),
+    };
+    let restore = conn
+        .pragma_update(None, "foreign_keys", "ON")
+        .map_err(|err| format!("cache DB SQLite error: {err}"));
+    result.and(restore)
+}
+
+enum LockedMigrationOutcome {
+    Complete,
+    RebuildRequired,
+}
+
+enum BaselinePreparation {
+    Ready(i64),
+    RebuildRequired,
+}
+
+fn migrate_with_sql_locked(
+    conn: &mut Connection,
+    migrations: &[&str],
+    rebuild_invalid_schema: bool,
+) -> Result<LockedMigrationOutcome> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    let user_version = cache_migration_version(&tx)?;
+    if user_version < 0 {
+        return Err(format!(
+            "cache DB migration user_version must not be negative: {user_version}"
+        ));
+    }
+    if user_version as usize > migrations.len() {
+        return Err(format!(
+            "cache DB migration error: DatabaseTooFarAhead: user_version {user_version} exceeds {}",
+            migrations.len()
+        ));
+    }
+
+    let user_version = match prepare_baseline_migration(&tx, user_version, rebuild_invalid_schema)?
+    {
+        BaselinePreparation::Ready(user_version) => user_version,
+        BaselinePreparation::RebuildRequired => {
+            return Ok(LockedMigrationOutcome::RebuildRequired);
+        }
+    };
+    let mut migration_applied = false;
+    for (index, sql) in migrations.iter().enumerate().skip(user_version as usize) {
+        let version = index + 1;
+        tx.execute_batch(sql)
+            .map_err(|err| format!("cache DB migration error applying version {version}: {err}"))?;
+        tx.pragma_update(None, "user_version", version)
+            .map_err(|err| format!("cache DB migration error setting version {version}: {err}"))?;
+        migration_applied = true;
+    }
+    if migration_applied {
+        validate_foreign_keys(&tx)?;
+    }
+    tx.commit()
+        .map_err(|err| format!("cache DB migration error: {err}"))?;
+    Ok(LockedMigrationOutcome::Complete)
 }
 
 pub fn now_unix_seconds() -> i64 {
@@ -230,28 +311,14 @@ fn delete_legacy_cache_if_idle(legacy_path: &Path) {
     }
 }
 
-fn recreate_schema(conn: &mut Connection) -> Result<()> {
-    conn.pragma_update(None, "foreign_keys", "OFF")
-        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    let result = (|| {
-        let schema_objects = user_schema_objects(conn)?;
-        let tx = conn
-            .transaction()
+fn recreate_schema(tx: &Transaction<'_>) -> Result<()> {
+    for (object_type, name) in user_schema_objects(tx)? {
+        let quoted = format!("\"{}\"", name.replace('"', "\"\""));
+        tx.execute_batch(&format!("DROP {object_type} {quoted};"))
             .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-        for (object_type, name) in schema_objects {
-            let quoted = format!("\"{}\"", name.replace('"', "\"\""));
-            tx.execute_batch(&format!("DROP {object_type} {quoted};"))
-                .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-        }
-        tx.execute_batch("PRAGMA user_version = 0;")
-            .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-        tx.commit()
-            .map_err(|err| format!("cache DB SQLite error: {err}"))
-    })();
-    let restore = conn
-        .pragma_update(None, "foreign_keys", "ON")
-        .map_err(|err| format!("cache DB SQLite error: {err}"));
-    result.and(restore)
+    }
+    tx.pragma_update(None, "user_version", 0)
+        .map_err(|err| format!("cache DB SQLite error: {err}"))
 }
 
 #[cfg(test)]
@@ -309,29 +376,32 @@ fn schema_object_definitions(conn: &Connection) -> Result<Vec<(String, String, S
         .map_err(|err| format!("cache DB SQLite error: {err}"))
 }
 
-fn prepare_baseline_migration(conn: &mut Connection) -> Result<()> {
-    let user_version = cache_migration_version(conn)?;
-    if user_version < 0 {
-        return Err(format!(
-            "cache DB migration user_version must not be negative: {user_version}"
-        ));
-    }
+fn prepare_baseline_migration(
+    tx: &Transaction<'_>,
+    user_version: i64,
+    rebuild_invalid_schema: bool,
+) -> Result<BaselinePreparation> {
     if user_version > BASELINE_MIGRATION_VERSION {
-        return Ok(());
+        return Ok(BaselinePreparation::Ready(user_version));
     }
 
-    if user_version == 0 && user_schema_objects(conn)?.is_empty() {
-        return Ok(());
+    if user_version == 0 && user_schema_objects(tx)?.is_empty() {
+        return Ok(BaselinePreparation::Ready(0));
     }
 
-    if baseline_schema_is_valid(conn)? {
+    if baseline_schema_is_valid(tx)? {
         if user_version == 0 {
-            adopt_current_baseline(conn)?;
+            adopt_current_baseline(tx)?;
+            return Ok(BaselinePreparation::Ready(BASELINE_MIGRATION_VERSION));
         }
-        return Ok(());
+        return Ok(BaselinePreparation::Ready(user_version));
     }
 
-    recreate_schema(conn)
+    if !rebuild_invalid_schema {
+        return Ok(BaselinePreparation::RebuildRequired);
+    }
+    recreate_schema(tx)?;
+    Ok(BaselinePreparation::Ready(0))
 }
 
 fn cache_migration_version(conn: &Connection) -> Result<i64> {
@@ -379,20 +449,30 @@ fn quick_check_is_ok(conn: &Connection) -> Result<bool> {
     Ok(result == "ok")
 }
 
-fn adopt_current_baseline(conn: &mut Connection) -> Result<()> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    if cache_migration_version(&tx)? != 0 {
+fn adopt_current_baseline(tx: &Transaction<'_>) -> Result<()> {
+    if cache_migration_version(tx)? != 0 {
         return Ok(());
     }
-    if !baseline_schema_is_valid(&tx)? {
+    if !baseline_schema_is_valid(tx)? {
         return Err("cache DB baseline changed while being adopted".to_string());
     }
-    tx.execute_batch("PRAGMA user_version = 1;")
-        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    tx.commit()
+    tx.pragma_update(None, "user_version", BASELINE_MIGRATION_VERSION)
         .map_err(|err| format!("cache DB SQLite error: {err}"))
+}
+
+fn validate_foreign_keys(conn: &Connection) -> Result<()> {
+    let violations: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    if violations == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "cache DB migration foreign key validation failed with {violations} violation(s)"
+        ))
+    }
 }
 
 fn assert_sqlite_version(conn: &Connection) -> Result<()> {
@@ -421,6 +501,8 @@ fn parse_sqlite_version(version: &str) -> Option<(u32, u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use std::time::Duration;
 
     use rusqlite_migration::{M, Migrations};
@@ -441,17 +523,11 @@ mod tests {
         conn
     }
 
-    fn future_migrations(sql: &'static str) -> Migrations<'static> {
-        Migrations::new(vec![
-            M::up(CURRENT_BASELINE_SQL),
-            M::up(PATH_SYMBOL_UNITS_SQL),
-            M::up(FORWARD_FACTS_SQL),
-            M::up(ANALYZER_GENERATIONS_SQL),
-            M::up(ANALYZER_BLOB_CASCADE_COSTS_SQL),
-            M::up(ANALYZER_BLOB_PAYLOAD_COSTS_SQL),
-            M::up(STRUCTURAL_FACTS_SNAPSHOTS_SQL),
-            M::up(sql),
-        ])
+    fn future_migration_sql(sql: &'static str) -> Vec<&'static str> {
+        CACHE_MIGRATION_SQL
+            .into_iter()
+            .chain(std::iter::once(sql))
+            .collect()
     }
 
     fn create_legacy_cache(path: &Path) {
@@ -475,6 +551,56 @@ mod tests {
             CURRENT_MIGRATION_VERSION
         );
         assert!(current_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn concurrent_fresh_cache_openers_serialize_schema_migration() {
+        const OPENERS: usize = 16;
+
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join(CACHE_DB_FILE_NAME);
+        let barrier = Arc::new(Barrier::new(OPENERS));
+        let results = thread::scope(|scope| {
+            let handles = (0..OPENERS)
+                .map(|_| {
+                    let barrier = Arc::clone(&barrier);
+                    let db_path = db_path.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let conn = open_unified_connection(&db_path)?;
+                        if cache_migration_version(&conn)? != CURRENT_MIGRATION_VERSION {
+                            return Err("concurrent opener observed an old schema version".into());
+                        }
+                        if !current_schema_is_valid(&conn)? {
+                            return Err("concurrent opener observed an invalid schema".into());
+                        }
+                        let foreign_keys: i64 = conn
+                            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+                            .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+                        if foreign_keys != 1 {
+                            return Err("concurrent opener left foreign keys disabled".into());
+                        }
+                        Ok(())
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("cache opener thread panicked"))
+                .collect::<Vec<_>>()
+        });
+
+        assert!(
+            results.iter().all(Result::is_ok),
+            "concurrent cache openers failed: {results:#?}"
+        );
+        let conn = open_unified_connection(&db_path).unwrap();
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert!(current_schema_is_valid(&conn).unwrap());
+        assert!(quick_check_is_ok(&conn).unwrap());
     }
 
     #[test]
@@ -555,7 +681,7 @@ mod tests {
         )
         .unwrap();
 
-        CACHE_MIGRATIONS.to_latest(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
 
         assert_eq!(
             cache_migration_version(&conn).unwrap(),
@@ -654,7 +780,7 @@ mod tests {
         )
         .unwrap();
 
-        CACHE_MIGRATIONS.to_latest(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
 
         assert_eq!(
             cache_migration_version(&conn).unwrap(),
@@ -810,9 +936,9 @@ mod tests {
         )
         .unwrap();
         let migrations =
-            future_migrations("CREATE TABLE migration_probe(value TEXT NOT NULL) STRICT;");
+            future_migration_sql("CREATE TABLE migration_probe(value TEXT NOT NULL) STRICT;");
 
-        migrations.to_latest(&mut conn).unwrap();
+        migrate_with_sql(&mut conn, &migrations).unwrap();
 
         let analyzer_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
@@ -825,18 +951,49 @@ mod tests {
     #[test]
     fn failing_migration_rolls_back_schema_and_version() {
         let mut conn = open_in_memory_cache();
-        let migrations = future_migrations(
+        let migrations = future_migration_sql(
             "CREATE TABLE migration_probe(value TEXT NOT NULL) STRICT;
              this is not valid SQL;",
         );
 
-        assert!(migrations.to_latest(&mut conn).is_err());
+        assert!(migrate_with_sql(&mut conn, &migrations).is_err());
 
         assert_eq!(
             cache_migration_version(&conn).unwrap(),
             CURRENT_MIGRATION_VERSION
         );
         assert!(!table_exists(&conn, "migration_probe").unwrap());
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn foreign_key_validation_rolls_back_schema_and_version() {
+        let mut conn = create_current_baseline_without_migration();
+        conn.execute_batch("CREATE TABLE legacy_cache(value TEXT) STRICT;")
+            .unwrap();
+        let migrations = future_migration_sql(
+            "INSERT INTO blob_payload_costs(blob_oid, lang, payload_bytes)
+             VALUES('0000000000000000000000000000000000000000', 'rust', 0);",
+        );
+
+        let err = migrate_with_sql(&mut conn, &migrations).unwrap_err();
+
+        assert!(
+            err.contains("foreign key validation failed"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(cache_migration_version(&conn).unwrap(), 0);
+        assert!(table_exists(&conn, "legacy_cache").unwrap());
+        assert!(!table_exists(&conn, "blob_payload_costs").unwrap());
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -854,17 +1011,22 @@ mod tests {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
         let migrations =
-            future_migrations("CREATE TABLE migration_probe(value TEXT NOT NULL) STRICT;");
+            future_migration_sql("CREATE TABLE migration_probe(value TEXT NOT NULL) STRICT;");
 
-        assert!(migrations.to_latest(&mut conn).is_err());
+        assert!(migrate_with_sql(&mut conn, &migrations).is_err());
         assert_eq!(
             cache_migration_version(&conn).unwrap(),
             CURRENT_MIGRATION_VERSION
         );
         assert!(!table_exists(&conn, "migration_probe").unwrap());
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
 
         writer.rollback().unwrap();
-        migrations.to_latest(&mut conn).unwrap();
+        migrate_with_sql(&mut conn, &migrations).unwrap();
 
         assert_eq!(cache_migration_version(&conn).unwrap(), 8);
         assert!(table_exists(&conn, "migration_probe").unwrap());

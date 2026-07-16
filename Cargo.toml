@@ -49,7 +49,6 @@ rayon = "1.10.0"
 reedline = "0.49"
 regex = "1.12.2"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
-rusqlite_migration = "=1.3.1"
 rustc-hash = "2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
@@ -105,6 +104,7 @@ python = ["dep:pyo3"]
 filetime = "0.2"
 pretty_assertions = "1.4.1"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
+rusqlite_migration = "=1.3.1"
 
 # Unix: process-group kill for the embedding sidecar (and the peak-RSS bench).
 [target.'cfg(unix)'.dependencies]
