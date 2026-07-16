@@ -22,9 +22,10 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [x] (2026-07-16 09:51+02:00) Created root epic #813 and thirteen dependency-ordered native subissues #814 through #826.
 - [x] (2026-07-16 09:52+02:00) Cross-linked #813 with the existing structural-query epic #328, policy issue #709, and typed set-composition issue #720.
 - [x] (2026-07-16 09:58+02:00) Wrote this living ExecPlan with architecture, lifecycle, milestone, validation, and recovery contracts.
-- [x] (2026-07-16 10:27+02:00) Published the plan in draft PR [#827](https://github.com/BrokkAi/bifrost/pull/827) from checkpoint commit `41f1e88b`.
+- [x] (2026-07-16 10:27+02:00) Published the plan from checkpoint commit `41f1e88b` for review.
 - [x] (2026-07-16 10:35+02:00) Made #709 the early public policy/API contract gate for #824 and #825 while keeping #814 through #823 free to build diagnostic-neutral internal analysis services.
 - [x] (2026-07-16 11:43+02:00) Defined and published set-oriented taint policies, compatible multi-policy batching, symbolic taint summaries, broad meeting-point findings, exact cache layers, and evidence-backed CVSS classification across #709, #813, #821, #823, and #824.
+- [x] (2026-07-16 12:39+02:00) Moved the publication thread to neutral branch `dave/composable-typestate-roadmap` and draft PR [#828](https://github.com/BrokkAi/bifrost/pull/828).
 - [ ] Complete #814: define the language-neutral semantic IR, stable identities, capabilities, uncertainty, and an inspectable renderer.
 - [ ] Complete #815 and the first adapter children: build equivalent per-callable CFGs for TypeScript and Java.
 - [ ] Complete #816 in parallel: expose reusable dispatch, value, heap, and bounded access-path oracles for the reference languages.
@@ -976,7 +977,7 @@ Roadmap artifacts created on 2026-07-16:
 - CodeQuery/RQL integration epic: https://github.com/BrokkAi/bifrost/issues/824
 - Cross-language pilot: https://github.com/BrokkAi/bifrost/issues/825
 - WPDS/SPDS evaluation: https://github.com/BrokkAi/bifrost/issues/826
-- Living-plan draft PR: https://github.com/BrokkAi/bifrost/pull/827
+- Living-plan draft PR: https://github.com/BrokkAi/bifrost/pull/828
 - Initial plan commit: `41f1e88b`
 
 Existing integration anchors:
@@ -1335,4 +1336,4 @@ A `SummaryStore` may memoize any reusable summary type in memory and optionally 
 
 Public query changes depend on the declarative schema registry in `src/analyzer/structural/query/schema.rs`. Public policy changes depend on the versioned schema and finding model established by #709. Neither side may add private keyword lists, editor-only vocabulary, source-text path parsing, or an implicit conversion from query matches to diagnostics. Existing Rust dependencies should be preferred for the first implementation; any new solver or graph crate requires a measured build/runtime benefit and an explicit Decision Log entry.
 
-Plan revision note (2026-07-16): Initial roadmap written after auditing the post-PR-#802 codebase and creating epic #813 with native subissues #814–#826. The initial plan deliberately makes TypeScript/Java the reference pair, IFDS/IDE the baseline solver shape, compact memory plus selective SQLite the lifecycle policy, dominance optional, and WPDS/SPDS evidence-gated. Draft PR #827 and its initial checkpoint commit were added after publication. A later same-day revision made #709 the early public policy/API gate, separated `.rqlp`/`PolicyFinding` from the internal protocol and analysis result models, and required the #825 pilot to validate query, human, and SARIF surfaces from one analysis result. This revision also made `analysis.type: taint` set-oriented end to end: one compatible multi-source/multi-sink batch, stable class-set propagation with bounded origins, symbolic taint summaries and exact cache layers, broad findings before CWE refinement, and evidence-backed CVSS v4.0 variants that never fabricate a score from incomplete Base evidence.
+Plan revision note (2026-07-16): Initial roadmap written after auditing the post-PR-#802 codebase and creating epic #813 with native subissues #814–#826. The initial plan deliberately makes TypeScript/Java the reference pair, IFDS/IDE the baseline solver shape, compact memory plus selective SQLite the lifecycle policy, dominance optional, and WPDS/SPDS evidence-gated. Draft PR #828 is the current publication thread for the initial checkpoint and subsequent revisions. A later same-day revision made #709 the early public policy/API gate, separated `.rqlp`/`PolicyFinding` from the internal protocol and analysis result models, and required the #825 pilot to validate query, human, and SARIF surfaces from one analysis result. This revision also made `analysis.type: taint` set-oriented end to end: one compatible multi-source/multi-sink batch, stable class-set propagation with bounded origins, symbolic taint summaries and exact cache layers, broad findings before CWE refinement, and evidence-backed CVSS v4.0 variants that never fabricate a score from incomplete Base evidence.
