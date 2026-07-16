@@ -366,6 +366,62 @@ void n::Outer::Inner::f() {}
 }
 
 #[test]
+fn one_direct_forward_owner_preserves_exact_inverted_method_edges() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("widget_fwd.h", "namespace demo { class Widget; }\n")
+        .file(
+            "widget.h",
+            r#"namespace demo {
+class Widget { public: void run(); };
+class Other { public: void run(); };
+}
+"#,
+        )
+        .file(
+            "widget.cc",
+            r#"#include "widget_fwd.h"
+namespace demo {
+void Widget::run() {}
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "widget.h"
+void consume() {
+    demo::Widget().run();
+    demo::Widget local;
+    local.run();
+    demo::Other().run();
+    demo::Other other;
+    other.run();
+    demo::Widget malformed;
+    malformed.run(1);
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    let edges = value["edges"]
+        .as_array()
+        .expect("usage graph edges")
+        .iter()
+        .filter(|edge| {
+            edge["from"].as_str() == Some("consume")
+                && edge["to"].as_str() == Some("demo.Widget.run")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(edges.len(), 1, "{}", value["edges"]);
+    assert_eq!(
+        edges[0]["weight"].as_u64(),
+        Some(2),
+        "only the temporary and local exact-owner calls should edge: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn namespace_free_function_return_type_edges() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

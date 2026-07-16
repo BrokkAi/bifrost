@@ -266,6 +266,12 @@ pub(super) struct TargetSpec {
     pub(super) callable_arity: Option<CallableArity>,
     pub(super) param_types: Option<Vec<String>>,
     pub(super) enum_owner_kind: EnumOwnerKind,
+    pub(super) owner_is_forward_declaration: bool,
+}
+
+struct ResolvedTypeOwner {
+    unit: CodeUnit,
+    is_forward_declaration: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -319,7 +325,11 @@ impl TargetSpec {
         if target.is_function() {
             // Free functions declared inside a namespace have a module owner; that namespace is
             // not a call receiver, so resolve them as free functions rather than methods.
-            let owner = type_owner_of(analyzer, target);
+            let owner_resolution = type_owner_resolution(analyzer, target);
+            let owner_is_forward_declaration = owner_resolution
+                .as_ref()
+                .is_some_and(|owner| owner.is_forward_declaration);
+            let owner = owner_resolution.map(|owner| owner.unit);
             let kind = if owner
                 .as_ref()
                 .is_some_and(|owner| target.identifier() == owner.identifier())
@@ -330,14 +340,16 @@ impl TargetSpec {
             } else {
                 TargetKind::FreeFunction
             };
-            return Some(Self::new(
+            let mut spec = Self::new(
                 target.clone(),
                 kind,
                 owner,
                 target.identifier().to_string(),
                 Some(cpp_callable_arity(analyzer, target)),
                 target.signature().and_then(cpp_signature_param_types),
-            ));
+            );
+            spec.owner_is_forward_declaration = owner_is_forward_declaration;
+            return Some(spec);
         }
 
         None
@@ -359,6 +371,7 @@ impl TargetSpec {
             callable_arity,
             param_types,
             enum_owner_kind: EnumOwnerKind::NonEnum,
+            owner_is_forward_declaration: false,
         }
     }
 }
@@ -2979,50 +2992,116 @@ pub(in crate::analyzer::usages) fn enclosing_namespace_context(
 /// type or receiver, so namespace-scoped functions and constants resolve as free functions and
 /// globals rather than members.
 pub(super) fn type_owner_of(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Option<CodeUnit> {
-    precise_parent_of(analyzer, code_unit).filter(|owner| !owner.is_module())
+    type_owner_resolution(analyzer, code_unit).map(|owner| owner.unit)
+}
+
+fn type_owner_resolution(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+) -> Option<ResolvedTypeOwner> {
+    precise_parent_resolution(analyzer, code_unit).filter(|owner| !owner.unit.is_module())
 }
 
 pub(super) fn precise_parent_of(
     analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
 ) -> Option<CodeUnit> {
+    precise_parent_resolution(analyzer, code_unit).map(|owner| owner.unit)
+}
+
+fn precise_parent_resolution(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+) -> Option<ResolvedTypeOwner> {
     let fallback = analyzer.parent_of(code_unit);
     let Some(owner_name) = code_unit
         .short_name()
         .rsplit_once('.')
         .map(|(owner, _)| owner)
     else {
-        return fallback;
+        return fallback.map(|unit| ResolvedTypeOwner {
+            unit,
+            is_forward_declaration: false,
+        });
     };
     let owner_fqn = if code_unit.package_name().is_empty() {
         owner_name.to_string()
     } else {
         format!("{}.{}", code_unit.package_name(), owner_name)
     };
-    if let Some(owner) = analyzer
+    match same_source_owner(analyzer, code_unit, &owner_fqn, owner_name) {
+        DirectOwnerResolution::UniqueFull(owner) => {
+            return Some(ResolvedTypeOwner {
+                unit: owner,
+                is_forward_declaration: false,
+            });
+        }
+        DirectOwnerResolution::Ambiguous => return None,
+        DirectOwnerResolution::ForwardsOnly(_) | DirectOwnerResolution::None => {}
+    }
+    match directly_included_owner(analyzer, code_unit, &owner_fqn, owner_name) {
+        DirectOwnerResolution::UniqueFull(owner) => Some(ResolvedTypeOwner {
+            unit: owner,
+            is_forward_declaration: false,
+        }),
+        DirectOwnerResolution::Ambiguous => None,
+        DirectOwnerResolution::ForwardsOnly(forwards) => {
+            match visible_full_cpp_owner(analyzer, code_unit, &owner_fqn, owner_name) {
+                FullOwnerResolution::Unique(owner) => Some(ResolvedTypeOwner {
+                    unit: owner,
+                    is_forward_declaration: false,
+                }),
+                FullOwnerResolution::None if forwards.len() == 1 => {
+                    forwards.into_iter().next().map(|unit| ResolvedTypeOwner {
+                        unit,
+                        is_forward_declaration: true,
+                    })
+                }
+                FullOwnerResolution::None | FullOwnerResolution::Ambiguous => None,
+            }
+        }
+        DirectOwnerResolution::None => {
+            match visible_full_cpp_owner(analyzer, code_unit, &owner_fqn, owner_name) {
+                FullOwnerResolution::Unique(owner) => Some(ResolvedTypeOwner {
+                    unit: owner,
+                    is_forward_declaration: false,
+                }),
+                FullOwnerResolution::Ambiguous => None,
+                FullOwnerResolution::None => fallback
+                    .filter(|parent| {
+                        parent.source() == code_unit.source()
+                            && parent.short_name() == owner_name
+                            && parent.package_name() == code_unit.package_name()
+                            && (!parent.is_class()
+                                || cpp_class_declaration_strength(analyzer, parent)
+                                    == CppClassDeclarationStrength::Full)
+                    })
+                    .map(|unit| ResolvedTypeOwner {
+                        unit,
+                        is_forward_declaration: false,
+                    }),
+            }
+        }
+    }
+}
+
+fn same_source_owner(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+    owner_fqn: &str,
+    owner_name: &str,
+) -> DirectOwnerResolution {
+    let candidates = analyzer
         .global_usage_definition_index()
-        .by_fqn(&owner_fqn)
+        .by_fqn(owner_fqn)
         .iter()
-        .find(|candidate| {
+        .filter(|candidate| {
             candidate.is_class()
                 && candidate.source() == code_unit.source()
                 && candidate.short_name() == owner_name
                 && candidate.package_name() == code_unit.package_name()
-        })
-        .cloned()
-    {
-        return Some(owner);
-    }
-    match directly_included_owner(analyzer, code_unit, &owner_fqn, owner_name) {
-        DirectOwnerResolution::Unique(owner) => Some(owner),
-        DirectOwnerResolution::Ambiguous => None,
-        DirectOwnerResolution::ForwardsOnly => {
-            visible_full_cpp_owner(analyzer, code_unit, &owner_fqn, owner_name)
-        }
-        DirectOwnerResolution::None => fallback.filter(|parent| {
-            parent.short_name() == owner_name && parent.package_name() == code_unit.package_name()
-        }),
-    }
+        });
+    classify_direct_owner_candidates(analyzer, candidates)
 }
 
 fn visible_full_cpp_owner(
@@ -3030,8 +3109,10 @@ fn visible_full_cpp_owner(
     code_unit: &CodeUnit,
     owner_fqn: &str,
     owner_name: &str,
-) -> Option<CodeUnit> {
-    let cpp = resolve_analyzer::<CppAnalyzer>(analyzer)?;
+) -> FullOwnerResolution {
+    let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) else {
+        return FullOwnerResolution::None;
+    };
     let mut visible_files = HashSet::default();
     collect_include_closure(
         analyzer,
@@ -3053,18 +3134,26 @@ fn visible_full_cpp_owner(
     let mut full_definition = None;
     for candidate in candidates {
         match cpp_class_declaration_strength(analyzer, candidate) {
-            CppClassDeclarationStrength::Full if full_definition.is_some() => return None,
+            CppClassDeclarationStrength::Full if full_definition.is_some() => {
+                return FullOwnerResolution::Ambiguous;
+            }
             CppClassDeclarationStrength::Full => full_definition = Some(candidate.clone()),
             CppClassDeclarationStrength::Forward => {}
-            CppClassDeclarationStrength::Unknown => return None,
+            CppClassDeclarationStrength::Unknown => return FullOwnerResolution::Ambiguous,
         }
     }
-    full_definition
+    full_definition.map_or(FullOwnerResolution::None, FullOwnerResolution::Unique)
 }
 
 enum DirectOwnerResolution {
     None,
-    ForwardsOnly,
+    ForwardsOnly(Vec<CodeUnit>),
+    UniqueFull(CodeUnit),
+    Ambiguous,
+}
+
+enum FullOwnerResolution {
+    None,
     Unique(CodeUnit),
     Ambiguous,
 }
@@ -3106,22 +3195,40 @@ fn directly_included_owner(
                 && candidate.package_name() == code_unit.package_name()
                 && direct_includes.contains(candidate.source())
         });
+    classify_direct_owner_candidates(analyzer, candidates)
+}
+
+fn classify_direct_owner_candidates<'a>(
+    analyzer: &dyn IAnalyzer,
+    candidates: impl Iterator<Item = &'a CodeUnit>,
+) -> DirectOwnerResolution {
+    collapse_owner_candidates(candidates.map(|candidate| {
+        (
+            candidate.clone(),
+            cpp_class_declaration_strength(analyzer, candidate),
+        )
+    }))
+}
+
+fn collapse_owner_candidates(
+    candidates: impl Iterator<Item = (CodeUnit, CppClassDeclarationStrength)>,
+) -> DirectOwnerResolution {
     let mut full_definition = None;
-    let mut saw_forward = false;
-    for candidate in candidates {
-        match cpp_class_declaration_strength(analyzer, candidate) {
+    let mut forwards = Vec::new();
+    for (candidate, strength) in candidates {
+        match strength {
             CppClassDeclarationStrength::Full if full_definition.is_some() => {
                 return DirectOwnerResolution::Ambiguous;
             }
-            CppClassDeclarationStrength::Full => full_definition = Some(candidate.clone()),
-            CppClassDeclarationStrength::Forward => saw_forward = true,
+            CppClassDeclarationStrength::Full => full_definition = Some(candidate),
+            CppClassDeclarationStrength::Forward => forwards.push(candidate),
             CppClassDeclarationStrength::Unknown => return DirectOwnerResolution::Ambiguous,
         }
     }
     if let Some(owner) = full_definition {
-        DirectOwnerResolution::Unique(owner)
-    } else if saw_forward {
-        DirectOwnerResolution::ForwardsOnly
+        DirectOwnerResolution::UniqueFull(owner)
+    } else if !forwards.is_empty() {
+        DirectOwnerResolution::ForwardsOnly(forwards)
     } else {
         DirectOwnerResolution::None
     }
@@ -3155,7 +3262,7 @@ fn cpp_class_declaration_strength(
             if node.start_byte() == range.start_byte && node.end_byte() == range.end_byte {
                 if matches!(
                     node.kind(),
-                    "class_specifier" | "struct_specifier" | "union_specifier"
+                    "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
                 ) {
                     if cpp_class_node_has_body(node) {
                         return CppClassDeclarationStrength::Full;
@@ -3184,8 +3291,12 @@ fn cpp_class_declaration_strength(
 fn cpp_class_node_has_body(node: Node<'_>) -> bool {
     node.child_by_field_name("body").is_some() || {
         let mut cursor = node.walk();
-        node.named_children(&mut cursor)
-            .any(|child| matches!(child.kind(), "declaration_list" | "field_declaration_list"))
+        node.named_children(&mut cursor).any(|child| {
+            matches!(
+                child.kind(),
+                "declaration_list" | "field_declaration_list" | "enumerator_list"
+            )
+        })
     }
 }
 
@@ -3425,5 +3536,56 @@ mod tests {
                 .is_empty(),
             "a degenerate qualified name must fail closed"
         );
+    }
+
+    #[test]
+    fn owner_candidate_collapse_prefers_one_full_and_rejects_unknown_or_duplicate_full() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let forward = CodeUnit::new(
+            ProjectFile::new(root.clone(), "forward.h"),
+            CodeUnitType::Class,
+            "demo",
+            "Widget",
+        );
+        let full = CodeUnit::new(
+            ProjectFile::new(root.clone(), "full.h"),
+            CodeUnitType::Class,
+            "demo",
+            "Widget",
+        );
+        let duplicate = CodeUnit::new(
+            ProjectFile::new(root, "duplicate.h"),
+            CodeUnitType::Class,
+            "demo",
+            "Widget",
+        );
+
+        assert!(matches!(
+            collapse_owner_candidates(
+                [
+                    (forward, CppClassDeclarationStrength::Forward),
+                    (full.clone(), CppClassDeclarationStrength::Full),
+                ]
+                .into_iter()
+            ),
+            DirectOwnerResolution::UniqueFull(owner) if owner == full
+        ));
+        assert!(matches!(
+            collapse_owner_candidates(
+                [(full.clone(), CppClassDeclarationStrength::Unknown)].into_iter()
+            ),
+            DirectOwnerResolution::Ambiguous
+        ));
+        assert!(matches!(
+            collapse_owner_candidates(
+                [
+                    (full, CppClassDeclarationStrength::Full),
+                    (duplicate, CppClassDeclarationStrength::Full),
+                ]
+                .into_iter()
+            ),
+            DirectOwnerResolution::Ambiguous
+        ));
     }
 }

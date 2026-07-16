@@ -28,11 +28,12 @@ use super::extractor::{
 };
 use super::resolver::{
     DesignatedInitializerOwner, EnclosingMemberOwnerResolution, LexicalCallableValueResolution,
-    LexicalTypeResolution, TargetKind, VisibilityIndex, VisibleMemberResolution,
-    constructor_style_local_declaration, declarator_name_node, designated_initializer_owner,
-    extract_variable_name, first_type_child, infer_cpp_initializer_binding,
-    infer_cpp_initializer_type, is_declaration_name, is_declarator_node, is_nested_type_node,
-    normalize_type_text, out_of_line_member_definition_owner, recovered_macro_function_return_type,
+    LexicalTypeResolution, TargetKind, VisibilityIndex, VisibleMemberResolution, call_arity,
+    constructor_style_local_declaration, cpp_callable_arity, declarator_name_node,
+    designated_initializer_owner, extract_variable_name, first_type_child,
+    infer_cpp_initializer_binding, infer_cpp_initializer_type, is_declaration_name,
+    is_declarator_node, is_nested_type_node, normalize_type_text,
+    out_of_line_member_definition_owner, recovered_macro_function_return_type,
     resolve_enclosing_member_owner, same_visible_symbol, type_owner_of,
 };
 use super::syntax::explicit_qualified_callable_value;
@@ -354,8 +355,24 @@ fn record_call(
             if receiver_is_self_like(receiver) {
                 return;
             }
-            if let Some(owner) = receiver_type_fqn(receiver, ctx, bindings) {
-                ctx.record(format!("{owner}.{name}"), field);
+            if let Some(owner) = receiver_type_unit(receiver, ctx, bindings, 32) {
+                let applicable = match ctx
+                    .visibility
+                    .visible_member_for_owner_name(ctx.file, &owner, name)
+                {
+                    VisibleMemberResolution::Callable(callables) => {
+                        callables.iter().any(|callable| {
+                            cpp_callable_arity(ctx.analyzer, callable).accepts(call_arity(node))
+                        })
+                    }
+                    VisibleMemberResolution::NonCallable => false,
+                    VisibleMemberResolution::AmbiguousKind | VisibleMemberResolution::Missing => {
+                        true
+                    }
+                };
+                if applicable {
+                    ctx.record(format!("{}.{name}", owner.fq_name()), field);
+                }
             } else {
                 ctx.record_unproven(name, field);
             }
@@ -518,16 +535,6 @@ fn scoped_call_member(node: Node<'_>, source: &str) -> String {
     node.child_by_field_name("name")
         .map(|name| node_text(name, source).to_string())
         .unwrap_or_default()
-}
-
-/// The fqn of a receiver expression's type, for the shapes that resolve without
-/// return-type inference.
-fn receiver_type_fqn(
-    receiver: Node<'_>,
-    ctx: &CppScan<'_, '_>,
-    bindings: &LocalInferenceEngine<CodeUnit>,
-) -> Option<String> {
-    receiver_type_unit(receiver, ctx, bindings, 32).map(|unit| unit.fq_name())
 }
 
 fn receiver_type_unit(
