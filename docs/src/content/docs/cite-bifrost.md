@@ -40,14 +40,14 @@ contribution.
 
 Use this human-readable form and replace the placeholders:
 
-> Bifrost contributors. *Bifrost: Tree-sitter-backed multi-language code analyzer*, version `<version>`, commit `<full-commit>`, `<year>`. https://github.com/BrokkAi/bifrost
+> Bifrost contributors. *Bifrost: Multi-language static analysis for agents, editors, and large repositories*, version `<version>`, commit `<full-commit>`, `<year>`. https://github.com/BrokkAi/bifrost
 
 A BibTeX software entry can use:
 
 ```bibtex
 @software{bifrost_contributors_<year>,
   author  = {{Bifrost contributors}},
-  title   = {Bifrost: Tree-sitter-backed Multi-language Code Analyzer},
+  title   = {Bifrost: Multi-language Static Analysis for Agents, Editors, and Large Repositories},
   version = {<version>},
   year    = {<year>},
   url     = {https://github.com/BrokkAi/bifrost},
