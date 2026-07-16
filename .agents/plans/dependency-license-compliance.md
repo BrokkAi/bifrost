@@ -20,6 +20,7 @@ A reviewer can see the result by generating the Rust and npm notice reports, pac
 - [x] (2026-07-16 14:27Z) Made binary archives, wheels/source distributions, the VSIX, and the agent plugin carry their applicable license, source, and notice files.
 - [x] (2026-07-16 14:27Z) Added and rendered the public Third-Party Notices page, linked it from the license guide, README, and sidebar, and documented optional NLP and build-tool boundaries.
 - [x] (2026-07-16 14:27Z) Passed policy, freshness, formatting, workflow parsing, docs, VSIX, wheel, source-distribution, and staged-archive checks and recorded the evidence below.
+- [x] (2026-07-16 15:27Z) Disabled the unused `setup-uv` dependency cache in the Rust CI matrix after a cache miss caused its Windows post-job cleanup to fail despite successful tests.
 
 ## Surprises & Discoveries
 
@@ -56,6 +57,9 @@ A reviewer can see the result by generating the Rust and npm notice reports, pac
 - Observation: `cargo-about` preserves CRLF bytes embedded in one upstream crate's license text, while Git's default text normalization rewrote those lines when the generated HTML was committed.
   Evidence: a clean regeneration differed only by 591 carriage returns inside the `proc-macro-error` Apache license block. Marking `THIRD_PARTY_LICENSES.html -text` in `.gitattributes` preserves the generator's exact bytes and makes the CI freshness comparison meaningful.
 
+- Observation: The first PR run's only failure happened after the Windows Rust tests passed, in `setup-uv`'s cache cleanup. Changing `pyproject.toml` produced a cache miss, no test populated `UV_CACHE_DIR`, and the action treated the missing directory as an error.
+  Evidence: the failed job ended with `Cache path D:\a\_temp\setup-uv-cache does not exist on disk`; the preceding Cargo test step passed. A master run with the same job succeeded only because its previous cache key hit and skipped saving.
+
 ## Decision Log
 
 - Decision: Treat the request as both an audit and a request to remediate confirmed documentation and artifact gaps.
@@ -80,6 +84,10 @@ A reviewer can see the result by generating the Rust and npm notice reports, pac
 
 - Decision: Do not commit checkpoints while the worktree remains detached.
   Rationale: Repository instructions forbid switching or creating a branch without an explicit request, and a detached checkpoint would not land on the current branch. Changes and validation will remain in the shared worktree for the user to place on a branch.
+  Date/Author: 2026-07-16 / Codex
+
+- Decision: Set `enable-cache: false` only on the Rust matrix's `setup-uv` step.
+  Rationale: Those jobs require the uv executable but do not install Python dependencies into uv's cache. The separate Python matrix does exercise dependency installation and keeps its cache enabled.
   Date/Author: 2026-07-16 / Codex
 
 ## Outcomes & Retrospective
@@ -184,3 +192,5 @@ Plan revision note (2026-07-16): Added the supplemental audit layer after findin
 Plan revision note (2026-07-16): Corrected the README duplicate reported during diff review, removed unrelated Markdown/YAML formatting churn, updated the VSIX generation steps to match the implementation, and recorded the user's authorization to publish a PR.
 
 Plan revision note (2026-07-16): Rebased onto current `origin/master` and preserved cargo-about's mixed upstream line endings so the generated-report freshness gate is byte-stable.
+
+Plan revision note (2026-07-16): Recorded and fixed the Windows post-job cache failure from PR #841 without disabling caching for the Python test matrix that actually uses it.

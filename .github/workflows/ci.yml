@@ -191,6 +191,7 @@ jobs:
         uses: astral-sh/setup-uv@v7
         with:
           python-version: '3.12'
+          enable-cache: false
 
       - name: cargo test
         if: matrix.can-test
