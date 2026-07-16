@@ -39,7 +39,7 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
         let target_spec_scope = crate::profiling::scope("java_graph::target_spec");
-        let Some(spec) = TargetSpec::from_target(self.java, target) else {
+        let Some(spec) = TargetSpec::from_targets(self.java, overloads) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),

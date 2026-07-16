@@ -1,4 +1,4 @@
-use super::resolver::signature_arity;
+use super::resolver::java_callable_arity;
 use crate::analyzer::usages::common::node_text;
 use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
 use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, ProjectFile, Range};
@@ -57,7 +57,7 @@ where
         .global_usage_definition_index()
         .by_fqn(&fqn)
         .iter()
-        .filter(|unit| unit.is_function() && signature_arity(unit.signature()) == arity)
+        .filter(|unit| unit.is_function() && java_callable_arity(ctx.java(), unit) == arity)
         .cloned()
         .collect::<Vec<_>>();
     if units.is_empty() {
@@ -262,10 +262,32 @@ fn is_java_nominal_type_node(kind: &str) -> bool {
     )
 }
 
-enum LexicalTypeResolution {
+pub(super) enum LexicalTypeResolution {
     Resolved(CodeUnit),
     NotFound,
     Blocked,
+}
+
+pub(super) fn java_lexical_type_from_node(
+    java: &JavaAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> LexicalTypeResolution {
+    let Some(components) = java_type_name_components(node, source) else {
+        return LexicalTypeResolution::Blocked;
+    };
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    };
+    let Some(declaration) = analyzer.enclosing_code_unit(file, &range) else {
+        return LexicalTypeResolution::NotFound;
+    };
+    java_lexical_type_from_declaration(java, &declaration, &components)
 }
 
 fn java_lexical_type_from_declaration(
@@ -276,7 +298,10 @@ fn java_lexical_type_from_declaration(
     let Some(first_component) = components.first() else {
         return LexicalTypeResolution::NotFound;
     };
-    let mut scope = java.parent_of(declaration);
+    let mut scope = declaration
+        .is_class()
+        .then(|| declaration.clone())
+        .or_else(|| java.parent_of(declaration));
     let mut visited = crate::hash::HashSet::default();
     while let Some(owner) = scope {
         if !visited.insert(owner.clone()) {
@@ -289,7 +314,7 @@ fn java_lexical_type_from_declaration(
 
         let mut first_binding = (owner.identifier() == first_component).then(|| owner.clone());
         let nested_fqn = format!("{}.{}", owner.fq_name(), first_component);
-        match unique_java_class_by_fqn(java, &nested_fqn) {
+        match unique_java_class_by_fqn_in_file(java, &nested_fqn, owner.source()) {
             Ok(Some(nested)) if first_binding.as_ref().is_some_and(|bound| bound != &nested) => {
                 return LexicalTypeResolution::Blocked;
             }
@@ -305,7 +330,7 @@ fn java_lexical_type_from_declaration(
             return LexicalTypeResolution::Resolved(first_binding);
         }
         let qualified_fqn = format!("{}.{}", first_binding.fq_name(), components[1..].join("."));
-        return match unique_java_class_by_fqn(java, &qualified_fqn) {
+        return match unique_java_class_by_fqn_in_file(java, &qualified_fqn, owner.source()) {
             Ok(Some(unit)) => LexicalTypeResolution::Resolved(unit),
             Ok(None) | Err(()) => LexicalTypeResolution::Blocked,
         };
@@ -313,12 +338,16 @@ fn java_lexical_type_from_declaration(
     LexicalTypeResolution::NotFound
 }
 
-fn unique_java_class_by_fqn(java: &JavaAnalyzer, fqn: &str) -> Result<Option<CodeUnit>, ()> {
+fn unique_java_class_by_fqn_in_file(
+    java: &JavaAnalyzer,
+    fqn: &str,
+    file: &ProjectFile,
+) -> Result<Option<CodeUnit>, ()> {
     let mut candidates = java
         .global_usage_definition_index()
         .by_fqn(fqn)
         .iter()
-        .filter(|unit| unit.is_class());
+        .filter(|unit| unit.is_class() && unit.source() == file);
     let Some(first) = candidates.next() else {
         return Ok(None);
     };

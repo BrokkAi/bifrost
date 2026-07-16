@@ -23,7 +23,7 @@ pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
         return;
     };
-    if enclosing == ctx.spec.target {
+    if enclosing == ctx.spec.target && !ctx.spec.target.is_class() {
         return;
     }
     let end = node.end_byte();
@@ -87,7 +87,10 @@ pub(super) fn enclosing_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> Enclos
     };
     let enclosing = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
     let owner = enclosing.as_ref().and_then(|enclosing| {
-        let mut current = ctx.analyzer.parent_of(enclosing);
+        let mut current = enclosing
+            .is_class()
+            .then(|| enclosing.clone())
+            .or_else(|| ctx.analyzer.parent_of(enclosing));
         while current.as_ref().is_some_and(|unit| unit.is_function()) {
             current = current
                 .as_ref()

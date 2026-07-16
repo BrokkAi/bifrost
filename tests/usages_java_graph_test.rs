@@ -2049,6 +2049,302 @@ public class Consumer {
 }
 
 #[test]
+fn java_graph_strategy_counts_generated_same_file_type_and_field_references() {
+    let (_project, analyzer) = java_analyzer_with_files(&[(
+        "com/example/Generated.java",
+        r#"
+package com.example;
+
+public class Generated {
+    private static Generated DEFAULT_INSTANCE;
+    static {
+        DEFAULT_INSTANCE = new Generated();
+    }
+
+    public static final class Builder {
+        public static Builder newBuilder() {
+            return new Builder();
+        }
+    }
+
+    public static Builder builder() {
+        return new Builder();
+    }
+
+    public com.example.Generated self() {
+        return this;
+    }
+
+    public enum Mode {
+        READY,
+        UNRECOGNIZED;
+
+        public Mode fallback() {
+            return UNRECOGNIZED;
+        }
+    }
+}
+"#,
+    )]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = JavaUsageGraphStrategy::new();
+
+    let builder = definition(&analyzer, "com.example.Generated.Builder");
+    let builder_hits: Vec<_> = strategy
+        .find_usages(&analyzer, &[builder], &candidates, 1000)
+        .into_either()
+        .expect("builder usages")
+        .into_iter()
+        .collect();
+    assert_hit_contains(&builder_hits, "Builder newBuilder()");
+    assert_hit_contains(&builder_hits, "Builder builder()");
+
+    let generated = definition(&analyzer, "com.example.Generated");
+    let generated_hits: Vec<_> = strategy
+        .find_usages(&analyzer, &[generated], &candidates, 1000)
+        .into_either()
+        .expect("generated usages")
+        .into_iter()
+        .collect();
+    assert_hit_contains(&generated_hits, "com.example.Generated self()");
+
+    let default_instance = definition(&analyzer, "com.example.Generated.DEFAULT_INSTANCE");
+    let default_hits: Vec<_> = strategy
+        .find_usages(&analyzer, &[default_instance], &candidates, 1000)
+        .into_either()
+        .expect("default instance usages")
+        .into_iter()
+        .collect();
+    assert_hit_contains(&default_hits, "DEFAULT_INSTANCE = new Generated()");
+
+    let unrecognized = definition(&analyzer, "com.example.Generated.Mode.UNRECOGNIZED");
+    let enum_hits: Vec<_> = strategy
+        .find_usages(&analyzer, &[unrecognized], &candidates, 1000)
+        .into_either()
+        .expect("enum constant usages")
+        .into_iter()
+        .collect();
+    assert_hit_contains(&enum_hits, "return UNRECOGNIZED");
+}
+
+#[test]
+fn java_graph_strategy_counts_generated_static_instance_and_fluent_calls() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Formatter.java",
+            r#"
+package com.example;
+
+public class Formatter {
+    public static class Pair<Left, Right> {}
+
+    public static Builder newBuilder() {
+        return new Builder();
+    }
+
+    public static Formatter create(Pair<String, String> value) {
+        return new Formatter();
+    }
+
+    public static class Builder {
+        public Builder setPath(String path, Pair<String, String> value) {
+            return this;
+        }
+
+        public Builder setQuery(Pair<String, String> query) {
+            return this;
+        }
+    }
+
+    public void write(Pair<String, String> value) {}
+}
+"#,
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+public class Consumer {
+    private final Formatter formatter = Formatter.create(null);
+
+    void call() {
+        Formatter.create(null);
+        formatter.write(null);
+        Formatter.newBuilder().setPath("path", null).setQuery(null);
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    for (target, expected) in [
+        ("com.example.Formatter.create", "Formatter.create(null)"),
+        ("com.example.Formatter.write", "formatter.write"),
+        ("com.example.Formatter.Builder.setQuery", ".setQuery"),
+    ] {
+        let target = definition(&analyzer, target);
+        let hits = hits(JavaUsageGraphStrategy::new().find_usages(
+            &analyzer,
+            &[target],
+            &candidates,
+            1000,
+        ));
+        assert_hit_contains(&hits, expected);
+    }
+}
+
+#[test]
+fn java_graph_strategy_accepts_any_supplied_overload_arity() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Factory.java",
+            r#"
+package com.example;
+
+public class Factory {
+    public static Factory create(String first) { return new Factory(); }
+    public static Factory create(String first, String second) { return new Factory(); }
+    public static Factory create(int first) { return new Factory(); }
+}
+"#,
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+public class Consumer {
+    Factory value = Factory.create("first", "second");
+}
+"#,
+        ),
+    ]);
+
+    let targets: Vec<_> = analyzer
+        .get_definitions("com.example.Factory.create")
+        .into_iter()
+        .filter(CodeUnit::is_function)
+        .collect();
+    assert_eq!(3, targets.len());
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits =
+        hits(JavaUsageGraphStrategy::new().find_usages(&analyzer, &targets, &candidates, 1000));
+    assert_hit_contains(&hits, "Factory.create(\"first\", \"second\")");
+}
+
+#[test]
+fn java_graph_strategy_counts_static_imported_nested_type() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Owner.java",
+            r#"
+package com.example;
+
+public class Owner {
+    public static class Nested {}
+}
+"#,
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+import static com.example.Owner.Nested;
+
+public class Consumer {
+    Nested value;
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "com.example.Owner.Nested");
+    let result = UsageFinder::new().find_usages_default(&analyzer, &[target]);
+    assert!(
+        result.all_hits_including_imports().iter().any(|hit| hit
+            .snippet
+            .contains("import static com.example.Owner.Nested")),
+        "the structured static import path should be retained as editor-visible evidence"
+    );
+}
+
+#[test]
+fn java_graph_strategy_uses_java_fqn_identity_across_duplicate_source_copies() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "copy-one/com/example/Owner.java",
+            "package com.example; public class Owner { public Owner() {} public static void create() {} }\n",
+        ),
+        (
+            "copy-two/com/example/Owner.java",
+            "package com.example; public class Owner { public Owner() {} public static void create() {} }\n",
+        ),
+        (
+            "consumer/com/example/Consumer.java",
+            r#"
+package com.example;
+
+public class Consumer {
+    Owner value = new Owner();
+
+    void call() {
+        Owner.create();
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let owners: Vec<_> = analyzer
+        .get_definitions("com.example.Owner")
+        .into_iter()
+        .filter(CodeUnit::is_class)
+        .collect();
+    let creates: Vec<_> = analyzer
+        .get_definitions("com.example.Owner.create")
+        .into_iter()
+        .filter(CodeUnit::is_function)
+        .collect();
+    let constructors: Vec<_> = analyzer
+        .get_definitions("com.example.Owner.Owner")
+        .into_iter()
+        .filter(CodeUnit::is_function)
+        .collect();
+    assert_eq!(2, owners.len());
+    assert_eq!(2, creates.len());
+    assert_eq!(2, constructors.len());
+
+    for owner in owners {
+        let hits =
+            hits(JavaUsageGraphStrategy::new().find_usages(&analyzer, &[owner], &candidates, 1000));
+        assert_hit_contains(&hits, "Owner value");
+    }
+    for create in creates {
+        let hits = hits(JavaUsageGraphStrategy::new().find_usages(
+            &analyzer,
+            &[create],
+            &candidates,
+            1000,
+        ));
+        assert_hit_contains(&hits, "Owner.create()");
+    }
+    for constructor in constructors {
+        let hits = hits(JavaUsageGraphStrategy::new().find_usages(
+            &analyzer,
+            &[constructor],
+            &candidates,
+            1000,
+        ));
+        assert_hit_contains(&hits, "new Owner()");
+    }
+}
+
+#[test]
 fn java_graph_strategy_counts_anonymous_class_typed_receiver_usage() {
     let (_project, analyzer) = java_analyzer_with_files(&[
         (

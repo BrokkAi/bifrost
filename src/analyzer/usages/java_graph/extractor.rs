@@ -287,7 +287,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(resolved) = resolve_type_from_node(node, ctx) else {
         return;
     };
-    if resolved != ctx.spec.owner {
+    if resolved.fq_name() != ctx.spec.owner.fq_name() {
         return;
     }
     hits::push_hit(node, ctx);
@@ -335,6 +335,12 @@ fn maybe_record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if ctx.spec.kind != TargetKind::Type {
         return;
     }
+    if let Some(path) = node.named_child(0)
+        && node_text(path, ctx.source) == ctx.spec.owner.fq_name()
+    {
+        hits::push_import_hit(path, ctx);
+        return;
+    }
     walk_tree_iterative(
         node,
         ctx,
@@ -344,7 +350,7 @@ fn maybe_record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 "type_identifier" | "scoped_type_identifier" | "scoped_identifier" | "identifier"
             ) && type_terminal_name_matches(current, ctx)
                 && resolve_type_from_node(current, ctx)
-                    .is_some_and(|resolved| resolved == ctx.spec.owner)
+                    .is_some_and(|resolved| resolved.fq_name() == ctx.spec.owner.fq_name())
             {
                 hits::push_import_hit(current, ctx);
                 return TreeWalkAction::Skip;
@@ -368,11 +374,11 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(resolved) = resolve_type_from_node(type_node, ctx) else {
         return;
     };
-    if resolved != ctx.spec.owner {
+    if resolved.fq_name() != ctx.spec.owner.fq_name() {
         return;
     }
-    if let Some(expected_arity) = ctx.spec.method_arity
-        && argument_list_arity(node) != expected_arity
+    if let Some(expected_arities) = ctx.spec.method_arities.as_ref()
+        && !expected_arities.contains(&argument_list_arity(node))
     {
         return;
     }
@@ -398,8 +404,8 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if node_text(name_node, ctx.source) != ctx.spec.member_name {
         return;
     }
-    if let Some(expected_arity) = ctx.spec.method_arity
-        && argument_list_arity(node) != expected_arity
+    if let Some(expected_arities) = ctx.spec.method_arities.as_ref()
+        && !expected_arities.contains(&argument_list_arity(node))
     {
         return;
     }
@@ -434,7 +440,7 @@ fn maybe_record_method_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(owner) = context.owner.as_ref() else {
         return;
     };
-    if owner == &ctx.spec.owner {
+    if owner.fq_name() == ctx.spec.owner.fq_name() {
         return;
     }
     if !ctx
@@ -444,7 +450,9 @@ fn maybe_record_method_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
-    if enclosing.is_function() && java_method_signatures_match(&ctx.spec.target, enclosing) {
+    if enclosing.is_function()
+        && java_method_signatures_match(ctx.java, &ctx.spec.target, enclosing)
+    {
         hits::push_override_declaration_hit(node, ctx);
     }
 }
