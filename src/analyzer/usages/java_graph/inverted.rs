@@ -21,8 +21,8 @@
 use super::resolver::{is_ignored_type_context, node_text};
 use super::return_type::{
     FileReturnCache, JavaReturnTypeContext, METHOD_RECEIVER_CHAIN_LIMIT,
-    METHOD_RECEIVER_CHAIN_LIMIT_NAME, MethodReturnCache, merge_receiver_type_outcomes,
-    method_return_type_for_owner_fqn,
+    METHOD_RECEIVER_CHAIN_LIMIT_NAME, MethodReturnCache, java_type_name_from_node,
+    merge_receiver_type_outcomes, method_return_type_for_owner_fqn,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
@@ -96,21 +96,11 @@ struct JavaScan<'a, 'b> {
 }
 
 impl JavaScan<'_, '_> {
-    /// Resolve a type node (stripping generics/arrays) to its fqn.
+    /// Resolve the nominal identity carried by a structured type node to its fqn.
     fn resolve_type_fqn(&self, node: Node<'_>) -> Option<String> {
-        let raw = node_text(node, self.source);
-        let normalized = raw
-            .split('<')
-            .next()
-            .unwrap_or(raw)
-            .trim()
-            .trim_end_matches("[]")
-            .trim();
-        if normalized.is_empty() {
-            return None;
-        }
+        let type_name = java_type_name_from_node(node, self.source)?;
         self.java
-            .resolve_type_name_in_file(self.file, normalized)
+            .resolve_type_name_in_file(self.file, &type_name)
             .map(|unit| unit.fq_name())
     }
 
@@ -138,12 +128,12 @@ impl JavaReturnTypeContext for JavaScan<'_, '_> {
         self.file
     }
 
-    fn root(&self) -> Node<'_> {
-        self.root
+    fn source(&self) -> &str {
+        self.source
     }
 
-    fn resolve_type_fqn(&self, node: Node<'_>) -> Option<String> {
-        JavaScan::resolve_type_fqn(self, node)
+    fn root(&self) -> Node<'_> {
+        self.root
     }
 
     fn method_return_cache(&self) -> &MethodReturnCache {

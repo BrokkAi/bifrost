@@ -1,9 +1,8 @@
 mod common;
 
-use brokk_bifrost::usages::FuzzyResult;
 use brokk_bifrost::usages::{
-    JavaUsageGraphStrategy, ScalaUsageGraphStrategy, UsageAnalyzer, UsageFinder, UsageHit,
-    UsageHitKind,
+    ExplicitCandidateProvider, FuzzyResult, JavaUsageGraphStrategy, ScalaUsageGraphStrategy,
+    UsageAnalyzer, UsageFinder, UsageHit, UsageHitKind,
 };
 use brokk_bifrost::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, JavaAnalyzer, Language, MultiAnalyzer, ScalaAnalyzer,
@@ -11,6 +10,7 @@ use brokk_bifrost::{
 use common::{InlineTestProject, call_search_tool_json, line_of};
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 fn definition(analyzer: &JavaAnalyzer, fq_name: &str) -> CodeUnit {
     analyzer
@@ -846,6 +846,123 @@ public class Consumer {
         assert_eq!(1, entry["total_hits"], "{scan}");
         assert_eq!(0, entry["unproven_hits"], "{scan}");
     }
+}
+
+#[test]
+fn authoritative_java_return_receiver_resolves_nested_type_from_declaring_scope() {
+    let (project, analyzer) = java_analyzer_with_files(&[
+        (
+            "p/Outer.java",
+            r#"
+package p;
+
+public class Outer {
+    public static class Inner {
+        public void run() {}
+    }
+
+    public static Inner make() {
+        return new Inner();
+    }
+
+    public static class Layer {
+        public static class Deep {
+            public static Inner make() {
+                return new Inner();
+            }
+        }
+    }
+}
+"#,
+        ),
+        (
+            "p/Inner.java",
+            "package p; public class Inner { public void run() {} }\n",
+        ),
+        (
+            "p/Consumer.java",
+            r#"
+package p;
+
+import p.Outer.Layer.Deep;
+
+public class Consumer {
+    void call() {
+        Outer.make().run();
+        Deep.make().run();
+    }
+}
+"#,
+        ),
+    ]);
+    let consumer = project.file("p/Consumer.java");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let nested_run = definition(&analyzer, "p.Outer.Inner.run");
+
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&nested_run),
+            Some(&provider),
+            1,
+            100,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = query.result
+    else {
+        panic!(
+            "expected authoritative Java usage success, got {:#?}",
+            query.result
+        );
+    };
+    let nested_hits = hits_by_overload
+        .get(&nested_run)
+        .expect("nested run should have a proven-hit bucket");
+    assert_eq!(
+        2,
+        nested_hits.len(),
+        "nested receiver hits: {nested_hits:#?}"
+    );
+    assert!(nested_hits.iter().all(|hit| hit.file == consumer));
+    assert_eq!(
+        0,
+        unproven_total_by_overload
+            .get(&nested_run)
+            .copied()
+            .unwrap_or_default(),
+        "lexically resolved nested return receivers must be precise"
+    );
+
+    let package_run = definition(&analyzer, "p.Inner.run");
+    let package_query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&package_run),
+            Some(&provider),
+            1,
+            100,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = package_query.result
+    else {
+        panic!(
+            "expected package-level Java usage success, got {:#?}",
+            package_query.result
+        );
+    };
+    assert!(
+        hits_by_overload
+            .get(&package_run)
+            .is_none_or(|hits| hits.is_empty()),
+        "the same-package type must not capture the lexically nested return type"
+    );
 }
 
 #[test]

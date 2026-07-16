@@ -3,7 +3,7 @@ use crate::analyzer::usages::java_graph::extractor::ScanCtx;
 use crate::analyzer::usages::java_graph::hits::enclosing_context;
 use crate::analyzer::usages::java_graph::return_type::{
     FileReturnCache, JavaReturnTypeContext, METHOD_RECEIVER_CHAIN_LIMIT, MethodReturnCache,
-    method_return_type_for_owner_fqns,
+    java_type_name_from_node, method_return_type_for_owner_fqns,
 };
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
@@ -175,12 +175,12 @@ impl JavaReturnTypeContext for ScanCtx<'_> {
         self.file
     }
 
-    fn root(&self) -> Node<'_> {
-        self.root
+    fn source(&self) -> &str {
+        self.source
     }
 
-    fn resolve_type_fqn(&self, node: Node<'_>) -> Option<String> {
-        resolve_type_from_node(node, self).map(|unit| unit.fq_name())
+    fn root(&self) -> Node<'_> {
+        self.root
     }
 
     fn method_return_cache(&self) -> &MethodReturnCache {
@@ -329,18 +329,8 @@ pub(super) fn resolve_type_from_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> Optio
         return Some(resolved);
     }
 
-    let raw = node_text(node, ctx.source);
-    if raw.is_empty() {
-        return None;
-    }
-    let normalized = raw
-        .split('<')
-        .next()
-        .unwrap_or(raw)
-        .trim()
-        .trim_end_matches("[]")
-        .trim();
-    ctx.java.resolve_type_name_in_file(ctx.file, normalized)
+    let type_name = java_type_name_from_node(node, ctx.source)?;
+    ctx.java.resolve_type_name_in_file(ctx.file, &type_name)
 }
 
 fn resolve_nested_type_from_scoped_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {

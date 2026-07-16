@@ -19,8 +19,8 @@ pub(super) type FileReturnCache =
 pub(super) trait JavaReturnTypeContext {
     fn java(&self) -> &JavaAnalyzer;
     fn file(&self) -> &ProjectFile;
+    fn source(&self) -> &str;
     fn root(&self) -> Node<'_>;
-    fn resolve_type_fqn(&self, node: Node<'_>) -> Option<String>;
     fn method_return_cache(&self) -> &MethodReturnCache;
     fn file_return_cache(&self) -> &FileReturnCache;
 }
@@ -111,7 +111,9 @@ where
     };
     if method.source() == ctx.file() {
         return java_return_type_node_covering(ctx.root(), &range)
-            .and_then(|type_node| ctx.resolve_type_fqn(type_node))
+            .and_then(|type_node| {
+                java_declared_type_fqn(ctx.java(), ctx.file(), ctx.source(), type_node, method)
+            })
             .map(|fqn| ReceiverAnalysisOutcome::Precise(vec![fqn]))
             .unwrap_or(ReceiverAnalysisOutcome::Unknown);
     }
@@ -177,7 +179,9 @@ where
                 .first()
                 .copied()
                 .and_then(|range| java_return_type_node_covering(tree.root_node(), &range))
-                .and_then(|type_node| java_type_fqn_from_node(ctx.java(), file, &source, type_node))
+                .and_then(|type_node| {
+                    java_declared_type_fqn(ctx.java(), file, &source, type_node, &unit)
+                })
                 .map(|fqn| ReceiverAnalysisOutcome::Precise(vec![fqn]))
                 .unwrap_or(ReceiverAnalysisOutcome::Unknown);
             (
@@ -188,24 +192,140 @@ where
         .collect()
 }
 
-fn java_type_fqn_from_node(
+fn java_declared_type_fqn(
     java: &JavaAnalyzer,
     file: &ProjectFile,
     source: &str,
     type_node: Node<'_>,
+    declaration: &CodeUnit,
 ) -> Option<String> {
-    let raw = node_text(type_node, source);
-    let normalized = raw
-        .split('<')
-        .next()
-        .unwrap_or(raw)
-        .trim()
-        .trim_end_matches("[]")
-        .trim();
-    (!normalized.is_empty())
-        .then(|| java.resolve_type_name_in_file(file, normalized))
-        .flatten()
-        .map(|unit| unit.fq_name())
+    let components = java_type_name_components(type_node, source)?;
+    match java_lexical_type_from_declaration(java, declaration, &components) {
+        LexicalTypeResolution::Resolved(unit) => Some(unit.fq_name()),
+        LexicalTypeResolution::Blocked => None,
+        LexicalTypeResolution::NotFound => java
+            .resolve_type_name_in_file(file, &components.join("."))
+            .map(|unit| unit.fq_name()),
+    }
+}
+
+pub(super) fn java_type_name_from_node(type_node: Node<'_>, source: &str) -> Option<String> {
+    java_type_name_components(type_node, source).map(|components| components.join("."))
+}
+
+fn java_type_name_components(type_node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    let mut components = Vec::new();
+    let mut stack = vec![type_node];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "identifier" | "type_identifier" => {
+                let component = node_text(node, source);
+                if component.is_empty() {
+                    return None;
+                }
+                components.push(component.to_string());
+            }
+            "array_type" => stack.push(node.child_by_field_name("element")?),
+            "annotated_type" | "generic_type" => {
+                let mut cursor = node.walk();
+                let nominal = node
+                    .named_children(&mut cursor)
+                    .find(|child| is_java_nominal_type_node(child.kind()))?;
+                stack.push(nominal);
+            }
+            "scoped_type_identifier" => {
+                let mut cursor = node.walk();
+                let nominal_children = node
+                    .named_children(&mut cursor)
+                    .filter(|child| is_java_nominal_type_node(child.kind()))
+                    .collect::<Vec<_>>();
+                if nominal_children.is_empty() {
+                    return None;
+                }
+                stack.extend(nominal_children.into_iter().rev());
+            }
+            _ => return None,
+        }
+    }
+    (!components.is_empty()).then_some(components)
+}
+
+fn is_java_nominal_type_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier"
+            | "type_identifier"
+            | "scoped_type_identifier"
+            | "generic_type"
+            | "array_type"
+            | "annotated_type"
+    )
+}
+
+enum LexicalTypeResolution {
+    Resolved(CodeUnit),
+    NotFound,
+    Blocked,
+}
+
+fn java_lexical_type_from_declaration(
+    java: &JavaAnalyzer,
+    declaration: &CodeUnit,
+    components: &[String],
+) -> LexicalTypeResolution {
+    let Some(first_component) = components.first() else {
+        return LexicalTypeResolution::NotFound;
+    };
+    let mut scope = java.parent_of(declaration);
+    let mut visited = crate::hash::HashSet::default();
+    while let Some(owner) = scope {
+        if !visited.insert(owner.clone()) {
+            return LexicalTypeResolution::Blocked;
+        }
+        scope = java.parent_of(&owner);
+        if !owner.is_class() {
+            continue;
+        }
+
+        let mut first_binding = (owner.identifier() == first_component).then(|| owner.clone());
+        let nested_fqn = format!("{}.{}", owner.fq_name(), first_component);
+        match unique_java_class_by_fqn(java, &nested_fqn) {
+            Ok(Some(nested)) if first_binding.as_ref().is_some_and(|bound| bound != &nested) => {
+                return LexicalTypeResolution::Blocked;
+            }
+            Ok(Some(nested)) => first_binding = Some(nested),
+            Ok(None) => {}
+            Err(()) => return LexicalTypeResolution::Blocked,
+        }
+
+        let Some(first_binding) = first_binding else {
+            continue;
+        };
+        if components.len() == 1 {
+            return LexicalTypeResolution::Resolved(first_binding);
+        }
+        let qualified_fqn = format!("{}.{}", first_binding.fq_name(), components[1..].join("."));
+        return match unique_java_class_by_fqn(java, &qualified_fqn) {
+            Ok(Some(unit)) => LexicalTypeResolution::Resolved(unit),
+            Ok(None) | Err(()) => LexicalTypeResolution::Blocked,
+        };
+    }
+    LexicalTypeResolution::NotFound
+}
+
+fn unique_java_class_by_fqn(java: &JavaAnalyzer, fqn: &str) -> Result<Option<CodeUnit>, ()> {
+    let mut candidates = java
+        .global_usage_definition_index()
+        .by_fqn(fqn)
+        .iter()
+        .filter(|unit| unit.is_class());
+    let Some(first) = candidates.next() else {
+        return Ok(None);
+    };
+    if candidates.any(|candidate| candidate != first) {
+        return Err(());
+    }
+    Ok(Some(first.clone()))
 }
 
 fn java_return_type_node_covering<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
@@ -233,4 +353,52 @@ pub(super) fn merge_receiver_type_outcomes(
     outcomes: impl IntoIterator<Item = ReceiverAnalysisOutcome<String>>,
 ) -> ReceiverAnalysisOutcome<String> {
     ReceiverAnalysisOutcome::merge_branch_outcomes(outcomes, ReceiverAnalysisBudget::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn nominal_type_name_uses_structured_java_wrappers() {
+        let source = r#"
+class Sample {
+    Target[] array() { return null; }
+    Box<Target> generic() { return null; }
+    pkg.Outer<String>.Inner scoped() { return null; }
+}
+"#;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .expect("Java parser language");
+        let tree = parser.parse(source, None).expect("parsed Java fixture");
+        let mut actual = BTreeMap::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "method_declaration" {
+                let name_node = node.child_by_field_name("name").expect("method name");
+                let type_node = node.child_by_field_name("type").expect("method type");
+                actual.insert(
+                    node_text(name_node, source).to_string(),
+                    java_type_name_from_node(type_node, source).expect("nominal type name"),
+                );
+            }
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+
+        assert_eq!(
+            BTreeMap::from([
+                ("array".to_string(), "Target".to_string()),
+                ("generic".to_string(), "Box".to_string()),
+                ("scoped".to_string(), "pkg.Outer.Inner".to_string()),
+            ]),
+            actual
+        );
+    }
 }
