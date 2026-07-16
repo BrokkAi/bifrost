@@ -14,7 +14,7 @@ The observable proof is a temporary Java project containing only an import and a
 
 - [x] (2026-07-16 14:05Z) Inspected issue #443, predecessor issue #354 and PR #445, the current external index, analyzer configuration, project abstraction, workspace update routing, formatter process lifecycle, and official Maven/Gradle dependency-reporting APIs.
 - [x] (2026-07-16 14:05Z) Chose the external-declaration boundary, trust model, metadata subset, build-tool execution model, cache lookup constraints, and invalidation behavior with the user.
-- [ ] Add the public discovery configuration and safe Maven/Gradle metadata discovery with exact cache lookup.
+- [x] (2026-07-16 14:43Z) Added public discovery configuration, structural Maven POM parsing, modern and legacy Gradle lock parsing, and exact Maven/Gradle cache lookup. `cargo test java_dependency_discovery --lib` passes all seven focused parser and generated-JAR tests.
 - [ ] Add bounded offline Maven/Gradle discovery and reuse the formatter process lifecycle safely.
 - [ ] Integrate lazy discovery and manifest invalidation into Java and multi-language analyzer updates.
 - [ ] Add end-to-end and failure-mode coverage, run all required validation, and complete the retrospective.
@@ -29,6 +29,8 @@ The observable proof is a temporary Java project containing only an import and a
   Evidence: `MultiAnalyzer::should_receive_changed_file` currently special-cases only JavaScript and TypeScript configuration files.
 - Observation: The formatter already owns the difficult cross-platform process cleanup required by build-tool execution.
   Evidence: `src/lsp/handlers/formatting.rs` uses Unix sessions and Windows Job Objects to terminate descendants on cancellation and timeout.
+- Observation: Gradle's artifact cache adds a content-hash directory beneath an exact coordinate, so exact lookup still requires one bounded directory-listing step.
+  Evidence: The resolver enters only `<root>/<group>/<artifact>/<version>`, sorts its direct hash children, and considers JARs immediately beneath them; the end-to-end test places another valid JAR under an unrelated coordinate and proves it is not indexed.
 
 ## Decision Log
 
@@ -53,7 +55,7 @@ The observable proof is a temporary Java project containing only an import and a
 
 ## Outcomes & Retrospective
 
-Implementation has not started. The intended outcome is automatic exact dependency awareness from safe metadata, optional resolved transitive coverage from offline build tools, and correct lazy refresh after build inputs change, without widening external types into workspace declarations.
+The safe metadata milestone now provides automatic exact dependency awareness from Maven POMs and Gradle lockfiles, while keeping all discovered declarations in `JavaExternalDeclarationIndex`. Offline resolved transitive coverage and correct lazy refresh after build inputs change remain to be implemented.
 
 ## Context and Orientation
 

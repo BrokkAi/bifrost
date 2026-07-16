@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnalyzerConfig {
@@ -10,6 +11,7 @@ pub struct AnalyzerConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JavaAnalyzerConfig {
     pub external_dependencies: JavaExternalDependencies,
+    pub dependency_discovery: JavaDependencyDiscoveryConfig,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -17,6 +19,34 @@ pub struct JavaExternalDependencies {
     pub artifact_paths: Vec<JavaExternalArtifact>,
     pub coordinates: Vec<JavaMavenCoordinate>,
     pub repository_roots: Vec<PathBuf>,
+    pub gradle_cache_roots: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JavaDependencyDiscoveryMode {
+    Disabled,
+    #[default]
+    Metadata,
+    OfflineBuildTools,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JavaDependencyDiscoveryConfig {
+    pub mode: JavaDependencyDiscoveryMode,
+    pub maven_executable: Option<PathBuf>,
+    pub gradle_executable: Option<PathBuf>,
+    pub timeout: Duration,
+}
+
+impl Default for JavaDependencyDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            mode: JavaDependencyDiscoveryMode::Metadata,
+            maven_executable: None,
+            gradle_executable: None,
+            timeout: Duration::from_secs(30),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
