@@ -179,8 +179,13 @@ fn rust_declaration_targets_in_files(
 
 impl RustAnalyzer {
     pub fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {
+        if let Some(cached) = self.export_indexes.get(file) {
+            return (*cached).clone();
+        }
         let declarations = self.declarations(file);
-        self.export_index_of_declarations(file, &declarations)
+        let index = Arc::new(self.export_index_of_declarations(file, &declarations));
+        self.export_indexes.insert(file.clone(), index.clone());
+        (*index).clone()
     }
 
     pub(super) fn export_index_of_declarations(
@@ -1313,5 +1318,6 @@ mod tests {
         let second = analyzer.forward_reference_context_of(&file);
 
         assert!(Arc::ptr_eq(&first, &second));
+        assert!(analyzer.export_indexes.get(&file).is_some());
     }
 }

@@ -17,7 +17,8 @@ The result is observable in two ways. Focused `bifrost_benchmark` runs for `clic
 - [x] (2026-07-16 10:59Z) Cached owned Python module-binding timelines and retained query-specific import classification; all 89 Python usage-graph tests pass, including rebinding and deferred-body behavior.
 - [x] (2026-07-16 10:59Z) Added per-binding workspace-module facts and a graph-build-wide canonical namespace cache for Python inverted edges; all nine Python dead-code tests pass.
 - [x] (2026-07-16 10:59Z) Added `post_to_slack` with schedule-preserving conditions shared by both Slack steps; workflow policy tests pass.
-- [ ] Run focused profile benchmarks and the repository Rust quality gates.
+- [x] (2026-07-16 11:24Z) Ran focused local benchmarks for all three repositories. Strict comparisons pass for warmed focused reports: Click scan 2261.8 ms and dead code 1484.5 ms; Gin scan 738.8 ms; Serde definition 19.0 ms on the final repeat.
+- [ ] Run the repository Rust quality gates.
 - [ ] Review, commit each completed milestone, push the branch, run the silent benchmark path, and open a ready-for-review pull request.
 
 ## Surprises & Discoveries
@@ -30,6 +31,12 @@ The result is observable in two ways. Focused `bifrost_benchmark` runs for `clic
 
 - Observation: On this macOS host, feature-enabled integration-test linking attempts to build the crate's dynamic-library target and fails on unresolved PyO3 symbols, although the feature-enabled library test binary links and passes.
   Evidence: `cargo test --features nlp,python --lib reused_within` passed both cache tests; `cargo test --features nlp,python --test usages_go_graph_test ...` failed at the linker, while the same integration suite without optional features passed all 51 tests. Linux CI remains the authoritative full-feature gate.
+
+- Observation: Caching the complete Rust forward context was only a partial fix because one cold context recomputed the same export indexes dozens of times.
+  Evidence: The first profile improved `serde-json-rs get_definition` from 979.8 ms to 786.3 ms, but `RustAnalyzer::build_reference_context` still spent 748.0 ms in repeated `export_index_of_declarations` calls of up to about 40 ms each. Caching export indexes reduced the final warmed median to 19.0 ms.
+
+- Observation: Python binding-timeline classification became negligible after caching; receiver scope-fact construction was the residual targeted-scan hotspot.
+  Evidence: A Click profile measured 56 file timelines at 0.3 ms aggregate, versus 3934.3 ms aggregate worker time for `python_graph::scope_facts`. Generation-caching target-independent scope facts reduced the scan median from 2677.2 ms to 2261.8 ms.
 
 ## Decision Log
 
@@ -51,6 +58,10 @@ The result is observable in two ways. Focused `bifrost_benchmark` runs for `clic
 
 - Decision: Cache raw Python binding events, not target-classified results or syntax trees.
   Rationale: Source ordering and rebinding are generation-stable, while whether an import reaches a target depends on each query's seed set. Owned strings and byte positions safely reuse the expensive tree walk without leaking target state or retaining trees.
+  Date/Author: 2026-07-16 / Codex
+
+- Decision: Make Python receiver scope facts target-independent and generation-cached, while enforcing queried-name shadowing when the reference's enclosing scope is selected.
+  Rationale: Imported factory and receiver facts depend on file contents and analyzer state, not the requested target. Module-level binding order remains the responsibility of the binding timeline; function-local shadows remain scope-wide. This lets targeted and inverted scans share the expensive facts without weakening Python shadowing semantics.
   Date/Author: 2026-07-16 / Codex
 
 ## Outcomes & Retrospective
@@ -146,6 +157,15 @@ Initial run evidence from `29489210696`:
     serde-json-rs get_definition:406.2 ms -> 979.8 ms (+141.2%)
 
 The prior scheduled run was faster than the blessed baseline on all four scenarios, so the current deltas are not explained by a generally slower runner.
+
+Final focused local evidence, compared with the same blessed baseline:
+
+    click-py scan_usages:       2261.8 ms (strict compare passes)
+    click-py dead_code_smells:  1484.5 ms (strict compare improvement)
+    gin-go scan_usages:          738.8 ms (strict compare passes)
+    serde-json-rs get_definition: 19.0 ms (strict compare improvement)
+
+The first Serde run immediately after relinking showed unrelated cold local regressions in workspace build and search; the repeat with unchanged binaries cleared them and is the report used for strict comparison. The GitHub Actions run remains the cross-machine acceptance gate.
 
 ## Interfaces and Dependencies
 
