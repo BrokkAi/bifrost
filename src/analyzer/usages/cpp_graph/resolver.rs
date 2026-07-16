@@ -32,6 +32,7 @@ pub(super) enum LexicalTypeResolution {
     Resolved {
         unit: CodeUnit,
         components: Vec<String>,
+        candidates: Vec<CodeUnit>,
     },
     Ambiguous,
     Missing,
@@ -187,7 +188,7 @@ pub(in crate::analyzer::usages) struct VisibilityIndex {
     alias_source_files: HashSet<ProjectFile>,
     aliases_by_file: OnceLock<HashMap<ProjectFile, Vec<CppAlias>>>,
     field_type_facts: Mutex<HashMap<CodeUnit, Option<DeclaredFieldTypeFact>>>,
-    structured_alias_targets: Mutex<HashMap<CodeUnit, Option<String>>>,
+    structured_alias_targets: Mutex<HashMap<CodeUnit, Option<StructuredAliasTarget>>>,
     #[cfg(test)]
     qualified_candidate_inspections: AtomicUsize,
 }
@@ -196,6 +197,15 @@ pub(in crate::analyzer::usages) struct VisibilityIndex {
 struct DeclaredFieldTypeFact {
     type_text: String,
     indirection: i32,
+}
+
+#[derive(Clone)]
+enum StructuredAliasTarget {
+    Builtin,
+    Named {
+        components: Vec<String>,
+        global: bool,
+    },
 }
 
 struct CppAlias {
@@ -318,15 +328,14 @@ impl VisibilityIndex {
             if candidates.is_empty() {
                 continue;
             }
-            let Some(resolved) = unique_logical_type_candidate(candidates) else {
-                return LexicalTypeResolution::Ambiguous;
-            };
-            let Some(unit) = self.canonical_type_unit(analyzer, file, &resolved) else {
+            let Some(unit) = self.unique_canonical_type_candidate(analyzer, file, &candidates)
+            else {
                 return LexicalTypeResolution::Ambiguous;
             };
             return LexicalTypeResolution::Resolved {
                 unit,
                 components: qualified,
+                candidates: candidates.into_iter().cloned().collect(),
             };
         }
         LexicalTypeResolution::Missing
@@ -354,10 +363,9 @@ impl VisibilityIndex {
             let resolved_type = if type_candidates.is_empty() {
                 None
             } else {
-                let Some(resolved) = unique_logical_type_candidate(type_candidates) else {
-                    return LexicalCallableValueResolution::Ambiguous;
-                };
-                let Some(unit) = self.canonical_type_unit(analyzer, file, &resolved) else {
+                let Some(unit) =
+                    self.unique_canonical_type_candidate(analyzer, file, &type_candidates)
+                else {
                     return LexicalCallableValueResolution::Ambiguous;
                 };
                 Some(unit)
@@ -418,21 +426,20 @@ impl VisibilityIndex {
         declaration: &CodeUnit,
         raw_name: &str,
     ) -> Option<CodeUnit> {
-        let mut declaration = declaration.clone();
-        let mut raw_name = raw_name.to_string();
+        let mut current =
+            self.resolve_unique_type_for_declaration(visible_from, declaration, raw_name)?;
         let mut seen_aliases = HashSet::default();
         loop {
-            let resolved =
-                self.resolve_unique_type_for_declaration(visible_from, &declaration, &raw_name)?;
-            if let Some(target) = self.structured_alias_target(analyzer, &resolved) {
-                if !seen_aliases.insert(resolved.clone()) {
-                    return None;
-                }
-                raw_name = target;
-                declaration = resolved;
-                continue;
+            let Some(target) = self.structured_alias_target(analyzer, &current) else {
+                return current.is_class().then_some(current);
+            };
+            if matches!(target, StructuredAliasTarget::Builtin) {
+                return current.is_class().then_some(current);
             }
-            return resolved.is_class().then_some(resolved);
+            if !seen_aliases.insert(current.clone()) {
+                return None;
+            }
+            current = self.resolve_structured_alias_target(visible_from, &current, &target)?;
         }
     }
 
@@ -448,11 +455,53 @@ impl VisibilityIndex {
             let Some(target) = self.structured_alias_target(analyzer, &current) else {
                 return current.is_class().then_some(current);
             };
+            if matches!(target, StructuredAliasTarget::Builtin) {
+                return current.is_class().then_some(current);
+            }
             if !seen_aliases.insert(current.clone()) {
                 return None;
             }
-            current = self.resolve_unique_type_for_declaration(visible_from, &current, &target)?;
+            current = self.resolve_structured_alias_target(visible_from, &current, &target)?;
         }
+    }
+
+    fn resolve_structured_alias_target(
+        &self,
+        visible_from: &ProjectFile,
+        declaration: &CodeUnit,
+        target: &StructuredAliasTarget,
+    ) -> Option<CodeUnit> {
+        let StructuredAliasTarget::Named { components, global } = target else {
+            return None;
+        };
+        let qualified = components.join("::");
+        if *global {
+            return unique_logical_type_candidate(self.type_candidates(visible_from, &qualified));
+        }
+        self.resolve_unique_type_for_declaration(visible_from, declaration, &qualified)
+    }
+
+    fn unique_canonical_type_candidate(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        visible_from: &ProjectFile,
+        candidates: &[&CodeUnit],
+    ) -> Option<CodeUnit> {
+        let mut canonical = Vec::new();
+        for candidate in candidates {
+            let resolved = self.canonical_type_unit(analyzer, visible_from, candidate)?;
+            if canonical
+                .iter()
+                .any(|existing| same_visible_symbol(existing, &resolved))
+            {
+                continue;
+            }
+            canonical.push(resolved);
+            if canonical.len() > 1 {
+                return None;
+            }
+        }
+        canonical.pop()
     }
 
     fn resolve_unique_type_for_declaration(
@@ -748,7 +797,11 @@ impl VisibilityIndex {
         decoded
     }
 
-    fn structured_alias_target(&self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<String> {
+    fn structured_alias_target(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+    ) -> Option<StructuredAliasTarget> {
         if let Some(cached) = self
             .structured_alias_targets
             .lock()
@@ -1437,7 +1490,10 @@ fn decode_field_declared_type_fact(
     None
 }
 
-fn decode_structured_alias_target(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<String> {
+fn decode_structured_alias_target(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+) -> Option<StructuredAliasTarget> {
     let declaration = analyzer.get_source(unit, false)?;
     let mut parser = Parser::new();
     parser
@@ -1484,24 +1540,55 @@ fn decode_structured_alias_target(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> 
                 continue;
             }
         };
-        return structured_alias_type_name(type_node, &declaration);
+        return structured_alias_type_target(type_node, &declaration);
     }
     None
 }
 
-fn structured_alias_type_name(mut type_node: Node<'_>, source: &str) -> Option<String> {
+fn structured_alias_type_target(
+    mut type_node: Node<'_>,
+    source: &str,
+) -> Option<StructuredAliasTarget> {
     while type_node.kind() == "type_descriptor" {
         type_node = type_node.child_by_field_name("type")?;
+    }
+    if type_node.kind() == "primitive_type" {
+        return Some(StructuredAliasTarget::Builtin);
     }
     if matches!(
         type_node.kind(),
         "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
     ) {
-        let name = type_node.child_by_field_name("name")?;
-        return Some(node_text(name, source).to_string());
+        type_node = type_node.child_by_field_name("name")?;
     }
-    let normalized = normalize_type_text(node_text(type_node, source));
-    (!normalized.is_empty()).then_some(normalized)
+    let global = type_node.child_by_field_name("scope").is_none()
+        && type_node.child(0).is_some_and(|child| child.kind() == "::");
+    let mut components = Vec::new();
+    append_structured_type_components(type_node, source, &mut components)?;
+    (!components.is_empty()).then_some(StructuredAliasTarget::Named { components, global })
+}
+
+fn append_structured_type_components(
+    node: Node<'_>,
+    source: &str,
+    out: &mut Vec<String>,
+) -> Option<()> {
+    match node.kind() {
+        "identifier" | "namespace_identifier" | "type_identifier" => {
+            out.push(node_text(node, source).to_string());
+            Some(())
+        }
+        "template_type" => {
+            append_structured_type_components(node.child_by_field_name("name")?, source, out)
+        }
+        "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier" => {
+            if let Some(scope) = node.child_by_field_name("scope") {
+                append_structured_type_components(scope, source, out)?;
+            }
+            append_structured_type_components(node.child_by_field_name("name")?, source, out)
+        }
+        _ => None,
+    }
 }
 
 fn declared_name_indirection(

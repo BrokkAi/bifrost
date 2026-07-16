@@ -22,13 +22,16 @@
 //! return-type inference) is a recall gap, never a wrong edge — mirroring the
 //! receiver shapes the forward C++ scan proves.
 
-use super::extractor::{LexicalScopeResolution, enclosing_lexical_scope_components};
+use super::extractor::{
+    LexicalScopeResolution, enclosing_lexical_scope_components, resolve_type_node_lexically,
+};
 use super::resolver::{
-    DesignatedInitializerOwner, LexicalCallableValueResolution, TargetKind, VisibilityIndex,
-    VisibleMemberResolution, constructor_style_local_declaration, designated_initializer_owner,
-    extract_variable_name, first_type_child, infer_cpp_initializer_type, is_declaration_name,
-    is_declarator_node, is_nested_type_node, normalize_type_text,
-    out_of_line_member_definition_owner, recovered_macro_function_return_type, type_owner_of,
+    DesignatedInitializerOwner, LexicalCallableValueResolution, LexicalTypeResolution, TargetKind,
+    VisibilityIndex, VisibleMemberResolution, constructor_style_local_declaration,
+    designated_initializer_owner, extract_variable_name, first_type_child,
+    infer_cpp_initializer_type, is_declaration_name, is_declarator_node, is_nested_type_node,
+    normalize_type_text, out_of_line_member_definition_owner, recovered_macro_function_return_type,
+    type_owner_of,
 };
 use super::syntax::explicit_qualified_callable_value;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
@@ -182,9 +185,7 @@ fn record_reference(
     }
     match node.kind() {
         "namespace_identifier" if recovered_macro_function_return_type(node).is_some() => {
-            if let Some(unit) = ctx.resolve_type(node_text(node, ctx.source)) {
-                ctx.record(unit.fq_name(), node);
-            }
+            record_type_reference(node, ctx);
         }
         // A type reference (`Foo x`, base class, `new Foo()`'s type child) resolves
         // to the class. `new Foo()` reaches its type via this case (its type child
@@ -214,12 +215,17 @@ fn record_reference(
                     return;
                 }
             }
-            if let Some(unit) = ctx.resolve_type(node_text(node, ctx.source)) {
-                ctx.record(unit.fq_name(), node);
-            }
+            record_type_reference(node, ctx);
         }
         "call_expression" => record_call(node, ctx, bindings),
         _ => {}
+    }
+}
+
+fn record_type_reference(node: Node<'_>, ctx: &mut CppScan<'_, '_>) {
+    match resolve_type_node_lexically(node, ctx.analyzer, ctx.visibility, ctx.file, ctx.source) {
+        LexicalTypeResolution::Resolved { unit, .. } => ctx.record(unit.fq_name(), node),
+        LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => {}
     }
 }
 

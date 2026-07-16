@@ -130,6 +130,65 @@ void use() {
 }
 
 #[test]
+fn lexical_type_references_match_authoritative_namespace_tiers_in_workspace_graph() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"#pragma once
+namespace alpha { class Value {}; }
+namespace beta { class Value {}; }
+"#,
+        )
+        .file(
+            "consumer.cpp",
+            r#"#include "types.h"
+namespace alpha {
+void consume() {
+    Value local;
+    ::alpha::Value explicit_alpha;
+    beta::Value explicit_beta;
+}
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    let edge = |target: &str| {
+        value["edges"]
+            .as_array()
+            .expect("edges array")
+            .iter()
+            .filter(|edge| {
+                edge["from"].as_str() == Some("alpha.consume")
+                    && edge["to"].as_str() == Some(target)
+            })
+            .collect::<Vec<_>>()
+    };
+    let alpha_edges = edge("alpha.Value");
+    let beta_edges = edge("beta.Value");
+
+    assert_eq!(
+        alpha_edges.len(),
+        1,
+        "bare and explicit alpha types must aggregate into one edge: {}",
+        value["edges"]
+    );
+    assert_eq!(
+        alpha_edges[0]["weight"].as_u64(),
+        Some(2),
+        "alpha edge must contain the bare and explicit source lines exactly"
+    );
+    assert_eq!(
+        beta_edges.len(),
+        1,
+        "explicit beta type must keep a separate exact edge: {}",
+        value["edges"]
+    );
+    assert_eq!(beta_edges[0]["weight"].as_u64(), Some(1));
+}
+
+#[test]
 fn out_of_line_member_definition_qualifiers_edge_to_class() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

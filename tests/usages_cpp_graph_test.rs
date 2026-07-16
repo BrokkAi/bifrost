@@ -6928,3 +6928,415 @@ typedef ns::Owner Owner;
         "all named/unnamed pointer, reference, array, function, and alias RHS types must hit exactly; actual Owner declarator names must not"
     );
 }
+
+#[test]
+fn authoritative_cpp_class_usage_resolves_bare_type_in_lexical_namespace() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"#pragma once
+namespace alpha {
+class Value {};
+}
+
+namespace beta {
+class Value {};
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "types.h"
+namespace alpha {
+void consume() {
+    Value local;
+    ::alpha::Value explicit_alpha;
+    beta::Value explicit_beta;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "alpha.Value"
+            && !unit.is_synthetic()
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let bare_start = source.find("Value local").expect("bare lexical type");
+    let bare_end = bare_start + "Value".len();
+    let line_start = source[..bare_start]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let line = source[..bare_start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let column = source[line_start..bare_start].chars().count() + 1;
+    let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+        &analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "consumer.cc".to_string(),
+                line: Some(line),
+                column: Some(column),
+            }],
+        },
+    );
+    let forward_result = &forward.results[0];
+    assert_eq!("resolved", forward_result.status, "{forward_result:#?}");
+    assert!(
+        forward_result
+            .definitions
+            .iter()
+            .any(|definition| definition.fqn.as_deref() == Some("alpha.Value")),
+        "bare Value must forward-resolve through namespace alpha: {forward_result:#?}"
+    );
+    assert!(
+        !forward_result
+            .definitions
+            .iter()
+            .any(|definition| definition.fqn.as_deref() == Some("beta.Value")),
+        "bare Value must not forward-resolve to beta.Value: {forward_result:#?}"
+    );
+
+    let explicit_start = source.find("::alpha::Value").expect("explicit alpha type");
+    let explicit_end = explicit_start + "::alpha::Value".len();
+    let expected = BTreeSet::from([(bare_start, bare_end), (explicit_start, explicit_end)]);
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    assert_eq!(
+        query.candidate_files,
+        std::iter::once(consumer.clone()).collect(),
+        "authoritative query must scan only consumer.cc"
+    );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!("expected authoritative lexical-type usage success");
+    };
+    let hits = hits_by_overload.get(&target).cloned().unwrap_or_default();
+    let actual = hits
+        .iter()
+        .map(|hit| {
+            assert_eq!(hit.file, consumer);
+            (hit.start_offset, hit.end_offset)
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        actual, expected,
+        "bare and explicit alpha types must hit exactly; beta.Value and declarator names must not: {hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_type_resolution_preserves_global_nested_template_and_alias_tiers() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"#pragma once
+class Value {};
+namespace alpha {
+class Value {};
+class Canonical {};
+using Alias = Canonical;
+template <typename T> class Box {};
+class Outer { public: class Inner {}; };
+}
+namespace beta {
+class Value {};
+class Canonical {};
+using Alias = Canonical;
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "types.h"
+namespace alpha {
+void consume() {
+    Value lexical_value;
+    ::Value global_value;
+    ::alpha::Value explicit_alpha;
+    beta::Value explicit_beta;
+    Alias lexical_alias;
+    beta::Alias explicit_beta_alias;
+    Outer::Inner nested_value;
+    Box<Value> templated_value;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let target = |fq_name: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Class && unit.fq_name() == fq_name && !unit.is_synthetic()
+        })
+    };
+    let exact_hits = |target: &CodeUnit| {
+        let result = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(target),
+                Some(&provider),
+                1,
+                1000,
+            )
+            .result;
+        let FuzzyResult::Success {
+            hits_by_overload, ..
+        } = result
+        else {
+            panic!("expected authoritative type usage success for {target:#?}");
+        };
+        hits_by_overload
+            .get(target)
+            .into_iter()
+            .flatten()
+            .map(|hit| {
+                assert_eq!(hit.file, consumer);
+                (hit.start_offset, hit.end_offset)
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    let range = |line: &str, token: &str| {
+        let line_start = source
+            .find(line)
+            .unwrap_or_else(|| panic!("missing fixture line {line}"));
+        let token_start = line
+            .find(token)
+            .unwrap_or_else(|| panic!("missing {token} in {line}"));
+        let start = line_start + token_start;
+        (start, start + token.len())
+    };
+
+    assert_eq!(
+        exact_hits(&target("alpha.Value")),
+        BTreeSet::from([
+            range("Value lexical_value;", "Value"),
+            range("::alpha::Value explicit_alpha;", "::alpha::Value"),
+            range("Box<Value> templated_value;", "Value"),
+        ])
+    );
+    assert_eq!(
+        exact_hits(&target("Value")),
+        BTreeSet::from([range("::Value global_value;", "::Value")])
+    );
+    assert_eq!(
+        exact_hits(&target("alpha.Canonical")),
+        BTreeSet::from([range("Alias lexical_alias;", "Alias")])
+    );
+    assert_eq!(
+        exact_hits(&target("beta.Canonical")),
+        BTreeSet::from([range("beta::Alias explicit_beta_alias;", "beta::Alias",)])
+    );
+    assert_eq!(
+        exact_hits(&target("alpha.Outer$Inner")),
+        BTreeSet::from([range("Outer::Inner nested_value;", "Outer::Inner")])
+    );
+}
+
+#[test]
+fn authoritative_cpp_type_resolution_rejects_ambiguous_nearest_alias_tier() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"class Canonical {};
+using Choice = Canonical;
+namespace alpha { class Canonical {}; }
+"#,
+        )
+        .file(
+            "left.h",
+            r#"#include "types.h"
+namespace alpha { using Choice = Canonical; }
+"#,
+        )
+        .file(
+            "right.h",
+            r#"#include "types.h"
+namespace alpha { using Choice = ::Canonical; }
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "left.h"
+#include "right.h"
+namespace alpha {
+void consume() {
+    Choice ambiguous;
+    ::Canonical global_control;
+    ::alpha::Canonical alpha_control;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let exact_hits = |fq_name: &str| {
+        let target = definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Class && unit.fq_name() == fq_name && !unit.is_synthetic()
+        });
+        let result = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1,
+                1000,
+            )
+            .result;
+        let FuzzyResult::Success {
+            hits_by_overload, ..
+        } = result
+        else {
+            panic!("expected authoritative ambiguous-tier query success");
+        };
+        hits_by_overload
+            .get(&target)
+            .into_iter()
+            .flatten()
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect::<BTreeSet<_>>()
+    };
+    let range = |token: &str| {
+        let start = source
+            .find(token)
+            .unwrap_or_else(|| panic!("missing {token}"));
+        (start, start + token.len())
+    };
+
+    assert_eq!(
+        exact_hits("Canonical"),
+        BTreeSet::from([range("::Canonical")]),
+        "conflicting alpha::Choice must not fall through to global Choice"
+    );
+    assert_eq!(
+        exact_hits("alpha.Canonical"),
+        BTreeSet::from([range("::alpha::Canonical")]),
+        "conflicting alpha::Choice must not choose either canonical owner"
+    );
+}
+
+#[test]
+fn authoritative_cpp_nested_type_keeps_outer_owner_qualifier_usage() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"namespace alpha {
+class Outer {
+public:
+    class Inner {};
+};
+}
+namespace beta {
+class Outer {
+public:
+    class Inner {};
+};
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "types.h"
+namespace alpha {
+void consume() {
+    Outer::Inner value;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "alpha.Outer"
+            && !unit.is_synthetic()
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let expected_start = source.find("Outer::Inner").expect("nested type");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = result
+    else {
+        panic!("expected authoritative outer-owner query success");
+    };
+    let hits = hits_by_overload.get(&target).cloned().unwrap_or_default();
+
+    assert_eq!(
+        hits.len(),
+        1,
+        "only Outer is an outer-owner usage: {hits:#?}"
+    );
+    let hit = hits.iter().next().expect("outer owner hit");
+    assert_eq!(hit.file, consumer);
+    assert_eq!(
+        (hit.start_offset, hit.end_offset),
+        (expected_start, expected_start + "Outer".len()),
+        "nested full-type resolution must retain its exact outer qualifier usage"
+    );
+
+    let beta_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "beta.Outer" && !unit.is_synthetic()
+    });
+    let beta_result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&beta_target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result;
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = beta_result
+    else {
+        panic!("expected authoritative beta outer-owner query success");
+    };
+    assert!(
+        hits_by_overload
+            .get(&beta_target)
+            .is_some_and(BTreeSet::is_empty),
+        "lexical alpha Outer qualifier must not leak to beta.Outer: {hits_by_overload:#?}"
+    );
+}
