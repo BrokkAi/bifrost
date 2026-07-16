@@ -90,9 +90,17 @@ impl ScalaDeadCodeBulkContext {
         let Some(owner_fq_name) = spec.owner_fq_name.as_deref() else {
             return false;
         };
-        self.wildcard_owner_imports.contains(owner_fq_name)
-            || self.direct_member_imports.contains(&spec.target_fq_name)
+        let normalized_owner = scala_normalized_fq_name(owner_fq_name);
+        normalized_import_paths_contain(&self.wildcard_owner_imports, &normalized_owner)
+            || normalized_import_paths_contain(&self.direct_member_imports, &spec.target_fq_name)
     }
+}
+
+fn normalized_import_paths_contain(paths: &HashSet<String>, target_fq_name: &str) -> bool {
+    paths.contains(target_fq_name)
+        || target_fq_name
+            .match_indices('.')
+            .any(|(separator, _)| paths.contains(&target_fq_name[separator + 1..]))
 }
 
 pub(crate) fn dead_code_bulk_eligibility(
