@@ -3,6 +3,7 @@ mod hits;
 mod inverted;
 mod resolver;
 mod shared;
+mod syntax;
 
 use crate::analyzer::usages::common::language_for_target;
 pub(in crate::analyzer::usages) use crate::analyzer::usages::cpp_call_match::cpp_split_top_level_commas;

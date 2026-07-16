@@ -209,9 +209,6 @@ class CodeQueryResultRef:
     input_kind: str | None = None
     parameter_index: int | None = None
     parameter_name: str | None = None
-    analysis_kind: str | None = None
-    outcome: str | None = None
-    capture: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryResultRef:
@@ -240,9 +237,6 @@ class CodeQueryResultRef:
             if "parameter_index" in data
             else None,
             parameter_name=data.get("parameter_name"),
-            analysis_kind=data.get("analysis_kind"),
-            outcome=data.get("outcome"),
-            capture=data.get("capture"),
         )
 
 
@@ -555,132 +549,6 @@ class CodeQueryExpressionSite:
         )
 
 
-@dataclass(frozen=True)
-class CodeQuerySourceSite:
-    path: str
-    range: CodeQueryRange
-
-    @classmethod
-    def from_dict(cls, data: dict) -> CodeQuerySourceSite:
-        return cls(path=data["path"], range=CodeQueryRange.from_dict(data["range"]))
-
-
-@dataclass(frozen=True)
-class CodeQueryReceiverValue:
-    receiver_value_kind: str
-    declaration: CodeQueryDeclaration | None = None
-    type_declaration: CodeQueryDeclaration | None = None
-    allocation_site: CodeQuerySourceSite | None = None
-    factory: CodeQueryDeclaration | None = None
-    returned_value: CodeQueryReceiverValue | None = None
-
-    @classmethod
-    def from_dict(cls, data: dict) -> CodeQueryReceiverValue:
-        return cls(
-            receiver_value_kind=data["receiver_value_kind"],
-            declaration=CodeQueryDeclaration.from_dict(data["declaration"])
-            if "declaration" in data
-            else None,
-            type_declaration=CodeQueryDeclaration.from_dict(data["type_declaration"])
-            if "type_declaration" in data
-            else None,
-            allocation_site=CodeQuerySourceSite.from_dict(data["allocation_site"])
-            if "allocation_site" in data
-            else None,
-            factory=CodeQueryDeclaration.from_dict(data["factory"])
-            if "factory" in data
-            else None,
-            returned_value=CodeQueryReceiverValue.from_dict(data["returned_value"])
-            if "returned_value" in data
-            else None,
-        )
-
-    def render_text(self) -> str:
-        if self.receiver_value_kind == "allocation_site":
-            assert self.type_declaration is not None
-            assert self.allocation_site is not None
-            site = self.allocation_site
-            return (
-                f"allocation {self.type_declaration.fq_name} at "
-                f"{site.path}:{site.range.start_line}:{site.range.start_column}"
-            )
-        labels = {
-            "instance_type": "instance",
-            "class_or_static_object": "class/static",
-            "module_or_export_object": "module/export",
-            "current_receiver": "current receiver",
-        }
-        if self.receiver_value_kind in labels:
-            assert self.declaration is not None
-            return f"{labels[self.receiver_value_kind]} {self.declaration.fq_name}"
-        if self.receiver_value_kind == "factory_return":
-            assert self.factory is not None
-            assert self.returned_value is not None
-            return (
-                f"factory {self.factory.fq_name} -> "
-                f"{self.returned_value.render_text()}"
-            )
-        return self.receiver_value_kind
-
-
-@dataclass(frozen=True)
-class CodeQueryReceiverAnalysis:
-    analysis_kind: str
-    path: str
-    language: str
-    range: CodeQueryRange
-    text: str
-    input_kind: str
-    outcome: str
-    capture: str | None = None
-    values: list[CodeQueryReceiverValue] = field(default_factory=list)
-    member_targets: list[CodeQueryDeclaration] = field(default_factory=list)
-    reason: str | None = None
-    limit: str | None = None
-    provenance: list[CodeQueryProvenance] = field(default_factory=list)
-    provenance_truncated: bool = False
-
-    @classmethod
-    def from_dict(cls, data: dict) -> CodeQueryReceiverAnalysis:
-        return cls(
-            analysis_kind=data["analysis_kind"],
-            path=data["path"],
-            language=data["language"],
-            range=CodeQueryRange.from_dict(data["range"]),
-            text=data["text"],
-            input_kind=data["input_kind"],
-            outcome=data["outcome"],
-            capture=data.get("capture"),
-            values=[
-                CodeQueryReceiverValue.from_dict(item)
-                for item in data.get("values", [])
-            ],
-            member_targets=[
-                CodeQueryDeclaration.from_dict(item)
-                for item in data.get("member_targets", [])
-            ],
-            reason=data.get("reason"),
-            limit=data.get("limit"),
-            provenance=_query_provenance(data),
-            provenance_truncated=bool(data.get("provenance_truncated", False)),
-        )
-
-    def render_text(self) -> str:
-        lines = [
-            f"{self.path}:{self.range.start_line}:{self.range.start_column} "
-            f"[receiver analysis; {self.analysis_kind}; {self.outcome}] `{self.text}`"
-        ]
-        lines.extend(f"  value -> {value.render_text()}" for value in self.values)
-        lines.extend(
-            f"  member -> {target.fq_name}" for target in self.member_targets
-        )
-        if self.reason is not None:
-            lines.append(f"  reason -> {self.reason}")
-        if self.limit is not None:
-            lines.append(f"  limit -> {self.limit}")
-        return "\n".join(lines)
-
-
 CodeQueryResultItem = (
     CodeQueryMatch
     | CodeQueryDeclaration
@@ -688,7 +556,6 @@ CodeQueryResultItem = (
     | CodeQueryReferenceSite
     | CodeQueryCallSite
     | CodeQueryExpressionSite
-    | CodeQueryReceiverAnalysis
 )
 
 
@@ -706,8 +573,6 @@ def _code_query_result_item(data: dict) -> CodeQueryResultItem:
         return CodeQueryCallSite.from_dict(data)
     if result_type == "expression_site":
         return CodeQueryExpressionSite.from_dict(data)
-    if result_type == "receiver_analysis":
-        return CodeQueryReceiverAnalysis.from_dict(data)
     raise ValueError(f"unknown code query result_type: {result_type!r}")
 
 

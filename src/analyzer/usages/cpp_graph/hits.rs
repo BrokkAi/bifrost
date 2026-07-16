@@ -9,15 +9,19 @@ use crate::text_utils::{find_line_index_for_offset, snippet_around_line};
 use tree_sitter::Node;
 
 pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    push_hit_with_options(node, ctx, false, false);
+    push_hit_with_options(node, ctx, false, false, false);
+}
+
+pub(super) fn push_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    push_hit_with_options(node, ctx, false, false, true);
 }
 
 pub(super) fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    push_hit_with_options(node, ctx, false, true);
+    push_hit_with_options(node, ctx, false, true, false);
 }
 
 pub(super) fn push_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    push_hit_with_options(node, ctx, true, false);
+    push_hit_with_options(node, ctx, true, false, false);
 }
 
 pub(super) fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -54,13 +58,16 @@ fn push_hit_with_options(
     ctx: &mut ScanCtx<'_>,
     allow_logical_target_enclosing: bool,
     self_receiver: bool,
+    allow_inside_target_declaration: bool,
 ) {
     if *ctx.limit_exceeded {
         return;
     }
     let start = node.start_byte();
     let end = node.end_byte();
-    if is_inside_target_declaration(node, ctx) || is_member_field_declaration_context(node, ctx) {
+    if (!allow_inside_target_declaration && is_inside_target_declaration(node, ctx))
+        || is_member_field_declaration_context(node, ctx)
+    {
         return;
     }
     let line_idx = find_line_index_for_offset(ctx.line_starts, start);

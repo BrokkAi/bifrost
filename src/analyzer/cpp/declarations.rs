@@ -102,10 +102,22 @@ fn cpp_export_macro_token(token: &str) -> bool {
         .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
 }
 
+struct RecoveredExportedClass<'tree> {
+    declaration_node: Node<'tree>,
+    name: String,
+    body: Option<Node<'tree>>,
+    raw_supertypes: Option<Vec<String>>,
+    uses_initializer_body: bool,
+}
+
 fn recover_exported_class_declaration<'tree>(
     node: Node<'tree>,
     source: &str,
-) -> Option<(Node<'tree>, String)> {
+) -> Option<RecoveredExportedClass<'tree>> {
+    if let Some(recovered) = recover_malformed_exported_multiple_base_class(node, source) {
+        return Some(recovered);
+    }
+
     let class_node = first_class_like_child(node)?;
     if let Some(name_node) = class_node.child_by_field_name("name") {
         let class_name = normalize_cpp_whitespace(node_text(name_node, source));
@@ -125,7 +137,198 @@ fn recover_exported_class_declaration<'tree>(
         }
     }
     let name = exported_class_name_from_node(class_node, source)?;
-    Some((class_node, name))
+    Some(RecoveredExportedClass {
+        declaration_node: class_node,
+        name,
+        body: cpp_body_node(class_node),
+        raw_supertypes: matches!(class_node.kind(), "class_specifier" | "struct_specifier")
+            .then(|| extract_cpp_supertypes(class_node, source)),
+        uses_initializer_body: false,
+    })
+}
+
+fn recover_malformed_exported_multiple_base_class<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<RecoveredExportedClass<'tree>> {
+    if node.kind() != "declaration" {
+        return None;
+    }
+    let class_node = node.child_by_field_name("type")?;
+    if class_node.kind() != "class_specifier" || cpp_body_node(class_node).is_some() {
+        return None;
+    }
+    let macro_name = class_node
+        .child_by_field_name("name")
+        .and_then(|name| direct_identifier_name(name, source))?;
+    if !cpp_export_macro_token(&macro_name) {
+        return None;
+    }
+
+    let mut named_cursor = node.walk();
+    let mut named = node.named_children(&mut named_cursor);
+    if named
+        .next()
+        .is_none_or(|child| !same_node(child, class_node))
+    {
+        return None;
+    }
+    let displaced = named.next()?;
+    if displaced.kind() != "ERROR" {
+        return None;
+    }
+    let name = displaced_exported_class_name(displaced, source)?;
+
+    let remaining = named.collect::<Vec<_>>();
+    let init = *remaining.last()?;
+    if init.kind() != "init_declarator" {
+        return None;
+    }
+    let final_base = init
+        .child_by_field_name("declarator")
+        .and_then(|base| recovered_malformed_base_name(base, source))?;
+    let body = init.child_by_field_name("value")?;
+    // A complete reduction has a real closing brace here. In Chromium's Widget
+    // declaration, tree-sitter instead emits the same direct `}` slot as a
+    // zero-width missing node where the first body macro truncates the prefix.
+    if body.kind() != "initializer_list" || !has_direct_token(body, "}") {
+        return None;
+    }
+
+    let mut declarator_cursor = node.walk();
+    let direct_declarators = node.children_by_field_name("declarator", &mut declarator_cursor);
+    if direct_declarators.count() < 2 {
+        return None;
+    }
+    if remaining[..remaining.len() - 1]
+        .iter()
+        .any(|child| match child.kind() {
+            "qualified_identifier"
+            | "scoped_type_identifier"
+            | "type_identifier"
+            | "identifier" => false,
+            "ERROR" => !is_malformed_inheritance_access(*child, source),
+            _ => true,
+        })
+    {
+        return None;
+    }
+
+    let mut raw_supertypes = Vec::new();
+    for base in &remaining[..remaining.len() - 1] {
+        if base.kind() == "ERROR" {
+            continue;
+        }
+        raw_supertypes.push(recovered_malformed_base_name(*base, source)?);
+    }
+    raw_supertypes.push(final_base);
+
+    Some(RecoveredExportedClass {
+        declaration_node: node,
+        name,
+        body: Some(body),
+        raw_supertypes: Some(raw_supertypes),
+        uses_initializer_body: true,
+    })
+}
+
+fn displaced_exported_class_name(node: Node<'_>, source: &str) -> Option<String> {
+    let mut name = None;
+    let mut colon_count = 0;
+    let mut access_count = 0;
+    for index in 0..node.child_count() {
+        let child = node.child(index)?;
+        match child.kind() {
+            "identifier" | "type_identifier" if child.is_named() => {
+                if name.is_some() {
+                    return None;
+                }
+                let candidate = normalize_cpp_whitespace(node_text(child, source));
+                if candidate.is_empty() || cpp_export_macro_token(&candidate) {
+                    return None;
+                }
+                name = Some(candidate);
+            }
+            ":" if !child.is_named() => colon_count += 1,
+            "public" | "protected" | "private" if !child.is_named() => access_count += 1,
+            _ => return None,
+        }
+    }
+    (colon_count == 1 && access_count == 1)
+        .then_some(name)
+        .flatten()
+}
+
+fn is_malformed_inheritance_access(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "ERROR" || node.named_child_count() != 1 {
+        return false;
+    }
+    node.named_child(0)
+        .and_then(|child| direct_identifier_name(child, source))
+        .is_some_and(|name| matches!(name.as_str(), "public" | "protected" | "private"))
+}
+
+fn has_direct_token(node: Node<'_>, expected_kind: &str) -> bool {
+    (0..node.child_count()).any(|index| {
+        node.child(index)
+            .is_some_and(|child| !child.is_named() && child.kind() == expected_kind)
+    })
+}
+
+fn recovered_malformed_base_name(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "type_identifier" | "identifier" | "namespace_identifier" => {
+            recovered_base_atom(node, source)
+        }
+        "ERROR" => None,
+        "qualified_identifier" | "scoped_type_identifier" => {
+            let suffix = node
+                .child_by_field_name("name")
+                .and_then(|name| recovered_malformed_base_name(name, source))?;
+            let scope = node
+                .child_by_field_name("scope")
+                .and_then(|scope| recovered_malformed_base_name(scope, source))?;
+            let prefix = if matches!(scope.as_str(), "public" | "protected" | "private") {
+                malformed_qualified_prefix(node, source)?
+            } else {
+                if malformed_qualified_prefix(node, source).is_some() {
+                    return None;
+                }
+                scope
+            };
+            Some(format!("{prefix}::{suffix}"))
+        }
+        _ => None,
+    }
+}
+
+fn recovered_base_atom(node: Node<'_>, source: &str) -> Option<String> {
+    if !matches!(
+        node.kind(),
+        "identifier" | "type_identifier" | "namespace_identifier"
+    ) {
+        return None;
+    }
+    let name = normalize_cpp_whitespace(node_text(node, source));
+    (!name.is_empty()).then_some(name)
+}
+
+fn malformed_qualified_prefix(node: Node<'_>, source: &str) -> Option<String> {
+    let mut prefix = None;
+    let mut cursor = node.walk();
+    for error in node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "ERROR")
+    {
+        if error.named_child_count() != 1 || prefix.is_some() {
+            return None;
+        }
+        prefix = error
+            .named_child(0)
+            .and_then(|child| recovered_base_atom(child, source));
+        prefix.as_ref()?;
+    }
+    prefix
 }
 
 fn recover_exported_class_function_definition<'tree>(
@@ -177,6 +380,24 @@ fn recover_exported_class_function_definition<'tree>(
         return None;
     }
     class_identifier_before_body(node, source).map(|name| (node, name))
+}
+
+pub(crate) fn recovered_exported_class_has_body(
+    node: Node<'_>,
+    source: &str,
+    expected_name: &str,
+) -> Option<bool> {
+    match node.kind() {
+        "function_definition" => {
+            let (class_node, name) = recover_exported_class_function_definition(node, source)?;
+            (name == expected_name).then(|| cpp_body_node(class_node).is_some())
+        }
+        "declaration" | "field_declaration" => {
+            let recovered = recover_exported_class_declaration(node, source)?;
+            (recovered.name == expected_name).then(|| recovered.body.is_some())
+        }
+        _ => None,
+    }
 }
 
 fn class_identifier_before_body(node: Node<'_>, source: &str) -> Option<String> {
@@ -371,6 +592,7 @@ impl<'a> CppVisitor<'a> {
                             | "function_definition"
                             | "declaration"
                             | "field_declaration"
+                            | "alias_declaration"
                             | "namespace_definition"
                     ) {
                         let mut template_scope = scope.clone();
@@ -496,6 +718,21 @@ impl<'a> CppVisitor<'a> {
         scope: &ScopeInfo,
         stack: &mut Vec<CppWork<'tree>>,
     ) {
+        let body = cpp_body_node(node);
+        let raw_supertypes = matches!(node.kind(), "class_specifier" | "struct_specifier")
+            .then(|| extract_cpp_supertypes(node, self.source));
+        self.visit_named_class_like_shape(node, name, body, raw_supertypes, scope, stack);
+    }
+
+    fn visit_named_class_like_shape<'tree>(
+        &mut self,
+        declaration_node: Node<'tree>,
+        name: String,
+        body: Option<Node<'tree>>,
+        raw_supertypes: Option<Vec<String>>,
+        scope: &ScopeInfo,
+        stack: &mut Vec<CppWork<'tree>>,
+    ) {
         let short_name = if let Some(parent) = &scope.class_unit {
             format!("{}${name}", parent.short_name())
         } else {
@@ -509,24 +746,33 @@ impl<'a> CppVisitor<'a> {
             scope.template_signature.clone(),
             false,
         );
-        let has_body = cpp_body_node(node).is_some();
+        let has_body = body.is_some();
         if !has_body && self.parsed.contains_declaration(&code_unit) {
             return;
         }
         if has_body {
-            self.parsed
-                .replace_code_unit(code_unit.clone(), node, self.source, None, None);
+            self.parsed.replace_code_unit(
+                code_unit.clone(),
+                declaration_node,
+                self.source,
+                None,
+                None,
+            );
         } else {
             self.parsed
-                .add_code_unit(code_unit.clone(), node, self.source, None, None);
+                .add_code_unit(code_unit.clone(), declaration_node, self.source, None, None);
         }
-        if matches!(node.kind(), "class_specifier" | "struct_specifier") {
+        if let Some(raw_supertypes) = raw_supertypes {
             self.parsed
-                .set_raw_supertypes(code_unit.clone(), extract_cpp_supertypes(node, self.source));
+                .set_raw_supertypes(code_unit.clone(), raw_supertypes);
         }
         self.parsed.add_signature(
             code_unit.clone(),
-            render_cpp_type_signature(node, self.source, scope.template_signature.as_deref()),
+            render_cpp_type_signature(
+                declaration_node,
+                self.source,
+                scope.template_signature.as_deref(),
+            ),
         );
         if let Some(parent) = &scope.class_unit {
             self.parsed.add_child(parent.clone(), code_unit.clone());
@@ -534,7 +780,7 @@ impl<'a> CppVisitor<'a> {
             self.parsed.add_child(module.clone(), code_unit.clone());
         }
 
-        if let Some(body) = cpp_body_node(node) {
+        if let Some(body) = body {
             let mut nested_scope = scope.clone();
             nested_scope.class_unit = Some(code_unit.clone());
             nested_scope.template_signature = scope.template_signature.clone();
@@ -543,10 +789,10 @@ impl<'a> CppVisitor<'a> {
                 scope: nested_scope,
             }));
         }
-        if node.kind() == "enum_specifier" {
-            self.visit_enum_enumerators(node, scope, &code_unit);
+        if declaration_node.kind() == "enum_specifier" {
+            self.visit_enum_enumerators(declaration_node, scope, &code_unit);
             if !self.has_enum_enumerator_units(&code_unit) {
-                self.visit_enum_enumerators_from_text(node, scope, &code_unit);
+                self.visit_enum_enumerators_from_text(declaration_node, scope, &code_unit);
             }
         }
     }
@@ -713,8 +959,19 @@ impl<'a> CppVisitor<'a> {
         in_class_body: bool,
         stack: &mut Vec<CppWork<'tree>>,
     ) {
-        if let Some((class_node, name)) = recover_exported_class_declaration(node, self.source) {
-            self.visit_named_class_like(class_node, name, scope, stack);
+        if let Some(recovered) = recover_exported_class_declaration(node, self.source) {
+            let uses_initializer_body = recovered.uses_initializer_body;
+            self.visit_named_class_like_shape(
+                recovered.declaration_node,
+                recovered.name,
+                recovered.body,
+                recovered.raw_supertypes,
+                scope,
+                stack,
+            );
+            if uses_initializer_body {
+                return;
+            }
         }
 
         let mut handled_function = false;

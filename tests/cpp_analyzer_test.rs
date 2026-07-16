@@ -2,7 +2,7 @@ mod common;
 
 use brokk_bifrost::{
     CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, Project,
-    ProjectFile, TestProject,
+    ProjectFile, TestProject, TypeAliasProvider, TypeHierarchyProvider,
 };
 use common::{InlineTestProject, assert_code_eq, cpp_fixture_project};
 use std::collections::BTreeSet;
@@ -69,6 +69,147 @@ fn function_like_export_macro_preserves_class_declaration_identity() {
     assert_eq!(methods.len(), 1, "method declarations: {methods:#?}");
     assert_eq!(methods[0].kind(), CodeUnitType::Function);
     assert_eq!(analyzer.parent_of(&methods[0]), Some(classes[0].clone()));
+}
+
+#[test]
+fn malformed_exported_multiple_base_class_does_not_promote_object_declarators() {
+    let project = inline_cpp_project(&[
+        (
+            "widget.h",
+            r#"#define VIEWS_EXPORT
+namespace internal { class NativeWidgetDelegate {}; }
+namespace ui {
+class EventSource {};
+class NativeThemeObserver {};
+class ColorProviderSource {};
+class PropertyHandler {};
+class AXModeObserver {};
+namespace metadata { class MetaDataProvider {}; }
+}
+class FocusTraversable {};
+namespace views {
+class VIEWS_EXPORT Widget : public internal::NativeWidgetDelegate,
+                            public ui::EventSource,
+                            public FocusTraversable,
+                            public ui::NativeThemeObserver,
+                            public ui::ColorProviderSource,
+                            public ui::PropertyHandler,
+                            public ui::AXModeObserver,
+                            public ui::metadata::MetaDataProvider {
+    ADVANCED_MEMORY_SAFETY_CHECKS();
+
+ public:
+    Widget();
+};
+}
+
+class Outer { class Nested; };
+class API {};
+class API *pointer_value;
+class API &reference_value = *pointer_value;
+class API array_value[1];
+class API object_value{};
+"#,
+        ),
+        (
+            "two_base.h",
+            r#"#define VIEWS_EXPORT
+namespace views {
+class VIEWS_EXPORT TwoBase : public internal::NativeWidgetDelegate,
+                             public ui::EventSource {
+public:
+    TwoBase();
+};
+}
+"#,
+        ),
+    ]);
+    let analyzer = CppAnalyzer::from_project(project);
+
+    let classes: Vec<_> = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| unit.kind() == CodeUnitType::Class && !unit.is_synthetic())
+        .collect();
+    assert_eq!(
+        classes
+            .iter()
+            .filter(|unit| unit.fq_name() == "views.Widget")
+            .count(),
+        1,
+        "recovered Widget identities: {classes:#?}"
+    );
+    let widget = classes
+        .iter()
+        .find(|unit| unit.fq_name() == "views.Widget")
+        .expect("recovered Widget class");
+    let ancestors: BTreeSet<_> = analyzer
+        .get_direct_ancestors(widget)
+        .into_iter()
+        .map(|unit| unit.fq_name())
+        .collect();
+    assert_eq!(
+        ancestors,
+        BTreeSet::from([
+            "FocusTraversable".to_string(),
+            "internal.NativeWidgetDelegate".to_string(),
+            "ui.AXModeObserver".to_string(),
+            "ui.ColorProviderSource".to_string(),
+            "ui.EventSource".to_string(),
+            "ui.NativeThemeObserver".to_string(),
+            "ui.PropertyHandler".to_string(),
+            "ui::metadata.MetaDataProvider".to_string(),
+        ]),
+        "recovered Widget supertypes"
+    );
+    assert_eq!(
+        classes
+            .iter()
+            .filter(|unit| unit.fq_name() == "views.TwoBase")
+            .count(),
+        1,
+        "two-base exported class identities: {classes:#?}"
+    );
+    assert!(
+        classes.iter().any(|unit| unit.fq_name() == "Outer$Nested"),
+        "nested forward declaration was not preserved: {classes:#?}"
+    );
+    assert_eq!(
+        classes
+            .iter()
+            .filter(|unit| unit.fq_name() == "API")
+            .count(),
+        1,
+        "ordinary API object declarators must not become classes: {classes:#?}"
+    );
+    for phantom in [
+        "pointer_value",
+        "reference_value",
+        "array_value",
+        "object_value",
+    ] {
+        assert!(
+            classes.iter().all(|unit| unit.identifier() != phantom),
+            "ordinary declarator {phantom} became a phantom class: {classes:#?}"
+        );
+    }
+
+    let fields: Vec<_> = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| unit.kind() == CodeUnitType::Field && !unit.is_synthetic())
+        .collect();
+    for expected in [
+        "pointer_value",
+        "reference_value",
+        "array_value",
+        "object_value",
+    ] {
+        assert!(
+            fields.iter().any(|unit| unit.fq_name() == expected),
+            "ordinary declarator {expected} lost its Field identity: {fields:#?}"
+        );
+    }
 }
 
 #[test]
@@ -1583,4 +1724,67 @@ fn test_inline_template_class_constructor_signatures() {
             .any(|sig| sig.contains("size_t... Idxs") || sig.contains("class... ValueTypes"))
     );
     assert!(signatures.iter().any(|sig| sig.contains("<class T>")));
+}
+
+#[test]
+fn cpp_template_alias_is_indexed_once_with_lexical_namespace_identity() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "canonical.h",
+            r#"#pragma once
+namespace jni_zero {
+template <typename T>
+class ScopedJavaGlobalRef {};
+class Plain {};
+}
+"#,
+        )
+        .file(
+            "aliases.h",
+            r#"#pragma once
+#include "canonical.h"
+namespace base::android {
+using Plain = jni_zero::Plain;
+template <typename T = int>
+using ScopedJavaGlobalRef = jni_zero::ScopedJavaGlobalRef<T>;
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let aliases = analyzer
+        .get_declarations(&project.file("aliases.h"))
+        .into_iter()
+        .filter(|unit| matches!(unit.identifier(), "Plain" | "ScopedJavaGlobalRef"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        aliases.len(),
+        2,
+        "template wrapper and ordinary traversal must not emit duplicate aliases: {aliases:#?}"
+    );
+    let plain = aliases
+        .iter()
+        .find(|unit| unit.identifier() == "Plain")
+        .expect("plain alias");
+    let template = aliases
+        .iter()
+        .find(|unit| unit.identifier() == "ScopedJavaGlobalRef")
+        .expect("template alias");
+    for alias in [plain, template] {
+        assert_eq!(alias.kind(), CodeUnitType::Class);
+        assert_eq!(alias.package_name(), "base::android");
+        assert!(analyzer.is_type_alias(alias));
+        assert!(!alias.is_synthetic());
+    }
+    assert_eq!(plain.fq_name(), "base::android.Plain");
+    assert_eq!(template.fq_name(), "base::android.ScopedJavaGlobalRef");
+    assert_eq!(
+        analyzer.get_source(template, false).as_deref(),
+        Some("using ScopedJavaGlobalRef = jni_zero::ScopedJavaGlobalRef<T>;")
+    );
+    assert_eq!(
+        template.signature(),
+        Some("using ScopedJavaGlobalRef = jni_zero::ScopedJavaGlobalRef<T>;")
+    );
 }
