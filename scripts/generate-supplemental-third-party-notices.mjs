@@ -11,7 +11,7 @@ const repositoryRoot = path.resolve(
 );
 const outputPath = path.resolve(
   repositoryRoot,
-  process.argv[2] ?? "SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt",
+  process.argv[2] ?? "licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt",
 );
 const auditedStandaloneNotices = new Set(["moka/NOTICE"]);
 const auditedLinksPackages = new Set([

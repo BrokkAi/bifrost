@@ -13,13 +13,13 @@ component controls.
 
 ## Notices By Artifact
 
-| Artifact                     | Code incorporated into the artifact                                                         | Notice material shipped with it                                                                                      |
-| ---------------------------- | ------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| GitHub release archive       | Bifrost, the locked Rust graph, and target-dependent vendored native libraries              | `LICENSE.md`, `SOURCE.md`, `THIRD_PARTY_LICENSES.html`, and `SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt` beside the binary |
-| Python wheel                 | Bifrost, the locked Rust graph, the `python` feature, and vendored native libraries         | The same four files under the wheel's `.dist-info/licenses` directory                                                |
-| VS Code extension            | The Bifrost extension and production npm packages bundled into `out/extension.js`           | `LICENSE.md`, `SOURCE.md`, and a VSIX-specific `THIRD_PARTY_LICENSES.txt`                                            |
-| Agent plugin archive         | Bifrost launcher and agent instructions; no third-party npm runtime packages                | `LICENSE.md` and `SOURCE.md` in the plugin root                                                                      |
-| Rust crate or source archive | Bifrost source plus Cargo metadata; dependencies are obtained as separately licensed crates | Bifrost's `LICENSE.md`; dependency packages carry their own source notices                                           |
+| Artifact                     | Code incorporated into the artifact                                                         | Notice material shipped with it                                                                                                    |
+| ---------------------------- | ------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| GitHub release archive       | Bifrost, the locked Rust graph, and target-dependent vendored native libraries              | `LICENSE.md`, `GPL-3.0.md`, `SOURCE.md`, `THIRD_PARTY_LICENSES.html`, and `SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt` beside the binary |
+| Python wheel                 | Bifrost, the locked Rust graph, the `python` feature, and vendored native libraries         | The same five files under the wheel's `.dist-info/licenses` tree                                                                   |
+| VS Code extension            | The Bifrost extension and production npm packages bundled into `out/extension.js`           | `LICENSE.md`, `GPL-3.0.md`, `SOURCE.md`, and a VSIX-specific `THIRD_PARTY_LICENSES.txt`                                            |
+| Agent plugin archive         | Bifrost launcher and agent instructions; no third-party npm runtime packages                | `LICENSE.md`, `GPL-3.0.md`, and `SOURCE.md` in the plugin root                                                                     |
+| Rust crate or source archive | Bifrost source plus Cargo metadata; dependencies are obtained as separately licensed crates | Bifrost's `LICENSE.md` and `licenses/GPL-3.0.md`; dependency packages carry their own source notices                               |
 
 The VS Code extension and agent plugin download the platform-specific Bifrost
 release archive instead of embedding its executable. The downloaded archive
@@ -27,7 +27,7 @@ therefore carries its own Rust dependency report in addition to the notice files
 inside the extension or plugin.
 
 The source-controlled [Rust dependency
-report](https://github.com/BrokkAi/bifrost/blob/master/THIRD_PARTY_LICENSES.html)
+report](https://github.com/BrokkAi/bifrost/blob/master/licenses/THIRD_PARTY_LICENSES.html)
 is generated from `Cargo.lock`, the default plus `python` feature graph, and the
 union of targets used by the binary and wheel release workflows. It is not a
 hand-maintained package list.
@@ -35,7 +35,7 @@ hand-maintained package list.
 Cargo metadata describes the Rust wrapper crates, but does not expose separate
 `NOTICE` files or every license inside native source trees compiled by `*-sys`
 crates. The companion
-[`SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt`](https://github.com/BrokkAi/bifrost/blob/master/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt)
+[`SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt`](https://github.com/BrokkAi/bifrost/blob/master/licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt)
 therefore reproduces Moka's standalone notice and the notices for bundled
 libgit2 and its components, zlib, SQLite, and tree-sitter's Unicode data. It also
 links to the exact source crates resolved by `Cargo.lock`. The VSIX report is
@@ -97,5 +97,7 @@ reports from their lockfiles so an unreviewed license or missing notice cannot
 silently enter an artifact.
 
 For Bifrost's own copyleft and integration obligations, return to [License and
-Use Cases](/license-use-cases/). The combined GNU GPLv3 and LGPLv3 text is in
-[`LICENSE.md`](https://github.com/BrokkAi/bifrost/blob/master/LICENSE.md).
+Use Cases](/license-use-cases/). The GNU LGPLv3 text is in
+[`LICENSE.md`](https://github.com/BrokkAi/bifrost/blob/master/LICENSE.md), and
+the incorporated GNU GPLv3 text is in
+[`licenses/GPL-3.0.md`](https://github.com/BrokkAi/bifrost/blob/master/licenses/GPL-3.0.md).

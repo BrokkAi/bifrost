@@ -10,9 +10,10 @@ requires-python = ">=3.12"
 license = "LGPL-3.0-or-later"
 license-files = [
     "LICENSE.md",
-    "SOURCE.md",
-    "THIRD_PARTY_LICENSES.html",
-    "SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt",
+    "licenses/GPL-3.0.md",
+    "licenses/SOURCE.md",
+    "licenses/THIRD_PARTY_LICENSES.html",
+    "licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt",
 ]
 authors = [{ name = "Brokk" }]
 keywords = [
