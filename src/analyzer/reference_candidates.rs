@@ -88,6 +88,7 @@ fn collect_candidate_ranges(
             }
         };
         if candidate
+            && !is_excluded_reference_candidate(language, node, frontier)
             && (node.named_child_count() == 0 || compound)
             && node.start_byte() < node.end_byte()
         {
@@ -112,6 +113,26 @@ fn collect_candidate_ranges(
     ranges.sort_unstable();
     ranges.dedup();
     Some(ReferenceCandidateRanges::Complete(ranges))
+}
+
+fn is_excluded_reference_candidate(
+    language: Language,
+    node: Node<'_>,
+    frontier: CandidateFrontier,
+) -> bool {
+    if !matches!(frontier, CandidateFrontier::References)
+        || !matches!(language, Language::JavaScript | Language::TypeScript)
+    {
+        return false;
+    }
+
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    parent.kind() == "export_specifier"
+        && parent
+            .child_by_field_name("alias")
+            .is_some_and(|alias| alias == node)
 }
 
 fn is_semantic_token_identifier_node(language: Language, kind: &str) -> bool {
@@ -148,4 +169,70 @@ pub(crate) fn is_reference_candidate_node(language: Language, kind: &str) -> boo
 
 fn is_compound_reference_candidate(language: Language, kind: &str) -> bool {
     language == Language::Cpp && matches!(kind, "operator_name" | "destructor_name")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::ProjectFile;
+    use crate::analyzer::usages::get_definition::parse_tree_for_language;
+
+    #[test]
+    fn js_ts_reference_frontier_excludes_export_alias_but_semantic_frontier_keeps_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let cases = [
+            (Language::JavaScript, "index.js"),
+            (Language::TypeScript, "index.ts"),
+        ];
+
+        for (language, path) in cases {
+            let source = "const value = 1; export { value as renamed };\n";
+            let file = ProjectFile::new(&root, path);
+            let tree = parse_tree_for_language(&file, language, source)
+                .unwrap_or_else(|| panic!("failed to parse {language:?}"));
+            let export_start = source.find("export").expect("export statement");
+            let value_start = source[export_start..]
+                .find("value")
+                .map(|offset| export_start + offset)
+                .expect("export value");
+            let alias_start = source.find("renamed").expect("export alias");
+
+            let ReferenceCandidateRanges::Complete(reference_ranges) =
+                reference_candidate_ranges(tree.root_node(), language, 100)
+            else {
+                panic!("reference candidate budget exceeded for {language:?}");
+            };
+            assert!(
+                reference_ranges
+                    .iter()
+                    .any(|range| range.start_byte == value_start),
+                "export value must remain a reference candidate for {language:?}: {reference_ranges:?}"
+            );
+            assert!(
+                reference_ranges
+                    .iter()
+                    .all(|range| range.start_byte != alias_start),
+                "export alias must not be a reference candidate for {language:?}: {reference_ranges:?}"
+            );
+
+            let ReferenceCandidateRanges::Complete(semantic_ranges) =
+                semantic_token_candidate_ranges(tree.root_node(), language, 100)
+            else {
+                panic!("semantic candidate budget exceeded for {language:?}");
+            };
+            assert!(
+                semantic_ranges
+                    .iter()
+                    .any(|range| range.start_byte == value_start),
+                "semantic tokens must retain the export value for {language:?}: {semantic_ranges:?}"
+            );
+            assert!(
+                semantic_ranges
+                    .iter()
+                    .any(|range| range.start_byte == alias_start),
+                "semantic tokens must retain the export alias for {language:?}: {semantic_ranges:?}"
+            );
+        }
+    }
 }
