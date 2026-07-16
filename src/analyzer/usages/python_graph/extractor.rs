@@ -10,7 +10,10 @@ use crate::analyzer::usages::python_graph::resolver::{
     member_name, normalized_receiver_type, receiver_annotation_matches_target,
     resolve_receiver_type, target_owner_code_unit, top_level_identifier,
 };
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, PythonAnalyzer, Range};
+use crate::analyzer::{
+    CodeUnit, IAnalyzer, ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline,
+    ProjectFile, PythonAnalyzer, PythonScopeFacts, Range,
+};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
@@ -154,19 +157,31 @@ pub(super) fn scan_files_for_seeds(
             return;
         }
 
-        let edges = py.usage_matching_edges(file, seeds);
-        let module_bindings =
-            collect_module_binding_timeline(py, file, tree_ref.root_node(), source_str, seeds);
+        let edges = {
+            let _scope = crate::profiling::scope("python_graph::matching_edges");
+            py.usage_matching_edges(file, seeds)
+        };
+        let module_bindings = {
+            let _scope = crate::profiling::scope("python_graph::module_binding_timeline");
+            let raw_module_bindings = py.usage_module_binding_timeline(file, || {
+                collect_module_binding_timeline(tree_ref.root_node(), source_str)
+            });
+            classify_module_binding_timeline(py, file, raw_module_bindings.as_ref(), seeds, &edges)
+        };
         let target_self_file = *file == target.source();
-        let scope_facts = collect_scope_facts_from_parsed_source(
-            analyzer,
-            py,
-            file,
-            target_short.as_str(),
-            source_str,
-            tree_ref.root_node(),
-        );
-        let scope_range_index = build_scope_range_index(analyzer, &scope_facts);
+        let scope_facts = {
+            let _scope = crate::profiling::scope("python_graph::scope_facts");
+            py.usage_scope_facts(file, || {
+                collect_scope_facts_from_parsed_source(
+                    analyzer,
+                    py,
+                    file,
+                    source_str,
+                    tree_ref.root_node(),
+                )
+            })
+        };
+        let scope_range_index = build_scope_range_index(analyzer, scope_facts.as_ref());
 
         let mut local_hits = BTreeSet::new();
         let mut local_unproven_hits = BTreeSet::new();
@@ -186,13 +201,16 @@ pub(super) fn scan_files_for_seeds(
             target_self_file,
             member_best_effort_unique: target_self_file && member_unique_in_target_file,
             module_bindings: &module_bindings,
-            scope_facts: &scope_facts,
+            scope_facts: scope_facts.as_ref(),
             scope_range_index: &scope_range_index,
             hits: &mut local_hits,
             unproven_hits: &mut local_unproven_hits,
         };
 
-        scan_node(tree_ref.root_node(), &mut scan_ctx);
+        {
+            let _scope = crate::profiling::scope("python_graph::scan_tree");
+            scan_node(tree_ref.root_node(), &mut scan_ctx);
+        }
 
         if !local_hits.is_empty() {
             let mut sink = collected
@@ -241,7 +259,7 @@ pub(super) struct ScanCtx<'a> {
     /// an un-inferrable `recv` unambiguously means the target). Cross-file
     /// untyped receivers stay conservative.
     member_best_effort_unique: bool,
-    module_bindings: &'a HashMap<String, Vec<ModuleBindingEvent>>,
+    module_bindings: &'a HashMap<String, Vec<ClassifiedModuleBindingEvent>>,
     scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
     scope_range_index: &'a [ScopeRangeEntry],
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
@@ -286,11 +304,11 @@ fn build_scope_range_index(
     entries
 }
 
-fn indexed_scope_facts<'a>(
-    scope_range_index: &[ScopeRangeEntry],
-    scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
+fn indexed_scope_entry<'entry, 'facts>(
+    scope_range_index: &'entry [ScopeRangeEntry],
+    scope_facts: &'facts HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
     node: Node<'_>,
-) -> Option<&'a LocalBindingsSnapshot<String>> {
+) -> Option<(&'entry CodeUnit, &'facts LocalBindingsSnapshot<String>)> {
     let mut cursor =
         scope_range_index.partition_point(|entry| entry.range.start_byte <= node.start_byte());
     while cursor > 0 {
@@ -300,7 +318,9 @@ fn indexed_scope_facts<'a>(
             return None;
         }
         if entry.range.end_byte >= node.end_byte() {
-            return scope_facts.get(&entry.scope);
+            return scope_facts
+                .get(&entry.scope)
+                .map(|facts| (&entry.scope, facts));
         }
     }
     None
@@ -326,18 +346,29 @@ pub(in crate::analyzer::usages) fn enclosing_scope_facts<'a>(
 }
 
 impl ScanCtx<'_> {
+    fn scope_entry_for_node(
+        &self,
+        node: Node<'_>,
+    ) -> Option<(&CodeUnit, &LocalBindingsSnapshot<String>)> {
+        indexed_scope_entry(self.scope_range_index, self.scope_facts, node)
+    }
+
     fn scope_facts_for_node(&self, node: Node<'_>) -> Option<&LocalBindingsSnapshot<String>> {
-        indexed_scope_facts(self.scope_range_index, self.scope_facts, node)
+        self.scope_entry_for_node(node).map(|(_, facts)| facts)
     }
 
     fn binds_target(&self, ident: &str, node: Node<'_>) -> bool {
-        if let Some(scope_facts) = self.scope_facts_for_node(node)
-            && scope_facts.is_shadowed(ident)
+        let scope_entry = self.scope_entry_for_node(node);
+        if self.target_self_file
+            && ident == self.target_short
+            && scope_entry
+                .is_none_or(|(scope, facts)| scope.is_module() || !facts.is_shadowed(ident))
+        {
+            return true;
+        }
+        if scope_entry.is_some_and(|(scope, facts)| !scope.is_module() && facts.is_shadowed(ident))
         {
             return false;
-        }
-        if self.target_self_file && ident == self.target_short {
-            return true;
         }
         self.module_binding_targets_query(ident, node)
     }
@@ -745,19 +776,13 @@ enum ModuleBindingKind {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct ModuleBindingEvent {
+struct ClassifiedModuleBindingEvent {
     visible_from: usize,
     kind: ModuleBindingKind,
 }
 
-fn collect_module_binding_timeline(
-    py: &PythonAnalyzer,
-    file: &ProjectFile,
-    root: Node<'_>,
-    source: &str,
-    seeds: &BTreeSet<(ProjectFile, String)>,
-) -> HashMap<String, Vec<ModuleBindingEvent>> {
-    let mut timeline: HashMap<String, Vec<ModuleBindingEvent>> = HashMap::default();
+fn collect_module_binding_timeline(root: Node<'_>, source: &str) -> ModuleBindingTimeline {
+    let mut timeline = ModuleBindingTimeline::default();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         match node.kind() {
@@ -767,13 +792,13 @@ fn collect_module_binding_timeline(
                         &mut timeline,
                         slice(name, source),
                         node.end_byte(),
-                        ModuleBindingKind::Other,
+                        ModuleBindingEventKind::Other,
                     );
                 }
                 continue;
             }
             "import_statement" | "import_from_statement" => {
-                collect_import_binding_events(py, file, node, source, seeds, &mut timeline);
+                collect_import_binding_events(node, source, &mut timeline);
                 continue;
             }
             "assignment" | "augmented_assignment" | "named_expression" => {
@@ -802,12 +827,9 @@ fn collect_module_binding_timeline(
 }
 
 fn collect_import_binding_events(
-    py: &PythonAnalyzer,
-    file: &ProjectFile,
     node: Node<'_>,
     source: &str,
-    seeds: &BTreeSet<(ProjectFile, String)>,
-    timeline: &mut HashMap<String, Vec<ModuleBindingEvent>>,
+    timeline: &mut ModuleBindingTimeline,
 ) {
     if node.kind() == "import_statement" {
         let mut cursor = node.walk();
@@ -820,19 +842,11 @@ fn collect_import_binding_events(
                 continue;
             };
             let module = slice(name, source).trim();
-            let target_import = py
-                .usage_resolve_module_files(file, module)
-                .iter()
-                .any(|resolved| seeds.iter().any(|(seed_file, _)| seed_file == resolved));
             record_module_binding(
                 timeline,
                 slice(local, source),
                 node.end_byte(),
-                if target_import {
-                    ModuleBindingKind::TargetImport
-                } else {
-                    ModuleBindingKind::Other
-                },
+                ModuleBindingEventKind::ImportModule(module.to_string()),
             );
         }
         return;
@@ -842,7 +856,6 @@ fn collect_import_binding_events(
         return;
     };
     let module = slice(module_node, source).trim();
-    let module_files = py.usage_resolve_module_files(file, module);
     let mut cursor = node.walk();
     for imported in node.children_by_field_name("name", &mut cursor) {
         if imported.kind() == "wildcard_import" {
@@ -859,36 +872,93 @@ fn collect_import_binding_events(
         else {
             continue;
         };
-        let direct_target = module_files
-            .iter()
-            .any(|resolved| seeds.contains(&(resolved.clone(), imported_name.to_string())));
-        let submodule = if module.ends_with('.') {
-            format!("{module}{imported_name}")
-        } else {
-            format!("{module}.{imported_name}")
-        };
-        let submodule_target = py
-            .usage_resolve_module_files(file, &submodule)
-            .iter()
-            .any(|resolved| seeds.iter().any(|(seed_file, _)| seed_file == resolved));
         record_module_binding(
             timeline,
             slice(local, source),
             node.end_byte(),
-            if direct_target || submodule_target {
-                ModuleBindingKind::TargetImport
-            } else {
-                ModuleBindingKind::Other
+            ModuleBindingEventKind::FromImport {
+                module: module.to_string(),
+                imported_name: imported_name.to_string(),
             },
         );
     }
 }
 
+fn classify_module_binding_timeline(
+    py: &PythonAnalyzer,
+    file: &ProjectFile,
+    timeline: &ModuleBindingTimeline,
+    seeds: &BTreeSet<(ProjectFile, String)>,
+    edges: &[ImportEdge],
+) -> HashMap<String, Vec<ClassifiedModuleBindingEvent>> {
+    let mut classified = HashMap::default();
+    let mut module_targets: HashMap<String, bool> = HashMap::default();
+    let relevant_locals: HashSet<&str> =
+        edges.iter().map(|edge| edge.local_name.as_str()).collect();
+    for (local, events) in timeline {
+        if !relevant_locals.contains(local.as_str()) {
+            continue;
+        }
+        let classified_events = events
+            .iter()
+            .map(|event| {
+                let targets_query = match &event.kind {
+                    ModuleBindingEventKind::ImportModule(module) => *module_targets
+                        .entry(module.clone())
+                        .or_insert_with(|| module_contains_seed(py, file, module, seeds)),
+                    ModuleBindingEventKind::FromImport {
+                        module,
+                        imported_name,
+                    } => {
+                        let direct =
+                            py.usage_resolve_module_files(file, module)
+                                .iter()
+                                .any(|resolved| {
+                                    seeds.contains(&(resolved.clone(), imported_name.clone()))
+                                });
+                        let submodule = if module.ends_with('.') {
+                            format!("{module}{imported_name}")
+                        } else {
+                            format!("{module}.{imported_name}")
+                        };
+                        direct
+                            || *module_targets.entry(submodule.clone()).or_insert_with(|| {
+                                module_contains_seed(py, file, &submodule, seeds)
+                            })
+                    }
+                    ModuleBindingEventKind::Other => false,
+                };
+                ClassifiedModuleBindingEvent {
+                    visible_from: event.visible_from,
+                    kind: if targets_query {
+                        ModuleBindingKind::TargetImport
+                    } else {
+                        ModuleBindingKind::Other
+                    },
+                }
+            })
+            .collect();
+        classified.insert(local.clone(), classified_events);
+    }
+    classified
+}
+
+fn module_contains_seed(
+    py: &PythonAnalyzer,
+    file: &ProjectFile,
+    module: &str,
+    seeds: &BTreeSet<(ProjectFile, String)>,
+) -> bool {
+    py.usage_resolve_module_files(file, module)
+        .iter()
+        .any(|resolved| seeds.iter().any(|(seed_file, _)| seed_file == resolved))
+}
+
 fn record_module_binding(
-    timeline: &mut HashMap<String, Vec<ModuleBindingEvent>>,
+    timeline: &mut ModuleBindingTimeline,
     name: &str,
     visible_from: usize,
-    kind: ModuleBindingKind,
+    kind: ModuleBindingEventKind,
 ) {
     let name = name.trim();
     if name.is_empty() {
@@ -904,7 +974,7 @@ fn record_local_binding_targets(
     target: Node<'_>,
     source: &str,
     visible_from: usize,
-    timeline: &mut HashMap<String, Vec<ModuleBindingEvent>>,
+    timeline: &mut ModuleBindingTimeline,
 ) {
     let mut stack = vec![target];
     while let Some(node) = stack.pop() {
@@ -913,7 +983,7 @@ fn record_local_binding_targets(
                 timeline,
                 slice(node, source),
                 visible_from,
-                ModuleBindingKind::Other,
+                ModuleBindingEventKind::Other,
             );
             continue;
         }
@@ -1000,19 +1070,12 @@ pub(in crate::analyzer::usages) fn collect_scope_facts_from_parsed_source(
     analyzer: &dyn IAnalyzer,
     py: &PythonAnalyzer,
     file: &ProjectFile,
-    target_short: &str,
     source: &str,
     root: Node<'_>,
-) -> HashMap<CodeUnit, LocalBindingsSnapshot<String>> {
+) -> PythonScopeFacts {
     let mut factory_return_types = collect_factory_return_types_from_root(root, source);
     collect_imported_factory_return_types(analyzer, py, file, &mut factory_return_types);
-    collect_scope_facts_with_factory_returns(
-        analyzer,
-        file,
-        target_short,
-        source,
-        &factory_return_types,
-    )
+    collect_scope_facts_with_factory_returns(analyzer, file, source, &factory_return_types)
 }
 
 fn collect_imported_factory_return_types(
@@ -1110,10 +1173,9 @@ fn first_function_definition(root: Node<'_>) -> Option<Node<'_>> {
 fn collect_scope_facts_with_factory_returns(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
-    target_short: &str,
     source: &str,
     factory_return_types: &HashMap<String, String>,
-) -> HashMap<CodeUnit, LocalBindingsSnapshot<String>> {
+) -> PythonScopeFacts {
     let declarations = analyzer.declarations(file);
     let mut class_facts_by_name: HashMap<String, LocalBindingsSnapshot<String>> =
         HashMap::default();
@@ -1126,9 +1188,7 @@ fn collect_scope_facts_with_factory_returns(
         };
         let facts = collect_scope_facts_from_source(
             &declaration_source,
-            target_short,
             true,
-            false,
             Some(declaration.short_name()),
             factory_return_types,
         );
@@ -1152,8 +1212,6 @@ fn collect_scope_facts_with_factory_returns(
             .map(|(owner, _)| owner);
         let mut facts = collect_scope_facts_from_source(
             &declaration_source,
-            target_short,
-            false,
             false,
             owner,
             factory_return_types,
@@ -1174,14 +1232,8 @@ fn collect_scope_facts_with_factory_returns(
         let Some(declaration_source) = declaration_source(analyzer, declaration, source) else {
             continue;
         };
-        let facts = collect_scope_facts_from_source(
-            &declaration_source,
-            target_short,
-            false,
-            true,
-            None,
-            factory_return_types,
-        );
+        let facts =
+            collect_scope_facts_from_source(&declaration_source, false, None, factory_return_types);
         scope_facts.insert(declaration.clone(), facts);
     }
     scope_facts
@@ -1211,9 +1263,7 @@ fn declaration_source_slices<'a>(
 
 fn collect_scope_facts_from_source(
     source: &str,
-    target_short: &str,
     allow_self_receivers: bool,
-    is_module_scope: bool,
     current_class: Option<&str>,
     factory_return_types: &HashMap<String, String>,
 ) -> LocalBindingsSnapshot<String> {
@@ -1250,16 +1300,6 @@ fn collect_scope_facts_from_source(
                     annotation: None, ..
                 } => {}
                 ScopeFactEvent::Assignment { lhs, rhs } => {
-                    // A module-level assignment of the target's own name is its
-                    // definition, not a shadow that hides an outer binding, so
-                    // it must not block the target's same-file usages. Its RHS
-                    // may still infer a receiver type for ordinary locals, but
-                    // seeding the queried target itself would make
-                    // `is_shadowed(target)` true and hide every later read.
-                    let is_target_module_definition = is_module_scope && lhs == target_short;
-                    if is_target_module_definition {
-                        continue;
-                    }
                     if !engine.is_shadowed(lhs) {
                         engine.declare_shadow(lhs.clone());
                     }

@@ -23,6 +23,11 @@ on:
         required: false
         default: false
         type: boolean
+      post_to_slack:
+        description: 'Post results to Slack; disable for exploratory runs'
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -168,7 +173,7 @@ jobs:
 
       - name: Prepare Slack payload
         id: slack_payload
-        if: always() && env.SLACK_DAILY_PERF_WEBHOOK_URL != ''
+        if: always() && env.SLACK_DAILY_PERF_WEBHOOK_URL != '' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.post_to_slack))
         continue-on-error: true
         shell: bash
         run: |
@@ -331,7 +336,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Send benchmark data to Slack Workflow
-        if: always() && env.SLACK_DAILY_PERF_WEBHOOK_URL != '' && steps.slack_payload.outputs.payload != ''
+        if: always() && env.SLACK_DAILY_PERF_WEBHOOK_URL != '' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.post_to_slack)) && steps.slack_payload.outputs.payload != ''
         continue-on-error: true
         uses: slackapi/slack-github-action@v3
         with:

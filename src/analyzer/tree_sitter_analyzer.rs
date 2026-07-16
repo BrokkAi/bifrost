@@ -61,6 +61,12 @@ pub(crate) struct AnalyzerStoreContext {
     pub(crate) generations: Arc<HashMap<String, GenerationId>>,
 }
 
+pub(crate) struct StructuralSnapshotKey {
+    oid: Oid,
+    lang: String,
+    generation: GenerationId,
+}
+
 pub(crate) fn default_store_context(project: &dyn Project) -> AnalyzerStoreContext {
     store_context(project, false)
 }
@@ -1197,6 +1203,55 @@ where
         &self,
     ) -> &crate::analyzer::structural::provider::StructuralFactsCache {
         &self.structural_cache
+    }
+
+    /// Resolve a persistence identity for the exact source string being
+    /// normalized. Hashing the supplied bytes prevents a concurrent file or
+    /// overlay change from associating facts with a different live OID.
+    pub(crate) fn structural_snapshot_key(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> Option<StructuralSnapshotKey> {
+        if self.store_context.store.is_in_memory() {
+            return None;
+        }
+        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok()?;
+        let lang = self.adapter.storage_language_key_for_file(file);
+        let generation = self.store_context.generations.get(&lang).copied()?;
+        Some(StructuralSnapshotKey {
+            oid,
+            lang,
+            generation,
+        })
+    }
+
+    pub(crate) fn load_structural_facts_snapshot(
+        &self,
+        key: &StructuralSnapshotKey,
+        snapshot_version: i64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        self.store_context.store.load_structural_facts_snapshot(
+            key.oid,
+            &key.lang,
+            key.generation,
+            snapshot_version,
+        )
+    }
+
+    pub(crate) fn persist_structural_facts_snapshot(
+        &self,
+        key: &StructuralSnapshotKey,
+        snapshot_version: i64,
+        payload: &[u8],
+    ) -> Result<bool, StoreError> {
+        self.store_context.store.upsert_structural_facts_snapshot(
+            key.oid,
+            &key.lang,
+            key.generation,
+            snapshot_version,
+            payload,
+        )
     }
 
     pub fn project(&self) -> &dyn Project {

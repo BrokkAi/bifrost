@@ -33,14 +33,15 @@ fn parses_the_issue_example_query() {
         "limit": 100
     }));
 
-    assert_eq!(query.where_globs.len(), 2);
+    let seed = query.seed().expect("structural seed");
+    assert_eq!(seed.where_globs.len(), 2);
     assert_eq!(query.limit, 100);
-    assert_eq!(query.root.kinds, vec![NormalizedKind::Call]);
-    let callee = query.root.callee.as_ref().expect("callee pattern");
+    assert_eq!(seed.root.kinds, vec![NormalizedKind::Call]);
+    let callee = seed.root.callee.as_ref().expect("callee pattern");
     assert!(matches!(&callee.name, Some(StringPredicate::Exact(name)) if name == "eval"));
-    assert_eq!(query.root.args.len(), 1);
-    assert_eq!(query.root.args[0].capture.as_deref(), Some("code"));
-    let inside = query.inside.as_ref().expect("inside pattern");
+    assert_eq!(seed.root.args.len(), 1);
+    assert_eq!(seed.root.args[0].capture.as_deref(), Some("code"));
+    let inside = seed.inside.as_ref().expect("inside pattern");
     assert_eq!(inside.kinds, vec![NormalizedKind::Function]);
     assert_eq!(inside.capture.as_deref(), Some("enclosing_function"));
 }
@@ -60,7 +61,7 @@ fn parses_and_canonicalizes_reference_traversal_filters() {
         ]
     }));
     assert_eq!(
-        query.steps[1],
+        query.plan.steps[1],
         QueryStep::ReferencesOf(ReferenceTraversalFilter {
             reference_kinds: vec![ReferenceKind::FieldWrite, ReferenceKind::MethodCall],
             proof: Some(UsageProof::Proven),
@@ -91,20 +92,20 @@ fn parses_call_traversal_sites_and_formal_input_selectors() {
         ]
     }));
     assert_eq!(
-        query.steps[1],
+        query.plan.steps[1],
         QueryStep::Callers(CallTraversalFilter {
             depth: std::num::NonZeroUsize::new(3).unwrap(),
             proof: Some(UsageProof::Proven),
         })
     );
     assert_eq!(
-        query.steps[2],
+        query.plan.steps[2],
         QueryStep::CallSitesFrom(CallSiteTraversalFilter {
             proof: Some(UsageProof::Unproven),
         })
     );
     assert_eq!(
-        query.steps[3],
+        query.plan.steps[3],
         QueryStep::CallInput(CallInputSelector::ParameterIndex(0))
     );
     assert_eq!(query.to_canonical_json()["steps"][1]["depth"], 3);
@@ -114,7 +115,7 @@ fn parses_call_traversal_sites_and_formal_input_selectors() {
     )
     .expect("RQL call pipeline should parse");
     assert_eq!(
-        rql.steps,
+        rql.plan.steps,
         vec![
             QueryStep::EnclosingDecl,
             QueryStep::CallSitesTo(CallSiteTraversalFilter {
@@ -153,7 +154,7 @@ fn receiver_steps_parse_canonically_and_validate_capture_domains() {
     });
     let query = parse_ok(json.clone());
     assert_eq!(
-        query.steps[0],
+        query.plan.steps[0],
         QueryStep::ReceiverTargets(ReceiverTraversalFilter {
             capture: Some("service".to_string()),
         })
@@ -258,16 +259,19 @@ fn parses_kind_unions_and_exclusions() {
         "match": { "kind": ["function", "method"] }
     }));
     assert_eq!(
-        union.root.kinds,
+        union.seed().unwrap().root.kinds,
         vec![NormalizedKind::Function, NormalizedKind::Method]
     );
 
     let subtractive = parse_ok(json!({
         "match": { "kind": "callable", "not_kind": ["constructor", "lambda"] }
     }));
-    assert_eq!(subtractive.root.kinds, vec![NormalizedKind::Callable]);
     assert_eq!(
-        subtractive.root.not_kinds,
+        subtractive.seed().unwrap().root.kinds,
+        vec![NormalizedKind::Callable]
+    );
+    assert_eq!(
+        subtractive.seed().unwrap().root.not_kinds,
         vec![NormalizedKind::Constructor, NormalizedKind::Lambda]
     );
 
@@ -275,7 +279,7 @@ fn parses_kind_unions_and_exclusions() {
     let mixed = parse_ok(json!({
         "match": { "kind": ["call", "assignment"], "callee": { "name": "eval" } }
     }));
-    assert!(mixed.root.callee.is_some());
+    assert!(mixed.seed().unwrap().root.callee.is_some());
 }
 
 #[test]
@@ -294,11 +298,12 @@ fn parses_receiver_kwargs_and_regex_predicates() {
         }
     }));
 
-    assert_eq!(query.languages, vec![Language::Python]);
+    let seed = query.seed().unwrap();
+    assert_eq!(seed.languages, vec![Language::Python]);
     assert_eq!(query.limit, DEFAULT_LIMIT);
-    assert_eq!(query.root.kwargs.len(), 1);
-    assert_eq!(query.root.kwargs[0].0, "shell");
-    let not_inside = query.not_inside.as_ref().expect("not_inside pattern");
+    assert_eq!(seed.root.kwargs.len(), 1);
+    assert_eq!(seed.root.kwargs[0].0, "shell");
+    let not_inside = seed.not_inside.as_ref().expect("not_inside pattern");
     assert!(matches!(
         &not_inside.name,
         Some(StringPredicate::Regex(regex)) if regex.is_match("LoginTest")
@@ -354,7 +359,7 @@ fn parses_and_validates_typed_steps() {
         ]
     }));
     assert_eq!(
-        query.steps,
+        query.plan.steps,
         vec![
             QueryStep::EnclosingDecl,
             QueryStep::FileOf,
@@ -393,6 +398,147 @@ fn parses_and_validates_typed_steps() {
 }
 
 #[test]
+fn parses_typed_set_composition_and_common_suffix_steps() {
+    let json = json!({
+        "union": [
+            {
+                "match": { "kind": "class", "name": "Legacy" },
+                "steps": [{ "op": "enclosing_decl" }]
+            },
+            {
+                "match": { "kind": "class", "name": "Replacement" },
+                "steps": [{ "op": "enclosing_decl" }]
+            }
+        ],
+        "steps": [{ "op": "file_of" }],
+        "limit": 20
+    });
+    let query = parse_ok(json);
+    assert_eq!(query.validate_steps().unwrap(), QueryValueKind::File);
+    assert!(matches!(
+        query.plan.source,
+        CodeQueryPlanSource::Set {
+            op: SetOperator::Union,
+            ref branches,
+        } if branches.len() == 2
+    ));
+
+    let rql = CodeQuery::from_sexp(
+        r#"(limit 20
+          (file-of
+            (union
+              (enclosing-decl (class :name "Legacy"))
+              (enclosing-decl (class :name "Replacement")))))"#,
+    )
+    .expect("set RQL should parse");
+    assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
+    assert_eq!(
+        query.to_canonical_json()["union"][0]["steps"][0]["op"],
+        "enclosing_decl"
+    );
+}
+
+#[test]
+fn set_composition_rejects_invalid_shapes_and_incompatible_domains() {
+    let error = error_of(json!({
+        "union": [{ "match": { "kind": "class" } }]
+    }));
+    assert_eq!(error.path, "union");
+    assert!(error.message.contains("at least two"));
+
+    let error = error_of(json!({
+        "match": { "kind": "class" },
+        "intersect": [
+            { "match": { "kind": "class" } },
+            { "match": { "kind": "class" } }
+        ]
+    }));
+    assert_eq!(error.path, "intersect");
+    assert!(error.message.contains("mutually exclusive"));
+
+    let error = error_of(json!({
+        "except": [
+            {
+                "match": { "kind": "class" },
+                "steps": [{ "op": "enclosing_decl" }]
+            },
+            {
+                "match": { "kind": "class" },
+                "steps": [{ "op": "file_of" }]
+            }
+        ]
+    }));
+    assert_eq!(error.path, "except[1]");
+    assert!(error.message.contains("file"));
+    assert!(error.message.contains("declaration"));
+
+    let error = error_of(json!({
+        "union": [
+            { "match": { "kind": "class" }, "limit": 1 },
+            { "match": { "kind": "class" } }
+        ]
+    }));
+    assert_eq!(error.path, "union[0].limit");
+}
+
+#[test]
+fn composed_structural_capture_must_exist_in_every_branch() {
+    let valid = parse_ok(json!({
+        "intersect": [
+            {
+                "match": { "kind": "call", "receiver": { "capture": "service" } }
+            },
+            {
+                "match": { "kind": "call", "receiver": { "capture": "service" } }
+            }
+        ],
+        "steps": [{ "op": "points_to", "capture": "service" }]
+    }));
+    assert_eq!(
+        valid.validate_steps().unwrap(),
+        QueryValueKind::ReceiverAnalysis
+    );
+
+    let error = error_of(json!({
+        "union": [
+            {
+                "match": { "kind": "call", "receiver": { "capture": "service" } }
+            },
+            { "match": { "kind": "call" } }
+        ],
+        "steps": [{ "op": "points_to", "capture": "service" }]
+    }));
+    assert_eq!(error.path, "steps[0].capture");
+    assert!(error.message.contains("every contributing"));
+
+    let difference = parse_ok(json!({
+        "except": [
+            {
+                "match": { "kind": "call", "receiver": { "capture": "service" } }
+            },
+            { "match": { "kind": "call", "callee": { "name": "ignored" } } }
+        ],
+        "steps": [{ "op": "points_to", "capture": "service" }]
+    }));
+    assert_eq!(
+        difference.validate_steps().unwrap(),
+        QueryValueKind::ReceiverAnalysis
+    );
+
+    let rql = CodeQuery::from_sexp(
+        r#"(points-to :capture service
+          (except
+            (call :receiver (capture "service"))
+            (call :callee "ignored")))"#,
+    )
+    .expect("except RQL should preserve first-branch captures");
+    assert_eq!(
+        rql.validate_steps().unwrap(),
+        QueryValueKind::ReceiverAnalysis
+    );
+}
+
+#[test]
 fn parses_configured_hierarchy_and_member_steps() {
     let query = parse_ok(json!({
         "match": { "kind": "class" },
@@ -406,7 +552,7 @@ fn parses_configured_hierarchy_and_member_steps() {
         ]
     }));
     assert_eq!(
-        query.steps,
+        query.plan.steps,
         vec![
             QueryStep::EnclosingDecl,
             QueryStep::Supertypes(HierarchyTraversal::Direct),
@@ -568,8 +714,11 @@ fn allows_capture_only_and_empty_nested_patterns() {
     let query = parse_ok(json!({
         "match": { "kind": "call", "args": [{}, { "capture": "second" }] }
     }));
-    assert!(query.root.args[0].is_empty());
-    assert_eq!(query.root.args[1].capture.as_deref(), Some("second"));
+    assert!(query.seed().unwrap().root.args[0].is_empty());
+    assert_eq!(
+        query.seed().unwrap().root.args[1].capture.as_deref(),
+        Some("second")
+    );
 }
 
 #[test]
@@ -637,6 +786,31 @@ fn rejects_query_budget_overruns() {
         }
     }));
     assert_eq!(error.path, "match.text.regex");
+
+    let mut too_deep = json!({ "match": 3 });
+    for _ in 0..=MAX_QUERY_PLAN_DEPTH {
+        too_deep = json!({
+            "union": [too_deep, { "match": { "kind": "call" } }]
+        });
+    }
+    let error = error_of(too_deep);
+    assert!(error.message.contains("plan depth"), "{error}");
+
+    let mut groups = Vec::new();
+    for group in 0..4 {
+        let leaves = (0..16)
+            .map(|index| {
+                if group == 3 && index == 11 {
+                    json!({ "match": 3 })
+                } else {
+                    json!({ "match": { "kind": "call" } })
+                }
+            })
+            .collect::<Vec<_>>();
+        groups.push(json!({ "union": leaves }));
+    }
+    let error = error_of(json!({ "union": groups }));
+    assert!(error.message.contains("at most 64 nodes"), "{error}");
 }
 
 #[test]

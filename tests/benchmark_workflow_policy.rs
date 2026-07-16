@@ -49,6 +49,17 @@ fn benchmark_workflow_enforces_actionable_regressions_by_default() {
         strict_input.contains("        default: true\n"),
         "strict_compare must default to enforcement"
     );
+    let slack_input = workflow
+        .split_once("      post_to_slack:\n")
+        .and_then(|(_, rest)| {
+            rest.split_once("\n\npermissions:")
+                .map(|(slack_input, _)| slack_input)
+        })
+        .expect("workflow should define the post_to_slack dispatch input");
+    assert!(
+        slack_input.contains("        default: true\n"),
+        "post_to_slack must preserve manual notification behavior by default"
+    );
     assert!(
         workflow.contains(
             "      BENCHMARK_REPO: ${{ inputs.repo || '' }}\n      BENCHMARK_MAX_FILES: ${{ inputs.max_files || '' }}"
@@ -93,6 +104,12 @@ fn benchmark_workflow_enforces_actionable_regressions_by_default() {
     assert!(
         workflow.contains("strict_compare=\"${{ steps.paths.outputs.effective_strict_compare }}\""),
         "Slack must report the centralized strictness output"
+    );
+    let slack_policy = "env.SLACK_DAILY_PERF_WEBHOOK_URL != '' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.post_to_slack))";
+    assert_eq!(
+        workflow.matches(slack_policy).count(),
+        2,
+        "payload preparation and Slack transmission must share the schedule-or-opted-in-dispatch policy"
     );
 
     let compare = step_position(&workflow, "      - name: Compare against blessed baseline");

@@ -28,7 +28,9 @@ use tree_sitter::Parser;
 
 use super::js_ts::build_weighted_cache;
 pub(crate) use adapter::RustAdapter;
-use cache::{weight_code_unit_set, weight_project_file_set, weight_reference_context};
+use cache::{
+    weight_code_unit_set, weight_export_index, weight_project_file_set, weight_reference_context,
+};
 use cargo_routes::RustCargoRouteIndex;
 use declarations::collect_rust_type_identifiers;
 pub(crate) use field_roles::rust_is_field_declaration_name;
@@ -46,6 +48,8 @@ pub struct RustAnalyzer {
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     reference_contexts: Cache<ProjectFile, Arc<RustReferenceContext>>,
+    forward_reference_contexts: Cache<ProjectFile, Arc<RustReferenceContext>>,
+    export_indexes: Cache<ProjectFile, Arc<crate::analyzer::usages::ExportIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     cargo_routes: Arc<OnceLock<Arc<RustCargoRouteIndex>>>,
     usage_index: Arc<OnceLock<RustUsageIndex>>,
@@ -57,6 +61,19 @@ pub struct RustAnalyzer {
 crate::analyzer::impl_forward_query_provider!(RustAnalyzer);
 
 impl RustAnalyzer {
+    fn indexed_sources_unchanged(&self, changed_files: &BTreeSet<ProjectFile>) -> bool {
+        changed_files
+            .iter()
+            .filter(|file| file_language(file) == Language::Rust || self.inner.is_analyzed(file))
+            .all(|file| {
+                self.inner
+                    .project()
+                    .read_source(file)
+                    .ok()
+                    .is_some_and(|source| self.inner.indexed_source_matches(file, &source))
+            })
+    }
+
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
@@ -87,6 +104,11 @@ impl RustAnalyzer {
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             reference_contexts: build_weighted_cache(memo_budget / 8, weight_reference_context),
+            forward_reference_contexts: build_weighted_cache(
+                memo_budget / 8,
+                weight_reference_context,
+            ),
+            export_indexes: build_weighted_cache(memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(OnceLock::new()),
             usage_index: Arc::new(OnceLock::new()),
@@ -115,6 +137,11 @@ impl RustAnalyzer {
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             reference_contexts: build_weighted_cache(memo_budget / 8, weight_reference_context),
+            forward_reference_contexts: build_weighted_cache(
+                memo_budget / 8,
+                weight_reference_context,
+            ),
+            export_indexes: build_weighted_cache(memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(OnceLock::new()),
             usage_index: Arc::new(OnceLock::new()),
@@ -275,6 +302,10 @@ impl IAnalyzer for RustAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        if self.indexed_sources_unchanged(changed_files) {
+            return self.clone();
+        }
+
         Self {
             inner: self.inner.update(changed_files),
             memo_budget: self.memo_budget,
@@ -284,6 +315,11 @@ impl IAnalyzer for RustAnalyzer {
                 self.memo_budget / 8,
                 weight_reference_context,
             ),
+            forward_reference_contexts: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_reference_context,
+            ),
+            export_indexes: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(OnceLock::new()),
             usage_index: Arc::new(OnceLock::new()),
@@ -302,6 +338,11 @@ impl IAnalyzer for RustAnalyzer {
                 self.memo_budget / 8,
                 weight_reference_context,
             ),
+            forward_reference_contexts: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_reference_context,
+            ),
+            export_indexes: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(OnceLock::new()),
             usage_index: Arc::new(OnceLock::new()),

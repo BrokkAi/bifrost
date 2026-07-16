@@ -8,7 +8,7 @@
 //! delegates'. Each provider covers exactly one language.
 
 use super::extract::extract_file_facts;
-use super::facts::FileFacts;
+use super::facts::{FileFacts, STRUCTURAL_FACTS_SNAPSHOT_VERSION};
 use super::kinds::{NormalizedKind, Role};
 use super::spec::StructuralSpec;
 use crate::analyzer::tree_sitter_analyzer::{LanguageAdapter, TreeSitterAnalyzer};
@@ -40,6 +40,10 @@ pub trait StructuralSearchProvider: Send + Sync {
     /// pruning skipped a file and that repeated queries hit the cache.
     fn structural_extraction_count(&self) -> u64;
 
+    /// How many facts-cache misses were satisfied by a persisted compact
+    /// snapshot rather than a tree-sitter parse and normalization pass.
+    fn structural_hydration_count(&self) -> u64;
+
     fn structural_supports_kind(&self, kind: NormalizedKind) -> bool;
 
     fn structural_supports_role(&self, role: Role) -> bool;
@@ -53,6 +57,7 @@ pub trait StructuralSearchProvider: Send + Sync {
 pub struct StructuralFactsCache {
     cache: Cache<ProjectFile, Arc<CachedFacts>>,
     extractions: AtomicU64,
+    hydrations: AtomicU64,
 }
 
 struct CachedFacts {
@@ -79,15 +84,17 @@ impl StructuralFactsCache {
                 .weigher(weigh_entry)
                 .build(),
             extractions: AtomicU64::new(0),
+            hydrations: AtomicU64::new(0),
         }
     }
 
     /// Return cached facts when the stored source hash still matches;
-    /// otherwise run `extract` and cache its result.
-    fn get_or_extract(
+    /// otherwise try durable hydration before falling back to extraction.
+    fn get_or_materialize(
         &self,
         file: &ProjectFile,
         source: &str,
+        load: impl FnOnce() -> Option<FileFacts>,
         extract: impl FnOnce() -> Option<FileFacts>,
     ) -> Option<Arc<FileFacts>> {
         let source_hash = hash_source(source);
@@ -96,8 +103,13 @@ impl StructuralFactsCache {
         {
             return Some(Arc::clone(&entry.facts));
         }
-        self.extractions.fetch_add(1, Ordering::Relaxed);
-        let facts = Arc::new(extract()?);
+        let facts = if let Some(facts) = load() {
+            self.hydrations.fetch_add(1, Ordering::Relaxed);
+            Arc::new(facts)
+        } else {
+            self.extractions.fetch_add(1, Ordering::Relaxed);
+            Arc::new(extract()?)
+        };
         self.cache.insert(
             file.clone(),
             Arc::new(CachedFacts {
@@ -110,6 +122,10 @@ impl StructuralFactsCache {
 
     pub fn extraction_count(&self) -> u64 {
         self.extractions.load(Ordering::Relaxed)
+    }
+
+    pub fn hydration_count(&self) -> u64 {
+        self.hydrations.load(Ordering::Relaxed)
     }
 }
 
@@ -129,14 +145,40 @@ impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
     fn structural_facts(&self, file: &ProjectFile) -> Option<Arc<FileFacts>> {
         let spec: &'static dyn StructuralSpec = self.adapter().structural_spec()?;
         let source = self.file_source(file)?;
-        self.structural_cache().get_or_extract(file, &source, || {
-            let grammar = self.adapter().parser_language_for_file(file);
-            extract_file_facts(spec, &grammar, &source)
-        })
+        let snapshot_key = self.structural_snapshot_key(file, &source);
+        self.structural_cache().get_or_materialize(
+            file,
+            &source,
+            || {
+                let key = snapshot_key.as_ref()?;
+                let payload = self
+                    .load_structural_facts_snapshot(key, STRUCTURAL_FACTS_SNAPSHOT_VERSION)
+                    .ok()??;
+                FileFacts::decode_snapshot(source.clone(), &payload).ok()
+            },
+            || {
+                let grammar = self.adapter().parser_language_for_file(file);
+                let facts = extract_file_facts(spec, &grammar, &source)?;
+                if let Some(key) = snapshot_key.as_ref()
+                    && let Ok(payload) = facts.encode_snapshot()
+                {
+                    let _ = self.persist_structural_facts_snapshot(
+                        key,
+                        STRUCTURAL_FACTS_SNAPSHOT_VERSION,
+                        &payload,
+                    );
+                }
+                Some(facts)
+            },
+        )
     }
 
     fn structural_extraction_count(&self) -> u64 {
         self.structural_cache().extraction_count()
+    }
+
+    fn structural_hydration_count(&self) -> u64 {
+        self.structural_cache().hydration_count()
     }
 
     fn structural_supports_kind(&self, kind: NormalizedKind) -> bool {

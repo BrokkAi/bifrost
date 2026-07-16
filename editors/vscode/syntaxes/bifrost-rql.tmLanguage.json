@@ -46,7 +46,7 @@
     },
     {
       "name": "support.function.wrapper.bifrost-rql",
-      "match": "\\b(?:call-input|call-sites-from|call-sites-to|callees|callers|enclosing-decl|file-of|importers-of|imports-of|inside|language|languages|limit|member-targets|members|not-inside|owner|points-to|receiver-targets|references-of|result-detail|subtypes|supertypes|used-by|uses|where)\\b"
+      "match": "\\b(?:call-input|call-sites-from|call-sites-to|callees|callers|enclosing-decl|except|file-of|importers-of|imports-of|inside|intersect|language|languages|limit|member-targets|members|not-inside|owner|points-to|receiver-targets|references-of|result-detail|subtypes|supertypes|union|used-by|uses|where)\\b"
     },
     {
       "name": "entity.name.type.kind.bifrost-rql",

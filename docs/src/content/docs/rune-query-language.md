@@ -128,6 +128,20 @@ Pipeline wrappers transform the result domain. Inner wrappers execute first:
 (member-targets (references-of :proof proven (enclosing-decl (method :name "run"))))
 ```
 
+Typed set forms combine complete compatible pipelines and may themselves be wrapped by another step:
+
+```lisp
+(union query-a query-b ...)
+(intersect query-a query-b ...)
+(except query-a query-b ...)
+(file-of
+  (union
+    (enclosing-decl (class :name "Legacy"))
+    (enclosing-decl (class :name "Replacement"))))
+```
+
+All operands at one node must produce the same terminal domain. Union preserves first appearance by operand order; intersection and except preserve the first operand's order. Branch provenance and diagnostics use zero-based paths. See the executable [Typed Set Composition](/code-query-tutorials/set-composition/) cookbook.
+
 The fourth expression performs two direct reverse-import hops. Hierarchy traversal is direct when no option is supplied; `:depth N` returns the one-through-N closure, and `:transitive true` returns the full indexed closure under the execution budget. Call traversal is also direct by default and accepts finite `:depth N`, but not `:transitive`. `call-input` requires exactly one receiver, parameter-index, or parameter-name selector. `members` returns direct declarations and `owner` recovers their exact declaring type. Reference and call proof options may appear before the nested query. Receiver wrappers produce terminal `receiver_analysis` rows; only `file-of` may wrap them. Their optional `:capture name` is legal only over a structural match and must name a declared positive capture. `:json` renders every wrapper as an ordered `steps` array.
 
 JavaScript and TypeScript provide the bounded receiver provider. Other languages preserve an explicit `unsupported` row and capability diagnostic. See [Receiver Traversal](/code-query-tutorials/receiver-traversal/) for allocation, factory, ambiguity, reference-site, and call-input examples with exact output.

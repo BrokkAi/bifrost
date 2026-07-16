@@ -62,7 +62,7 @@ exposes:
 | Method | Purpose |
 | --- | --- |
 | `search_symbols(patterns, *, include_tests=False, limit=20)` | Find symbols by name pattern. |
-| `query_code(pattern, *, inside=None, not_inside=None, where=None, languages=None, steps=None, limit=None, result_detail=None, schema_version=None)` | Query normalized code structure and apply typed declaration, hierarchy, ownership, and import steps. |
+| `query_code(pattern=None, *, union=None, intersect=None, except_=None, inside=None, not_inside=None, where=None, languages=None, steps=None, limit=None, result_detail=None, schema_version=None)` | Query normalized code structure, compose compatible typed branches, and apply semantic steps. |
 | `get_symbol_locations(symbols, *, kind_filter=...)` | Resolve symbols to definition sites. |
 | `get_symbol_ancestors(symbols, *, kind_filter=...)` | Walk the enclosing type/scope chain. |
 | `get_symbol_sources(symbols, *, kind_filter=...)` | Pull full source for symbols. |
@@ -115,7 +115,9 @@ passed through `options` (keys map 1:1 to the Rust tool arguments).
 ## `query_code` detail and ranges
 
 `query_code` is the version-2 typed query surface. Omit `schema_version` for v2
-or pass `schema_version=2` explicitly. The structural `pattern` can be followed
+or pass `schema_version=2` explicitly. Pass exactly one of `pattern`, `union`,
+`intersect`, or `except_`; set operands are complete query-plan dictionaries
+with compatible terminal domains. A structural `pattern` or composed set can be followed
 by ordered `steps` using `enclosing_decl`, `file_of`, `imports_of`,
 `importers_of`, `supertypes`, `subtypes`, `members`, and `owner`. Import
 operations traverse one direct project-local edge per step. Hierarchy operations

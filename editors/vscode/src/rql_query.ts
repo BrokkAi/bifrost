@@ -9,8 +9,14 @@ export interface RqlQueryDocument {
 interface RqlQueryResultBase {
   uri: string;
   path: string;
-  provenance?: unknown[];
+  provenance?: RqlQueryProvenance[];
   provenance_truncated?: boolean;
+}
+
+export interface RqlQueryProvenance {
+  branch?: number[];
+  seed: unknown;
+  steps: unknown[];
 }
 
 export interface RqlResultRange {

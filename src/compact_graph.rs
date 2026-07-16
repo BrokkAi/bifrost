@@ -11,20 +11,30 @@ pub(crate) struct CompactRows<T> {
 
 impl<T> CompactRows<T> {
     pub(crate) fn from_parts(offsets: Vec<u32>, values: Vec<T>) -> Self {
-        assert!(
-            !offsets.is_empty(),
-            "compact rows require the zero boundary"
-        );
-        assert_eq!(offsets[0], 0);
-        assert_eq!(
-            offsets.last().copied().map(|value| value as usize),
-            Some(values.len())
-        );
-        assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
-        Self {
+        Self::try_from_parts(offsets, values).expect("invalid compact row parts")
+    }
+
+    /// Construct compact rows from an untrusted persisted representation.
+    ///
+    /// Builders enforce these invariants by construction, while snapshot
+    /// decoding must reject corrupt boundaries instead of panicking.
+    pub(crate) fn try_from_parts(offsets: Vec<u32>, values: Vec<T>) -> Result<Self, &'static str> {
+        if offsets.is_empty() {
+            return Err("compact rows require the zero boundary");
+        }
+        if offsets[0] != 0 {
+            return Err("compact row offsets must start at zero");
+        }
+        if offsets.last().copied().map(|value| value as usize) != Some(values.len()) {
+            return Err("compact row offsets must end at the value count");
+        }
+        if !offsets.windows(2).all(|pair| pair[0] <= pair[1]) {
+            return Err("compact row offsets must be monotonic");
+        }
+        Ok(Self {
             offsets: offsets.into_boxed_slice(),
             values: values.into_boxed_slice(),
-        }
+        })
     }
 
     pub(crate) fn rows(&self) -> usize {
@@ -33,6 +43,14 @@ impl<T> CompactRows<T> {
 
     pub(crate) fn len(&self) -> usize {
         self.values.len()
+    }
+
+    pub(crate) fn offsets(&self) -> &[u32] {
+        &self.offsets
+    }
+
+    pub(crate) fn values(&self) -> &[T] {
+        &self.values
     }
 
     pub(crate) fn row(&self, row: usize) -> &[T] {
@@ -197,7 +215,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{CompactDirectedGraph, CompactRowsBuilder};
+    use super::{CompactDirectedGraph, CompactRows, CompactRowsBuilder};
 
     #[test]
     fn compact_rows_preserve_empty_rows_and_value_order() {
@@ -211,6 +229,19 @@ mod tests {
         assert_eq!(rows.row(0), [1, 2]);
         assert!(rows.row(1).is_empty());
         assert_eq!(rows.row(2), [3]);
+    }
+
+    #[test]
+    fn checked_compact_rows_reject_corrupt_boundaries() {
+        assert!(CompactRows::<u32>::try_from_parts(Vec::new(), vec![]).is_err());
+        assert!(CompactRows::try_from_parts(vec![1], vec![7_u32]).is_err());
+        assert!(CompactRows::try_from_parts(vec![0, 2], vec![7_u32]).is_err());
+        assert!(CompactRows::try_from_parts(vec![0, 2, 1], vec![7_u32]).is_err());
+
+        let rows = CompactRows::try_from_parts(vec![0, 0, 2], vec![7_u32, 8])
+            .expect("valid decoded compact rows");
+        assert!(rows.row(0).is_empty());
+        assert_eq!(rows.row(1), &[7, 8]);
     }
 
     #[test]
