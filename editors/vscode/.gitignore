@@ -1,4 +1,7 @@
 node_modules/
 out/
 out-test/
+LICENSE.md
+SOURCE.md
+THIRD_PARTY_LICENSES.txt
 *.vsix

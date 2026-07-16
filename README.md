@@ -128,6 +128,7 @@ The public documentation site lives in [`docs/`](docs/) and is published at
 Useful starting points:
 
 - [Choose the right Bifrost interface](docs/src/content/docs/choose-bifrost.md)
+- [Third-party notices](docs/src/content/docs/third-party-notices.md)
 - [Install Bifrost](docs/src/content/docs/install.md)
 - [Evaluate Bifrost in ten minutes](docs/src/content/docs/evaluate-bifrost.md)
 - [MCP server and toolsets](docs/src/content/docs/mcp.md)

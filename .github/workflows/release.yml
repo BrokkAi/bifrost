@@ -134,7 +134,7 @@ jobs:
           stage="${BIN_NAME}-${{ steps.tag.outputs.name }}-${{ matrix.target }}"
           mkdir -p "dist/${stage}"
           cp "target/${{ matrix.target }}/release/${BIN_NAME}" "dist/${stage}/"
-          cp LICENSE.md README.md "dist/${stage}/"
+          cp LICENSE.md README.md SOURCE.md THIRD_PARTY_LICENSES.html SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "dist/${stage}/"
           tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
           (cd dist && shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256")
 
@@ -145,7 +145,7 @@ jobs:
           $stage = "${env:BIN_NAME}-${{ steps.tag.outputs.name }}-${{ matrix.target }}"
           New-Item -ItemType Directory -Path "dist/$stage" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe" "dist/$stage/"
-          Copy-Item LICENSE.md, README.md "dist/$stage/"
+          Copy-Item LICENSE.md, README.md, SOURCE.md, THIRD_PARTY_LICENSES.html, SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "dist/$stage/"
           Compress-Archive -Path "dist/$stage" -DestinationPath "dist/$stage.zip"
           $hash = (Get-FileHash -Algorithm SHA256 "dist/$stage.zip").Hash.ToLower()
           "$hash  $stage.zip" | Out-File -Encoding ascii "dist/$stage.zip.sha256"
@@ -253,7 +253,11 @@ jobs:
         working-directory: editors/vscode
 
       - name: Package agent plugin
-        run: tar -C plugins -czf "dist/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz" bifrost-agent
+        shell: bash
+        run: |
+          cp -R plugins/bifrost-agent "${RUNNER_TEMP}/bifrost-agent"
+          cp LICENSE.md SOURCE.md "${RUNNER_TEMP}/bifrost-agent/"
+          tar -C "${RUNNER_TEMP}" -czf "dist/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz" bifrost-agent
 
       - name: Upload editor and agent plugin artifacts to GitHub Release
         uses: softprops/action-gh-release@v3
