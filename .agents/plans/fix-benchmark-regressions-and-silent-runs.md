@@ -21,7 +21,7 @@ The result is observable in two ways. Focused `bifrost_benchmark` runs for `clic
 - [x] (2026-07-16 11:39Z) Passed `cargo fmt --all -- --check`, the workflow policy suite, and isolated `cargo clippy --all-targets --all-features -- -D warnings` with one consistent rustup toolchain.
 - [x] (2026-07-16 11:59Z) Diagnosed the first hosted run's sole residual regression with a silent profiled dispatch, preserved Rust caches across no-op watcher updates, and passed the focused cache test, 111 Rust usage tests, 477 definition tests, and a 22.6 ms local Serde strict comparison.
 - [x] (2026-07-16 12:21Z) Aligned no-op detection with Rust file relevance after the second hosted run exposed unrelated watcher paths; the extended test, Rust suites, workflow policy, formatting, all-feature Clippy, and a 20.9 ms local Serde run pass.
-- [ ] Review, commit each completed milestone, push the branch, run the silent benchmark path, and open a ready-for-review pull request.
+- [x] (2026-07-16 12:36Z) Opened ready-for-review PR `#829`, proved both Slack steps skip on PR and `post_to_slack=false` dispatches, passed full hosted strict run `29497879862`, and removed the temporary PR trigger.
 
 ## Surprises & Discoveries
 
@@ -83,7 +83,7 @@ The result is observable in two ways. Focused `bifrost_benchmark` runs for `clic
 
 ## Outcomes & Retrospective
 
-All four reported latency regressions are repaired locally without changing the blessed baseline. Focused strict comparisons pass at 2261.8 milliseconds for Click `scan_usages`, 1484.5 milliseconds for Click `dead_code_smells`, 738.8 milliseconds for Gin `scan_usages`, and 20.9 milliseconds for Serde JSON `get_definition` after unrelated watcher paths were included in the regression test. The language-specific suites, workflow policy tests, formatting check, and final all-target/all-feature Clippy gate pass. The final full hosted benchmark remains in progress.
+All four reported latency regressions are repaired without changing the blessed baseline. Full hosted run `29497879862` passed strict comparison across all 76 scenarios: Click `scan_usages` measured 2410.7 milliseconds, Click `dead_code_smells` 1486.4 milliseconds, Gin `scan_usages` 757.4 milliseconds, and Serde JSON `get_definition` 21.7 milliseconds. The latter improved 94.6 percent against baseline despite one isolated 631.8 millisecond iteration; the other nine measured iterations were 19.6-27.0 milliseconds. Both Slack steps were skipped on the PR event, and focused dispatches with `post_to_slack=false` also skipped them. The temporary `pull_request` workflow trigger was removed after acceptance. All language-specific suites, workflow policy tests, formatting, and all-target/all-feature Clippy pass. Ready-for-review PR `#829` contains the completed work.
 
 ## Context and Orientation
 
