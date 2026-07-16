@@ -7,13 +7,14 @@ use git2::{Repository, StatusOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::Instant;
 
 const SCHEMA_VERSION: u32 = 1;
@@ -149,6 +150,7 @@ struct RunCorpusArgs {
     repos_per_language: usize,
     languages: Vec<String>,
     repos: HashSet<String>,
+    repo_parallelism: usize,
     strict: bool,
     force: bool,
     dry_run: bool,
@@ -213,6 +215,7 @@ fn parse_run_corpus_args(args: &[String]) -> Result<RunCorpusArgs, String> {
     let mut repos_per_language = 1;
     let mut languages = Vec::new();
     let mut repos = HashSet::new();
+    let mut repo_parallelism = 1;
     let mut strict = false;
     let mut force = false;
     let mut dry_run = false;
@@ -246,6 +249,9 @@ fn parse_run_corpus_args(args: &[String]) -> Result<RunCorpusArgs, String> {
             "--repo" => {
                 repos.insert(take_value(args, &mut index, "--repo")?);
             }
+            "--repo-jobs" => {
+                repo_parallelism = take_positive_usize(args, &mut index, "--repo-jobs")?
+            }
             "--strict" => strict = true,
             "--force" => force = true,
             "--dry-run" => dry_run = true,
@@ -270,6 +276,7 @@ fn parse_run_corpus_args(args: &[String]) -> Result<RunCorpusArgs, String> {
         repos_per_language,
         languages,
         repos,
+        repo_parallelism,
         strict,
         force,
         dry_run,
@@ -427,7 +434,8 @@ fn run_repo_command(args: RunRepoArgs) -> Result<bool, String> {
 
     eprintln!("run {} {} ({})", args.language, repo_slug, root.display());
     let started = Instant::now();
-    let result = run_engine(&root, &config, args.options.cache_mode);
+    let progress_repo = format!("{}/{}", args.language, repo_slug);
+    let result = run_engine(&root, &config, args.options.cache_mode, &progress_repo);
     let record = repository_record(
         &args.language,
         &repo_slug,
@@ -451,6 +459,21 @@ fn run_repo_command(args: RunRepoArgs) -> Result<bool, String> {
     }
 }
 
+#[derive(Debug)]
+struct PreparedCorpusRun {
+    position: usize,
+    total: usize,
+    selected_repo: SelectedRepository,
+    metadata: RepositoryMetadata,
+    config: ReferenceDifferentialConfig,
+    fingerprint: String,
+}
+
+#[derive(Debug)]
+struct CorpusRunGroup {
+    runs: Vec<PreparedCorpusRun>,
+}
+
 fn run_corpus_command(args: RunCorpusArgs) -> Result<bool, String> {
     let selected = select_corpus_repositories(&args)?;
     if args.dry_run {
@@ -467,21 +490,23 @@ fn run_corpus_command(args: RunCorpusArgs) -> Result<bool, String> {
     }
 
     let output = args.output.as_ref().expect("validated output");
-    let bifrost_metadata = repository_metadata(Path::new(env!("CARGO_MANIFEST_DIR")))?;
+    let bifrost_metadata = Arc::new(repository_metadata(Path::new(env!("CARGO_MANIFEST_DIR")))?);
     let completed = if args.force {
         HashSet::new()
     } else {
         completed_runs(output)?
     };
-    let mut strict_failure = false;
-    for (position, selected_repo) in selected.iter().enumerate() {
+    let total = selected.len();
+    let mut groups = Vec::<CorpusRunGroup>::new();
+    let mut group_by_root = HashMap::<PathBuf, usize>::new();
+    for (position, selected_repo) in selected.into_iter().enumerate() {
         let metadata = match repository_metadata(&selected_repo.root) {
             Ok(metadata) => metadata,
             Err(err) => {
                 eprintln!(
                     "[{}/{}] {} {} metadata error: {err}",
                     position + 1,
-                    selected.len(),
+                    total,
                     selected_repo.language,
                     selected_repo.slug
                 );
@@ -515,67 +540,159 @@ fn run_corpus_command(args: RunCorpusArgs) -> Result<bool, String> {
             eprintln!(
                 "[{}/{}] skip {} {}: already completed",
                 position + 1,
-                selected.len(),
+                total,
                 selected_repo.language,
                 selected_repo.slug
             );
             continue;
         }
 
-        eprintln!(
-            "[{}/{}] run {} {} ({} LOC)",
-            position + 1,
-            selected.len(),
-            selected_repo.language,
-            selected_repo.slug,
-            selected_repo.code_loc
-        );
-        let started = Instant::now();
-        let result = run_engine(&selected_repo.root, &config, args.options.cache_mode);
-        let record = repository_record(
-            &selected_repo.language,
-            &selected_repo.slug,
-            Some(selected_repo.code_loc),
-            &metadata,
-            &bifrost_metadata,
+        let run = PreparedCorpusRun {
+            position,
+            total,
+            selected_repo,
+            metadata,
+            config,
             fingerprint,
-            started.elapsed().as_secs_f64(),
-            result,
-        );
-        append_record(output, &record)?;
-        print_record_summary(&record);
-        if args.strict
-            && matches!(
-                &record.result,
-                RepositoryResult::Completed { report } if report.has_actionable_findings()
-            )
-        {
-            strict_failure = true;
+        };
+        let root = run.selected_repo.root.clone();
+        if let Some(&group_index) = group_by_root.get(&root) {
+            groups[group_index].runs.push(run);
+        } else {
+            group_by_root.insert(root, groups.len());
+            groups.push(CorpusRunGroup { runs: vec![run] });
         }
     }
+
+    if groups.is_empty() {
+        return Ok(false);
+    }
+
+    let worker_count = args.repo_parallelism.min(groups.len());
+    eprintln!(
+        "run-corpus repositories={} clone_groups={} repo_jobs={} jobs_per_repo={}",
+        groups.iter().map(|group| group.runs.len()).sum::<usize>(),
+        groups.len(),
+        worker_count,
+        args.options.parallelism
+    );
+    let queue = Arc::new(Mutex::new(VecDeque::from(groups)));
+    let (sender, receiver) = mpsc::channel::<RepositoryRecord>();
+    let cache_mode = args.options.cache_mode;
+    let strict = args.strict;
+    let mut strict_failure = false;
+    thread::scope(|scope| -> Result<(), String> {
+        for _ in 0..worker_count {
+            let queue = Arc::clone(&queue);
+            let sender = sender.clone();
+            let bifrost_metadata = Arc::clone(&bifrost_metadata);
+            scope.spawn(move || {
+                loop {
+                    let Some(group) = queue
+                        .lock()
+                        .expect("corpus queue lock poisoned")
+                        .pop_front()
+                    else {
+                        break;
+                    };
+                    for run in group.runs {
+                        let record = execute_corpus_run(run, &bifrost_metadata, cache_mode);
+                        if sender.send(record).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+        drop(sender);
+        for record in receiver {
+            append_record(output, &record)?;
+            print_record_summary(&record);
+            if strict
+                && matches!(
+                    &record.result,
+                    RepositoryResult::Completed { report } if report.has_actionable_findings()
+                )
+            {
+                strict_failure = true;
+            }
+        }
+        Ok(())
+    })?;
     Ok(strict_failure)
+}
+
+fn execute_corpus_run(
+    run: PreparedCorpusRun,
+    bifrost_metadata: &RepositoryMetadata,
+    cache_mode: CacheMode,
+) -> RepositoryRecord {
+    let PreparedCorpusRun {
+        position,
+        total,
+        selected_repo,
+        metadata,
+        config,
+        fingerprint,
+    } = run;
+    eprintln!(
+        "[{}/{}] run {} {} ({} LOC)",
+        position + 1,
+        total,
+        selected_repo.language,
+        selected_repo.slug,
+        selected_repo.code_loc
+    );
+    let started = Instant::now();
+    let progress_repo = format!("{}/{}", selected_repo.language, selected_repo.slug);
+    let result = run_engine(&selected_repo.root, &config, cache_mode, &progress_repo);
+    let record = repository_record(
+        &selected_repo.language,
+        &selected_repo.slug,
+        Some(selected_repo.code_loc),
+        &metadata,
+        bifrost_metadata,
+        fingerprint,
+        started.elapsed().as_secs_f64(),
+        result,
+    );
+    eprintln!(
+        "[{}/{}] complete {} {} elapsed={:.1}s",
+        position + 1,
+        total,
+        selected_repo.language,
+        selected_repo.slug,
+        record.elapsed_seconds
+    );
+    record
 }
 
 fn run_engine(
     root: &Path,
     config: &ReferenceDifferentialConfig,
     cache_mode: CacheMode,
+    progress_repo: &str,
 ) -> Result<ReferenceDifferentialReport, String> {
     let started = Instant::now();
-    eprintln!("progress phase=workspace status=started elapsed=0.0s");
+    eprintln!(
+        "progress phase=workspace status=started repo={progress_repo} jobs={} elapsed=0.0s",
+        config.parallelism
+    );
     let project: Arc<dyn Project> = Arc::new(
         FilesystemProject::new(root.to_path_buf())
             .map_err(|err| format!("failed to open project: {err}"))?,
     );
+    let analyzer_config = AnalyzerConfig {
+        parallelism: Some(config.parallelism),
+        ..AnalyzerConfig::default()
+    };
     let workspace = match cache_mode {
-        CacheMode::Persisted => {
-            WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
-                .map_err(|error| format!("failed to build persisted analyzer: {error}"))?
-        }
-        CacheMode::Ephemeral => WorkspaceAnalyzer::build(project, AnalyzerConfig::default()),
+        CacheMode::Persisted => WorkspaceAnalyzer::build_persisted(project, analyzer_config)
+            .map_err(|error| format!("failed to build persisted analyzer: {error}"))?,
+        CacheMode::Ephemeral => WorkspaceAnalyzer::build(project, analyzer_config),
     };
     eprintln!(
-        "progress phase=workspace status=completed elapsed={:.1}s",
+        "progress phase=workspace status=completed repo={progress_repo} elapsed={:.1}s",
         started.elapsed().as_secs_f64()
     );
     run_reference_differential_with_progress(workspace.analyzer(), config, &|event| match event {
@@ -583,21 +700,21 @@ fn run_engine(
             eligible_files,
             audited_files,
         } => eprintln!(
-            "progress phase=inventory eligible_files={eligible_files} audited_files={audited_files} elapsed={:.1}s",
+            "progress phase=inventory eligible_files={eligible_files} audited_files={audited_files} repo={progress_repo} elapsed={:.1}s",
             started.elapsed().as_secs_f64()
         ),
         ReferenceDifferentialProgress::Sampling {
             sampled_sites,
             structured_candidates,
         } => eprintln!(
-            "progress phase=sampling sampled_sites={sampled_sites} structured_candidates={structured_candidates} elapsed={:.1}s",
+            "progress phase=sampling sampled_sites={sampled_sites} structured_candidates={structured_candidates} repo={progress_repo} elapsed={:.1}s",
             started.elapsed().as_secs_f64()
         ),
         ReferenceDifferentialProgress::ForwardResolution {
             resolved_sites,
             distinct_targets,
         } => eprintln!(
-            "progress phase=forward resolved_sites={resolved_sites} distinct_targets={distinct_targets} elapsed={:.1}s",
+            "progress phase=forward resolved_sites={resolved_sites} distinct_targets={distinct_targets} repo={progress_repo} elapsed={:.1}s",
             started.elapsed().as_secs_f64()
         ),
         ReferenceDifferentialProgress::ForwardFile {
@@ -605,7 +722,7 @@ fn run_engine(
             total,
             path,
         } => eprintln!(
-            "progress phase=forward completed={completed} total={total} file={path} elapsed={:.1}s",
+            "progress phase=forward completed={completed} total={total} file={path} repo={progress_repo} elapsed={:.1}s",
             started.elapsed().as_secs_f64()
         ),
         ReferenceDifferentialProgress::InverseTarget {
@@ -613,7 +730,7 @@ fn run_engine(
             total,
             target,
         } => eprintln!(
-            "progress phase=inverse completed={completed} total={total} target={target} elapsed={:.1}s",
+            "progress phase=inverse completed={completed} total={total} target={target} repo={progress_repo} elapsed={:.1}s",
             started.elapsed().as_secs_f64()
         ),
     })
@@ -1054,6 +1171,7 @@ fn print_run_corpus_help() {
     println!("  --repos-per-language N   Largest valid clones per language (default: 1)");
     println!("  --language LANG          Exact corpus language filter; repeatable");
     println!("  --repo SLUG              Exact repository filter; repeatable");
+    println!("  --repo-jobs N            Repositories audited concurrently (default: 1)");
     println!("  --dry-run                Print deterministic selection without auditing");
     print_common_options();
 }
@@ -1071,7 +1189,7 @@ fn print_common_options() {
         "  --max-targets N          Distinct inverse target groups (default: {DEFAULT_MAX_TARGETS})"
     );
     println!(
-        "  --jobs N                 Parallel forward-file and inverse-target queries (default: {DEFAULT_TARGET_PARALLELISM})"
+        "  --jobs N                 Analyzer and audit workers per repository (default: {DEFAULT_TARGET_PARALLELISM})"
     );
     println!(
         "  --max-usage-files N      Files per inverse target query (default: {DEFAULT_MAX_USAGE_FILES})"
