@@ -643,7 +643,7 @@ pub(super) fn parse_import_info(raw: String) -> ImportInfo {
     }
 }
 
-fn non_static_import_path(import: &ImportInfo) -> Option<&str> {
+pub(super) fn non_static_import_path(import: &ImportInfo) -> Option<&str> {
     if import
         .raw_snippet
         .trim_start()

@@ -2,8 +2,8 @@ use crate::analyzer::cognitive_complexity;
 use crate::analyzer::store::liveness::{LivePathEntry, LivePathMap, LiveSnapshot, Liveness};
 use crate::analyzer::store::query::QueryResolver;
 use crate::analyzer::store::{
-    AnalyzerStore, GenerationId, PathSymbolRow, PersistBatchLimits, PersistBatchStats,
-    PreparedParsedBlob, StoreError,
+    AnalyzerStore, GenerationId, HierarchyStorageKey, PathSymbolRow, PersistBatchLimits,
+    PersistBatchStats, PreparedParsedBlob, StoreError,
 };
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, DeclarationInfo,
@@ -362,6 +362,15 @@ pub struct FileState {
     /// falls back to a fresh parse in that case until the next `update`
     /// re-populates the field.
     pub(crate) parse_errors: Option<Vec<crate::analyzer::ParseError>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct HierarchyDeclarationFacts {
+    pub(crate) declaration: CodeUnit,
+    pub(crate) primary_range: Option<Range>,
+    pub(crate) imports: Arc<[ImportInfo]>,
+    pub(crate) raw_supertypes: Arc<[String]>,
+    storage_key: Option<HierarchyStorageKey>,
 }
 
 pub(crate) struct ImportFileFacts {
@@ -3421,6 +3430,112 @@ where
         units.sort_by(|(left, _), (right, _)| left.cmp(right));
         units.dedup_by(|(left, _), (right, _)| left == right);
         Some(units)
+    }
+
+    pub(crate) fn hierarchy_declaration_facts_by_kind(
+        &self,
+        kind: CodeUnitType,
+    ) -> Option<Vec<HierarchyDeclarationFacts>> {
+        let rows = self
+            .store_context
+            .store
+            .declaration_candidate_rows_with_primary_ranges_by_kind_for_langs(
+                &self.storage_language_keys_for_queries(),
+                self.store_context.generations.as_ref(),
+                kind,
+            )
+            .ok()?;
+        let resolver = QueryResolver::from_snapshot(
+            self.adapter.as_ref(),
+            self.project.root(),
+            self.live_snapshot(),
+        );
+        let mut facts = resolver
+            .resolve_rows_with_payload(rows.into_iter().map(|row| {
+                let storage_key = HierarchyStorageKey {
+                    blob_oid: row.candidate.blob_oid,
+                    lang: row.candidate.lang.clone(),
+                    unit_key: row.candidate.unit_key,
+                };
+                (row.candidate, (row.primary_range, storage_key))
+            }))
+            .into_iter()
+            .map(
+                |(declaration, (primary_range, storage_key))| HierarchyDeclarationFacts {
+                    declaration,
+                    primary_range,
+                    imports: Arc::default(),
+                    raw_supertypes: Arc::default(),
+                    storage_key: Some(storage_key),
+                },
+            )
+            .collect::<Vec<_>>();
+        for state in self.dirty_file_states_for_queries() {
+            facts.extend(
+                state
+                    .declarations
+                    .iter()
+                    .filter(|unit| !unit.is_file_scope() && unit.kind() == kind)
+                    .cloned()
+                    .map(|unit| {
+                        let primary_range = state.ranges.get(&unit).and_then(|ranges| {
+                            ranges
+                                .iter()
+                                .copied()
+                                .min_by_key(|range| (range.start_line, range.start_byte))
+                        });
+                        let raw_supertypes =
+                            state.raw_supertypes.get(&unit).cloned().unwrap_or_default();
+                        HierarchyDeclarationFacts {
+                            declaration: unit,
+                            primary_range,
+                            imports: Arc::from(state.imports.clone()),
+                            raw_supertypes: Arc::from(raw_supertypes),
+                            storage_key: None,
+                        }
+                    }),
+            );
+        }
+        facts.extend(
+            self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| unit.kind() == kind)?
+                .into_iter()
+                .map(|declaration| HierarchyDeclarationFacts {
+                    declaration,
+                    primary_range: None,
+                    imports: Arc::default(),
+                    raw_supertypes: Arc::default(),
+                    storage_key: None,
+                }),
+        );
+        facts.sort_by(|left, right| left.declaration.cmp(&right.declaration));
+        facts.dedup_by(|left, right| left.declaration == right.declaration);
+        Some(facts)
+    }
+
+    pub(crate) fn hydrate_hierarchy_declaration_facts(
+        &self,
+        facts: &mut [HierarchyDeclarationFacts],
+    ) -> Option<()> {
+        let keys = facts
+            .iter()
+            .filter_map(|facts| facts.storage_key.clone())
+            .collect::<Vec<_>>();
+        let persisted = self
+            .store_context
+            .store
+            .hierarchy_facts_by_keys(&keys, self.store_context.generations.as_ref())
+            .ok()?;
+        for facts in facts {
+            let Some(storage_key) = facts.storage_key.as_ref() else {
+                continue;
+            };
+            let Some(stored) = persisted.get(storage_key) else {
+                continue;
+            };
+            facts.imports = Arc::clone(&stored.imports);
+            facts.raw_supertypes = Arc::clone(&stored.raw_supertypes);
+        }
+        Some(())
     }
 
     fn definition_candidate_short_names(&self, fq_name: &str) -> Vec<String> {

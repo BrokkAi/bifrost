@@ -218,6 +218,24 @@ pub struct CandidateRow {
     pub flags: CandidateFlags,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CandidatePrimaryRangeRow {
+    pub(crate) candidate: CandidateRow,
+    pub(crate) primary_range: Option<Range>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct HierarchyStorageKey {
+    pub(crate) blob_oid: Oid,
+    pub(crate) lang: String,
+    pub(crate) unit_key: i64,
+}
+
+pub(crate) struct PersistedHierarchyFacts {
+    pub(crate) imports: Arc<[ImportInfo]>,
+    pub(crate) raw_supertypes: Arc<[String]>,
+}
+
 /// Persisted metadata needed to preserve definition ordering without
 /// reconstructing the candidate's complete file state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1744,6 +1762,105 @@ impl AnalyzerStore {
                 let range = ranges.get(&(row.blob_oid, row.unit_key)).copied();
                 (row, range)
             }));
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
+    pub(crate) fn declaration_candidate_rows_with_primary_ranges_by_kind_for_langs(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        kind: CodeUnitType,
+    ) -> Result<Vec<CandidatePrimaryRangeRow>> {
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        let sql = format!(
+            "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
+                    units.content_qualifier, units.signature, units.synthetic,
+                    units.is_type_alias, units.top_level_ordinal, units.in_declarations,
+                    units.in_definition_lookup,
+                    primary_range.start_byte, primary_range.end_byte,
+                    primary_range.start_line, primary_range.end_line
+             FROM code_units AS units
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+             LEFT JOIN unit_ranges AS primary_range
+               ON primary_range.blob_oid = units.blob_oid
+              AND primary_range.lang = units.lang
+              AND primary_range.unit_key = units.unit_key
+              AND primary_range.ordinal = 0
+             WHERE units.lang = ?1 AND units.kind = ?2 AND units.in_declarations = 1
+               AND {PARSED_BLOB_COMPLETE_CONDITION}
+             ORDER BY units.blob_oid, units.unit_key"
+        );
+        let kind = code_unit_kind_to_i64(kind);
+        let mut statement = tx.prepare_cached(&sql)?;
+        let mut out = Vec::new();
+        for lang in langs {
+            out.extend(collect_candidate_primary_range_rows(statement.query_map(
+                params![lang, kind],
+                candidate_primary_range_row_from_row,
+            )?)?);
+        }
+        drop(statement);
+        tx.commit()?;
+        Ok(out)
+    }
+
+    pub(crate) fn hierarchy_facts_by_keys(
+        &self,
+        keys: &[HierarchyStorageKey],
+        generations: &HashMap<String, GenerationId>,
+    ) -> Result<HashMap<HierarchyStorageKey, PersistedHierarchyFacts>> {
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, keys.iter().map(|key| key.lang.as_str()))?;
+        let mut keys_by_lang: HashMap<String, Vec<&HierarchyStorageKey>> = HashMap::default();
+        let unique_keys = keys.iter().collect::<HashSet<_>>();
+        for key in unique_keys {
+            keys_by_lang.entry(key.lang.clone()).or_default().push(key);
+        }
+        let mut out = HashMap::default();
+        for (lang, lang_keys) in keys_by_lang {
+            let mut oids = lang_keys
+                .iter()
+                .map(|key| key.blob_oid.to_string())
+                .collect::<Vec<_>>();
+            oids.sort();
+            oids.dedup();
+            let imports_by_oid = read_import_infos_bulk(&tx, &lang, &oids)?
+                .into_iter()
+                .map(|(oid, imports)| (oid, Arc::<[ImportInfo]>::from(imports)))
+                .collect::<HashMap<_, _>>();
+            let mut supertypes_by_unit = HashMap::default();
+            for (oid, entries) in
+                read_unit_string_vec_bulk(&tx, &lang, "unit_supertypes", "raw", &oids)?
+            {
+                for (unit_key, raw) in entries {
+                    supertypes_by_unit
+                        .entry((oid.clone(), unit_key))
+                        .or_insert_with(Vec::new)
+                        .push(raw);
+                }
+            }
+            for key in lang_keys {
+                let oid = key.blob_oid.to_string();
+                let imports = imports_by_oid.get(&oid).cloned().unwrap_or_default();
+                let raw_supertypes = Arc::from(
+                    supertypes_by_unit
+                        .remove(&(oid, key.unit_key))
+                        .unwrap_or_default(),
+                );
+                out.insert(
+                    key.clone(),
+                    PersistedHierarchyFacts {
+                        imports,
+                        raw_supertypes,
+                    },
+                );
+            }
         }
         tx.commit()?;
         Ok(out)
@@ -4209,6 +4326,42 @@ fn definition_order_candidate_row_from_row(
         candidate: candidate_row_from_row(row)?,
         first_start_byte,
     })
+}
+
+fn candidate_primary_range_row_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<CandidatePrimaryRangeRow> {
+    let primary_range = match (
+        row.get::<_, Option<i64>>(12)?,
+        row.get::<_, Option<i64>>(13)?,
+        row.get::<_, Option<i64>>(14)?,
+        row.get::<_, Option<i64>>(15)?,
+    ) {
+        (Some(start_byte), Some(end_byte), Some(start_line), Some(end_line)) => Some(Range {
+            start_byte: i64_to_usize(start_byte).map_err(rusqlite_error_from_store)?,
+            end_byte: i64_to_usize(end_byte).map_err(rusqlite_error_from_store)?,
+            start_line: i64_to_usize(start_line).map_err(rusqlite_error_from_store)?,
+            end_line: i64_to_usize(end_line).map_err(rusqlite_error_from_store)?,
+        }),
+        _ => None,
+    };
+    Ok(CandidatePrimaryRangeRow {
+        candidate: candidate_row_from_row(row)?,
+        primary_range,
+    })
+}
+
+fn collect_candidate_primary_range_rows<F>(
+    rows: rusqlite::MappedRows<'_, F>,
+) -> Result<Vec<CandidatePrimaryRangeRow>>
+where
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<CandidatePrimaryRangeRow>,
+{
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 fn collect_definition_order_candidate_rows<F>(

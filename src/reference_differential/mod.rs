@@ -734,6 +734,14 @@ fn compare_inverse(
         set_group_inconclusive(records, &group.site_indexes, "target_truncated");
     }
     for group in groups {
+        let _scope = crate::profiling::scope(format!(
+            "reference_differential::inverse_target[{}]",
+            group
+                .targets
+                .first()
+                .map(CodeUnit::fq_name)
+                .unwrap_or_else(|| "<unknown>".to_string())
+        ));
         let mut paths: Vec<String> = group
             .site_indexes
             .iter()

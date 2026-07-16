@@ -65,7 +65,7 @@ fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
         .and_then(|index| node.named_child(index))
 }
 
-fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
+pub(crate) fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
     let mut current = expression;
     loop {
         match current.kind() {

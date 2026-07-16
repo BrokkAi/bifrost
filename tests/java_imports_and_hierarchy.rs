@@ -1,8 +1,11 @@
+mod common;
+
 use brokk_bifrost::{
     AnalyzerConfig, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, JavaAnalyzerConfig,
     JavaExternalDependencies, JavaMavenCoordinate, Language, ProjectFile, TestProject,
     TypeHierarchyProvider,
 };
+use common::InlineTestProject;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -279,6 +282,103 @@ fn resolves_fully_qualified_extends() {
     assert_eq!(
         BTreeSet::from([child]),
         analyzer.get_direct_descendants(&base).into_iter().collect()
+    );
+}
+
+#[test]
+fn descendant_index_uses_batched_hierarchy_facts_without_point_definition_queries() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("base/Root.java", "package base; public class Root {}")
+        .file(
+            "explicit/ChildExplicit.java",
+            "package explicit; import base.Root; public class ChildExplicit extends Root {}",
+        )
+        .file(
+            "wild/ChildWildcard.java",
+            "package wild; import base.*; public class ChildWildcard extends Root {}",
+        )
+        .file(
+            "fq/ChildFullyQualified.java",
+            "package fq; public class ChildFullyQualified extends base.Root {}",
+        )
+        .file("same/Peer.java", "package same; public class Peer {}")
+        .file(
+            "same/ChildSamePackage.java",
+            "package same; public class ChildSamePackage extends Peer {}",
+        )
+        .file(
+            "nested/Outer.java",
+            "package nested; public class Outer { public static class Inner {} }",
+        )
+        .file(
+            "nested/ChildNested.java",
+            "package nested; public class ChildNested extends Outer.Inner {}",
+        )
+        .build();
+    let analyzer = JavaAnalyzer::new(project.project_dyn()).update_all();
+    let root = analyzer
+        .get_definitions("base.Root")
+        .into_iter()
+        .next()
+        .unwrap();
+    let peer = analyzer
+        .get_definitions("same.Peer")
+        .into_iter()
+        .next()
+        .unwrap();
+    let inner = analyzer
+        .get_definitions("nested.Outer.Inner")
+        .into_iter()
+        .next()
+        .unwrap();
+
+    analyzer.reset_hierarchy_query_counts_for_test();
+    let root_descendants = analyzer
+        .get_direct_descendants(&root)
+        .into_iter()
+        .map(|unit| unit.fq_name())
+        .collect::<BTreeSet<_>>();
+    let peer_descendants = analyzer
+        .get_direct_descendants(&peer)
+        .into_iter()
+        .map(|unit| unit.fq_name())
+        .collect::<BTreeSet<_>>();
+    let inner_descendants = analyzer
+        .get_direct_descendants(&inner)
+        .into_iter()
+        .map(|unit| unit.fq_name())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        BTreeSet::from([
+            "explicit.ChildExplicit".to_string(),
+            "fq.ChildFullyQualified".to_string(),
+            "wild.ChildWildcard".to_string(),
+        ]),
+        root_descendants
+    );
+    assert_eq!(
+        BTreeSet::from(["same.ChildSamePackage".to_string()]),
+        peer_descendants
+    );
+    assert_eq!(
+        BTreeSet::from(["nested.ChildNested".to_string()]),
+        inner_descendants
+    );
+    assert_eq!(
+        0,
+        analyzer.hierarchy_definition_query_count_for_test(),
+        "workspace descendant construction must not resolve every stored supertype through point definition queries"
+    );
+    assert_eq!(
+        0,
+        analyzer.hierarchy_full_hydration_count_for_test(),
+        "workspace descendant construction must not point-hydrate complete file states"
+    );
+    assert_eq!(
+        0,
+        analyzer.hierarchy_bulk_hydration_count_for_test(),
+        "workspace descendant construction must project persisted hierarchy facts instead of bulk-hydrating complete file states"
     );
 }
 

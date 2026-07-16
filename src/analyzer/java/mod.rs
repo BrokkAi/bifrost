@@ -266,6 +266,12 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.all_declarations()
     }
 
+    fn all_declarations_with_primary_ranges(
+        &self,
+    ) -> Vec<(CodeUnit, Option<crate::analyzer::Range>)> {
+        self.inner.all_declarations_with_primary_ranges()
+    }
+
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
         self.inner.declarations(file)
     }

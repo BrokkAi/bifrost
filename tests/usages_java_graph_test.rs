@@ -346,6 +346,43 @@ public class Consumer {
 }
 
 #[test]
+fn java_type_usage_scan_filters_unrelated_ast_names_before_definition_lookup() {
+    let mut consumer = String::from(
+        "package consumer; import target.Wanted; public class Consumer { Wanted wanted;\n",
+    );
+    for index in 0..128 {
+        consumer.push_str(&format!("Noise{index} noise{index};\n"));
+    }
+    consumer.push('}');
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "target/Wanted.java",
+            "package target; public class Wanted {}",
+        )
+        .file("consumer/Consumer.java", consumer)
+        .build();
+    let analyzer = JavaAnalyzer::new(project.project_dyn()).update_all();
+    let target = definition(&analyzer, "target.Wanted");
+    let candidates = [project.file("consumer/Consumer.java")]
+        .into_iter()
+        .collect();
+
+    analyzer.reset_definition_query_count_for_test();
+    let type_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    ));
+
+    assert_eq!(1, type_hits.len());
+    assert!(
+        analyzer.definition_query_count_for_test() <= 2,
+        "unrelated type AST names must not trigger definition lookups"
+    );
+}
+
+#[test]
 fn java_graph_strategy_resolves_inline_constructor_receiver_method_call() {
     let (_project, analyzer) = java_analyzer_with_files(&[
         (
@@ -760,6 +797,7 @@ public class Consumer {
         "org.example.ProcessOperationLockRegistry.waitUntilReleaseReady",
     );
 
+    analyzer.reset_full_declaration_scan_count_for_test();
     let notify_hits = hits(JavaUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&notify),
@@ -777,6 +815,11 @@ public class Consumer {
     assert_hit_contains(
         &wait_hits,
         "getInstance().waitUntilReleaseReady(processId, 10L)",
+    );
+    assert_eq!(
+        0,
+        analyzer.full_declaration_scan_count_for_test(),
+        "targeted Java return-receiver inference must not build the workspace-wide usage-facts index"
     );
 
     let scan = call_search_tool_json(

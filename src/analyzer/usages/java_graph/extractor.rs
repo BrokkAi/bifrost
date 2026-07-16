@@ -1,3 +1,4 @@
+use crate::analyzer::java::structural::expression_name_node;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::java_graph::hits;
@@ -185,7 +186,9 @@ fn seed_variable_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(type_node) = node.child_by_field_name("type") else {
         return;
     };
-    let mut resolved_type = resolve_type_from_node(type_node, ctx);
+    let mut resolved_type = (ctx.spec.kind != TargetKind::Type)
+        .then(|| resolve_type_from_node(type_node, ctx))
+        .flatten();
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() != "variable_declarator" {
@@ -199,7 +202,8 @@ fn seed_variable_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             continue;
         }
 
-        if resolved_type.is_none()
+        if ctx.spec.kind != TargetKind::Type
+            && resolved_type.is_none()
             && let Some(value) = child.child_by_field_name("value")
         {
             resolved_type = infer_type_from_value(value, ctx);
@@ -229,12 +233,14 @@ fn seed_typed_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if binding_name.is_empty() {
         return;
     }
+    if ctx.spec.kind == TargetKind::Type {
+        ctx.bindings.declare_shadow(binding_name.to_string());
+        return;
+    }
     let resolved = node
         .child_by_field_name("type")
         .and_then(|type_node| resolve_type_from_node(type_node, ctx));
-    if ctx.spec.kind == TargetKind::Type {
-        ctx.bindings.declare_shadow(binding_name.to_string());
-    } else if let Some(resolved) = resolved
+    if let Some(resolved) = resolved
         && ctx
             .spec
             .receiver_owner_fq_names
@@ -273,6 +279,9 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if is_ignored_type_context(node) {
+        return;
+    }
+    if !type_terminal_name_matches(node, ctx) {
         return;
     }
     let Some(resolved) = resolve_type_from_node(node, ctx) else {
@@ -333,8 +342,9 @@ fn maybe_record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             if matches!(
                 current.kind(),
                 "type_identifier" | "scoped_type_identifier" | "scoped_identifier" | "identifier"
-            ) && resolve_type_from_node(current, ctx)
-                .is_some_and(|resolved| resolved == ctx.spec.owner)
+            ) && type_terminal_name_matches(current, ctx)
+                && resolve_type_from_node(current, ctx)
+                    .is_some_and(|resolved| resolved == ctx.spec.owner)
             {
                 hits::push_import_hit(current, ctx);
                 return TreeWalkAction::Skip;
@@ -352,6 +362,9 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(type_node) = node.child_by_field_name("type") else {
         return;
     };
+    if !type_terminal_name_matches(type_node, ctx) {
+        return;
+    }
     let Some(resolved) = resolve_type_from_node(type_node, ctx) else {
         return;
     };
@@ -364,6 +377,11 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     hits::push_hit(node, ctx);
+}
+
+fn type_terminal_name_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    expression_name_node(node)
+        .is_some_and(|name| node_text(name, ctx.source) == ctx.spec.member_name)
 }
 
 fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
