@@ -20,6 +20,7 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [x] (2026-07-16 09:51+02:00) Created root epic #813 and thirteen dependency-ordered native subissues #814 through #826.
 - [x] (2026-07-16 09:52+02:00) Cross-linked #813 with the existing structural-query epic #328, policy issue #709, and typed set-composition issue #720.
 - [x] (2026-07-16 09:58+02:00) Wrote this living ExecPlan with architecture, lifecycle, milestone, validation, and recovery contracts.
+- [x] (2026-07-16 10:27+02:00) Published the plan in draft PR [#827](https://github.com/BrokkAi/bifrost/pull/827) from checkpoint commit `41f1e88b`.
 - [ ] Complete #814: define the language-neutral semantic IR, stable identities, capabilities, uncertainty, and an inspectable renderer.
 - [ ] Complete #815 and the first adapter children: build equivalent per-callable CFGs for TypeScript and Java.
 - [ ] Complete #816 in parallel: expose reusable dispatch, value, heap, and bounded access-path oracles for the reference languages.
@@ -644,6 +645,8 @@ Roadmap artifacts created on 2026-07-16:
 - CodeQuery/RQL integration epic: https://github.com/BrokkAi/bifrost/issues/824
 - Cross-language pilot: https://github.com/BrokkAi/bifrost/issues/825
 - WPDS/SPDS evaluation: https://github.com/BrokkAi/bifrost/issues/826
+- Living-plan draft PR: https://github.com/BrokkAi/bifrost/pull/827
+- Initial plan commit: `41f1e88b`
 
 Existing integration anchors:
 
@@ -656,7 +659,7 @@ Existing integration anchors:
 - SQLite-backed compact structural snapshots PR #802
 - Store failure reporting #695
 
-Add the plan PR and merged commit here after publication. Add benchmark tables or links to `.agents/docs/` notes after each experimental milestone; include a recommendation, not only raw percentages.
+Add the merged commit here after publication completes. Add benchmark tables or links to `.agents/docs/` notes after each experimental milestone; include a recommendation, not only raw percentages.
 
 ## Interfaces and Dependencies
 
@@ -841,4 +844,4 @@ A `SummaryStore` may memoize either reusable type in memory and optionally SQLit
 
 Public query changes depend on the declarative schema registry in `src/analyzer/structural/query/schema.rs`. Do not add private keyword lists, editor-only vocabulary, or source-text path parsing. Existing Rust dependencies should be preferred for the first implementation; any new solver or graph crate requires a measured build/runtime benefit and an explicit Decision Log entry.
 
-Plan revision note (2026-07-16): Initial roadmap written after auditing the post-PR-#802 codebase and creating epic #813 with native subissues #814–#826. The initial plan deliberately makes TypeScript/Java the reference pair, IFDS/IDE the baseline solver shape, compact memory plus selective SQLite the lifecycle policy, dominance optional, and WPDS/SPDS evidence-gated.
+Plan revision note (2026-07-16): Initial roadmap written after auditing the post-PR-#802 codebase and creating epic #813 with native subissues #814–#826. The initial plan deliberately makes TypeScript/Java the reference pair, IFDS/IDE the baseline solver shape, compact memory plus selective SQLite the lifecycle policy, dominance optional, and WPDS/SPDS evidence-gated. Draft PR #827 and its initial checkpoint commit were added after publication.
