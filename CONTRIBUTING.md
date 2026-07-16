@@ -18,19 +18,19 @@ This repository has a maturin-backed `pyproject.toml` so `uv run python ...` can
 
 ## Test
 
-Rust:
+Run the core Rust checks before submitting a change:
 
 ```bash
-cargo test
 cargo fmt --check
-cargo clippy-no-cuda
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --features nlp,python
 ```
 
-`cargo clippy-no-cuda` checks all targets with the optional `nlp` and `python`
-features enabled, but leaves `nlp-gpu` off. Use
-`cargo clippy --all-targets --all-features -- -D warnings` only on machines with
-NVIDIA CUDA tooling available; `--all-features` enables Candle's CUDA backend,
-whose build script expects `nvcc`.
+Bifrost's default feature set is empty. Include the `nlp` and `python` features
+when running the full test suite; a featureless `cargo test` skips the
+feature-gated integration suites. `--all-features` enables those same two
+features. Embedding acceleration is selected by the Python sidecar at runtime,
+so these checks do not require CUDA or Metal build tooling.
 
 Python:
 
