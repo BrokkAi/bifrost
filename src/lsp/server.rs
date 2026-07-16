@@ -1305,7 +1305,13 @@ fn handle_formatting_request(
     let document_generation = state.document_generation(&params.text_document.uri);
     let document_uri = params.text_document.uri.clone();
     let rules = state.runtime_configuration.formatter_commands.clone();
-    let prepared = match formatting::prepare(state.project(), &params, &rules) {
+    let prepared = match state.open_documents.get(document_uri.as_str()) {
+        Some(document) if formatting::is_bifrost_sexp_language(&document.language_id) => {
+            Ok(Some(formatting::prepare_bifrost_sexp(&document.text)))
+        }
+        _ => formatting::prepare(state.project(), &params, &rules),
+    };
+    let prepared = match prepared {
         Ok(Some(prepared)) => prepared,
         Ok(None) => {
             drop(slot);
