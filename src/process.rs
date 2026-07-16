@@ -62,13 +62,15 @@ pub(crate) fn run_bounded_process(
     // those guards.
     let stdout = collect_pipe("stdout", stdout_reader, request, &mut child);
     let stderr = collect_pipe("stderr", stderr_reader, request, &mut child);
-    let stdin_result = stdin_writer
-        .map(|worker| collect_stdin_writer(worker, request, &mut child))
-        .transpose();
+    let stdin_result = stdin_writer.map(|worker| collect_stdin_writer(worker, &mut child));
     let status = status?;
     let stdout = stdout?;
     let stderr = stderr?;
-    stdin_result?;
+    if let Some(Err(error)) = stdin_result
+        && (status.success() || !error.is_broken_pipe())
+    {
+        return Err(error.message(request));
+    }
     Ok(BoundedProcessOutput {
         status,
         stdout,
@@ -290,34 +292,54 @@ fn cleanup_error_suffix(cleanup: Result<(), String>) -> String {
 }
 
 type PipeReadResult = Result<Vec<u8>, String>;
-type StdinWriteResult = Result<(), String>;
+type StdinWriteResult = std::io::Result<()>;
+
+enum StdinWriteFailure {
+    TimedOut { cleanup: Result<(), String> },
+    Write(std::io::Error),
+    Panicked,
+}
+
+impl StdinWriteFailure {
+    fn is_broken_pipe(&self) -> bool {
+        matches!(self, Self::Write(error) if error.kind() == std::io::ErrorKind::BrokenPipe)
+    }
+
+    fn message(self, request: &BoundedProcessRequest) -> String {
+        match self {
+            Self::TimedOut { cleanup } => format!(
+                "{} did not finish reading stdin{}",
+                request.description,
+                cleanup_error_suffix(cleanup)
+            ),
+            Self::Write(error) => {
+                format!("failed to write stdin for {}: {error}", request.description)
+            }
+            Self::Panicked => format!("{} stdin writer panicked", request.description),
+        }
+    }
+}
 
 fn spawn_stdin_writer(
     mut stdin: impl Write + Send + 'static,
     input: Vec<u8>,
 ) -> JoinHandle<StdinWriteResult> {
-    thread::spawn(move || stdin.write_all(&input).map_err(|err| err.to_string()))
+    thread::spawn(move || stdin.write_all(&input))
 }
 
 fn collect_stdin_writer(
     worker: JoinHandle<StdinWriteResult>,
-    request: &BoundedProcessRequest,
     child: &mut OwnedProcess,
-) -> Result<(), String> {
+) -> Result<(), StdinWriteFailure> {
     let timed_out = !worker_finished_within(&worker, READER_GRACE);
     let cleanup = timed_out.then(|| terminate_and_wait(child));
     match worker.join() {
         Ok(Ok(())) if !timed_out => Ok(()),
-        Ok(Ok(())) => Err(format!(
-            "{} did not finish reading stdin{}",
-            request.description,
-            cleanup_error_suffix(cleanup.expect("timeout cleanup must exist"))
-        )),
-        Ok(Err(err)) => Err(format!(
-            "failed to write stdin for {}: {err}",
-            request.description
-        )),
-        Err(_) => Err(format!("{} stdin writer panicked", request.description)),
+        Ok(Ok(())) => Err(StdinWriteFailure::TimedOut {
+            cleanup: cleanup.expect("timeout cleanup must exist"),
+        }),
+        Ok(Err(error)) => Err(StdinWriteFailure::Write(error)),
+        Err(_) => Err(StdinWriteFailure::Panicked),
     }
 }
 
