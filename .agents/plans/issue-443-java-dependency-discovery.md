@@ -15,7 +15,7 @@ The observable proof is a temporary Java project containing only an import and a
 - [x] (2026-07-16 14:05Z) Inspected issue #443, predecessor issue #354 and PR #445, the current external index, analyzer configuration, project abstraction, workspace update routing, formatter process lifecycle, and official Maven/Gradle dependency-reporting APIs.
 - [x] (2026-07-16 14:05Z) Chose the external-declaration boundary, trust model, metadata subset, build-tool execution model, cache lookup constraints, and invalidation behavior with the user.
 - [x] (2026-07-16 14:43Z) Added public discovery configuration, structural Maven POM parsing, modern and legacy Gradle lock parsing, and exact Maven/Gradle cache lookup. `cargo test java_dependency_discovery --lib` passes all seven focused parser and generated-JAR tests.
-- [ ] Add bounded offline Maven/Gradle discovery and reuse the formatter process lifecycle safely.
+- [x] (2026-07-16 15:32Z) Extracted the formatter lifecycle into a shared bounded process runner and added trusted offline Maven/Gradle execution with top-level build-root selection, bounded reports, cross-platform parsers, and injected failure/partial-result tests. Formatter execution and shared descendant-cleanup tests pass.
 - [ ] Integrate lazy discovery and manifest invalidation into Java and multi-language analyzer updates.
 - [ ] Add end-to-end and failure-mode coverage, run all required validation, and complete the retrospective.
 
@@ -31,6 +31,8 @@ The observable proof is a temporary Java project containing only an import and a
   Evidence: `src/lsp/handlers/formatting.rs` uses Unix sessions and Windows Job Objects to terminate descendants on cancellation and timeout.
 - Observation: Gradle's artifact cache adds a content-hash directory beneath an exact coordinate, so exact lookup still requires one bounded directory-listing step.
   Evidence: The resolver enters only `<root>/<group>/<artifact>/<version>`, sorts its direct hash children, and considers JARs immediately beneath them; the end-to-end test places another valid JAR under an unrelated coordinate and proves it is not indexed.
+- Observation: A bounded reader must continue draining after crossing its memory limit or a child that keeps writing can block before the timeout path can reap it.
+  Evidence: The shared runner records overflow, discards subsequent bytes, and reports the limit only after EOF; formatter large-stdin/output concurrency and timeout tests still pass after extraction.
 
 ## Decision Log
 
@@ -55,7 +57,7 @@ The observable proof is a temporary Java project containing only an import and a
 
 ## Outcomes & Retrospective
 
-The safe metadata milestone now provides automatic exact dependency awareness from Maven POMs and Gradle lockfiles, while keeping all discovered declarations in `JavaExternalDeclarationIndex`. Offline resolved transitive coverage and correct lazy refresh after build inputs change remain to be implemented.
+Safe metadata now provides automatic exact dependency awareness from Maven POMs and Gradle lockfiles, while trusted `OfflineBuildTools` mode adds resolved artifacts from installed/configured Maven and Gradle executables. Both paths keep declarations in `JavaExternalDeclarationIndex`; correct lazy refresh after build inputs change remains to be implemented.
 
 ## Context and Orientation
 

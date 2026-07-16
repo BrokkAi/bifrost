@@ -2,7 +2,7 @@ use super::declarations::{
     class_like_body_children_rev, determine_package_name, is_class_like_declaration_kind,
     node_text, normalize_java_full_name, parse_tree,
 };
-use super::dependency_discovery::discover_metadata;
+use super::dependency_discovery::{discover_build_tools, discover_metadata};
 use crate::analyzer::{
     JavaAnalyzerConfig, JavaDependencyDiscoveryMode, JavaExternalArtifact,
     JavaExternalDependencies, JavaMavenCoordinate, Project,
@@ -83,6 +83,10 @@ impl JavaExternalDeclarationIndex {
         let mut dependencies = config.external_dependencies.clone();
         if config.dependency_discovery.mode != JavaDependencyDiscoveryMode::Disabled {
             discover_metadata(project).merge_into(&mut dependencies);
+        }
+        if config.dependency_discovery.mode == JavaDependencyDiscoveryMode::OfflineBuildTools {
+            discover_build_tools(project, &config.dependency_discovery)
+                .merge_into(&mut dependencies);
         }
         let artifacts = resolve_configured_artifacts(&dependencies, project.root());
         Self::build_from_artifacts(artifacts)

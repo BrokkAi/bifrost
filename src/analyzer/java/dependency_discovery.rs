@@ -1,12 +1,54 @@
 use crate::analyzer::{
-    JavaExternalArtifact, JavaExternalDependencies, JavaMavenCoordinate, Project, ProjectFile,
+    JavaDependencyDiscoveryConfig, JavaExternalArtifact, JavaExternalDependencies,
+    JavaMavenCoordinate, Project, ProjectFile,
 };
 use crate::hash::{HashMap, HashSet};
+use crate::process::{BoundedProcessRequest, read_limited, run_bounded_process};
 use quick_xml::Reader;
 use quick_xml::events::Event;
-use std::path::{Component, PathBuf};
+use serde::Deserialize;
+use std::ffi::OsString;
+use std::fs::File;
+use std::path::{Component, Path, PathBuf};
 
 const MAX_BUILD_METADATA_BYTES: usize = 2 * 1024 * 1024;
+const MAX_TOOL_REPORT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
+
+const GRADLE_INIT_SCRIPT: &str = r#"
+import groovy.json.JsonOutput
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
+
+gradle.projectsEvaluated {
+    def root = gradle.rootProject
+    root.tasks.register("bifrostExternalDependencies") {
+        doLast {
+            def output = new File(System.getProperty("bifrost.output"))
+            output.withPrintWriter("UTF-8") { writer ->
+                root.allprojects.each { project ->
+                    project.configurations.findAll { it.canBeResolved }.each { configuration ->
+                        try {
+                            configuration.incoming.artifactView { lenient true }.artifacts.artifacts.each { artifact ->
+                                def component = artifact.id.componentIdentifier
+                                if (component instanceof ModuleComponentIdentifier) {
+                                    writer.println(JsonOutput.toJson([
+                                        group: component.group,
+                                        name: component.module,
+                                        version: component.version,
+                                        file: artifact.file.absolutePath
+                                    ]))
+                                }
+                            }
+                        } catch (Exception ignored) {
+                            // One unresolved configuration must not hide the others.
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+"#;
 
 #[derive(Debug, Default)]
 pub(super) struct DiscoveredJavaDependencies {
@@ -26,6 +68,7 @@ pub(super) fn discover_metadata(project: &dyn Project) -> DiscoveredJavaDependen
     let Ok(files) = project.all_files() else {
         return DiscoveredJavaDependencies::default();
     };
+    let files: Vec<_> = files.into_iter().collect();
     let mut discovered = DiscoveredJavaDependencies::default();
     for file in files {
         if is_maven_pom(&file) {
@@ -33,6 +76,153 @@ pub(super) fn discover_metadata(project: &dyn Project) -> DiscoveredJavaDependen
         } else if is_gradle_lockfile(&file) {
             discover_gradle_lockfile(project, &file, &mut discovered);
         }
+    }
+    deduplicate_discovered(&mut discovered);
+    discovered
+}
+
+pub(super) fn discover_build_tools(
+    project: &dyn Project,
+    config: &JavaDependencyDiscoveryConfig,
+) -> DiscoveredJavaDependencies {
+    discover_build_tools_with_executor(project, config, &SystemDependencyCommandExecutor)
+}
+
+trait DependencyCommandExecutor {
+    fn maven_report(
+        &self,
+        root: &Path,
+        executable: &Path,
+        config: &JavaDependencyDiscoveryConfig,
+    ) -> Result<Vec<u8>, String>;
+
+    fn gradle_report(
+        &self,
+        root: &Path,
+        executable: &Path,
+        config: &JavaDependencyDiscoveryConfig,
+    ) -> Result<Vec<u8>, String>;
+}
+
+struct SystemDependencyCommandExecutor;
+
+impl DependencyCommandExecutor for SystemDependencyCommandExecutor {
+    fn maven_report(
+        &self,
+        root: &Path,
+        executable: &Path,
+        config: &JavaDependencyDiscoveryConfig,
+    ) -> Result<Vec<u8>, String> {
+        let temporary = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let report_path = temporary.path().join("maven-dependencies.txt");
+        let args = [
+            "-o".to_string(),
+            "-B".to_string(),
+            "-ntp".to_string(),
+            "dependency:list".to_string(),
+            "-DincludeScope=test".to_string(),
+            "-DoutputAbsoluteArtifactFilename=true".to_string(),
+            format!("-DoutputFile={}", report_path.display()),
+        ];
+        run_dependency_process(
+            executable,
+            &args,
+            root,
+            config.timeout,
+            "Maven dependency discovery",
+        )?;
+        let report = File::open(report_path).map_err(|err| err.to_string())?;
+        read_limited(report, MAX_TOOL_REPORT_BYTES)
+    }
+
+    fn gradle_report(
+        &self,
+        root: &Path,
+        executable: &Path,
+        config: &JavaDependencyDiscoveryConfig,
+    ) -> Result<Vec<u8>, String> {
+        let temporary = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let init_path = temporary.path().join("bifrost.init.gradle");
+        let report_path = temporary.path().join("gradle-dependencies.jsonl");
+        std::fs::write(&init_path, GRADLE_INIT_SCRIPT).map_err(|err| err.to_string())?;
+        let args = [
+            "--offline".to_string(),
+            "--no-daemon".to_string(),
+            "--console=plain".to_string(),
+            "-q".to_string(),
+            "-I".to_string(),
+            init_path.display().to_string(),
+            format!("-Dbifrost.output={}", report_path.display()),
+            "bifrostExternalDependencies".to_string(),
+        ];
+        run_dependency_process(
+            executable,
+            &args,
+            root,
+            config.timeout,
+            "Gradle dependency discovery",
+        )?;
+        let report = File::open(report_path).map_err(|err| err.to_string())?;
+        read_limited(report, MAX_TOOL_REPORT_BYTES)
+    }
+}
+
+fn run_dependency_process(
+    executable: &Path,
+    args: &[String],
+    root: &Path,
+    timeout: std::time::Duration,
+    description: &str,
+) -> Result<(), String> {
+    let request = BoundedProcessRequest {
+        program: executable.as_os_str().to_os_string(),
+        args: args.iter().map(OsString::from).collect(),
+        env: Vec::new(),
+        cwd: root.to_path_buf(),
+        stdin: None,
+        timeout,
+        stdout_limit: MAX_TOOL_OUTPUT_BYTES,
+        stderr_limit: MAX_TOOL_OUTPUT_BYTES,
+        description: description.to_string(),
+    };
+    let output = run_bounded_process(&request, || false)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!("{description} exited with {}", output.status))
+    }
+}
+
+fn discover_build_tools_with_executor(
+    project: &dyn Project,
+    config: &JavaDependencyDiscoveryConfig,
+    executor: &dyn DependencyCommandExecutor,
+) -> DiscoveredJavaDependencies {
+    let Ok(files) = project.all_files() else {
+        return DiscoveredJavaDependencies::default();
+    };
+    let files: Vec<_> = files.into_iter().collect();
+    let mut discovered = DiscoveredJavaDependencies::default();
+    let maven_executable = config
+        .maven_executable
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("mvn"));
+    for root in maven_build_roots(project, &files) {
+        let Ok(report) = executor.maven_report(&root, &maven_executable, config) else {
+            continue;
+        };
+        add_tool_records(parse_maven_dependency_list(&report), &mut discovered);
+    }
+
+    let gradle_executable = config
+        .gradle_executable
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("gradle"));
+    for root in gradle_build_roots(&files) {
+        let Ok(report) = executor.gradle_report(&root, &gradle_executable, config) else {
+            continue;
+        };
+        add_tool_records(parse_gradle_dependency_jsonl(&report), &mut discovered);
     }
     deduplicate_discovered(&mut discovered);
     discovered
@@ -87,36 +277,7 @@ fn discover_maven_pom(
         return;
     }
 
-    let mut properties = HashMap::default();
-    if let Some(property_node) = project_node.child("properties") {
-        for child in &property_node.children {
-            let value = child.text.trim();
-            if !child.name.is_empty() && !value.is_empty() {
-                properties.insert(child.name.clone(), value.to_string());
-            }
-        }
-    }
-
-    let parent = project_node.child("parent");
-    let project_group = project_node
-        .child_text("groupId")
-        .or_else(|| parent.and_then(|node| node.child_text("groupId")));
-    let project_artifact = project_node.child_text("artifactId");
-    let project_version = project_node
-        .child_text("version")
-        .or_else(|| parent.and_then(|node| node.child_text("version")));
-    for (key, value) in [
-        ("project.groupId", project_group),
-        ("pom.groupId", project_group),
-        ("project.artifactId", project_artifact),
-        ("pom.artifactId", project_artifact),
-        ("project.version", project_version),
-        ("pom.version", project_version),
-    ] {
-        if let Some(value) = value {
-            properties.insert(key.to_string(), value.to_string());
-        }
-    }
+    let properties = maven_project_properties(&project_node);
 
     let Some(dependencies) = project_node.child("dependencies") else {
         return;
@@ -139,8 +300,10 @@ fn discover_maven_pom(
             let path = PathBuf::from(system_path);
             let path = if path.is_absolute() {
                 path
+            } else if let Some(parent) = file.abs_path().parent() {
+                parent.join(path)
             } else {
-                file.parent().join(path)
+                path
             };
             if path.is_file() {
                 discovered.artifact_paths.push(JavaExternalArtifact {
@@ -184,6 +347,39 @@ fn discover_maven_pom(
     }
 }
 
+fn maven_project_properties(project_node: &XmlNode) -> HashMap<String, String> {
+    let mut properties = HashMap::default();
+    if let Some(property_node) = project_node.child("properties") {
+        for child in &property_node.children {
+            let value = child.text.trim();
+            if !child.name.is_empty() && !value.is_empty() {
+                properties.insert(child.name.clone(), value.to_string());
+            }
+        }
+    }
+    let parent = project_node.child("parent");
+    let project_group = project_node
+        .child_text("groupId")
+        .or_else(|| parent.and_then(|node| node.child_text("groupId")));
+    let project_artifact = project_node.child_text("artifactId");
+    let project_version = project_node
+        .child_text("version")
+        .or_else(|| parent.and_then(|node| node.child_text("version")));
+    for (key, value) in [
+        ("project.groupId", project_group),
+        ("pom.groupId", project_group),
+        ("project.artifactId", project_artifact),
+        ("pom.artifactId", project_artifact),
+        ("project.version", project_version),
+        ("pom.version", project_version),
+    ] {
+        if let Some(value) = value {
+            properties.insert(key.to_string(), value.to_string());
+        }
+    }
+    properties
+}
+
 fn discover_gradle_lockfile(
     project: &dyn Project,
     file: &ProjectFile,
@@ -220,6 +416,176 @@ fn parse_gradle_lockfile(source: &str) -> Vec<JavaMavenCoordinate> {
             Some(JavaMavenCoordinate::new(group_id, artifact_id, version))
         })
         .collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ToolArtifactRecord {
+    coordinate: JavaMavenCoordinate,
+    artifact_path: PathBuf,
+}
+
+fn parse_maven_dependency_list(report: &[u8]) -> Vec<ToolArtifactRecord> {
+    String::from_utf8_lossy(report)
+        .lines()
+        .filter_map(parse_maven_dependency_line)
+        .collect()
+}
+
+fn parse_maven_dependency_line(line: &str) -> Option<ToolArtifactRecord> {
+    let fields: Vec<_> = line.trim().split(':').collect();
+    if fields.len() < 6 || fields.get(2)?.trim() != "jar" {
+        return None;
+    }
+    let scope_index = (4..fields.len().min(7)).find(|&index| {
+        matches!(
+            fields[index].trim(),
+            "compile" | "runtime" | "provided" | "test" | "system"
+        )
+    })?;
+    let group_id = fields.first()?.trim();
+    let artifact_id = fields.get(1)?.trim();
+    let version = fields.get(scope_index.checked_sub(1)?)?.trim();
+    let artifact_path = fields.get(scope_index + 1..)?.join(":");
+    if group_id.is_empty()
+        || artifact_id.is_empty()
+        || version.is_empty()
+        || artifact_path.trim().is_empty()
+    {
+        return None;
+    }
+    Some(ToolArtifactRecord {
+        coordinate: JavaMavenCoordinate::new(group_id, artifact_id, version),
+        artifact_path: PathBuf::from(artifact_path.trim()),
+    })
+}
+
+#[derive(Deserialize)]
+struct GradleArtifactRecord {
+    group: String,
+    name: String,
+    version: String,
+    file: String,
+}
+
+fn parse_gradle_dependency_jsonl(report: &[u8]) -> Vec<ToolArtifactRecord> {
+    String::from_utf8_lossy(report)
+        .lines()
+        .filter_map(|line| {
+            let record = serde_json::from_str::<GradleArtifactRecord>(line).ok()?;
+            if record.group.trim().is_empty()
+                || record.name.trim().is_empty()
+                || record.version.trim().is_empty()
+                || record.file.trim().is_empty()
+            {
+                return None;
+            }
+            Some(ToolArtifactRecord {
+                coordinate: JavaMavenCoordinate::new(
+                    record.group.trim(),
+                    record.name.trim(),
+                    record.version.trim(),
+                ),
+                artifact_path: PathBuf::from(record.file),
+            })
+        })
+        .collect()
+}
+
+fn add_tool_records(records: Vec<ToolArtifactRecord>, discovered: &mut DiscoveredJavaDependencies) {
+    for record in records {
+        if !record.artifact_path.is_absolute()
+            || !record.artifact_path.is_file()
+            || !record
+                .artifact_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("jar"))
+        {
+            continue;
+        }
+        discovered.coordinates.push(record.coordinate);
+        discovered.artifact_paths.push(JavaExternalArtifact {
+            artifact_path: record.artifact_path,
+            source_artifact_path: None,
+        });
+    }
+}
+
+fn maven_build_roots(project: &dyn Project, files: &[ProjectFile]) -> Vec<PathBuf> {
+    let poms: Vec<_> = files.iter().filter(|file| is_maven_pom(file)).collect();
+    let mut module_poms = HashSet::default();
+    for pom in &poms {
+        let Some(source) = read_bounded_source(project, pom) else {
+            continue;
+        };
+        let Some(project_node) = parse_xml(&source) else {
+            continue;
+        };
+        let Some(modules) = project_node.child("modules") else {
+            continue;
+        };
+        let properties = maven_project_properties(&project_node);
+        let pom_path = pom.abs_path();
+        let Some(parent) = pom_path.parent() else {
+            continue;
+        };
+        for module in modules.children_named("module") {
+            let Some(module) = expand_maven_value(module.text.trim(), &properties) else {
+                continue;
+            };
+            module_poms.insert(stable_path(parent.join(module).join("pom.xml")));
+        }
+    }
+    let mut roots: Vec<_> = poms
+        .into_iter()
+        .filter_map(|pom| {
+            let path = stable_path(pom.abs_path());
+            (!module_poms.contains(&path)).then(|| path.parent().map(Path::to_path_buf))?
+        })
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn gradle_build_roots(files: &[ProjectFile]) -> Vec<PathBuf> {
+    let mut settings_roots: Vec<_> = files
+        .iter()
+        .filter(|file| {
+            file.rel_path()
+                .file_name()
+                .is_some_and(|name| name == "settings.gradle" || name == "settings.gradle.kts")
+        })
+        .filter_map(|file| file.abs_path().parent().map(stable_path))
+        .collect();
+    settings_roots.sort();
+    settings_roots.dedup();
+
+    let mut roots = settings_roots.clone();
+    for file in files.iter().filter(|file| {
+        file.rel_path()
+            .file_name()
+            .is_some_and(|name| name == "build.gradle" || name == "build.gradle.kts")
+    }) {
+        let Some(root) = file.abs_path().parent().map(stable_path) else {
+            continue;
+        };
+        if !settings_roots
+            .iter()
+            .any(|settings_root| root.starts_with(settings_root))
+        {
+            roots.push(root);
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn stable_path(path: impl AsRef<Path>) -> PathBuf {
+    path.as_ref()
+        .canonicalize()
+        .unwrap_or_else(|_| path.as_ref().to_path_buf())
 }
 
 fn expand_maven_value(value: &str, properties: &HashMap<String, String>) -> Option<String> {
@@ -407,6 +773,7 @@ mod tests {
     use super::*;
     use crate::analyzer::{Language, TestProject};
     use std::fs;
+    use std::sync::Mutex;
 
     #[test]
     fn java_dependency_discovery_parses_exact_maven_dependencies_only() {
@@ -495,6 +862,206 @@ mod tests {
         ] {
             let file = ProjectFile::new(root.path().to_path_buf(), PathBuf::from(path));
             assert_eq!(expected, is_java_dependency_input(&file), "{path}");
+        }
+    }
+
+    #[test]
+    fn java_dependency_discovery_parses_maven_tool_records_cross_platform() {
+        let report = br#"
+            org.example:direct:jar:1.0:compile:/tmp/direct.jar
+            org.example:transitive:jar:tests:2.0:runtime:C:\cache\transitive-tests.jar
+            org.example:not-a-jar:pom:1.0:compile:/tmp/not-a-jar.pom
+            malformed
+            org.example:direct:jar:1.0:compile:/tmp/direct.jar
+        "#;
+        let records = parse_maven_dependency_list(report);
+        assert_eq!(3, records.len());
+        assert_eq!(
+            JavaMavenCoordinate::new("org.example", "direct", "1.0"),
+            records[0].coordinate
+        );
+        assert_eq!(PathBuf::from("/tmp/direct.jar"), records[0].artifact_path);
+        assert_eq!(
+            JavaMavenCoordinate::new("org.example", "transitive", "2.0"),
+            records[1].coordinate
+        );
+        assert_eq!(
+            PathBuf::from(r"C:\cache\transitive-tests.jar"),
+            records[1].artifact_path
+        );
+    }
+
+    #[test]
+    fn java_dependency_discovery_parses_gradle_tool_records_cross_platform() {
+        let report = br#"
+{"group":"org.example","name":"direct","version":"1.0","file":"/tmp/direct.jar"}
+{"group":"org.example","name":"classified","version":"2.0","file":"C:\\cache\\classified-tests.jar"}
+malformed
+{"group":"org.example","name":"direct","version":"1.0","file":"/tmp/direct.jar"}
+        "#;
+        let records = parse_gradle_dependency_jsonl(report);
+        assert_eq!(3, records.len());
+        assert_eq!(
+            JavaMavenCoordinate::new("org.example", "classified", "2.0"),
+            records[1].coordinate
+        );
+        assert_eq!(
+            PathBuf::from(r"C:\cache\classified-tests.jar"),
+            records[1].artifact_path
+        );
+    }
+
+    #[test]
+    fn java_dependency_discovery_fake_executor_merges_partial_build_results() {
+        let project = project(&[
+            (
+                "pom.xml",
+                "<project><modules><module>child</module></modules></project>",
+            ),
+            ("child/pom.xml", "<project/>"),
+            ("other/pom.xml", "<project/>"),
+            ("settings.gradle.kts", "rootProject.name = \"root\""),
+            ("module/build.gradle.kts", "plugins { java }"),
+            ("standalone/build.gradle", "plugins { id 'java' }"),
+            ("src/App.java", "class App {}"),
+        ]);
+        let maven_jar = project.root().join("maven.jar");
+        let gradle_jar = project.root().join("gradle-tests.jar");
+        fs::write(&maven_jar, []).unwrap();
+        fs::write(&gradle_jar, []).unwrap();
+        let root = stable_path(project.root());
+        let other_root = stable_path(project.root().join("other"));
+        let standalone_root = stable_path(project.root().join("standalone"));
+        let executor = FakeExecutor::new(
+            PathBuf::from("trusted-mvn"),
+            PathBuf::from("trusted-gradle"),
+            [(
+                root.clone(),
+                Ok(format!(
+                    "org.example:maven:jar:1.0:compile:{}\norg.example:maven:jar:1.0:runtime:{}\norg.example:absent:jar:9.0:test:{}\n",
+                    maven_jar.display(),
+                    maven_jar.display(),
+                    project.root().join("absent.jar").display()
+                )
+                .into_bytes()),
+            ), (other_root, Err("missing tool".to_string()))],
+            [
+                (
+                    root,
+                    Ok(format!(
+                        "{{\"group\":\"org.example\",\"name\":\"gradle\",\"version\":\"2.0\",\"file\":{}}}\n",
+                        serde_json::to_string(&gradle_jar.display().to_string()).unwrap()
+                    )
+                    .into_bytes()),
+                ),
+                (standalone_root, Err("timed out".to_string())),
+            ],
+        );
+        let config = JavaDependencyDiscoveryConfig {
+            maven_executable: Some(PathBuf::from("trusted-mvn")),
+            gradle_executable: Some(PathBuf::from("trusted-gradle")),
+            ..JavaDependencyDiscoveryConfig::default()
+        };
+
+        let discovered = discover_build_tools_with_executor(&project, &config, &executor);
+        assert_eq!(
+            vec![
+                JavaMavenCoordinate::new("org.example", "gradle", "2.0"),
+                JavaMavenCoordinate::new("org.example", "maven", "1.0"),
+            ],
+            discovered.coordinates
+        );
+        assert_eq!(2, discovered.artifact_paths.len());
+        assert_eq!(3, executor.calls.lock().unwrap().len());
+    }
+
+    #[test]
+    fn java_dependency_discovery_fake_executor_failures_are_empty() {
+        let project = project(&[
+            ("pom.xml", "<project/>"),
+            ("timeout/pom.xml", "<project/>"),
+            ("settings.gradle", "rootProject.name = 'root'"),
+            ("src/App.java", "class App {}"),
+        ]);
+        let root = stable_path(project.root());
+        let timeout_root = stable_path(project.root().join("timeout"));
+        let executor = FakeExecutor::new(
+            PathBuf::from("mvn"),
+            PathBuf::from("gradle"),
+            [
+                (root.clone(), Err("executable missing".to_string())),
+                (timeout_root, Err("timed out".to_string())),
+            ],
+            [(root, Err("nonzero exit".to_string()))],
+        );
+        let discovered = discover_build_tools_with_executor(
+            &project,
+            &JavaDependencyDiscoveryConfig::default(),
+            &executor,
+        );
+        assert!(discovered.coordinates.is_empty());
+        assert!(discovered.artifact_paths.is_empty());
+        assert_eq!(3, executor.calls.lock().unwrap().len());
+    }
+
+    struct FakeExecutor {
+        expected_maven: PathBuf,
+        expected_gradle: PathBuf,
+        maven: HashMap<PathBuf, Result<Vec<u8>, String>>,
+        gradle: HashMap<PathBuf, Result<Vec<u8>, String>>,
+        calls: Mutex<Vec<(String, PathBuf)>>,
+    }
+
+    impl FakeExecutor {
+        fn new(
+            expected_maven: PathBuf,
+            expected_gradle: PathBuf,
+            maven: impl IntoIterator<Item = (PathBuf, Result<Vec<u8>, String>)>,
+            gradle: impl IntoIterator<Item = (PathBuf, Result<Vec<u8>, String>)>,
+        ) -> Self {
+            Self {
+                expected_maven,
+                expected_gradle,
+                maven: maven.into_iter().collect(),
+                gradle: gradle.into_iter().collect(),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl DependencyCommandExecutor for FakeExecutor {
+        fn maven_report(
+            &self,
+            root: &Path,
+            executable: &Path,
+            _config: &JavaDependencyDiscoveryConfig,
+        ) -> Result<Vec<u8>, String> {
+            assert_eq!(self.expected_maven, executable);
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("maven".to_string(), root.to_path_buf()));
+            self.maven
+                .get(root)
+                .cloned()
+                .unwrap_or_else(|| Err("unexpected Maven root".to_string()))
+        }
+
+        fn gradle_report(
+            &self,
+            root: &Path,
+            executable: &Path,
+            _config: &JavaDependencyDiscoveryConfig,
+        ) -> Result<Vec<u8>, String> {
+            assert_eq!(self.expected_gradle, executable);
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("gradle".to_string(), root.to_path_buf()));
+            self.gradle
+                .get(root)
+                .cloned()
+                .unwrap_or_else(|| Err("unexpected Gradle root".to_string()))
         }
     }
 

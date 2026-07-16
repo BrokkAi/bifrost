@@ -26,6 +26,7 @@ mod model_context;
 pub mod nlp;
 mod path_normalization;
 mod path_utils;
+mod process;
 pub mod profiling;
 mod project_watcher;
 #[cfg(feature = "python")]

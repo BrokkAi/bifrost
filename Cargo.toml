@@ -57,6 +57,7 @@ strsim = "0.11.1"
 json-spanned-value = "0.2.2"
 sha2 = "0.10.8"
 toml = "0.8.23"
+tempfile = "3.23.0"
 
 # Tree-sitter policy:
 # - keep one shared runtime version
@@ -104,7 +105,6 @@ python = ["dep:pyo3"]
 filetime = "0.2"
 pretty_assertions = "1.4.1"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
-tempfile = "3.23.0"
 
 # Unix: process-group kill for the embedding sidecar (and the peak-RSS bench).
 [target.'cfg(unix)'.dependencies]
