@@ -2348,7 +2348,7 @@ impl ServerState {
         if let Some(progress) = progress {
             progress.set_expected_language_count(project.analyzer_languages().len());
         }
-        let workspace = build_workspace_for_lsp(project, progress);
+        let workspace = build_workspace_for_lsp(project, progress)?;
         Ok(Self {
             active_roots,
             editor_roots,
@@ -2489,7 +2489,7 @@ impl ServerState {
             }
         }
         let project = Arc::clone(&overlay) as Arc<dyn Project>;
-        let mut workspace = build_workspace_for_lsp(project, None);
+        let mut workspace = build_workspace_for_lsp(project, None)?;
         if !replayed_files.is_empty() {
             workspace = workspace.update(&replayed_files);
         }
@@ -2929,7 +2929,7 @@ fn uri_belongs_to_project(project: &dyn Project, uri: &Uri) -> bool {
 fn build_workspace_for_lsp(
     project: Arc<dyn Project>,
     progress: Option<&StartupProgress>,
-) -> WorkspaceAnalyzer {
+) -> Result<WorkspaceAnalyzer, String> {
     let config = AnalyzerConfig::default();
     match progress {
         Some(progress) => {
@@ -2937,11 +2937,13 @@ fn build_workspace_for_lsp(
             WorkspaceAnalyzer::build_persisted_with_progress(project, config, move |event| {
                 progress.report_analyzer_event(event)
             })
+            .map_err(|error| format!("Failed to build persisted LSP analyzer: {error}"))
         }
         // Build the analyzer regardless of progress support. Work-done progress
         // is a UI capability (can the client render a progress bar); it has no
         // bearing on whether the analyzer store should be populated.
-        None => WorkspaceAnalyzer::build_persisted(project, config),
+        None => WorkspaceAnalyzer::build_persisted(project, config)
+            .map_err(|error| format!("Failed to build persisted LSP analyzer: {error}")),
     }
 }
 

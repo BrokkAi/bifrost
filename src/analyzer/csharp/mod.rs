@@ -104,7 +104,7 @@ impl CSharpAnalyzer {
         config: AnalyzerConfig,
         store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
-    ) -> Self {
+    ) -> Result<Self, crate::analyzer::store::StoreError> {
         let memo_budget = config.memo_cache_budget_bytes();
         let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             project,
@@ -112,11 +112,11 @@ impl CSharpAnalyzer {
             config,
             store_context,
             progress,
-        );
-        Self {
+        )?;
+        Ok(Self {
             inner,
             memo_caches: Arc::new(CSharpMemoCaches::new(memo_budget)),
-        }
+        })
     }
 
     pub fn from_project<P>(project: P) -> Self
@@ -842,12 +842,12 @@ fn count_top_level_comma_separated(text: &str) -> usize {
 impl TestDetectionProvider for CSharpAnalyzer {}
 
 impl IAnalyzer for CSharpAnalyzer {
-    fn begin_query(&self) {
-        self.inner.begin_query();
+    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.begin_query(context);
     }
 
-    fn end_query(&self) {
-        self.inner.end_query();
+    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.end_query(context);
     }
 
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {

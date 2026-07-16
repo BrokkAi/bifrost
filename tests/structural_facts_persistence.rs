@@ -132,7 +132,8 @@ fn persisted_structural_facts_hydrate_by_exact_language_and_recover_corruption()
     let project = typescript_project(root);
     let database = root.join(".brokk/bifrost_cache.db");
 
-    let cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
+        .expect("persisted analyzer should build");
     let expected = materialize(&cold);
     assert_eq!(expected.extractions, 2);
     assert_eq!(expected.hydrations, 0);
@@ -160,7 +161,8 @@ fn persisted_structural_facts_hydrate_by_exact_language_and_recover_corruption()
     );
     drop(connection);
 
-    let warm = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let warm = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
+        .expect("persisted analyzer should reopen");
     let hydrated = materialize(&warm);
     assert_eq!(hydrated.extractions, 0);
     assert_eq!(hydrated.hydrations, 2);
@@ -178,7 +180,8 @@ fn persisted_structural_facts_hydrate_by_exact_language_and_recover_corruption()
         )
         .unwrap();
     let repairing =
-        WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+        WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
+            .expect("persisted analyzer should repair corrupt facts");
     let repaired = materialize(&repairing);
     assert_eq!(repaired.extractions, 1);
     assert_eq!(repaired.hydrations, 1);
@@ -186,7 +189,8 @@ fn persisted_structural_facts_hydrate_by_exact_language_and_recover_corruption()
     assert_eq!(repaired.roles, expected.roles);
     drop(repairing);
 
-    let verified = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default());
+    let verified = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
+        .expect("persisted analyzer should reopen after repair");
     let verified = materialize(&verified);
     assert_eq!(verified.extractions, 0);
     assert_eq!(verified.hydrations, 2);
@@ -205,7 +209,8 @@ fn changed_content_extracts_once_then_hydrates_its_new_blob() {
 
     let initial = {
         let workspace =
-            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
+                .expect("persisted analyzer should build");
         materialize(&workspace)
     };
     assert_eq!((initial.extractions, initial.hydrations), (1, 0));
@@ -218,14 +223,16 @@ fn changed_content_extracts_once_then_hydrates_its_new_blob() {
     commit_all(&repository, "change source");
     let changed = {
         let workspace =
-            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
+                .expect("persisted analyzer should rebuild changed content");
         materialize(&workspace)
     };
     assert_eq!((changed.extractions, changed.hydrations), (1, 0));
     assert_ne!(changed.facts, initial.facts);
 
     let reopened = {
-        let workspace = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default());
+        let workspace = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
+            .expect("persisted analyzer should reopen");
         materialize(&workspace)
     };
     assert_eq!((reopened.extractions, reopened.hydrations), (0, 1));

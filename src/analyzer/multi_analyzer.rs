@@ -13,7 +13,7 @@ use rayon::prelude::*;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
-    Arc, OnceLock,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -196,11 +196,31 @@ fn is_js_ts_config_file(file: &ProjectFile) -> bool {
     )
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct MultiAnalyzer {
     delegates: BTreeMap<Language, AnalyzerDelegate>,
     global_usage_definition_index: Arc<OnceLock<GlobalUsageDefinitionIndex>>,
     global_usage_definition_index_build_count: Arc<AtomicUsize>,
+    global_usage_definition_index_build_lock: Arc<Mutex<()>>,
+    query_contexts: Mutex<Vec<Arc<crate::analyzer::AnalyzerQueryContext>>>,
+    global_usage_definition_fallback: GlobalUsageDefinitionIndex,
+}
+
+impl Clone for MultiAnalyzer {
+    fn clone(&self) -> Self {
+        Self {
+            delegates: self.delegates.clone(),
+            global_usage_definition_index: Arc::clone(&self.global_usage_definition_index),
+            global_usage_definition_index_build_count: Arc::clone(
+                &self.global_usage_definition_index_build_count,
+            ),
+            global_usage_definition_index_build_lock: Arc::clone(
+                &self.global_usage_definition_index_build_lock,
+            ),
+            query_contexts: Mutex::new(Vec::new()),
+            global_usage_definition_fallback: GlobalUsageDefinitionIndex::default(),
+        }
+    }
 }
 
 impl MultiAnalyzer {
@@ -209,6 +229,9 @@ impl MultiAnalyzer {
             delegates,
             global_usage_definition_index: Arc::new(OnceLock::new()),
             global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
+            global_usage_definition_index_build_lock: Arc::new(Mutex::new(())),
+            query_contexts: Mutex::new(Vec::new()),
+            global_usage_definition_fallback: GlobalUsageDefinitionIndex::default(),
         }
     }
 
@@ -234,7 +257,18 @@ impl MultiAnalyzer {
                 .collect(),
             global_usage_definition_index: Arc::new(OnceLock::new()),
             global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
+            global_usage_definition_index_build_lock: Arc::new(Mutex::new(())),
+            query_contexts: Mutex::new(Vec::new()),
+            global_usage_definition_fallback: GlobalUsageDefinitionIndex::default(),
         }
+    }
+
+    fn query_has_store_error(&self) -> bool {
+        self.query_contexts
+            .lock()
+            .expect("multi-analyzer query context mutex poisoned")
+            .iter()
+            .any(|context| context.store_error().is_some())
     }
 
     fn delegate_for_file(&self, file: &ProjectFile) -> Option<&AnalyzerDelegate> {
@@ -323,16 +357,28 @@ impl TypeAliasProvider for MultiAnalyzer {
 impl TestDetectionProvider for MultiAnalyzer {}
 
 impl IAnalyzer for MultiAnalyzer {
-    fn begin_query(&self) {
+    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        let mut contexts = self
+            .query_contexts
+            .lock()
+            .expect("multi-analyzer query context mutex poisoned");
+        if !contexts.iter().any(|active| Arc::ptr_eq(active, context)) {
+            contexts.push(Arc::clone(context));
+        }
+        drop(contexts);
         self.delegates
             .values()
-            .for_each(|delegate| delegate.analyzer().begin_query());
+            .for_each(|delegate| delegate.analyzer().begin_query(context));
     }
 
-    fn end_query(&self) {
+    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.delegates
             .values()
-            .for_each(|delegate| delegate.analyzer().end_query());
+            .for_each(|delegate| delegate.analyzer().end_query(context));
+        self.query_contexts
+            .lock()
+            .expect("multi-analyzer query context mutex poisoned")
+            .retain(|active| !Arc::ptr_eq(active, context));
     }
 
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
@@ -468,17 +514,34 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     fn global_usage_definition_index(&self) -> &GlobalUsageDefinitionIndex {
-        self.global_usage_definition_index.get_or_init(|| {
-            self.global_usage_definition_index_build_count
-                .fetch_add(1, Ordering::Relaxed);
-            GlobalUsageDefinitionIndex::from_declarations(
-                self.delegates
-                    .values()
-                    .flat_map(|delegate| delegate.analyzer().all_declarations()),
-                str::to_string,
-                |unit| unit.identifier().to_string(),
-            )
-        })
+        if let Some(index) = self.global_usage_definition_index.get() {
+            return index;
+        }
+        let _build_guard = self
+            .global_usage_definition_index_build_lock
+            .lock()
+            .expect("merged definition index build mutex poisoned");
+        if let Some(index) = self.global_usage_definition_index.get() {
+            return index;
+        }
+
+        self.global_usage_definition_index_build_count
+            .fetch_add(1, Ordering::Relaxed);
+        let built = GlobalUsageDefinitionIndex::from_declarations(
+            self.delegates
+                .values()
+                .flat_map(|delegate| delegate.analyzer().all_declarations()),
+            str::to_string,
+            |unit| unit.identifier().to_string(),
+        );
+        if self.query_has_store_error() {
+            return &self.global_usage_definition_fallback;
+        }
+
+        let _ = self.global_usage_definition_index.set(built);
+        self.global_usage_definition_index
+            .get()
+            .expect("successful merged definition index build initializes OnceLock")
     }
 
     fn reset_global_usage_definition_index_build_count_for_test(&self) {
@@ -1003,6 +1066,52 @@ mod tests {
         assert_eq!(
             analyzer.global_usage_definition_index_build_count_for_test(),
             0
+        );
+    }
+
+    #[test]
+    fn ordinary_clone_shares_successful_lazy_definition_index() {
+        let analyzer = MultiAnalyzer::new(BTreeMap::new());
+        let snapshot = analyzer.clone();
+
+        assert!(Arc::ptr_eq(
+            &analyzer.global_usage_definition_index,
+            &snapshot.global_usage_definition_index
+        ));
+        assert!(Arc::ptr_eq(
+            &analyzer.global_usage_definition_index_build_count,
+            &snapshot.global_usage_definition_index_build_count
+        ));
+
+        snapshot.global_usage_definition_index();
+        analyzer.global_usage_definition_index();
+        assert_eq!(
+            analyzer.global_usage_definition_index_build_count_for_test(),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_clones_build_successful_lazy_definition_index_once() {
+        let analyzer = Arc::new(MultiAnalyzer::new(BTreeMap::new()));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let analyzer = Arc::new(analyzer.as_ref().clone());
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    analyzer.global_usage_definition_index();
+                })
+            })
+            .collect();
+
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(
+            analyzer.global_usage_definition_index_build_count_for_test(),
+            1
         );
     }
 }

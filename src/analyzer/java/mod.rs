@@ -109,7 +109,7 @@ impl JavaAnalyzer {
         config: AnalyzerConfig,
         store_context: AnalyzerStoreContext,
         progress: Option<BuildProgress>,
-    ) -> Self {
+    ) -> Result<Self, crate::analyzer::store::StoreError> {
         let memo_budget = config.memo_cache_budget_bytes();
         let java_config = config.java.clone();
         let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
@@ -118,13 +118,13 @@ impl JavaAnalyzer {
             config,
             store_context,
             progress,
-        );
-        Self {
+        )?;
+        Ok(Self {
             inner,
             memo_caches: Arc::new(JavaMemoCaches::new(memo_budget)),
             java_config,
             external_index: Arc::new(std::sync::OnceLock::new()),
-        }
+        })
     }
 
     pub fn from_project<P>(project: P) -> Self
@@ -227,12 +227,12 @@ impl JavaAnalyzer {
 }
 
 impl IAnalyzer for JavaAnalyzer {
-    fn begin_query(&self) {
-        self.inner.begin_query();
+    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.begin_query(context);
     }
 
-    fn end_query(&self) {
-        self.inner.end_query();
+    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.end_query(context);
     }
 
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {

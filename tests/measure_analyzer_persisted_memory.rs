@@ -308,7 +308,8 @@ fn analyzer_persisted_memory_child() {
                 }
             }
         },
-    );
+    )
+    .expect("persisted analyzer should build");
     let after = current_rss_bytes();
     let peak_after = peak_rss_bytes();
     let parses = parses.load(Ordering::Relaxed);
