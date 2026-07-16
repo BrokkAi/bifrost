@@ -97,7 +97,7 @@ function render(packages) {
     "",
     "This report covers production npm packages bundled into out/extension.js.",
     "Development-only packages and the separately downloaded Bifrost executable are",
-    "outside this report. Bifrost's own terms are in LICENSE.md; SOURCE.md explains",
+    "outside this report. Bifrost's own terms are in LICENSE.md, with the incorporated GPL text in GPL-3.0.md; SOURCE.md explains",
     "how to obtain the corresponding source for the extension and executable.",
     "",
     `Packages: ${packages.length}`,
@@ -161,7 +161,11 @@ async function main() {
     path.join(extensionRoot, "LICENSE.md"),
   );
   await copyFile(
-    path.join(repositoryRoot, "SOURCE.md"),
+    path.join(repositoryRoot, "licenses", "GPL-3.0.md"),
+    path.join(extensionRoot, "GPL-3.0.md"),
+  );
+  await copyFile(
+    path.join(repositoryRoot, "licenses", "SOURCE.md"),
     path.join(extensionRoot, "SOURCE.md"),
   );
   await writeFile(outputPath, render(packages), "utf8");

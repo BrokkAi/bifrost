@@ -1,3 +1,4 @@
+pub(crate) mod bounded_output;
 mod capabilities;
 mod clone_detection;
 pub mod cognitive_complexity;
@@ -25,6 +26,7 @@ pub(crate) mod reference_candidates;
 mod ruby;
 mod rust;
 mod scala;
+pub mod semantic;
 pub(crate) mod semantic_diagnostics;
 mod source_content;
 pub mod store;
@@ -48,8 +50,8 @@ pub(crate) use capabilities::{
     resolve_imported_files_from_infos,
 };
 pub use config::{
-    AnalyzerConfig, JavaAnalyzerConfig, JavaExternalArtifact, JavaExternalDependencies,
-    JavaMavenCoordinate,
+    AnalyzerConfig, JavaAnalyzerConfig, JavaDependencyDiscoveryConfig, JavaDependencyDiscoveryMode,
+    JavaExternalArtifact, JavaExternalDependencies, JavaMavenCoordinate,
 };
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
@@ -78,7 +80,7 @@ pub(crate) use go::{
     packages::{GoModuleRoot, go_module_roots},
 };
 pub(crate) use i_analyzer::AnalyzerQueryScope;
-pub use i_analyzer::IAnalyzer;
+pub use i_analyzer::{AnalyzerQueryContext, IAnalyzer};
 pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;
 pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};
@@ -133,6 +135,96 @@ pub(crate) enum ParserFlavor {
     TypeScriptTsx,
 }
 
+/// A source language plus the parser dialect needed to interpret one file.
+///
+/// Most languages have one grammar. TypeScript is the exception because `.ts`
+/// and `.tsx` files use distinct tree-sitter grammars while sharing the same
+/// normalized language adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LanguageDialect {
+    Standard(Language),
+    TypeScriptTsx,
+}
+
+impl LanguageDialect {
+    /// Parse a user-facing language or dialect label.
+    pub fn from_config_label(label: &str) -> Option<Self> {
+        let normalized = label
+            .trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase()
+            .replace(['_', '-'], "");
+        if matches!(
+            normalized.as_str(),
+            "tsx" | "typescriptreact" | "typescripttsx"
+        ) {
+            return Some(Self::TypeScriptTsx);
+        }
+        Language::from_config_label(label).map(Self::Standard)
+    }
+
+    /// Select the parser dialect used by the indexed analyzer for `path`.
+    pub fn for_path(language: Language, path: &std::path::Path) -> Self {
+        if parser_flavor_for_path(language, path) == ParserFlavor::TypeScriptTsx {
+            Self::TypeScriptTsx
+        } else {
+            Self::Standard(language)
+        }
+    }
+
+    pub const fn language(self) -> Language {
+        match self {
+            Self::Standard(language) => language,
+            Self::TypeScriptTsx => Language::TypeScript,
+        }
+    }
+
+    /// Canonical durable identity label. Unlike [`Self::config_label`], this
+    /// makes the TypeScript language explicit rather than using the `tsx`
+    /// shorthand.
+    pub fn stable_label(self) -> &'static str {
+        match self {
+            Self::Standard(language) => language.config_label(),
+            Self::TypeScriptTsx => "typescript-tsx",
+        }
+    }
+
+    /// Short user-facing configuration label retained by Rune IR and the CLI.
+    pub fn config_label(self) -> &'static str {
+        match self {
+            Self::Standard(language) => language.config_label(),
+            Self::TypeScriptTsx => "tsx",
+        }
+    }
+
+    pub fn config_labels() -> impl Iterator<Item = &'static str> {
+        Language::ANALYZABLE
+            .iter()
+            .map(|language| language.config_label())
+            .chain(std::iter::once("tsx"))
+    }
+
+    pub(crate) fn parser_language(self) -> Option<tree_sitter::Language> {
+        let flavor = match self {
+            Self::Standard(_) => ParserFlavor::Default,
+            Self::TypeScriptTsx => ParserFlavor::TypeScriptTsx,
+        };
+        parser_language_for_flavor(self.language(), flavor)
+    }
+}
+
+impl From<Language> for LanguageDialect {
+    fn from(language: Language) -> Self {
+        Self::Standard(language)
+    }
+}
+
+impl std::fmt::Display for LanguageDialect {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.stable_label())
+    }
+}
+
 /// Resolve the default parser grammar registered for a language.
 pub(crate) fn parser_language_for(language: Language) -> Option<tree_sitter::Language> {
     parser_language_for_flavor(language, ParserFlavor::Default)
@@ -172,7 +264,10 @@ pub(crate) fn parser_language_for_path(
 
 pub(crate) fn parser_flavor_for_path(language: Language, path: &std::path::Path) -> ParserFlavor {
     if language == Language::TypeScript
-        && path.extension().is_some_and(|extension| extension == "tsx")
+        && path
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("tsx"))
     {
         ParserFlavor::TypeScriptTsx
     } else {

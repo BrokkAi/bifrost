@@ -152,7 +152,8 @@ fn hydrated_baseline_returns_none_so_diagnostic_falls_back() {
         let analyzer = WorkspaceAnalyzer::build_persisted(
             project as Arc<dyn brokk_bifrost::Project>,
             AnalyzerConfig::default(),
-        );
+        )
+        .expect("persisted analyzer should build");
         let file = project_file(&root, "broken.py");
         // Sanity: the cold-start analyzer DID populate parse_errors.
         let errors = analyzer
@@ -172,7 +173,8 @@ fn hydrated_baseline_returns_none_so_diagnostic_falls_back() {
     let analyzer = WorkspaceAnalyzer::build_persisted(
         project as Arc<dyn brokk_bifrost::Project>,
         AnalyzerConfig::default(),
-    );
+    )
+    .expect("persisted analyzer should reopen");
     let file = project_file(&root, "broken.py");
     assert!(
         analyzer.analyzer().parse_errors(&file).is_none(),

@@ -1,3 +1,4 @@
+use crate::analyzer::store::StoreError;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerDelegate, BuildProgress, CSharpAnalyzer, CppAnalyzer, GoAnalyzer,
     IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language, MultiAnalyzer, PhpAnalyzer, Project,
@@ -168,7 +169,9 @@ impl WorkspaceAnalyzer {
     }
 
     pub fn build(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
-        Self::build_filtered(project, config, None, false, None)
+        let store_context = crate::analyzer::default_store_context(project.as_ref());
+        Self::build_filtered(project, config, None, store_context, None)
+            .expect("failed to initialize in-memory workspace analyzer")
     }
 
     pub fn build_for_languages(
@@ -176,11 +179,17 @@ impl WorkspaceAnalyzer {
         config: AnalyzerConfig,
         languages: &BTreeSet<Language>,
     ) -> Self {
-        Self::build_filtered(project, config, Some(languages), false, None)
+        let store_context = crate::analyzer::default_store_context(project.as_ref());
+        Self::build_filtered(project, config, Some(languages), store_context, None)
+            .expect("failed to initialize in-memory workspace analyzer")
     }
 
-    pub fn build_persisted(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
-        Self::build_filtered(project, config, None, true, None)
+    pub fn build_persisted(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+    ) -> Result<Self, StoreError> {
+        let store_context = crate::analyzer::persistent_store_context(project.as_ref())?;
+        Self::build_filtered(project, config, None, store_context, None)
     }
 
     /// Progress-reporting variant of `build_persisted`.
@@ -188,27 +197,29 @@ impl WorkspaceAnalyzer {
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
         progress: F,
-    ) -> Self
+    ) -> Result<Self, StoreError>
     where
         F: Fn(crate::analyzer::BuildProgressEvent) + Send + Sync + 'static,
     {
-        Self::build_filtered(project, config, None, true, Some(Arc::new(progress)))
+        let store_context = crate::analyzer::persistent_store_context(project.as_ref())?;
+        Self::build_filtered(
+            project,
+            config,
+            None,
+            store_context,
+            Some(Arc::new(progress)),
+        )
     }
 
     fn build_filtered(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
         requested_languages: Option<&BTreeSet<Language>>,
-        persisted: bool,
+        store_context: crate::analyzer::AnalyzerStoreContext,
         progress: Option<BuildProgress>,
-    ) -> Self {
+    ) -> Result<Self, StoreError> {
         let _scope = profiling::scope("WorkspaceAnalyzer::build");
         let mut delegates = BTreeMap::new();
-        let store_context = if persisted {
-            crate::analyzer::persistent_store_context(project.as_ref())
-        } else {
-            crate::analyzer::default_store_context(project.as_ref())
-        };
         let project_languages = project.analyzer_languages();
         let selected_languages: Vec<_> = match requested_languages {
             Some(requested) if !requested.is_empty() => project_languages
@@ -232,7 +243,7 @@ impl WorkspaceAnalyzer {
                             cfg,
                             store_context,
                             progress.as_ref().map(Arc::clone),
-                        ))
+                        )?)
                     };
                 }
                 match language {
@@ -253,13 +264,13 @@ impl WorkspaceAnalyzer {
             delegates.insert(language, delegate);
         }
 
-        match delegates.len() {
+        Ok(match delegates.len() {
             0 => Self::Empty(EmptyAnalyzer::new(project)),
             1 => Self::Single(Box::new(
                 delegates.into_values().next().expect("checked len"),
             )),
             _ => Self::Multi(Box::new(MultiAnalyzer::new(delegates))),
-        }
+        })
     }
 
     pub fn analyzer(&self) -> &dyn IAnalyzer {
@@ -283,12 +294,12 @@ impl WorkspaceAnalyzer {
     }
 
     /// Starts a request-scoped query cache across the active language analyzers.
-    pub(crate) fn begin_query(&self) {
-        self.analyzer().begin_query();
+    pub(crate) fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.analyzer().begin_query(context);
     }
 
-    pub(crate) fn end_query(&self) {
-        self.analyzer().end_query();
+    pub(crate) fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.analyzer().end_query(context);
     }
 
     pub fn update(&self, changed_files: &BTreeSet<crate::analyzer::ProjectFile>) -> Self {
@@ -321,6 +332,20 @@ mod tests {
     use rusqlite::Connection;
 
     #[test]
+    fn unsupported_analyzer_query_remains_a_healthy_empty_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
+        let analyzer = EmptyAnalyzer::new(project);
+        let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+
+        analyzer.begin_query(&context);
+        assert!(analyzer.definitions("Missing").next().is_none());
+        assert!(context.store_error().is_none());
+        analyzer.end_query(&context);
+    }
+
+    #[test]
     fn request_overlay_snapshot_cannot_replace_committed_structural_facts() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -335,7 +360,8 @@ mod tests {
         let file = ProjectFile::new(root.clone(), "app.ts");
 
         let disk_workspace =
-            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
+                .expect("persisted analyzer should build");
         let disk_provider = disk_workspace.analyzer().structural_search_providers()[0];
         let disk_facts = disk_provider.structural_facts(&file).unwrap();
         let disk_fact_count = disk_facts.nodes().len();
@@ -358,7 +384,8 @@ mod tests {
         drop(overlay_workspace);
         drop(disk_workspace);
 
-        let disk_reopened = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default());
+        let disk_reopened = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
+            .expect("persisted analyzer should reopen");
         let disk_provider = disk_reopened.analyzer().structural_search_providers()[0];
         let hydrated_before = disk_provider.structural_hydration_count();
         let disk_facts = disk_provider.structural_facts(&file).unwrap();

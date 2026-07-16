@@ -38,6 +38,7 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
         let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
+        let target_spec_scope = crate::profiling::scope("java_graph::target_spec");
         let Some(spec) = TargetSpec::from_target(self.java, target) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
@@ -45,7 +46,9 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
                 "JavaUsageGraphStrategy",
             );
         };
+        drop(target_spec_scope);
 
+        let select_files_scope = crate::profiling::scope("java_graph::select_files");
         let candidate_files = scan_scope.candidate_files();
         let mut files: HashSet<ProjectFile> = candidate_files
             .iter()
@@ -55,6 +58,7 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
         if scan_scope.allows(target.source()) {
             files.insert(target.source().clone());
         }
+        drop(select_files_scope);
         let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
         let mut unproven_hits: BTreeSet<UsageHit> = BTreeSet::new();
         let mut raw_match_count = 0usize;
@@ -69,6 +73,7 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
             limit_exceeded: &mut limit_exceeded,
         };
         for file in files {
+            let _scan_scope = crate::profiling::scope("java_graph::scan_file");
             scan_file(
                 self.java,
                 analyzer,
@@ -82,6 +87,7 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
                 break;
             }
         }
+        let _scala_scope = crate::profiling::scope("java_graph::scan_scala_files");
         scan_scala_files_for_java_type(analyzer, candidate_files, &spec, &mut state, None);
 
         if limit_exceeded || hits.len() > max_usages {

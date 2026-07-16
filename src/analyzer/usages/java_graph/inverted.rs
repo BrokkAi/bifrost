@@ -100,7 +100,7 @@ impl JavaScan<'_, '_> {
     fn resolve_type_fqn(&self, node: Node<'_>) -> Option<String> {
         let type_name = java_type_name_from_node(node, self.source)?;
         self.java
-            .resolve_type_name_in_file(self.file, &type_name)
+            .resolve_usage_type_name(self.file, &type_name)
             .map(|unit| unit.fq_name())
     }
 

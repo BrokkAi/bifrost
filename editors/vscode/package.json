@@ -41,7 +41,8 @@
     "onLanguage:csharp",
     "onLanguage:php",
     "onLanguage:scala",
-    "onLanguage:bifrost-rql"
+    "onLanguage:bifrost-rql",
+    "onLanguage:bifrost-rune-ir"
   ],
   "main": "./out/extension.js",
   "contributes": {

@@ -26,6 +26,7 @@ mod model_context;
 pub mod nlp;
 mod path_normalization;
 mod path_utils;
+mod process;
 pub mod profiling;
 mod project_watcher;
 #[cfg(feature = "python")]
@@ -51,7 +52,8 @@ pub use analyzer::{
     AnalyzerConfig, AnalyzerDelegate, CSharpAnalyzer, CapabilityProvider, CloneSmell,
     CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CppAnalyzer, DeclarationInfo,
     DeclarationKind, EmptyAnalyzer, FileSetProject, FilesystemProject, GoAnalyzer, IAnalyzer,
-    ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavaAnalyzerConfig, JavaExternalArtifact,
+    ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavaAnalyzerConfig,
+    JavaDependencyDiscoveryConfig, JavaDependencyDiscoveryMode, JavaExternalArtifact,
     JavaExternalDependencies, JavaMavenCoordinate, JavascriptAnalyzer, Language, MultiAnalyzer,
     MultiRootProject, OverlayProject, ParseError, ParseErrorKind, PhpAnalyzer, Project,
     ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SourceContent,

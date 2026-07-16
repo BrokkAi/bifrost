@@ -8,12 +8,13 @@
 use super::CodeQuery;
 use super::extract::extract_file_facts;
 use super::facts::FileFacts;
+#[cfg(test)]
 use crate::analyzer::Language;
+pub use crate::analyzer::LanguageDialect as RuneIrLanguage;
+use crate::analyzer::bounded_output::{BalancedWriter, TruncationStyle, quoted};
 use crate::analyzer::common::is_unparseable_source;
-use crate::analyzer::{ParserFlavor, parser_flavor_for_path, parser_language_for_flavor};
 use std::fmt;
 use std::ops::Range;
-use std::path::Path;
 
 const TRUNCATION_RESERVE: usize = 96;
 const MIN_OUTPUT_BYTES: usize = 64;
@@ -36,74 +37,6 @@ impl Default for RuneIrLimits {
             max_source_bytes: 64 * 1024,
             max_output_bytes: 256 * 1024,
         }
-    }
-}
-
-/// The parser flavor used to extract Rune IR from a source snippet.
-///
-/// Most languages have one grammar. TypeScript is the exception because `.ts`
-/// and `.tsx` files use distinct tree-sitter grammars while sharing the same
-/// normalized structural adapter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuneIrLanguage {
-    Standard(Language),
-    TypeScriptTsx,
-}
-
-impl RuneIrLanguage {
-    pub fn from_config_label(label: &str) -> Option<Self> {
-        let normalized = label
-            .trim()
-            .trim_start_matches('.')
-            .to_ascii_lowercase()
-            .replace(['_', '-'], "");
-        if matches!(normalized.as_str(), "tsx" | "typescriptreact") {
-            return Some(Self::TypeScriptTsx);
-        }
-        Language::from_config_label(label).map(Self::Standard)
-    }
-
-    pub fn for_path(language: Language, path: &Path) -> Self {
-        if parser_flavor_for_path(language, path) == ParserFlavor::TypeScriptTsx {
-            Self::TypeScriptTsx
-        } else {
-            Self::Standard(language)
-        }
-    }
-
-    pub fn language(self) -> Language {
-        match self {
-            Self::Standard(language) => language,
-            Self::TypeScriptTsx => Language::TypeScript,
-        }
-    }
-
-    pub fn config_label(self) -> &'static str {
-        match self {
-            Self::Standard(language) => language.config_label(),
-            Self::TypeScriptTsx => "tsx",
-        }
-    }
-
-    pub fn config_labels() -> impl Iterator<Item = &'static str> {
-        Language::ANALYZABLE
-            .iter()
-            .map(|language| language.config_label())
-            .chain(std::iter::once("tsx"))
-    }
-
-    fn parser_language(self) -> Option<tree_sitter::Language> {
-        let flavor = match self {
-            Self::Standard(_) => ParserFlavor::Default,
-            Self::TypeScriptTsx => ParserFlavor::TypeScriptTsx,
-        };
-        parser_language_for_flavor(self.language(), flavor)
-    }
-}
-
-impl From<Language> for RuneIrLanguage {
-    fn from(language: Language) -> Self {
-        Self::Standard(language)
     }
 }
 
@@ -321,11 +254,9 @@ enum Event {
 struct Renderer<'a> {
     facts: &'a FileFacts,
     limits: RuneIrLimits,
-    output: String,
+    writer: BalancedWriter,
     rendered_nodes: usize,
     copied_source_bytes: usize,
-    truncated: Option<&'static str>,
-    open_nodes: usize,
     children: Vec<Vec<u32>>,
 }
 
@@ -337,14 +268,17 @@ impl<'a> Renderer<'a> {
                 children[parent as usize].push(id as u32);
             }
         }
+        let writer = BalancedWriter::new(
+            limits.max_output_bytes,
+            TRUNCATION_RESERVE,
+            TruncationStyle::Positional,
+        );
         Self {
             facts,
             limits,
-            output: String::new(),
+            writer,
             rendered_nodes: 0,
             copied_source_bytes: 0,
-            truncated: None,
-            open_nodes: 0,
             children,
         }
     }
@@ -356,32 +290,26 @@ impl<'a> Renderer<'a> {
             .map(|root| Event::Open(*root, 0))
             .collect::<Vec<_>>();
         while let Some(event) = stack.pop() {
-            if self.truncated.is_some() {
+            if self.writer.is_truncated() {
                 break;
             }
             match event {
                 Event::Open(id, depth) => self.open_node(id, depth, &mut stack),
                 Event::Close(depth) => {
-                    if self.push_line(depth, ")") {
-                        self.open_nodes -= 1;
-                    }
+                    self.writer.close(depth);
                 }
             }
         }
-        if let Some(reason) = self.truncated {
-            self.append_truncation(reason);
-        }
-        let truncated = self.truncated.is_some();
-        (self.output, truncated)
+        self.writer.finish()
     }
 
     fn open_node(&mut self, id: u32, depth: usize, stack: &mut Vec<Event>) {
         if self.rendered_nodes >= self.limits.max_nodes {
-            self.truncated = Some("node limit reached");
+            self.writer.truncate("node limit reached");
             return;
         }
         if depth >= self.limits.max_depth {
-            self.truncated = Some("depth limit reached");
+            self.writer.truncate("depth limit reached");
             return;
         }
         self.rendered_nodes += 1;
@@ -399,10 +327,9 @@ impl<'a> Renderer<'a> {
             line.push_str(" :name ");
             line.push_str(&value);
         }
-        if !self.push_line(depth, &line) {
+        if !self.writer.open(depth, &line) {
             return;
         }
-        self.open_nodes += 1;
         for role in self.facts.roles(id) {
             let mut role_line = format!(
                 "({} :span ({} {})",
@@ -430,7 +357,7 @@ impl<'a> Renderer<'a> {
             role_line.push_str(" :text ");
             role_line.push_str(&value);
             role_line.push(')');
-            if !self.push_line(depth + 1, &role_line) {
+            if !self.writer.line(depth + 1, &role_line) {
                 return;
             }
         }
@@ -442,53 +369,12 @@ impl<'a> Renderer<'a> {
 
     fn source_value(&mut self, value: &str) -> Option<String> {
         if self.copied_source_bytes.saturating_add(value.len()) > self.limits.max_source_bytes {
-            self.truncated = Some("source byte limit reached");
+            self.writer.truncate("source byte limit reached");
             return None;
         }
         self.copied_source_bytes += value.len();
-        Some(quoted(value))
+        Some(quoted(value).to_string())
     }
-
-    fn push_line(&mut self, depth: usize, line: &str) -> bool {
-        let needed = depth.saturating_mul(2) + line.len() + 1;
-        // Preserve enough space for a truncation form and compact closing
-        // parentheses for every node that would remain open after this line.
-        let opens_node = line.starts_with('(') && !line.ends_with(')');
-        let prospective_open_nodes = self.open_nodes + usize::from(opens_node);
-        let reserve = TRUNCATION_RESERVE.saturating_add(prospective_open_nodes);
-        if self
-            .output
-            .len()
-            .saturating_add(needed)
-            .saturating_add(reserve)
-            > self.limits.max_output_bytes
-        {
-            self.truncated = Some("output byte limit reached");
-            return false;
-        }
-        self.output.extend(std::iter::repeat_n(' ', depth * 2));
-        self.output.push_str(line);
-        self.output.push('\n');
-        true
-    }
-
-    fn append_truncation(&mut self, reason: &str) {
-        let marker = format!("(truncated {})\n", quoted(reason));
-        debug_assert!(
-            self.output.len() + marker.len() + self.open_nodes < self.limits.max_output_bytes
-        );
-        self.output.push_str(&marker);
-        self.output
-            .extend(std::iter::repeat_n(')', self.open_nodes));
-        if self.open_nodes > 0 {
-            self.output.push('\n');
-        }
-        self.open_nodes = 0;
-    }
-}
-
-fn quoted(value: &str) -> String {
-    serde_json::to_string(value).expect("serializing a string cannot fail")
 }
 
 #[cfg(test)]
@@ -588,6 +474,24 @@ mod tests {
         assert!(rendered.rune_ir.starts_with("(function"), "{rendered:?}");
         assert!(rendered.rune_ir.contains(":name \"View\""));
         assert_eq!(rendered.starter_rql, "(function :name \"View\")");
+    }
+
+    #[test]
+    fn shared_language_dialect_preserves_rune_labels_and_stable_identity() {
+        let tsx = RuneIrLanguage::from_config_label("typescript-tsx").unwrap();
+        assert_eq!(tsx, RuneIrLanguage::TypeScriptTsx);
+        assert_eq!(tsx.language(), Language::TypeScript);
+        assert_eq!(tsx.config_label(), "tsx");
+        assert_eq!(tsx.stable_label(), "typescript-tsx");
+        assert_eq!(
+            RuneIrLanguage::for_path(Language::TypeScript, std::path::Path::new("View.tsx")),
+            RuneIrLanguage::TypeScriptTsx
+        );
+        assert_eq!(
+            RuneIrLanguage::for_path(Language::TypeScript, std::path::Path::new("View.TSX")),
+            RuneIrLanguage::TypeScriptTsx
+        );
+        assert!(RuneIrLanguage::config_labels().any(|label| label == "tsx"));
     }
 
     #[test]

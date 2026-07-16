@@ -206,13 +206,41 @@ impl JavaAnalyzer {
         file: &ProjectFile,
         raw_name: &str,
     ) -> Option<CodeUnit> {
+        self.resolve_type_name_with(file, raw_name, |fqn| self.forward_source_type_by_fqn(fqn))
+    }
+
+    /// Resolve a source type while a usage query already owns the complete
+    /// workspace declaration index. This preserves the same import and package
+    /// tiers as forward resolution without serializing every AST type node on
+    /// the persisted SQLite connection.
+    pub(crate) fn resolve_usage_type_name(
+        &self,
+        file: &ProjectFile,
+        raw_name: &str,
+    ) -> Option<CodeUnit> {
+        let index = self.global_usage_definition_index();
+        self.resolve_type_name_with(file, raw_name, |fqn| {
+            index
+                .by_fqn(fqn)
+                .iter()
+                .find(|unit| unit.is_class() && unit.fq_name() == fqn)
+                .cloned()
+        })
+    }
+
+    fn resolve_type_name_with(
+        &self,
+        file: &ProjectFile,
+        raw_name: &str,
+        mut source_type_by_fqn: impl FnMut(&str) -> Option<CodeUnit>,
+    ) -> Option<CodeUnit> {
         let normalized = raw_name.trim();
         if normalized.is_empty() {
             return None;
         }
 
         if normalized.contains('.')
-            && let Some(unit) = self.forward_source_type_by_fqn(normalized)
+            && let Some(unit) = source_type_by_fqn(normalized)
         {
             return Some(unit);
         }
@@ -229,7 +257,7 @@ impl JavaAnalyzer {
                 continue;
             };
             if normalized == imported_name
-                && let Some(unit) = self.forward_source_type_by_fqn(import_path)
+                && let Some(unit) = source_type_by_fqn(import_path)
             {
                 return Some(unit);
             }
@@ -238,7 +266,7 @@ impl JavaAnalyzer {
                 .and_then(|rest| rest.strip_prefix('.'))
             {
                 let nested_fqn = format!("{import_path}.{rest}");
-                if let Some(unit) = self.forward_source_type_by_fqn(&nested_fqn) {
+                if let Some(unit) = source_type_by_fqn(&nested_fqn) {
                     return Some(unit);
                 }
             }
@@ -253,14 +281,13 @@ impl JavaAnalyzer {
             }
             let package = import_path.trim_end_matches(".*");
             let fqn = format!("{package}.{normalized}");
-            if let Some(unit) = self.forward_source_type_by_fqn(&fqn) {
+            if let Some(unit) = source_type_by_fqn(&fqn) {
                 return Some(unit);
             }
         }
 
         let same_package_fqn = self.same_package_fqn(file, normalized);
-        self.forward_source_type_by_fqn(&same_package_fqn)
-            .or_else(|| self.forward_source_type_by_fqn(normalized))
+        source_type_by_fqn(&same_package_fqn).or_else(|| source_type_by_fqn(normalized))
     }
 
     fn forward_source_type_by_fqn(&self, fqn: &str) -> Option<CodeUnit> {

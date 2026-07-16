@@ -159,7 +159,7 @@ pub(super) fn seed_class_binding(
 ) {
     if spec.kind == TargetKind::Type
         || java
-            .resolve_type_name_in_file(file, spec.owner.identifier())
+            .resolve_usage_type_name(file, spec.owner.identifier())
             .is_some_and(|resolved| resolved == spec.owner)
     {
         bindings.seed_symbol(spec.owner.identifier().to_string(), spec.owner.fq_name());
@@ -330,7 +330,7 @@ pub(super) fn resolve_type_from_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> Optio
     }
 
     let type_name = java_type_name_from_node(node, ctx.source)?;
-    ctx.java.resolve_type_name_in_file(ctx.file, &type_name)
+    ctx.java.resolve_usage_type_name(ctx.file, &type_name)
 }
 
 fn resolve_nested_type_from_scoped_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {

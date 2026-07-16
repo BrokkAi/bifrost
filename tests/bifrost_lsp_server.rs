@@ -798,13 +798,16 @@ fn bifrost_lsp_server_renders_rune_ir_from_unsaved_overlay_and_indexed_code_unit
     .unwrap();
     assert_eq!(response["result"]["runeIr"], direct.rune_ir);
     assert_eq!(response["result"]["starterRql"], direct.starter_rql);
-    assert_eq!(
-        response["result"]["displayText"],
-        format!(
-            "; Rune IR for fresh_name (rust)\n\n{}\n; Starter RQL\n{}\n",
-            direct.rune_ir.trim_end(),
-            direct.starter_rql
-        )
+    let display_text = response["result"]["displayText"]
+        .as_str()
+        .expect("Rune IR display text");
+    assert!(
+        display_text.starts_with("; Rune IR for fresh_name (rust)\n\n(function\n  :range "),
+        "generated Rune IR should already use the document formatter: {display_text}"
+    );
+    assert!(
+        display_text.ends_with("\n; Starter RQL\n(function :name \"fresh_name\")\n"),
+        "{display_text}"
     );
 
     let ts_source = "class Widget {\n  value = 1;\n  constructor() {}\n  run() {}\n}\n";
@@ -8306,6 +8309,86 @@ fn write_stub_command(path: &Path, body: &str) {
 #[cfg(unix)]
 fn formatting_response(server: &mut LspServer, file_uri: &str) -> Value {
     server.formatting_response(file_uri)
+}
+
+#[test]
+fn bifrost_lsp_server_formats_rql_and_rune_documents_at_120_columns() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let rql_path = root.join("query.rql");
+    let rune_path = root.join("preview.rune");
+    fs::write(&rql_path, "").expect("write RQL file");
+    fs::write(&rune_path, "").expect("write Rune file");
+    let mut server = LspServer::start(&root);
+
+    let long_name = "a".repeat(90);
+    let long_form = format!(
+        "(call :name \"{long_name}\" :callee (name \"eval\") :args [(capture \"payload\")])"
+    );
+    let formatted_form = format!(
+        "(call\n  :name \"{long_name}\"\n  :callee (name \"eval\")\n  :args [(capture \"payload\")]\n)"
+    );
+    let rune_source =
+        format!("; Rune IR\n\n{long_form}\n\n; Starter RQL\n(function :name \"demo\")\n");
+    let formatted_rune =
+        format!("; Rune IR\n\n{formatted_form}\n\n; Starter RQL\n(function :name \"demo\")\n");
+
+    for (path, language_id, source, expected) in [
+        (
+            &rql_path,
+            "bifrost-rql",
+            long_form.as_str(),
+            formatted_form.as_str(),
+        ),
+        (
+            &rune_path,
+            "bifrost-rune-ir",
+            rune_source.as_str(),
+            formatted_rune.as_str(),
+        ),
+    ] {
+        let file_uri = uri_for(path);
+        server.notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": file_uri,
+                    "languageId": language_id,
+                    "version": 1,
+                    "text": source,
+                }
+            }),
+        );
+        let response = server.request(
+            "textDocument/formatting",
+            json!({
+                "textDocument": {"uri": file_uri},
+                "options": {"tabSize": 4, "insertSpaces": true}
+            }),
+        );
+        let edits = response["result"]
+            .as_array()
+            .unwrap_or_else(|| panic!("expected formatting edits, got {response}"));
+        assert_eq!(edits.len(), 1, "{response}");
+        assert_eq!(edits[0]["newText"], expected, "{response}");
+    }
+
+    let rql_uri = uri_for(&rql_path);
+    server.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": rql_uri, "version": 2},
+            "contentChanges": [{"text": "(call :name \"unfinished\""}]
+        }),
+    );
+    let response = server.request(
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": rql_uri},
+            "options": {"tabSize": 4, "insertSpaces": true}
+        }),
+    );
+    assert_eq!(response["result"], json!([]), "{response}");
 }
 
 #[cfg(unix)]

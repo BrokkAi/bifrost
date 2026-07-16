@@ -73,7 +73,8 @@ fn build_with_parse_count(project: Arc<dyn Project>) -> (WorkspaceAnalyzer, usiz
                     counter.fetch_add(1, Ordering::Relaxed);
                 }
             }
-        });
+        })
+        .expect("persisted analyzer should build");
     (analyzer, parses.load(Ordering::Relaxed))
 }
 
@@ -139,7 +140,8 @@ fn persisted_build_triggers_analyzer_store_gc() {
     store.gc_with(|_| true).unwrap();
 
     let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Python));
-    let _ = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let _ = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
+        .expect("persisted analyzer should build");
     assert!(store.contains_blob(reachable_oid, "python").unwrap());
     assert!(store.contains_blob(dirty_oid, "python").unwrap());
 
@@ -154,7 +156,8 @@ fn persisted_build_triggers_analyzer_store_gc() {
     let _guard = brokk_bifrost::analyzer::store::gc::set_min_interval_secs_for_test(0);
     // Keep the workspace alive while its best-effort GC runs. Closing a
     // workspace now cancels and joins its GC work before returning.
-    let _workspace = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default());
+    let _workspace = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
+        .expect("persisted analyzer should build");
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline && store.contains_blob(bogus_oid, "python").unwrap() {

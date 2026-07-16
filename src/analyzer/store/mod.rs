@@ -59,6 +59,13 @@ impl StoreError {
     pub(crate) fn is_stale_generation(&self) -> bool {
         self.stale_generation
     }
+
+    pub(crate) fn context(self, context: impl fmt::Display) -> Self {
+        Self {
+            message: format!("{context}: {}", self.message),
+            stale_generation: self.stale_generation,
+        }
+    }
 }
 
 impl fmt::Display for StoreError {

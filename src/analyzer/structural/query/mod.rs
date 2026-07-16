@@ -10,6 +10,7 @@
 
 mod decode;
 mod features;
+pub(crate) mod format;
 mod ir;
 mod json;
 pub mod schema;

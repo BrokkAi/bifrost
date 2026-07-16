@@ -1877,9 +1877,11 @@ void hidden_call(GURL& value, GURL& other) {
         .build();
     let project_handle = project.project_dyn();
     let cold =
-        WorkspaceAnalyzer::build_persisted(Arc::clone(&project_handle), AnalyzerConfig::default());
+        WorkspaceAnalyzer::build_persisted(Arc::clone(&project_handle), AnalyzerConfig::default())
+            .expect("persisted analyzer should build");
     drop(cold);
-    let reopened = WorkspaceAnalyzer::build_persisted(project_handle, AnalyzerConfig::default());
+    let reopened = WorkspaceAnalyzer::build_persisted(project_handle, AnalyzerConfig::default())
+        .expect("persisted analyzer should reopen");
     let analyzer = reopened.analyzer();
 
     let method_in = |path: &str| {
