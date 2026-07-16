@@ -13,8 +13,9 @@ available at:
 
 https://github.com/BrokkAi/bifrost
 
-Bifrost is licensed under `LGPL-3.0-or-later`. `LICENSE.md` contains the combined
-GNU GPL version 3 and GNU LGPL version 3 texts. In binary and wheel artifacts,
+Bifrost is licensed under `LGPL-3.0-or-later`. `LICENSE.md` contains the GNU
+LGPL version 3 text, and `GPL-3.0.md` contains the incorporated GNU GPL version
+3 text. In binary and wheel artifacts,
 `THIRD_PARTY_LICENSES.html` and `SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt` contain
 license information, standalone notices, and exact source-package links for
 incorporated Rust and vendored native dependencies. An artifact-specific

@@ -2,6 +2,7 @@ node_modules/
 out/
 out-test/
 LICENSE.md
+GPL-3.0.md
 SOURCE.md
 THIRD_PARTY_LICENSES.txt
 *.vsix
