@@ -259,6 +259,7 @@ class CodeQueryProvenanceStep:
 class CodeQueryProvenance:
     seed: CodeQueryResultRef
     steps: list[CodeQueryProvenanceStep]
+    branch: list[int] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryProvenance:
@@ -268,6 +269,7 @@ class CodeQueryProvenance:
                 CodeQueryProvenanceStep.from_dict(item)
                 for item in data.get("steps", [])
             ],
+            branch=[int(index) for index in data.get("branch", [])],
         )
 
 
@@ -580,13 +582,19 @@ def _code_query_result_item(data: dict) -> CodeQueryResultItem:
 class CodeQueryDiagnostic:
     language: str
     message: str
+    branch: list[int] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryDiagnostic:
-        return cls(language=data["language"], message=data["message"])
+        return cls(
+            language=data["language"],
+            message=data["message"],
+            branch=[int(index) for index in data.get("branch", [])],
+        )
 
     def render_text(self) -> str:
-        return f"note: {self.message}"
+        branch = f" [branch {'.'.join(map(str, self.branch))}]" if self.branch else ""
+        return f"note{branch}: {self.message}"
 
 
 @dataclass(frozen=True)

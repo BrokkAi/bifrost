@@ -13,6 +13,7 @@ use super::ir::{MAX_CAPTURE_LENGTH, MAX_KWARG_NAME_LENGTH};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueShape {
     Query,
+    QueryList,
     QuerySteps,
     Pattern,
     PatternList,
@@ -40,6 +41,7 @@ impl ValueShape {
     pub fn description(self) -> &'static str {
         match self {
             Self::Query => "a query",
+            Self::QueryList => "two or more compatible typed queries",
             Self::QuerySteps => "an ordered list of query steps",
             Self::Pattern => "a pattern",
             Self::PatternList => "a list/vector of patterns",
@@ -247,6 +249,9 @@ macro_rules! rql_forms {
                     | Self::ResultDetail
                     | Self::Inside
                     | Self::NotInside
+                    | Self::Union
+                    | Self::Intersect
+                    | Self::Except
                     | Self::EnclosingDecl
                     | Self::FileOf
                     | Self::ImportsOf
@@ -321,6 +326,27 @@ rql_forms! {
         shape: Pattern,
         signature: "(not-inside container-pattern query)",
         description: "Exclude root matches lexically inside a matching container.",
+    }
+    Union {
+        labels: ["union"],
+        class: Wrapper,
+        shape: QueryList,
+        signature: "(union query query ...)",
+        description: "Return each compatible typed endpoint reached by any branch.",
+    }
+    Intersect {
+        labels: ["intersect"],
+        class: Wrapper,
+        shape: QueryList,
+        signature: "(intersect query query ...)",
+        description: "Return compatible typed endpoints reached by every branch.",
+    }
+    Except {
+        labels: ["except"],
+        class: Wrapper,
+        shape: QueryList,
+        signature: "(except query query ...)",
+        description: "Return first-branch endpoints not reached by any later branch.",
     }
     EnclosingDecl {
         labels: ["enclosing-decl"],
@@ -665,6 +691,9 @@ json_fields! {
     Where { label: "where", shape: StringList, signature: "\"where\": [\"glob\", ...]", description: "Restrict the query to workspace-relative path globs." }
     Languages { label: "languages", shape: LanguageList, signature: "\"languages\": [\"rust\", ...]", description: "Restrict the query to analyzer languages." }
     Match { label: "match", shape: Pattern, signature: "\"match\": { pattern }", description: "Define the required root structural pattern." }
+    Union { label: "union", shape: QueryList, signature: "\"union\": [{ query }, { query }, ...]", description: "Combine compatible typed endpoints reached by any branch." }
+    Intersect { label: "intersect", shape: QueryList, signature: "\"intersect\": [{ query }, { query }, ...]", description: "Keep compatible typed endpoints reached by every branch." }
+    Except { label: "except", shape: QueryList, signature: "\"except\": [{ query }, { query }, ...]", description: "Keep first-branch endpoints absent from every later branch." }
     Inside { label: "inside", shape: Pattern, signature: "\"inside\": { pattern }", description: "Require the root match to be inside a matching container." }
     NotInside { label: "not_inside", shape: Pattern, signature: "\"not_inside\": { pattern }", description: "Exclude root matches inside a matching container." }
     Steps { label: "steps", shape: QuerySteps, signature: "\"steps\": [{ \"op\": \"file_of\" }, ...]", description: "Apply ordered typed transformations to structural matches." }

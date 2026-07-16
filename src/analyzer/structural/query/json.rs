@@ -1,5 +1,6 @@
 use super::ir::{
-    CallInputSelector, CodeQuery, HierarchyTraversal, Pattern, QueryStep, StringPredicate,
+    CallInputSelector, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed,
+    HierarchyTraversal, Pattern, QueryStep, StringPredicate,
 };
 use super::schema::{reference_kind_label, usage_proof_label, usage_surface_label};
 use crate::analyzer::structural::kinds::{NormalizedKind, Role};
@@ -10,49 +11,81 @@ impl CodeQuery {
     /// debugging and by tests asserting that both frontends parse to the same
     /// query (`parse(json).to_canonical_json() == parse(sexp).to_canonical_json()`).
     pub fn to_canonical_json(&self) -> Value {
-        let mut object = Map::new();
+        let mut object = plan_to_json(&self.plan);
         object.insert("schema_version".to_string(), json!(self.schema_version));
-        if !self.where_globs.is_empty() {
-            object.insert(
-                "where".to_string(),
-                Value::Array(
-                    self.where_globs
-                        .iter()
-                        .map(|glob| Value::String(glob.as_str().to_string()))
-                        .collect(),
-                ),
-            );
-        }
-        if !self.languages.is_empty() {
-            object.insert(
-                "languages".to_string(),
-                Value::Array(
-                    self.languages
-                        .iter()
-                        .map(|language| Value::String(language.config_label().to_string()))
-                        .collect(),
-                ),
-            );
-        }
-        object.insert("match".to_string(), pattern_to_json(&self.root));
-        if let Some(pattern) = &self.inside {
-            object.insert("inside".to_string(), pattern_to_json(pattern));
-        }
-        if let Some(pattern) = &self.not_inside {
-            object.insert("not_inside".to_string(), pattern_to_json(pattern));
-        }
-        if !self.steps.is_empty() {
-            object.insert(
-                "steps".to_string(),
-                Value::Array(self.steps.iter().map(query_step_to_json).collect()),
-            );
-        }
         object.insert("limit".to_string(), json!(self.limit));
         object.insert(
             "result_detail".to_string(),
             json!(self.result_detail.label()),
         );
         Value::Object(object)
+    }
+}
+
+fn plan_to_json(plan: &CodeQueryPlan) -> Map<String, Value> {
+    let mut object = match &plan.source {
+        CodeQueryPlanSource::Seed(seed) => seed_to_json(seed),
+        CodeQueryPlanSource::Set { op, branches } => {
+            let mut object = Map::new();
+            object.insert(
+                op.label().to_string(),
+                Value::Array(
+                    branches
+                        .iter()
+                        .map(|branch| Value::Object(plan_to_json(branch)))
+                        .collect(),
+                ),
+            );
+            object
+        }
+    };
+    if !plan.steps.is_empty() {
+        object.insert(
+            "steps".to_string(),
+            Value::Array(plan.steps.iter().map(query_step_to_json).collect()),
+        );
+    }
+    object
+}
+
+pub(super) fn seed_to_json(seed: &CodeQuerySeed) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !seed.where_globs.is_empty() {
+        object.insert(
+            "where".to_string(),
+            Value::Array(
+                seed.where_globs
+                    .iter()
+                    .map(|glob| Value::String(glob.as_str().to_string()))
+                    .collect(),
+            ),
+        );
+    }
+    if !seed.languages.is_empty() {
+        object.insert(
+            "languages".to_string(),
+            Value::Array(
+                seed.languages
+                    .iter()
+                    .map(|language| Value::String(language.config_label().to_string()))
+                    .collect(),
+            ),
+        );
+    }
+    object.insert("match".to_string(), pattern_to_json(&seed.root));
+    if let Some(pattern) = &seed.inside {
+        object.insert("inside".to_string(), pattern_to_json(pattern));
+    }
+    if let Some(pattern) = &seed.not_inside {
+        object.insert("not_inside".to_string(), pattern_to_json(pattern));
+    }
+    object
+}
+
+impl CodeQuerySeed {
+    pub(crate) fn canonical_cache_key(&self) -> String {
+        serde_json::to_string(&Value::Object(seed_to_json(self)))
+            .expect("canonical CodeQuery seed is serializable")
     }
 }
 

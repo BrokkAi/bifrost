@@ -210,6 +210,34 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertEqual(files.results[0].path, "A.java")
         self.assertEqual(len(files.results[0].provenance), 1)
 
+    def test_query_code_builds_typed_set_plans_and_parses_branch_paths(self) -> None:
+        with SearchToolsClient(root=self.fixture_root) as client:
+            result = client.query_code(
+                union=[
+                    {"match": {"kind": "class", "name": "A"}},
+                    {"match": {"kind": "class", "name": "A"}},
+                ],
+                result_detail="full",
+            )
+
+        self.assertEqual(result.count, 1)
+        self.assertEqual(
+            [trace.branch for trace in result.results[0].provenance],
+            [[0], [1]],
+        )
+
+        with SearchToolsClient(root=self.fixture_root) as client:
+            with self.assertRaisesRegex(ValueError, "exactly one"):
+                client.query_code(
+                    {"kind": "class"},
+                    union=[{"match": {"kind": "class"}}] * 2,
+                )
+            with self.assertRaisesRegex(ValueError, "scope fields"):
+                client.query_code(
+                    intersect=[{"match": {"kind": "class"}}] * 2,
+                    languages=["java"],
+                )
+
     def test_query_code_parses_reference_sites_and_via_provenance(self) -> None:
         result = CodeQueryResult.from_dict(
             {

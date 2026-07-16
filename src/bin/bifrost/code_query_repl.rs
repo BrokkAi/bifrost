@@ -1,8 +1,9 @@
 use brokk_bifrost::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, Role};
 use brokk_bifrost::analyzer::structural::query::schema::ALL_RQL_FORMS;
 use brokk_bifrost::analyzer::structural::{
-    CodeQuery, CodeQueryMatch, CodeQueryResult, CodeQueryResultValue, Pattern, RuneIrLanguage,
-    RuneIrLimits, RuneIrSelection, StringPredicate, render_source_rune_ir,
+    CodeQuery, CodeQueryMatch, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResult,
+    CodeQueryResultValue, Pattern, RuneIrLanguage, RuneIrLimits, RuneIrSelection, StringPredicate,
+    render_source_rune_ir,
 };
 use brokk_bifrost::{Language, SearchToolsService};
 use nu_ansi_term::{Color, Style};
@@ -680,44 +681,56 @@ fn canonical_json_text(value: &Value) -> String {
 }
 
 fn query_summary_text(query: &CodeQuery) -> String {
-    let mut parts = vec![format!("{} query", pattern_summary(&query.root))];
-    if !query.where_globs.is_empty() {
-        let globs = query
-            .where_globs
-            .iter()
-            .map(|glob| format!("\"{}\"", sanitize_terminal_text(glob.as_str())))
-            .collect::<Vec<_>>()
-            .join(", ");
-        parts.push(format!("where {globs}"));
-    }
-    if !query.languages.is_empty() {
-        let languages = query
-            .languages
-            .iter()
-            .map(|language| language.config_label())
-            .collect::<Vec<_>>()
-            .join(", ");
-        parts.push(format!("language {languages}"));
-    }
-    if let Some(pattern) = &query.inside {
-        parts.push(format!("inside {}", pattern_summary(pattern)));
-    }
-    if let Some(pattern) = &query.not_inside {
-        parts.push(format!("not inside {}", pattern_summary(pattern)));
-    }
-    if !query.steps.is_empty() {
+    let mut parts = vec![plan_summary_text(&query.plan)];
+    parts.push(format!("limit {}", query.limit));
+    parts.push(format!("detail {}", query.result_detail.label()));
+    parts.join("; ")
+}
+
+fn plan_summary_text(plan: &CodeQueryPlan) -> String {
+    let mut parts = match &plan.source {
+        CodeQueryPlanSource::Seed(seed) => {
+            let mut parts = vec![format!("{} query", pattern_summary(&seed.root))];
+            if !seed.where_globs.is_empty() {
+                let globs = seed
+                    .where_globs
+                    .iter()
+                    .map(|glob| format!("\"{}\"", sanitize_terminal_text(glob.as_str())))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                parts.push(format!("where {globs}"));
+            }
+            if !seed.languages.is_empty() {
+                let languages = seed
+                    .languages
+                    .iter()
+                    .map(|language| language.config_label())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                parts.push(format!("language {languages}"));
+            }
+            if let Some(pattern) = &seed.inside {
+                parts.push(format!("inside {}", pattern_summary(pattern)));
+            }
+            if let Some(pattern) = &seed.not_inside {
+                parts.push(format!("not inside {}", pattern_summary(pattern)));
+            }
+            parts
+        }
+        CodeQueryPlanSource::Set { op, branches } => {
+            vec![format!("{} of {} queries", op.label(), branches.len())]
+        }
+    };
+    if !plan.steps.is_empty() {
         parts.push(format!(
             "steps {}",
-            query
-                .steps
+            plan.steps
                 .iter()
                 .map(|step| step.label())
                 .collect::<Vec<_>>()
                 .join(" -> ")
         ));
     }
-    parts.push(format!("limit {}", query.limit));
-    parts.push(format!("detail {}", query.result_detail.label()));
     parts.join("; ")
 }
 
@@ -872,8 +885,15 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                 }
             }
             if !result.provenance.is_empty() {
+                let mut branch_labels = Vec::new();
+                for trace in &result.provenance {
+                    let label = format_branch_path(&trace.branch);
+                    if !label.is_empty() && !branch_labels.contains(&label) {
+                        branch_labels.push(label);
+                    }
+                }
                 out.push_str(&format!(
-                    "  provenance: {} path{}{}\n",
+                    "  provenance: {} path{}{}{}\n",
                     result.provenance.len(),
                     if result.provenance.len() == 1 {
                         ""
@@ -884,16 +904,26 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         " (truncated)"
                     } else {
                         ""
-                    }
+                    },
+                    if branch_labels.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; branches {}", branch_labels.join(", "))
+                    },
                 ));
             }
         }
     }
 
     for diagnostic in &output.diagnostics {
+        let label = if diagnostic.branch.is_empty() {
+            "note:".to_string()
+        } else {
+            format!("note [branch {}]:", format_branch_path(&diagnostic.branch))
+        };
         out.push_str(&format!(
             "{} {}\n",
-            paint(Style::new().fg(Color::Yellow), "note:", use_color),
+            paint(Style::new().fg(Color::Yellow), &label, use_color),
             sanitize_terminal_text(&diagnostic.message)
         ));
     }
@@ -957,6 +987,14 @@ fn render_code_query_match(out: &mut String, matched: &CodeQueryMatch, use_color
             )
         ));
     }
+}
+
+fn format_branch_path(branch: &[usize]) -> String {
+    branch
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn sanitize_terminal_text(text: &str) -> String {

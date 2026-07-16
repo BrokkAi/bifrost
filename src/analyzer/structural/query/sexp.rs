@@ -106,6 +106,18 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
             insert_unique(&mut query, field, pattern_to_json(&items[1])?)?;
             Ok(Some(Value::Object(query)))
         }
+        RqlForm::Union | RqlForm::Intersect | RqlForm::Except => {
+            if items.len() < 3 {
+                return Err(format!("({head} ...) requires at least two queries"));
+            }
+            let branches = items[1..]
+                .iter()
+                .map(query_to_json)
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut query = Map::new();
+            query.insert(head.to_string(), Value::Array(branches));
+            Ok(Some(Value::Object(query)))
+        }
         RqlForm::EnclosingDecl
         | RqlForm::FileOf
         | RqlForm::ImportsOf
@@ -448,6 +460,9 @@ fn pattern_to_json(expr: &Expr) -> Result<Value, String> {
         | RqlForm::ResultDetail
         | RqlForm::Inside
         | RqlForm::NotInside
+        | RqlForm::Union
+        | RqlForm::Intersect
+        | RqlForm::Except
         | RqlForm::EnclosingDecl
         | RqlForm::FileOf
         | RqlForm::ImportsOf

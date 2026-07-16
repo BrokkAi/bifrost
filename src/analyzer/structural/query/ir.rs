@@ -20,6 +20,9 @@ pub const MAX_STRING_PREDICATE_LENGTH: usize = 4096;
 pub const MAX_CAPTURE_LENGTH: usize = 128;
 pub const MAX_KWARG_NAME_LENGTH: usize = 128;
 pub const MAX_QUERY_STEPS: usize = 16;
+pub const MAX_QUERY_BRANCHES: usize = 16;
+pub const MAX_QUERY_PLAN_DEPTH: usize = 16;
+pub const MAX_QUERY_PLAN_NODES: usize = 64;
 pub const SCHEMA_VERSION: u64 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,15 +236,19 @@ impl QueryStep {
     }
 }
 
-pub(super) fn validate_query_steps(steps: &[QueryStep]) -> Result<QueryValueKind, QueryError> {
+pub(super) fn validate_query_steps(
+    steps: &[QueryStep],
+    input: QueryValueKind,
+    path: &str,
+) -> Result<QueryValueKind, QueryError> {
     if steps.len() > MAX_QUERY_STEPS {
         return Err(QueryError::new(
-            "steps",
+            path,
             format!("at most {MAX_QUERY_STEPS} query steps are allowed"),
         ));
     }
 
-    let mut value_kind = QueryValueKind::StructuralMatch;
+    let mut value_kind = input;
     for (index, step) in steps.iter().enumerate() {
         let expected_input = match step {
             QueryStep::EnclosingDecl => "structural_match",
@@ -267,7 +274,7 @@ pub(super) fn validate_query_steps(steps: &[QueryStep]) -> Result<QueryValueKind
         };
         value_kind = step.output_kind(value_kind).ok_or_else(|| {
             QueryError::new(
-                format!("steps[{index}]"),
+                format!("{path}[{index}]"),
                 format!(
                     "step {} requires {expected_input}, but the previous stage produces {}",
                     step.label(),
@@ -277,6 +284,34 @@ pub(super) fn validate_query_steps(steps: &[QueryStep]) -> Result<QueryValueKind
         })?;
     }
     Ok(value_kind)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOperator {
+    Union,
+    Intersect,
+    Except,
+}
+
+impl SetOperator {
+    pub const ALL: [Self; 3] = [Self::Union, Self::Intersect, Self::Except];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Union => "union",
+            Self::Intersect => "intersect",
+            Self::Except => "except",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "union" => Some(Self::Union),
+            "intersect" => Some(Self::Intersect),
+            "except" => Some(Self::Except),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,11 +343,9 @@ impl CodeQueryResultDetail {
     }
 }
 
-/// A structural query: one root pattern plus containment constraints and
-/// workspace scoping. This is the semantic authority both syntaxes parse into.
+/// One structural seed before typed semantic pipeline transformations.
 #[derive(Debug, Clone)]
-pub struct CodeQuery {
-    pub schema_version: u64,
+pub struct CodeQuerySeed {
     /// Path globs relative to the workspace root; empty means all files.
     pub where_globs: Vec<glob::Pattern>,
     /// Language filter; empty means all languages with structural adapters.
@@ -322,64 +355,207 @@ pub struct CodeQuery {
     pub inside: Option<Pattern>,
     /// Verifier-only negative containment: never used for candidate pruning.
     pub not_inside: Option<Pattern>,
-    /// Ordered semantic transformations applied after structural matching.
+}
+
+/// The source of values entering one typed pipeline suffix.
+#[derive(Debug, Clone)]
+pub enum CodeQueryPlanSource {
+    Seed(Box<CodeQuerySeed>),
+    Set {
+        op: SetOperator,
+        branches: Vec<CodeQueryPlan>,
+    },
+}
+
+/// A structural seed or compatible set composition followed by typed steps.
+#[derive(Debug, Clone)]
+pub struct CodeQueryPlan {
+    pub source: CodeQueryPlanSource,
     pub steps: Vec<QueryStep>,
+}
+
+/// A canonical typed code query. Both JSON and RQL parse into this model.
+#[derive(Debug, Clone)]
+pub struct CodeQuery {
+    pub schema_version: u64,
+    pub plan: CodeQueryPlan,
     pub limit: usize,
     pub result_detail: CodeQueryResultDetail,
 }
 
 impl CodeQuery {
+    pub fn seed(&self) -> Option<&CodeQuerySeed> {
+        match &self.plan.source {
+            CodeQueryPlanSource::Seed(seed) => Some(seed),
+            CodeQueryPlanSource::Set { .. } => None,
+        }
+    }
+
     /// Validate the semantic pipeline independently of its JSON/RQL origin.
     /// Embedders may construct this public IR directly, so execution cannot
     /// rely solely on decoder validation.
     pub fn validate_steps(&self) -> Result<QueryValueKind, QueryError> {
-        let output = validate_query_steps(&self.steps)?;
-        let captures = self.positive_capture_names();
-        let mut input = QueryValueKind::StructuralMatch;
-        for (index, step) in self.steps.iter().enumerate() {
-            let filter = match step {
-                QueryStep::ReceiverTargets(filter)
-                | QueryStep::PointsTo(filter)
-                | QueryStep::MemberTargets(filter) => filter,
-                _ => {
-                    input = step
-                        .output_kind(input)
-                        .expect("typed steps were validated above");
-                    continue;
-                }
-            };
-            if let Some(capture) = &filter.capture {
-                let path = format!("steps[{index}].capture");
-                if input != QueryValueKind::StructuralMatch {
+        let mut nodes = 0;
+        validate_plan(&self.plan, "", 0, &mut nodes).map(|domain| domain.kind)
+    }
+}
+
+#[derive(Debug)]
+struct ValidatedDomain {
+    kind: QueryValueKind,
+    captures: Option<std::collections::HashSet<String>>,
+}
+
+fn validate_plan(
+    plan: &CodeQueryPlan,
+    path: &str,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<ValidatedDomain, QueryError> {
+    if depth > MAX_QUERY_PLAN_DEPTH {
+        return Err(QueryError::new(
+            path,
+            format!("query plan depth must be at most {MAX_QUERY_PLAN_DEPTH}"),
+        ));
+    }
+    *nodes += 1;
+    if *nodes > MAX_QUERY_PLAN_NODES {
+        return Err(QueryError::new(
+            path,
+            format!("query plan may contain at most {MAX_QUERY_PLAN_NODES} nodes"),
+        ));
+    }
+
+    let mut domain = match &plan.source {
+        CodeQueryPlanSource::Seed(seed) => ValidatedDomain {
+            kind: QueryValueKind::StructuralMatch,
+            captures: Some(seed.positive_capture_names()),
+        },
+        CodeQueryPlanSource::Set { op, branches } => {
+            let op_path = child_query_path(path, op.label());
+            if branches.len() < 2 {
+                return Err(QueryError::new(
+                    &op_path,
+                    format!("{} requires at least two branches", op.label()),
+                ));
+            }
+            if branches.len() > MAX_QUERY_BRANCHES {
+                return Err(QueryError::new(
+                    &op_path,
+                    format!("at most {MAX_QUERY_BRANCHES} branches are allowed"),
+                ));
+            }
+            let mut branch_domains = Vec::with_capacity(branches.len());
+            for (index, branch) in branches.iter().enumerate() {
+                let branch_path = format!("{op_path}[{index}]");
+                branch_domains.push(validate_plan(branch, &branch_path, depth + 1, nodes)?);
+            }
+            let expected = branch_domains[0].kind;
+            for (index, branch) in branch_domains.iter().enumerate().skip(1) {
+                if branch.kind != expected {
                     return Err(QueryError::new(
-                        path,
-                        "capture is allowed only when the preceding stage produces structural_match",
-                    ));
-                }
-                if capture.is_empty() {
-                    return Err(QueryError::new(path, "capture name must not be empty"));
-                }
-                if capture.len() > MAX_CAPTURE_LENGTH {
-                    return Err(QueryError::new(
-                        path,
-                        format!("capture name must be at most {MAX_CAPTURE_LENGTH} bytes"),
-                    ));
-                }
-                if !captures.contains(capture.as_str()) {
-                    return Err(QueryError::new(
-                        path,
-                        format!("capture {capture:?} is not declared by a positive pattern"),
+                        format!("{op_path}[{index}]"),
+                        format!(
+                            "{} branch produces {}, but the first branch produces {}",
+                            op.label(),
+                            branch.kind.label(),
+                            expected.label()
+                        ),
                     ));
                 }
             }
-            input = step
-                .output_kind(input)
-                .expect("typed steps were validated above");
+            let captures = if expected == QueryValueKind::StructuralMatch {
+                let mut common = branch_domains[0].captures.clone().unwrap_or_default();
+                if *op != SetOperator::Except {
+                    for branch in &branch_domains[1..] {
+                        common.retain(|capture| {
+                            branch
+                                .captures
+                                .as_ref()
+                                .is_some_and(|captures| captures.contains(capture))
+                        });
+                    }
+                }
+                Some(common)
+            } else {
+                None
+            };
+            ValidatedDomain {
+                kind: expected,
+                captures,
+            }
         }
-        Ok(output)
-    }
+    };
 
-    fn positive_capture_names(&self) -> std::collections::HashSet<&str> {
+    let steps_path = child_query_path(path, "steps");
+    let output = validate_query_steps(&plan.steps, domain.kind, &steps_path)?;
+    let mut input = domain.kind;
+    for (index, step) in plan.steps.iter().enumerate() {
+        let filter = match step {
+            QueryStep::ReceiverTargets(filter)
+            | QueryStep::PointsTo(filter)
+            | QueryStep::MemberTargets(filter) => filter,
+            _ => {
+                input = step
+                    .output_kind(input)
+                    .expect("typed steps were validated above");
+                continue;
+            }
+        };
+        if let Some(capture) = &filter.capture {
+            let capture_path = format!("{steps_path}[{index}].capture");
+            if input != QueryValueKind::StructuralMatch {
+                return Err(QueryError::new(
+                    capture_path,
+                    "capture is allowed only when the preceding stage produces structural_match",
+                ));
+            }
+            if capture.is_empty() {
+                return Err(QueryError::new(
+                    capture_path,
+                    "capture name must not be empty",
+                ));
+            }
+            if capture.len() > MAX_CAPTURE_LENGTH {
+                return Err(QueryError::new(
+                    capture_path,
+                    format!("capture name must be at most {MAX_CAPTURE_LENGTH} bytes"),
+                ));
+            }
+            if !domain
+                .captures
+                .as_ref()
+                .is_some_and(|captures| captures.contains(capture))
+            {
+                return Err(QueryError::new(
+                    capture_path,
+                    format!(
+                        "capture {capture:?} is not declared by a positive pattern in every contributing branch"
+                    ),
+                ));
+            }
+        }
+        input = step
+            .output_kind(input)
+            .expect("typed steps were validated above");
+    }
+    domain.kind = output;
+    if output != QueryValueKind::StructuralMatch {
+        domain.captures = None;
+    }
+    Ok(domain)
+}
+
+fn child_query_path(path: &str, field: &str) -> String {
+    if path.is_empty() {
+        field.to_string()
+    } else {
+        format!("{path}.{field}")
+    }
+}
+
+impl CodeQuerySeed {
+    fn positive_capture_names(&self) -> std::collections::HashSet<String> {
         let mut captures = std::collections::HashSet::new();
         let mut stack = vec![&self.root];
         if let Some(inside) = &self.inside {
@@ -387,7 +563,7 @@ impl CodeQuery {
         }
         while let Some(pattern) = stack.pop() {
             if let Some(capture) = pattern.capture.as_deref() {
-                captures.insert(capture);
+                captures.insert(capture.to_string());
             }
             if let Some(has) = pattern.has.as_deref() {
                 stack.push(has);

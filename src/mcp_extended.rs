@@ -4,8 +4,8 @@ use crate::analyzer::structural::query::schema::{
 use crate::analyzer::structural::{
     ALL_KINDS, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
     MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES,
-    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
-    SCHEMA_VERSION,
+    MAX_QUERY_BRANCHES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH,
+    MAX_WHERE_GLOBS, SCHEMA_VERSION,
 };
 use crate::mcp_common::{McpRenderOptions, run_stdio_server, tool_descriptor};
 use serde_json::{Value, json};
@@ -204,6 +204,103 @@ fn query_step_input_variants() -> Vec<Value> {
     ]
 }
 
+fn query_plan_properties(
+    pattern_schema_description: &str,
+    query_step_variants: &[Value],
+) -> serde_json::Map<String, Value> {
+    json!({
+        "match": {
+            "type": "object",
+            "description": pattern_schema_description
+        },
+        "inside": {
+            "type": "object",
+            "description": "Optional containment constraint: the match must be lexically inside a node matching this pattern (same shape as match)."
+        },
+        "not_inside": {
+            "type": "object",
+            "description": "Optional negative containment: the match must NOT be inside a node matching this pattern."
+        },
+        "where": {
+            "type": "array",
+            "maxItems": MAX_WHERE_GLOBS,
+            "items": { "type": "string", "maxLength": MAX_GLOB_LENGTH },
+            "description": "Optional project-relative path globs limiting which files are searched. Absolute paths/globs inside the active workspace are normalized before execution."
+        },
+        "languages": {
+            "type": "array",
+            "maxItems": MAX_LANGUAGE_FILTERS,
+            "items": { "type": "string" },
+            "description": "Optional language filter (e.g. \"python\"). Languages without structural support are reported in diagnostics."
+        },
+        "union": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": MAX_QUERY_BRANCHES,
+            "items": { "$ref": "#/$defs/queryPlan" },
+            "description": "Compatible typed query branches combined by endpoint union."
+        },
+        "intersect": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": MAX_QUERY_BRANCHES,
+            "items": { "$ref": "#/$defs/queryPlan" },
+            "description": "Compatible typed query branches combined by endpoint intersection."
+        },
+        "except": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": MAX_QUERY_BRANCHES,
+            "items": { "$ref": "#/$defs/queryPlan" },
+            "description": "First compatible typed branch minus every later branch."
+        },
+        "steps": {
+            "type": "array",
+            "maxItems": MAX_QUERY_STEPS,
+            "items": { "oneOf": query_step_variants },
+            "description": "Ordered typed transformations. Hierarchy/member/owner steps consume and produce exact indexed declarations; import steps consume files."
+        }
+    })
+    .as_object()
+    .expect("query plan properties are an object")
+    .clone()
+}
+
+fn query_plan_source_variants() -> Vec<Value> {
+    let seed_scope_fields = ["inside", "not_inside", "where", "languages"];
+    let sources = ["match", "union", "intersect", "except"];
+    sources
+        .into_iter()
+        .map(|source| {
+            let mut excluded = sources
+                .into_iter()
+                .filter(|candidate| *candidate != source)
+                .collect::<Vec<_>>();
+            if source != "match" {
+                excluded.extend(seed_scope_fields);
+            }
+            json!({
+                "required": [source],
+                "not": {
+                        "anyOf": excluded
+                            .into_iter()
+                            .map(|field| json!({ "required": [field] }))
+                            .collect::<Vec<_>>()
+                }
+            })
+        })
+        .collect()
+}
+
+fn query_plan_schema(pattern_schema_description: &str, query_step_variants: &[Value]) -> Value {
+    json!({
+        "type": "object",
+        "properties": query_plan_properties(pattern_schema_description, query_step_variants),
+        "oneOf": query_plan_source_variants(),
+        "additionalProperties": false
+    })
+}
+
 pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
     let kind_vocabulary = ALL_KINDS
         .iter()
@@ -224,76 +321,63 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         .collect::<Vec<_>>()
         .join(", ");
     let query_code_description = format!(
-        "Query normalized code structure, then optionally apply typed semantic steps. Version 2 supports {step_vocabulary}. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Call traversal is direct by default, accepts only finite positive depth, and can expose call sites plus one direct receiver or formal-parameter input. Reference and call steps preserve proof-bearing exact indexed targets and sites. JavaScript and TypeScript receiver_targets, points_to, and member_targets expose bounded demand-driven receiver provenance; other languages return explicit unsupported analysis rows. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, file, reference_site, call_site, expression_site, or receiver_analysis results with provenance. This is not whole-program points-to, general alias, control-flow, taint, or data-flow analysis. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. Receiver example: {{\"match\":{{\"kind\":\"call\",\"receiver\":{{\"capture\":\"object\"}}}},\"steps\":[{{\"op\":\"points_to\",\"capture\":\"object\"}}]}}. Guide: https://brokkai.github.io/bifrost/code-querying/"
+        "Query normalized code structure, compose compatible typed branches with union, intersect, or except, then optionally apply typed semantic steps. Version 2 supports {step_vocabulary}. Set branches must produce the same terminal domain; a common steps suffix may continue from that domain. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Call traversal is direct by default, accepts only finite positive depth, and can expose call sites plus one direct receiver or formal-parameter input. Reference and call steps preserve proof-bearing exact indexed targets and sites. JavaScript and TypeScript receiver_targets, points_to, and member_targets expose bounded demand-driven receiver provenance; other languages return explicit unsupported analysis rows. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, file, reference_site, call_site, expression_site, or receiver_analysis results with provenance. This is not whole-program points-to, general alias, control-flow, taint, or data-flow analysis. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. Set example: {{\"union\":[{{\"match\":{{\"kind\":\"class\",\"name\":\"Legacy\"}}}},{{\"match\":{{\"kind\":\"class\",\"name\":\"Replacement\"}}}}]}}. Guide: https://brokkai.github.io/bifrost/code-querying/"
     );
     let query_step_variants = query_step_input_variants();
+    let query_plan_schema = query_plan_schema(&pattern_schema_description, &query_step_variants);
+    let mut query_code_properties =
+        query_plan_properties(&pattern_schema_description, &query_step_variants);
+    query_code_properties.extend(
+        json!({
+            "limit": {
+                "type": "integer",
+                "default": DEFAULT_LIMIT,
+                "minimum": 1,
+                "maximum": MAX_LIMIT,
+                "description": "Maximum number of terminal results to return after pipeline deduplication."
+            },
+            "result_detail": {
+                "type": "string",
+                "enum": ["compact", "full"],
+                "default": "compact",
+                "description": "Use compact for context-efficient snippets and line ranges. Use full when follow-up tools need deterministic match IDs, line/column ranges, decorator ranges, and capture ranges."
+            },
+            "schema_version": {
+                "type": "integer",
+                "default": SCHEMA_VERSION,
+                "enum": [SCHEMA_VERSION],
+                "description": "Optional query schema version. Omit for v2; other versions are rejected so callers do not accidentally rely on an incompatible query shape."
+            },
+            "query_file": {
+                "type": "string",
+                "description": "Workspace-relative query file. Use .rql for an RQL S-expression or .json for a complete canonical CodeQuery. Exclusive with inline query fields."
+            }
+        })
+        .as_object()
+        .expect("root query properties are an object")
+        .clone(),
+    );
+    let inline_query_variants = query_plan_source_variants()
+        .into_iter()
+        .map(|variant| {
+            json!({
+                "allOf": [
+                    variant,
+                    { "not": { "required": ["query_file"] } }
+                ]
+            })
+        })
+        .collect::<Vec<_>>();
     vec![
         tool_descriptor(
             "query_code",
             &query_code_description,
             json!({
                 "type": "object",
-                "properties": {
-                    "match": {
-                        "type": "object",
-                        "description": pattern_schema_description
-                    },
-                    "inside": {
-                        "type": "object",
-                        "description": "Optional containment constraint: the match must be lexically inside a node matching this pattern (same shape as match)."
-                    },
-                    "not_inside": {
-                        "type": "object",
-                        "description": "Optional negative containment: the match must NOT be inside a node matching this pattern."
-                    },
-                    "where": {
-                        "type": "array",
-                        "maxItems": MAX_WHERE_GLOBS,
-                        "items": { "type": "string", "maxLength": MAX_GLOB_LENGTH },
-                        "description": "Optional project-relative path globs limiting which files are searched. Absolute paths/globs inside the active workspace are normalized before execution."
-                    },
-                    "languages": {
-                        "type": "array",
-                        "maxItems": MAX_LANGUAGE_FILTERS,
-                        "items": { "type": "string" },
-                        "description": "Optional language filter (e.g. \"python\"). Languages without structural support are reported in diagnostics."
-                    },
-                    "steps": {
-                        "type": "array",
-                        "maxItems": MAX_QUERY_STEPS,
-                        "items": {
-                            "oneOf": query_step_variants
-                        },
-                        "description": "Ordered typed transformations. Hierarchy/member/owner steps consume and produce exact indexed declarations; import steps consume files."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "default": DEFAULT_LIMIT,
-                        "minimum": 1,
-                        "maximum": MAX_LIMIT,
-                        "description": "Maximum number of terminal results to return after pipeline deduplication."
-                    },
-                    "result_detail": {
-                        "type": "string",
-                        "enum": ["compact", "full"],
-                        "default": "compact",
-                        "description": "Use compact for context-efficient snippets and line ranges. Use full when follow-up tools need deterministic match IDs, line/column ranges, decorator ranges, and capture ranges."
-                    },
-                    "schema_version": {
-                        "type": "integer",
-                        "default": SCHEMA_VERSION,
-                        "enum": [SCHEMA_VERSION],
-                        "description": "Optional query schema version. Omit for v2; other versions are rejected so callers do not accidentally rely on an incompatible query shape."
-                    },
-                    "query_file": {
-                        "type": "string",
-                        "description": "Workspace-relative query file. Use .rql for an RQL S-expression or .json for a complete canonical CodeQuery. Exclusive with inline query fields."
-                    }
-                },
+                "properties": query_code_properties,
                 "oneOf": [
                     {
-                        "required": ["match"],
-                        "not": { "required": ["query_file"] }
+                        "oneOf": inline_query_variants
                     },
                     {
                         "required": ["query_file"],
@@ -302,6 +386,9 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                                 { "required": ["where"] },
                                 { "required": ["languages"] },
                                 { "required": ["match"] },
+                                { "required": ["union"] },
+                                { "required": ["intersect"] },
+                                { "required": ["except"] },
                                 { "required": ["inside"] },
                                 { "required": ["not_inside"] },
                                 { "required": ["steps"] },
@@ -311,7 +398,8 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                             ]
                         }
                     }
-                ]
+                ],
+                "$defs": { "queryPlan": query_plan_schema }
             }),
         ),
         tool_descriptor(
@@ -623,6 +711,63 @@ mod tests {
             query_code["inputSchema"]["properties"]["schema_version"]["enum"],
             json!([2])
         );
+        for op in ["union", "intersect", "except"] {
+            let composition = &query_code["inputSchema"]["properties"][op];
+            assert_eq!(composition["minItems"], 2);
+            assert_eq!(composition["maxItems"], MAX_QUERY_BRANCHES);
+            assert_eq!(composition["items"]["$ref"], "#/$defs/queryPlan");
+        }
+        assert_eq!(
+            query_code["inputSchema"]["$defs"]["queryPlan"]["additionalProperties"],
+            false
+        );
+        let nested_plan = &query_code["inputSchema"]["$defs"]["queryPlan"];
+        for field in [
+            "match",
+            "inside",
+            "not_inside",
+            "where",
+            "languages",
+            "union",
+            "intersect",
+            "except",
+            "steps",
+        ] {
+            assert_eq!(
+                query_code["inputSchema"]["properties"][field], nested_plan["properties"][field],
+                "root and nested plan schemas drifted for {field}"
+            );
+        }
+        for op in ["union", "intersect", "except"] {
+            let variant = nested_plan["oneOf"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|variant| variant["required"] == json!([op]))
+                .expect("set source variant");
+            let excluded = variant["not"]["anyOf"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["required"][0].as_str().unwrap())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                excluded,
+                [
+                    "match",
+                    "union",
+                    "intersect",
+                    "except",
+                    "inside",
+                    "languages",
+                    "not_inside",
+                    "where",
+                ]
+                .into_iter()
+                .filter(|field| *field != op)
+                .collect()
+            );
+        }
     }
 
     #[test]
