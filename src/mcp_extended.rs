@@ -4,8 +4,8 @@ use crate::analyzer::structural::query::schema::{
 use crate::analyzer::structural::{
     ALL_KINDS, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
     MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES,
-    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
-    SCHEMA_VERSION,
+    MAX_QUERY_BRANCHES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH,
+    MAX_WHERE_GLOBS, SCHEMA_VERSION,
 };
 use crate::mcp_common::{McpRenderOptions, run_stdio_server, tool_descriptor};
 use serde_json::{Value, json};
@@ -224,9 +224,60 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         .collect::<Vec<_>>()
         .join(", ");
     let query_code_description = format!(
-        "Query normalized code structure, then optionally apply typed semantic steps. Version 2 supports {step_vocabulary}. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Call traversal is direct by default, accepts only finite positive depth, and can expose call sites plus one direct receiver or formal-parameter input. Reference and call steps preserve proof-bearing exact indexed targets and sites. JavaScript and TypeScript receiver_targets, points_to, and member_targets expose bounded demand-driven receiver provenance; other languages return explicit unsupported analysis rows. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, file, reference_site, call_site, expression_site, or receiver_analysis results with provenance. This is not whole-program points-to, general alias, control-flow, taint, or data-flow analysis. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. Receiver example: {{\"match\":{{\"kind\":\"call\",\"receiver\":{{\"capture\":\"object\"}}}},\"steps\":[{{\"op\":\"points_to\",\"capture\":\"object\"}}]}}. Guide: https://brokkai.github.io/bifrost/code-querying/"
+        "Query normalized code structure, compose compatible typed branches with union, intersect, or except, then optionally apply typed semantic steps. Version 2 supports {step_vocabulary}. Set branches must produce the same terminal domain; a common steps suffix may continue from that domain. Hierarchy steps are direct by default and accept either a positive depth or transitive: true. Call traversal is direct by default, accepts only finite positive depth, and can expose call sites plus one direct receiver or formal-parameter input. Reference and call steps preserve proof-bearing exact indexed targets and sites. JavaScript and TypeScript receiver_targets, points_to, and member_targets expose bounded demand-driven receiver provenance; other languages return explicit unsupported analysis rows. Results include only declarations indexed by the workspace analyzer; observing library usages does not imply that library declarations are queryable. Terminal values are tagged structural_match, declaration, file, reference_site, call_site, expression_site, or receiver_analysis results with provenance. This is not whole-program points-to, general alias, control-flow, taint, or data-flow analysis. Minimal query: {{\"match\":{{\"kind\":\"call\",\"callee\":{{\"name\":\"eval\"}}}}}}. Set example: {{\"union\":[{{\"match\":{{\"kind\":\"class\",\"name\":\"Legacy\"}}}},{{\"match\":{{\"kind\":\"class\",\"name\":\"Replacement\"}}}}]}}. Guide: https://brokkai.github.io/bifrost/code-querying/"
     );
     let query_step_variants = query_step_input_variants();
+    let query_plan_schema = json!({
+        "type": "object",
+        "properties": {
+            "match": {
+                "type": "object",
+                "description": pattern_schema_description.clone()
+            },
+            "inside": { "type": "object" },
+            "not_inside": { "type": "object" },
+            "where": {
+                "type": "array",
+                "maxItems": MAX_WHERE_GLOBS,
+                "items": { "type": "string", "maxLength": MAX_GLOB_LENGTH }
+            },
+            "languages": {
+                "type": "array",
+                "maxItems": MAX_LANGUAGE_FILTERS,
+                "items": { "type": "string" }
+            },
+            "union": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": MAX_QUERY_BRANCHES,
+                "items": { "$ref": "#/$defs/queryPlan" }
+            },
+            "intersect": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": MAX_QUERY_BRANCHES,
+                "items": { "$ref": "#/$defs/queryPlan" }
+            },
+            "except": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": MAX_QUERY_BRANCHES,
+                "items": { "$ref": "#/$defs/queryPlan" }
+            },
+            "steps": {
+                "type": "array",
+                "maxItems": MAX_QUERY_STEPS,
+                "items": { "oneOf": query_step_variants.clone() }
+            }
+        },
+        "oneOf": [
+            { "required": ["match"] },
+            { "required": ["union"] },
+            { "required": ["intersect"] },
+            { "required": ["except"] }
+        ],
+        "additionalProperties": false
+    });
     vec![
         tool_descriptor(
             "query_code",
@@ -237,6 +288,27 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                     "match": {
                         "type": "object",
                         "description": pattern_schema_description
+                    },
+                    "union": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": MAX_QUERY_BRANCHES,
+                        "items": { "$ref": "#/$defs/queryPlan" },
+                        "description": "Compatible typed query branches combined by endpoint union."
+                    },
+                    "intersect": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": MAX_QUERY_BRANCHES,
+                        "items": { "$ref": "#/$defs/queryPlan" },
+                        "description": "Compatible typed query branches combined by endpoint intersection."
+                    },
+                    "except": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": MAX_QUERY_BRANCHES,
+                        "items": { "$ref": "#/$defs/queryPlan" },
+                        "description": "First compatible typed branch minus every later branch."
                     },
                     "inside": {
                         "type": "object",
@@ -292,7 +364,12 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                 },
                 "oneOf": [
                     {
-                        "required": ["match"],
+                        "oneOf": [
+                            { "required": ["match"] },
+                            { "required": ["union"] },
+                            { "required": ["intersect"] },
+                            { "required": ["except"] }
+                        ],
                         "not": { "required": ["query_file"] }
                     },
                     {
@@ -302,6 +379,9 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                                 { "required": ["where"] },
                                 { "required": ["languages"] },
                                 { "required": ["match"] },
+                                { "required": ["union"] },
+                                { "required": ["intersect"] },
+                                { "required": ["except"] },
                                 { "required": ["inside"] },
                                 { "required": ["not_inside"] },
                                 { "required": ["steps"] },
@@ -311,7 +391,8 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                             ]
                         }
                     }
-                ]
+                ],
+                "$defs": { "queryPlan": query_plan_schema }
             }),
         ),
         tool_descriptor(
@@ -622,6 +703,16 @@ mod tests {
         assert_eq!(
             query_code["inputSchema"]["properties"]["schema_version"]["enum"],
             json!([2])
+        );
+        for op in ["union", "intersect", "except"] {
+            let composition = &query_code["inputSchema"]["properties"][op];
+            assert_eq!(composition["minItems"], 2);
+            assert_eq!(composition["maxItems"], MAX_QUERY_BRANCHES);
+            assert_eq!(composition["items"]["$ref"], "#/$defs/queryPlan");
+        }
+        assert_eq!(
+            query_code["inputSchema"]["$defs"]["queryPlan"]["additionalProperties"],
+            false
         );
     }
 

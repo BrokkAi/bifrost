@@ -15,7 +15,7 @@
 //! source span like any other.
 
 use super::capabilities::QueryFeatures;
-use super::query::{CodeQuery, Pattern, StringPredicate};
+use super::query::{CodeQuerySeed, Pattern, StringPredicate};
 use crate::analyzer::structural::Role;
 
 /// Language-independent execution plan derived from a parsed query.
@@ -30,7 +30,7 @@ pub(crate) struct QueryPlan {
 }
 
 impl QueryPlan {
-    pub(crate) fn for_query(query: &CodeQuery) -> Self {
+    pub(crate) fn for_query(query: &CodeQuerySeed) -> Self {
         Self {
             positive_source_anchors: collect_positive_source_anchors(query),
             features: QueryFeatures::for_query(query),
@@ -74,7 +74,7 @@ impl SourceCandidateIndex<'_> {
 /// Literal strings that must all appear in a file's source for the query's
 /// root (plus `inside`) constraints to possibly match. Empty when the query
 /// has no exact-name anchors (regex/text/kind-only queries prune nothing).
-fn collect_positive_source_anchors(query: &CodeQuery) -> Vec<String> {
+fn collect_positive_source_anchors(query: &CodeQuerySeed) -> Vec<String> {
     let mut anchors = Vec::new();
     collect_pattern_anchors(&query.root, &mut anchors);
     if let Some(inside) = &query.inside {
@@ -117,11 +117,12 @@ fn collect_pattern_anchors(pattern: &Pattern, out: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::structural::CodeQuery;
     use serde_json::json;
 
     fn anchors_of(query: serde_json::Value) -> Vec<String> {
-        QueryPlan::for_query(&CodeQuery::from_json(&query).expect("query should parse"))
-            .positive_source_anchors
+        let query = CodeQuery::from_json(&query).expect("query should parse");
+        QueryPlan::for_query(query.seed().unwrap()).positive_source_anchors
     }
 
     #[test]
@@ -156,20 +157,18 @@ mod tests {
 
     #[test]
     fn reports_whether_a_query_has_source_anchors() {
-        let anchored = QueryPlan::for_query(
-            &CodeQuery::from_json(&json!({
-                "match": { "kind": "call", "callee": { "name": "eval" } }
-            }))
-            .expect("query should parse"),
-        );
+        let anchored_query = CodeQuery::from_json(&json!({
+            "match": { "kind": "call", "callee": { "name": "eval" } }
+        }))
+        .expect("query should parse");
+        let anchored = QueryPlan::for_query(anchored_query.seed().unwrap());
         assert!(anchored.has_source_anchors());
 
-        let unanchored = QueryPlan::for_query(
-            &CodeQuery::from_json(&json!({
-                "match": { "kind": "call", "callee": { "name": { "regex": "^eval$" } } }
-            }))
-            .expect("query should parse"),
-        );
+        let unanchored_query = CodeQuery::from_json(&json!({
+            "match": { "kind": "call", "callee": { "name": { "regex": "^eval$" } } }
+        }))
+        .expect("query should parse");
+        let unanchored = QueryPlan::for_query(unanchored_query.seed().unwrap());
         assert!(!unanchored.has_source_anchors());
     }
 

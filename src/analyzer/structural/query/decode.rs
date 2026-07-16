@@ -1,11 +1,11 @@
 use super::ir::{
-    CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
-    CodeQueryResultDetail, DEFAULT_LIMIT, HierarchyTraversal, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH,
-    MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
-    MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
-    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError, QueryStep,
-    ReceiverTraversalFilter, ReferenceTraversalFilter, SCHEMA_VERSION, StringPredicate,
-    validate_query_steps,
+    CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery, CodeQueryPlan,
+    CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed, DEFAULT_LIMIT, HierarchyTraversal,
+    MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS,
+    MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
+    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern,
+    QueryError, QueryStep, ReceiverTraversalFilter, ReferenceTraversalFilter, SCHEMA_VERSION,
+    SetOperator, StringPredicate,
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, PatternField, QueryField, QueryStepField, StringPredicateField,
@@ -27,54 +27,6 @@ impl CodeQuery {
             Some(value) => decode_schema_version(value, "schema_version")?,
         };
 
-        let where_globs = match fields.where_globs {
-            None => Vec::new(),
-            Some(value) => decode_globs(value, "where")?,
-        };
-
-        let languages = match fields.languages {
-            None => Vec::new(),
-            Some(value) => decode_languages(value, "languages")?,
-        };
-
-        let root = match fields.root {
-            Some(value) => decode_pattern(value, "match", &mut budget, 0)?,
-            None => return Err(QueryError::new("match", "required field is missing")),
-        };
-        if root.kinds.is_empty() && root.name.is_none() && root.text.is_none() {
-            // `not_kind` alone is near-wildcard, so it does not anchor a
-            // root either.
-            return Err(QueryError::new(
-                "match",
-                "root pattern must constrain at least one of \"kind\", \"name\", or \"text\"",
-            ));
-        }
-
-        let inside = fields
-            .inside
-            .map(|value| decode_pattern(value, "inside", &mut budget, 0))
-            .transpose()?;
-        if let Some(pattern) = &inside
-            && pattern.is_empty()
-        {
-            return Err(QueryError::new("inside", "pattern must not be empty"));
-        }
-
-        let not_inside = fields
-            .not_inside
-            .map(|value| decode_pattern(value, "not_inside", &mut budget, 0))
-            .transpose()?;
-        if let Some(pattern) = &not_inside
-            && pattern.is_empty()
-        {
-            return Err(QueryError::new("not_inside", "pattern must not be empty"));
-        }
-
-        let steps = match fields.steps {
-            None => Vec::new(),
-            Some(value) => decode_steps(value, "steps")?,
-        };
-
         let limit = match fields.limit {
             None => DEFAULT_LIMIT,
             Some(value) => decode_limit(value, "limit")?,
@@ -86,12 +38,7 @@ impl CodeQuery {
 
         let query = Self {
             schema_version,
-            where_globs,
-            languages,
-            root,
-            inside,
-            not_inside,
-            steps,
+            plan: decode_plan(fields, "", &mut budget, true)?,
             limit,
             result_detail,
         };
@@ -137,11 +84,14 @@ fn index_path(path: &str, index: usize) -> String {
     format!("{path}[{index}]")
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct QueryFields<'a> {
     where_globs: Option<&'a Value>,
     languages: Option<&'a Value>,
     root: Option<&'a Value>,
+    union: Option<&'a Value>,
+    intersect: Option<&'a Value>,
+    except: Option<&'a Value>,
     inside: Option<&'a Value>,
     not_inside: Option<&'a Value>,
     steps: Option<&'a Value>,
@@ -166,6 +116,9 @@ fn collect_query_fields<'a>(
             QueryField::Where => fields.where_globs = Some(value),
             QueryField::Languages => fields.languages = Some(value),
             QueryField::Match => fields.root = Some(value),
+            QueryField::Union => fields.union = Some(value),
+            QueryField::Intersect => fields.intersect = Some(value),
+            QueryField::Except => fields.except = Some(value),
             QueryField::Inside => fields.inside = Some(value),
             QueryField::NotInside => fields.not_inside = Some(value),
             QueryField::Steps => fields.steps = Some(value),
@@ -175,6 +128,162 @@ fn collect_query_fields<'a>(
         }
     }
     Ok(fields)
+}
+
+fn decode_plan(
+    fields: QueryFields<'_>,
+    path: &str,
+    budget: &mut QueryBudget,
+    root: bool,
+) -> Result<CodeQueryPlan, QueryError> {
+    if !root {
+        for (label, value) in [
+            ("schema_version", fields.schema_version),
+            ("limit", fields.limit),
+            ("result_detail", fields.result_detail),
+        ] {
+            if value.is_some() {
+                return Err(QueryError::new(
+                    child_path(path, label),
+                    "field is allowed only on the root query",
+                ));
+            }
+        }
+    }
+
+    let sources = [
+        ("match", fields.root),
+        ("union", fields.union),
+        ("intersect", fields.intersect),
+        ("except", fields.except),
+    ];
+    let present = sources
+        .iter()
+        .filter_map(|(label, value)| value.map(|value| (*label, value)))
+        .collect::<Vec<_>>();
+    if present.is_empty() {
+        return Err(QueryError::new(
+            child_path(path, "match"),
+            "one of match, union, intersect, or except is required",
+        ));
+    }
+    if present.len() > 1 {
+        return Err(QueryError::new(
+            child_path(path, present[1].0),
+            format!(
+                "query plan source is mutually exclusive with {}",
+                present[0].0
+            ),
+        ));
+    }
+
+    let source = if let Some(value) = fields.root {
+        let match_path = child_path(path, "match");
+        let root_pattern = decode_pattern(value, &match_path, budget, 0)?;
+        if root_pattern.kinds.is_empty()
+            && root_pattern.name.is_none()
+            && root_pattern.text.is_none()
+        {
+            return Err(QueryError::new(
+                match_path,
+                "root pattern must constrain at least one of \"kind\", \"name\", or \"text\"",
+            ));
+        }
+        let inside_path = child_path(path, "inside");
+        let inside = fields
+            .inside
+            .map(|value| decode_pattern(value, &inside_path, budget, 0))
+            .transpose()?;
+        if let Some(pattern) = &inside
+            && pattern.is_empty()
+        {
+            return Err(QueryError::new(inside_path, "pattern must not be empty"));
+        }
+        let not_inside_path = child_path(path, "not_inside");
+        let not_inside = fields
+            .not_inside
+            .map(|value| decode_pattern(value, &not_inside_path, budget, 0))
+            .transpose()?;
+        if let Some(pattern) = &not_inside
+            && pattern.is_empty()
+        {
+            return Err(QueryError::new(
+                not_inside_path,
+                "pattern must not be empty",
+            ));
+        }
+        CodeQueryPlanSource::Seed(CodeQuerySeed {
+            where_globs: fields
+                .where_globs
+                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .transpose()?
+                .unwrap_or_default(),
+            languages: fields
+                .languages
+                .map(|value| decode_languages(value, &child_path(path, "languages")))
+                .transpose()?
+                .unwrap_or_default(),
+            root: root_pattern,
+            inside,
+            not_inside,
+        })
+    } else {
+        for (label, value) in [
+            ("where", fields.where_globs),
+            ("languages", fields.languages),
+            ("inside", fields.inside),
+            ("not_inside", fields.not_inside),
+        ] {
+            if value.is_some() {
+                return Err(QueryError::new(
+                    child_path(path, label),
+                    "structural scope field requires a match source",
+                ));
+            }
+        }
+        let (op, value) = if let Some(value) = fields.union {
+            (SetOperator::Union, value)
+        } else if let Some(value) = fields.intersect {
+            (SetOperator::Intersect, value)
+        } else {
+            (
+                SetOperator::Except,
+                fields.except.expect("set source is present"),
+            )
+        };
+        let op_path = child_path(path, op.label());
+        let entries = value.as_array().ok_or_else(|| {
+            QueryError::new(&op_path, "expected an array of query branch objects")
+        })?;
+        if entries.len() < 2 {
+            return Err(QueryError::new(
+                &op_path,
+                format!("{} requires at least two branches", op.label()),
+            ));
+        }
+        if entries.len() > MAX_QUERY_BRANCHES {
+            return Err(QueryError::new(
+                &op_path,
+                format!("at most {MAX_QUERY_BRANCHES} branches are allowed"),
+            ));
+        }
+        let mut branches = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.iter().enumerate() {
+            let branch_path = index_path(&op_path, index);
+            let object = as_object(entry, &branch_path)?;
+            let branch_fields = collect_query_fields(object, &branch_path)?;
+            branches.push(decode_plan(branch_fields, &branch_path, budget, false)?);
+        }
+        CodeQueryPlanSource::Set { op, branches }
+    };
+
+    let steps_path = child_path(path, "steps");
+    let steps = fields
+        .steps
+        .map(|value| decode_steps(value, &steps_path))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(CodeQueryPlan { source, steps })
 }
 
 fn decode_globs(value: &Value, path: &str) -> Result<Vec<glob::Pattern>, QueryError> {
@@ -550,7 +659,6 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         }
         steps.push(step);
     }
-    validate_query_steps(&steps)?;
     Ok(steps)
 }
 

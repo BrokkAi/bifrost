@@ -1,7 +1,7 @@
-use super::ir::{CodeQuery, Pattern};
+use super::ir::{CodeQuerySeed, Pattern};
 use crate::analyzer::structural::kinds::{NormalizedKind, Role};
 
-impl CodeQuery {
+impl CodeQuerySeed {
     pub(crate) fn referenced_kinds(&self) -> Vec<NormalizedKind> {
         let mut kinds = Vec::new();
         collect_referenced_kinds(&self.root, &mut kinds);

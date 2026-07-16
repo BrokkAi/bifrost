@@ -6,7 +6,7 @@
 //! into stable diagnostics.
 
 use super::kinds::{NormalizedKind, Role};
-use super::query::CodeQuery;
+use super::query::CodeQuerySeed;
 use crate::analyzer::Language;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -21,7 +21,7 @@ pub(crate) struct QueryFeatures {
 }
 
 impl QueryFeatures {
-    pub(crate) fn for_query(query: &CodeQuery) -> Self {
+    pub(crate) fn for_query(query: &CodeQuerySeed) -> Self {
         let features = query
             .referenced_kinds()
             .into_iter()
@@ -120,6 +120,7 @@ fn labels(labels: impl Iterator<Item = &'static str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::structural::CodeQuery;
     use serde_json::json;
 
     #[test]
@@ -134,13 +135,14 @@ mod tests {
         }))
         .expect("query should parse");
 
-        let unsupported = QueryFeatures::for_query(&query).unsupported_by(|feature| {
-            !matches!(
-                feature,
-                QueryFeature::Kind(NormalizedKind::BooleanLiteral)
-                    | QueryFeature::Role(Role::Kwarg)
-            )
-        });
+        let unsupported =
+            QueryFeatures::for_query(query.seed().unwrap()).unsupported_by(|feature| {
+                !matches!(
+                    feature,
+                    QueryFeature::Kind(NormalizedKind::BooleanLiteral)
+                        | QueryFeature::Role(Role::Kwarg)
+                )
+            });
         let diagnostics = unsupported.into_diagnostics(Language::Python);
 
         assert_eq!(diagnostics.len(), 2);

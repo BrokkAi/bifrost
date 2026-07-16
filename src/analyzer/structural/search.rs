@@ -13,7 +13,8 @@ use super::planner::QueryPlan;
 use super::query::schema::{reference_kind_label, usage_proof_label};
 use super::query::{
     CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
-    CodeQueryResultDetail, HierarchyTraversal, QueryStep, ReferenceTraversalFilter,
+    CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed, HierarchyTraversal, QueryStep,
+    ReferenceTraversalFilter,
 };
 use crate::analyzer::reference_candidates::{
     ReferenceCandidateRanges, reference_candidate_ranges, reference_candidate_ranges_cancellable,
@@ -904,13 +905,24 @@ fn execute_internal(
             }],
         };
     }
+    let CodeQueryPlanSource::Seed(seed) = &query.plan.source else {
+        return CodeQueryResult {
+            results: Vec::new(),
+            truncated: false,
+            diagnostics: vec![CodeQueryDiagnostic {
+                language: "workspace",
+                message: "set composition execution is not available".to_string(),
+            }],
+        };
+    };
+    let steps = &query.plan.steps;
 
-    let plan = QueryPlan::for_query(query);
+    let plan = QueryPlan::for_query(seed);
     let source_index = plan.build_source_index();
     let mut providers = analyzer.structural_search_providers();
     providers.sort_by_key(|provider| provider.structural_language());
     providers.retain(|provider| {
-        query.languages.is_empty() || query.languages.contains(&provider.structural_language())
+        seed.languages.is_empty() || seed.languages.contains(&provider.structural_language())
     });
 
     let mut diagnostics = Vec::new();
@@ -920,8 +932,8 @@ fn execute_internal(
             return cancelled_query_result();
         }
         let language = crate::analyzer::common::language_for_file(&file);
-        let requested = query.languages.is_empty() || query.languages.contains(&language);
-        if requested && file_matches_globs(&file, query) {
+        let requested = seed.languages.is_empty() || seed.languages.contains(&language);
+        if requested && file_matches_globs(&file, seed) {
             scoped_languages.insert(language);
         }
     }
@@ -940,10 +952,10 @@ fn execute_internal(
         let language = provider.structural_language();
         supported.insert(language);
         let mut files = provider.structural_files();
-        files.retain(|file| file_matches_globs(file, query));
+        files.retain(|file| file_matches_globs(file, seed));
         files.sort();
 
-        let explicitly_requested = query.languages.contains(&language);
+        let explicitly_requested = seed.languages.contains(&language);
         if !files.is_empty() || explicitly_requested {
             diagnostics.extend(
                 plan.features()
@@ -961,8 +973,8 @@ fn execute_internal(
     }
 
     for language in analyzer.languages() {
-        let explicitly_requested = query.languages.contains(&language);
-        let requested = query.languages.is_empty() || explicitly_requested;
+        let explicitly_requested = seed.languages.contains(&language);
+        let requested = seed.languages.is_empty() || explicitly_requested;
         if requested
             && !supported.contains(&language)
             && (explicitly_requested || scoped_languages.contains(&language))
@@ -994,7 +1006,7 @@ fn execute_internal(
     }
     candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
 
-    let pipeline_query = !query.steps.is_empty();
+    let pipeline_query = !steps.is_empty();
     let global_cap = if pipeline_query {
         limits.max_pipeline_rows.saturating_add(1)
     } else {
@@ -1033,7 +1045,7 @@ fn execute_internal(
             break;
         }
         let remaining = global_cap - pending.len();
-        for fact_match in super::matcher::match_query(query, &facts, remaining) {
+        for fact_match in super::matcher::match_query(seed, &facts, remaining) {
             pending.push((language, file.clone(), Arc::clone(&facts), fact_match));
         }
         if pending.len() >= global_cap {
@@ -1059,7 +1071,7 @@ fn execute_internal(
             return cancelled_query_result();
         }
         let truncated = match_truncated || budget_exhausted;
-        if should_report_broad_query(&plan, query, &budget, truncated) {
+        if should_report_broad_query(&plan, seed, &budget, truncated) {
             push_broad_query_diagnostic(&mut diagnostics, &budget);
         }
         pending.truncate(query.limit);
@@ -1119,7 +1131,7 @@ fn execute_internal(
 
     let mut import_graph = None;
     let mut import_graph_budget_diagnostic_emitted = false;
-    for (step_index, step) in query.steps.iter().enumerate() {
+    for (step_index, step) in steps.iter().enumerate() {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return cancelled_query_result();
         }
@@ -1192,7 +1204,7 @@ fn execute_internal(
             &mut call_cache,
             &mut budget,
             limits,
-            if step_index + 1 == query.steps.len() {
+            if step_index + 1 == steps.len() {
                 query.limit.saturating_add(1)
             } else {
                 limits.max_pipeline_rows
@@ -1214,7 +1226,7 @@ fn execute_internal(
             {
                 push_pipeline_budget_diagnostic(&mut diagnostics, &budget);
             }
-            if step_index + 1 < query.steps.len() {
+            if step_index + 1 < steps.len() {
                 // A partial intermediate stage does not satisfy the statically
                 // validated terminal domain. Preserve only complete terminal
                 // values when the final stage itself exhausts the budget.
@@ -1230,7 +1242,7 @@ fn execute_internal(
         rows.truncate(query.limit);
     }
     let truncated = terminal_truncated || budget_exhausted;
-    if should_report_broad_query(&plan, query, &budget, truncated) {
+    if should_report_broad_query(&plan, seed, &budget, truncated) {
         push_broad_query_diagnostic(&mut diagnostics, &budget);
     }
     let mut render_cache = PipelineRenderCache::default();
@@ -3952,7 +3964,7 @@ fn push_truncation_diagnostic(
 
 fn should_report_broad_query(
     plan: &QueryPlan,
-    query: &CodeQuery,
+    query: &CodeQuerySeed,
     budget: &CodeQueryExecutionBudget,
     truncated: bool,
 ) -> bool {
@@ -3978,7 +3990,7 @@ fn push_broad_query_diagnostic(
     });
 }
 
-fn file_matches_globs(file: &ProjectFile, query: &CodeQuery) -> bool {
+fn file_matches_globs(file: &ProjectFile, query: &CodeQuerySeed) -> bool {
     if query.where_globs.is_empty() {
         return true;
     }
@@ -4268,7 +4280,7 @@ mod tests {
             std::path::PathBuf::from("src\\app.py"),
         );
 
-        assert!(file_matches_globs(&file, &query));
+        assert!(file_matches_globs(&file, query.seed().unwrap()));
     }
 
     #[test]

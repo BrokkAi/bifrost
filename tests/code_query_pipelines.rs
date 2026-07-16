@@ -2518,7 +2518,7 @@ fn invalid_programmatic_pipeline_is_diagnostic_not_panic() {
         "match": { "kind": "call" }
     }))
     .unwrap();
-    query.steps = vec![brokk_bifrost::analyzer::structural::QueryStep::ImportsOf];
+    query.plan.steps = vec![brokk_bifrost::analyzer::structural::QueryStep::ImportsOf];
 
     let result = execute(workspace.analyzer(), &query);
     assert!(result.results.is_empty());

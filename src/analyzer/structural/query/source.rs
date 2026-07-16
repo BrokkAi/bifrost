@@ -10,8 +10,9 @@ use super::sexp::query_to_json;
 use super::syntax::{Expr, ExprKind, parse_rql};
 use super::{
     CodeQuery, CodeQueryResultDetail, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES,
-    MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_QUERY_STEPS,
-    MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, QueryStep, SCHEMA_VERSION,
+    MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_QUERY_BRANCHES,
+    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
+    QueryStep, SCHEMA_VERSION,
 };
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{
@@ -575,6 +576,25 @@ fn validate_wrapper(form: RqlForm, args: &[Expr], path: &str, analysis: &mut Ana
                 };
                 validate_rql_pattern(&args[0], field, analysis);
             }
+        }
+        RqlForm::Union | RqlForm::Intersect | RqlForm::Except => {
+            if args.len() < 2 {
+                analysis.error(
+                    query.range.clone(),
+                    "wrong-value-shape",
+                    format!("{} expects at least two queries", form.label()),
+                );
+            } else if args.len() > MAX_QUERY_BRANCHES {
+                analysis.error(
+                    args[MAX_QUERY_BRANCHES].range.clone(),
+                    "invalid-query",
+                    format!("at most {MAX_QUERY_BRANCHES} branches are allowed"),
+                );
+            }
+            for (index, branch) in args.iter().enumerate() {
+                validate_rql_query(branch, &format!("{}[{index}]", form.label()), analysis);
+            }
+            return;
         }
         RqlForm::EnclosingDecl
         | RqlForm::FileOf
@@ -1205,6 +1225,7 @@ fn validate_property_value(
         super::schema::ValueShape::PatternList
         | super::schema::ValueShape::PatternMap
         | super::schema::ValueShape::Query
+        | super::schema::ValueShape::QueryList
         | super::schema::ValueShape::QuerySteps
         | super::schema::ValueShape::StringList
         | super::schema::ValueShape::StringPredicate
@@ -1671,6 +1692,32 @@ fn validate_json_query(value: &spanned::Value, path: &str, analysis: &mut Analys
                         "invalid-query",
                         "containment pattern must not be empty",
                     );
+                }
+            }
+            QueryField::Union | QueryField::Intersect | QueryField::Except => {
+                let Some(branches) = child.as_array() else {
+                    analysis.error(
+                        child.range(),
+                        "wrong-value-shape",
+                        "set composition must be an array of query objects",
+                    );
+                    continue;
+                };
+                if branches.len() < 2 {
+                    analysis.error(
+                        child.range(),
+                        "wrong-value-shape",
+                        format!("{} requires at least two branches", field.label()),
+                    );
+                } else if branches.len() > MAX_QUERY_BRANCHES {
+                    analysis.error(
+                        branches[MAX_QUERY_BRANCHES].range(),
+                        "invalid-query",
+                        format!("at most {MAX_QUERY_BRANCHES} branches are allowed"),
+                    );
+                }
+                for (index, branch) in branches.iter().enumerate() {
+                    validate_json_query(branch, &format!("{child_path}[{index}]"), analysis);
                 }
             }
             QueryField::Steps => validate_json_steps(child, &child_path, analysis),
@@ -2948,6 +2995,36 @@ mod tests {
             &conflicting[diagnostic.range.clone()] == "true"
                 && diagnostic.message.contains("mutually exclusive")
         }));
+    }
+
+    #[test]
+    fn set_composition_help_and_domain_diagnostics_are_range_precise() {
+        let rql = "(file-of (union (enclosing-decl (class :name \"A\")) (enclosing-decl (class :name \"B\"))))";
+        for token in ["union", "file-of"] {
+            let offset = rql.find(token).unwrap();
+            let help = query_source_help_at(rql, offset)
+                .unwrap_or_else(|| panic!("no set-composition help for {token}"));
+            assert_eq!(&rql[help.range], token);
+            assert!(!help.description.is_empty());
+        }
+        assert!(validate_query_source(rql).is_empty());
+
+        let json = r#"{"union":[{"match":{"kind":"class"},"steps":[{"op":"enclosing_decl"}]},{"match":{"kind":"class"},"steps":[{"op":"file_of"}]}]}"#;
+        let diagnostic = validate_query_source(json)
+            .into_iter()
+            .find(|diagnostic| diagnostic.message.contains("first branch produces"))
+            .expect("typed branch diagnostic");
+        assert_eq!(
+            &json[diagnostic.range],
+            r#"{"match":{"kind":"class"},"steps":[{"op":"file_of"}]}"#
+        );
+
+        let too_short = "(except (class))";
+        let diagnostic = validate_query_source(too_short)
+            .into_iter()
+            .find(|diagnostic| diagnostic.message.contains("at least two"))
+            .expect("branch-count diagnostic");
+        assert_eq!(&too_short[diagnostic.range], "(class)");
     }
 
     #[test]
