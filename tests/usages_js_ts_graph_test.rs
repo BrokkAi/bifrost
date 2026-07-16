@@ -1,7 +1,8 @@
 mod common;
 
 use brokk_bifrost::usages::{
-    FuzzyResult, JsTsExportUsageGraphStrategy, UsageAnalyzer, UsageFinder, UsageHitKind,
+    ExplicitCandidateProvider, FuzzyResult, JsTsExportUsageGraphStrategy, UsageAnalyzer,
+    UsageFinder, UsageHitKind,
 };
 use brokk_bifrost::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, JavascriptAnalyzer, Language, MultiAnalyzer,
@@ -10,6 +11,7 @@ use brokk_bifrost::{
 use common::{InlineTestProject, js_fixture_project, ts_fixture_project};
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 fn js_analyzer() -> JavascriptAnalyzer {
     JavascriptAnalyzer::from_project(js_fixture_project())
@@ -442,6 +444,222 @@ fn find_js_target(
         .all_declarations()
         .find(|cu| cu.source() == source_file && predicate(cu))
         .expect("target definition not found")
+}
+
+fn authoritative_js_hits(
+    analyzer: &JavascriptAnalyzer,
+    target: &CodeUnit,
+    candidate: ProjectFile,
+) -> BTreeSet<brokk_bifrost::usages::UsageHit> {
+    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(candidate).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            analyzer,
+            std::slice::from_ref(target),
+            Some(&provider),
+            1,
+            100,
+        );
+    match query.result {
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => hits_by_overload.get(target).cloned().unwrap_or_default(),
+        other => panic!("expected authoritative JS usage success, got {other:#?}"),
+    }
+}
+
+fn authoritative_ts_hits(
+    analyzer: &TypescriptAnalyzer,
+    target: &CodeUnit,
+    candidate: ProjectFile,
+) -> BTreeSet<brokk_bifrost::usages::UsageHit> {
+    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(candidate).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            analyzer,
+            std::slice::from_ref(target),
+            Some(&provider),
+            1,
+            100,
+        );
+    match query.result {
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => hits_by_overload.get(target).cloned().unwrap_or_default(),
+        other => panic!("expected authoritative TS usage success, got {other:#?}"),
+    }
+}
+
+fn identifier_occurrence_range(
+    source: &str,
+    identifier: &str,
+    occurrence: usize,
+) -> (usize, usize) {
+    let start = source
+        .match_indices(identifier)
+        .nth(occurrence)
+        .map(|(start, _)| start)
+        .unwrap_or_else(|| panic!("missing occurrence {occurrence} of {identifier:?}"));
+    (start, start + identifier.len())
+}
+
+#[test]
+fn authoritative_js_usage_counts_assignment_pattern_default_rhs() {
+    let source = r#"const UNKNOWN = 0;
+class Path {
+  newChild(name, type = UNKNOWN) { return type; }
+  nested({ [UNKNOWN]: [{ value = UNKNOWN } = UNKNOWN] } = UNKNOWN) { return value; }
+  shadow(UNKNOWN = 1) { return UNKNOWN; }
+}
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("assignment.js", source).build());
+    let file = project.file("assignment.js");
+    let target = find_js_target(&analyzer, &file, |unit| {
+        unit.is_field() && unit.identifier() == "UNKNOWN"
+    });
+
+    let hits = authoritative_js_hits(&analyzer, &target, file.clone());
+    let ranges = hits
+        .iter()
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    let expected = BTreeSet::from([
+        identifier_occurrence_range(source, "UNKNOWN", 1),
+        identifier_occurrence_range(source, "UNKNOWN", 2),
+        identifier_occurrence_range(source, "UNKNOWN", 3),
+        identifier_occurrence_range(source, "UNKNOWN", 4),
+        identifier_occurrence_range(source, "UNKNOWN", 5),
+    ]);
+
+    assert_eq!(
+        expected, ranges,
+        "computed keys and nested default RHS reads must reference UNKNOWN, while the real UNKNOWN parameter shadows its body; hits: {hits:#?}"
+    );
+    assert!(hits.iter().all(|hit| hit.file == file));
+}
+
+#[test]
+fn authoritative_js_commonjs_usage_counts_default_rhs_and_later_value() {
+    let target_source = "const kEmptyObject = {};\nmodule.exports = { kEmptyObject };\n";
+    let consumer_source = r#"const { kEmptyObject } = require('./target');
+function use(options = kEmptyObject) {
+  return { attributes: kEmptyObject };
+}
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file("target.js", target_source)
+            .file("consumer.js", consumer_source)
+            .build()
+    });
+    let target_file = project.file("target.js");
+    let consumer = project.file("consumer.js");
+    let target = find_js_target(&analyzer, &target_file, |unit| {
+        unit.is_field() && unit.identifier() == "kEmptyObject"
+    });
+
+    let hits = authoritative_js_hits(&analyzer, &target, consumer.clone());
+    let ranges = hits
+        .iter()
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    let default_rhs = identifier_occurrence_range(consumer_source, "kEmptyObject", 1);
+    let object_value = identifier_occurrence_range(consumer_source, "kEmptyObject", 2);
+
+    assert!(
+        ranges.contains(&default_rhs),
+        "the imported assignment-pattern default RHS must be retained at {default_rhs:?}; hits: {hits:#?}"
+    );
+    assert!(
+        ranges.contains(&object_value),
+        "the later object value must remain a reference at {object_value:?}; hits: {hits:#?}"
+    );
+    assert!(hits.iter().all(|hit| hit.file == consumer));
+}
+
+#[test]
+fn authoritative_ts_typed_destructuring_only_types_real_binder_as_receiver() {
+    let consumer_source = r#"import { Foo } from './target';
+import { Other } from './other';
+declare const COMPUTED: string;
+declare const DEFAULT: Other;
+export function use({ [COMPUTED]: real = DEFAULT }: Record<string, Foo>) {
+  real.bar();
+  DEFAULT.bar();
+  COMPUTED.bar();
+}
+"#;
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file("target.ts", "export class Foo { bar() {} }\n")
+            .file("other.ts", "export class Other { bar() {} }\n")
+            .file("consumer.ts", consumer_source)
+            .build()
+    });
+    let target_file = project.file("target.ts");
+    let consumer = project.file("consumer.ts");
+    let target = find_ts_target(&analyzer, &target_file, |unit| {
+        unit.is_function() && unit.identifier().starts_with("bar")
+    });
+
+    let hits = authoritative_ts_hits(&analyzer, &target, consumer.clone());
+    let ranges = hits
+        .iter()
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        BTreeSet::from([identifier_occurrence_range(consumer_source, "bar", 0)]),
+        ranges,
+        "the typed destructuring binder is a Foo receiver, but its computed key and default expression are reads rather than receiver bindings; hits: {hits:#?}"
+    );
+    assert!(hits.iter().all(|hit| hit.file == consumer));
+}
+
+#[test]
+fn authoritative_js_array_binder_shadows_import_but_keeps_default_rhs_read() {
+    let consumer_source = r#"import { TARGET, DEFAULT } from './target';
+export function use(values) {
+  const [TARGET = DEFAULT] = values;
+  return TARGET;
+}
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "target.js",
+            "export const TARGET = 0;\nexport const DEFAULT = 1;\n",
+        )
+        .file("consumer.js", consumer_source)
+        .build()
+    });
+    let target_file = project.file("target.js");
+    let consumer = project.file("consumer.js");
+    let target = find_js_target(&analyzer, &target_file, |unit| {
+        unit.is_field() && unit.identifier() == "TARGET"
+    });
+    let default = find_js_target(&analyzer, &target_file, |unit| {
+        unit.is_field() && unit.identifier() == "DEFAULT"
+    });
+
+    let target_hits = authoritative_js_hits(&analyzer, &target, consumer.clone());
+    assert!(
+        target_hits
+            .iter()
+            .all(|hit| hit.kind == UsageHitKind::Import),
+        "the array binder must shadow every non-import TARGET reference in its function scope: {target_hits:#?}"
+    );
+
+    let default_hits = authoritative_js_hits(&analyzer, &default, consumer.clone());
+    let default_ranges = default_hits
+        .iter()
+        .filter(|hit| hit.kind != UsageHitKind::Import)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        BTreeSet::from([identifier_occurrence_range(consumer_source, "DEFAULT", 1,)]),
+        default_ranges,
+        "the array binding's default RHS must remain an imported DEFAULT read: {default_hits:#?}"
+    );
 }
 
 // Models the call-graph hit surface (`all_hits`): `Import` and self-receiver hits
@@ -1723,7 +1941,52 @@ fn ts_interface_property_usages_include_typed_iterable_and_receiver_destructurin
         )
         .file(
             "app.ts",
-            "import { SyncSourceEntry, OtherEntry } from './api';\nfunction collect(entries: Array<SyncSourceEntry>) {\n  for (const { source } of entries) {\n    consume(source);\n  }\n}\nfunction collectRenamed(entries: SyncSourceEntry[]) {\n  for (const { source: sourceValue } of entries) {\n    consume(sourceValue);\n  }\n}\nfunction collectSet(entries: Set<SyncSourceEntry>) {\n  for (const { source: setSource } of entries) {\n    consume(setSource);\n  }\n}\nfunction collectIterable(entries: Iterable<SyncSourceEntry>) {\n  for (const { source: iterableSource } of entries) {\n    consume(iterableSource);\n  }\n}\nfunction direct(entry: SyncSourceEntry) {\n  const { source: directSource } = entry;\n  consume(directSource);\n}\nfunction forIn(entry: SyncSourceEntry) {\n  for (const { source } in entry) {\n    consume(source);\n  }\n}\nfunction unrelated(entries: OtherEntry[]) {\n  for (const { source } of entries) {\n    consume(source);\n  }\n}\ndeclare function consume(value: string): void;\n",
+            r#"import { SyncSourceEntry, OtherEntry } from './api';
+function collect(entries: Array<SyncSourceEntry>) {
+  for (const { source } of entries) {
+    consume(source);
+  }
+}
+function collectRenamed(entries: SyncSourceEntry[]) {
+  for (const { source: sourceValue } of entries) {
+    consume(sourceValue);
+  }
+}
+function collectSet(entries: Set<SyncSourceEntry>) {
+  for (const { source: setSource } of entries) {
+    consume(setSource);
+  }
+}
+function collectIterable(entries: Iterable<SyncSourceEntry>) {
+  for (const { source: iterableSource } of entries) {
+    consume(iterableSource);
+  }
+}
+function direct(entry: SyncSourceEntry) {
+  const { source: directSource } = entry;
+  consume(directSource);
+}
+function renamedDefault(entry: SyncSourceEntry) {
+  const { source: defaultSource = fallback } = entry;
+  defaultSource.trim();
+}
+function shorthandDefault(entry: SyncSourceEntry) {
+  const { source = fallback } = entry;
+  source.trim();
+}
+function forIn(entry: SyncSourceEntry) {
+  for (const { source } in entry) {
+    consume(source);
+  }
+}
+function unrelated(entries: OtherEntry[]) {
+  for (const { source } of entries) {
+    consume(source);
+  }
+}
+declare const fallback: string;
+declare function consume(value: string): void;
+"#,
         )
         .build()
     });
@@ -1741,7 +2004,7 @@ fn ts_interface_property_usages_include_typed_iterable_and_receiver_destructurin
         .filter(|hit| hit.file == project.file("app.ts"))
         .collect();
     assert_eq!(
-        5,
+        9,
         app_hits.len(),
         "SyncSourceEntry.source hits: {app_hits:?}"
     );
@@ -1774,6 +2037,22 @@ fn ts_interface_property_usages_include_typed_iterable_and_receiver_destructurin
             .iter()
             .any(|hit| hit.snippet.contains("{ source: iterableSource }")),
         "expected Iterable element destructuring label, got {app_hits:?}"
+    );
+    assert_eq!(
+        2,
+        app_hits
+            .iter()
+            .filter(|hit| hit.enclosing.short_name() == "renamedDefault")
+            .count(),
+        "renamed default binding should record its field label and carry the field value: {app_hits:?}"
+    );
+    assert_eq!(
+        2,
+        app_hits
+            .iter()
+            .filter(|hit| hit.enclosing.short_name() == "shorthandDefault")
+            .count(),
+        "shorthand default binding should record its field label and carry the field value: {app_hits:?}"
     );
 }
 

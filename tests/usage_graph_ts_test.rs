@@ -410,3 +410,29 @@ export function caller() {
         graph["edges"]
     );
 }
+
+#[test]
+fn ts_parameter_default_rhs_remains_an_imported_call() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "defaults.ts",
+            "export function fallback(): string { return ''; }\n",
+        )
+        .file(
+            "consumer.ts",
+            r#"
+import { fallback } from "./defaults";
+export function caller(value: string = fallback()) {
+  return value;
+}
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&graph, "caller", "fallback"),
+        "a required parameter's default initializer must remain a reference rather than a local shadow: {}",
+        graph["edges"]
+    );
+}

@@ -765,6 +765,24 @@ fn declare_pattern_shadows(
                     locals.declare_shadow(text.to_string());
                 }
             }
+            "required_parameter" | "optional_parameter" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    stack.push(name);
+                }
+                if let Some(pattern) = node.child_by_field_name("pattern") {
+                    stack.push(pattern);
+                }
+            }
+            "assignment_pattern" | "object_assignment_pattern" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    stack.push(left);
+                }
+            }
+            "pair_pattern" => {
+                if let Some(value) = node.child_by_field_name("value") {
+                    stack.push(value);
+                }
+            }
             _ => {
                 for index in (0..node.named_child_count()).rev() {
                     if let Some(child) = node.named_child(index) {
@@ -1124,6 +1142,41 @@ fn record_scoped_jsx_attributes(node: Node<'_>, ctx: &mut ScopedTsScan<'_, '_>) 
                 UsageNodeKey::new(target.source().clone(), target.fq_name()),
                 name,
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    #[test]
+    fn pattern_shadows_only_structured_binding_positions() {
+        let source = r#"
+function use({ [COMPUTED]: [{ deep = DEFAULT } = FALLBACK], bound }, plain = DEFAULT) {}
+"#;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_javascript::LANGUAGE.into())
+            .expect("JavaScript parser language");
+        let tree = parser.parse(source, None).expect("parsed JS fixture");
+        let function = tree
+            .root_node()
+            .named_child(0)
+            .expect("function declaration");
+        let parameters = function
+            .child_by_field_name("parameters")
+            .expect("function parameters");
+        let mut locals = LocalInferenceEngine::<String>::new(LocalInferenceConfig::default());
+
+        declare_pattern_shadows(parameters, source, &mut locals);
+
+        for binding in ["deep", "bound", "plain"] {
+            assert!(locals.is_shadowed(binding), "missing binder {binding}");
+        }
+        for read in ["COMPUTED", "DEFAULT", "FALLBACK"] {
+            assert!(!locals.is_shadowed(read), "{read} must remain a read");
         }
     }
 }

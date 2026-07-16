@@ -397,10 +397,11 @@ fn register_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     };
 
-    if name_node.kind() == "object_pattern" {
+    if matches!(name_node.kind(), "object_pattern" | "array_pattern") {
         register_pattern_bindings(name_node, ctx);
-        if expression_carries_target_object(value_node, ctx)
-            || expression_resolves_to_target_owner(value_node, ctx)
+        if name_node.kind() == "object_pattern"
+            && (expression_carries_target_object(value_node, ctx)
+                || expression_resolves_to_target_owner(value_node, ctx))
         {
             seed_target_destructuring_bindings(name_node, ctx);
         }
@@ -466,11 +467,8 @@ fn seed_target_destructuring_bindings(pattern: Node<'_>, ctx: &mut ScanCtx<'_>) 
     };
     let mut cursor = pattern.walk();
     for property in pattern.named_children(&mut cursor) {
-        let (key, local) = match property.kind() {
-            "shorthand_property_identifier_pattern" => {
-                let name = slice(property, ctx.source);
-                (name, name)
-            }
+        let (key_node, local_node) = match property.kind() {
+            "shorthand_property_identifier_pattern" => (property, property),
             "pair_pattern" => {
                 let Some(key_node) = property.child_by_field_name("key") else {
                     continue;
@@ -478,19 +476,44 @@ fn seed_target_destructuring_bindings(pattern: Node<'_>, ctx: &mut ScanCtx<'_>) 
                 let Some(value_node) = property.child_by_field_name("value") else {
                     continue;
                 };
-                (slice(key_node, ctx.source), slice(value_node, ctx.source))
+                let Some(local_node) = direct_pattern_binding(value_node) else {
+                    continue;
+                };
+                (key_node, local_node)
+            }
+            "object_assignment_pattern" => {
+                let Some(left) = property.child_by_field_name("left") else {
+                    continue;
+                };
+                let Some(local_node) = direct_pattern_binding(left) else {
+                    continue;
+                };
+                (left, local_node)
             }
             _ => continue,
         };
+        let key = slice(key_node, ctx.source);
+        let local = slice(local_node, ctx.source);
         if key == target_member && !local.is_empty() {
             // The pattern key is an immediate field reference. The introduced local is
             // separately seeded only to carry that field value through later expressions.
-            let key_node = property.child_by_field_name("key").unwrap_or(property);
             record_hit(key_node, ctx);
             ctx.binding_engine
                 .seed_symbol(local.to_string(), TARGET_VALUE_BINDING);
         }
     }
+}
+
+fn direct_pattern_binding(node: Node<'_>) -> Option<Node<'_>> {
+    let binding = match node.kind() {
+        "assignment_pattern" | "object_assignment_pattern" => node.child_by_field_name("left")?,
+        _ => node,
+    };
+    matches!(
+        binding.kind(),
+        "identifier" | "shorthand_property_identifier_pattern"
+    )
+    .then_some(binding)
 }
 
 fn expression_carries_target_object(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -620,8 +643,17 @@ fn register_parameter_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 collect_pattern_identifiers(pattern, ctx, binding);
             }
         }
-        "rest_pattern" | "assignment_pattern" | "object_pattern" | "array_pattern"
-        | "pair_pattern" => {
+        "assignment_pattern" | "object_assignment_pattern" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                register_parameter_binding(left, ctx);
+            }
+        }
+        "pair_pattern" => {
+            if let Some(value) = node.child_by_field_name("value") {
+                register_parameter_binding(value, ctx);
+            }
+        }
+        "rest_pattern" | "object_pattern" | "array_pattern" => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 register_parameter_binding(child, ctx);
@@ -645,8 +677,17 @@ fn register_pattern_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 register_pattern_bindings(pattern, ctx);
             }
         }
-        "rest_pattern" | "assignment_pattern" | "object_pattern" | "array_pattern"
-        | "pair_pattern" => {
+        "assignment_pattern" | "object_assignment_pattern" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                register_pattern_bindings(left, ctx);
+            }
+        }
+        "pair_pattern" => {
+            if let Some(value) = node.child_by_field_name("value") {
+                register_pattern_bindings(value, ctx);
+            }
+        }
+        "rest_pattern" | "object_pattern" | "array_pattern" => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 register_pattern_bindings(child, ctx);
@@ -690,8 +731,17 @@ fn collect_pattern_identifiers_into(
                 out.insert(name.to_string(), binding);
             }
         }
-        "object_pattern" | "array_pattern" | "assignment_pattern" | "rest_pattern"
-        | "pair_pattern" => {
+        "assignment_pattern" | "object_assignment_pattern" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                collect_pattern_identifiers_into(left, source, binding, out);
+            }
+        }
+        "pair_pattern" => {
+            if let Some(value) = node.child_by_field_name("value") {
+                collect_pattern_identifiers_into(value, source, binding, out);
+            }
+        }
+        "object_pattern" | "array_pattern" | "rest_pattern" => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 collect_pattern_identifiers_into(child, source, binding, out);
