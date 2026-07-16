@@ -1,8 +1,6 @@
-use std::io::{Read, Write};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use glob::Pattern;
 use lsp_types::{DocumentFormattingParams, TextEdit};
@@ -15,15 +13,11 @@ use crate::lsp::conversion::byte_range_to_lsp_range;
 use crate::lsp::handlers::util::read_document_for_uri;
 #[cfg(windows)]
 use crate::path_normalization::NormalizePath;
+use crate::process::{BoundedProcessRequest, run_bounded_process};
 
 const MAX_ERROR_OUTPUT_CHARS: usize = 1_000;
 const MAX_FORMATTER_STDERR_BYTES: usize = 64 * 1024;
 const MAX_FORMATTER_STDOUT_BYTES: usize = 32 * 1024 * 1024;
-const FORMATTER_READER_GRACE: Duration = Duration::from_secs(1);
-#[cfg(unix)]
-const FORMATTER_SPAWN_RETRIES: usize = 5;
-#[cfg(unix)]
-const FORMATTER_SPAWN_RETRY_DELAY: Duration = Duration::from_millis(10);
 const FORMATTER_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(all(test, unix))]
 const TEST_HUNG_FORMATTER_TIMEOUT: Duration = Duration::from_secs(2);
@@ -91,277 +85,6 @@ impl FormatterCancellation {
 
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancellation.is_cancelled()
-    }
-}
-
-struct FormatterProcess {
-    child: Child,
-    #[cfg(windows)]
-    job: WindowsJob,
-}
-
-impl FormatterProcess {
-    #[cfg(not(windows))]
-    fn new(child: Child) -> Self {
-        Self { child }
-    }
-
-    fn take_stdin(&mut self) -> Option<ChildStdin> {
-        self.child.stdin.take()
-    }
-
-    fn take_stdout(&mut self) -> Option<ChildStdout> {
-        self.child.stdout.take()
-    }
-
-    fn take_stderr(&mut self) -> Option<ChildStderr> {
-        self.child.stderr.take()
-    }
-
-    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
-        let status = self.child.try_wait()?;
-        #[cfg(windows)]
-        if status.is_some() && !self.job.try_wait()? {
-            return Ok(None);
-        }
-        Ok(status)
-    }
-
-    fn wait(&mut self) -> std::io::Result<ExitStatus> {
-        let status = self.child.wait()?;
-        #[cfg(windows)]
-        self.job.wait()?;
-        Ok(status)
-    }
-
-    #[cfg(windows)]
-    fn terminate(&mut self) -> std::io::Result<()> {
-        self.job.terminate()
-    }
-
-    #[cfg(unix)]
-    fn terminate(&mut self) -> std::io::Result<()> {
-        terminate_process_id(self.child.id());
-        match self.child.kill() {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
-            Err(err) => Err(err),
-        }
-    }
-
-    #[cfg(all(not(unix), not(windows)))]
-    fn terminate(&mut self) -> std::io::Result<()> {
-        self.child.kill()
-    }
-}
-
-#[cfg(windows)]
-impl Drop for FormatterProcess {
-    fn drop(&mut self) {
-        // Keep the slot-lifetime invariant even on an unexpected early return
-        // or panic after spawn. Repeated waits are harmless after normal
-        // completion, while a live job is terminated and fully drained.
-        let _ = self.job.terminate();
-        let _ = self.child.wait();
-        let _ = self.job.wait();
-    }
-}
-
-#[cfg(windows)]
-impl FormatterProcess {
-    fn spawn_windows(mut command: Command) -> std::io::Result<Self> {
-        use std::os::windows::{io::AsRawHandle, process::CommandExt};
-        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
-
-        let job = WindowsJob::new()?;
-        command.creation_flags(CREATE_SUSPENDED);
-        let mut child = command.spawn()?;
-        let process = child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-
-        if let Err(err) = job.assign(process) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(err);
-        }
-        if let Err(err) = resume_process(process) {
-            let _ = job.terminate();
-            let _ = child.wait();
-            let _ = job.wait();
-            return Err(err);
-        }
-
-        Ok(Self { child, job })
-    }
-}
-
-#[cfg(windows)]
-struct WindowsJob(windows_sys::Win32::Foundation::HANDLE);
-
-#[cfg(windows)]
-impl WindowsJob {
-    fn new() -> std::io::Result<Self> {
-        use std::mem::size_of;
-        use std::ptr;
-        use windows_sys::Win32::System::JobObjects::{
-            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject,
-        };
-
-        let handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-        if handle.is_null() {
-            return Err(std::io::Error::last_os_error());
-        }
-        let job = Self(handle);
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let configured = unsafe {
-            SetInformationJobObject(
-                job.0,
-                JobObjectExtendedLimitInformation,
-                &limits as *const _ as *const _,
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        };
-        if configured == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(job)
-    }
-
-    fn assign(&self, process: windows_sys::Win32::Foundation::HANDLE) -> std::io::Result<()> {
-        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
-
-        if unsafe { AssignProcessToJobObject(self.0, process) } == 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    fn terminate(&self) -> std::io::Result<()> {
-        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
-
-        if unsafe { TerminateJobObject(self.0, 1) } == 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    fn wait(&self) -> std::io::Result<()> {
-        while !self.try_wait()? {
-            thread::sleep(Duration::from_millis(1));
-        }
-        Ok(())
-    }
-
-    fn try_wait(&self) -> std::io::Result<bool> {
-        use std::mem::size_of;
-        use windows_sys::Win32::System::JobObjects::{
-            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
-            QueryInformationJobObject,
-        };
-
-        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-        let queried = unsafe {
-            QueryInformationJobObject(
-                self.0,
-                JobObjectBasicAccountingInformation,
-                &mut accounting as *mut _ as *mut _,
-                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                std::ptr::null_mut(),
-            )
-        };
-        if queried == 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(accounting.ActiveProcesses == 0)
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for WindowsJob {
-    fn drop(&mut self) {
-        use windows_sys::Win32::Foundation::CloseHandle;
-
-        unsafe {
-            CloseHandle(self.0);
-        }
-    }
-}
-
-#[cfg(windows)]
-fn resume_process(process: windows_sys::Win32::Foundation::HANDLE) -> std::io::Result<()> {
-    use std::mem::size_of;
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
-    };
-    use windows_sys::Win32::System::Threading::{
-        GetProcessId, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
-    };
-
-    let process_id = unsafe { GetProcessId(process) };
-    if process_id == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error());
-    }
-    let snapshot = WindowsHandle(snapshot);
-    let mut entry = THREADENTRY32 {
-        dwSize: size_of::<THREADENTRY32>() as u32,
-        ..THREADENTRY32::default()
-    };
-    if unsafe { Thread32First(snapshot.0, &mut entry) } == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    let mut resumed = false;
-    loop {
-        if entry.th32OwnerProcessID == process_id {
-            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-            if thread.is_null() {
-                return Err(std::io::Error::last_os_error());
-            }
-            let thread = WindowsHandle(thread);
-            if unsafe { ResumeThread(thread.0) } == u32::MAX {
-                return Err(std::io::Error::last_os_error());
-            }
-            resumed = true;
-        }
-        if unsafe { Thread32Next(snapshot.0, &mut entry) } == 0 {
-            break;
-        }
-    }
-
-    if resumed {
-        Ok(())
-    } else {
-        // A suspended std::process child always has a primary thread. Treat an
-        // empty snapshot as a lifecycle failure instead of returning an
-        // unusable, permanently suspended formatter.
-        Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "formatter primary thread was not found",
-        ))
-    }
-}
-
-#[cfg(windows)]
-struct WindowsHandle(windows_sys::Win32::Foundation::HANDLE);
-
-#[cfg(windows)]
-impl Drop for WindowsHandle {
-    fn drop(&mut self) {
-        use windows_sys::Win32::Foundation::CloseHandle;
-
-        unsafe {
-            CloseHandle(self.0);
-        }
     }
 }
 
@@ -629,295 +352,33 @@ fn run_formatter_command_with_timeout(
     cancellation: &FormatterCancellation,
     timeout: Duration,
 ) -> Result<String, String> {
-    if cancellation.is_cancelled() {
-        return Err(format!(
-            "formatter `{}` was cancelled",
-            command_line_for_message(command)
-        ));
-    }
-    let mut child = spawn_formatter(command)?;
-    let stdin = child.take_stdin().ok_or_else(|| {
-        format!(
-            "failed to open stdin for formatter `{}`",
-            command_line_for_message(command)
-        )
-    })?;
-    let stdout = child.take_stdout().ok_or_else(|| {
-        format!(
-            "failed to open stdout for formatter `{}`",
-            command_line_for_message(command)
-        )
-    })?;
-    let stderr = child.take_stderr().ok_or_else(|| {
-        format!(
-            "failed to open stderr for formatter `{}`",
-            command_line_for_message(command)
-        )
-    })?;
-    let stdout_reader = spawn_pipe_reader(stdout, max_stdout_bytes(input.len()));
-    let stderr_reader = spawn_pipe_reader(stderr, MAX_FORMATTER_STDERR_BYTES);
-    let stdin_writer = spawn_stdin_writer(stdin, input.as_bytes().to_vec());
-    let status = wait_for_formatter(&mut child, command, cancellation, timeout);
-    // Always join every pipe worker before returning. FormattingJobs holds its
-    // concurrency slot around this function, so workspace replacement cannot
-    // outlive a worker that still owns an inherited formatter handle.
-    let stdout = collect_pipe("stdout", stdout_reader, command, &mut child);
-    let stderr = collect_pipe("stderr", stderr_reader, command, &mut child);
-    let stdin_result = collect_stdin_writer(stdin_writer, command, &mut child);
-    let status = status?;
-    let stdout = stdout?;
-    let stderr = stderr?;
-    if !status.success() {
+    let description = format!("formatter `{}`", command_line_for_message(command));
+    let request = BoundedProcessRequest {
+        program: OsString::from(&command.command),
+        args: command.args.iter().map(OsString::from).collect(),
+        env: Vec::new(),
+        cwd: command.cwd.clone(),
+        stdin: Some(input.as_bytes().to_vec()),
+        timeout,
+        stdout_limit: max_stdout_bytes(input.len()),
+        stderr_limit: MAX_FORMATTER_STDERR_BYTES,
+        description,
+    };
+    let output = run_bounded_process(&request, || cancellation.is_cancelled())?;
+    if !output.status.success() {
         return Err(format!(
             "formatter `{}` exited with status {}: {}",
             command_line_for_message(command),
-            status,
-            truncate_for_error(&String::from_utf8_lossy(&stderr))
+            output.status,
+            truncate_for_error(&String::from_utf8_lossy(&output.stderr))
         ));
     }
-    stdin_result?;
-    String::from_utf8(stdout).map_err(|err| {
+    String::from_utf8(output.stdout).map_err(|err| {
         format!(
             "formatter `{}` emitted non-UTF-8 stdout: {err}",
             command_line_for_message(command)
         )
     })
-}
-
-fn wait_for_formatter(
-    child: &mut FormatterProcess,
-    command: &FormatterCommand,
-    cancellation: &FormatterCancellation,
-    timeout: Duration,
-) -> Result<ExitStatus, String> {
-    let started = Instant::now();
-    loop {
-        if cancellation.is_cancelled() {
-            let cleanup = terminate_and_wait_for_formatter(child);
-            return Err(format!(
-                "formatter `{}` was cancelled{}",
-                command_line_for_message(command),
-                cleanup_error_suffix(cleanup)
-            ));
-        }
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                return child.wait().map_err(|err| {
-                    format!(
-                        "failed to wait for formatter group `{}`: {err}",
-                        command_line_for_message(command)
-                    )
-                });
-            }
-            Ok(None) if started.elapsed() >= timeout => {
-                let cleanup = terminate_and_wait_for_formatter(child);
-                return Err(format!(
-                    "formatter `{}` timed out after {}{}",
-                    command_line_for_message(command),
-                    format_duration(timeout),
-                    cleanup_error_suffix(cleanup)
-                ));
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(err) => {
-                let cleanup = terminate_and_wait_for_formatter(child);
-                return Err(format!(
-                    "failed to poll formatter `{}`: {err}{}",
-                    command_line_for_message(command),
-                    cleanup_error_suffix(cleanup)
-                ));
-            }
-        }
-    }
-}
-
-fn terminate_and_wait_for_formatter(child: &mut FormatterProcess) -> Result<(), String> {
-    let terminate = child.terminate();
-    let wait = child.wait();
-    match (terminate, wait) {
-        (Ok(()), Ok(_)) => Ok(()),
-        (Err(terminate), Ok(_)) => Err(format!("termination failed: {terminate}")),
-        (Ok(()), Err(wait)) => Err(format!("group wait failed: {wait}")),
-        (Err(terminate), Err(wait)) => Err(format!(
-            "termination failed: {terminate}; group wait failed: {wait}"
-        )),
-    }
-}
-
-fn cleanup_error_suffix(cleanup: Result<(), String>) -> String {
-    cleanup
-        .err()
-        .map(|err| format!(" (cleanup error: {err})"))
-        .unwrap_or_default()
-}
-
-fn spawn_formatter(command: &FormatterCommand) -> Result<FormatterProcess, String> {
-    #[cfg(unix)]
-    {
-        for attempt in 0..=FORMATTER_SPAWN_RETRIES {
-            match spawn_formatter_once(command) {
-                Ok(child) => return Ok(child),
-                Err(err) if is_text_file_busy(&err) && attempt < FORMATTER_SPAWN_RETRIES => {
-                    thread::sleep(FORMATTER_SPAWN_RETRY_DELAY);
-                }
-                Err(err) => return Err(format_formatter_spawn_error(command, err)),
-            }
-        }
-        unreachable!("formatter spawn retry loop must return");
-    }
-
-    #[cfg(not(unix))]
-    {
-        spawn_formatter_once(command).map_err(|err| format_formatter_spawn_error(command, err))
-    }
-}
-
-fn spawn_formatter_once(command: &FormatterCommand) -> std::io::Result<FormatterProcess> {
-    let mut builder = Command::new(&command.command);
-    builder
-        .args(&command.args)
-        .current_dir(&command.cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    #[cfg(windows)]
-    {
-        FormatterProcess::spawn_windows(builder)
-    }
-
-    #[cfg(not(windows))]
-    {
-        configure_formatter_process(&mut builder);
-        builder.spawn().map(FormatterProcess::new)
-    }
-}
-
-fn format_formatter_spawn_error(command: &FormatterCommand, err: std::io::Error) -> String {
-    format!(
-        "failed to start formatter `{}` in {}: {err}",
-        command_line_for_message(command),
-        command.cwd.display()
-    )
-}
-
-#[cfg(unix)]
-fn is_text_file_busy(err: &std::io::Error) -> bool {
-    err.raw_os_error() == Some(libc::ETXTBSY)
-}
-
-#[cfg(unix)]
-fn configure_formatter_process(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(all(not(unix), not(windows)))]
-fn configure_formatter_process(_command: &mut Command) {}
-
-#[cfg(unix)]
-fn terminate_process_id(pid: u32) {
-    let pid = pid as libc::pid_t;
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
-        libc::kill(pid, libc::SIGKILL);
-    }
-}
-
-type PipeReadResult = Result<Vec<u8>, String>;
-type StdinWriteResult = Result<(), String>;
-
-fn spawn_stdin_writer(
-    mut stdin: impl Write + Send + 'static,
-    input: Vec<u8>,
-) -> JoinHandle<StdinWriteResult> {
-    thread::spawn(move || stdin.write_all(&input).map_err(|err| err.to_string()))
-}
-
-fn collect_stdin_writer(
-    worker: JoinHandle<StdinWriteResult>,
-    command: &FormatterCommand,
-    child: &mut FormatterProcess,
-) -> Result<(), String> {
-    let timed_out = !worker_finished_within(&worker, FORMATTER_READER_GRACE);
-    let cleanup = timed_out.then(|| terminate_and_wait_for_formatter(child));
-    match worker.join() {
-        Ok(Ok(())) if !timed_out => Ok(()),
-        Ok(Ok(())) => Err(format!(
-            "formatter `{}` did not finish reading stdin{}",
-            command_line_for_message(command),
-            cleanup_error_suffix(cleanup.expect("timeout cleanup must exist"))
-        )),
-        Ok(Err(err)) => Err(format!(
-            "failed to write document to formatter `{}`: {err}",
-            command_line_for_message(command)
-        )),
-        Err(_) => Err(format!(
-            "formatter `{}` stdin writer panicked",
-            command_line_for_message(command)
-        )),
-    }
-}
-
-fn spawn_pipe_reader(pipe: impl Read + Send + 'static, limit: usize) -> JoinHandle<PipeReadResult> {
-    thread::spawn(move || read_pipe_limited(pipe, limit))
-}
-
-fn collect_pipe(
-    name: &str,
-    worker: JoinHandle<PipeReadResult>,
-    command: &FormatterCommand,
-    child: &mut FormatterProcess,
-) -> Result<Vec<u8>, String> {
-    let timed_out = !worker_finished_within(&worker, FORMATTER_READER_GRACE);
-    let cleanup = timed_out.then(|| terminate_and_wait_for_formatter(child));
-    match worker.join() {
-        Ok(Ok(bytes)) if !timed_out => Ok(bytes),
-        Ok(Ok(_)) => Err(format!(
-            "formatter `{}` did not close {name}{}",
-            command_line_for_message(command),
-            cleanup_error_suffix(cleanup.expect("timeout cleanup must exist"))
-        )),
-        Ok(Err(err)) => Err(format!(
-            "failed to read formatter `{}` {name}: {err}",
-            command_line_for_message(command)
-        )),
-        Err(_) => Err(format!(
-            "formatter `{}` {name} reader panicked",
-            command_line_for_message(command)
-        )),
-    }
-}
-
-fn worker_finished_within<T>(worker: &JoinHandle<T>, timeout: Duration) -> bool {
-    let started = Instant::now();
-    while !worker.is_finished() && started.elapsed() < timeout {
-        thread::sleep(Duration::from_millis(10));
-    }
-    worker.is_finished()
-}
-
-fn read_pipe_limited(mut pipe: impl Read, limit: usize) -> PipeReadResult {
-    let mut bytes = Vec::new();
-    let mut buf = [0; 8192];
-    loop {
-        let read = pipe.read(&mut buf).map_err(|err| err.to_string())?;
-        if read == 0 {
-            return Ok(bytes);
-        }
-        if bytes.len().saturating_add(read) > limit {
-            return Err(format!("output exceeded {} bytes", limit));
-        }
-        bytes.extend_from_slice(&buf[..read]);
-    }
 }
 
 fn max_stdout_bytes(input_len: usize) -> usize {
@@ -981,14 +442,6 @@ fn formatter_relative_file(project: &dyn Project, file: &ProjectFile) -> PathBuf
         .strip_prefix(&workspace_root)
         .map(Path::to_path_buf)
         .unwrap_or_else(|_| file.rel_path().to_path_buf())
-}
-
-fn format_duration(duration: Duration) -> String {
-    if duration.as_secs() > 0 {
-        format!("{} seconds", duration.as_secs())
-    } else {
-        format!("{} milliseconds", duration.as_millis())
-    }
 }
 
 fn expand_placeholders(value: &str, context: &FormatContext<'_>) -> String {
@@ -1395,7 +848,7 @@ mod tests {
 
     #[test]
     fn formatter_pipe_reader_rejects_oversized_output() {
-        let error = read_pipe_limited(&b"abcdef"[..], 5).unwrap_err();
+        let error = crate::process::read_limited(&b"abcdef"[..], 5).unwrap_err();
         assert!(error.contains("exceeded 5 bytes"), "{error}");
     }
 

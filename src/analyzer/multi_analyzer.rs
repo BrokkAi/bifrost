@@ -165,7 +165,11 @@ impl AnalyzerDelegate {
     }
 
     fn needs_config_update_for(&self, file: &ProjectFile) -> bool {
-        matches!(self, Self::JavaScript(_) | Self::TypeScript(_)) && is_js_ts_config_file(file)
+        match self {
+            Self::Java(_) => crate::analyzer::java::is_java_dependency_input(file),
+            Self::JavaScript(_) | Self::TypeScript(_) => is_js_ts_config_file(file),
+            _ => false,
+        }
     }
 
     pub(crate) fn update_all(&self) -> Self {
@@ -950,6 +954,25 @@ mod tests {
         )));
         assert!(!is_js_ts_config_file(&project_file("package.json")));
         assert!(!is_js_ts_config_file(&project_file("src/app.ts")));
+    }
+
+    #[test]
+    fn java_build_inputs_are_routed_as_delegate_relevant_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = FileSetProject::new(
+            temp.path().canonicalize().unwrap(),
+            std::iter::empty::<std::path::PathBuf>(),
+        );
+        let delegate = AnalyzerDelegate::Java(JavaAnalyzer::from_project(project));
+        assert!(delegate.needs_config_update_for(&project_file("pom.xml")));
+        assert!(
+            delegate
+                .needs_config_update_for(&project_file("gradle/dependency-locks/runtime.lockfile"))
+        );
+        assert!(
+            delegate.needs_config_update_for(&project_file("buildSrc/src/main/java/Plugin.java"))
+        );
+        assert!(!delegate.needs_config_update_for(&project_file("src/App.java")));
     }
 
     #[test]

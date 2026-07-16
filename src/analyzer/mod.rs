@@ -48,8 +48,8 @@ pub(crate) use capabilities::{
     resolve_imported_files_from_infos,
 };
 pub use config::{
-    AnalyzerConfig, JavaAnalyzerConfig, JavaExternalArtifact, JavaExternalDependencies,
-    JavaMavenCoordinate,
+    AnalyzerConfig, JavaAnalyzerConfig, JavaDependencyDiscoveryConfig, JavaDependencyDiscoveryMode,
+    JavaExternalArtifact, JavaExternalDependencies, JavaMavenCoordinate,
 };
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
