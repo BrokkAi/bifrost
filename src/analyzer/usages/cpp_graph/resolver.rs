@@ -489,42 +489,26 @@ impl VisibilityIndex {
         roots: &HashSet<ProjectFile>,
         cancellation: Option<&CancellationToken>,
     ) -> Self {
-        let mut files = HashSet::default();
         let include_targets = cpp.include_target_index();
-        for file in roots {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                break;
-            }
-            collect_include_closure(analyzer, include_targets, file, &mut files, cancellation);
-        }
-        let declarations_by_file: HashMap<ProjectFile, BTreeSet<CodeUnit>> = files
-            .iter()
-            .take_while(|_| !cancellation.is_some_and(CancellationToken::is_cancelled))
-            .map(|file| (file.clone(), analyzer.declarations(file)))
-            .collect();
-        let mut visible_by_file = HashMap::default();
-        for file in roots {
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                break;
-            }
-            let mut visited = HashSet::default();
-            let mut visible = HashSet::default();
-            collect_visible_declarations(
-                analyzer,
-                include_targets,
-                &declarations_by_file,
-                file,
-                &mut visited,
-                &mut visible,
-                cancellation,
-            );
-            visible_by_file.insert(file.clone(), visible);
-        }
+        let (include_graph, visible_by_file) = build_visibility_data(
+            roots,
+            cancellation,
+            |file| {
+                let imports = analyzer.import_statements(file);
+                cpp_include_paths(&imports)
+                    .into_iter()
+                    .flat_map(|include| {
+                        resolve_include_targets_with_index(file, &include, include_targets)
+                    })
+                    .collect()
+            },
+            |file| analyzer.declarations(file),
+        );
         let visible_by_identifier = build_visible_identifier_index(&visible_by_file);
         Self {
             visible_by_file,
             visible_by_identifier,
-            alias_source_files: files,
+            alias_source_files: include_graph.into_files(),
             aliases_by_file: OnceLock::new(),
             field_type_facts: Mutex::new(HashMap::default()),
             structured_alias_targets: Mutex::new(HashMap::default()),
@@ -1144,6 +1128,92 @@ impl VisibilityIndex {
     }
 }
 
+#[derive(Default)]
+struct IncludeGraph {
+    targets_by_file: HashMap<ProjectFile, Vec<ProjectFile>>,
+}
+
+impl IncludeGraph {
+    fn extend_with<F>(
+        &mut self,
+        root: &ProjectFile,
+        cancellation: Option<&CancellationToken>,
+        targets_for: &mut F,
+    ) where
+        F: FnMut(&ProjectFile) -> Vec<ProjectFile>,
+    {
+        let mut stack = vec![root.clone()];
+        while let Some(file) = stack.pop() {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                break;
+            }
+            if self.targets_by_file.contains_key(&file) {
+                continue;
+            }
+            let targets = targets_for(&file);
+            stack.extend(targets.iter().cloned());
+            self.targets_by_file.insert(file, targets);
+        }
+    }
+
+    fn files(&self) -> impl Iterator<Item = &ProjectFile> {
+        self.targets_by_file.keys()
+    }
+
+    fn into_files(self) -> HashSet<ProjectFile> {
+        self.targets_by_file.into_keys().collect()
+    }
+
+    fn targets(&self, file: &ProjectFile) -> &[ProjectFile] {
+        self.targets_by_file
+            .get(file)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+}
+
+fn build_visibility_data<F, D>(
+    roots: &HashSet<ProjectFile>,
+    cancellation: Option<&CancellationToken>,
+    mut targets_for: F,
+    mut declarations_for: D,
+) -> (IncludeGraph, HashMap<ProjectFile, HashSet<CodeUnit>>)
+where
+    F: FnMut(&ProjectFile) -> Vec<ProjectFile>,
+    D: FnMut(&ProjectFile) -> BTreeSet<CodeUnit>,
+{
+    let mut include_graph = IncludeGraph::default();
+    for file in roots {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            break;
+        }
+        include_graph.extend_with(file, cancellation, &mut targets_for);
+    }
+    let declarations_by_file: HashMap<ProjectFile, BTreeSet<CodeUnit>> = include_graph
+        .files()
+        .take_while(|_| !cancellation.is_some_and(CancellationToken::is_cancelled))
+        .map(|file| (file.clone(), declarations_for(file)))
+        .collect();
+    let mut visible_by_file = HashMap::default();
+    for file in roots {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            break;
+        }
+        let mut visited = HashSet::default();
+        let mut visible = HashSet::default();
+        collect_visible_declarations(
+            &include_graph,
+            &declarations_by_file,
+            file,
+            &mut visited,
+            &mut visible,
+            cancellation,
+        );
+        visible_by_file.insert(file.clone(), visible);
+    }
+    (include_graph, visible_by_file)
+}
+
 pub(super) enum VisibleMemberResolution {
     Callable(Vec<CodeUnit>),
     NonCallable,
@@ -1650,9 +1720,8 @@ pub(super) fn collect_include_closure(
     }
 }
 
-pub(super) fn collect_visible_declarations(
-    analyzer: &dyn IAnalyzer,
-    include_targets: &IncludeTargetIndex,
+fn collect_visible_declarations(
+    include_graph: &IncludeGraph,
     declarations_by_file: &HashMap<ProjectFile, BTreeSet<CodeUnit>>,
     file: &ProjectFile,
     visited: &mut HashSet<ProjectFile>,
@@ -1670,12 +1739,7 @@ pub(super) fn collect_visible_declarations(
         if let Some(declarations) = declarations_by_file.get(&file) {
             out.extend(declarations.iter().cloned());
         }
-        let imports = analyzer.import_statements(&file);
-        for include in cpp_include_paths(&imports) {
-            for target in resolve_include_targets_with_index(&file, &include, include_targets) {
-                stack.push(target);
-            }
-        }
+        stack.extend(include_graph.targets(&file).iter().cloned());
     }
 }
 
@@ -3346,6 +3410,77 @@ pub(super) fn same_logical_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visibility_build_hydrates_overlapping_closures_once_and_preserves_root_visibility() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let left = ProjectFile::new(root.clone(), "left.cpp");
+        let right = ProjectFile::new(root.clone(), "right.cpp");
+        let shared = ProjectFile::new(root.clone(), "shared.h");
+        let leaf = ProjectFile::new(root.clone(), "leaf.h");
+        let right_only = ProjectFile::new(root, "right_only.h");
+
+        let adjacency = HashMap::from_iter([
+            (left.clone(), vec![shared.clone()]),
+            (right.clone(), vec![shared.clone(), right_only.clone()]),
+            (shared.clone(), vec![leaf.clone()]),
+            (leaf.clone(), Vec::new()),
+            (right_only.clone(), Vec::new()),
+        ]);
+        let declarations_by_file: HashMap<_, _> = [
+            (left.clone(), "Left"),
+            (right.clone(), "Right"),
+            (shared.clone(), "Shared"),
+            (leaf.clone(), "Leaf"),
+            (right_only.clone(), "RightOnly"),
+        ]
+        .into_iter()
+        .map(|(file, name)| {
+            let declaration = CodeUnit::new(file.clone(), CodeUnitType::Class, "", name);
+            (file, BTreeSet::from([declaration]))
+        })
+        .collect();
+
+        let roots = HashSet::from_iter([left.clone(), right.clone()]);
+        let mut include_discovery_counts = HashMap::<ProjectFile, usize>::default();
+        let (_include_graph, visible_by_file) = build_visibility_data(
+            &roots,
+            None,
+            |file| {
+                *include_discovery_counts.entry(file.clone()).or_default() += 1;
+                adjacency.get(file).cloned().unwrap_or_default()
+            },
+            |file| declarations_by_file.get(file).cloned().unwrap_or_default(),
+        );
+
+        assert_eq!(include_discovery_counts.len(), adjacency.len());
+        assert!(
+            include_discovery_counts.values().all(|count| *count == 1),
+            "the complete visibility build must discover each union-closure file exactly once: \
+             {include_discovery_counts:#?}"
+        );
+        assert_eq!(include_discovery_counts.get(&shared), Some(&1));
+        assert_eq!(include_discovery_counts.get(&leaf), Some(&1));
+
+        let visible_names = |root: &ProjectFile| {
+            visible_by_file
+                .get(root)
+                .into_iter()
+                .flatten()
+                .map(|unit| unit.identifier().to_string())
+                .collect::<HashSet<_>>()
+        };
+
+        assert_eq!(
+            visible_names(&left),
+            HashSet::from_iter(["Left", "Shared", "Leaf"].map(str::to_string))
+        );
+        assert_eq!(
+            visible_names(&right),
+            HashSet::from_iter(["Right", "Shared", "Leaf", "RightOnly"].map(str::to_string))
+        );
+    }
 
     fn visibility_index(
         visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
