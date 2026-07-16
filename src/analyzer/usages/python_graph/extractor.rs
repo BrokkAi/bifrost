@@ -10,7 +10,10 @@ use crate::analyzer::usages::python_graph::resolver::{
     member_name, normalized_receiver_type, receiver_annotation_matches_target,
     resolve_receiver_type, target_owner_code_unit, top_level_identifier,
 };
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, PythonAnalyzer, Range};
+use crate::analyzer::{
+    CodeUnit, IAnalyzer, ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline,
+    ProjectFile, PythonAnalyzer, Range,
+};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
@@ -155,8 +158,11 @@ pub(super) fn scan_files_for_seeds(
         }
 
         let edges = py.usage_matching_edges(file, seeds);
+        let raw_module_bindings = py.usage_module_binding_timeline(file, || {
+            collect_module_binding_timeline(tree_ref.root_node(), source_str)
+        });
         let module_bindings =
-            collect_module_binding_timeline(py, file, tree_ref.root_node(), source_str, seeds);
+            classify_module_binding_timeline(py, file, raw_module_bindings.as_ref(), seeds);
         let target_self_file = *file == target.source();
         let scope_facts = collect_scope_facts_from_parsed_source(
             analyzer,
@@ -241,7 +247,7 @@ pub(super) struct ScanCtx<'a> {
     /// an un-inferrable `recv` unambiguously means the target). Cross-file
     /// untyped receivers stay conservative.
     member_best_effort_unique: bool,
-    module_bindings: &'a HashMap<String, Vec<ModuleBindingEvent>>,
+    module_bindings: &'a HashMap<String, Vec<ClassifiedModuleBindingEvent>>,
     scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
     scope_range_index: &'a [ScopeRangeEntry],
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
@@ -745,19 +751,13 @@ enum ModuleBindingKind {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct ModuleBindingEvent {
+struct ClassifiedModuleBindingEvent {
     visible_from: usize,
     kind: ModuleBindingKind,
 }
 
-fn collect_module_binding_timeline(
-    py: &PythonAnalyzer,
-    file: &ProjectFile,
-    root: Node<'_>,
-    source: &str,
-    seeds: &BTreeSet<(ProjectFile, String)>,
-) -> HashMap<String, Vec<ModuleBindingEvent>> {
-    let mut timeline: HashMap<String, Vec<ModuleBindingEvent>> = HashMap::default();
+fn collect_module_binding_timeline(root: Node<'_>, source: &str) -> ModuleBindingTimeline {
+    let mut timeline = ModuleBindingTimeline::default();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         match node.kind() {
@@ -767,13 +767,13 @@ fn collect_module_binding_timeline(
                         &mut timeline,
                         slice(name, source),
                         node.end_byte(),
-                        ModuleBindingKind::Other,
+                        ModuleBindingEventKind::Other,
                     );
                 }
                 continue;
             }
             "import_statement" | "import_from_statement" => {
-                collect_import_binding_events(py, file, node, source, seeds, &mut timeline);
+                collect_import_binding_events(node, source, &mut timeline);
                 continue;
             }
             "assignment" | "augmented_assignment" | "named_expression" => {
@@ -802,12 +802,9 @@ fn collect_module_binding_timeline(
 }
 
 fn collect_import_binding_events(
-    py: &PythonAnalyzer,
-    file: &ProjectFile,
     node: Node<'_>,
     source: &str,
-    seeds: &BTreeSet<(ProjectFile, String)>,
-    timeline: &mut HashMap<String, Vec<ModuleBindingEvent>>,
+    timeline: &mut ModuleBindingTimeline,
 ) {
     if node.kind() == "import_statement" {
         let mut cursor = node.walk();
@@ -820,19 +817,11 @@ fn collect_import_binding_events(
                 continue;
             };
             let module = slice(name, source).trim();
-            let target_import = py
-                .usage_resolve_module_files(file, module)
-                .iter()
-                .any(|resolved| seeds.iter().any(|(seed_file, _)| seed_file == resolved));
             record_module_binding(
                 timeline,
                 slice(local, source),
                 node.end_byte(),
-                if target_import {
-                    ModuleBindingKind::TargetImport
-                } else {
-                    ModuleBindingKind::Other
-                },
+                ModuleBindingEventKind::ImportModule(module.to_string()),
             );
         }
         return;
@@ -842,7 +831,6 @@ fn collect_import_binding_events(
         return;
     };
     let module = slice(module_node, source).trim();
-    let module_files = py.usage_resolve_module_files(file, module);
     let mut cursor = node.walk();
     for imported in node.children_by_field_name("name", &mut cursor) {
         if imported.kind() == "wildcard_import" {
@@ -859,36 +847,87 @@ fn collect_import_binding_events(
         else {
             continue;
         };
-        let direct_target = module_files
-            .iter()
-            .any(|resolved| seeds.contains(&(resolved.clone(), imported_name.to_string())));
-        let submodule = if module.ends_with('.') {
-            format!("{module}{imported_name}")
-        } else {
-            format!("{module}.{imported_name}")
-        };
-        let submodule_target = py
-            .usage_resolve_module_files(file, &submodule)
-            .iter()
-            .any(|resolved| seeds.iter().any(|(seed_file, _)| seed_file == resolved));
         record_module_binding(
             timeline,
             slice(local, source),
             node.end_byte(),
-            if direct_target || submodule_target {
-                ModuleBindingKind::TargetImport
-            } else {
-                ModuleBindingKind::Other
+            ModuleBindingEventKind::FromImport {
+                module: module.to_string(),
+                imported_name: imported_name.to_string(),
             },
         );
     }
 }
 
+fn classify_module_binding_timeline(
+    py: &PythonAnalyzer,
+    file: &ProjectFile,
+    timeline: &ModuleBindingTimeline,
+    seeds: &BTreeSet<(ProjectFile, String)>,
+) -> HashMap<String, Vec<ClassifiedModuleBindingEvent>> {
+    let mut classified = HashMap::default();
+    let mut module_targets: HashMap<String, bool> = HashMap::default();
+    for (local, events) in timeline {
+        let classified_events = events
+            .iter()
+            .map(|event| {
+                let targets_query = match &event.kind {
+                    ModuleBindingEventKind::ImportModule(module) => *module_targets
+                        .entry(module.clone())
+                        .or_insert_with(|| module_contains_seed(py, file, module, seeds)),
+                    ModuleBindingEventKind::FromImport {
+                        module,
+                        imported_name,
+                    } => {
+                        let direct =
+                            py.usage_resolve_module_files(file, module)
+                                .iter()
+                                .any(|resolved| {
+                                    seeds.contains(&(resolved.clone(), imported_name.clone()))
+                                });
+                        let submodule = if module.ends_with('.') {
+                            format!("{module}{imported_name}")
+                        } else {
+                            format!("{module}.{imported_name}")
+                        };
+                        direct
+                            || *module_targets.entry(submodule.clone()).or_insert_with(|| {
+                                module_contains_seed(py, file, &submodule, seeds)
+                            })
+                    }
+                    ModuleBindingEventKind::Other => false,
+                };
+                ClassifiedModuleBindingEvent {
+                    visible_from: event.visible_from,
+                    kind: if targets_query {
+                        ModuleBindingKind::TargetImport
+                    } else {
+                        ModuleBindingKind::Other
+                    },
+                }
+            })
+            .collect();
+        classified.insert(local.clone(), classified_events);
+    }
+    classified
+}
+
+fn module_contains_seed(
+    py: &PythonAnalyzer,
+    file: &ProjectFile,
+    module: &str,
+    seeds: &BTreeSet<(ProjectFile, String)>,
+) -> bool {
+    py.usage_resolve_module_files(file, module)
+        .iter()
+        .any(|resolved| seeds.iter().any(|(seed_file, _)| seed_file == resolved))
+}
+
 fn record_module_binding(
-    timeline: &mut HashMap<String, Vec<ModuleBindingEvent>>,
+    timeline: &mut ModuleBindingTimeline,
     name: &str,
     visible_from: usize,
-    kind: ModuleBindingKind,
+    kind: ModuleBindingEventKind,
 ) {
     let name = name.trim();
     if name.is_empty() {
@@ -904,7 +943,7 @@ fn record_local_binding_targets(
     target: Node<'_>,
     source: &str,
     visible_from: usize,
-    timeline: &mut HashMap<String, Vec<ModuleBindingEvent>>,
+    timeline: &mut ModuleBindingTimeline,
 ) {
     let mut stack = vec![target];
     while let Some(node) = stack.pop() {
@@ -913,7 +952,7 @@ fn record_local_binding_targets(
                 timeline,
                 slice(node, source),
                 visible_from,
-                ModuleBindingKind::Other,
+                ModuleBindingEventKind::Other,
             );
             continue;
         }

@@ -107,6 +107,7 @@ pub use project::{
     Project, TestProject, collect_workspace_files,
 };
 pub use python::PythonAnalyzer;
+pub(crate) use python::{ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline};
 pub use ruby::RubyAnalyzer;
 pub(crate) use ruby::RubySemanticFacts;
 pub(crate) use rust::rust_is_field_declaration_name;
