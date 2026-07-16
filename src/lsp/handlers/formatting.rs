@@ -878,15 +878,30 @@ mod tests {
     fn formatter_executor_reports_failure_stderr() {
         let temp = tempfile::tempdir().unwrap();
         let stub = temp.path().join("stub-fail");
-        stub_command(&stub, "#!/bin/sh\necho nope >&2\nexit 7\n");
+        stub_command(&stub, "#!/bin/sh\nexec 0<&-\necho nope >&2\nexit 7\n");
         let command = FormatterCommand {
             command: stub.display().to_string(),
             args: Vec::new(),
             cwd: temp.path().to_path_buf(),
         };
-        let error = run_test_formatter(&command, "hello\n").unwrap_err();
+        let error = run_test_formatter(&command, &"x".repeat(256 * 1024)).unwrap_err();
         assert!(error.contains("exited with status"), "{error}");
         assert!(error.contains("nope"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn formatter_executor_reports_broken_stdin_for_successful_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("stub-close-stdin");
+        stub_command(&stub, "#!/bin/sh\nexec 0<&-\nexit 0\n");
+        let command = FormatterCommand {
+            command: stub.display().to_string(),
+            args: Vec::new(),
+            cwd: temp.path().to_path_buf(),
+        };
+        let error = run_test_formatter(&command, &"x".repeat(256 * 1024)).unwrap_err();
+        assert!(error.contains("failed to write stdin"), "{error}");
     }
 
     #[test]
