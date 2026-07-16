@@ -7340,3 +7340,242 @@ void consume() {
         "lexical alpha Outer qualifier must not leak to beta.Outer: {hits_by_overload:#?}"
     );
 }
+
+#[test]
+fn authoritative_cpp_template_alias_resolves_to_canonical_type() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "canonical.h",
+            r#"#pragma once
+namespace jni_zero {
+template <typename T>
+class ScopedJavaGlobalRef {};
+class Plain {};
+}
+"#,
+        )
+        .file(
+            "aliases.h",
+            r#"#pragma once
+#include "canonical.h"
+namespace base::android {
+using Plain = jni_zero::Plain;
+template <typename T>
+using ScopedJavaGlobalRef = jni_zero::ScopedJavaGlobalRef<T>;
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "aliases.h"
+namespace content {
+struct Params {
+    base::android::Plain plain;
+    base::android::ScopedJavaGlobalRef<int> java_ref;
+};
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let terminal_start = source
+        .find("ScopedJavaGlobalRef")
+        .expect("template alias terminal");
+    let line_start = source[..terminal_start]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let line = source[..terminal_start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let column = source[line_start..terminal_start].chars().count() + 1;
+    let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+        &analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "consumer.cc".to_string(),
+                line: Some(line),
+                column: Some(column),
+            }],
+        },
+    );
+    let forward_result = &forward.results[0];
+    assert_eq!("resolved", forward_result.status, "{forward_result:#?}");
+    assert!(
+        forward_result.definitions.iter().any(|definition| {
+            definition.fqn.as_deref() == Some("jni_zero.ScopedJavaGlobalRef")
+        }),
+        "template alias terminal must forward-resolve to the canonical template: {forward_result:#?}"
+    );
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let canonical_target = |fq_name: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Class && unit.fq_name() == fq_name && !unit.is_synthetic()
+        })
+    };
+    let plain_target = canonical_target("jni_zero.Plain");
+    let template_target = canonical_target("jni_zero.ScopedJavaGlobalRef");
+    let exact_hits = |target: &CodeUnit| {
+        let query = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(target),
+                Some(&provider),
+                1,
+                1000,
+            );
+        assert_eq!(
+            query.candidate_files,
+            std::iter::once(consumer.clone()).collect(),
+            "authoritative query must scan only consumer.cc"
+        );
+        let FuzzyResult::Success {
+            hits_by_overload, ..
+        } = query.result
+        else {
+            panic!("expected authoritative alias query success for {target:#?}");
+        };
+        hits_by_overload
+            .get(target)
+            .into_iter()
+            .flatten()
+            .map(|hit| {
+                assert_eq!(hit.file, consumer);
+                (hit.start_offset, hit.end_offset)
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    let plain = "base::android::Plain";
+    let plain_start = source.find(plain).expect("plain alias type");
+    let template_alias = "base::android::ScopedJavaGlobalRef<int>";
+    let template_start = source
+        .find(template_alias)
+        .expect("qualified template alias type");
+
+    assert_eq!(
+        exact_hits(&plain_target),
+        BTreeSet::from([(plain_start, plain_start + plain.len())]),
+        "non-template alias control must remain canonical and exclude declarator plain"
+    );
+    assert_eq!(
+        exact_hits(&template_target),
+        BTreeSet::from([(template_start, template_start + template_alias.len(),)]),
+        "qualified template alias must hit the canonical template exactly and exclude java_ref"
+    );
+}
+
+#[test]
+fn authoritative_cpp_template_alias_ambiguity_and_cycle_fail_closed() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "canonical.h",
+            r#"#pragma once
+namespace canonical {
+template <typename T> class Left {};
+template <typename T> class Right {};
+template <typename T> class Loop {};
+}
+"#,
+        )
+        .file(
+            "left.h",
+            r#"#pragma once
+#include "canonical.h"
+namespace api {
+template <typename T> using Choice = canonical::Left<T>;
+}
+"#,
+        )
+        .file(
+            "right.h",
+            r#"#pragma once
+#include "canonical.h"
+namespace api {
+template <typename T> using Choice = canonical::Right<T>;
+}
+"#,
+        )
+        .file(
+            "cycle.h",
+            r#"#pragma once
+namespace cycle {
+template <typename T> using Loop = Loop<T>;
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "left.h"
+#include "right.h"
+#include "cycle.h"
+void consume() {
+    api::Choice<int> ambiguous;
+    cycle::Loop<int> cyclic;
+    canonical::Left<int> left_control;
+    canonical::Right<int> right_control;
+    canonical::Loop<int> loop_control;
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let exact_hits = |fq_name: &str| {
+        let target = definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Class && unit.fq_name() == fq_name && !unit.is_synthetic()
+        });
+        let result = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1,
+                1000,
+            )
+            .result;
+        let FuzzyResult::Success {
+            hits_by_overload, ..
+        } = result
+        else {
+            panic!("expected authoritative fail-closed alias query for {target:#?}");
+        };
+        hits_by_overload
+            .get(&target)
+            .into_iter()
+            .flatten()
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect::<BTreeSet<_>>()
+    };
+    let range = |token: &str| {
+        let start = source
+            .find(token)
+            .unwrap_or_else(|| panic!("missing fixture token {token}"));
+        (start, start + token.len())
+    };
+
+    assert_eq!(
+        exact_hits("canonical.Left"),
+        BTreeSet::from([range("canonical::Left<int>")]),
+        "conflicting template aliases must not choose Left"
+    );
+    assert_eq!(
+        exact_hits("canonical.Right"),
+        BTreeSet::from([range("canonical::Right<int>")]),
+        "conflicting template aliases must not choose Right"
+    );
+    assert_eq!(
+        exact_hits("canonical.Loop"),
+        BTreeSet::from([range("canonical::Loop<int>")]),
+        "a cyclic template alias must not fan out by terminal name"
+    );
+}

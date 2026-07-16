@@ -592,6 +592,7 @@ impl<'a> CppVisitor<'a> {
                             | "function_definition"
                             | "declaration"
                             | "field_declaration"
+                            | "alias_declaration"
                             | "namespace_definition"
                     ) {
                         let mut template_scope = scope.clone();

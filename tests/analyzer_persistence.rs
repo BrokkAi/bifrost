@@ -621,6 +621,60 @@ fn warm_multilanguage_cpp_include_query_is_candidate_bounded() {
 }
 
 #[test]
+fn warm_cpp_template_alias_unit_round_trips_with_namespace_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "canonical.h",
+        "namespace jni_zero { template <typename T> class ScopedJavaGlobalRef {}; }\n",
+    );
+    write_file(
+        root,
+        "aliases.h",
+        r#"#include "canonical.h"
+namespace base::android {
+template <typename T = int>
+using ScopedJavaGlobalRef = jni_zero::ScopedJavaGlobalRef<T>;
+}
+"#,
+    );
+    let repo = init_git_repo(root);
+    commit_all(&repo, "init");
+    let project = language_python_project(root, Language::Cpp);
+
+    let _cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let warm_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let warm =
+        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
+            let events = Arc::clone(&warm_events);
+            move |event| events.lock().unwrap().push(event)
+        });
+    assert_eq!(
+        parsed_file_count(&warm_events.lock().unwrap()),
+        0,
+        "warm build must hydrate the alias unit from the analyzer store"
+    );
+    let analyzer = warm.analyzer();
+    let aliases = analyzer.get_definitions("base::android.ScopedJavaGlobalRef");
+    assert_eq!(aliases.len(), 1, "persisted alias units: {aliases:#?}");
+    let alias = &aliases[0];
+    assert_eq!(alias.package_name(), "base::android");
+    assert_eq!(alias.identifier(), "ScopedJavaGlobalRef");
+    assert!(!alias.is_synthetic());
+    assert!(
+        analyzer
+            .type_alias_provider()
+            .is_some_and(|provider| provider.is_type_alias(alias)),
+        "hydrated unit must retain persisted type-alias classification"
+    );
+    assert_eq!(
+        analyzer.get_source(alias, false).as_deref(),
+        Some("using ScopedJavaGlobalRef = jni_zero::ScopedJavaGlobalRef<T>;")
+    );
+}
+
+#[test]
 fn warm_multilanguage_java_imported_receiver_query_is_candidate_bounded() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

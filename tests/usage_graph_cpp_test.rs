@@ -189,6 +189,80 @@ void consume() {
 }
 
 #[test]
+fn template_alias_type_reference_edges_once_to_the_canonical_template() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "canonical.h",
+            r#"#pragma once
+namespace jni_zero {
+template <typename T>
+class ScopedJavaGlobalRef {};
+class Plain {};
+}
+"#,
+        )
+        .file(
+            "aliases.h",
+            r#"#pragma once
+#include "canonical.h"
+namespace base::android {
+using Plain = jni_zero::Plain;
+template <typename T = int>
+using ScopedJavaGlobalRef = jni_zero::ScopedJavaGlobalRef<T>;
+}
+"#,
+        )
+        .file(
+            "consumer.cpp",
+            r#"#include "aliases.h"
+namespace content {
+void consume() {
+    base::android::Plain plain;
+    base::android::ScopedJavaGlobalRef<int> java_ref;
+}
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    let edges_to = |target: &str| {
+        value["edges"]
+            .as_array()
+            .expect("edges array")
+            .iter()
+            .filter(|edge| {
+                edge["from"].as_str() == Some("content.consume")
+                    && edge["to"].as_str() == Some(target)
+            })
+            .collect::<Vec<_>>()
+    };
+    let template_edges = edges_to("jni_zero.ScopedJavaGlobalRef");
+    let plain_edges = edges_to("jni_zero.Plain");
+
+    assert_eq!(
+        template_edges.len(),
+        1,
+        "template alias must produce one canonical edge: {}",
+        value["edges"]
+    );
+    assert_eq!(template_edges[0]["weight"].as_u64(), Some(1));
+    assert_eq!(
+        plain_edges.len(),
+        1,
+        "non-template alias control must retain its canonical edge: {}",
+        value["edges"]
+    );
+    assert_eq!(plain_edges[0]["weight"].as_u64(), Some(1));
+    assert!(
+        edges_to("base::android.ScopedJavaGlobalRef").is_empty()
+            && edges_to("base::android.Plain").is_empty(),
+        "alias declarations and declarator names must not become graph targets: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn out_of_line_member_definition_qualifiers_edge_to_class() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

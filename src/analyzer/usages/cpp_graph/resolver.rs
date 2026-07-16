@@ -1211,6 +1211,7 @@ fn alias_has_visible_file_scope(node: Node<'_>) -> bool {
             | "namespace_definition"
             | "declaration_list"
             | "linkage_specification" => current = parent.parent(),
+            "template_declaration" => current = parent.parent(),
             _ => return false,
         }
     }

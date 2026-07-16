@@ -2,7 +2,7 @@ mod common;
 
 use brokk_bifrost::{
     CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, Project,
-    ProjectFile, TestProject, TypeHierarchyProvider,
+    ProjectFile, TestProject, TypeAliasProvider, TypeHierarchyProvider,
 };
 use common::{InlineTestProject, assert_code_eq, cpp_fixture_project};
 use std::collections::BTreeSet;
@@ -1724,4 +1724,67 @@ fn test_inline_template_class_constructor_signatures() {
             .any(|sig| sig.contains("size_t... Idxs") || sig.contains("class... ValueTypes"))
     );
     assert!(signatures.iter().any(|sig| sig.contains("<class T>")));
+}
+
+#[test]
+fn cpp_template_alias_is_indexed_once_with_lexical_namespace_identity() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "canonical.h",
+            r#"#pragma once
+namespace jni_zero {
+template <typename T>
+class ScopedJavaGlobalRef {};
+class Plain {};
+}
+"#,
+        )
+        .file(
+            "aliases.h",
+            r#"#pragma once
+#include "canonical.h"
+namespace base::android {
+using Plain = jni_zero::Plain;
+template <typename T = int>
+using ScopedJavaGlobalRef = jni_zero::ScopedJavaGlobalRef<T>;
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let aliases = analyzer
+        .get_declarations(&project.file("aliases.h"))
+        .into_iter()
+        .filter(|unit| matches!(unit.identifier(), "Plain" | "ScopedJavaGlobalRef"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        aliases.len(),
+        2,
+        "template wrapper and ordinary traversal must not emit duplicate aliases: {aliases:#?}"
+    );
+    let plain = aliases
+        .iter()
+        .find(|unit| unit.identifier() == "Plain")
+        .expect("plain alias");
+    let template = aliases
+        .iter()
+        .find(|unit| unit.identifier() == "ScopedJavaGlobalRef")
+        .expect("template alias");
+    for alias in [plain, template] {
+        assert_eq!(alias.kind(), CodeUnitType::Class);
+        assert_eq!(alias.package_name(), "base::android");
+        assert!(analyzer.is_type_alias(alias));
+        assert!(!alias.is_synthetic());
+    }
+    assert_eq!(plain.fq_name(), "base::android.Plain");
+    assert_eq!(template.fq_name(), "base::android.ScopedJavaGlobalRef");
+    assert_eq!(
+        analyzer.get_source(template, false).as_deref(),
+        Some("using ScopedJavaGlobalRef = jni_zero::ScopedJavaGlobalRef<T>;")
+    );
+    assert_eq!(
+        template.signature(),
+        Some("using ScopedJavaGlobalRef = jni_zero::ScopedJavaGlobalRef<T>;")
+    );
 }
