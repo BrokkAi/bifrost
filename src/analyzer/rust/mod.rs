@@ -62,13 +62,16 @@ crate::analyzer::impl_forward_query_provider!(RustAnalyzer);
 
 impl RustAnalyzer {
     fn indexed_sources_unchanged(&self, changed_files: &BTreeSet<ProjectFile>) -> bool {
-        changed_files.iter().all(|file| {
-            self.inner
-                .project()
-                .read_source(file)
-                .ok()
-                .is_some_and(|source| self.inner.indexed_source_matches(file, &source))
-        })
+        changed_files
+            .iter()
+            .filter(|file| file_language(file) == Language::Rust || self.inner.is_analyzed(file))
+            .all(|file| {
+                self.inner
+                    .project()
+                    .read_source(file)
+                    .ok()
+                    .is_some_and(|source| self.inner.indexed_source_matches(file, &source))
+            })
     }
 
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
