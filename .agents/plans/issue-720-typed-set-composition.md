@@ -13,7 +13,7 @@ The behavior is visible through ordinary `query_code` execution and the executab
 - [x] (2026-07-16 08:05Z) Fetched the live issue and comment, confirmed the clean issue branch is exactly aligned with current `origin/master`, and inspected the typed query IR, decoder, RQL/schema registries, executor, result/provenance model, public clients, and executable documentation harness.
 - [x] (2026-07-16 08:35Z) Chose the recursive plan-node representation and deterministic set semantics described below.
 - [x] (2026-07-16 08:55Z) Implemented recursive canonical IR, JSON/RQL parsing and rendering, path-specific typed validation, source diagnostics/help, TextMate vocabulary, recursive MCP schema, and focused frontend tests.
-- [ ] Implement shared-context branch execution, endpoint set algebra, branch provenance/diagnostics, fair branch budgets, cancellation, truncation, and identical-seed reuse (in progress: the single-leaf executor consumes the new plan shape; remaining: recursive internal-row evaluation and shared request state).
+- [x] (2026-07-16 09:45Z) Implemented shared-context recursive execution, typed endpoint set algebra, nested branch provenance/diagnostics, fair immediate-branch budgets, root-only limits, cancellation propagation, truncation, and identical canonical-seed reuse.
 - [ ] Update Rust/Python/VS Code public surfaces and add focused behavior tests for every acceptance case.
 - [ ] Add and render-verify the executable JSON/RQL cookbook and update the query references and navigation.
 - [ ] Run focused tests, formatting, strict all-feature Clippy, the full `nlp,python` suite, Python and VS Code tests, and docs check/build; review the complete diff and resolve findings.
@@ -31,6 +31,9 @@ The behavior is visible through ordinary `query_code` execution and the executab
 
 - Observation: The installed Bifrost code-navigation skills have no corresponding MCP tools in this Codex session.
   Evidence: the active tool catalog contains no `search_symbols`, `get_symbol_sources`, `scan_usages`, or related Bifrost tool, so research uses the skill-prescribed narrow `rg` and direct-file fallback.
+
+- Observation: Reusing a cached seed must still charge row-cloning work, but must not charge source scanning or fact materialization a second time.
+  Evidence: the identical-seed integration test completes two union branches with a one-file scan limit and retains both branch-labeled provenance traces.
 
 ## Decision Log
 
@@ -72,7 +75,9 @@ The behavior is visible through ordinary `query_code` execution and the executab
 
 ## Outcomes & Retrospective
 
-Milestone 1 is complete. Schema-version-2 JSON and RQL now express recursive `union`, `intersect`, and `except` nodes, allow ordinary typed steps after composition, and reject mixed sources, too few branches, branch-local output controls, incompatible domains, and inconsistent named captures at exact paths. Live source validation, hover metadata, TextMate highlighting, REPL summaries, and the MCP schema all recognize the new vocabulary. Seventy focused query/frontend tests, two MCP schema tests, `cargo check --tests`, JSON grammar validation, formatting, and diff checks pass. Execution still intentionally reports the temporary unavailable diagnostic for a composed root until Milestone 2 replaces the single-leaf executor.
+Milestones 1 and 2 are complete. Schema-version-2 JSON and RQL now express recursive `union`, `intersect`, and `except` nodes, allow ordinary typed steps after composition, and reject mixed sources, too few branches, branch-local output controls, incompatible domains, and inconsistent named captures at exact paths. Live source validation, hover metadata, TextMate highlighting, REPL summaries, and the MCP schema all recognize the new vocabulary.
+
+The executor now evaluates recursive plans over internal typed rows in one shared request context. Union, intersection, and subtraction use existing exact `PipelineKey` identities and deterministic operand order; union/intersection aggregate capped branch-labeled provenance, subtraction retains the first branch's evidence, nested paths are preserved, fair quotas reserve work for later operands, and the public result limit is applied only after composition. Identical canonical seeds reuse structural rows without rescanning files. The complete 66-test pipeline integration suite passes, including new set algebra, nesting, common suffix, provenance, cache reuse, fairness, diagnostic attribution, and global-limit coverage.
 
 ## Context and Orientation
 
@@ -173,3 +178,5 @@ Domain flow at a plan node:
 Revision note (2026-07-16): Created the initial self-contained plan after reading live issue #720, confirming the exact issue branch and remote state, and tracing the current schema-version-2 query and execution pipeline. The plan chooses recursive source nodes with step suffixes so composition remains typed and can feed later traversal.
 
 Revision note (2026-07-16): Completed Milestone 1. The final frontend shape keeps output controls root-only, supports suffix steps on every recursive node, intersects structural capture names across compatible branches, and publishes the recursive branch shape through JSON Schema `$defs`.
+
+Revision note (2026-07-16): Completed Milestone 2. Recursive execution shares structural and semantic caches and global counters, partitions remaining work across immediate branches with roll-forward, combines exact typed endpoint keys before rendering, labels nested provenance and diagnostics, and preserves the existing plain-leaf response shape.

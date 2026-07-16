@@ -2596,3 +2596,228 @@ fn reverse_import_graph_work_is_bounded_and_diagnostic() {
         result.diagnostics
     );
 }
+
+#[test]
+fn typed_set_operators_use_stable_endpoint_identity_and_branch_order() {
+    let files = [(
+        "app.py",
+        "def alpha():\n    pass\ndef beta():\n    pass\ndef gamma():\n    pass\n",
+    )];
+
+    let union = serialized(&run(
+        &files,
+        json!({
+            "union": [
+                { "match": { "kind": "function", "name": "beta" } },
+                { "match": { "kind": "function", "name": "alpha" } },
+                { "match": { "kind": "function", "name": "beta" } }
+            ]
+        }),
+    ));
+    let union_results = union["results"].as_array().unwrap();
+    assert_eq!(union_results.len(), 2, "{union}");
+    assert!(
+        union_results[0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("def beta"),
+        "{union}"
+    );
+    assert!(
+        union_results[1]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("def alpha"),
+        "{union}"
+    );
+    assert_eq!(
+        union_results[0]["provenance"][0]["branch"],
+        json!([0]),
+        "{union}"
+    );
+    assert_eq!(
+        union_results[0]["provenance"][1]["branch"],
+        json!([2]),
+        "{union}"
+    );
+
+    let intersection = serialized(&run(
+        &files,
+        json!({
+            "intersect": [
+                { "match": { "kind": "function" } },
+                { "match": { "kind": "function", "name": { "regex": "^(alpha|gamma)$" } } }
+            ]
+        }),
+    ));
+    let intersection_names = intersection["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| {
+            result["text"].as_str().unwrap()[4..]
+                .split('(')
+                .next()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(intersection_names, ["alpha", "gamma"], "{intersection}");
+
+    let difference = serialized(&run(
+        &files,
+        json!({
+            "except": [
+                { "match": { "kind": "function" } },
+                { "match": { "kind": "function", "name": "beta" } },
+                { "match": { "kind": "function", "name": "gamma" } }
+            ]
+        }),
+    ));
+    let difference_names = difference["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| {
+            result["text"].as_str().unwrap()[4..]
+                .split('(')
+                .next()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(difference_names, ["alpha"], "{difference}");
+}
+
+#[test]
+fn typed_set_composition_supports_nested_paths_and_common_typed_steps() {
+    let result = serialized(&run(
+        &[("app.py", "def alpha():\n    pass\ndef beta():\n    pass\n")],
+        json!({
+            "union": [
+                { "match": { "kind": "function", "name": "alpha" } },
+                {
+                    "intersect": [
+                        { "match": { "kind": "function", "name": "beta" } },
+                        { "match": { "kind": "function" } }
+                    ]
+                }
+            ],
+            "steps": [{ "op": "enclosing_decl" }, { "op": "file_of" }]
+        }),
+    ));
+    assert_eq!(result["results"].as_array().unwrap().len(), 1, "{result}");
+    assert_eq!(result["results"][0]["result_type"], "file", "{result}");
+    let branches = result["results"][0]["provenance"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|trace| trace["branch"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(branches, [json!([0]), json!([1, 0]), json!([1, 1])]);
+}
+
+#[test]
+fn identical_composed_seeds_share_structural_scan_work() {
+    let project = InlineTestProject::new()
+        .file("app.py", "def target():\n    pass\n")
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "union": [
+            { "match": { "kind": "function", "name": "target" } },
+            { "match": { "kind": "function", "name": "target" } }
+        ]
+    }))
+    .unwrap();
+    let result = execute_with_limits(
+        workspace.analyzer(),
+        &query,
+        CodeQueryExecutionLimits {
+            max_scanned_files: 1,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+    assert!(!result.truncated, "{:?}", result.diagnostics);
+    let value = serialized(&result);
+    assert_eq!(value["results"].as_array().unwrap().len(), 1, "{value}");
+    assert_eq!(
+        value["results"][0]["provenance"].as_array().unwrap().len(),
+        2
+    );
+}
+
+#[test]
+fn fair_branch_budgets_preserve_later_branches_and_attribute_diagnostics() {
+    let project = InlineTestProject::new()
+        .file("a.py", "def first():\n    pass\n")
+        .file("b.py", "def second():\n    pass\n")
+        .file("z.py", "def important():\n    pass\n")
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "union": [
+            { "match": { "kind": "function" } },
+            { "match": { "kind": "function", "name": "important" } }
+        ]
+    }))
+    .unwrap();
+    let result = execute_with_limits(
+        workspace.analyzer(),
+        &query,
+        CodeQueryExecutionLimits {
+            max_pipeline_rows: 3,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+    let value = serialized(&result);
+    assert!(result.truncated, "{value}");
+    assert!(
+        value["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["text"].as_str().unwrap().starts_with("def important")),
+        "{value}"
+    );
+    assert!(
+        value["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["branch"] == json!([0])
+                && diagnostic["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("pipeline budget exhausted")),
+        "{value}"
+    );
+}
+
+#[test]
+fn global_result_limit_is_applied_after_set_composition() {
+    let result = serialized(&run(
+        &[(
+            "app.py",
+            "def alpha():\n    pass\ndef beta():\n    pass\ndef gamma():\n    pass\n",
+        )],
+        json!({
+            "union": [
+                { "match": { "kind": "function", "name": "gamma" } },
+                { "match": { "kind": "function" } }
+            ],
+            "limit": 2
+        }),
+    ));
+    assert_eq!(result["truncated"], true, "{result}");
+    let names = result["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            item["text"].as_str().unwrap()[4..]
+                .split('(')
+                .next()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["gamma", "alpha"], "{result}");
+}

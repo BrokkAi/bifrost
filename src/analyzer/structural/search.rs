@@ -12,9 +12,9 @@ use super::matcher::FactMatch;
 use super::planner::QueryPlan;
 use super::query::schema::{reference_kind_label, usage_proof_label};
 use super::query::{
-    CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
+    CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery, CodeQueryPlan,
     CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed, HierarchyTraversal, QueryStep,
-    ReferenceTraversalFilter,
+    ReferenceTraversalFilter, SetOperator,
 };
 use crate::analyzer::reference_candidates::{
     ReferenceCandidateRanges, reference_candidate_ranges, reference_candidate_ranges_cancellable,
@@ -327,6 +327,8 @@ pub struct CodeQuerySourceSite {
 
 #[derive(Debug, Serialize)]
 pub struct CodeQueryProvenance {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub branch: Vec<usize>,
     pub seed: CodeQueryResultRef,
     pub steps: Vec<CodeQueryProvenanceStep>,
 }
@@ -423,8 +425,10 @@ pub struct CodeQueryRange {
     pub end_column: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CodeQueryDiagnostic {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub branch: Vec<usize>,
     pub language: &'static str,
     pub message: String,
 }
@@ -630,6 +634,7 @@ impl PipelineValue {
 
 #[derive(Debug, Clone)]
 struct PipelineTrace {
+    branch: Vec<usize>,
     seed: Arc<SeedMatch>,
     steps: Vec<PipelineTraceStep>,
 }
@@ -673,7 +678,7 @@ struct CallTraversalCache {
     bindings: CallBindingCache,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PipelineRow {
     value: PipelineValue,
     traces: Vec<PipelineTrace>,
@@ -852,6 +857,32 @@ struct CodeQueryExecutionBudget {
     provenance_steps: usize,
 }
 
+#[derive(Clone)]
+struct CachedSeedExecution {
+    rows: Vec<PipelineRow>,
+    diagnostics: Vec<CodeQueryDiagnostic>,
+}
+
+struct QueryExecutionState<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    global_limits: CodeQueryExecutionLimits,
+    cancellation: Option<&'a CancellationToken>,
+    receiver_budget_override: Option<ReceiverAnalysisBudget>,
+    budget: CodeQueryExecutionBudget,
+    seed_cache: HashMap<String, CachedSeedExecution>,
+    indexed_declarations: IndexedDeclarations,
+    reference_cache: ReferenceTraversalCache,
+    call_cache: CallTraversalCache,
+    import_graph: Option<DirectImportGraph>,
+    import_graph_budget_diagnostic_emitted: bool,
+}
+
+struct PlanExecution {
+    rows: Vec<PipelineRow>,
+    truncated: bool,
+    cancelled: bool,
+}
+
 #[doc(hidden)]
 pub fn execute_with_limits(
     analyzer: &dyn IAnalyzer,
@@ -900,36 +931,208 @@ fn execute_internal(
             results: Vec::new(),
             truncated: false,
             diagnostics: vec![CodeQueryDiagnostic {
+                branch: Vec::new(),
                 language: "workspace",
                 message: error.to_string(),
             }],
         };
     }
-    let CodeQueryPlanSource::Seed(seed) = &query.plan.source else {
-        return CodeQueryResult {
-            results: Vec::new(),
-            truncated: false,
-            diagnostics: vec![CodeQueryDiagnostic {
-                language: "workspace",
-                message: "set composition execution is not available".to_string(),
-            }],
-        };
+    let mut diagnostics = Vec::new();
+    let mut state = QueryExecutionState {
+        analyzer,
+        global_limits: limits,
+        cancellation,
+        receiver_budget_override,
+        budget: CodeQueryExecutionBudget::default(),
+        seed_cache: HashMap::default(),
+        indexed_declarations: IndexedDeclarations::default(),
+        reference_cache: ReferenceTraversalCache::default(),
+        call_cache: CallTraversalCache::default(),
+        import_graph: None,
+        import_graph_budget_diagnostic_emitted: false,
     };
-    let steps = &query.plan.steps;
+    let mut execution = execute_plan(
+        &query.plan,
+        &mut state,
+        limits,
+        Some(query.limit.saturating_add(1)),
+        &mut diagnostics,
+    );
+    if execution.cancelled || cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return cancelled_query_result();
+    }
 
+    let terminal_truncated = execution.rows.len() > query.limit;
+    if terminal_truncated {
+        push_truncation_diagnostic(&mut diagnostics, &state.budget, query.limit);
+        execution.rows.truncate(query.limit);
+    }
+    let truncated = terminal_truncated || execution.truncated;
+    // Preserve the pre-composition response shape for a plain structural
+    // query. Set plans retain their seed-only traces because the branch path
+    // is meaningful provenance even when no semantic step follows the set.
+    if query.seed().is_some() && query.plan.steps.is_empty() {
+        for row in &mut execution.rows {
+            row.traces.clear();
+            row.provenance_truncated = false;
+        }
+    }
+    if let Some(seed) = query.seed() {
+        let plan = QueryPlan::for_query(seed);
+        if should_report_broad_query(&plan, seed, &state.budget, truncated) {
+            push_broad_query_diagnostic(&mut diagnostics, &state.budget);
+        }
+    }
+    let mut render_cache = PipelineRenderCache::default();
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return cancelled_query_result();
+    }
+    let results = execution
+        .rows
+        .into_iter()
+        .map(|row| render_pipeline_item(analyzer, row, query.result_detail, &mut render_cache))
+        .collect();
+    CodeQueryResult {
+        results,
+        truncated,
+        diagnostics,
+    }
+}
+
+fn execute_plan(
+    plan: &CodeQueryPlan,
+    state: &mut QueryExecutionState<'_>,
+    limits: CodeQueryExecutionLimits,
+    terminal_cap: Option<usize>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> PlanExecution {
+    if state
+        .cancellation
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        return PlanExecution {
+            rows: Vec::new(),
+            truncated: true,
+            cancelled: true,
+        };
+    }
+
+    let mut execution = match &plan.source {
+        CodeQueryPlanSource::Seed(seed) => execute_seed(
+            seed,
+            if plan.steps.is_empty() {
+                terminal_cap
+            } else {
+                None
+            },
+            state,
+            limits,
+            diagnostics,
+        ),
+        CodeQueryPlanSource::Set { op, branches } => {
+            let mut branch_rows = Vec::with_capacity(branches.len());
+            let mut truncated = false;
+            for (index, branch) in branches.iter().enumerate() {
+                let branch_limits =
+                    fair_branch_limits(&state.budget, limits, branches.len().saturating_sub(index));
+                let diagnostic_start = diagnostics.len();
+                let mut child = execute_plan(branch, state, branch_limits, None, diagnostics);
+                prefix_branch_rows(&mut child.rows, index);
+                prefix_branch_diagnostics(&mut diagnostics[diagnostic_start..], index);
+                truncated |= child.truncated;
+                if child.cancelled {
+                    return child;
+                }
+                branch_rows.push(child.rows);
+            }
+            PlanExecution {
+                rows: combine_set_rows(*op, branch_rows),
+                truncated,
+                cancelled: false,
+            }
+        }
+    };
+
+    if execution.cancelled {
+        return execution;
+    }
+    if !plan.steps.is_empty() {
+        let (rows, truncated, cancelled) = apply_plan_steps(
+            &plan.steps,
+            execution.rows,
+            state,
+            limits,
+            terminal_cap,
+            diagnostics,
+        );
+        execution.rows = rows;
+        execution.truncated |= truncated;
+        execution.cancelled = cancelled;
+    } else if let Some(cap) = terminal_cap
+        && execution.rows.len() > cap
+    {
+        execution.rows.truncate(cap);
+    }
+    execution
+}
+
+fn execute_seed(
+    seed: &CodeQuerySeed,
+    terminal_cap: Option<usize>,
+    state: &mut QueryExecutionState<'_>,
+    limits: CodeQueryExecutionLimits,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> PlanExecution {
+    let cache_key = seed.canonical_cache_key();
+    let budget_cap = limits
+        .max_pipeline_rows
+        .saturating_sub(state.budget.pipeline_rows);
+    let desired_rows = terminal_cap.unwrap_or(budget_cap).min(budget_cap);
+    let capped_by_budget = terminal_cap.is_none_or(|cap| budget_cap <= cap);
+    if let Some(cached) = state.seed_cache.get(&cache_key).cloned() {
+        diagnostics.extend(cached.diagnostics);
+        let mut rows = cached.rows;
+        let truncated = capped_by_budget && rows.len() > desired_rows;
+        rows.truncate(desired_rows);
+        state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(rows.len());
+        if truncated {
+            push_pipeline_budget_diagnostic(diagnostics, &state.budget);
+        }
+        return PlanExecution {
+            rows,
+            truncated,
+            cancelled: false,
+        };
+    }
+    if desired_rows == 0 {
+        push_pipeline_budget_diagnostic(diagnostics, &state.budget);
+        return PlanExecution {
+            rows: Vec::new(),
+            truncated: true,
+            cancelled: false,
+        };
+    }
+
+    let diagnostic_start = diagnostics.len();
     let plan = QueryPlan::for_query(seed);
     let source_index = plan.build_source_index();
-    let mut providers = analyzer.structural_search_providers();
+    let mut providers = state.analyzer.structural_search_providers();
     providers.sort_by_key(|provider| provider.structural_language());
     providers.retain(|provider| {
         seed.languages.is_empty() || seed.languages.contains(&provider.structural_language())
     });
 
-    let mut diagnostics = Vec::new();
     let mut scoped_languages = BTreeSet::new();
-    for file in analyzer.analyzed_files() {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return cancelled_query_result();
+    for file in state.analyzer.analyzed_files() {
+        if state
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return PlanExecution {
+                rows: Vec::new(),
+                truncated: true,
+                cancelled: true,
+            };
         }
         let language = crate::analyzer::common::language_for_file(&file);
         let requested = seed.languages.is_empty() || seed.languages.contains(&language);
@@ -939,22 +1142,13 @@ fn execute_internal(
     }
 
     let mut supported = BTreeSet::new();
-    let mut provider_scopes: Vec<(
-        Language,
-        &dyn super::StructuralSearchProvider,
-        Vec<ProjectFile>,
-    )> = Vec::new();
-
+    let mut provider_scopes = Vec::new();
     for provider in providers {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return cancelled_query_result();
-        }
         let language = provider.structural_language();
         supported.insert(language);
         let mut files = provider.structural_files();
         files.retain(|file| file_matches_globs(file, seed));
         files.sort();
-
         let explicitly_requested = seed.languages.contains(&language);
         if !files.is_empty() || explicitly_requested {
             diagnostics.extend(
@@ -963,16 +1157,15 @@ fn execute_internal(
                     .into_diagnostics(language)
                     .into_iter()
                     .map(|diagnostic| CodeQueryDiagnostic {
+                        branch: Vec::new(),
                         language: diagnostic.language().config_label(),
                         message: diagnostic.message(),
                     }),
             );
         }
-
         provider_scopes.push((language, provider, files));
     }
-
-    for language in analyzer.languages() {
+    for language in state.analyzer.languages() {
         let explicitly_requested = seed.languages.contains(&language);
         let requested = seed.languages.is_empty() || explicitly_requested;
         if requested
@@ -980,6 +1173,7 @@ fn execute_internal(
             && (explicitly_requested || scoped_languages.contains(&language))
         {
             diagnostics.push(CodeQueryDiagnostic {
+                branch: Vec::new(),
                 language: language.config_label(),
                 message: format!(
                     "no structural adapter for {} yet; its files were not searched",
@@ -989,14 +1183,7 @@ fn execute_internal(
         }
     }
 
-    // Deterministic candidate order: global project-relative path order, with
-    // language only as a tiebreaker for providers that share a path.
-    let mut candidates: Vec<(
-        String,
-        Language,
-        &dyn super::StructuralSearchProvider,
-        ProjectFile,
-    )> = Vec::new();
+    let mut candidates = Vec::new();
     for (language, provider, files) in provider_scopes {
         candidates.extend(
             files
@@ -1006,30 +1193,34 @@ fn execute_internal(
     }
     candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
 
-    let pipeline_query = !steps.is_empty();
-    let global_cap = if pipeline_query {
-        limits.max_pipeline_rows.saturating_add(1)
-    } else {
-        query.limit.saturating_add(1)
-    };
+    let probing_budget = capped_by_budget;
+    let match_cap = desired_rows.saturating_add(usize::from(probing_budget));
     let mut pending: Vec<PendingMatch> = Vec::new();
-    let mut budget = CodeQueryExecutionBudget::default();
-    let mut budget_exhausted = false;
-    let mut pipeline_budget_diagnostic_emitted = false;
+    let mut truncated = false;
     for (_path, language, provider, file) in candidates {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return cancelled_query_result();
+        if state
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return PlanExecution {
+                rows: Vec::new(),
+                truncated: true,
+                cancelled: true,
+            };
         }
         let Some(source) = provider.structural_source(&file) else {
             continue;
         };
-        budget.scanned_files += 1;
-        budget.scanned_source_bytes = budget.scanned_source_bytes.saturating_add(source.len());
-        if budget.scanned_files > limits.max_scanned_files
-            || budget.scanned_source_bytes > limits.max_scanned_source_bytes
+        state.budget.scanned_files += 1;
+        state.budget.scanned_source_bytes = state
+            .budget
+            .scanned_source_bytes
+            .saturating_add(source.len());
+        if state.budget.scanned_files > limits.max_scanned_files
+            || state.budget.scanned_source_bytes > limits.max_scanned_source_bytes
         {
-            push_budget_diagnostic(&mut diagnostics, &budget);
-            budget_exhausted = true;
+            push_budget_diagnostic(diagnostics, &state.budget);
+            truncated = true;
             break;
         }
         if !source_index.may_match(&source) {
@@ -1038,73 +1229,35 @@ fn execute_internal(
         let Some(facts) = provider.structural_facts(&file) else {
             continue;
         };
-        budget.fact_nodes = budget.fact_nodes.saturating_add(facts.nodes().len());
-        if budget.fact_nodes > limits.max_fact_nodes {
-            push_budget_diagnostic(&mut diagnostics, &budget);
-            budget_exhausted = true;
+        state.budget.fact_nodes = state.budget.fact_nodes.saturating_add(facts.nodes().len());
+        if state
+            .budget
+            .fact_nodes
+            .saturating_add(state.budget.examined_references)
+            > limits.max_fact_nodes
+        {
+            push_budget_diagnostic(diagnostics, &state.budget);
+            truncated = true;
             break;
         }
-        let remaining = global_cap - pending.len();
-        for fact_match in super::matcher::match_query(seed, &facts, remaining) {
-            pending.push((language, file.clone(), Arc::clone(&facts), fact_match));
-        }
-        if pending.len() >= global_cap {
+        let remaining = match_cap.saturating_sub(pending.len());
+        pending.extend(
+            super::matcher::match_query(seed, &facts, remaining)
+                .into_iter()
+                .map(|fact_match| (language, file.clone(), Arc::clone(&facts), fact_match)),
+        );
+        if pending.len() >= match_cap {
             break;
         }
     }
-
-    let match_truncated = !pipeline_query && pending.len() > query.limit;
-    let seed_budget_exhausted = pipeline_query && pending.len() > limits.max_pipeline_rows;
-    budget_exhausted |= seed_budget_exhausted;
-    if match_truncated {
-        push_truncation_diagnostic(&mut diagnostics, &budget, query.limit);
-    }
-    if seed_budget_exhausted {
-        pending.truncate(limits.max_pipeline_rows);
-        budget.pipeline_rows = pending.len();
-        push_pipeline_budget_diagnostic(&mut diagnostics, &budget);
-        pipeline_budget_diagnostic_emitted = true;
-    }
-
-    if !pipeline_query {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return cancelled_query_result();
+    if pending.len() > desired_rows {
+        pending.truncate(desired_rows);
+        if capped_by_budget {
+            truncated = true;
+            push_pipeline_budget_diagnostic(diagnostics, &state.budget);
         }
-        let truncated = match_truncated || budget_exhausted;
-        if should_report_broad_query(&plan, seed, &budget, truncated) {
-            push_broad_query_diagnostic(&mut diagnostics, &budget);
-        }
-        pending.truncate(query.limit);
-        let matches: Vec<_> = pending
-            .into_iter()
-            .map(|(language, file, facts, fact_match)| {
-                render_match(
-                    analyzer,
-                    language,
-                    &file,
-                    &facts,
-                    &fact_match,
-                    query.result_detail,
-                )
-            })
-            .collect();
-        let results = matches
-            .iter()
-            .cloned()
-            .map(|value| CodeQueryResultItem {
-                value: CodeQueryResultValue::StructuralMatch { value },
-                provenance: Vec::new(),
-                provenance_truncated: false,
-            })
-            .collect();
-        return CodeQueryResult {
-            results,
-            truncated,
-            diagnostics,
-        };
     }
-
-    let mut rows = pending
+    let rows = pending
         .into_iter()
         .map(|(language, file, facts, fact_match)| {
             let seed = Arc::new(SeedMatch {
@@ -1116,6 +1269,7 @@ fn execute_internal(
             PipelineRow {
                 value: PipelineValue::StructuralMatch(Arc::clone(&seed)),
                 traces: vec![PipelineTrace {
+                    branch: Vec::new(),
                     seed,
                     steps: Vec::new(),
                 }],
@@ -1123,45 +1277,49 @@ fn execute_internal(
             }
         })
         .collect::<Vec<_>>();
-    budget.pipeline_rows = rows.len();
+    state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(rows.len());
+    if !truncated {
+        state.seed_cache.insert(
+            cache_key,
+            CachedSeedExecution {
+                rows: rows.clone(),
+                diagnostics: diagnostics[diagnostic_start..].to_vec(),
+            },
+        );
+    }
+    PlanExecution {
+        rows,
+        truncated,
+        cancelled: false,
+    }
+}
 
-    let mut indexed_declarations = None;
-    let mut reference_cache = ReferenceTraversalCache::default();
-    let mut call_cache = CallTraversalCache::default();
-
-    let mut import_graph = None;
-    let mut import_graph_budget_diagnostic_emitted = false;
+fn apply_plan_steps(
+    steps: &[QueryStep],
+    mut rows: Vec<PipelineRow>,
+    state: &mut QueryExecutionState<'_>,
+    limits: CodeQueryExecutionLimits,
+    terminal_cap: Option<usize>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+) -> (Vec<PipelineRow>, bool, bool) {
+    let mut truncated = false;
     for (step_index, step) in steps.iter().enumerate() {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return cancelled_query_result();
-        }
-        if !rows.is_empty()
-            && indexed_declarations.is_none()
-            && matches!(
-                step,
-                QueryStep::Supertypes(_)
-                    | QueryStep::Subtypes(_)
-                    | QueryStep::Members
-                    | QueryStep::Owner
-                    | QueryStep::ReferencesOf(_)
-                    | QueryStep::UsedBy(_)
-                    | QueryStep::Uses(_)
-                    | QueryStep::Callers(_)
-                    | QueryStep::Callees(_)
-                    | QueryStep::CallSitesTo(_)
-                    | QueryStep::CallSitesFrom(_)
-            )
+        if state
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
         {
-            indexed_declarations = Some(IndexedDeclarations::default());
+            return (Vec::new(), true, true);
         }
         if !rows.is_empty() && matches!(step, QueryStep::ImportsOf | QueryStep::ImportersOf) {
-            let graph = import_graph.get_or_insert_with(|| DirectImportGraph::new(analyzer));
+            let graph = state
+                .import_graph
+                .get_or_insert_with(|| DirectImportGraph::new(state.analyzer));
             let graph_exhausted = if step == &QueryStep::ImportersOf {
                 ensure_complete_import_graph(
-                    analyzer,
+                    state.analyzer,
                     graph,
-                    limits.max_scanned_files,
-                    limits.max_pipeline_rows,
+                    state.global_limits.max_scanned_files,
+                    state.global_limits.max_pipeline_rows,
                 )
             } else {
                 let mut frontier = rows
@@ -1179,84 +1337,183 @@ fn execute_internal(
                 frontier.sort_by_key(rel_path_string);
                 frontier.dedup();
                 ensure_forward_import_edges(
-                    analyzer,
+                    state.analyzer,
                     graph,
                     &frontier,
-                    limits.max_scanned_files,
-                    limits.max_pipeline_rows,
+                    state.global_limits.max_scanned_files,
+                    state.global_limits.max_pipeline_rows,
                 )
             };
             if graph_exhausted {
-                budget_exhausted = true;
-                if !import_graph_budget_diagnostic_emitted {
-                    push_import_graph_budget_diagnostic(&mut diagnostics, graph);
-                    import_graph_budget_diagnostic_emitted = true;
+                truncated = true;
+                if !state.import_graph_budget_diagnostic_emitted {
+                    push_import_graph_budget_diagnostic(diagnostics, graph);
+                    state.import_graph_budget_diagnostic_emitted = true;
                 }
             }
         }
+        let last = step_index + 1 == steps.len();
+        let max_step_outputs = if last {
+            terminal_cap.unwrap_or(limits.max_pipeline_rows)
+        } else {
+            limits.max_pipeline_rows
+        };
         let (next, exhausted, step_truncated) = apply_pipeline_step(
-            analyzer,
+            state.analyzer,
             step,
             rows,
-            import_graph.as_ref(),
-            indexed_declarations.as_mut(),
-            &mut reference_cache,
-            &mut call_cache,
-            &mut budget,
+            state.import_graph.as_ref(),
+            Some(&mut state.indexed_declarations),
+            &mut state.reference_cache,
+            &mut state.call_cache,
+            &mut state.budget,
             limits,
-            if step_index + 1 == steps.len() {
-                query.limit.saturating_add(1)
-            } else {
-                limits.max_pipeline_rows
-            },
-            cancellation,
-            &mut diagnostics,
-            receiver_budget_override,
+            max_step_outputs,
+            state.cancellation,
+            diagnostics,
+            state.receiver_budget_override,
         );
-        budget_exhausted |= step_truncated;
+        truncated |= step_truncated;
         rows = next;
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return cancelled_query_result();
+        if state
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return (Vec::new(), true, true);
         }
         if exhausted {
-            budget_exhausted = true;
-            if (budget.pipeline_rows >= limits.max_pipeline_rows
-                || budget.provenance_steps >= limits.max_pipeline_rows)
-                && !pipeline_budget_diagnostic_emitted
+            truncated = true;
+            if state.budget.pipeline_rows >= limits.max_pipeline_rows
+                || state.budget.provenance_steps >= limits.max_pipeline_rows
             {
-                push_pipeline_budget_diagnostic(&mut diagnostics, &budget);
+                push_pipeline_budget_diagnostic(diagnostics, &state.budget);
             }
-            if step_index + 1 < steps.len() {
-                // A partial intermediate stage does not satisfy the statically
-                // validated terminal domain. Preserve only complete terminal
-                // values when the final stage itself exhausts the budget.
+            if !last {
                 rows.clear();
             }
             break;
         }
     }
+    (rows, truncated, false)
+}
 
-    let terminal_truncated = rows.len() > query.limit;
-    if terminal_truncated {
-        push_truncation_diagnostic(&mut diagnostics, &budget, query.limit);
-        rows.truncate(query.limit);
+fn fair_branch_limits(
+    budget: &CodeQueryExecutionBudget,
+    parent: CodeQueryExecutionLimits,
+    remaining_branches: usize,
+) -> CodeQueryExecutionLimits {
+    fn fair_cap(current: usize, maximum: usize, remaining: usize) -> usize {
+        current.saturating_add(maximum.saturating_sub(current).div_ceil(remaining.max(1)))
     }
-    let truncated = terminal_truncated || budget_exhausted;
-    if should_report_broad_query(&plan, seed, &budget, truncated) {
-        push_broad_query_diagnostic(&mut diagnostics, &budget);
+    CodeQueryExecutionLimits {
+        max_scanned_files: fair_cap(
+            budget.scanned_files,
+            parent.max_scanned_files,
+            remaining_branches,
+        ),
+        max_scanned_source_bytes: fair_cap(
+            budget.scanned_source_bytes,
+            parent.max_scanned_source_bytes,
+            remaining_branches,
+        ),
+        max_fact_nodes: fair_cap(
+            budget.fact_nodes.saturating_add(budget.examined_references),
+            parent.max_fact_nodes,
+            remaining_branches,
+        ),
+        max_pipeline_rows: fair_cap(
+            budget.pipeline_rows.max(budget.provenance_steps),
+            parent.max_pipeline_rows,
+            remaining_branches,
+        ),
     }
-    let mut render_cache = PipelineRenderCache::default();
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return cancelled_query_result();
+}
+
+fn prefix_branch_rows(rows: &mut [PipelineRow], branch: usize) {
+    for row in rows {
+        for trace in &mut row.traces {
+            trace.branch.insert(0, branch);
+        }
     }
-    let results = rows
-        .into_iter()
-        .map(|row| render_pipeline_item(analyzer, row, query.result_detail, &mut render_cache))
-        .collect();
-    CodeQueryResult {
-        results,
-        truncated,
-        diagnostics,
+}
+
+fn prefix_branch_diagnostics(diagnostics: &mut [CodeQueryDiagnostic], branch: usize) {
+    for diagnostic in diagnostics {
+        diagnostic.branch.insert(0, branch);
+    }
+}
+
+fn combine_set_rows(op: SetOperator, mut branches: Vec<Vec<PipelineRow>>) -> Vec<PipelineRow> {
+    match op {
+        SetOperator::Union => {
+            let mut output = Vec::new();
+            let mut indexes = HashMap::default();
+            for branch in branches {
+                for row in branch {
+                    insert_pipeline_row(
+                        &mut output,
+                        &mut indexes,
+                        row.value,
+                        row.traces,
+                        row.provenance_truncated,
+                    );
+                }
+            }
+            output
+        }
+        SetOperator::Intersect => {
+            let first = branches.remove(0);
+            let mut later = branches
+                .into_iter()
+                .map(|branch| {
+                    branch
+                        .into_iter()
+                        .map(|row| (row.value.key(), row))
+                        .collect::<HashMap<_, _>>()
+                })
+                .collect::<Vec<_>>();
+            let mut output = Vec::new();
+            let mut indexes = HashMap::default();
+            for mut row in first {
+                let key = row.value.key();
+                let mut contributions = Vec::with_capacity(later.len());
+                let mut present = true;
+                for branch in &mut later {
+                    if let Some(contribution) = branch.remove(&key) {
+                        contributions.push(contribution);
+                    } else {
+                        present = false;
+                        break;
+                    }
+                }
+                if present {
+                    for contribution in contributions {
+                        row.traces.extend(contribution.traces);
+                        row.provenance_truncated |= contribution.provenance_truncated;
+                    }
+                    insert_pipeline_row(
+                        &mut output,
+                        &mut indexes,
+                        row.value,
+                        row.traces,
+                        row.provenance_truncated,
+                    );
+                }
+            }
+            output
+        }
+        SetOperator::Except => {
+            let first = branches.remove(0);
+            let excluded = branches
+                .into_iter()
+                .flatten()
+                .map(|row| row.value.key())
+                .collect::<HashSet<_>>();
+            first
+                .into_iter()
+                .filter(|row| !excluded.contains(&row.value.key()))
+                .collect()
+        }
     }
 }
 
@@ -1265,6 +1522,7 @@ fn cancelled_query_result() -> CodeQueryResult {
         results: Vec::new(),
         truncated: true,
         diagnostics: vec![CodeQueryDiagnostic {
+            branch: Vec::new(),
             language: "workspace",
             message: "query_code cancelled; no partial results were retained".to_string(),
         }],
@@ -1775,6 +2033,7 @@ fn apply_pipeline_step(
 
     for language in unsupported_languages {
         diagnostics.push(CodeQueryDiagnostic {
+            branch: Vec::new(),
             language: language.config_label(),
             message: format!(
                 "{} does not provide structured import analysis; {} omitted its affected files",
@@ -1785,6 +2044,7 @@ fn apply_pipeline_step(
     }
     for ((language, reason), count) in semantic_omissions {
         diagnostics.push(CodeQueryDiagnostic {
+            branch: Vec::new(),
             language: language.config_label(),
             message: format!(
                 "{} omitted {count} input{} because {reason}",
@@ -1795,6 +2055,7 @@ fn apply_pipeline_step(
     }
     for ((language, operation, reason), count) in receiver_diagnostics {
         diagnostics.push(CodeQueryDiagnostic {
+            branch: Vec::new(),
             language: language.config_label(),
             message: format!(
                 "{operation} returned {count} analysis row{} with {reason}",
@@ -2258,7 +2519,11 @@ fn cached_call_relation(
                 .diagnostics
                 .iter()
                 .cloned()
-                .map(|message| CodeQueryDiagnostic { language, message }),
+                .map(|message| CodeQueryDiagnostic {
+                    branch: Vec::new(),
+                    language,
+                    message,
+                }),
         );
     }
     result
@@ -2423,6 +2688,7 @@ fn inbound_reference_expansions(
         if report && query.source_bytes_truncated {
             exhausted = true;
             diagnostics.push(CodeQueryDiagnostic {
+                branch: Vec::new(),
                 language: crate::analyzer::common::language_for_file(declaration.unit.source())
                     .config_label(),
                 message: format!(
@@ -2433,6 +2699,7 @@ fn inbound_reference_expansions(
         } else if report && query.candidate_files_truncated {
             exhausted = true;
             diagnostics.push(CodeQueryDiagnostic {
+                branch: Vec::new(),
                 language: crate::analyzer::common::language_for_file(declaration.unit.source())
                     .config_label(),
                 message: format!(
@@ -2474,6 +2741,7 @@ fn inbound_reference_expansions(
                         );
                     if omitted > 0 {
                         diagnostics.push(CodeQueryDiagnostic {
+                            branch: Vec::new(),
                             language: crate::analyzer::common::language_for_file(
                                 declaration.unit.source(),
                             )
@@ -2499,6 +2767,7 @@ fn inbound_reference_expansions(
                 }));
                 if report {
                     diagnostics.push(CodeQueryDiagnostic {
+                        branch: Vec::new(),
                         language: crate::analyzer::common::language_for_file(
                             declaration.unit.source(),
                         )
@@ -2518,6 +2787,7 @@ fn inbound_reference_expansions(
                 exhausted = true;
                 if report {
                     diagnostics.push(CodeQueryDiagnostic {
+                        branch: Vec::new(),
                         language: crate::analyzer::common::language_for_file(
                             declaration.unit.source(),
                         )
@@ -2532,6 +2802,7 @@ fn inbound_reference_expansions(
             FuzzyResult::Failure { reason, .. } => {
                 if report {
                     diagnostics.push(CodeQueryDiagnostic {
+                        branch: Vec::new(),
                         language: crate::analyzer::common::language_for_file(
                             declaration.unit.source(),
                         )
@@ -2780,6 +3051,7 @@ fn scan_outbound_reference_hits(
     let source = Arc::new(source);
     let Some(tree) = parse_tree_for_language(file, language, &source) else {
         diagnostics.push(CodeQueryDiagnostic {
+            branch: Vec::new(),
             language: language.config_label(),
             message: format!("uses does not support parsing {}", rel_path_string(file)),
         });
@@ -2823,6 +3095,7 @@ fn scan_outbound_reference_hits(
             push_budget_diagnostic(diagnostics, budget);
         } else {
             diagnostics.push(CodeQueryDiagnostic {
+                branch: Vec::new(),
                 language: language.config_label(),
                 message: format!(
                     "uses returned a bounded partial scan of {} after reaching the structured reference-candidate limit of {candidate_limit}",
@@ -2834,6 +3107,7 @@ fn scan_outbound_reference_hits(
     if candidate_limit == 0 {
         exhausted = true;
         diagnostics.push(CodeQueryDiagnostic {
+            branch: Vec::new(),
             language: language.config_label(),
             message: format!(
                 "uses has no reference-candidate capacity for {}",
@@ -2923,6 +3197,7 @@ fn scan_outbound_reference_hits(
     }
     if ambiguous > 0 {
         diagnostics.push(CodeQueryDiagnostic {
+            branch: Vec::new(),
             language: language.config_label(),
             message: format!(
                 "uses emitted {ambiguous} ambiguous reference site{} in {} as unproven",
@@ -2933,6 +3208,7 @@ fn scan_outbound_reference_hits(
     }
     if omitted > 0 {
         diagnostics.push(CodeQueryDiagnostic {
+            branch: Vec::new(),
             language: language.config_label(),
             message: format!(
                 "uses omitted {omitted} candidate reference site{} in {} because the structured usage analyzer did not confirm the exact edge",
@@ -3407,6 +3683,7 @@ fn render_provenance(
     cache: &mut PipelineRenderCache,
 ) -> CodeQueryProvenance {
     CodeQueryProvenance {
+        branch: trace.branch.clone(),
         seed: render_seed_ref(&trace.seed, detail),
         steps: trace
             .steps
@@ -3908,6 +4185,7 @@ fn push_budget_diagnostic(
     budget: &CodeQueryExecutionBudget,
 ) {
     diagnostics.push(CodeQueryDiagnostic {
+        branch: Vec::new(),
         language: "workspace",
         message: format!(
             "query_code execution budget exhausted after scanning {} files, {} bytes, {} facts, and examining {} references; refine the query with where, languages, kind/name anchors, or a narrower pattern",
@@ -3923,7 +4201,16 @@ fn push_pipeline_budget_diagnostic(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     budget: &CodeQueryExecutionBudget,
 ) {
+    if diagnostics.iter().any(|diagnostic| {
+        diagnostic.branch.is_empty()
+            && diagnostic
+                .message
+                .starts_with("query_code pipeline budget exhausted")
+    }) {
+        return;
+    }
     diagnostics.push(CodeQueryDiagnostic {
+        branch: Vec::new(),
         language: "workspace",
         message: format!(
             "query_code pipeline budget exhausted after producing {} seed and edge rows; refine the match, where, or languages filters",
@@ -3937,6 +4224,7 @@ fn push_import_graph_budget_diagnostic(
     graph: &DirectImportGraph,
 ) {
     diagnostics.push(CodeQueryDiagnostic {
+        branch: Vec::new(),
         language: "workspace",
         message: format!(
             "query_code import graph budget exhausted after resolving {} files and {} direct edges; import traversal results are partial",
@@ -3951,6 +4239,7 @@ fn push_truncation_diagnostic(
     limit: usize,
 ) {
     diagnostics.push(CodeQueryDiagnostic {
+        branch: Vec::new(),
         language: "workspace",
         message: format!(
             "query_code returned the first {limit} results after scanning {} files, {} bytes, {} facts, and examining {} references; results are ordered by project-relative path; refine the query with where, languages, exact names, or a narrower pattern",
@@ -3979,6 +4268,7 @@ fn push_broad_query_diagnostic(
     budget: &CodeQueryExecutionBudget,
 ) {
     diagnostics.push(CodeQueryDiagnostic {
+        branch: Vec::new(),
         language: "workspace",
         message: format!(
             "broad unanchored query_code query scanned {} files, {} bytes, {} facts, and examined {} references; add where, languages, exact name predicates, or a more specific pattern to reduce work and output",

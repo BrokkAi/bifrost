@@ -82,6 +82,13 @@ pub(super) fn seed_to_json(seed: &CodeQuerySeed) -> Map<String, Value> {
     object
 }
 
+impl CodeQuerySeed {
+    pub(crate) fn canonical_cache_key(&self) -> String {
+        serde_json::to_string(&Value::Object(seed_to_json(self)))
+            .expect("canonical CodeQuery seed is serializable")
+    }
+}
+
 fn query_step_to_json(step: &QueryStep) -> Value {
     let mut object = Map::new();
     object.insert("op".to_string(), json!(step.label()));
