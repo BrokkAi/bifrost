@@ -2102,7 +2102,8 @@ int read_value() {
     let alpha = definition_by(&analyzer, |unit| unit.fq_name() == "alpha.Leaf.value");
     let beta = definition_by(&analyzer, |unit| unit.fq_name() == "beta.Leaf.value");
     let consumer = project.file("consumer.cpp");
-    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer).collect()));
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
 
     for target in [alpha, beta] {
         let query = UsageFinder::new()
@@ -6187,6 +6188,205 @@ void consume() {
 }
 
 #[test]
+fn authoritative_cpp_usage_resolves_method_owner_from_one_direct_forward_only() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("widget_fwd.h", "namespace demo { class Widget; }\n")
+        .file(
+            "widget.h",
+            r#"namespace demo {
+class Widget { public: void run(); };
+class Other { public: void run(); };
+}
+"#,
+        )
+        .file(
+            "widget.cc",
+            r#"#include "widget_fwd.h"
+namespace demo {
+void Widget::run() {}
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "widget.h"
+void consume() {
+    demo::Widget().run(); // positive-temporary
+    demo::Widget local;
+    local.run(); // positive-local
+    demo::Other().run(); // negative-other-owner
+    demo::Other other;
+    other.run(); // negative-other-local
+    demo::Widget malformed;
+    malformed.run(1); // negative-malformed-arity
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Widget.run"
+            && slash_path(unit.source()) == "widget.cc"
+            && !unit.is_synthetic()
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let terminal = |line: &str, expression_through_run: &str| {
+        let expression = fixture_token_range(&source, line, expression_through_run);
+        (expression.1 - "run".len(), expression.1)
+    };
+    let expected = BTreeSet::from([
+        terminal(
+            "    demo::Widget().run(); // positive-temporary",
+            "demo::Widget().run",
+        ),
+        terminal("    local.run(); // positive-local", "local.run"),
+    ]);
+
+    let hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &consumer);
+    assert_eq!(
+        hits, expected,
+        "a unique directly included exact-FQN forward owner should prove only the temporary and local Widget calls"
+    );
+}
+
+#[test]
+fn authoritative_cpp_one_forward_overload_group_is_order_invariant() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("widget_fwd.h", "namespace demo { class Widget; }\n")
+        .file(
+            "widget.h",
+            r#"namespace demo {
+class Widget {
+public:
+    void set(int value);
+    void set(const char* value);
+};
+}
+"#,
+        )
+        .file(
+            "widget.cc",
+            r#"#include "widget_fwd.h"
+namespace demo {
+void Widget::set(int value) {}
+void Widget::set(const char* value) {}
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "widget.h"
+void consume() {
+    demo::Widget().set(1); // positive-int
+    demo::Widget local;
+    local.set("x"); // positive-string
+    local.set(1, 2); // negative-arity
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let mut targets = analyzer
+        .definitions("demo.Widget.set")
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Function
+                && slash_path(unit.source()) == "widget.cc"
+                && !unit.is_synthetic()
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by_key(|target| target.signature().map(str::to_string));
+    assert_eq!(targets.len(), 2, "expected two implementation overloads");
+
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let int_range =
+        fixture_token_range(&source, "    demo::Widget().set(1); // positive-int", "set");
+    let string_range =
+        fixture_token_range(&source, "    local.set(\"x\"); // positive-string", "set");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query_order = |order: &[CodeUnit]| {
+        let query = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(&analyzer, order, Some(&provider), 1, 1000);
+        assert_eq!(
+            query.candidate_files,
+            std::iter::once(consumer.clone()).collect()
+        );
+        let FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } = query.result
+        else {
+            panic!("expected authoritative overload-group success");
+        };
+        assert!(
+            unproven_total_by_overload.values().all(|count| *count == 0),
+            "invalid arity and the non-selected overload must be proven exclusions: {unproven_total_by_overload:#?}"
+        );
+        hits_by_overload
+            .values()
+            .flatten()
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect::<BTreeSet<_>>()
+    };
+
+    let forward = query_order(&targets);
+    targets.reverse();
+    let reversed = query_order(&targets);
+    assert_eq!(
+        forward, reversed,
+        "overload target order must not affect hits"
+    );
+    assert_eq!(
+        forward,
+        BTreeSet::from([int_range, string_range]),
+        "the overload group must contain only its two applicable exact call ranges"
+    );
+}
+
+#[test]
+fn authoritative_cpp_same_source_forward_and_full_prefers_the_full_owner() {
+    let positive = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "positive.cc",
+            r#"namespace demo {
+class Widget;
+class Widget { public: void run(); };
+void Widget::run() {}
+void consume() { Widget().run(); }
+}
+"#,
+        )
+        .build();
+    let positive_analyzer = CppAnalyzer::from_project(positive.project().clone());
+    let positive_target = definition_by(&positive_analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Widget.run"
+            && !unit.is_synthetic()
+    });
+    let positive_file = positive.file("positive.cc");
+    let positive_source = positive_file.read_to_string().expect("positive source");
+    let expected = BTreeSet::from([fixture_token_range(
+        &positive_source,
+        "void consume() { Widget().run(); }",
+        "run",
+    )]);
+    assert_eq!(
+        authoritative_exact_ranges(
+            &positive_analyzer,
+            std::slice::from_ref(&positive_target),
+            &positive_file,
+        ),
+        expected,
+        "one same-source full definition must beat its forward declaration"
+    );
+}
+
+#[test]
 fn authoritative_cpp_usage_keeps_constructor_owner_unresolved_with_only_direct_forwards() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
         ("one/widget_fwd.h", "namespace demo { class Widget; }\n"),
@@ -6197,6 +6397,7 @@ fn authoritative_cpp_usage_keeps_constructor_owner_unresolved_with_only_direct_f
 class Widget {
 public:
     Widget();
+    void run();
 };
 }
 "#,
@@ -6207,6 +6408,7 @@ public:
 #include "two/widget_fwd.h"
 namespace demo {
 Widget::Widget() = default;
+void Widget::run() {}
 }
 "#,
         ),
@@ -6215,6 +6417,7 @@ Widget::Widget() = default;
             r#"#include "widget.h"
 void consume() {
     auto* widget = new demo::Widget;
+    widget->run();
 }
 "#,
         ),
@@ -6227,7 +6430,8 @@ void consume() {
             && !unit.is_synthetic()
     });
     let consumer = project.file("consumer.cc");
-    let provider = ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer).collect()));
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
     let result = UsageFinder::new()
         .with_authoritative_scope(true)
         .query_with_provider(
@@ -6240,6 +6444,17 @@ void consume() {
         .result;
 
     assert_success_counts(result, &constructor, 0, 0);
+
+    let method = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Widget.run"
+            && slash_path(unit.source()) == "widget.cc"
+            && !unit.is_synthetic()
+    });
+    assert!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&method), &consumer).is_empty(),
+        "two directly included exact-FQN forwards must not establish a method owner"
+    );
 }
 
 #[test]

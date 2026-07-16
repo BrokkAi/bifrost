@@ -1890,7 +1890,11 @@ fn receiver_owner_matches_target(
     ctx: &ScanCtx<'_>,
 ) -> bool {
     same_symbol(receiver_owner, target_owner)
-        || ctx.visibility.is_physically_visible(ctx.file, target_owner)
+        || (ctx.visibility.is_physically_visible(ctx.file, target_owner)
+            || (ctx.spec.owner_is_forward_declaration
+                && ctx
+                    .visibility
+                    .is_physically_visible(ctx.file, receiver_owner)))
             && same_logical_symbol(receiver_owner, target_owner)
 }
 
