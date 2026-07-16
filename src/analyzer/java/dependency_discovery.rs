@@ -228,8 +228,7 @@ fn discover_build_tools_with_executor(
     discovered
 }
 
-#[cfg(test)]
-pub(super) fn is_java_dependency_input(file: &ProjectFile) -> bool {
+pub(crate) fn is_java_dependency_input(file: &ProjectFile) -> bool {
     let path = file.rel_path();
     let file_name = path
         .file_name()
@@ -250,10 +249,10 @@ pub(super) fn is_java_dependency_input(file: &ProjectFile) -> bool {
     ) {
         return true;
     }
-    if path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| matches!(extension, "gradle" | "kts" | "lockfile"))
+    let normalized_name = file_name.to_ascii_lowercase();
+    if normalized_name.ends_with(".gradle")
+        || normalized_name.ends_with(".gradle.kts")
+        || normalized_name.ends_with(".lockfile")
     {
         return true;
     }
@@ -857,6 +856,7 @@ mod tests {
             ("module/build.gradle.kts", true),
             ("gradle/libs.versions.toml", true),
             ("buildSrc/src/main/java/Plugin.java", true),
+            ("scripts/unrelated.kts", false),
             ("src/App.java", false),
             ("README.md", false),
         ] {

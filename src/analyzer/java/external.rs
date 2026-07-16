@@ -853,12 +853,15 @@ fn enclosing_type_fqns(external_type: &JavaExternalType) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::analyzer::{
-        AnalyzerConfig, JavaAnalyzer, JavaExternalArtifact, JavaExternalDependencies,
-        JavaMavenCoordinate, Language, Project, ProjectFile, TestProject,
+        AnalyzerConfig, AnalyzerDelegate, IAnalyzer, JavaAnalyzer, JavaExternalArtifact,
+        JavaExternalDependencies, JavaMavenCoordinate, Language, MultiAnalyzer, Project,
+        ProjectFile, PythonAnalyzer, TestProject, resolve_analyzer,
     };
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::io::Write;
     use std::process::Command;
+    use std::sync::Arc;
     use zip::write::SimpleFileOptions;
 
     const GROUP_PATH: &str = "com/example/external-lib/1.2.3";
@@ -1114,6 +1117,110 @@ mod tests {
             config,
         );
         assert!(!analyzer.is_known_type_name_in_file(&app, "ExternalService"));
+    }
+
+    #[test]
+    fn java_dependency_discovery_invalidates_only_for_build_inputs() {
+        let Some(fixture) = ExternalJarFixture::new(false) else {
+            return;
+        };
+        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
+        app.write(
+            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
+        )
+        .unwrap();
+        let pom = ProjectFile::new(fixture.project_root().to_path_buf(), "pom.xml");
+        pom.write("<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId></dependency></dependencies></project>")
+            .unwrap();
+        let config = AnalyzerConfig {
+            java: JavaAnalyzerConfig {
+                external_dependencies: JavaExternalDependencies {
+                    repository_roots: vec![fixture.maven_repository_root()],
+                    ..JavaExternalDependencies::default()
+                },
+                ..JavaAnalyzerConfig::default()
+            },
+            ..AnalyzerConfig::default()
+        };
+        let analyzer = JavaAnalyzer::from_project_with_config(
+            TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
+            config,
+        );
+        assert!(!analyzer.is_known_type_name_in_file(&app, "ExternalService"));
+        let initial_index = analyzer.external_index.clone();
+
+        pom.write("<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>")
+            .unwrap();
+        let updated = analyzer.update(&BTreeSet::from([pom.clone()]));
+        assert!(!Arc::ptr_eq(&initial_index, &updated.external_index));
+        assert!(updated.is_known_type_name_in_file(&app, "ExternalService"));
+
+        app.write(
+            "package app; import com.example.dep.ExternalService; class App { ExternalService changed; }",
+        )
+        .unwrap();
+        let java_only = updated.update(&BTreeSet::from([app]));
+        assert!(Arc::ptr_eq(
+            &updated.external_index,
+            &java_only.external_index
+        ));
+        let refreshed = java_only.update_all();
+        assert!(!Arc::ptr_eq(
+            &java_only.external_index,
+            &refreshed.external_index
+        ));
+    }
+
+    #[test]
+    fn java_dependency_discovery_routes_manifest_changes_through_multi_analyzer() {
+        let Some(fixture) = ExternalJarFixture::new(false) else {
+            return;
+        };
+        let app = ProjectFile::new(fixture.project_root().to_path_buf(), "src/App.java");
+        app.write(
+            "package app; import com.example.dep.ExternalService; class App { ExternalService service; }",
+        )
+        .unwrap();
+        ProjectFile::new(fixture.project_root().to_path_buf(), "tool.py")
+            .write("def tool():\n    pass\n")
+            .unwrap();
+        let pom = ProjectFile::new(fixture.project_root().to_path_buf(), "pom.xml");
+        pom.write("<project/>").unwrap();
+        let project = TestProject::with_languages(
+            fixture.project_root().to_path_buf(),
+            BTreeSet::from([Language::Java, Language::Python]),
+        );
+        let config = AnalyzerConfig {
+            java: JavaAnalyzerConfig {
+                external_dependencies: JavaExternalDependencies {
+                    repository_roots: vec![fixture.maven_repository_root()],
+                    ..JavaExternalDependencies::default()
+                },
+                ..JavaAnalyzerConfig::default()
+            },
+            ..AnalyzerConfig::default()
+        };
+        let multi = MultiAnalyzer::new(BTreeMap::from([
+            (
+                Language::Java,
+                AnalyzerDelegate::Java(JavaAnalyzer::from_project_with_config(
+                    project.clone(),
+                    config,
+                )),
+            ),
+            (
+                Language::Python,
+                AnalyzerDelegate::Python(PythonAnalyzer::from_project(project)),
+            ),
+        ]));
+        let java = resolve_analyzer::<JavaAnalyzer>(&multi).unwrap();
+        assert!(!java.is_known_type_name_in_file(&app, "ExternalService"));
+
+        pom.write("<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>")
+            .unwrap();
+        let updated = multi.update(&BTreeSet::from([pom]));
+        let java = resolve_analyzer::<JavaAnalyzer>(&updated).unwrap();
+        assert!(java.is_known_type_name_in_file(&app, "ExternalService"));
     }
 
     #[test]

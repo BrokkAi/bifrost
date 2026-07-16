@@ -16,7 +16,7 @@ The observable proof is a temporary Java project containing only an import and a
 - [x] (2026-07-16 14:05Z) Chose the external-declaration boundary, trust model, metadata subset, build-tool execution model, cache lookup constraints, and invalidation behavior with the user.
 - [x] (2026-07-16 14:43Z) Added public discovery configuration, structural Maven POM parsing, modern and legacy Gradle lock parsing, and exact Maven/Gradle cache lookup. `cargo test java_dependency_discovery --lib` passes all seven focused parser and generated-JAR tests.
 - [x] (2026-07-16 15:32Z) Extracted the formatter lifecycle into a shared bounded process runner and added trusted offline Maven/Gradle execution with top-level build-root selection, bounded reports, cross-platform parsers, and injected failure/partial-result tests. Formatter execution and shared descendant-cleanup tests pass.
-- [ ] Integrate lazy discovery and manifest invalidation into Java and multi-language analyzer updates.
+- [x] (2026-07-16 15:50Z) Added build-input invalidation for Java snapshots, full-refresh/project-replacement invalidation, Java-only index reuse, and non-Java manifest routing in `MultiAnalyzer`. Generated-JAR rediscovery tests pass for direct and Java-plus-Python multi-analyzer snapshots.
 - [ ] Add end-to-end and failure-mode coverage, run all required validation, and complete the retrospective.
 
 ## Surprises & Discoveries
@@ -33,6 +33,8 @@ The observable proof is a temporary Java project containing only an import and a
   Evidence: The resolver enters only `<root>/<group>/<artifact>/<version>`, sorts its direct hash children, and considers JARs immediately beneath them; the end-to-end test places another valid JAR under an unrelated coordinate and proves it is not indexed.
 - Observation: A bounded reader must continue draining after crossing its memory limit or a child that keeps writing can block before the timeout path can reap it.
   Evidence: The shared runner records overflow, discards subsequent bytes, and reports the limit only after EOF; formatter large-stdin/output concurrency and timeout tests still pass after extraction.
+- Observation: Multi-analyzer routing must recognize dependency inputs before Java can decide whether to invalidate its lazy index.
+  Evidence: Without the Java-specific `needs_config_update_for` case, `pom.xml` has `Language::None` and would leave the Java delegate unchanged; the Java-plus-Python regression now changes a POM and resolves the newly available dependency type after `MultiAnalyzer::update`.
 
 ## Decision Log
 
@@ -57,7 +59,7 @@ The observable proof is a temporary Java project containing only an import and a
 
 ## Outcomes & Retrospective
 
-Safe metadata now provides automatic exact dependency awareness from Maven POMs and Gradle lockfiles, while trusted `OfflineBuildTools` mode adds resolved artifacts from installed/configured Maven and Gradle executables. Both paths keep declarations in `JavaExternalDeclarationIndex`; correct lazy refresh after build inputs change remains to be implemented.
+Safe metadata provides automatic exact dependency awareness from Maven POMs and Gradle lockfiles, while trusted `OfflineBuildTools` mode adds resolved artifacts from installed/configured Maven and Gradle executables. Both paths keep declarations in `JavaExternalDeclarationIndex`, and Java plus multi-language snapshots now rediscover lazily after build-input changes while reusing the index for ordinary Java edits. Full-suite and lint validation remain.
 
 ## Context and Orientation
 

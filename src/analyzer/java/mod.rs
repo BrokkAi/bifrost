@@ -34,6 +34,7 @@ use declarations::{
     is_declaration_parent, is_java_anonymous_structure, node_text, normalize_java_full_name,
     parse_tree,
 };
+pub(crate) use dependency_discovery::is_java_dependency_input;
 use exceptions::detect_exception_handling_smells_java;
 use external::JavaExternalDeclarationIndex;
 use tests::detect_test_assertion_smells_java;
@@ -52,6 +53,7 @@ impl JavaAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
+        clone.external_index = Arc::new(std::sync::OnceLock::new());
         clone
     }
 
@@ -348,12 +350,17 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.languages()
     }
 
-    fn update(&self, _changed_files: &BTreeSet<ProjectFile>) -> Self {
+    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        let external_index = if changed_files.iter().any(is_java_dependency_input) {
+            Arc::new(std::sync::OnceLock::new())
+        } else {
+            self.external_index.clone()
+        };
         Self {
-            inner: self.inner.update(_changed_files),
+            inner: self.inner.update(changed_files),
             memo_caches: Arc::new(JavaMemoCaches::new(self.memo_caches.budget_bytes())),
             java_config: self.java_config.clone(),
-            external_index: self.external_index.clone(),
+            external_index,
         }
     }
 
@@ -362,7 +369,7 @@ impl IAnalyzer for JavaAnalyzer {
             inner: self.inner.update_all(),
             memo_caches: Arc::new(JavaMemoCaches::new(self.memo_caches.budget_bytes())),
             java_config: self.java_config.clone(),
-            external_index: self.external_index.clone(),
+            external_index: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
