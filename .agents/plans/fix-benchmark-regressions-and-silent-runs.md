@@ -18,7 +18,7 @@ The result is observable in two ways. Focused `bifrost_benchmark` runs for `clic
 - [x] (2026-07-16 10:59Z) Added per-binding workspace-module facts and a graph-build-wide canonical namespace cache for Python inverted edges; all nine Python dead-code tests pass.
 - [x] (2026-07-16 10:59Z) Added `post_to_slack` with schedule-preserving conditions shared by both Slack steps; workflow policy tests pass.
 - [x] (2026-07-16 11:24Z) Ran focused local benchmarks for all three repositories. Strict comparisons pass for warmed focused reports: Click scan 2261.8 ms and dead code 1484.5 ms; Gin scan 738.8 ms; Serde definition 19.0 ms on the final repeat.
-- [ ] Run the repository Rust quality gates.
+- [x] (2026-07-16 11:39Z) Passed `cargo fmt --all -- --check`, the workflow policy suite, and isolated `cargo clippy --all-targets --all-features -- -D warnings` with one consistent rustup toolchain.
 - [ ] Review, commit each completed milestone, push the branch, run the silent benchmark path, and open a ready-for-review pull request.
 
 ## Surprises & Discoveries
@@ -37,6 +37,12 @@ The result is observable in two ways. Focused `bifrost_benchmark` runs for `clic
 
 - Observation: Python binding-timeline classification became negligible after caching; receiver scope-fact construction was the residual targeted-scan hotspot.
   Evidence: A Click profile measured 56 file timelines at 0.3 ms aggregate, versus 3934.3 ms aggregate worker time for `python_graph::scope_facts`. Generation-caching target-independent scope facts reduced the scan median from 2677.2 ms to 2261.8 ms.
+
+- Observation: This host placed rustup's `cargo` and `rustc` ahead of Homebrew, but placed Homebrew's `clippy-driver` ahead of rustup's driver.
+  Evidence: The first fresh-target Clippy run rejected dependencies compiled by the rustup compiler when the workspace was checked by the Homebrew driver. Prefixing the complete rustup toolchain directory made the same isolated all-target/all-feature command pass in 1 minute 38 seconds.
+
+- Observation: `origin/master` advanced by one unrelated documentation commit after implementation began.
+  Evidence: The refreshed remote is one commit ahead at `91ccc876`, which only adds `.agents/plans/language-agnostic-composable-typestate-platform.md` and does not overlap this change.
 
 ## Decision Log
 
@@ -66,7 +72,7 @@ The result is observable in two ways. Focused `bifrost_benchmark` runs for `clic
 
 ## Outcomes & Retrospective
 
-Implementation is in progress. This section will record final benchmark medians, test results, the pull request URL, and any residual regression that needs follow-up.
+All four reported latency regressions are repaired locally without changing the blessed baseline. Focused strict comparisons pass at 2261.8 milliseconds for Click `scan_usages`, 1484.5 milliseconds for Click `dead_code_smells`, 738.8 milliseconds for Gin `scan_usages`, and 19.0 milliseconds for Serde JSON `get_definition`. The language-specific suites, workflow policy tests, formatting check, and isolated all-target/all-feature Clippy gate pass. Publication and the GitHub-hosted silent benchmark remain in progress; their URLs and hosted results will be recorded here after the temporary PR trigger completes.
 
 ## Context and Orientation
 
