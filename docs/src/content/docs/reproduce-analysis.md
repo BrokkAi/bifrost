@@ -27,7 +27,7 @@ Use a machine-readable manifest such as:
 ```json
 {
   "bifrost": {
-    "version": "0.8.3",
+    "version": "0.8.4",
     "commit": "<full Bifrost commit>",
     "features": [],
     "interface": "cli"
@@ -60,7 +60,7 @@ Use a machine-readable manifest such as:
 }
 ```
 
-Replace example values with observed values; do not copy `0.8.3` into a future run without checking the binary. Record only environment variables that affect Bifrost behavior, and redact secrets before publication.
+Replace example values with observed values; do not copy `0.8.4` into a future run without checking the binary. Record only environment variables that affect Bifrost behavior, and redact secrets before publication.
 
 ## Capture The Execution Contract
 
