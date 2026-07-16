@@ -7,6 +7,7 @@ use crate::analyzer::structural::{
 use crate::analyzer::{Project, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::{byte_range_to_lsp_range, position_to_byte_offset};
 use crate::lsp::handlers::document_symbol::primary_range;
+use crate::lsp::handlers::formatting::format_bifrost_sexp;
 use crate::lsp::handlers::util::read_document_for_uri;
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -71,13 +72,15 @@ pub(crate) fn handle(
     .map_err(|error| format!("failed to render Rune IR: {error}"))?;
     let code_unit_name = display_identifier_for_target(&code_unit);
     let source_range = byte_range_to_lsp_range(&source, &line_starts, &code_unit_range);
-    let display_text = format!(
+    let unformatted_display_text = format!(
         "; Rune IR for {} ({})\n\n{}\n; Starter RQL\n{}\n",
         code_unit_name,
         rune_ir_language.config_label(),
         rendered.rune_ir.trim_end(),
         rendered.starter_rql
     );
+    let display_text = format_bifrost_sexp(&unformatted_display_text)
+        .ok_or_else(|| "generated Rune IR was not a complete S-expression document".to_string())?;
 
     Ok(RuneIrResponse {
         code_unit: code_unit_name,

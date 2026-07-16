@@ -7,6 +7,9 @@ use lsp_types::{DocumentFormattingParams, TextEdit};
 use serde::Deserialize;
 
 use crate::analyzer::common::language_for_file;
+use crate::analyzer::structural::query::format::{
+    DEFAULT_SEXP_LINE_WIDTH, SexpFormatOptions, format_sexp_document,
+};
 use crate::analyzer::{Language, Project, ProjectFile, Range as ByteRange};
 use crate::cancellation::CancellationToken;
 use crate::lsp::conversion::byte_range_to_lsp_range;
@@ -14,11 +17,14 @@ use crate::lsp::handlers::util::read_document_for_uri;
 #[cfg(windows)]
 use crate::path_normalization::NormalizePath;
 use crate::process::{BoundedProcessRequest, run_bounded_process};
+use crate::text_utils::compute_line_starts;
 
 const MAX_ERROR_OUTPUT_CHARS: usize = 1_000;
 const MAX_FORMATTER_STDERR_BYTES: usize = 64 * 1024;
 const MAX_FORMATTER_STDOUT_BYTES: usize = 32 * 1024 * 1024;
 const FORMATTER_TIMEOUT: Duration = Duration::from_secs(30);
+const RQL_LANGUAGE_ID: &str = "bifrost-rql";
+const RUNE_IR_LANGUAGE_ID: &str = "bifrost-rune-ir";
 #[cfg(all(test, unix))]
 const TEST_HUNG_FORMATTER_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -64,9 +70,14 @@ pub(crate) struct FormatterCommand {
 }
 
 pub(crate) struct PreparedFormatting {
-    command: FormatterCommand,
+    operation: FormattingOperation,
     content: String,
     line_starts: Vec<usize>,
+}
+
+enum FormattingOperation {
+    Command(FormatterCommand),
+    BuiltInSexp,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -119,10 +130,32 @@ pub(crate) fn prepare(
         return Ok(None);
     };
     Ok(Some(PreparedFormatting {
-        command,
+        operation: FormattingOperation::Command(command),
         content,
         line_starts,
     }))
+}
+
+pub(crate) fn is_bifrost_sexp_language(language_id: &str) -> bool {
+    matches!(language_id, RQL_LANGUAGE_ID | RUNE_IR_LANGUAGE_ID)
+}
+
+pub(crate) fn prepare_bifrost_sexp(content: &str) -> PreparedFormatting {
+    PreparedFormatting {
+        operation: FormattingOperation::BuiltInSexp,
+        content: content.to_string(),
+        line_starts: compute_line_starts(content),
+    }
+}
+
+pub(crate) fn format_bifrost_sexp(content: &str) -> Option<String> {
+    format_sexp_document(
+        content,
+        SexpFormatOptions {
+            line_width: DEFAULT_SEXP_LINE_WIDTH,
+            indent: "  ",
+        },
+    )
 }
 
 pub(crate) fn run_prepared_with_cancellation(
@@ -130,11 +163,21 @@ pub(crate) fn run_prepared_with_cancellation(
     cancellation: &FormatterCancellation,
 ) -> Result<Vec<TextEdit>, String> {
     let PreparedFormatting {
-        command,
+        operation,
         content,
         line_starts,
     } = prepared;
-    let formatted = run_formatter_command(&command, &content, cancellation)?;
+    let formatted = match operation {
+        FormattingOperation::Command(command) => {
+            run_formatter_command(&command, &content, cancellation)?
+        }
+        FormattingOperation::BuiltInSexp => {
+            if cancellation.is_cancelled() {
+                return Err("S-expression formatting was cancelled".to_string());
+            }
+            format_bifrost_sexp(&content).unwrap_or_else(|| content.clone())
+        }
+    };
     if formatted == content {
         return Ok(Vec::new());
     }

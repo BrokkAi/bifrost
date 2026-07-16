@@ -31,7 +31,7 @@ void test("registers Bifrost RQL as a distinct .rql language", () => {
   const runeIrSourceContext =
     "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == ruby";
   assert.ok(manifest.activationEvents.includes("onLanguage:bifrost-rql"));
-  assert.ok(!manifest.activationEvents.includes("onLanguage:bifrost-rune-ir"));
+  assert.ok(manifest.activationEvents.includes("onLanguage:bifrost-rune-ir"));
   assert.deepEqual(manifest.contributes.languages, [
     {
       id: "bifrost-rql",
