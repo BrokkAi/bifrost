@@ -11,8 +11,8 @@ use super::syntax::{Expr, ExprKind, parse_rql};
 use super::{
     CodeQuery, CodeQueryResultDetail, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES,
     MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_QUERY_BRANCHES,
-    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
-    QueryStep, SCHEMA_VERSION,
+    MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
+    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, QueryStep, SCHEMA_VERSION,
 };
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{
@@ -30,6 +30,40 @@ const MAX_SOURCE_DIAGNOSTICS: usize = 100;
 const MAX_SOURCE_HELP_ITEMS: usize = 1_000;
 const MAX_JSON_COMPLETION_DEPTH: usize = 6;
 const MAX_JSON_COMPLETION_SOURCE_BYTES: usize = 8 * 1024;
+
+#[derive(Default)]
+struct SourcePlanBudget {
+    nodes: usize,
+    exhausted: bool,
+}
+
+impl SourcePlanBudget {
+    fn enter(&mut self, depth: usize, range: Range<usize>, analysis: &mut Analysis) -> bool {
+        if self.exhausted {
+            return false;
+        }
+        if depth > MAX_QUERY_PLAN_DEPTH {
+            analysis.error(
+                range,
+                "invalid-query",
+                format!("query plan depth must be at most {MAX_QUERY_PLAN_DEPTH}"),
+            );
+            self.exhausted = true;
+            return false;
+        }
+        if self.nodes >= MAX_QUERY_PLAN_NODES {
+            analysis.error(
+                range,
+                "invalid-query",
+                format!("query plan may contain at most {MAX_QUERY_PLAN_NODES} nodes"),
+            );
+            self.exhausted = true;
+            return false;
+        }
+        self.nodes += 1;
+        true
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuerySourceDiagnostic {
@@ -397,7 +431,8 @@ fn analyze_rql(source: &str) -> Analysis {
         return analysis;
     };
 
-    validate_rql_query(&expr, "match", &mut analysis);
+    let mut plan_budget = SourcePlanBudget::default();
+    validate_rql_query(&expr, "match", &mut analysis, 0, &mut plan_budget);
     if parsed.incomplete.is_some() || analysis.incomplete {
         analysis.diagnostics.clear();
     } else if analysis.diagnostics.is_empty() {
@@ -424,7 +459,13 @@ fn list_head(expr: &Expr) -> Option<(&str, Range<usize>, &[Expr])> {
     Some((label, first.range.clone(), &items[1..]))
 }
 
-fn validate_rql_query(expr: &Expr, path: &str, analysis: &mut Analysis) {
+fn validate_rql_query(
+    expr: &Expr,
+    path: &str,
+    analysis: &mut Analysis,
+    depth: usize,
+    plan_budget: &mut SourcePlanBudget,
+) {
     analysis.path(path, expr.range.clone());
     let Some((head, head_range, args)) = list_head(expr) else {
         analysis.error(
@@ -437,12 +478,20 @@ fn validate_rql_query(expr: &Expr, path: &str, analysis: &mut Analysis) {
     if let Some(form) = RqlForm::from_label(head)
         && form.class() == RqlFormClass::Wrapper
     {
+        if matches!(form, RqlForm::Union | RqlForm::Intersect | RqlForm::Except)
+            && !plan_budget.enter(depth, expr.range.clone(), analysis)
+        {
+            return;
+        }
         analysis.add_help(head_range, form.signature(), form.description());
-        validate_wrapper(form, args, path, analysis);
+        validate_wrapper(form, args, path, analysis, depth, plan_budget);
     } else if path == "match"
         && NormalizedKind::from_label(head).is_none()
         && RqlForm::from_label(head).is_none()
     {
+        if !plan_budget.enter(depth, expr.range.clone(), analysis) {
+            return;
+        }
         add_spelling_error(
             analysis,
             head_range,
@@ -453,6 +502,9 @@ fn validate_rql_query(expr: &Expr, path: &str, analysis: &mut Analysis) {
             |suggestion| suggestion.to_string(),
         );
     } else {
+        if !plan_budget.enter(depth, expr.range.clone(), analysis) {
+            return;
+        }
         validate_rql_pattern(expr, path, analysis);
         if path == "match" && rql_pattern_anchors_root(expr) == Some(false) {
             analysis.error(
@@ -479,7 +531,14 @@ fn rql_pattern_anchors_root(expr: &Expr) -> Option<bool> {
     ))
 }
 
-fn validate_wrapper(form: RqlForm, args: &[Expr], path: &str, analysis: &mut Analysis) {
+fn validate_wrapper(
+    form: RqlForm,
+    args: &[Expr],
+    path: &str,
+    analysis: &mut Analysis,
+    depth: usize,
+    plan_budget: &mut SourcePlanBudget,
+) {
     let Some(query) = args.last() else {
         return;
     };
@@ -592,7 +651,13 @@ fn validate_wrapper(form: RqlForm, args: &[Expr], path: &str, analysis: &mut Ana
                 );
             }
             for (index, branch) in args.iter().enumerate() {
-                validate_rql_query(branch, &format!("{}[{index}]", form.label()), analysis);
+                validate_rql_query(
+                    branch,
+                    &format!("{}[{index}]", form.label()),
+                    analysis,
+                    depth + 1,
+                    plan_budget,
+                );
             }
             return;
         }
@@ -674,7 +739,7 @@ fn validate_wrapper(form: RqlForm, args: &[Expr], path: &str, analysis: &mut Ana
         | RqlForm::NotHas
         | RqlForm::NotKind => unreachable!("predicate cannot be a query wrapper"),
     }
-    validate_rql_query(query, path, analysis);
+    validate_rql_query(query, path, analysis, depth, plan_budget);
 }
 
 fn validate_receiver_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &mut Analysis) {
@@ -1599,7 +1664,8 @@ fn analyze_json(source: &str) -> Analysis {
             return analysis;
         }
     };
-    validate_json_query(&parsed, "", &mut analysis);
+    let mut plan_budget = SourcePlanBudget::default();
+    validate_json_query(&parsed, "", &mut analysis, 0, &mut plan_budget);
     if analysis.diagnostics.is_empty()
         && let Err(error) = CodeQuery::from_json(&spanned_to_json(&parsed))
     {
@@ -1631,7 +1697,8 @@ fn analyze_incomplete_json(source: &str) -> Analysis {
                     continue;
                 };
                 let mut analysis = Analysis::default();
-                validate_json_query(&parsed, "", &mut analysis);
+                let mut plan_budget = SourcePlanBudget::default();
+                validate_json_query(&parsed, "", &mut analysis, 0, &mut plan_budget);
                 analysis.diagnostics.clear();
                 analysis.help.retain(|item| item.range.end <= source.len());
                 analysis.paths.retain(|_, range| range.end <= source.len());
@@ -1643,8 +1710,17 @@ fn analyze_incomplete_json(source: &str) -> Analysis {
     Analysis::default()
 }
 
-fn validate_json_query(value: &spanned::Value, path: &str, analysis: &mut Analysis) {
+fn validate_json_query(
+    value: &spanned::Value,
+    path: &str,
+    analysis: &mut Analysis,
+    depth: usize,
+    plan_budget: &mut SourcePlanBudget,
+) {
     analysis.path(path, value.range());
+    if !plan_budget.enter(depth, value.range(), analysis) {
+        return;
+    }
     let Some(object) = value.as_object() else {
         analysis.error(
             value.range(),
@@ -1717,7 +1793,13 @@ fn validate_json_query(value: &spanned::Value, path: &str, analysis: &mut Analys
                     );
                 }
                 for (index, branch) in branches.iter().enumerate() {
-                    validate_json_query(branch, &format!("{child_path}[{index}]"), analysis);
+                    validate_json_query(
+                        branch,
+                        &format!("{child_path}[{index}]"),
+                        analysis,
+                        depth + 1,
+                        plan_budget,
+                    );
                 }
             }
             QueryField::Steps => validate_json_steps(child, &child_path, analysis),
@@ -2882,6 +2964,41 @@ mod tests {
             validate_query_source(&many_errors).len(),
             MAX_SOURCE_DIAGNOSTICS
         );
+    }
+
+    #[test]
+    fn plan_budgets_stop_json_and_rql_source_validation_early() {
+        let mut deep_json = serde_json::json!({ "match": 3 });
+        let mut deep_rql = "(banana)".to_string();
+        for _ in 0..=MAX_QUERY_PLAN_DEPTH {
+            deep_json = serde_json::json!({
+                "union": [deep_json, { "match": { "kind": "call" } }]
+            });
+            deep_rql = format!("(union {deep_rql} (call))");
+        }
+        for source in [deep_json.to_string(), deep_rql] {
+            let diagnostics = validate_query_source(&source);
+            assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:#?}");
+            assert!(diagnostics[0].message.contains("plan depth"));
+        }
+
+        let json_groups = (0..4)
+            .map(|_| {
+                serde_json::json!({
+                    "union": (0..16)
+                        .map(|_| serde_json::json!({ "match": { "kind": "call" } }))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let wide_json = serde_json::json!({ "union": json_groups }).to_string();
+        let rql_group = format!("(union {})", vec!["(call)"; 16].join(" "));
+        let wide_rql = format!("(union {})", vec![rql_group; 4].join(" "));
+        for source in [wide_json, wide_rql] {
+            let diagnostics = validate_query_source(&source);
+            assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:#?}");
+            assert!(diagnostics[0].message.contains("at most 64 nodes"));
+        }
     }
 
     #[test]

@@ -510,6 +510,32 @@ fn composed_structural_capture_must_exist_in_every_branch() {
     }));
     assert_eq!(error.path, "steps[0].capture");
     assert!(error.message.contains("every contributing"));
+
+    let difference = parse_ok(json!({
+        "except": [
+            {
+                "match": { "kind": "call", "receiver": { "capture": "service" } }
+            },
+            { "match": { "kind": "call", "callee": { "name": "ignored" } } }
+        ],
+        "steps": [{ "op": "points_to", "capture": "service" }]
+    }));
+    assert_eq!(
+        difference.validate_steps().unwrap(),
+        QueryValueKind::ReceiverAnalysis
+    );
+
+    let rql = CodeQuery::from_sexp(
+        r#"(points-to :capture service
+          (except
+            (call :receiver (capture "service"))
+            (call :callee "ignored")))"#,
+    )
+    .expect("except RQL should preserve first-branch captures");
+    assert_eq!(
+        rql.validate_steps().unwrap(),
+        QueryValueKind::ReceiverAnalysis
+    );
 }
 
 #[test]
@@ -760,6 +786,31 @@ fn rejects_query_budget_overruns() {
         }
     }));
     assert_eq!(error.path, "match.text.regex");
+
+    let mut too_deep = json!({ "match": 3 });
+    for _ in 0..=MAX_QUERY_PLAN_DEPTH {
+        too_deep = json!({
+            "union": [too_deep, { "match": { "kind": "call" } }]
+        });
+    }
+    let error = error_of(too_deep);
+    assert!(error.message.contains("plan depth"), "{error}");
+
+    let mut groups = Vec::new();
+    for group in 0..4 {
+        let leaves = (0..16)
+            .map(|index| {
+                if group == 3 && index == 11 {
+                    json!({ "match": 3 })
+                } else {
+                    json!({ "match": { "kind": "call" } })
+                }
+            })
+            .collect::<Vec<_>>();
+        groups.push(json!({ "union": leaves }));
+    }
+    let error = error_of(json!({ "union": groups }));
+    assert!(error.message.contains("at most 64 nodes"), "{error}");
 }
 
 #[test]

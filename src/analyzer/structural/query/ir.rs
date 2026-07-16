@@ -466,13 +466,15 @@ fn validate_plan(
             }
             let captures = if expected == QueryValueKind::StructuralMatch {
                 let mut common = branch_domains[0].captures.clone().unwrap_or_default();
-                for branch in &branch_domains[1..] {
-                    common.retain(|capture| {
-                        branch
-                            .captures
-                            .as_ref()
-                            .is_some_and(|captures| captures.contains(capture))
-                    });
+                if *op != SetOperator::Except {
+                    for branch in &branch_domains[1..] {
+                        common.retain(|capture| {
+                            branch
+                                .captures
+                                .as_ref()
+                                .is_some_and(|captures| captures.contains(capture))
+                        });
+                    }
                 }
                 Some(common)
             } else {

@@ -2598,6 +2598,71 @@ fn reverse_import_graph_work_is_bounded_and_diagnostic() {
 }
 
 #[test]
+fn import_graph_budget_rolls_forward_to_later_branches() {
+    let project = InlineTestProject::new()
+        .file(
+            "a.py",
+            "import b\nimport c\nimport d\ndef from_a():\n    pass\n",
+        )
+        .file("b.py", "def from_b():\n    pass\n")
+        .file("c.py", "def from_c():\n    pass\n")
+        .file("d.py", "def from_d():\n    pass\n")
+        .file("y.py", "def from_y():\n    pass\n")
+        .file("z.py", "import y\ndef from_z():\n    pass\n")
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "union": [
+            {
+                "where": ["a.py"],
+                "match": { "kind": "function", "name": "from_a" },
+                "steps": [
+                    { "op": "file_of" },
+                    { "op": "imports_of" },
+                    { "op": "imports_of" }
+                ]
+            },
+            {
+                "where": ["z.py"],
+                "match": { "kind": "function", "name": "from_z" },
+                "steps": [{ "op": "file_of" }, { "op": "imports_of" }]
+            }
+        ]
+    }))
+    .unwrap();
+    let result = execute_with_limits(
+        workspace.analyzer(),
+        &query,
+        CodeQueryExecutionLimits {
+            max_scanned_files: 4,
+            ..CodeQueryExecutionLimits::default()
+        },
+    );
+    let value = serialized(&result);
+    assert!(result.truncated, "{value}");
+    assert!(
+        value["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["path"] == "y.py" && item["provenance"][0]["branch"] == json!([1])),
+        "{value}"
+    );
+    assert!(
+        value["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["branch"] == json!([0])
+                && diagnostic["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("import graph budget exhausted")),
+        "{value}"
+    );
+}
+
+#[test]
 fn typed_set_operators_use_stable_endpoint_identity_and_branch_order() {
     let files = [(
         "app.py",
@@ -2716,6 +2781,140 @@ fn typed_set_composition_supports_nested_paths_and_common_typed_steps() {
 }
 
 #[test]
+fn capture_sensitive_suffixes_preserve_each_branch_binding() {
+    let files = [(
+        "app.ts",
+        r#"
+interface Runner {
+  sendRequest(method: string, payload: object): void;
+}
+declare const runner: Runner;
+const method = "run";
+runner.sendRequest(method, {});
+"#,
+    )];
+    let branch = |capture_receiver: bool| {
+        if capture_receiver {
+            json!({
+                "match": {
+                    "kind": "call",
+                    "callee": { "name": "sendRequest" },
+                    "receiver": { "capture": "x" }
+                }
+            })
+        } else {
+            json!({
+                "match": {
+                    "kind": "call",
+                    "callee": { "name": "sendRequest" },
+                    "args": [{ "capture": "x" }]
+                }
+            })
+        }
+    };
+    let query = |receiver_first: bool| {
+        let branches = if receiver_first {
+            vec![branch(true), branch(false)]
+        } else {
+            vec![branch(false), branch(true)]
+        };
+        json!({
+            "union": branches,
+            "steps": [{ "op": "points_to", "capture": "x" }],
+            "result_detail": "full"
+        })
+    };
+
+    let forward = serialized(&run(&files, query(true)));
+    let reverse = serialized(&run(&files, query(false)));
+    let summarize = |value: &serde_json::Value| {
+        let mut rows = value["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["text"].as_str().unwrap().to_string(),
+                    row["outcome"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    };
+    assert_eq!(
+        summarize(&forward),
+        summarize(&reverse),
+        "forward={forward}\nreverse={reverse}"
+    );
+    assert_eq!(forward["results"].as_array().unwrap().len(), 2, "{forward}");
+    assert_eq!(reverse["results"].as_array().unwrap().len(), 2, "{reverse}");
+    for result in forward["results"].as_array().unwrap() {
+        assert_eq!(
+            result["provenance"].as_array().unwrap().len(),
+            1,
+            "{result}"
+        );
+        let expected_branch = if result["text"] == "runner" { 0 } else { 1 };
+        assert_eq!(
+            result["provenance"][0]["branch"],
+            json!([expected_branch]),
+            "{result}"
+        );
+    }
+    for result in reverse["results"].as_array().unwrap() {
+        assert_eq!(
+            result["provenance"].as_array().unwrap().len(),
+            1,
+            "{result}"
+        );
+        let expected_branch = if result["text"] == "runner" { 1 } else { 0 };
+        assert_eq!(
+            result["provenance"][0]["branch"],
+            json!([expected_branch]),
+            "{result}"
+        );
+    }
+}
+
+#[test]
+fn except_capture_suffix_uses_the_surviving_first_branch_binding() {
+    let result = serialized(&run(
+        &[(
+            "app.ts",
+            r#"
+interface Runner {
+  sendRequest(method: string): void;
+}
+declare const runner: Runner;
+runner.sendRequest("run");
+"#,
+        )],
+        json!({
+            "except": [
+                {
+                    "match": {
+                        "kind": "call",
+                        "callee": { "name": "sendRequest" },
+                        "receiver": { "capture": "service" }
+                    }
+                },
+                {
+                    "match": {
+                        "kind": "call",
+                        "callee": { "name": "ignored" }
+                    }
+                }
+            ],
+            "steps": [{ "op": "points_to", "capture": "service" }]
+        }),
+    ));
+    assert_eq!(result["results"].as_array().unwrap().len(), 1, "{result}");
+    assert_eq!(result["results"][0]["text"], "runner", "{result}");
+    assert_eq!(result["results"][0]["provenance"][0]["branch"], json!([0]));
+}
+
+#[test]
 fn identical_composed_seeds_share_structural_scan_work() {
     let project = InlineTestProject::new()
         .file("app.py", "def target():\n    pass\n")
@@ -2743,6 +2942,63 @@ fn identical_composed_seeds_share_structural_scan_work() {
         value["results"][0]["provenance"].as_array().unwrap().len(),
         2
     );
+}
+
+#[test]
+fn truncated_identical_seeds_reuse_partial_materialization() {
+    let project = InlineTestProject::new()
+        .file(
+            "app.py",
+            "def first():\n    pass\ndef second():\n    pass\n",
+        )
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    for operator in ["union", "intersect"] {
+        let branches = json!([
+            { "match": { "kind": "function" } },
+            { "match": { "kind": "function" } }
+        ]);
+        let query_json = if operator == "union" {
+            json!({ "union": branches })
+        } else {
+            json!({ "intersect": branches })
+        };
+        let query = CodeQuery::from_json(&query_json).unwrap();
+        let result = execute_with_limits(
+            workspace.analyzer(),
+            &query,
+            CodeQueryExecutionLimits {
+                max_scanned_files: 1,
+                max_pipeline_rows: 2,
+                ..CodeQueryExecutionLimits::default()
+            },
+        );
+        let value = serialized(&result);
+        assert!(result.truncated, "{operator}: {value}");
+        assert_eq!(
+            value["results"].as_array().unwrap().len(),
+            1,
+            "{operator}: {value}"
+        );
+        assert_eq!(
+            value["results"][0]["provenance"].as_array().unwrap().len(),
+            2,
+            "{operator}: {value}"
+        );
+        assert!(
+            value["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|diagnostic| {
+                    !diagnostic["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("scanned 2 files")
+                }),
+            "{operator}: {value}"
+        );
+    }
 }
 
 #[test]
@@ -2790,6 +3046,61 @@ fn fair_branch_budgets_preserve_later_branches_and_attribute_diagnostics() {
                     .contains("pipeline budget exhausted")),
         "{value}"
     );
+}
+
+#[test]
+fn fair_scan_budgets_do_not_charge_rejected_work_to_later_branches() {
+    let large_source = format!(
+        "# missing\n{}",
+        (0..64)
+            .map(|index| format!("value_{index} = {index}\n"))
+            .collect::<String>()
+    );
+    let important_source = "def important():\n    pass\n";
+    let project = InlineTestProject::new()
+        .file("a.py", &large_source)
+        .file("b.py", "value = 1\n")
+        .file("z.py", important_source)
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "union": [
+            {
+                "where": ["a.py", "b.py"],
+                "match": { "kind": "function", "name": "missing" }
+            },
+            {
+                "where": ["z.py"],
+                "match": { "kind": "function", "name": "important" }
+            }
+        ]
+    }))
+    .unwrap();
+    let finds_important = |limits| {
+        let result = execute_with_limits(workspace.analyzer(), &query, limits);
+        let value = serialized(&result);
+        assert!(
+            value["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["text"].as_str().unwrap().starts_with("def important")),
+            "{value}"
+        );
+    };
+
+    finds_important(CodeQueryExecutionLimits {
+        max_scanned_files: 2,
+        ..CodeQueryExecutionLimits::default()
+    });
+    finds_important(CodeQueryExecutionLimits {
+        max_scanned_source_bytes: large_source.len(),
+        ..CodeQueryExecutionLimits::default()
+    });
+    finds_important(CodeQueryExecutionLimits {
+        max_fact_nodes: 10,
+        ..CodeQueryExecutionLimits::default()
+    });
 }
 
 #[test]

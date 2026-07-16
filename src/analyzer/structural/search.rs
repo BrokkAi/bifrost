@@ -752,7 +752,6 @@ struct DirectImportGraph {
     resolved_files: usize,
     resolved_edges: usize,
     complete: bool,
-    truncated: bool,
 }
 
 impl DirectImportGraph {
@@ -771,20 +770,20 @@ impl DirectImportGraph {
         if self.compact.is_some() {
             return;
         }
-        let nodes = std::mem::take(&mut self.all_files);
+        let nodes = self.all_files.clone();
         let index_by_file: HashMap<_, _> = nodes
             .iter()
             .enumerate()
             .map(|(index, file)| (file.clone(), index as u32))
             .collect();
         let mut edges = Vec::with_capacity(self.resolved_edges);
-        for (source, targets) in std::mem::take(&mut self.forward) {
-            let Some(source) = index_by_file.get(&source).copied() else {
+        for (source, targets) in &self.forward {
+            let Some(source) = index_by_file.get(source).copied() else {
                 continue;
             };
-            edges.extend(targets.into_iter().filter_map(|target| {
+            edges.extend(targets.iter().filter_map(|target| {
                 index_by_file
-                    .get(&target)
+                    .get(target)
                     .copied()
                     .map(|target| (source, target))
             }));
@@ -794,8 +793,6 @@ impl DirectImportGraph {
             index_by_file,
             edges,
         ));
-        self.analyzed.clear();
-        self.analyzed.shrink_to_fit();
     }
 
     fn imports_of(&self, file: &ProjectFile) -> Vec<ProjectFile> {
@@ -847,7 +844,7 @@ impl Default for CodeQueryExecutionLimits {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 struct CodeQueryExecutionBudget {
     scanned_files: usize,
     scanned_source_bytes: usize,
@@ -861,11 +858,11 @@ struct CodeQueryExecutionBudget {
 struct CachedSeedExecution {
     rows: Vec<PipelineRow>,
     diagnostics: Vec<CodeQueryDiagnostic>,
+    truncated: bool,
 }
 
 struct QueryExecutionState<'a> {
     analyzer: &'a dyn IAnalyzer,
-    global_limits: CodeQueryExecutionLimits,
     cancellation: Option<&'a CancellationToken>,
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
     budget: CodeQueryExecutionBudget,
@@ -874,7 +871,6 @@ struct QueryExecutionState<'a> {
     reference_cache: ReferenceTraversalCache,
     call_cache: CallTraversalCache,
     import_graph: Option<DirectImportGraph>,
-    import_graph_budget_diagnostic_emitted: bool,
 }
 
 struct PlanExecution {
@@ -940,7 +936,6 @@ fn execute_internal(
     let mut diagnostics = Vec::new();
     let mut state = QueryExecutionState {
         analyzer,
-        global_limits: limits,
         cancellation,
         receiver_budget_override,
         budget: CodeQueryExecutionBudget::default(),
@@ -949,7 +944,6 @@ fn execute_internal(
         reference_cache: ReferenceTraversalCache::default(),
         call_cache: CallTraversalCache::default(),
         import_graph: None,
-        import_graph_budget_diagnostic_emitted: false,
     };
     let mut execution = execute_plan(
         &query.plan,
@@ -1092,10 +1086,11 @@ fn execute_seed(
     if let Some(cached) = state.seed_cache.get(&cache_key).cloned() {
         diagnostics.extend(cached.diagnostics);
         let mut rows = cached.rows;
-        let truncated = capped_by_budget && rows.len() > desired_rows;
+        let locally_capped = capped_by_budget && rows.len() > desired_rows;
+        let truncated = cached.truncated || locally_capped;
         rows.truncate(desired_rows);
         state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(rows.len());
-        if truncated {
+        if locally_capped {
             push_pipeline_budget_diagnostic(diagnostics, &state.budget);
         }
         return PlanExecution {
@@ -1211,35 +1206,37 @@ fn execute_seed(
         let Some(source) = provider.structural_source(&file) else {
             continue;
         };
-        state.budget.scanned_files += 1;
-        state.budget.scanned_source_bytes = state
-            .budget
-            .scanned_source_bytes
-            .saturating_add(source.len());
-        if state.budget.scanned_files > limits.max_scanned_files
-            || state.budget.scanned_source_bytes > limits.max_scanned_source_bytes
+        let mut projected = state.budget;
+        projected.scanned_files = projected.scanned_files.saturating_add(1);
+        projected.scanned_source_bytes =
+            projected.scanned_source_bytes.saturating_add(source.len());
+        if projected.scanned_files > limits.max_scanned_files
+            || projected.scanned_source_bytes > limits.max_scanned_source_bytes
         {
-            push_budget_diagnostic(diagnostics, &state.budget);
+            push_budget_diagnostic(diagnostics, &projected);
             truncated = true;
             break;
         }
+        state.budget.scanned_files = projected.scanned_files;
+        state.budget.scanned_source_bytes = projected.scanned_source_bytes;
         if !source_index.may_match(&source) {
             continue;
         }
         let Some(facts) = provider.structural_facts(&file) else {
             continue;
         };
-        state.budget.fact_nodes = state.budget.fact_nodes.saturating_add(facts.nodes().len());
-        if state
-            .budget
+        projected = state.budget;
+        projected.fact_nodes = projected.fact_nodes.saturating_add(facts.nodes().len());
+        if projected
             .fact_nodes
-            .saturating_add(state.budget.examined_references)
+            .saturating_add(projected.examined_references)
             > limits.max_fact_nodes
         {
-            push_budget_diagnostic(diagnostics, &state.budget);
+            push_budget_diagnostic(diagnostics, &projected);
             truncated = true;
             break;
         }
+        state.budget.fact_nodes = projected.fact_nodes;
         let remaining = match_cap.saturating_sub(pending.len());
         pending.extend(
             super::matcher::match_query(seed, &facts, remaining)
@@ -1278,15 +1275,14 @@ fn execute_seed(
         })
         .collect::<Vec<_>>();
     state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(rows.len());
-    if !truncated {
-        state.seed_cache.insert(
-            cache_key,
-            CachedSeedExecution {
-                rows: rows.clone(),
-                diagnostics: diagnostics[diagnostic_start..].to_vec(),
-            },
-        );
-    }
+    state.seed_cache.insert(
+        cache_key,
+        CachedSeedExecution {
+            rows: rows.clone(),
+            diagnostics: diagnostics[diagnostic_start..].to_vec(),
+            truncated,
+        },
+    );
     PlanExecution {
         rows,
         truncated,
@@ -1318,8 +1314,8 @@ fn apply_plan_steps(
                 ensure_complete_import_graph(
                     state.analyzer,
                     graph,
-                    state.global_limits.max_scanned_files,
-                    state.global_limits.max_pipeline_rows,
+                    limits.max_scanned_files,
+                    limits.max_pipeline_rows,
                 )
             } else {
                 let mut frontier = rows
@@ -1340,16 +1336,13 @@ fn apply_plan_steps(
                     state.analyzer,
                     graph,
                     &frontier,
-                    state.global_limits.max_scanned_files,
-                    state.global_limits.max_pipeline_rows,
+                    limits.max_scanned_files,
+                    limits.max_pipeline_rows,
                 )
             };
             if graph_exhausted {
                 truncated = true;
-                if !state.import_graph_budget_diagnostic_emitted {
-                    push_import_graph_budget_diagnostic(diagnostics, graph);
-                    state.import_graph_budget_diagnostic_emitted = true;
-                }
+                push_import_graph_budget_diagnostic(diagnostics, graph);
             }
         }
         let last = step_index + 1 == steps.len();
@@ -1539,10 +1532,6 @@ fn ensure_complete_import_graph(
         graph.freeze();
         return false;
     }
-    if graph.truncated {
-        graph.freeze();
-        return graph.truncated;
-    }
     let files = graph.all_files.clone();
     let exhausted = ensure_forward_import_edges(analyzer, graph, &files, max_files, max_edges);
     if !exhausted {
@@ -1559,10 +1548,6 @@ fn ensure_forward_import_edges(
     max_files: usize,
     max_edges: usize,
 ) -> bool {
-    if graph.truncated {
-        return true;
-    }
-
     let mut pending = files
         .iter()
         .filter(|file| !graph.forward.contains_key(*file) && !graph.unsupported.contains(*file))
@@ -1575,21 +1560,22 @@ fn ensure_forward_import_edges(
     }
 
     let available_files = max_files.saturating_sub(graph.resolved_files);
+    let mut exhausted = pending.len() > available_files;
     if pending.len() > available_files {
         pending.truncate(available_files);
-        graph.truncated = true;
     }
 
     let mut groups: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
     for file in pending {
-        graph.resolved_files += 1;
         if analyzer.import_analysis_provider_for_file(&file).is_some() {
             groups
                 .entry(crate::analyzer::common::language_for_file(&file))
                 .or_default()
                 .push(file);
         } else {
+            graph.resolved_files += 1;
             graph.unsupported.insert(file);
+            graph.compact = None;
         }
     }
 
@@ -1618,14 +1604,16 @@ fn ensure_forward_import_edges(
 
             let available_edges = max_edges.saturating_sub(graph.resolved_edges);
             if targets.len() > available_edges {
-                targets.truncate(available_edges);
-                graph.truncated = true;
+                exhausted = true;
+                continue;
             }
+            graph.resolved_files += 1;
             graph.resolved_edges += targets.len();
             graph.forward.insert(file.clone(), targets);
+            graph.compact = None;
         }
     }
-    graph.truncated
+    exhausted
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1670,6 +1658,60 @@ fn apply_pipeline_step(
             return (Vec::new(), true, receiver_truncated);
         }
         let mut row_exhausted = false;
+        if let (
+            PipelineValue::StructuralMatch(_),
+            QueryStep::ReceiverTargets(filter)
+            | QueryStep::PointsTo(filter)
+            | QueryStep::MemberTargets(filter),
+        ) = (&row.value, step)
+            && filter.capture.is_some()
+        {
+            let operation = receiver_operation(step);
+            for trace in &row.traces {
+                if output.len() >= max_step_outputs {
+                    break;
+                }
+                let (ranges, input) =
+                    structural_receiver_ranges(&trace.seed, operation, filter.capture.as_deref());
+                let mut trace_exhausted = false;
+                let expansions = receiver_analysis_expansions(
+                    receiver_service
+                        .as_ref()
+                        .expect("receiver query service exists for receiver steps"),
+                    operation,
+                    &trace.seed.file,
+                    ranges,
+                    input,
+                    filter.capture.clone(),
+                    budget,
+                    limits,
+                    receiver_budget_override,
+                    max_step_outputs.saturating_sub(output.len()),
+                    cancellation,
+                    &mut receiver_diagnostics,
+                    &mut trace_exhausted,
+                    &mut receiver_truncated,
+                );
+                for expansion in expansions {
+                    insert_pipeline_row(
+                        &mut output,
+                        &mut indexes,
+                        expansion.value,
+                        vec![advance_pipeline_trace(
+                            trace.clone(),
+                            step,
+                            &expansion.trace,
+                        )],
+                        row.provenance_truncated,
+                    );
+                }
+                if trace_exhausted {
+                    exhausted = true;
+                    break 'rows;
+                }
+            }
+            continue;
+        }
         let expansions = match (&row.value, step) {
             (PipelineValue::StructuralMatch(seed), QueryStep::EnclosingDecl) => {
                 enclosing_declaration_value(analyzer, seed, &mut enclosing_declarations)
@@ -1993,18 +2035,7 @@ fn apply_pipeline_step(
                 .traces
                 .iter()
                 .cloned()
-                .map(|mut trace| {
-                    trace
-                        .steps
-                        .extend(expansion.trace.iter().cloned().map(|(value, via)| {
-                            PipelineTraceStep {
-                                op: step.clone(),
-                                value,
-                                via,
-                            }
-                        }));
-                    trace
-                })
+                .map(|trace| advance_pipeline_trace(trace, step, &expansion.trace))
                 .collect();
             insert_pipeline_row(
                 &mut output,
@@ -2064,6 +2095,24 @@ fn apply_pipeline_step(
         });
     }
     (output, exhausted, receiver_truncated)
+}
+
+fn advance_pipeline_trace(
+    mut trace: PipelineTrace,
+    step: &QueryStep,
+    expansion: &[(PipelineTraceValue, Option<PipelineVia>)],
+) -> PipelineTrace {
+    trace.steps.extend(
+        expansion
+            .iter()
+            .cloned()
+            .map(|(value, via)| PipelineTraceStep {
+                op: step.clone(),
+                value,
+                via,
+            }),
+    );
+    trace
 }
 
 fn receiver_operation(step: &QueryStep) -> ReceiverQueryOperation {

@@ -17,6 +17,7 @@ The behavior is visible through ordinary `query_code` execution and the executab
 - [x] (2026-07-16 11:20Z) Updated Rust text output, Python request/result models, VS Code provenance types, and focused public-client coverage.
 - [x] (2026-07-16 11:30Z) Added the executable JSON/RQL set-composition cookbook, updated query references and navigation, built and link-checked all docs, and visually verified the styled page and formatted exact outputs.
 - [x] (2026-07-16 12:45Z) Completed adversarial diff review and final validation: formatting and diff checks, strict all-target/all-feature Clippy, the complete Rust `nlp` suite, the supported Python extension suite, VS Code tests, and Astro check/build all pass. The rendered cookbook was rechecked in the in-app browser.
+- [x] (2026-07-16) Ran the guided review against current `origin/master`, fixed all seven accepted findings with focused regressions, and revalidated the 73-test pipeline suite, all query/source and MCP schema tests, strict all-target/all-feature Clippy, and the complete Rust `nlp` unit/integration/doc matrix.
 
 ## Surprises & Discoveries
 
@@ -42,7 +43,16 @@ The behavior is visible through ordinary `query_code` execution and the executab
   Evidence: rerunning with `/Users/dave/.cargo/bin` first exposed one real `large_enum_variant` warning; boxing the seed variant fixed it, and `cargo clippy --all-targets --all-features -- -D warnings` then passed.
 
 - Observation: Several full-suite tests need process-control, GPG, and linked-worktree access unavailable in the managed sandbox.
-  Evidence: the sandboxed `cargo test --features nlp` run passed 876 library tests but reported six permission/environment failures; the exact full command outside the sandbox passed every non-ignored unit, integration, and doc test.
+  Evidence: the post-review sandboxed `cargo test --features nlp` run passed 877 library tests but reported six permission/environment failures; the exact full command outside the sandbox passed every non-ignored unit and integration test, and the rustup-first doc-test command also passed.
+
+- Observation: A deduplicated structural endpoint can retain multiple provenance traces whose capture names bind to different source ranges.
+  Evidence: reversing two union branches that captured the receiver versus the first argument of the same TypeScript call changed `points_to` output until capture-sensitive receiver analysis was applied independently to each trace.
+
+- Observation: Fair-share limits must be checked before shared counters or lazy graph state are committed.
+  Evidence: post-charge scan checks and a permanently frozen import graph let an exhausted early branch consume work reserved for later branches; projected accounting and resumable graph materialization preserve roll-forward.
+
+- Observation: A cached seed materialization needs explicit completeness metadata.
+  Evidence: refusing to cache truncated rows caused identical later branches to rescan, while caching the rows together with their truncation state reuses safe partial work without claiming completeness.
 
 ## Decision Log
 
@@ -82,15 +92,25 @@ The behavior is visible through ordinary `query_code` execution and the executab
   Rationale: one expensive branch must not starve every later operand, global caps must still bound the request, and the issue explicitly requires identical seed work not to be reparsed.
   Date/Author: 2026-07-16 / Codex
 
+- Decision: Capture-sensitive common suffixes execute per provenance trace, and `except` exposes captures from its surviving first branch rather than requiring exclusion branches to declare them.
+  Rationale: capture ranges are trace-local evidence; endpoint deduplication must not collapse distinct bindings, while subtraction never contributes rows or provenance from later branches.
+  Date/Author: 2026-07-16 / Codex
+
+- Decision: Plan depth and node limits are charged before recursive JSON decoding and before JSON/RQL source validation descends into child plans.
+  Rationale: validation itself is part of the untrusted-input boundary, so the same bounded plan contract must stop work before expensive descendant decoding rather than only rejecting the completed IR.
+  Date/Author: 2026-07-16 / Codex
+
 ## Outcomes & Retrospective
 
 All four milestones are complete. Schema-version-2 JSON and RQL now express recursive `union`, `intersect`, and `except` nodes, allow ordinary typed steps after composition, and reject mixed sources, too few branches, branch-local output controls, incompatible domains, and inconsistent named captures at exact paths. Live source validation, hover metadata, TextMate highlighting, REPL summaries, and the MCP schema all recognize the new vocabulary.
 
-The executor now evaluates recursive plans over internal typed rows in one shared request context. Union, intersection, and subtraction use existing exact `PipelineKey` identities and deterministic operand order; union/intersection aggregate capped branch-labeled provenance, subtraction retains the first branch's evidence, nested paths are preserved, fair quotas reserve work for later operands, and the public result limit is applied only after composition. Identical canonical seeds reuse structural rows without rescanning files. The complete 68-test pipeline integration suite passes, including new set algebra, nesting, common suffix, provenance, cache reuse, fairness, diagnostic attribution, and global-limit coverage.
+The executor now evaluates recursive plans over internal typed rows in one shared request context. Union, intersection, and subtraction use existing exact `PipelineKey` identities and deterministic operand order; union/intersection aggregate capped branch-labeled provenance, subtraction retains the first branch's evidence, nested paths are preserved, fair quotas reserve work for later operands, and the public result limit is applied only after composition. Identical canonical seeds reuse structural rows without rescanning files. The complete 73-test pipeline integration suite passes, including new set algebra, nesting, common suffix, provenance, cache reuse, fairness, diagnostic attribution, and global-limit coverage.
 
-Python callers can choose exactly one of `pattern`, `union`, `intersect`, or `except_`, and both Python and VS Code surface typed branch provenance. Human Rust/REPL output labels contributing branches and branch diagnostics. The new cookbook executes import-graph union, intersection, and subtraction in equivalent JSON and RQL and asserts the complete serialized results. All 41 Python tests, 54 VS Code tests, 68 pipeline tests, 3 query-doc tests, and 21 executable tutorial tests pass; focused coverage exercises exact composition identity in all seven terminal domains, branch capability diagnostics, and cancellation. Astro check/build and all 4,270 internal link checks pass, and the rendered page was inspected in the in-app browser with readable formatted outputs and the expected navigation placement.
+Python callers can choose exactly one of `pattern`, `union`, `intersect`, or `except_`, and both Python and VS Code surface typed branch provenance. Human Rust/REPL output labels contributing branches and branch diagnostics. The new cookbook executes import-graph union, intersection, and subtraction in equivalent JSON and RQL and asserts the complete serialized results. All 41 Python tests, 54 VS Code tests, 73 pipeline tests, 3 query-doc tests, and 21 executable tutorial tests pass; focused coverage exercises exact composition identity in all seven terminal domains, branch capability diagnostics, and cancellation. Astro check/build and all 4,270 internal link checks pass, and the rendered page was inspected in the in-app browser with readable formatted outputs and the expected navigation placement.
 
-Final repository validation is green. `cargo fmt --all`, strict all-target/all-feature Clippy, and the full `cargo test --features nlp` matrix pass; the latter includes 882 library tests plus every non-ignored binary, integration, and doc test. The Python feature is validated through the repository's supported wheel-building script because a direct combined Rust `nlp,python` test build attempts to link the extension `cdylib` without Python symbols on this host. No compatibility fallback or text parser was introduced, and the final Clippy-driven boxing change keeps the recursive source enum compact without suppressing the lint.
+Final repository validation is green. `cargo fmt --all`, strict all-target/all-feature Clippy, and the full `cargo test --features nlp` matrix pass; the latter includes 883 non-ignored library tests plus every non-ignored binary and integration test, with doc tests verified separately under the same rustup-first toolchain path. The Python feature is validated through the repository's supported wheel-building script because a direct combined Rust `nlp,python` test build attempts to link the extension `cdylib` without Python symbols on this host. No compatibility fallback or text parser was introduced, and the final Clippy-driven boxing change keeps the recursive source enum compact without suppressing the lint.
+
+The guided review follow-up closed seven additional correctness gaps: trace-local capture traversal, pre-commit fair scan accounting, reusable truncated seed caches, resumable fair import-graph construction, first-branch capture semantics for `except`, a single accurate recursive MCP plan schema, and early plan bounds in both decoding and editor validation. The pipeline suite now contains 73 passing tests. The post-fix Rust gate passes 883 non-ignored `nlp` library tests plus every non-ignored binary and integration suite; doc tests also pass under the rustup-first toolchain path used by Clippy.
 
 ## Context and Orientation
 
@@ -198,3 +218,5 @@ Revision note (2026-07-16): Completed Milestone 2. Recursive execution shares st
 Revision note (2026-07-16): Completed Milestone 3. Public clients expose set plans and branch paths, textual result surfaces identify branch provenance, and a rendered, executable cookbook documents exact import-graph set algebra plus completeness rules.
 
 Revision note (2026-07-16): Completed Milestone 4. Adversarial review found and fixed the recursive source enum's Clippy size warning. Strict all-feature linting, the full supported Rust and Python test matrices, client tests, docs checks, link validation, and visual QA are green; direct combined Rust `nlp,python` testing is recorded as a host extension-linking limitation rather than silently treated as coverage.
+
+Revision note (2026-07-16): Completed the guided review follow-up against `origin/master`. All seven accepted findings were fixed with behavior-focused regressions, the recursive MCP schema now derives root and nested plan properties from one builder, and final Rust formatting, lint, focused query suites, full `nlp` unit/integration coverage, and doc tests are green.

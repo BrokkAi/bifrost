@@ -3,9 +3,10 @@ use super::ir::{
     CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed, DEFAULT_LIMIT, HierarchyTraversal,
     MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS,
     MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
-    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern,
-    QueryError, QueryStep, ReceiverTraversalFilter, ReferenceTraversalFilter, SCHEMA_VERSION,
-    SetOperator, StringPredicate,
+    MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
+    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError, QueryStep,
+    ReceiverTraversalFilter, ReferenceTraversalFilter, SCHEMA_VERSION, SetOperator,
+    StringPredicate,
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, PatternField, QueryField, QueryStepField, StringPredicateField,
@@ -38,7 +39,7 @@ impl CodeQuery {
 
         let query = Self {
             schema_version,
-            plan: decode_plan(fields, "", &mut budget, true)?,
+            plan: decode_plan(fields, "", &mut budget, true, 0)?,
             limit,
             result_detail,
         };
@@ -50,6 +51,7 @@ impl CodeQuery {
 #[derive(Default)]
 struct QueryBudget {
     pattern_nodes: usize,
+    plan_nodes: usize,
 }
 
 fn as_object<'a>(value: &'a Value, path: &str) -> Result<&'a Map<String, Value>, QueryError> {
@@ -135,7 +137,21 @@ fn decode_plan(
     path: &str,
     budget: &mut QueryBudget,
     root: bool,
+    depth: usize,
 ) -> Result<CodeQueryPlan, QueryError> {
+    if depth > MAX_QUERY_PLAN_DEPTH {
+        return Err(QueryError::new(
+            path,
+            format!("query plan depth must be at most {MAX_QUERY_PLAN_DEPTH}"),
+        ));
+    }
+    budget.plan_nodes += 1;
+    if budget.plan_nodes > MAX_QUERY_PLAN_NODES {
+        return Err(QueryError::new(
+            path,
+            format!("query plan may contain at most {MAX_QUERY_PLAN_NODES} nodes"),
+        ));
+    }
     if !root {
         for (label, value) in [
             ("schema_version", fields.schema_version),
@@ -272,7 +288,13 @@ fn decode_plan(
             let branch_path = index_path(&op_path, index);
             let object = as_object(entry, &branch_path)?;
             let branch_fields = collect_query_fields(object, &branch_path)?;
-            branches.push(decode_plan(branch_fields, &branch_path, budget, false)?);
+            branches.push(decode_plan(
+                branch_fields,
+                &branch_path,
+                budget,
+                false,
+                depth + 1,
+            )?);
         }
         CodeQueryPlanSource::Set { op, branches }
     };
