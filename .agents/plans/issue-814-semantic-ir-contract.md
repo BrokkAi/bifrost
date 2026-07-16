@@ -17,7 +17,8 @@ The observable result is an immutable `SemanticArtifact` API under `brokk_bifros
 - [x] (2026-07-16 15:32+02:00) Implemented the immutable semantic artifact/procedure/event contract and construction-time invariant validation.
 - [x] (2026-07-16 15:32+02:00) Implemented the deterministic bounded semantic IR renderer with artifact/procedure selection and balanced truncation.
 - [x] (2026-07-16 15:32+02:00) Added behavior-focused cross-language, nested callable, value/cell capture, method-reference, invalidation, uncertainty, validation, and renderer tests.
-- [x] (2026-07-16 18:01+02:00) Ran formatting, focused tests, the full `nlp,python` feature suite, all-target/all-feature clippy, and parallel specialist plus final invariant audits; fixed every accepted finding and checkpointed the reviewed implementation as `648a9fec`.
+- [x] (2026-07-16 18:01+02:00) Ran formatting, focused tests, the full `nlp,python` feature suite, all-target/all-feature clippy, and parallel specialist plus final invariant audits; fixed every accepted finding and checkpointed the reviewed implementation as `296c1de1` after rebasing onto current `master`.
+- [x] (2026-07-16 19:20+02:00) Ran the guided review against rebased `origin/master`, fixed all four findings in `1faf8b9b`, and revalidated 60 semantic tests, 9 Rune IR tests, 10 contract tests, all-feature clippy, and the complete `nlp,python` suite.
 
 ## Surprises & Discoveries
 
@@ -117,7 +118,7 @@ The observable result is an immutable `SemanticArtifact` API under `brokk_bifros
 
 ## Outcomes & Retrospective
 
-Issue #814 is implemented in checkpoint `648a9fec`. The public `analyzer::semantic` module now exposes durable artifact and locator identities, scoped dense IDs and handles, total capability declarations, typed semantic outcomes and operational errors, finite work budgets, immutable artifact/procedure/event topology, construction-time validation, and a deterministic bounded renderer. The file-level artifact with artifact-local procedures and procedure-local rows remained sufficient; no graph storage or persistence representation was frozen prematurely.
+Issue #814 is implemented in checkpoint `296c1de1`, with guided-review fixes in `1faf8b9b`. The public `analyzer::semantic` module now exposes durable artifact and locator identities, scoped dense IDs and handles, total capability declarations, typed semantic outcomes and operational errors, finite work budgets, immutable artifact/procedure/event topology, construction-time validation, and a deterministic bounded renderer. The file-level artifact with artifact-local procedures and procedure-local rows remained sufficient; no graph storage or persistence representation was frozen prematurely.
 
 The TypeScript and Java fixtures deliberately construct equivalent neutral artifacts rather than claiming real language adapters. They prove the contract for straight-line flow, calls, nested callable bodies, value/cell/receiver captures, bound and unbound method references, partial targets, uncertainty, and rendering. #815 owns real adapter extraction and callable CFG construction; #816 owns dispatch/value/heap refinement and target oracles; #818 owns matched interprocedural call/return edges; #817 may promote storage only after those artifact shapes are measured.
 
@@ -279,3 +280,5 @@ The artifact key, locator, and renderer use stable relative paths and digests; `
 Plan revision note (2026-07-16): Initial issue plan written after live issue/roadmap review and parallel diagnosis of source, call, receiver, identity, storage, nested-callable, capture, and method-reference seams. It corrects the broader roadmap's procedure-shaped artifact sketch to a mounted source artifact with explicitly scoped dense IDs.
 
 Plan revision note (2026-07-16): Closed the implementation milestone at checkpoint `648a9fec` after specialist review and final invariant audits. Review replaced optional continuations with typed states, made invoke/suspend topology exact, correlated gaps and proof evidence in both directions, constrained unmaterialized local targets, separated provider failures from semantic uncertainty, bounded all retained payload and streamed rendering, and scoped handles to materializations. Validation passed 59 focused semantic tests, 10 contract tests, the complete `nlp,python` suite, all-target/all-feature clippy with warnings denied, formatting, and diff checks.
+
+Plan revision note (2026-07-16): After rebasing onto current `master`, guided review fixed four additional findings in `1faf8b9b`: normal/exceptional call and async arms may converge on one edge-typed join point; known callable creation survives unknown, unsupported, or pre-locator budget exhaustion; semantic and Rune IR share one transactional balanced writer; and semantic registries share one identifier-count macro. The corrected complete `nlp,python` suite and all-feature clippy passed.
