@@ -1800,6 +1800,7 @@ fn active_workspace_result(root: &Path) -> Result<ToolOutput, SearchToolsService
 #[cfg(test)]
 mod watcher_startup_tests {
     use super::*;
+    use crate::path_normalization::NormalizePath;
     use serde_json::json;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1810,7 +1811,7 @@ mod watcher_startup_tests {
     fn workspace(file: &str, source: &str) -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join(file), source).unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
         (temp, root)
     }
 
