@@ -136,6 +136,13 @@ enum UpdateStrategy {
     Manual,
 }
 
+type WatcherStarter =
+    Arc<dyn Fn(Arc<dyn Project>) -> Result<ProjectChangeWatcher, String> + Send + Sync + 'static>;
+
+fn production_watcher_starter() -> WatcherStarter {
+    Arc::new(ProjectChangeWatcher::start)
+}
+
 pub struct SearchToolsService {
     root: RwLock<PathBuf>,
     session: RwLock<Option<WorkspaceSession>>,
@@ -150,13 +157,19 @@ pub struct SearchToolsService {
     build_error: Mutex<Option<String>>,
     update_strategy: UpdateStrategy,
     semantic_indexing: bool,
+    watcher_starter: WatcherStarter,
 }
 
 struct WorkspaceSession {
     snapshot: Arc<WorkspaceAnalyzer>,
-    watcher: Option<ProjectChangeWatcher>,
+    watcher: SessionWatcher,
     #[cfg(feature = "nlp")]
     semantic: Option<Arc<SemanticIndexer>>,
+}
+
+enum SessionWatcher {
+    Disabled,
+    Active(ProjectChangeWatcher),
 }
 
 /// Owns one workspace snapshot and its request-scoped analyzer memoization.
@@ -334,10 +347,17 @@ impl SearchToolsService {
     /// watchers while still sharing the analyzer blob cache for git roots.
     pub fn new_manual_for_project(project: Arc<dyn Project>) -> Result<Self, String> {
         let root = project.root().to_path_buf();
+        let watcher_starter = production_watcher_starter();
         let workspace =
             WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
                 .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
-        let session = assemble_session(project, workspace, UpdateStrategy::Manual, false);
+        let session = assemble_session(
+            project,
+            workspace,
+            UpdateStrategy::Manual,
+            false,
+            &watcher_starter,
+        )?;
         Ok(Self {
             root: RwLock::new(root),
             session: RwLock::new(Some(session)),
@@ -345,6 +365,7 @@ impl SearchToolsService {
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::Manual,
             semantic_indexing: false,
+            watcher_starter,
         })
     }
 
@@ -783,9 +804,29 @@ impl SearchToolsService {
         update_strategy: UpdateStrategy,
         semantic_indexing: bool,
     ) -> Result<Self, String> {
+        Self::new_with_strategy_and_watcher_starter(
+            root,
+            update_strategy,
+            semantic_indexing,
+            production_watcher_starter(),
+        )
+    }
+
+    fn new_with_strategy_and_watcher_starter(
+        root: PathBuf,
+        update_strategy: UpdateStrategy,
+        semantic_indexing: bool,
+        watcher_starter: WatcherStarter,
+    ) -> Result<Self, String> {
         let (project, workspace) = build_persisted_workspace(root)?;
         let root = project.root().to_path_buf();
-        let session = assemble_session(project, workspace, update_strategy, semantic_indexing);
+        let session = assemble_session(
+            project,
+            workspace,
+            update_strategy,
+            semantic_indexing,
+            &watcher_starter,
+        )?;
         Ok(Self {
             root: RwLock::new(root),
             session: RwLock::new(Some(session)),
@@ -793,6 +834,7 @@ impl SearchToolsService {
             build_error: Mutex::new(None),
             update_strategy,
             semantic_indexing,
+            watcher_starter,
         })
     }
 
@@ -801,9 +843,29 @@ impl SearchToolsService {
         update_strategy: UpdateStrategy,
         semantic_indexing: bool,
     ) -> Result<Self, String> {
+        Self::new_transient_with_strategy_and_watcher_starter(
+            root,
+            update_strategy,
+            semantic_indexing,
+            production_watcher_starter(),
+        )
+    }
+
+    fn new_transient_with_strategy_and_watcher_starter(
+        root: PathBuf,
+        update_strategy: UpdateStrategy,
+        semantic_indexing: bool,
+        watcher_starter: WatcherStarter,
+    ) -> Result<Self, String> {
         let (project, workspace) = build_transient_workspace(root)?;
         let root = project.root().to_path_buf();
-        let session = assemble_session(project, workspace, update_strategy, semantic_indexing);
+        let session = assemble_session(
+            project,
+            workspace,
+            update_strategy,
+            semantic_indexing,
+            &watcher_starter,
+        )?;
         Ok(Self {
             root: RwLock::new(root),
             session: RwLock::new(Some(session)),
@@ -811,6 +873,7 @@ impl SearchToolsService {
             build_error: Mutex::new(None),
             update_strategy,
             semantic_indexing,
+            watcher_starter,
         })
     }
 
@@ -818,6 +881,20 @@ impl SearchToolsService {
         root: PathBuf,
         update_strategy: UpdateStrategy,
         semantic_indexing: bool,
+    ) -> Result<Self, String> {
+        Self::new_lazy_with_strategy_and_watcher_starter(
+            root,
+            update_strategy,
+            semantic_indexing,
+            production_watcher_starter(),
+        )
+    }
+
+    fn new_lazy_with_strategy_and_watcher_starter(
+        root: PathBuf,
+        update_strategy: UpdateStrategy,
+        semantic_indexing: bool,
+        watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
         let canonical = root
             .canonicalize()
@@ -835,6 +912,7 @@ impl SearchToolsService {
             build_error: Mutex::new(None),
             update_strategy,
             semantic_indexing,
+            watcher_starter,
         })
     }
 
@@ -854,6 +932,13 @@ impl SearchToolsService {
     /// mount, etc.). Without this, the discovery walk alone could exceed an MCP
     /// client's startup timeout.
     pub fn new_deferred(root: PathBuf) -> Result<Self, String> {
+        Self::new_deferred_with_watcher_starter(root, production_watcher_starter())
+    }
+
+    fn new_deferred_with_watcher_starter(
+        root: PathBuf,
+        watcher_starter: WatcherStarter,
+    ) -> Result<Self, String> {
         let update_strategy = UpdateStrategy::WatchFiles;
         let semantic_indexing = semantic_indexing_enabled();
         let canonical = root
@@ -869,6 +954,7 @@ impl SearchToolsService {
             .name("bifrost-index-build".to_string())
             .spawn({
                 let canonical = canonical.clone();
+                let watcher_starter = Arc::clone(&watcher_starter);
                 move || -> Result<WorkspaceSession, String> {
                     let project: Arc<dyn Project> = Arc::new(
                         FilesystemProject::new(canonical)
@@ -879,12 +965,13 @@ impl SearchToolsService {
                         AnalyzerConfig::default(),
                     )
                     .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
-                    Ok(assemble_session(
+                    assemble_session(
                         project,
                         workspace,
                         update_strategy,
                         semantic_indexing,
-                    ))
+                        &watcher_starter,
+                    )
                 }
             })
             .map_err(|err| format!("Failed to spawn index build thread: {err}"))?;
@@ -895,6 +982,7 @@ impl SearchToolsService {
             build_error: Mutex::new(None),
             update_strategy,
             semantic_indexing,
+            watcher_starter,
         })
     }
 
@@ -942,14 +1030,25 @@ impl SearchToolsService {
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
             .is_none()
         {
-            let (project, workspace) = build_persisted_workspace(self.service_root()?)
-                .map_err(SearchToolsServiceError::internal)?;
-            let session = assemble_session(
-                project,
-                workspace,
-                self.update_strategy,
-                self.semantic_indexing,
-            );
+            let built =
+                build_persisted_workspace(self.service_root()?).and_then(|(project, workspace)| {
+                    assemble_session(
+                        project,
+                        workspace,
+                        self.update_strategy,
+                        self.semantic_indexing,
+                        &self.watcher_starter,
+                    )
+                });
+            let session = match built {
+                Ok(session) => session,
+                Err(err) => {
+                    *self.build_error.lock().map_err(|_| {
+                        SearchToolsServiceError::internal("index build lock poisoned")
+                    })? = Some(err.clone());
+                    return Err(SearchToolsServiceError::internal(err));
+                }
+            };
             let mut guard = self.session.write().map_err(|_| {
                 SearchToolsServiceError::internal("SearchToolsService lock poisoned")
             })?;
@@ -1077,37 +1176,41 @@ impl SearchToolsService {
             return active_workspace_result(&resolved);
         }
 
-        // Build the new project + workspace before mutating self so a failed
-        // switch leaves the existing workspace queryable.
+        // Fully assemble the replacement before mutating either active field so
+        // analyzer-store or watcher startup failure leaves the old session usable.
         let (new_project, new_workspace) =
             build_persisted_workspace(resolved.clone()).map_err(|err| {
-                SearchToolsServiceError::invalid_params(format!(
+                SearchToolsServiceError::internal(format!(
                     "Failed to activate workspace {}: {err}",
                     resolved.display()
                 ))
             })?;
-
-        // Drop the old watcher first so its inotify/kqueue handle is released
-        // before we start watching the same tree from the new root.
-        let new_snapshot = Arc::new(new_workspace);
         #[cfg(feature = "nlp")]
-        let semantic = maybe_start_semantic(session.semantic.is_some(), &new_snapshot);
-        let old_session = std::mem::replace(
-            session,
-            WorkspaceSession {
-                snapshot: new_snapshot,
-                watcher: maybe_start_watcher(new_project, self.update_strategy),
-                #[cfg(feature = "nlp")]
-                semantic,
-            },
-        );
-        drop(guard);
-        old_session.close_semantic();
-        *self
+        let semantic_indexing = session.semantic.is_some();
+        #[cfg(not(feature = "nlp"))]
+        let semantic_indexing = false;
+        let new_session = assemble_session(
+            new_project,
+            new_workspace,
+            self.update_strategy,
+            semantic_indexing,
+            &self.watcher_starter,
+        )
+        .map_err(|err| {
+            SearchToolsServiceError::internal(format!(
+                "Failed to activate workspace {}: {err}",
+                resolved.display()
+            ))
+        })?;
+        let mut root = self
             .root
             .write()
-            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))? =
-            resolved.clone();
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?;
+        let old_session = std::mem::replace(session, new_session);
+        *root = resolved.clone();
+        drop(guard);
+        drop(root);
+        old_session.close_semantic();
 
         active_workspace_result(&resolved)
     }
@@ -1196,8 +1299,9 @@ impl SearchToolsService {
 
     fn apply_watcher_delta(session: &mut WorkspaceSession) {
         let _scope = profiling::scope("SearchToolsService::apply_watcher_delta");
-        let Some(watcher) = session.watcher.as_ref() else {
-            return;
+        let watcher = match &session.watcher {
+            SessionWatcher::Disabled => return,
+            SessionWatcher::Active(watcher) => watcher,
         };
 
         let delta = {
@@ -1582,28 +1686,37 @@ fn assemble_session(
     workspace: WorkspaceAnalyzer,
     update_strategy: UpdateStrategy,
     semantic_indexing: bool,
-) -> WorkspaceSession {
-    let watcher = maybe_start_watcher(project, update_strategy);
+    watcher_starter: &WatcherStarter,
+) -> Result<WorkspaceSession, String> {
+    let watcher = start_session_watcher(Arc::clone(&project), update_strategy, watcher_starter)?;
     let snapshot = Arc::new(workspace);
     #[cfg(feature = "nlp")]
     let semantic = maybe_start_semantic(semantic_indexing, &snapshot);
     #[cfg(not(feature = "nlp"))]
     let _ = semantic_indexing;
-    WorkspaceSession {
+    Ok(WorkspaceSession {
         snapshot,
         watcher,
         #[cfg(feature = "nlp")]
         semantic,
-    }
+    })
 }
 
-fn maybe_start_watcher(
+fn start_session_watcher(
     project: Arc<dyn Project>,
     update_strategy: UpdateStrategy,
-) -> Option<ProjectChangeWatcher> {
+    watcher_starter: &WatcherStarter,
+) -> Result<SessionWatcher, String> {
     match update_strategy {
-        UpdateStrategy::WatchFiles => ProjectChangeWatcher::start(project).ok(),
-        UpdateStrategy::Manual => None,
+        UpdateStrategy::WatchFiles => watcher_starter(Arc::clone(&project))
+            .map(SessionWatcher::Active)
+            .map_err(|error| {
+                format!(
+                    "Failed to start project watcher for {}: {error}",
+                    project.root().display()
+                )
+            }),
+        UpdateStrategy::Manual => Ok(SessionWatcher::Disabled),
     }
 }
 
@@ -1639,6 +1752,153 @@ fn active_workspace_result(root: &Path) -> Result<ToolOutput, SearchToolsService
         structured,
         rendered_text: None,
     })
+}
+
+#[cfg(test)]
+mod watcher_startup_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const WATCHER_FAILURE: &str = "injected watcher startup failure";
+
+    fn workspace(file: &str, source: &str) -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(file), source).unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        (temp, root)
+    }
+
+    fn failing_starter(calls: Arc<AtomicUsize>) -> WatcherStarter {
+        Arc::new(move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(WATCHER_FAILURE.to_string())
+        })
+    }
+
+    fn assert_watcher_error(error: &SearchToolsServiceError) {
+        assert_eq!(error.code, SearchToolsServiceErrorCode::Internal);
+        assert!(error.message.contains("Failed to start project watcher"));
+        assert!(error.message.contains(WATCHER_FAILURE));
+    }
+
+    #[test]
+    fn eager_watching_service_reports_watcher_startup_failure() {
+        let (_temp, root) = workspace("Eager.java", "class Eager {}\n");
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let error = match SearchToolsService::new_with_strategy_and_watcher_starter(
+            root,
+            UpdateStrategy::WatchFiles,
+            false,
+            failing_starter(Arc::clone(&calls)),
+        ) {
+            Ok(_) => panic!("watching service unexpectedly ignored watcher failure"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("Failed to start project watcher"));
+        assert!(error.contains(WATCHER_FAILURE));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn lazy_watching_service_retains_watcher_startup_failure() {
+        let (_temp, root) = workspace("Lazy.java", "class Lazy {}\n");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = SearchToolsService::new_lazy_with_strategy_and_watcher_starter(
+            root,
+            UpdateStrategy::WatchFiles,
+            false,
+            failing_starter(Arc::clone(&calls)),
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            let error = service
+                .call_tool_value("get_active_workspace", json!({}))
+                .unwrap_err();
+            assert_watcher_error(&error);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn deferred_watching_service_retains_watcher_startup_failure() {
+        let (_temp, root) = workspace("Deferred.java", "class Deferred {}\n");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = SearchToolsService::new_deferred_with_watcher_starter(
+            root,
+            failing_starter(Arc::clone(&calls)),
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            let error = service
+                .call_tool_value("get_active_workspace", json!({}))
+                .unwrap_err();
+            assert_watcher_error(&error);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn manual_service_does_not_invoke_watcher_starter() {
+        let (_temp, root) = workspace("Manual.java", "class Manual {}\n");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = SearchToolsService::new_transient_with_strategy_and_watcher_starter(
+            root.clone(),
+            UpdateStrategy::Manual,
+            false,
+            failing_starter(Arc::clone(&calls)),
+        )
+        .unwrap();
+
+        let active = service
+            .call_tool_value("get_active_workspace", json!({}))
+            .unwrap();
+        assert_eq!(active["workspace_path"], root.display().to_string());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn watcher_failure_during_activation_preserves_old_workspace() {
+        let (_old_temp, old_root) = workspace("Old.java", "class Old {}\n");
+        let (_new_temp, new_root) = workspace("New.java", "class New {}\n");
+        let failed_root = new_root.clone();
+        let starter: WatcherStarter = Arc::new(move |project| {
+            if project.root() == failed_root {
+                Err(WATCHER_FAILURE.to_string())
+            } else {
+                ProjectChangeWatcher::start_polling_for_tests(project)
+            }
+        });
+        let service = SearchToolsService::new_transient_with_strategy_and_watcher_starter(
+            old_root.clone(),
+            UpdateStrategy::WatchFiles,
+            false,
+            starter,
+        )
+        .unwrap();
+
+        let error = service
+            .call_tool_value(
+                "activate_workspace",
+                json!({"workspace_path": new_root.display().to_string()}),
+            )
+            .unwrap_err();
+        assert_watcher_error(&error);
+        assert_eq!(service.active_workspace_root(), old_root);
+
+        let active = service
+            .call_tool_value("get_active_workspace", json!({}))
+            .unwrap();
+        assert_eq!(active["workspace_path"], old_root.display().to_string());
+        let symbols = service
+            .call_tool_value("list_symbols", json!({"file_patterns": ["Old.java"]}))
+            .unwrap();
+        assert_eq!(symbols["files"][0]["path"], "Old.java");
+    }
 }
 
 #[cfg(test)]
@@ -1706,7 +1966,7 @@ public partial class MudDialogContainer
             root: RwLock::new(project.root().to_path_buf()),
             session: RwLock::new(Some(WorkspaceSession {
                 snapshot: Arc::new(workspace),
-                watcher: None,
+                watcher: SessionWatcher::Disabled,
                 #[cfg(feature = "nlp")]
                 semantic: None,
             })),
@@ -1714,6 +1974,7 @@ public partial class MudDialogContainer
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
             semantic_indexing: false,
+            watcher_starter: production_watcher_starter(),
         }
     }
 
@@ -1936,13 +2197,14 @@ mod tests {
             root: RwLock::new(dir.path().to_path_buf()),
             session: RwLock::new(Some(WorkspaceSession {
                 snapshot,
-                watcher: None,
+                watcher: SessionWatcher::Disabled,
                 semantic: Some(indexer.clone()),
             })),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
             semantic_indexing: true,
+            watcher_starter: production_watcher_starter(),
         };
 
         service.close().unwrap();

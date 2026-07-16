@@ -18,8 +18,10 @@ After this change, persisted-store opening and query failures will reach the too
 - [x] (2026-07-16 14:06Z) Chose request-context error reporting for resultless analyzer compatibility methods, fallible persisted workspace construction, and fallible watcher-backed session construction.
 - [x] (2026-07-16 14:28Z) Implemented per-request analyzer failure contexts, preserved retryable lazy-index fallbacks while recording their errors, made persisted workspace construction fallible, and propagated construction errors through runtime callers.
 - [x] (2026-07-16 14:28Z) Added healthy-miss, unsupported-analyzer, stale direct-definition, stale lazy-index, and broken-cache-path coverage. The isolated `nlp,python` analyzer-persistence suite passes all 39 tests with the required macOS PyO3 dynamic-lookup flags.
-- [ ] Commit the reviewed analyzer/store milestone checkpoint.
-- [ ] Make watcher-backed session construction and workspace activation fallible and transactional, then run focused service/watcher tests and commit the verified milestone.
+- [x] (2026-07-16 14:29Z) Committed the reviewed analyzer/store milestone as `88bb1d3a` (`fix: surface persisted analyzer failures`).
+- [x] (2026-07-16 14:36Z) Replaced optional watcher state with explicit disabled/active state, injected watcher startup per service, made eager/lazy/deferred session assembly fallible, retained lazy/deferred failures, and made workspace activation transactional.
+- [x] (2026-07-16 14:36Z) Passed five deterministic watcher-failure tests, all 12 service unit tests, both real polling-watcher tests, and all six activation integration tests; the linked-worktree activation tests required access to the primary checkout's shared `.brokk` cache.
+- [ ] Commit the reviewed watcher/session milestone checkpoint.
 - [ ] Run formatting, all-target/all-feature clippy, the full `nlp,python` test suite, inspect the final diff, and perform the required post-milestone review.
 
 ## Surprises & Discoveries
@@ -74,7 +76,9 @@ After this change, persisted-store opening and query failures will reach the too
 
 ## Outcomes & Retrospective
 
-Milestone 1 now prevents persisted analyzer construction from silently degrading to memory and retains the failed database path in its error. Store-backed definition, path-module, global-definition-index, and usage-facts compatibility paths record their first `StoreError` in every active request context without poisoning their retryable lazy cells. Healthy missing symbols and unsupported analyzers still return empty results without an error. Focused unit tests and all 39 feature-enabled analyzer-persistence tests pass. The remaining work is watcher/session construction and closing the service response boundaries that inspect the recorded context.
+Milestone 1 prevents persisted analyzer construction from silently degrading to memory and retains the failed database path in its error. Store-backed definition, path-module, global-definition-index, and usage-facts compatibility paths record their first `StoreError` in every active request context without poisoning their retryable lazy cells. Healthy missing symbols and unsupported analyzers still return empty results without an error.
+
+Milestone 2 makes every production `WatchFiles` session contain a successfully started watcher. Eager construction fails immediately; lazy and deferred construction retain the failure so repeated calls remain explicit; manual construction never invokes the starter. Activation now builds the analyzer, starts the candidate watcher, and prepares semantic state before replacing the session and root. An injected activation failure leaves both the old root and a real `list_symbols` query intact. The remaining work is closing every service response boundary over the analyzer query context, followed by full gates and specialist review.
 
 ## Context and Orientation
 
@@ -187,6 +191,20 @@ The analyzer milestone proof is:
 The feature-enabled persistence command that passes on this macOS host is:
 
     env RUSTFLAGS='-Clink-arg=-undefined -Clink-arg=dynamic_lookup' BIFROST_SEMANTIC_INDEX=off scripts/with-isolated-cargo-target.sh cargo test --features nlp,python --test analyzer_persistence
+
+The watcher milestone proof is:
+
+    cargo test --lib watcher_startup_tests
+    test result: ok. 5 passed; 0 failed; 0 ignored
+
+    cargo test --lib searchtools_service::
+    test result: ok. 12 passed; 0 failed; 0 ignored
+
+    cargo test --test project_change_watcher_test
+    test result: ok. 2 passed; 0 failed; 0 ignored
+
+    cargo test --test searchtools_service activate_workspace
+    test result: ok. 6 passed; 0 failed; 0 ignored
 
 The source proof for watcher failure erasure is:
 
