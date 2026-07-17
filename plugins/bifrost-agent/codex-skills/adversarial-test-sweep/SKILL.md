@@ -53,17 +53,25 @@ the active scope.
    combinations, and external dependencies.
 2. Inventory the scoped production surfaces and existing tests. Use Bifrost
    code intelligence for symbols, usages, and related files when available;
-   use shell search for arbitrary text, test names, and bounded counts.
-3. Record exact baseline commands and outcomes, including ignored tests,
+   use shell search for arbitrary text, test names, and bounded counts. Keep
+   discovery commands limited to relevant paths and refs, and verify optional
+   paths exist before including them.
+3. Select the narrowest exact test target that exercises the scope. Confirm how
+   the framework applies name filters before starting a costly build so a unit
+   filter does not enumerate unrelated test targets.
+4. Complete and record the scoped baseline before editing files. Do not mutate
+   sources while a baseline command is still running.
+5. Record exact baseline commands and outcomes, including ignored tests,
    flakes, timeouts, and environment limitations. Do not treat an existing
    failure as background noise.
-4. State the current milestone, required gates, and evidence needed to call it
+6. State the current milestone, required gates, and evidence needed to call it
    complete.
 
 For Bifrost itself, treat `AGENTS.md` and `.agents/PLANS.md` as authoritative.
 Prefer `tests/common/inline_project.rs::InlineTestProject` for small analyzer
 projects, use `scripts/with-isolated-cargo-target.sh` for isolated Cargo builds,
-and include the feature-complete `nlp,python` suite in full validation.
+and include the feature-complete `nlp,python` suite for repository-wide full
+validation. A user-defined bounded milestone uses its stated gates instead.
 
 ### 2. Build a risk-ranked matrix
 
@@ -97,6 +105,13 @@ would fail for a plausible defect, has discriminating assertions, and uses the
 smallest realistic fixture. Remove or consolidate a test only after mapping its
 behavior to stronger retained coverage.
 
+Before adding coverage without a reproduced defect, name the missing behavioral
+evidence and a plausible defect that the test would catch. A boundary value is
+not sufficient justification by itself. Tests that merely restate an existing
+private assertion, internal collection invariant, or panic message are normally
+implementation mirrors; retain them only when that fail-fast behavior is itself
+an important observable contract.
+
 ### 4. Close each finding
 
 For every defect:
@@ -110,11 +125,12 @@ For every defect:
 
 ### 5. Validate from narrow to broad
 
-Run focused regressions first, then neighboring suites, formatting and linting,
-and finally the complete matrix required by the milestone. Repeat concurrency
-or flake tests only when multiple runs provide relevant evidence. Review every
-ignored, skipped, filtered, timed-out, or environment-gated result before
-calling the milestone clean.
+Run the narrowest exact focused target first, then neighboring suites,
+applicable formatting and scoped linting, and finally the complete matrix
+required by the milestone. Avoid generic filters that build or enumerate
+unrelated targets. Repeat concurrency or flake tests only when multiple runs
+provide relevant evidence. Review every ignored, skipped, filtered, timed-out,
+or environment-gated result before calling the milestone clean.
 
 ## Completion and report
 
