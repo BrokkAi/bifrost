@@ -314,7 +314,7 @@ fn assemblies_from_assets(path: &Path) -> Vec<PathBuf> {
                     for folder in &folders {
                         let candidate = folder.join(library).join(relative);
                         if let Ok(candidate) = candidate.canonicalize()
-                            && candidate.starts_with(&folder)
+                            && candidate.starts_with(folder)
                             && candidate.is_file()
                         {
                             out.push(candidate);
@@ -660,6 +660,7 @@ fn metadata_bytes<'a>(pe: &PE<'_>, bytes: &'a [u8]) -> Option<&'a [u8]> {
     bytes.get(offset..offset.checked_add(size)?)
 }
 
+#[allow(clippy::too_many_arguments)] // Metadata tables are distinct, borrowed inputs in a hot decode path.
 fn member(
     path: &Path,
     token: u32,
@@ -756,9 +757,9 @@ impl<'a> TableLayout<'a> {
         let valid = u64at(data, &mut p)?;
         take(data, &mut p, 8)?;
         let mut rows = [0; 45];
-        for i in 0..45 {
+        for (i, row_count) in rows.iter_mut().enumerate() {
             if valid & (1 << i) != 0 {
-                rows[i] = u32at(data, &mut p)?;
+                *row_count = u32at(data, &mut p)?;
             }
         }
         let mut starts = [0; 45];
