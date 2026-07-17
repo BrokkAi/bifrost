@@ -8866,6 +8866,64 @@ type Options struct {
 }
 
 #[test]
+fn go_import_selector_prefers_nearest_visible_vendor() {
+    let source = r#"
+package tool
+
+import dep "example.com/dependency/endpoints"
+
+var value = dep.Options{Selected: "nearest"}
+"#;
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file("cmd/tool/main.go", source)
+        .file(
+            "vendor/example.com/dependency/endpoints/endpoints.go",
+            r#"
+package endpoints
+
+type Options struct {
+    Selected string
+}
+"#,
+        )
+        .file(
+            "cmd/tool/vendor/example.com/dependency/endpoints/endpoints.go",
+            r#"
+package endpoints
+
+type Options struct {
+    Selected string
+}
+"#,
+        )
+        .build();
+
+    let selected = source.find("Selected:").expect("composite field label");
+    let value = lookup(
+        project.root(),
+        &location_reference("cmd/tool/main.go", source, selected),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().unwrap().len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["fqn"],
+        "example.com/app/cmd/tool/vendor/example.com/dependency/endpoints.Options.Selected",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"],
+        "cmd/tool/vendor/example.com/dependency/endpoints/endpoints.go",
+        "{value}"
+    );
+}
+
+#[test]
 fn go_import_selector_resolves_package_var_definition() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n")
@@ -8919,6 +8977,14 @@ var ErrDuplicate = errors.New("duplicate")
 fn go_external_import_selector_reports_boundary() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n")
+        .file(
+            "fmt/fmt.go",
+            r#"
+package fmt
+
+func Println(value string) {}
+"#,
+        )
         .file(
             "main.go",
             r#"

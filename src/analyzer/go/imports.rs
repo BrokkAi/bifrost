@@ -131,10 +131,19 @@ impl GoAnalyzer {
             let Some(path) = extract_go_import_path(&import.raw_snippet) else {
                 continue;
             };
+            let vendor_suffix = format!("/vendor/{path}");
             let mut packages: Vec<String> = self
-                .direct_import_files(file, &path)
+                .workspace_path_index()
+                .import_files(file, &path)
                 .into_iter()
-                .filter_map(|target| self.go_package_of(&target))
+                .filter(|target| self.is_analyzed(target))
+                .filter_map(|target| {
+                    let declared = self.package_clause_of(&target)?;
+                    Some(super::packages::canonical_go_package_name(
+                        &target, &declared,
+                    ))
+                })
+                .filter(|package| package == &path || package.ends_with(&vendor_suffix))
                 .collect();
             packages.sort();
             packages.dedup();
