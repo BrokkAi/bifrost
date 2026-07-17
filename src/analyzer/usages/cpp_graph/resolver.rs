@@ -3482,6 +3482,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn union_visibility_keeps_colliding_declarations_root_local() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let left = ProjectFile::new(root.clone(), "left.cpp");
+        let right = ProjectFile::new(root.clone(), "right.cpp");
+        let left_header = ProjectFile::new(root.clone(), "left/collision.h");
+        let right_header = ProjectFile::new(root, "right/collision.h");
+        let left_collision =
+            CodeUnit::new(left_header.clone(), CodeUnitType::Class, "", "Collision");
+        let right_collision =
+            CodeUnit::new(right_header.clone(), CodeUnitType::Class, "", "Collision");
+        let adjacency = HashMap::from_iter([
+            (left.clone(), vec![left_header.clone()]),
+            (right.clone(), vec![right_header.clone()]),
+            (left_header.clone(), Vec::new()),
+            (right_header.clone(), Vec::new()),
+        ]);
+        let declarations = HashMap::from_iter([
+            (left_header.clone(), BTreeSet::from([left_collision])),
+            (right_header.clone(), BTreeSet::from([right_collision])),
+        ]);
+        let roots = HashSet::from_iter([left.clone(), right.clone()]);
+        let (_, visible_by_file) = build_visibility_data(
+            &roots,
+            None,
+            |file| adjacency.get(file).cloned().unwrap_or_default(),
+            |file| declarations.get(file).cloned().unwrap_or_default(),
+        );
+        let visibility = visibility_index(visible_by_file);
+        let candidate_sources = |file: &ProjectFile| {
+            visibility
+                .visible_identifier_candidates(file, "Collision")
+                .map(|candidate| candidate.source().clone())
+                .collect::<HashSet<_>>()
+        };
+
+        assert_eq!(candidate_sources(&left), HashSet::from_iter([left_header]));
+        assert_eq!(
+            candidate_sources(&right),
+            HashSet::from_iter([right_header])
+        );
+    }
+
     fn visibility_index(
         visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
     ) -> VisibilityIndex {

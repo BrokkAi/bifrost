@@ -30,6 +30,7 @@ const TRANSIENT_FILE_STATE_CACHE_CAPACITY: usize = 128;
 // A broad usage traversal may visit more files than the small cross-request
 // cache holds. Retain hydrated states for one request, then release them.
 const QUERY_FILE_STATE_CACHE_CAPACITY: usize = 1_024;
+const QUERY_PREPARED_SYNTAX_CACHE_CAPACITY: usize = 1_024;
 const SUMMARY_FILE_PROJECTION_CACHE_CAPACITY: usize = 32;
 const STORE_WRITE_IMMEDIATE_RETRIES: usize = 2;
 const STORE_WRITE_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
@@ -371,6 +372,30 @@ pub struct FileState {
     pub(crate) parse_errors: Option<Vec<crate::analyzer::ParseError>>,
 }
 
+/// Immutable syntax prepared from the exact source snapshot owned by a
+/// request-scoped [`FileState`]. Keeping the state alive prevents the source
+/// bytes and tree from drifting apart while concurrent usage queries reuse it.
+#[derive(Debug)]
+pub(crate) struct PreparedSyntaxTree {
+    file_state: Arc<FileState>,
+    tree: Tree,
+    line_starts: Vec<usize>,
+}
+
+impl PreparedSyntaxTree {
+    pub(crate) fn source(&self) -> &str {
+        &self.file_state.source
+    }
+
+    pub(crate) fn tree(&self) -> &Tree {
+        &self.tree
+    }
+
+    pub(crate) fn line_starts(&self) -> &[usize] {
+        &self.line_starts
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct HierarchyDeclarationFacts {
     pub(crate) declaration: CodeUnit,
@@ -532,6 +557,7 @@ struct QueryReadCache {
     contexts: Vec<Arc<crate::analyzer::AnalyzerQueryContext>>,
     live_oids: HashMap<ProjectFile, Option<Oid>>,
     file_states: HashMap<FileStateCacheKey, Arc<FileState>>,
+    prepared_syntax: HashMap<FileStateCacheKey, Arc<OnceLock<Option<Arc<PreparedSyntaxTree>>>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -551,6 +577,7 @@ impl QueryReadCache {
         if self.contexts.is_empty() {
             self.live_oids.clear();
             self.file_states.clear();
+            self.prepared_syntax.clear();
         }
         if !self
             .contexts
@@ -566,6 +593,7 @@ impl QueryReadCache {
         if self.contexts.is_empty() {
             self.live_oids.clear();
             self.file_states.clear();
+            self.prepared_syntax.clear();
         }
     }
 
@@ -583,6 +611,32 @@ impl QueryReadCache {
         {
             self.file_states.insert(key, state);
         }
+    }
+
+    fn prepared_syntax_cell(
+        &mut self,
+        key: FileStateCacheKey,
+    ) -> Option<Arc<OnceLock<Option<Arc<PreparedSyntaxTree>>>>> {
+        self.prepared_syntax_cell_with_capacity(key, QUERY_PREPARED_SYNTAX_CACHE_CAPACITY)
+    }
+
+    fn prepared_syntax_cell_with_capacity(
+        &mut self,
+        key: FileStateCacheKey,
+        capacity: usize,
+    ) -> Option<Arc<OnceLock<Option<Arc<PreparedSyntaxTree>>>>> {
+        if !self.is_active() {
+            return None;
+        }
+        if let Some(cell) = self.prepared_syntax.get(&key) {
+            return Some(Arc::clone(cell));
+        }
+        if self.prepared_syntax.len() >= capacity {
+            return None;
+        }
+        let cell = Arc::new(OnceLock::new());
+        self.prepared_syntax.insert(key, Arc::clone(&cell));
+        Some(cell)
     }
 }
 
@@ -988,6 +1042,8 @@ pub struct TreeSitterAnalyzer<A> {
     query_read_cache: Arc<Mutex<QueryReadCache>>,
     #[cfg(test)]
     live_oid_validation_counts: Arc<Mutex<HashMap<ProjectFile, usize>>>,
+    #[cfg(test)]
+    prepared_syntax_parse_counts: Arc<Mutex<HashMap<FileStateCacheKey, usize>>>,
     transient_file_states: Arc<Mutex<FileStateCache>>,
     source_snapshot_file_states: Arc<Mutex<FileStateCache>>,
     summary_file_projections: Arc<Mutex<SummaryFileProjectionCache>>,
@@ -1019,6 +1075,8 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
             #[cfg(test)]
             live_oid_validation_counts: Arc::clone(&self.live_oid_validation_counts),
+            #[cfg(test)]
+            prepared_syntax_parse_counts: Arc::clone(&self.prepared_syntax_parse_counts),
             transient_file_states: Arc::clone(&self.transient_file_states),
             source_snapshot_file_states: Arc::clone(&self.source_snapshot_file_states),
             summary_file_projections: Arc::clone(&self.summary_file_projections),
@@ -1181,6 +1239,8 @@ where
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
             #[cfg(test)]
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
+            #[cfg(test)]
+            prepared_syntax_parse_counts: Arc::new(Mutex::new(HashMap::default())),
             transient_file_states: Arc::new(Mutex::new(FileStateCache::new(
                 TRANSIENT_FILE_STATE_CACHE_CAPACITY,
             ))),
@@ -1299,6 +1359,8 @@ where
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
             #[cfg(test)]
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
+            #[cfg(test)]
+            prepared_syntax_parse_counts: Arc::new(Mutex::new(HashMap::default())),
             transient_file_states: Arc::new(Mutex::new(FileStateCache::new(
                 TRANSIENT_FILE_STATE_CACHE_CAPACITY,
             ))),
@@ -2509,15 +2571,23 @@ where
     pub(crate) fn fetch_file_state(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
         let oid = self.resolve_live_oid_for_file(file)?;
         let key = Self::transient_cache_key(oid, file);
+        self.fetch_file_state_for_key(file, &key)
+    }
+
+    fn fetch_file_state_for_key(
+        &self,
+        file: &ProjectFile,
+        key: &FileStateCacheKey,
+    ) -> Option<Arc<FileState>> {
         let storage_key = self.adapter.storage_language_key_for_file(file);
-        if let Some(state) = self.retry_dirty_file_state(&key, &storage_key) {
+        if let Some(state) = self.retry_dirty_file_state(key, &storage_key) {
             return Some(state);
         }
         if let Some(state) = self
             .query_read_cache
             .lock()
             .expect("query read cache mutex poisoned")
-            .file_state(&key)
+            .file_state(key)
         {
             return Some(state);
         }
@@ -2525,24 +2595,24 @@ where
             .transient_file_states
             .lock()
             .expect("transient file-state cache mutex poisoned")
-            .get(&key)
+            .get(key)
         {
             let mut query_cache = self
                 .query_read_cache
                 .lock()
                 .expect("query read cache mutex poisoned");
             if query_cache.is_active() {
-                query_cache.retain_file_state(key, Arc::clone(&state));
+                query_cache.retain_file_state(key.clone(), Arc::clone(&state));
             }
             return Some(state);
         }
 
         self.full_hydration_count.fetch_add(1, Ordering::Relaxed);
-        let source = self.source_for_oid(file, oid)?;
+        let source = self.source_for_oid(file, key.oid)?;
         let mut state = match self
             .store_query_or_record(
                 self.store_context.store.hydrate_file_state_with_source(
-                    oid,
+                    key.oid,
                     &storage_key,
                     self.store_context.generations[&storage_key],
                     self.adapter.as_ref(),
@@ -2554,7 +2624,7 @@ where
             .flatten()
         {
             Some(state) => state,
-            None => self.parse_and_store_transient(file, oid, source.clone())?,
+            None => self.parse_and_store_transient(file, key.oid, source.clone())?,
         };
         state.source = source;
         let state = Arc::new(state);
@@ -2567,9 +2637,70 @@ where
             .lock()
             .expect("query read cache mutex poisoned");
         if query_cache.is_active() {
-            query_cache.retain_file_state(key, Arc::clone(&state));
+            query_cache.retain_file_state(key.clone(), Arc::clone(&state));
         }
         Some(state)
+    }
+
+    pub(crate) fn prepared_syntax(&self, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>> {
+        let oid = self.resolve_live_oid_for_file(file)?;
+        let key = Self::transient_cache_key(oid, file);
+        let cell = self
+            .query_read_cache
+            .lock()
+            .expect("query read cache mutex poisoned")
+            .prepared_syntax_cell(key.clone());
+        let Some(cell) = cell else {
+            return self.prepare_syntax_for_key(file, &key);
+        };
+        cell.get_or_init(|| {
+            #[cfg(test)]
+            {
+                let mut counts = self
+                    .prepared_syntax_parse_counts
+                    .lock()
+                    .expect("prepared syntax parse count mutex poisoned");
+                *counts.entry(key.clone()).or_default() += 1;
+            }
+            self.prepare_syntax_for_key(file, &key)
+        })
+        .clone()
+    }
+
+    fn prepare_syntax_for_key(
+        &self,
+        file: &ProjectFile,
+        key: &FileStateCacheKey,
+    ) -> Option<Arc<PreparedSyntaxTree>> {
+        let file_state = self.fetch_file_state_for_key(file, key)?;
+        if file_state.source.is_empty() {
+            return None;
+        }
+        let mut parser = Parser::new();
+        parser
+            .set_language(&self.adapter.parser_language_for_file(file))
+            .ok()?;
+        let tree = parser.parse(file_state.source.as_str(), None)?;
+        let line_starts = compute_line_starts(&file_state.source);
+        Some(Arc::new(PreparedSyntaxTree {
+            file_state,
+            tree,
+            line_starts,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepared_syntax_parse_count_for_test(&self, file: &ProjectFile) -> usize {
+        let Some(oid) = self.resolve_live_oid_for_file(file) else {
+            return 0;
+        };
+        let key = Self::transient_cache_key(oid, file);
+        self.prepared_syntax_parse_counts
+            .lock()
+            .expect("prepared syntax parse count mutex poisoned")
+            .get(&key)
+            .copied()
+            .unwrap_or_default()
     }
 
     pub(crate) fn bulk_file_states(
@@ -6763,6 +6894,130 @@ mod tests {
         assert_eq!(
             analyzer.full_hydration_count_for_test(),
             TRANSIENT_FILE_STATE_CACHE_CAPACITY + 2
+        );
+    }
+
+    #[test]
+    fn query_read_cache_does_not_retain_prepared_syntax_past_capacity() {
+        let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        let mut cache = QueryReadCache::default();
+        cache.begin(&context);
+        let first = FileStateCacheKey {
+            oid: Oid::hash_object(ObjectType::Blob, b"first").expect("first oid"),
+            rel_path: PathBuf::from("first.cpp"),
+        };
+        let second = FileStateCacheKey {
+            oid: Oid::hash_object(ObjectType::Blob, b"second").expect("second oid"),
+            rel_path: PathBuf::from("second.cpp"),
+        };
+
+        let first_cell = cache
+            .prepared_syntax_cell_with_capacity(first.clone(), 1)
+            .expect("first retained cell");
+        let repeated = cache
+            .prepared_syntax_cell_with_capacity(first, 1)
+            .expect("existing retained cell");
+        assert!(Arc::ptr_eq(&first_cell, &repeated));
+        assert!(
+            cache
+                .prepared_syntax_cell_with_capacity(second, 1)
+                .is_none(),
+            "a new file must be prepared without retention at capacity"
+        );
+        assert_eq!(cache.prepared_syntax.len(), 1);
+    }
+
+    #[test]
+    fn prepared_syntax_is_reused_sequentially_within_outer_query_scope() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/main.rs");
+        file.write("fn target() {}\nfn consumer() { target(); }\n")
+            .expect("rust source");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+        let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+
+        let first = analyzer.prepared_syntax(&file).expect("first syntax");
+        let second = analyzer.prepared_syntax(&file).expect("reused syntax");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 1);
+        assert_eq!(
+            first.source(),
+            "fn target() {}\nfn consumer() { target(); }\n"
+        );
+    }
+
+    #[test]
+    fn prepared_syntax_initializes_once_for_concurrent_queries() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/main.rs");
+        file.write("fn target() {}\nfn consumer() { target(); }\n")
+            .expect("rust source");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+        let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let barrier = Arc::new(Barrier::new(8));
+
+        let prepared: Vec<_> = std::thread::scope(|threads| {
+            let analyzer = &analyzer;
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let barrier = Arc::clone(&barrier);
+                    let file = file.clone();
+                    threads.spawn(move || {
+                        barrier.wait();
+                        analyzer.prepared_syntax(&file).expect("prepared syntax")
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("syntax worker"))
+                .collect()
+        });
+
+        assert!(
+            prepared
+                .iter()
+                .skip(1)
+                .all(|syntax| Arc::ptr_eq(&prepared[0], syntax))
+        );
+        assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 1);
+    }
+
+    #[test]
+    fn prepared_syntax_refreshes_after_outer_scope_and_overlay_change() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/main.rs");
+        std::fs::create_dir_all(file.abs_path().parent().expect("source parent"))
+            .expect("source directory");
+        file.write("fn disk() {}\n").expect("rust source");
+        let project = Arc::new(CountingOverlayProject::new(&root, "fn first() {}\n"));
+        let analyzer =
+            TreeSitterAnalyzer::new(Arc::clone(&project) as Arc<dyn Project>, RustAdapter);
+
+        let first = {
+            let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            let prepared = analyzer.prepared_syntax(&file).expect("first syntax");
+            assert_eq!(prepared.source(), "fn first() {}\n");
+            assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 1);
+            prepared
+        };
+
+        project.set_source("fn second() { first(); }\n");
+        let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let second = analyzer.prepared_syntax(&file).expect("updated syntax");
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.source(), "fn second() { first(); }\n");
+        assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 1);
+        assert_ne!(
+            first.tree().root_node().to_sexp(),
+            second.tree().root_node().to_sexp()
         );
     }
 

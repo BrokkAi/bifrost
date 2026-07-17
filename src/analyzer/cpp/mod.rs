@@ -47,6 +47,8 @@ pub struct CppAnalyzer {
     direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
     #[cfg(test)]
     type_alias_classification_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    authoritative_visibility_build_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 crate::analyzer::impl_forward_query_provider!(CppAnalyzer);
@@ -99,6 +101,8 @@ impl CppAnalyzer {
             direct_descendant_index: Arc::new(OnceLock::new()),
             #[cfg(test)]
             type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            authoritative_visibility_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -121,6 +125,8 @@ impl CppAnalyzer {
             direct_descendant_index: Arc::new(OnceLock::new()),
             #[cfg(test)]
             type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            authoritative_visibility_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -133,6 +139,36 @@ impl CppAnalyzer {
 }
 
 impl CppAnalyzer {
+    pub(crate) fn prepared_syntax(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
+        self.inner.prepared_syntax(file)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepared_syntax_parse_count_for_test(&self, file: &ProjectFile) -> usize {
+        self.inner.prepared_syntax_parse_count_for_test(file)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_authoritative_visibility_build_for_test(&self) {
+        self.authoritative_visibility_build_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_authoritative_visibility_build_count_for_test(&self) {
+        self.authoritative_visibility_build_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authoritative_visibility_build_count_for_test(&self) -> usize {
+        self.authoritative_visibility_build_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     #[doc(hidden)]
     pub fn reset_enclosing_parent_query_counts_for_test(&self) {
         self.inner.reset_enclosing_parent_query_counts_for_test();

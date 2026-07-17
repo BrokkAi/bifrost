@@ -46,6 +46,51 @@ pub(crate) struct CppQueryResolver<'a> {
     cpp: &'a CppAnalyzer,
 }
 
+/// One authoritative inverse batch over a fixed union of caller roots.
+///
+/// Each query still scans only its own candidate set; the union index merely
+/// prepares the per-root include closure and visible declarations once.
+/// This seam is intentionally limited to the reference-differential batch,
+/// which has no cancellation input. Cancellable `UsageFinder` requests keep
+/// using `build_with_cancellation` and never enter this batch.
+pub(crate) struct CppAuthoritativeUsageBatch<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    resolver: CppQueryResolver<'a>,
+    visibility: VisibilityIndex,
+}
+
+impl<'a> CppAuthoritativeUsageBatch<'a> {
+    pub(crate) fn new(analyzer: &'a dyn IAnalyzer, roots: &HashSet<ProjectFile>) -> Option<Self> {
+        let resolver = CppQueryResolver::try_new(analyzer)?;
+        #[cfg(test)]
+        resolver
+            .cpp
+            .record_authoritative_visibility_build_for_test();
+        let visibility = VisibilityIndex::build(resolver.cpp, analyzer, roots);
+        Some(Self {
+            analyzer,
+            resolver,
+            visibility,
+        })
+    }
+
+    pub(crate) fn find_usages(
+        &self,
+        overloads: &[CodeUnit],
+        candidate_files: &HashSet<ProjectFile>,
+        max_usages: usize,
+    ) -> GraphUsageOutcome {
+        let scan_scope = UsageScanScope::new(candidate_files, true);
+        self.resolver.find_usages_with_visibility(
+            self.analyzer,
+            overloads,
+            &scan_scope,
+            max_usages,
+            &self.visibility,
+        )
+    }
+}
+
 impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
     fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         Some(Self {
@@ -59,6 +104,28 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
         overloads: &[CodeUnit],
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
+    ) -> GraphUsageOutcome {
+        let files = self.scan_files(overloads, scan_scope);
+        #[cfg(test)]
+        self.cpp.record_authoritative_visibility_build_for_test();
+        let visibility = VisibilityIndex::build_with_cancellation(
+            self.cpp,
+            analyzer,
+            &files,
+            scan_scope.cancellation(),
+        );
+        self.find_usages_with_visibility(analyzer, overloads, scan_scope, max_usages, &visibility)
+    }
+}
+
+impl CppQueryResolver<'_> {
+    fn find_usages_with_visibility(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        overloads: &[CodeUnit],
+        scan_scope: &UsageScanScope<'_>,
+        max_usages: usize,
+        visibility: &VisibilityIndex,
     ) -> GraphUsageOutcome {
         let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
@@ -75,24 +142,7 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
             specs.push(spec);
         }
         let target_group: HashSet<CodeUnit> = overloads.iter().cloned().collect();
-
-        let candidate_files = scan_scope.candidate_files();
-        let mut files: HashSet<ProjectFile> = candidate_files
-            .iter()
-            .filter(|file| language_for_file(file) == Language::Cpp)
-            .cloned()
-            .collect();
-        for overload in overloads {
-            if scan_scope.allows(overload.source()) {
-                files.insert(overload.source().clone());
-            }
-        }
-        let visibility = VisibilityIndex::build_with_cancellation(
-            self.cpp,
-            analyzer,
-            &files,
-            scan_scope.cancellation(),
-        );
+        let files = self.scan_files(overloads, scan_scope);
 
         let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
         let mut unproven_hits: BTreeSet<UsageHit> = BTreeSet::new();
@@ -110,11 +160,11 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
             files,
             &specs,
             || scan_scope.is_cancelled(),
-            prepare_file,
+            |file| prepare_file(self.cpp, file),
             |file, prepared, spec| {
                 scan_prepared_file(
                     analyzer,
-                    &visibility,
+                    visibility,
                     file,
                     prepared,
                     spec,
@@ -143,6 +193,25 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
             hits,
             unproven_hits,
         ))
+    }
+
+    fn scan_files(
+        &self,
+        overloads: &[CodeUnit],
+        scan_scope: &UsageScanScope<'_>,
+    ) -> HashSet<ProjectFile> {
+        let mut files: HashSet<ProjectFile> = scan_scope
+            .candidate_files()
+            .iter()
+            .filter(|file| language_for_file(file) == Language::Cpp)
+            .cloned()
+            .collect();
+        for overload in overloads {
+            if scan_scope.allows(overload.source()) {
+                files.insert(overload.source().clone());
+            }
+        }
+        files
     }
 }
 
@@ -291,5 +360,53 @@ mod tests {
 
         assert_eq!(prepared, vec!["first.cpp"]);
         assert_eq!(scanned, vec![("first.cpp", "first-spec")]);
+    }
+
+    #[test]
+    fn file_major_scan_does_not_prepare_when_already_cancelled() {
+        let mut prepared = 0;
+        let mut scanned = 0;
+
+        scan_file_major(
+            ["must-not-prepare.cpp"],
+            &["must-not-scan"],
+            || true,
+            |_| {
+                prepared += 1;
+                Some(())
+            },
+            |_, (), _| {
+                scanned += 1;
+                false
+            },
+        );
+
+        assert_eq!(prepared, 0);
+        assert_eq!(scanned, 0);
+    }
+
+    #[test]
+    fn file_major_scan_rechecks_cancellation_after_preparing() {
+        let cancelled = Cell::new(false);
+        let mut prepared = 0;
+        let mut scanned = 0;
+
+        scan_file_major(
+            ["prepared.cpp"],
+            &["must-not-scan"],
+            || cancelled.get(),
+            |_| {
+                prepared += 1;
+                cancelled.set(true);
+                Some(())
+            },
+            |_, (), _| {
+                scanned += 1;
+                false
+            },
+        );
+
+        assert_eq!(prepared, 1);
+        assert_eq!(scanned, 0);
     }
 }
