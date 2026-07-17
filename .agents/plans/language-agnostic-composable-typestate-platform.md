@@ -30,6 +30,7 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [x] (2026-07-16 15:32+02:00) Implemented #814's identities, capabilities, outcomes/budgets, immutable artifact/procedure IR, invariant validation, scoped handles, bounded renderer, and TypeScript/Java contract fixtures.
 - [x] (2026-07-16 18:01+02:00) Completed #814 after specialist review and final invariant audits; all focused tests, the complete `nlp,python` suite, all-target/all-feature clippy, formatting, and diff checks passed, and the reviewed implementation was checkpointed as `296c1de1` after rebasing onto current `master`.
 - [x] (2026-07-16 19:20+02:00) Addressed all guided-review findings in `1faf8b9b`, including converged typed continuations, targetless uncertain callable creation, and shared bounded-renderer/registry utilities; all repository gates passed.
+- [x] (2026-07-17 10:10+02:00) Started #815 execution with the focused living plan `.agents/plans/all-language-cfg-icfg-rollout.md`, spanning callable CFGs, the #816 dispatch prerequisite, one #818 ICFG, all eleven analyzable-language adapters, and the evidence-gated CFG/ICFG slice of #817.
 - [ ] Complete #815 and the first adapter children: build equivalent per-callable CFGs for TypeScript and Java.
 - [ ] Complete #816 in parallel: expose reusable dispatch, value, heap, and bounded access-path oracles for the reference languages.
 - [ ] Complete #818: stitch CFG fragments through existing call relations into a demand-materialized ICFG.
@@ -78,6 +79,9 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - Observation: GitHub supports native subissues in this repository, so #814 through #826 can be attached directly to #813 while retaining explicit dependency text in each body.
   Evidence: the live `subIssues` query for #813 returned all thirteen children.
 
+- Observation: #815's predecessor/successor contract requires a rich-edge graph shape that the existing payloadless compact graph cannot directly supply.
+  Evidence: semantic CFGs preserve parallel source-target edges with different kinds or evidence, so one canonical `ControlEdge` table plus edge-ID adjacency is required. The focused implementation and rollout are tracked in `.agents/plans/all-language-cfg-icfg-rollout.md`.
+
 ## Decision Log
 
 - Decision: target meet-over-valid-interprocedural-paths analysis rather than SMT-backed path feasibility.
@@ -107,6 +111,10 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - Decision: freeze hot immutable base relations into dense IDs plus CSR/CSC, while persisting only stable, expensive, reusable artifacts in SQLite.
   Rationale: this matches the successful compact structural snapshot pattern from PR #802 and avoids persisting query-specific product states or maintaining rich and compact duplicate graphs.
   Date: 2026-07-16.
+
+- Decision: execute #815, the dispatch slice of #816, #818, and all remaining language adapters through one focused living plan while retaining issue-sized checkpoint reviews.
+  Rationale: TypeScript and Java must pressure-test both intraprocedural lowering and matched interprocedural transfers before the contract freezes, while one continuous record keeps all-language capability gaps and the CFG/ICFG lifecycle slice of #817 coherent. Later value-flow, solver, and summary persistence decisions remain in the broader roadmap. The implementation still preserves issue ownership and excludes public query, solver, value/heap, and typestate work.
+  Date: 2026-07-17.
 
 - Decision: keep language-semantic summaries separate from rule-specific protocol summaries.
   Rationale: adapter/call/value effects can be reused by several clients, while a protocol summary must include its rule hash and map incoming client state to outgoing client state and effects.
@@ -808,7 +816,7 @@ Record true/false positives and negatives, abstention, cold construction, warm i
 
 #826 then evaluates two separate questions. First, whether WPDS-style weights materially improve summary or proof composition. Second, whether a synchronized field/call pushdown component materially improves access-path precision beyond #816. The legitimate outcome is “not yet”; no extension is accepted without exact correctness and resource evidence, and baseline clients must not pay a material disabled cost.
 
-After the pilot, open adapter rollout children under #815 and #816 using the stabilized conformance contract. Do not make every language a prerequisite for shipping the first useful typestate analysis.
+After the TypeScript/Java CFG and ICFG reference contract passes its focused review, begin the per-language #815/#816 rollout recorded in `.agents/plans/all-language-cfg-icfg-rollout.md`. That rollout may proceed alongside the solver and TypeScript/Java typestate pilot: all languages are required by the focused CFG/ICFG plan, but they do not block shipping the first useful TypeScript/Java typestate analysis.
 
 ## Concrete Steps
 
@@ -1394,3 +1402,7 @@ Plan revision note (2026-07-16): Issue #814 diagnosis corrected the original pro
 Plan revision note (2026-07-16): Completed #814 at reviewed checkpoint `648a9fec`. The final contract uses typed continuations and exact outgoing topology, bidirectional subject-scoped gaps/evidence, direct-child unmaterialized targets, separate provider errors and semantic outcomes, atomic total-payload budgets, indexed validation, streaming bounded rendering, portable shared language/path identity, and materialization-scoped handles. Validation passed 59 semantic unit tests, 10 TypeScript/Java contract tests, the complete `nlp,python` suite, all-target/all-feature clippy with warnings denied, formatting, and diff checks. #815, #816, and #818 retain adapter/CFG, oracle/refinement, and matched-ICFG ownership respectively.
 
 Plan revision note (2026-07-16): Guided review against rebased `origin/master` produced and resolved four findings in `1faf8b9b`. Edge-typed normal and exceptional arms may now converge; recognized callable creation retains typed target uncertainty without requiring a locator; balanced bounded rendering is shared with Rune IR; and registry counting is centralized. The corrected complete `nlp,python` suite and all-feature clippy passed before publication.
+
+Plan revision note (2026-07-17): Began #815 implementation through `.agents/plans/all-language-cfg-icfg-rollout.md`. The focused plan carries the TypeScript/Java CFG reference slice through the dispatch prerequisite, one matched-return ICFG, all eleven analyzable-language adapters, and a measured CFG/ICFG lifecycle decision under #817 while keeping public query, solver, value/heap, and typestate layers outside its scope.
+
+Plan revision note (2026-07-17): Pre-checkpoint review clarified that remaining adapter children begin after the TypeScript/Java CFG/ICFG contract review and may run alongside later solver/pilot work, rather than waiting until after #825. This preserves the focused plan's all-language endpoint without making that rollout a prerequisite for the first TypeScript/Java typestate release.
