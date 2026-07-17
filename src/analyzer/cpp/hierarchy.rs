@@ -2,77 +2,54 @@ use super::*;
 use crate::analyzer::build_direct_descendant_index;
 
 impl CppAnalyzer {
-    fn build_direct_ancestor_index(&self) -> HashMap<String, Arc<Vec<CodeUnit>>> {
-        let include_targets = self.include_target_index();
-        let mut visible_by_file = HashMap::default();
-        let mut index = HashMap::default();
+    fn resolve_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        if !code_unit.is_class() || self.is_type_alias(code_unit) {
+            return Vec::new();
+        }
 
-        for code_unit in self.all_declarations().filter(|unit| unit.is_class()) {
-            if self.is_type_alias(&code_unit) {
-                continue;
+        let visible = self.visible_type_units(code_unit.source());
+        let mut ancestors = Vec::new();
+        for raw in self.inner.raw_supertypes_of(code_unit) {
+            if let Some(ancestor) = self.resolve_base_type(code_unit, &raw, &visible)
+                && !ancestors.iter().any(|existing| existing == &ancestor)
+            {
+                ancestors.push(ancestor);
             }
-            let visible =
-                self.visible_type_units(code_unit.source(), include_targets, &mut visible_by_file);
-            let mut ancestors = Vec::new();
-            for raw in self.inner.raw_supertypes_of(&code_unit) {
-                if let Some(ancestor) = self.resolve_base_type(&code_unit, &raw, &visible)
-                    && !ancestors.iter().any(|existing| existing == &ancestor)
-                {
-                    ancestors.push(ancestor);
+        }
+        ancestors
+    }
+
+    fn visible_type_units(&self, file: &ProjectFile) -> Arc<Vec<CodeUnit>> {
+        self.visible_type_units_by_file.get_with_by_ref(file, || {
+            let include_targets = self.include_target_index();
+            let mut visited = HashSet::default();
+            let mut declarations = Vec::new();
+            let mut pending = vec![file.clone()];
+            visited.insert(file.clone());
+
+            while let Some(current) = pending.pop() {
+                declarations.extend(
+                    self.declarations(&current)
+                        .into_iter()
+                        .filter(|unit| unit.is_class() || self.is_type_alias(unit)),
+                );
+
+                let imports = self.inner.import_statements(&current);
+                for include in include_paths(&imports) {
+                    for target in
+                        resolve_include_targets_with_index(&current, &include, include_targets)
+                    {
+                        if visited.insert(target.clone()) {
+                            pending.push(target);
+                        }
+                    }
                 }
             }
-            if !ancestors.is_empty() {
-                index.insert(code_unit.fq_name(), Arc::new(ancestors));
-            }
-        }
 
-        index
-    }
-
-    fn visible_type_units(
-        &self,
-        file: &ProjectFile,
-        include_targets: &IncludeTargetIndex,
-        cache: &mut HashMap<ProjectFile, Arc<Vec<CodeUnit>>>,
-    ) -> Arc<Vec<CodeUnit>> {
-        if let Some(cached) = cache.get(file) {
-            return cached.clone();
-        }
-
-        let mut visited = HashSet::default();
-        let mut declarations = Vec::new();
-        self.collect_visible_type_units(file, include_targets, &mut visited, &mut declarations);
-        declarations.sort();
-        declarations.dedup();
-
-        let declarations = Arc::new(declarations);
-        cache.insert(file.clone(), declarations.clone());
-        declarations
-    }
-
-    fn collect_visible_type_units(
-        &self,
-        file: &ProjectFile,
-        include_targets: &IncludeTargetIndex,
-        visited: &mut HashSet<ProjectFile>,
-        out: &mut Vec<CodeUnit>,
-    ) {
-        if !visited.insert(file.clone()) {
-            return;
-        }
-
-        out.extend(
-            self.declarations(file)
-                .into_iter()
-                .filter(|unit| unit.is_class() || self.is_type_alias(unit)),
-        );
-
-        let imports = self.inner.import_statements(file);
-        for include in include_paths(&imports) {
-            for target in resolve_include_targets_with_index(file, &include, include_targets) {
-                self.collect_visible_type_units(&target, include_targets, visited, out);
-            }
-        }
+            declarations.sort();
+            declarations.dedup();
+            Arc::new(declarations)
+        })
     }
 
     fn resolve_base_type(
@@ -147,19 +124,12 @@ impl CppAnalyzer {
 
 impl TypeHierarchyProvider for CppAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        if let Some(cached) = self.direct_ancestors.get(code_unit) {
-            return (*cached).clone();
-        }
-
-        let ancestors = self
-            .direct_ancestor_index
-            .get_or_init(|| self.build_direct_ancestor_index())
-            .get(&code_unit.fq_name())
-            .map(|ancestors| ancestors.as_ref().clone())
-            .unwrap_or_default();
         self.direct_ancestors
-            .insert(code_unit.clone(), Arc::new(ancestors.clone()));
-        ancestors
+            .get_with_by_ref(code_unit, || {
+                Arc::new(self.resolve_direct_ancestors(code_unit))
+            })
+            .as_ref()
+            .clone()
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {

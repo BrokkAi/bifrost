@@ -3,6 +3,7 @@ mod common;
 use brokk_bifrost::{CodeUnit, CppAnalyzer, IAnalyzer, Language, TypeHierarchyProvider};
 use common::{BuiltInlineTestProject, InlineTestProject};
 use std::collections::BTreeSet;
+use std::path::Path;
 
 fn cpp_analyzer_with_files(files: &[(&str, &str)]) -> (BuiltInlineTestProject, CppAnalyzer) {
     let mut builder = InlineTestProject::with_language(Language::Cpp);
@@ -20,6 +21,14 @@ fn definition(analyzer: &CppAnalyzer, fq_name: &str) -> CodeUnit {
         .into_iter()
         .next()
         .unwrap_or_else(|| panic!("missing definition for {fq_name}"))
+}
+
+fn definition_in(analyzer: &CppAnalyzer, fq_name: &str, source: &str) -> CodeUnit {
+    analyzer
+        .get_definitions(fq_name)
+        .into_iter()
+        .find(|unit| unit.source().rel_path() == Path::new(source))
+        .unwrap_or_else(|| panic!("missing definition for {fq_name} in {source}"))
 }
 
 fn fq_names(units: impl IntoIterator<Item = CodeUnit>) -> BTreeSet<String> {
@@ -207,5 +216,127 @@ struct Grandchild : Child {};
     assert_eq!(
         fq_names(analyzer.get_direct_descendants(&base)),
         BTreeSet::from(["Child".to_string()])
+    );
+}
+
+#[test]
+fn cpp_targeted_ancestor_lookups_do_not_scan_disconnected_declarations() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "queried/base.h",
+            r#"
+namespace queried {
+struct Base {};
+}
+"#,
+        ),
+        (
+            "queried/child.cpp",
+            r#"
+#include "base.h"
+namespace queried {
+struct Child : Base {};
+}
+"#,
+        ),
+        (
+            "unrelated/base.h",
+            r#"
+namespace unrelated {
+struct Base {};
+}
+"#,
+        ),
+        (
+            "unrelated/child.cpp",
+            r#"
+#include "base.h"
+namespace unrelated {
+struct Child : Base {};
+}
+"#,
+        ),
+    ]);
+
+    let queried = definition(&analyzer, "queried.Child");
+    let unrelated = definition(&analyzer, "unrelated.Child");
+    analyzer.reset_full_declaration_scan_count_for_test();
+
+    let (queried_ancestors, unrelated_ancestors) = std::thread::scope(|scope| {
+        let queried = scope.spawn(|| analyzer.get_direct_ancestors(&queried));
+        let unrelated = scope.spawn(|| analyzer.get_direct_ancestors(&unrelated));
+        (queried.join().unwrap(), unrelated.join().unwrap())
+    });
+
+    assert_eq!(
+        fq_names(queried_ancestors),
+        BTreeSet::from(["queried.Base".to_string()])
+    );
+    assert_eq!(
+        fq_names(unrelated_ancestors),
+        BTreeSet::from(["unrelated.Base".to_string()])
+    );
+    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+}
+
+#[test]
+fn cpp_type_hierarchy_keeps_same_fqn_disconnected_roots_source_local() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "left/base.h",
+            r#"
+namespace api {
+struct Base {};
+}
+"#,
+        ),
+        (
+            "left/child.cpp",
+            r#"
+#include "base.h"
+namespace api {
+struct Child : Base {};
+}
+"#,
+        ),
+        (
+            "right/base.h",
+            r#"
+namespace api {
+struct Base {};
+}
+"#,
+        ),
+        (
+            "right/child.cpp",
+            r#"
+#include "base.h"
+namespace api {
+struct Child : Base {};
+}
+"#,
+        ),
+    ]);
+
+    let left_base = definition_in(&analyzer, "api.Base", "left/base.h");
+    let left_child = definition_in(&analyzer, "api.Child", "left/child.cpp");
+    let right_base = definition_in(&analyzer, "api.Base", "right/base.h");
+    let right_child = definition_in(&analyzer, "api.Child", "right/child.cpp");
+
+    assert_eq!(
+        analyzer.get_direct_ancestors(&left_child),
+        vec![left_base.clone()]
+    );
+    assert_eq!(
+        analyzer.get_direct_ancestors(&right_child),
+        vec![right_base.clone()]
+    );
+    assert_eq!(
+        analyzer.get_direct_descendants(&left_base),
+        [left_child].into_iter().collect()
+    );
+    assert_eq!(
+        analyzer.get_direct_descendants(&right_base),
+        [right_child].into_iter().collect()
     );
 }
