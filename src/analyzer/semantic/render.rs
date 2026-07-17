@@ -19,6 +19,10 @@ use super::ir::{
     ProofStatus, SemanticArtifact, SemanticCallSite, SemanticEffect, SemanticEvent, SemanticGap,
     SemanticGapSubject, SemanticValue, SemanticValueKind, SourceMapping,
 };
+use super::{
+    DispatchBoundaryKind, IcfgBoundary, IcfgBoundaryKind, IcfgEdge, IcfgLimitKind, IcfgNodeKey,
+    IcfgSnapshot,
+};
 
 const TRUNCATION_RESERVE: usize = 160;
 const MIN_OUTPUT_BYTES: usize = 256;
@@ -54,6 +58,31 @@ pub struct RenderedSemanticIr {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IcfgRenderLimits {
+    pub max_nodes: usize,
+    pub max_edges: usize,
+    pub max_boundaries: usize,
+    pub max_output_bytes: usize,
+}
+
+impl Default for IcfgRenderLimits {
+    fn default() -> Self {
+        Self {
+            max_nodes: 50_000,
+            max_edges: 200_000,
+            max_boundaries: 50_000,
+            max_output_bytes: 512 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedIcfgSnapshot {
+    pub icfg: String,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticRenderError {
     InvalidLimits,
@@ -78,6 +107,67 @@ impl fmt::Display for SemanticRenderError {
 }
 
 impl std::error::Error for SemanticRenderError {}
+
+/// Render one already-bounded ICFG slice without resolving or materializing
+/// additional procedures. Node references are source-backed and never expose
+/// snapshot-local dense IDs as an assertion contract.
+pub fn render_icfg_snapshot(
+    snapshot: &IcfgSnapshot,
+    limits: IcfgRenderLimits,
+) -> Result<RenderedIcfgSnapshot, SemanticRenderError> {
+    if limits.max_nodes == 0
+        || limits.max_edges == 0
+        || limits.max_boundaries == 0
+        || limits.max_output_bytes < MIN_OUTPUT_BYTES
+    {
+        return Err(SemanticRenderError::InvalidLimits);
+    }
+    let mut writer = BalancedWriter::new(
+        limits.max_output_bytes,
+        TRUNCATION_RESERVE,
+        TruncationStyle::ReasonAttribute,
+    );
+    if writer.open(0, "(icfg-snapshot") && writer.open(1, "(nodes") {
+        for node in snapshot.nodes().iter().take(limits.max_nodes) {
+            if !writer.line_with(2, |output| write_icfg_node(output, node)) {
+                break;
+            }
+        }
+        if snapshot.node_count() > limits.max_nodes {
+            writer.truncate("ICFG node render limit reached");
+        }
+        if !writer.is_truncated() {
+            writer.close(1);
+            writer.open(1, "(edges");
+            for edge in snapshot.edges().iter().take(limits.max_edges) {
+                if !writer.line_with(2, |output| write_icfg_edge(output, snapshot, edge)) {
+                    break;
+                }
+            }
+            if snapshot.edge_count() > limits.max_edges {
+                writer.truncate("ICFG edge render limit reached");
+            }
+        }
+        if !writer.is_truncated() {
+            writer.close(1);
+            writer.open(1, "(boundaries");
+            for boundary in snapshot.boundaries().iter().take(limits.max_boundaries) {
+                if !writer.line_with(2, |output| write_icfg_boundary(output, snapshot, boundary)) {
+                    break;
+                }
+            }
+            if snapshot.boundaries().len() > limits.max_boundaries {
+                writer.truncate("ICFG boundary render limit reached");
+            }
+        }
+    }
+    if !writer.is_truncated() {
+        writer.close(1);
+        writer.close(0);
+    }
+    let (icfg, truncated) = writer.finish();
+    Ok(RenderedIcfgSnapshot { icfg, truncated })
+}
 
 impl SemanticIrLimits {
     fn validate(self) -> Result<Self, SemanticRenderError> {
@@ -856,6 +946,171 @@ fn write_control_edge(
         edge.source,
         edge.evidence,
     )
+}
+
+fn write_icfg_node(writer: &mut dyn fmt::Write, node: &IcfgNodeKey) -> fmt::Result {
+    writer.write_str("(icfg-node :point ")?;
+    write_icfg_point_ref(writer, node.point())?;
+    writer.write_str(" :context (")?;
+    for call in node.call_context() {
+        writer.write_str("(call ")?;
+        let semantic_call = call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .expect("published ICFG call context retains a valid call handle");
+        let mapping = call
+            .procedure()
+            .semantics()
+            .source_mapping(semantic_call.source)
+            .expect("published semantic call retains a valid source mapping");
+        write_locator(writer, &mapping.locator)?;
+        writer.write_char(')')?;
+    }
+    writer.write_str("))")
+}
+
+fn write_icfg_point_ref(
+    writer: &mut dyn fmt::Write,
+    point: &super::ProgramPointHandle,
+) -> fmt::Result {
+    let procedure = point.procedure().semantics();
+    let semantic_point = procedure
+        .point(point.id())
+        .expect("published ICFG node retains a valid point handle");
+    let mapping = procedure
+        .source_mapping(semantic_point.source)
+        .expect("published semantic point retains a valid source mapping");
+    writer.write_str("(point :procedure (locator ")?;
+    write_locator(writer, procedure.locator())?;
+    writer.write_str(") :source (locator ")?;
+    write_locator(writer, &mapping.locator)?;
+    writer.write_str(") :effects (")?;
+    for event in semantic_point.events.iter() {
+        write!(writer, "{} ", quoted(event.effect.label()))?;
+    }
+    writer.write_str("))")
+}
+
+fn write_icfg_edge(
+    writer: &mut dyn fmt::Write,
+    snapshot: &IcfgSnapshot,
+    edge: &IcfgEdge,
+) -> fmt::Result {
+    write!(
+        writer,
+        "(icfg-edge :kind {} :source ",
+        quoted(edge.kind.label())
+    )?;
+    write_icfg_node(
+        writer,
+        snapshot
+            .node(edge.source)
+            .expect("published ICFG edge source exists"),
+    )?;
+    writer.write_str(" :target ")?;
+    write_icfg_node(
+        writer,
+        snapshot
+            .node(edge.target)
+            .expect("published ICFG edge target exists"),
+    )?;
+    write!(
+        writer,
+        " :proof {} :completeness {}",
+        quoted(edge.proof.label()),
+        quoted(edge.completeness.label())
+    )?;
+    if let Some(origin) = &edge.origin {
+        writer.write_str(" :origin ")?;
+        let semantic_call = origin
+            .procedure()
+            .semantics()
+            .call_site(origin.id())
+            .expect("published ICFG edge origin exists");
+        let mapping = origin
+            .procedure()
+            .semantics()
+            .source_mapping(semantic_call.source)
+            .expect("published ICFG edge origin has a source mapping");
+        writer.write_str("(call ")?;
+        write_locator(writer, &mapping.locator)?;
+        writer.write_char(')')?;
+    }
+    writer.write_char(')')
+}
+
+fn write_icfg_boundary(
+    writer: &mut dyn fmt::Write,
+    snapshot: &IcfgSnapshot,
+    boundary: &IcfgBoundary,
+) -> fmt::Result {
+    writer.write_str("(icfg-boundary :at ")?;
+    write_icfg_node(
+        writer,
+        snapshot
+            .node(boundary.at)
+            .expect("published ICFG boundary node exists"),
+    )?;
+    writer.write_str(" :kind ")?;
+    match &boundary.kind {
+        IcfgBoundaryKind::Dispatch(dispatch) => {
+            write!(writer, "{}", quoted(dispatch_boundary_label(dispatch)))?
+        }
+        IcfgBoundaryKind::Limit(limit) => write!(
+            writer,
+            "{}",
+            quoted(match limit {
+                IcfgLimitKind::CallDepth => "call_depth_limit",
+                IcfgLimitKind::Nodes => "node_limit",
+                IcfgLimitKind::Edges => "edge_limit",
+            })
+        )?,
+        IcfgBoundaryKind::Continuation { kind, state } => write!(
+            writer,
+            "{} :continuation-state {}",
+            quoted(match kind {
+                super::CallContinuationKind::Normal => "normal_continuation",
+                super::CallContinuationKind::Exceptional => "exceptional_continuation",
+            }),
+            quoted(state.label())
+        )?,
+    }
+    if let IcfgBoundaryKind::Dispatch(
+        DispatchBoundaryKind::External(Some(locator))
+        | DispatchBoundaryKind::Unmaterialized(locator),
+    ) = &boundary.kind
+    {
+        writer.write_str(" :target (locator ")?;
+        write_locator(writer, locator)?;
+        writer.write_char(')')?;
+    }
+    if let Some(origin) = &boundary.origin {
+        writer.write_str(" :origin ")?;
+        let semantic_call = origin
+            .procedure()
+            .semantics()
+            .call_site(origin.id())
+            .expect("published ICFG boundary origin exists");
+        let mapping = origin
+            .procedure()
+            .semantics()
+            .source_mapping(semantic_call.source)
+            .expect("published ICFG boundary origin has a source mapping");
+        writer.write_str("(call ")?;
+        write_locator(writer, &mapping.locator)?;
+        writer.write_char(')')?;
+    }
+    writer.write_char(')')
+}
+
+fn dispatch_boundary_label(boundary: &DispatchBoundaryKind) -> &'static str {
+    match boundary {
+        DispatchBoundaryKind::External(_) => "external",
+        DispatchBoundaryKind::Unmaterialized(_) => "unmaterialized",
+        DispatchBoundaryKind::Unresolved => "unresolved",
+        DispatchBoundaryKind::Truncated => "truncated",
+    }
 }
 
 fn write_locator(writer: &mut dyn fmt::Write, locator: &SemanticLocator) -> fmt::Result {

@@ -331,6 +331,12 @@ impl WorkspaceAnalyzer {
         provider.materialize(file, request)
     }
 
+    /// Bind the demand-materialized ICFG facade to this exact analyzer
+    /// generation without widening the language analyzers or `IAnalyzer`.
+    pub fn icfg_provider(&self) -> crate::analyzer::semantic::WorkspaceIcfgProvider<'_> {
+        crate::analyzer::semantic::WorkspaceIcfgProvider::new(self)
+    }
+
     /// Starts a request-scoped query cache across the active language analyzers.
     pub(crate) fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.analyzer().begin_query(context);

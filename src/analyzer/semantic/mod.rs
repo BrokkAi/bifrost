@@ -9,6 +9,7 @@ macro_rules! count_idents {
 
 pub mod capabilities;
 pub(crate) mod cfg;
+pub mod icfg;
 pub mod ids;
 pub mod ir;
 pub mod provider;
@@ -17,6 +18,7 @@ pub(crate) mod service;
 
 pub use crate::cancellation::CancellationToken;
 pub use capabilities::*;
+pub use icfg::*;
 pub use ids::*;
 pub use ir::*;
 pub use provider::*;

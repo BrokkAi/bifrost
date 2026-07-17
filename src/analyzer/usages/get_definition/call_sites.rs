@@ -46,6 +46,42 @@ pub(crate) fn call_reference_ranges_in_tree(
     collect_call_reference_ranges(tree.root_node(), language, search_range, limit)
 }
 
+/// Resolve one exact whole-call source span to the precise reference token
+/// that names its callee.
+///
+/// Semantic CFG call sites are anchored to the complete call expression, not
+/// merely its callee token.  Matching the complete node range first is what
+/// keeps nested calls such as `outer(inner())` unambiguous: the outer and inner
+/// calls have different exact spans even when a cursor-based lookup would land
+/// inside both.  Callee selection remains tree-sitter-structured through the
+/// language's named fields and call-reference predicate.
+pub(crate) fn call_reference_range_for_call(
+    tree: &Tree,
+    language: Language,
+    call_span: &Range,
+) -> Option<Range> {
+    if call_span.start_byte >= call_span.end_byte {
+        return None;
+    }
+    let mut node = tree
+        .root_node()
+        .named_descendant_for_byte_range(call_span.start_byte, call_span.end_byte)?;
+    loop {
+        if node.start_byte() == call_span.start_byte
+            && node.end_byte() == call_span.end_byte
+            && is_call_expression_node(node, language)
+        {
+            let callee = callee_node_for_call(node, language)?;
+            return call_reference_leaf(callee, language).map(node_range);
+        }
+        let parent = node.parent()?;
+        if parent.start_byte() != call_span.start_byte || parent.end_byte() != call_span.end_byte {
+            return None;
+        }
+        node = parent;
+    }
+}
+
 pub(crate) fn is_call_reference_range_in_tree(
     tree: &Tree,
     language: Language,
@@ -698,10 +734,13 @@ fn ruby_bare_call_identifier(node: Node<'_>) -> bool {
 mod tests {
     use std::env;
 
-    use super::{call_signature_context, call_site_syntax_for_reference};
-    use crate::analyzer::ProjectFile;
+    use super::{
+        call_reference_range_for_call, call_signature_context, call_site_syntax_for_reference,
+    };
     use crate::analyzer::ruby::structural::RUBY_STRUCTURAL_SPEC;
     use crate::analyzer::structural::extract::extract_file_facts;
+    use crate::analyzer::usages::get_definition::parse_tree_for_language;
+    use crate::analyzer::{Language, ProjectFile, Range};
 
     fn file(name: &str) -> ProjectFile {
         ProjectFile::new(env::temp_dir().join("bifrost-signature-help"), name)
@@ -709,6 +748,78 @@ mod tests {
 
     fn offset_after(source: &str, needle: &str) -> usize {
         source.find(needle).expect("needle exists") + needle.len()
+    }
+
+    fn byte_range(source: &str, needle: &str) -> Range {
+        let start_byte = source.rfind(needle).expect("call expression exists");
+        Range {
+            start_byte,
+            end_byte: start_byte + needle.len(),
+            start_line: 0,
+            end_line: 0,
+        }
+    }
+
+    #[test]
+    fn exact_call_span_distinguishes_outer_and_inner_callees() {
+        let source = "function outer(value: number) { return value; }\nfunction inner() { return 1; }\nouter(inner());\n";
+        let file = file("nested.ts");
+        let tree = parse_tree_for_language(&file, Language::TypeScript, source)
+            .expect("TypeScript syntax tree");
+
+        let outer = call_reference_range_for_call(
+            &tree,
+            Language::TypeScript,
+            &byte_range(source, "outer(inner())"),
+        )
+        .expect("outer call reference");
+        let inner = call_reference_range_for_call(
+            &tree,
+            Language::TypeScript,
+            &byte_range(source, "inner()"),
+        )
+        .expect("inner call reference");
+
+        assert_eq!(&source[outer.start_byte..outer.end_byte], "outer");
+        assert_eq!(&source[inner.start_byte..inner.end_byte], "inner");
+    }
+
+    #[test]
+    fn exact_java_call_span_uses_the_named_method_field() {
+        let source = "class Nested { static int outer(int value) { return value; } static int inner() { return 1; } int call() { return outer(inner()); } }";
+        let file = file("Nested.java");
+        let tree =
+            parse_tree_for_language(&file, Language::Java, source).expect("Java syntax tree");
+
+        let outer = call_reference_range_for_call(
+            &tree,
+            Language::Java,
+            &byte_range(source, "outer(inner())"),
+        )
+        .expect("outer Java call reference");
+        let inner =
+            call_reference_range_for_call(&tree, Language::Java, &byte_range(source, "inner()"))
+                .expect("inner Java call reference");
+
+        assert_eq!(&source[outer.start_byte..outer.end_byte], "outer");
+        assert_eq!(&source[inner.start_byte..inner.end_byte], "inner");
+    }
+
+    #[test]
+    fn exact_call_span_rejects_an_enclosing_statement() {
+        let source = "function target() {}\ntarget();\n";
+        let file = file("statement.ts");
+        let tree = parse_tree_for_language(&file, Language::TypeScript, source)
+            .expect("TypeScript syntax tree");
+
+        assert!(
+            call_reference_range_for_call(
+                &tree,
+                Language::TypeScript,
+                &byte_range(source, "target();"),
+            )
+            .is_none()
+        );
     }
 
     #[test]

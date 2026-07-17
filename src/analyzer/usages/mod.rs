@@ -44,8 +44,9 @@ mod traits;
 pub(crate) mod workspace_graph;
 
 pub(crate) use call_relations::{
-    CallBindingCache, CallRelationLimits, CallRelationResult, CallRelationService, CallSite,
-    bind_call_site_arguments, is_call_relation_unit, nearest_call_relation_unit,
+    CallBindingCache, CallDispatchBoundaryKind, CallRelationLimits, CallRelationResult,
+    CallRelationService, CallSite, ExactCallLocation, bind_call_site_arguments,
+    is_call_relation_unit, nearest_call_relation_unit,
 };
 pub use candidates::{
     ExplicitCandidateProvider, FallbackCandidateProvider, ImportGraphCandidateProvider,

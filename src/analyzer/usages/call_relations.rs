@@ -8,9 +8,10 @@ use crate::analyzer::lexical_definitions::{
 };
 use crate::analyzer::structural::FileFacts;
 use crate::analyzer::usages::get_definition::{
-    CallSiteSyntax, CallSyntaxKind, DefinitionLookupRequest, DefinitionLookupStatus,
-    call_reference_ranges_in_tree, call_site_syntax_for_reference, parse_tree_for_language,
-    resolve_definition_batch_with_source, resolve_definition_batch_with_source_and_cancellation,
+    CallSiteSyntax, CallSyntaxKind, DefinitionLookupOutcome, DefinitionLookupRequest,
+    DefinitionLookupStatus, call_reference_range_for_call, call_reference_ranges_in_tree,
+    call_site_syntax_for_reference, parse_tree_for_language, resolve_definition_batch_with_source,
+    resolve_definition_batch_with_source_and_cancellation,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
@@ -40,6 +41,53 @@ pub(crate) struct CallSite {
     pub(crate) proof: UsageProof,
     pub(crate) receiver: Option<Range>,
     pub(crate) arguments: Vec<CallArgument>,
+}
+
+/// One exact source-backed call expression. The range covers the complete
+/// call expression; the dispatch service derives the precise callee reference
+/// through tree-sitter before invoking definition resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ExactCallLocation {
+    pub(crate) file: ProjectFile,
+    pub(crate) call_span: Range,
+}
+
+/// One workspace definition retained by exact call-site dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CallDispatchTarget {
+    pub(crate) definition: CodeUnit,
+    pub(crate) proof: UsageProof,
+}
+
+/// A dispatch arm that has no workspace procedure target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallDispatchBoundaryKind {
+    /// Resolution proved that the referenced declaration crosses the indexed
+    /// workspace boundary, but cannot name an external body.
+    External,
+    /// The exact resolver status is retained rather than collapsed into an
+    /// empty target list.
+    Unresolved(DefinitionLookupStatus),
+    /// A candidate set was retained only up to the supplied target bound.
+    Truncated,
+}
+
+/// Typed result of resolving one exact call expression.
+///
+/// `cancelled`, `budget_exhausted`, and `truncated` are deliberately
+/// independent. A request can, for example, retain a truncated candidate set
+/// because its target budget was exhausted without being cancelled.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CallDispatchLookup {
+    pub(crate) status: Option<DefinitionLookupStatus>,
+    pub(crate) callee_range: Option<Range>,
+    pub(crate) targets: Vec<CallDispatchTarget>,
+    pub(crate) boundaries: Vec<CallDispatchBoundaryKind>,
+    pub(crate) truncated: bool,
+    pub(crate) cancelled: bool,
+    pub(crate) budget_exhausted: bool,
+    pub(crate) diagnostics: Vec<String>,
+    pub(crate) work: CallRelationWork,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -109,6 +157,109 @@ impl CallSyntaxCache {
 pub(crate) struct CallRelationService;
 
 impl CallRelationService {
+    /// Resolve one exact whole-call span against one exact source snapshot.
+    ///
+    /// The caller supplies the source owned by the semantic artifact's
+    /// revision. This method never rereads the file, so its byte span cannot
+    /// race a newer disk or overlay snapshot. The same batched definition
+    /// resolution core is used by legacy outgoing call relations below.
+    pub(crate) fn dispatch_at_bounded(
+        analyzer: &dyn IAnalyzer,
+        location: &ExactCallLocation,
+        exact_source: Arc<String>,
+        limits: CallRelationLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> CallDispatchLookup {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return CallDispatchLookup {
+                cancelled: true,
+                ..CallDispatchLookup::default()
+            };
+        }
+        if limits.max_files == 0 || limits.max_source_bytes == 0 || limits.max_candidates == 0 {
+            return CallDispatchLookup {
+                budget_exhausted: true,
+                diagnostics: vec![format!(
+                    "exact call dispatch budget omitted {}",
+                    location.file
+                )],
+                ..CallDispatchLookup::default()
+            };
+        }
+        if exact_source.len() > limits.max_source_bytes {
+            return CallDispatchLookup {
+                budget_exhausted: true,
+                diagnostics: vec![format!(
+                    "exact call dispatch source budget omitted {}",
+                    location.file
+                )],
+                ..CallDispatchLookup::default()
+            };
+        }
+
+        let work = CallRelationWork {
+            scanned_files: 1,
+            scanned_source_bytes: exact_source.len(),
+            examined_candidates: 1,
+        };
+        let language = language_for_file(&location.file);
+        if language == Language::None {
+            return unresolved_dispatch_lookup(
+                DefinitionLookupStatus::UnsupportedLanguage,
+                "exact call dispatch does not support this file language".to_string(),
+                work,
+            );
+        }
+        let Some(tree) = parse_tree_for_language(&location.file, language, &exact_source) else {
+            return unresolved_dispatch_lookup(
+                DefinitionLookupStatus::NotFound,
+                format!("failed to parse {} for exact call dispatch", location.file),
+                work,
+            );
+        };
+        let Some(callee_range) =
+            call_reference_range_for_call(&tree, language, &location.call_span)
+        else {
+            return unresolved_dispatch_lookup(
+                DefinitionLookupStatus::InvalidLocation,
+                format!(
+                    "range [{}, {}) is not one exact supported call expression in {}",
+                    location.call_span.start_byte, location.call_span.end_byte, location.file
+                ),
+                work,
+            );
+        };
+        let batch = resolve_call_references_with_source(
+            analyzer,
+            &location.file,
+            Arc::clone(&exact_source),
+            std::slice::from_ref(&callee_range),
+            cancellation,
+        );
+        let mut lookup = CallDispatchLookup {
+            callee_range: Some(callee_range),
+            cancelled: batch.cancelled,
+            work,
+            ..CallDispatchLookup::default()
+        };
+        let Some((_, outcome)) = batch.resolved.into_iter().next() else {
+            if !lookup.cancelled {
+                lookup.status = Some(DefinitionLookupStatus::NotFound);
+                lookup.boundaries.push(CallDispatchBoundaryKind::Unresolved(
+                    DefinitionLookupStatus::NotFound,
+                ));
+                lookup.diagnostics.push(
+                    "definition resolver returned no outcome for the exact call reference"
+                        .to_string(),
+                );
+            }
+            return lookup;
+        };
+        apply_dispatch_outcome(&mut lookup, outcome, limits.max_candidates);
+        lookup.cancelled |= cancellation.is_some_and(CancellationToken::is_cancelled);
+        lookup
+    }
+
     pub(crate) fn incoming(
         analyzer: &dyn IAnalyzer,
         target: &CodeUnit,
@@ -312,34 +463,16 @@ impl CallRelationService {
             .into_iter()
             .take(limits.max_candidates)
             .collect::<Vec<_>>();
-        let requests = candidates
-            .iter()
-            .map(|range| DefinitionLookupRequest {
-                file: caller.source().clone(),
-                line: None,
-                column: None,
-                start_byte: Some(range.start_byte),
-                end_byte: Some(range.end_byte),
-            })
-            .collect();
-        let outcomes = match cancellation {
-            Some(cancellation) => resolve_definition_batch_with_source_and_cancellation(
-                analyzer,
-                requests,
-                caller.source().clone(),
-                Arc::clone(&source),
-                cancellation,
-            ),
-            None => resolve_definition_batch_with_source(
-                analyzer,
-                requests,
-                caller.source().clone(),
-                Arc::clone(&source),
-            ),
-        };
+        let batch = resolve_call_references_with_source(
+            analyzer,
+            caller.source(),
+            Arc::clone(&source),
+            &candidates,
+            cancellation,
+        );
         let mut sites = Vec::new();
         let mut syntax_cache = CallSyntaxCache::default();
-        for (candidate, outcome) in candidates.iter().copied().zip(outcomes) {
+        for (candidate, outcome) in batch.resolved {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 break;
             }
@@ -373,7 +506,7 @@ impl CallRelationService {
         CallRelationResult {
             sites,
             truncated,
-            cancelled: cancellation.is_some_and(CancellationToken::is_cancelled),
+            cancelled: batch.cancelled,
             diagnostics: Vec::new(),
             work: CallRelationWork {
                 scanned_files: 1,
@@ -381,6 +514,119 @@ impl CallRelationService {
                 examined_candidates: candidates.len(),
             },
         }
+    }
+}
+
+struct CallReferenceResolutionBatch {
+    resolved: Vec<(Range, DefinitionLookupOutcome)>,
+    cancelled: bool,
+}
+
+/// Resolve already-structured call reference ranges in one shared batch.
+/// Exact semantic dispatch supplies one range; outgoing call relations supply
+/// every range in the caller. Cancellation may shorten the lower-level result
+/// vector, so pairing is retained explicitly rather than silently assuming
+/// one outcome per request.
+fn resolve_call_references_with_source(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: Arc<String>,
+    references: &[Range],
+    cancellation: Option<&CancellationToken>,
+) -> CallReferenceResolutionBatch {
+    let requests = references
+        .iter()
+        .map(|range| DefinitionLookupRequest {
+            file: file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(range.start_byte),
+            end_byte: Some(range.end_byte),
+        })
+        .collect();
+    let outcomes = match cancellation {
+        Some(cancellation) => resolve_definition_batch_with_source_and_cancellation(
+            analyzer,
+            requests,
+            file.clone(),
+            source,
+            cancellation,
+        ),
+        None => resolve_definition_batch_with_source(analyzer, requests, file.clone(), source),
+    };
+    let resolved = references.iter().copied().zip(outcomes).collect::<Vec<_>>();
+    CallReferenceResolutionBatch {
+        resolved,
+        cancelled: cancellation.is_some_and(CancellationToken::is_cancelled),
+    }
+}
+
+fn unresolved_dispatch_lookup(
+    status: DefinitionLookupStatus,
+    diagnostic: String,
+    work: CallRelationWork,
+) -> CallDispatchLookup {
+    CallDispatchLookup {
+        status: Some(status),
+        boundaries: vec![CallDispatchBoundaryKind::Unresolved(status)],
+        diagnostics: vec![diagnostic],
+        work,
+        ..CallDispatchLookup::default()
+    }
+}
+
+fn apply_dispatch_outcome(
+    lookup: &mut CallDispatchLookup,
+    outcome: DefinitionLookupOutcome,
+    max_targets: usize,
+) {
+    let DefinitionLookupOutcome {
+        status,
+        mut definitions,
+        lexical_definition: _,
+        diagnostics,
+        reference: _,
+    } = outcome;
+    lookup.status = Some(status);
+    lookup.diagnostics.extend(
+        diagnostics
+            .into_iter()
+            .map(|diagnostic| format!("{}: {}", diagnostic.kind, diagnostic.message)),
+    );
+
+    definitions.sort();
+    definitions.dedup();
+    if definitions.len() > max_targets {
+        definitions.truncate(max_targets);
+        lookup.truncated = true;
+        lookup.budget_exhausted = true;
+        lookup.boundaries.push(CallDispatchBoundaryKind::Truncated);
+    }
+    let proof = if status == DefinitionLookupStatus::Resolved {
+        UsageProof::Proven
+    } else {
+        UsageProof::Unproven
+    };
+    lookup.targets.extend(
+        definitions
+            .into_iter()
+            .map(|definition| CallDispatchTarget { definition, proof }),
+    );
+
+    match status {
+        DefinitionLookupStatus::Resolved if lookup.targets.is_empty() => lookup
+            .boundaries
+            .push(CallDispatchBoundaryKind::Unresolved(status)),
+        DefinitionLookupStatus::Resolved | DefinitionLookupStatus::Ambiguous => {}
+        DefinitionLookupStatus::UnresolvableImportBoundary => {
+            lookup.boundaries.push(CallDispatchBoundaryKind::External)
+        }
+        DefinitionLookupStatus::NoDefinition
+        | DefinitionLookupStatus::UnsupportedLanguage
+        | DefinitionLookupStatus::InvalidLocation
+        | DefinitionLookupStatus::NotFound => lookup
+            .boundaries
+            .push(CallDispatchBoundaryKind::Unresolved(status)),
     }
 }
 
@@ -702,5 +948,198 @@ fn proof_rank(proof: UsageProof) -> u8 {
     match proof {
         UsageProof::Proven => 0,
         UsageProof::Unproven => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::usages::get_definition::{
+        DefinitionLookupDiagnostic, DefinitionLookupOutcome,
+    };
+    use crate::analyzer::{CodeUnitType, Language};
+    use crate::test_support::AnalyzerFixture;
+
+    fn call_span(source: &str, call: &str) -> Range {
+        let start_byte = source.rfind(call).expect("call exists");
+        Range {
+            start_byte,
+            end_byte: start_byte + call.len(),
+            start_line: 0,
+            end_line: 0,
+        }
+    }
+
+    fn generous_limits() -> CallRelationLimits {
+        CallRelationLimits {
+            max_files: 1,
+            max_source_bytes: usize::MAX,
+            max_candidates: 100,
+        }
+    }
+
+    #[test]
+    fn exact_dispatch_resolves_one_nested_call_without_resolving_its_neighbor() {
+        let source = "function outer(value: number) { return value; }\nfunction inner() { return 1; }\nfunction caller() { return outer(inner()); }\n";
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::TypeScript, &[("nested.ts", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "nested.ts");
+        let lookup = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            &ExactCallLocation {
+                file,
+                call_span: call_span(source, "inner()"),
+            },
+            Arc::new(source.to_string()),
+            generous_limits(),
+            None,
+        );
+
+        assert_eq!(lookup.status, Some(DefinitionLookupStatus::Resolved));
+        assert_eq!(lookup.targets.len(), 1, "{lookup:#?}");
+        assert_eq!(lookup.targets[0].definition.fq_name(), "inner");
+        assert_eq!(lookup.targets[0].proof, UsageProof::Proven);
+        assert!(lookup.boundaries.is_empty(), "{lookup:#?}");
+        assert!(!lookup.cancelled);
+        assert!(!lookup.budget_exhausted);
+        assert!(!lookup.truncated);
+    }
+
+    #[test]
+    fn exact_dispatch_resolves_java_methods_at_the_call_span() {
+        let source = "class Example { static void helper() {} static void caller() { helper(); } }";
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::Java, &[("Example.java", source)]);
+        let lookup = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            &ExactCallLocation {
+                file: ProjectFile::new(fixture.project_root(), "Example.java"),
+                call_span: call_span(source, "helper()"),
+            },
+            Arc::new(source.to_string()),
+            generous_limits(),
+            None,
+        );
+
+        assert_eq!(lookup.status, Some(DefinitionLookupStatus::Resolved));
+        assert_eq!(lookup.targets.len(), 1, "{lookup:#?}");
+        assert_eq!(lookup.targets[0].definition.fq_name(), "Example.helper");
+        assert_eq!(lookup.targets[0].proof, UsageProof::Proven);
+        assert!(lookup.boundaries.is_empty(), "{lookup:#?}");
+    }
+
+    #[test]
+    fn exact_dispatch_keeps_cancellation_budget_and_truncation_independent() {
+        let source = Arc::new("function target() {}\ntarget();\n".to_string());
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::TypeScript,
+            &[("sample.ts", source.as_str())],
+        );
+        let location = ExactCallLocation {
+            file: ProjectFile::new(fixture.project_root(), "sample.ts"),
+            call_span: call_span(&source, "target()"),
+        };
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let cancelled = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            &location,
+            Arc::clone(&source),
+            generous_limits(),
+            Some(&cancellation),
+        );
+        assert!(cancelled.cancelled);
+        assert!(!cancelled.budget_exhausted);
+        assert!(!cancelled.truncated);
+
+        let exhausted = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            &location,
+            source,
+            CallRelationLimits {
+                max_files: 0,
+                max_source_bytes: usize::MAX,
+                max_candidates: 100,
+            },
+            None,
+        );
+        assert!(!exhausted.cancelled);
+        assert!(exhausted.budget_exhausted);
+        assert!(!exhausted.truncated);
+    }
+
+    #[test]
+    fn dispatch_mapping_preserves_status_boundaries_and_partial_candidates() {
+        let root = std::env::temp_dir();
+        let file = ProjectFile::new(root, "dispatch.ts");
+        let first = CodeUnit::new(file.clone(), CodeUnitType::Function, "", "first");
+        let second = CodeUnit::new(file, CodeUnitType::Function, "", "second");
+        let mut ambiguous = CallDispatchLookup::default();
+        apply_dispatch_outcome(
+            &mut ambiguous,
+            DefinitionLookupOutcome {
+                status: DefinitionLookupStatus::Ambiguous,
+                reference: None,
+                definitions: vec![second, first],
+                lexical_definition: None,
+                diagnostics: vec![DefinitionLookupDiagnostic {
+                    kind: "ambiguous_definition".to_string(),
+                    message: "two candidates".to_string(),
+                }],
+            },
+            1,
+        );
+        assert_eq!(ambiguous.status, Some(DefinitionLookupStatus::Ambiguous));
+        assert_eq!(ambiguous.targets.len(), 1);
+        assert_eq!(ambiguous.targets[0].proof, UsageProof::Unproven);
+        assert!(ambiguous.truncated);
+        assert!(ambiguous.budget_exhausted);
+        assert!(
+            ambiguous
+                .boundaries
+                .contains(&CallDispatchBoundaryKind::Truncated)
+        );
+
+        let mut external = CallDispatchLookup::default();
+        apply_dispatch_outcome(
+            &mut external,
+            DefinitionLookupOutcome {
+                status: DefinitionLookupStatus::UnresolvableImportBoundary,
+                reference: None,
+                definitions: Vec::new(),
+                lexical_definition: None,
+                diagnostics: Vec::new(),
+            },
+            1,
+        );
+        assert_eq!(
+            external.boundaries,
+            vec![CallDispatchBoundaryKind::External]
+        );
+
+        for status in [
+            DefinitionLookupStatus::NoDefinition,
+            DefinitionLookupStatus::UnsupportedLanguage,
+            DefinitionLookupStatus::InvalidLocation,
+            DefinitionLookupStatus::NotFound,
+        ] {
+            let mut unresolved = CallDispatchLookup::default();
+            apply_dispatch_outcome(
+                &mut unresolved,
+                DefinitionLookupOutcome {
+                    status,
+                    reference: None,
+                    definitions: Vec::new(),
+                    lexical_definition: None,
+                    diagnostics: Vec::new(),
+                },
+                1,
+            );
+            assert_eq!(unresolved.status, Some(status));
+            assert_eq!(
+                unresolved.boundaries,
+                vec![CallDispatchBoundaryKind::Unresolved(status)]
+            );
+        }
     }
 }
