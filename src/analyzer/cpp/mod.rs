@@ -49,6 +49,12 @@ pub struct CppAnalyzer {
     type_alias_classification_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     authoritative_visibility_build_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    target_spec_scan_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    cpp_parent_resolution_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    cpp_class_strength_parse_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 crate::analyzer::impl_forward_query_provider!(CppAnalyzer);
@@ -103,6 +109,12 @@ impl CppAnalyzer {
             type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             authoritative_visibility_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            target_spec_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            cpp_parent_resolution_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            cpp_class_strength_parse_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -127,6 +139,12 @@ impl CppAnalyzer {
             type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             authoritative_visibility_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            target_spec_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            cpp_parent_resolution_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            cpp_class_strength_parse_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -144,6 +162,10 @@ impl CppAnalyzer {
         file: &ProjectFile,
     ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
         self.inner.prepared_syntax(file)
+    }
+
+    pub(crate) fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        self.inner.structural_parent_of(code_unit)
     }
 
     #[cfg(test)]
@@ -166,6 +188,56 @@ impl CppAnalyzer {
     #[cfg(test)]
     pub(crate) fn authoritative_visibility_build_count_for_test(&self) -> usize {
         self.authoritative_visibility_build_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_target_spec_scan_for_test(&self) {
+        self.target_spec_scan_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_target_spec_scan_count_for_test(&self) {
+        self.target_spec_scan_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn target_spec_scan_count_for_test(&self) -> usize {
+        self.target_spec_scan_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_cpp_parent_resolution_for_test(&self) {
+        self.cpp_parent_resolution_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_cpp_class_strength_parse_for_test(&self) {
+        self.cpp_class_strength_parse_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_cpp_owner_resolution_counts_for_test(&self) {
+        self.cpp_parent_resolution_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.cpp_class_strength_parse_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cpp_parent_resolution_count_for_test(&self) -> usize {
+        self.cpp_parent_resolution_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cpp_class_strength_parse_count_for_test(&self) -> usize {
+        self.cpp_class_strength_parse_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

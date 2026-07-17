@@ -269,6 +269,19 @@ pub(super) struct TargetSpec {
     pub(super) owner_is_forward_declaration: bool,
 }
 
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(super) struct TypeScanKey {
+    target: LogicalSymbolKey,
+    member_name: String,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct LogicalSymbolKey {
+    kind: CodeUnitType,
+    fq_name: String,
+    signature: Option<String>,
+}
+
 struct ResolvedTypeOwner {
     unit: CodeUnit,
     is_forward_declaration: bool,
@@ -282,6 +295,13 @@ pub(super) enum EnumOwnerKind {
 }
 
 impl TargetSpec {
+    pub(super) fn type_scan_key(&self) -> Option<TypeScanKey> {
+        (self.kind == TargetKind::Type).then(|| TypeScanKey {
+            target: logical_symbol_key(&self.target),
+            member_name: self.member_name.clone(),
+        })
+    }
+
     pub(super) fn from_target(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> Option<Self> {
         if target.is_class() {
             return Some(Self::new(
@@ -373,6 +393,14 @@ impl TargetSpec {
             enum_owner_kind: EnumOwnerKind::NonEnum,
             owner_is_forward_declaration: false,
         }
+    }
+}
+
+fn logical_symbol_key(unit: &CodeUnit) -> LogicalSymbolKey {
+    LogicalSymbolKey {
+        kind: unit.kind(),
+        fq_name: unit.fq_name(),
+        signature: unit.signature().map(str::to_string),
     }
 }
 
@@ -3077,6 +3105,16 @@ fn precise_parent_resolution(
     analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
 ) -> Option<ResolvedTypeOwner> {
+    #[cfg(test)]
+    if let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) {
+        cpp.record_cpp_parent_resolution_for_test();
+    }
+    if let Some(unit) = exact_structural_type_parent(analyzer, code_unit) {
+        return Some(ResolvedTypeOwner {
+            unit,
+            is_forward_declaration: false,
+        });
+    }
     let fallback = analyzer.parent_of(code_unit);
     let Some(owner_name) = code_unit
         .short_name()
@@ -3147,6 +3185,23 @@ fn precise_parent_resolution(
             }
         }
     }
+}
+
+fn exact_structural_type_parent(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+) -> Option<CodeUnit> {
+    if !code_unit.is_function() && !code_unit.is_field() {
+        return None;
+    }
+    let encoded_owner = code_unit.short_name().rsplit_once('.')?.0;
+    let cpp = resolve_analyzer::<CppAnalyzer>(analyzer)?;
+    let parent = cpp.structural_parent_of(code_unit)?;
+    (!parent.is_module()
+        && parent.source() == code_unit.source()
+        && parent.package_name() == code_unit.package_name()
+        && parent.short_name() == encoded_owner)
+        .then_some(parent)
 }
 
 fn same_source_owner(
@@ -3305,6 +3360,10 @@ fn cpp_class_declaration_strength(
     let Some(source) = analyzer.indexed_source(candidate.source()) else {
         return CppClassDeclarationStrength::Unknown;
     };
+    #[cfg(test)]
+    if let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) {
+        cpp.record_cpp_class_strength_parse_for_test();
+    }
     let mut parser = Parser::new();
     if parser
         .set_language(&tree_sitter_cpp::LANGUAGE.into())
@@ -3410,6 +3469,66 @@ pub(super) fn same_logical_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn type_target_spec_scan_keys_collapse_logical_redeclarations() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let logical_type = |path: &str| {
+            CodeUnit::with_signature(
+                ProjectFile::new(root.clone(), path),
+                CodeUnitType::Class,
+                "gfx",
+                "Size",
+                Some("class Size".to_string()),
+                false,
+            )
+        };
+        let first_type = logical_type("first.h");
+        let duplicate_type = logical_type("duplicate.h");
+        let first_type_spec = TargetSpec::new(
+            first_type.clone(),
+            TargetKind::Type,
+            Some(first_type),
+            "Size".to_string(),
+            None,
+            None,
+        );
+        let duplicate_type_spec = TargetSpec::new(
+            duplicate_type.clone(),
+            TargetKind::Type,
+            Some(duplicate_type),
+            "Size".to_string(),
+            None,
+            None,
+        );
+        assert_eq!(
+            first_type_spec.type_scan_key(),
+            duplicate_type_spec.type_scan_key()
+        );
+
+        let other_namespace = CodeUnit::with_signature(
+            ProjectFile::new(root, "other_namespace.h"),
+            CodeUnitType::Class,
+            "other",
+            "Size",
+            Some("class Size".to_string()),
+            false,
+        );
+        let other_namespace_spec = TargetSpec::new(
+            other_namespace.clone(),
+            TargetKind::Type,
+            Some(other_namespace),
+            "Size".to_string(),
+            None,
+            None,
+        );
+        assert_ne!(
+            first_type_spec.type_scan_key(),
+            other_namespace_spec.type_scan_key(),
+            "same-short-name Types with distinct FQNs must retain separate scans"
+        );
+    }
 
     #[test]
     fn visibility_build_hydrates_overlapping_closures_once_and_preserves_root_visibility() {

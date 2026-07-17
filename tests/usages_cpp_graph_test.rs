@@ -376,8 +376,8 @@ struct Consumer {
     );
     assert_eq!(
         (first_parent_queries, second_parent_queries),
-        (1, 1),
-        "the enclosing declaration's owner should be resolved once per file scan, with no cache shared across batches"
+        (0, 0),
+        "exact structural parents should avoid heuristic definition queries in every scan batch"
     );
 }
 

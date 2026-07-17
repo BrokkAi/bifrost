@@ -3,6 +3,8 @@ use crate::analyzer::declaration_range::DeclarationNameRangeContext;
 use crate::analyzer::reference_candidates::{ReferenceCandidateRanges, reference_candidate_ranges};
 use crate::analyzer::test_paths;
 use crate::analyzer::usages::cpp_graph::CppAuthoritativeUsageBatch;
+#[cfg(test)]
+use crate::analyzer::usages::cpp_graph::cpp_type_owner_for_test;
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, DefinitionLookupStatus, resolve_definition_batch_with_source,
 };
@@ -1540,6 +1542,246 @@ mod tests {
             cpp.authoritative_visibility_build_count_for_test(),
             1,
             "both inverse target groups should reuse one union visibility index"
+        );
+    }
+
+    #[test]
+    fn cpp_inverse_logical_type_redeclarations_share_one_target_spec_scan() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let mut consumer = String::new();
+        for index in 0..32 {
+            let header = format!("forward_{index}.h");
+            fs::write(root.join(&header), "namespace gfx { class Size; }\n")
+                .expect("write forward declaration");
+            consumer.push_str(&format!("#include \"{header}\"\n"));
+        }
+        fs::write(
+            root.join("definition.h"),
+            "namespace gfx { class Size {}; }\n",
+        )
+        .expect("write full definition");
+        consumer.push_str("namespace gfx { void consume() { Size* value; } }\n");
+        fs::write(root.join("consumer.cpp"), consumer).expect("write consumer");
+
+        let project = Arc::new(TestProject::new(&root, Language::Cpp));
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
+        let mut targets = cpp.get_definitions("gfx.Size");
+        assert_eq!(
+            targets.len(),
+            33,
+            "the regression must preserve every physical declaration in the target group"
+        );
+        let actual_target_paths: BTreeSet<_> = targets
+            .iter()
+            .map(|target| rel_path_string(target.source()))
+            .collect();
+        let mut expected_target_paths: BTreeSet<_> =
+            (0..32).map(|index| format!("forward_{index}.h")).collect();
+        expected_target_paths.insert("definition.h".to_string());
+        assert_eq!(actual_target_paths, expected_target_paths);
+        targets.sort_by_key(|target| target.source().rel_path() == Path::new("definition.h"));
+        assert_ne!(
+            targets.first().expect("first target").source().rel_path(),
+            Path::new("definition.h"),
+            "the retained representative must be a forward declaration"
+        );
+        let consumer_file = ProjectFile::new(&root, "consumer.cpp");
+        let definition_file = ProjectFile::new(&root, "definition.h");
+        let candidate_files = HashSet::from_iter([consumer_file.clone(), definition_file.clone()]);
+        let batch = CppAuthoritativeUsageBatch::new(workspace.analyzer(), &candidate_files)
+            .expect("C++ authoritative batch");
+        let consumer_start = fs::read_to_string(root.join("consumer.cpp"))
+            .expect("read consumer")
+            .find("Size* value")
+            .expect("consumer type offset");
+        let assert_order = |ordered_targets: &[CodeUnit]| {
+            cpp.reset_target_spec_scan_count_for_test();
+            let result = batch
+                .find_usages(ordered_targets, &candidate_files, 100)
+                .into_fuzzy_result();
+            let hits = result.all_hits_including_imports();
+            assert_eq!(hits.len(), 1, "one exact consumer hit: {result:#?}");
+            let hit = hits.first().expect("consumer hit");
+            assert_eq!(hit.file, consumer_file, "{result:#?}");
+            assert_eq!(hit.start_offset, consumer_start, "{result:#?}");
+            assert_eq!(hit.end_offset, consumer_start + "Size".len(), "{result:#?}");
+            assert_eq!(hit.kind, UsageHitKind::Reference, "{result:#?}");
+            assert_eq!(
+                cpp.target_spec_scan_count_for_test(),
+                2,
+                "33 logical Type declarations should scan each candidate file once"
+            );
+        };
+        assert_order(&targets);
+
+        targets.sort_by_key(|target| target.source().rel_path() != Path::new("definition.h"));
+        assert_eq!(
+            targets.first().expect("first target").source().rel_path(),
+            Path::new("definition.h"),
+            "the second pass must retain the full definition as representative"
+        );
+        assert_order(&targets);
+    }
+
+    #[test]
+    fn cpp_exact_member_target_does_not_reparse_sibling_owners() {
+        const SIBLING_COUNT: usize = 32;
+        const TARGET_INDEX: usize = 17;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let mut source = String::from("#pragma once\nnamespace demo {\n");
+        for index in 0..SIBLING_COUNT {
+            source.push_str(&format!(
+                "struct Sibling{index} {{ void SetHeader() {{}} void Init() {{ SetHeader(); }} }};\n"
+            ));
+        }
+        source.push_str("}\n");
+        fs::write(root.join("siblings.h"), &source).expect("write sibling fixture");
+        fs::write(
+            root.join("free_control.h"),
+            "namespace demo { void SetHeader() {} void FreeInit() { SetHeader(); } }\n",
+        )
+        .expect("write namespace-free control");
+        fs::write(
+            root.join("forward_owner.h"),
+            "namespace demo { struct ForwardOwner { void SetHeader(); void Init(); }; }\n",
+        )
+        .expect("write full owner");
+        fs::write(
+            root.join("forward_owner_fwd.h"),
+            "namespace demo { struct ForwardOwner; }\n",
+        )
+        .expect("write forward owner");
+        fs::write(
+            root.join("forward_owner.cc"),
+            "#include \"forward_owner_fwd.h\"\n\
+             #include \"forward_owner.h\"\n\
+             namespace demo {\n\
+             void ForwardOwner::SetHeader() {}\n\
+             void ForwardOwner::Init() { SetHeader(); }\n\
+             }\n",
+        )
+        .expect("write out-of-line forward-owner control");
+
+        let project: Arc<dyn crate::analyzer::Project> =
+            Arc::new(TestProject::new(&root, Language::Cpp));
+        let cold =
+            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
+                .expect("persisted analyzer build");
+        drop(cold);
+        let workspace = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
+            .expect("persisted analyzer reopen");
+        let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
+        let target_fqn = format!("demo.Sibling{TARGET_INDEX}.SetHeader");
+        let targets = cpp.get_definitions(&target_fqn);
+        assert_eq!(targets.len(), 1, "one exact inline target: {targets:#?}");
+        let inline_owner = cpp_type_owner_for_test(workspace.analyzer(), &targets[0])
+            .expect("inline method owner");
+        assert_eq!(
+            inline_owner.fq_name(),
+            format!("demo.Sibling{TARGET_INDEX}"),
+            "persisted structural children must resolve directly to their class"
+        );
+        let free_controls = cpp.get_definitions("demo.SetHeader");
+        assert_eq!(free_controls.len(), 1, "one namespace free control");
+        assert_eq!(
+            cpp_type_owner_for_test(workspace.analyzer(), &free_controls[0]),
+            None,
+            "namespace free functions must remain ownerless"
+        );
+        let forward_controls: Vec<_> = cpp
+            .get_definitions("demo.ForwardOwner.SetHeader")
+            .into_iter()
+            .filter(|target| target.source().rel_path() == Path::new("forward_owner.cc"))
+            .collect();
+        assert_eq!(
+            forward_controls.len(),
+            1,
+            "one source-backed out-of-line forward-owner control: {forward_controls:#?}"
+        );
+        assert!(
+            cpp.structural_parent_of(&forward_controls[0])
+                .is_none_or(|parent| parent.is_module()),
+            "out-of-line members must retain heuristic owner fallback: {forward_controls:#?}"
+        );
+        assert_eq!(
+            cpp_type_owner_for_test(workspace.analyzer(), &forward_controls[0])
+                .map(|owner| owner.fq_name()),
+            Some("demo.ForwardOwner".to_string()),
+            "qualified out-of-line members must still resolve through include/forward heuristics"
+        );
+        let free_candidate = ProjectFile::new(&root, "free_control.h");
+        let free_candidate_files = HashSet::from_iter([free_candidate]);
+        let free_batch =
+            CppAuthoritativeUsageBatch::new(workspace.analyzer(), &free_candidate_files)
+                .expect("namespace-free authoritative control batch");
+        let free_result = free_batch
+            .find_usages(&targets, &free_candidate_files, 1000)
+            .into_fuzzy_result();
+        let FuzzyResult::Success {
+            unproven_total_by_overload,
+            ..
+        } = &free_result
+        else {
+            panic!("namespace-free control must resolve successfully: {free_result:#?}");
+        };
+        assert_eq!(
+            unproven_total_by_overload.values().sum::<usize>(),
+            0,
+            "same-namespace free calls must be proven negatives: {free_result:#?}"
+        );
+        assert_eq!(
+            free_result.all_hits_including_imports().len(),
+            0,
+            "same-namespace free calls must not hit the member target: {free_result:#?}"
+        );
+
+        let candidate = ProjectFile::new(&root, "siblings.h");
+        let candidate_files = HashSet::from_iter([candidate.clone()]);
+        let batch = CppAuthoritativeUsageBatch::new(workspace.analyzer(), &candidate_files)
+            .expect("C++ authoritative batch");
+
+        cpp.reset_cpp_owner_resolution_counts_for_test();
+        let result = batch
+            .find_usages(&targets, &candidate_files, 1000)
+            .into_fuzzy_result();
+        let FuzzyResult::Success {
+            unproven_total_by_overload,
+            ..
+        } = &result
+        else {
+            panic!("exact sibling target must resolve successfully: {result:#?}");
+        };
+        assert_eq!(
+            unproven_total_by_overload.values().sum::<usize>(),
+            0,
+            "non-target sibling collisions must remain proven negatives: {result:#?}"
+        );
+        let hits = result.all_hits_including_imports();
+        assert_eq!(
+            hits.len(),
+            1,
+            "only the selected sibling may match: {result:#?}"
+        );
+        let hit = hits.first().expect("selected sibling hit");
+        assert_eq!(hit.file, candidate, "{result:#?}");
+        assert!(
+            hit.snippet
+                .contains(&format!("struct Sibling{TARGET_INDEX}")),
+            "the selected sibling's Init call must remain proven: {result:#?}"
+        );
+
+        let parent_resolutions = cpp.cpp_parent_resolution_count_for_test();
+        let class_strength_parses = cpp.cpp_class_strength_parse_count_for_test();
+        assert!(
+            (SIBLING_COUNT..=SIBLING_COUNT * 4 + 4).contains(&parent_resolutions),
+            "the first negative must exhaust N member candidates while the cached classification and structured enclosing checks keep total owner work linear; observed {parent_resolutions} resolutions for {SIBLING_COUNT} siblings"
+        );
+        assert_eq!(
+            class_strength_parses, 0,
+            "exact structural children must not invoke class-strength parsing"
         );
     }
 

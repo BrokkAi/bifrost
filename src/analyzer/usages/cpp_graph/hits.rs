@@ -139,11 +139,7 @@ pub(super) fn enclosing_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> EnclosingC
 }
 
 fn is_inside_target_declaration(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    if ctx.file != ctx.spec.target.source() {
-        return false;
-    }
-    ctx.analyzer
-        .ranges(&ctx.spec.target)
+    ctx.target_declaration_ranges
         .iter()
         .any(|range| node.start_byte() >= range.start_byte && node.end_byte() <= range.end_byte)
 }
