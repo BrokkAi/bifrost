@@ -14,8 +14,8 @@ pub(in crate::analyzer::usages) fn resolve_go_reference_with_namespaces(
     root: Node<'_>,
     source: &str,
     file_pkg: &str,
-    alias_packages: HashMap<String, Vec<String>>,
-    dot_packages: Vec<String>,
+    alias_packages: &HashMap<String, Vec<String>>,
+    dot_packages: &[String],
     site: &ResolvedReferenceSite,
 ) -> GoReferenceResolution {
     let reference = site.text.as_str();
@@ -63,7 +63,7 @@ pub(in crate::analyzer::usages) fn resolve_go_reference_with_namespaces(
     );
     GoReferenceResolution {
         fqn_candidates,
-        resolved_import_packages: dot_packages,
+        resolved_import_packages: dot_packages.to_vec(),
         shadowed: false,
     }
 }

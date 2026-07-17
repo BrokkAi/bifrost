@@ -38,7 +38,9 @@ mod resolver;
 
 /// The cacheable JS/TS resolution index and its tree-free builder, exposed so the
 /// TypeScript and JavaScript analyzers can cache one per language.
-pub(in crate::analyzer::usages) use receiver_analysis::JsTsReceiverFactProvider;
+pub(in crate::analyzer::usages) use receiver_analysis::{
+    JsTsReceiverFactProvider, JsTsReceiverSyntaxIndex, build_js_ts_receiver_syntax_index,
+};
 pub(crate) use resolver::{
     JsTsUsageIndex, build_jsts_usage_index, build_jsts_usage_index_with_cancellation,
 };
