@@ -959,6 +959,12 @@ impl<'a> CppVisitor<'a> {
         in_class_body: bool,
         stack: &mut Vec<CppWork<'tree>>,
     ) {
+        let recovered_alias_names = recovered_type_alias_names(node, self.source);
+        if !recovered_alias_names.is_empty() {
+            self.add_type_aliases(node, scope, recovered_alias_names);
+            return;
+        }
+
         if let Some(recovered) = recover_exported_class_declaration(node, self.source) {
             let uses_initializer_body = recovered.uses_initializer_body;
             self.visit_named_class_like_shape(
@@ -1199,15 +1205,6 @@ impl<'a> CppVisitor<'a> {
             self.visit_class_like(type_node, scope, stack);
         }
 
-        let signature = normalize_cpp_whitespace(node_text(node, self.source));
-        if signature.is_empty() {
-            return;
-        }
-
-        let type_name = node
-            .child_by_field_name("type")
-            .and_then(|type_node| type_node.child_by_field_name("name"))
-            .map(|name_node| normalize_cpp_whitespace(node_text(name_node, self.source)));
         let alias_names = match node.kind() {
             "alias_declaration" => extract_alias_declaration_name(node, self.source)
                 .into_iter()
@@ -1215,15 +1212,32 @@ impl<'a> CppVisitor<'a> {
             "type_definition" => extract_typedef_alias_names(node, self.source),
             _ => Vec::new(),
         };
+        self.add_type_aliases(node, scope, alias_names);
+    }
+
+    fn add_type_aliases(&mut self, node: Node<'_>, scope: &ScopeInfo, alias_names: Vec<String>) {
+        let signature = normalize_cpp_whitespace(node_text(node, self.source));
+        if signature.is_empty() {
+            return;
+        }
+        let type_name = node
+            .child_by_field_name("type")
+            .and_then(|type_node| type_node.child_by_field_name("name"))
+            .map(|name_node| normalize_cpp_whitespace(node_text(name_node, self.source)));
         for alias_name in alias_names {
             if alias_name.is_empty() || type_name.as_deref() == Some(alias_name.as_str()) {
                 continue;
             }
+            let short_name = if let Some(parent) = &scope.class_unit {
+                format!("{}${alias_name}", parent.short_name())
+            } else {
+                alias_name
+            };
             let code_unit = CodeUnit::with_signature(
                 self.file.clone(),
                 CodeUnitType::Class,
                 scope.package_name.clone(),
-                alias_name,
+                short_name,
                 Some(signature.clone()),
                 false,
             );
@@ -1234,6 +1248,11 @@ impl<'a> CppVisitor<'a> {
                 .add_code_unit(code_unit.clone(), node, self.source, None, None);
             self.parsed
                 .add_signature(code_unit.clone(), signature.clone());
+            if let Some(parent) = &scope.class_unit {
+                self.parsed.add_child(parent.clone(), code_unit.clone());
+            } else if let Some(module) = &scope.module {
+                self.parsed.add_child(module.clone(), code_unit.clone());
+            }
             self.parsed.mark_type_alias(code_unit);
         }
     }
@@ -1657,6 +1676,29 @@ fn extract_alias_declaration_name(node: Node<'_>, source: &str) -> Option<String
     (!name.is_empty()).then_some(name)
 }
 
+fn recovered_type_alias_names(node: Node<'_>, source: &str) -> Vec<String> {
+    if node.kind() != "declaration" {
+        return Vec::new();
+    }
+    let Some(keyword) = node.child_by_field_name("type").filter(|node| {
+        node.kind() == "type_identifier" && matches!(node_text(*node, source), "using" | "typedef")
+    }) else {
+        return Vec::new();
+    };
+    let Some(declarator) = node.child_by_field_name("declarator") else {
+        return Vec::new();
+    };
+    if node_text(keyword, source) == "using"
+        && (declarator.kind() != "init_declarator"
+            || declarator.child_by_field_name("value").is_none())
+    {
+        return Vec::new();
+    }
+    extract_typedef_declarator_name(declarator, source)
+        .into_iter()
+        .collect()
+}
+
 fn extract_typedef_alias_names(node: Node<'_>, source: &str) -> Vec<String> {
     let type_node = node.child_by_field_name("type");
     let mut names = Vec::new();
@@ -1676,10 +1718,13 @@ fn extract_typedef_alias_names(node: Node<'_>, source: &str) -> Vec<String> {
 
 fn extract_typedef_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
     match node.kind() {
-        "identifier" | "field_identifier" | "type_identifier" | "qualified_identifier" => {
+        "identifier" | "field_identifier" | "type_identifier" => {
             let name = normalize_cpp_whitespace(node_text(node, source));
             (!name.is_empty()).then_some(name)
         }
+        "qualified_identifier" => node
+            .child_by_field_name("name")
+            .and_then(|name| extract_typedef_declarator_name(name, source)),
         _ => node
             .child_by_field_name("declarator")
             .or_else(|| node.child_by_field_name("name"))

@@ -380,11 +380,41 @@ fn resolve_cpp_type_without_focused_qualifier(
     // Prefer a type declared in the lexically enclosing scope (namespace/class)
     // over the scope-blind visibility index, so a bare `Config` inside `namespace B`
     // resolves to `B::Config` rather than a same-named sibling namespace's (#431).
-    if node.kind() == "type_identifier"
-        && let Some(unit) =
+    if node.kind() == "type_identifier" {
+        match cpp_enclosing_lexical_scope_components(node, analyzer, visibility, file, source) {
+            CppLexicalScopeResolution::Resolved(scope) => {
+                match visibility.resolve_type_components_lexically_for_forward(
+                    analyzer,
+                    file,
+                    &[text.to_string()],
+                    false,
+                    &scope,
+                ) {
+                    CppLexicalTypeResolution::Resolved { unit, .. } => {
+                        return candidates_outcome(cpp_type_definition_candidates(
+                            analyzer, visibility, file, support, unit,
+                        ));
+                    }
+                    CppLexicalTypeResolution::Ambiguous => {
+                        return ambiguous_definition(format!(
+                            "`{text}` resolves ambiguously in its enclosing C++ class or namespace"
+                        ));
+                    }
+                    CppLexicalTypeResolution::Missing => {}
+                }
+            }
+            CppLexicalScopeResolution::Ambiguous => {
+                return ambiguous_definition(format!(
+                    "the enclosing C++ owner of `{text}` resolves ambiguously"
+                ));
+            }
+            CppLexicalScopeResolution::Missing => {}
+        }
+        if let Some(unit) =
             resolve_in_enclosing_scopes(analyzer, file, text, node.start_byte(), CodeUnit::is_class)
-    {
-        return candidates_outcome(vec![unit]);
+        {
+            return candidates_outcome(vec![unit]);
+        }
     }
     if let Some(unit) = visibility.resolve_type(file, text) {
         return candidates_outcome(cpp_type_definition_candidates(

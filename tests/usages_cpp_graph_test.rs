@@ -2704,6 +2704,572 @@ api::ExternalAlias make(api::ExternalAlias value);
 }
 
 #[test]
+fn authoritative_cpp_class_owned_aliases_preserve_owner_identity_and_usage_isolation() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "aliases.h",
+            r#"#pragma once
+namespace api {
+struct UsingOwner {
+    using Result = external::UsingResult;
+};
+struct TypedefOwner {
+    typedef external::TypedefResult Result;
+};
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "aliases.h"
+
+api::UsingOwner::Result copy_using(api::UsingOwner::Result value);
+api::TypedefOwner::Result copy_typedef(api::TypedefOwner::Result value);
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_all_declarations();
+    let aliases = declarations
+        .iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.identifier() == "Result"
+                && !unit.is_synthetic()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let alias_fq_names = aliases
+        .iter()
+        .map(|unit| unit.fq_name().to_string())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        alias_fq_names,
+        BTreeSet::from([
+            "api.TypedefOwner$Result".to_string(),
+            "api.UsingOwner$Result".to_string(),
+        ]),
+        "class-owned using and typedef aliases with the same terminal name must retain distinct owner-qualified identities: {aliases:#?}"
+    );
+
+    let alias = |fq_name: &str| {
+        aliases
+            .iter()
+            .find(|unit| unit.fq_name() == fq_name)
+            .cloned()
+            .unwrap_or_else(|| panic!("missing class-owned alias {fq_name}: {aliases:#?}"))
+    };
+    let using_alias = alias("api.UsingOwner$Result");
+    let typedef_alias = alias("api.TypedefOwner$Result");
+    assert_eq!(
+        analyzer
+            .parent_of(&using_alias)
+            .as_ref()
+            .map(CodeUnit::fq_name),
+        Some("api.UsingOwner".to_string()),
+        "the using alias must be attached to its enclosing class"
+    );
+    assert_eq!(
+        analyzer
+            .parent_of(&typedef_alias)
+            .as_ref()
+            .map(CodeUnit::fq_name),
+        Some("api.TypedefOwner".to_string()),
+        "the typedef alias must be attached to its enclosing class"
+    );
+
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let expected_ranges = |token: &str| {
+        source
+            .match_indices(token)
+            .map(|(start, matched)| (start, start + matched.len()))
+            .collect::<BTreeSet<_>>()
+    };
+    let using_token = "api::UsingOwner::Result";
+    let typedef_token = "api::TypedefOwner::Result";
+    let using_expected = expected_ranges(using_token);
+    let typedef_expected = expected_ranges(typedef_token);
+    assert_eq!(
+        2,
+        using_expected.len(),
+        "fixture must contain two references to the using alias"
+    );
+    assert_eq!(
+        2,
+        typedef_expected.len(),
+        "fixture must contain two references to the typedef alias"
+    );
+
+    for (token, expected, target_fq_name) in [
+        (using_token, &using_expected, "api.UsingOwner$Result"),
+        (typedef_token, &typedef_expected, "api.TypedefOwner$Result"),
+    ] {
+        for &(start, _) in expected {
+            let terminal_start = start + token.len() - "Result".len();
+            let line_start = source[..terminal_start]
+                .rfind('\n')
+                .map_or(0, |newline| newline + 1);
+            let line = source[..terminal_start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1;
+            let column = source[line_start..terminal_start].chars().count() + 1;
+            let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+                &analyzer,
+                brokk_bifrost::searchtools::GetDefinitionParams {
+                    references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                        path: "consumer.cc".to_string(),
+                        line: Some(line),
+                        column: Some(column),
+                    }],
+                },
+            );
+            let result = &forward.results[0];
+            assert_eq!(
+                "resolved", result.status,
+                "forward lookup must resolve {token} at {terminal_start}: {result:#?}"
+            );
+            assert!(
+                result
+                    .definitions
+                    .iter()
+                    .any(|definition| definition.fqn.as_deref() == Some(target_fq_name)),
+                "forward lookup must preserve the enclosing-class alias identity {target_fq_name}: {result:#?}"
+            );
+        }
+    }
+
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&using_alias), &consumer),
+        using_expected,
+        "inverse lookup for the using alias must not leak to the same-named typedef alias"
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&typedef_alias), &consumer),
+        typedef_expected,
+        "inverse lookup for the typedef alias must not leak to the same-named using alias"
+    );
+}
+
+#[test]
+fn authoritative_cpp_unqualified_class_alias_prefers_enclosing_and_inherited_owner() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"#pragma once
+namespace update_client {
+struct CrxInstaller {
+    struct Result {};
+};
+}
+namespace updater {
+struct UpdateService {
+    using Result = external::ServiceResult;
+};
+}
+"#,
+        )
+        .file(
+            "consumer.h",
+            r#"#pragma once
+#include "types.h"
+namespace updater {
+struct UpdateServiceProxy : UpdateService {
+    Result update(Result value);
+};
+struct LocalService {
+    using Result = external::LocalResult;
+    Result update(Result value);
+};
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = |fq_name: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Class && unit.fq_name() == fq_name && !unit.is_synthetic()
+        })
+    };
+    let inherited_alias = target("updater.UpdateService$Result");
+    let local_alias = target("updater.LocalService$Result");
+    let unrelated = target("update_client.CrxInstaller$Result");
+    let consumer = project.file("consumer.h");
+    let source = consumer.read_to_string().expect("consumer source");
+    let line_ranges = |line: &str| {
+        let line_start = source
+            .find(line)
+            .unwrap_or_else(|| panic!("missing fixture line {line:?}"));
+        line.match_indices("Result")
+            .map(|(start, matched)| (line_start + start, line_start + start + matched.len()))
+            .collect::<BTreeSet<_>>()
+    };
+    let inherited_expected = line_ranges("    Result update(Result value);");
+    let local_line = "    Result update(Result value);";
+    let local_line_start = source
+        .rfind(local_line)
+        .expect("local service fixture line");
+    let local_expected = local_line
+        .match_indices("Result")
+        .map(|(start, matched)| {
+            (
+                local_line_start + start,
+                local_line_start + start + matched.len(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(2, inherited_expected.len());
+    assert_eq!(2, local_expected.len());
+
+    for (expected, target_fq_name) in [
+        (&inherited_expected, "updater.UpdateService$Result"),
+        (&local_expected, "updater.LocalService$Result"),
+    ] {
+        for &(start, _) in expected {
+            let line_start = source[..start].rfind('\n').map_or(0, |newline| newline + 1);
+            let line = source[..start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1;
+            let column = source[line_start..start].chars().count() + 1;
+            let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+                &analyzer,
+                brokk_bifrost::searchtools::GetDefinitionParams {
+                    references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                        path: "consumer.h".to_string(),
+                        line: Some(line),
+                        column: Some(column),
+                    }],
+                },
+            );
+            let result = &forward.results[0];
+            assert_eq!(
+                "resolved", result.status,
+                "unqualified Result must resolve at {start}: {result:#?}"
+            );
+            assert!(
+                result
+                    .definitions
+                    .iter()
+                    .any(|definition| definition.fqn.as_deref() == Some(target_fq_name)),
+                "unqualified Result must resolve through its direct or inherited lexical owner {target_fq_name}, never an unrelated same-named nested type: {result:#?}"
+            );
+        }
+    }
+
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&inherited_alias), &consumer),
+        inherited_expected,
+        "inverse lookup must attribute unqualified inherited aliases to the base owner"
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&local_alias), &consumer),
+        local_expected,
+        "inverse lookup must prefer the directly enclosing class alias"
+    );
+    assert!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&unrelated), &consumer)
+            .is_empty(),
+        "an unrelated same-named nested Result must not capture lexical or inherited references"
+    );
+}
+
+#[test]
+fn authoritative_cpp_inherited_alias_lookup_collapses_same_declaration_and_prefers_nearest_level() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "hierarchy.h",
+            r#"#pragma once
+namespace internal {
+using MultiStep = external::Vector;
+struct InteractiveTestPrivate {
+    using MultiStep = internal::MultiStep;
+};
+}
+namespace api {
+struct InteractiveTestApi {
+    using MultiStep = internal::InteractiveTestPrivate::MultiStep;
+};
+struct LeftApi : InteractiveTestApi {};
+struct RightApi : InteractiveTestApi {};
+struct DiamondApi : LeftApi, RightApi {
+    MultiStep diamond(MultiStep value);
+};
+struct DeepOwner {
+    using MultiStep = external::Wrong;
+};
+struct DeepBranch : DeepOwner {};
+struct NearestApi : InteractiveTestApi, DeepBranch {
+    MultiStep nearest(MultiStep value);
+};
+struct OtherApi {
+    using MultiStep = external::Other;
+};
+struct AmbiguousApi : InteractiveTestApi, OtherApi {
+    MultiStep ambiguous(MultiStep value);
+};
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let file = project.file("hierarchy.h");
+    let source = file.read_to_string().expect("hierarchy source");
+    let inherited_alias = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "api.InteractiveTestApi$MultiStep"
+            && !unit.is_synthetic()
+    });
+    let middle_alias = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "internal.InteractiveTestPrivate$MultiStep"
+            && !unit.is_synthetic()
+    });
+    let underlying_alias = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "internal.MultiStep"
+            && !unit.is_synthetic()
+    });
+    let line_ranges = |line: &str| {
+        let line_start = source
+            .find(line)
+            .unwrap_or_else(|| panic!("missing fixture line {line:?}"));
+        line.match_indices("MultiStep")
+            .map(|(start, matched)| (line_start + start, line_start + start + matched.len()))
+            .collect::<BTreeSet<_>>()
+    };
+    let diamond = line_ranges("    MultiStep diamond(MultiStep value);");
+    let nearest = line_ranges("    MultiStep nearest(MultiStep value);");
+    let ambiguous = line_ranges("    MultiStep ambiguous(MultiStep value);");
+    let expected = diamond
+        .iter()
+        .chain(&nearest)
+        .copied()
+        .collect::<BTreeSet<_>>();
+
+    for &(start, _) in &expected {
+        let line_start = source[..start].rfind('\n').map_or(0, |newline| newline + 1);
+        let line = source[..start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let column = source[line_start..start].chars().count() + 1;
+        let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "hierarchy.h".to_string(),
+                    line: Some(line),
+                    column: Some(column),
+                }],
+            },
+        );
+        assert_eq!(
+            "resolved", forward.results[0].status,
+            "same logical inherited aliases and a nearer declaration must resolve at {start}: {forward:#?}"
+        );
+    }
+
+    let ambiguous_start = ambiguous.iter().next().copied().expect("ambiguous token").0;
+    let ambiguous_line_start = source[..ambiguous_start]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let ambiguous_line = source[..ambiguous_start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let ambiguous_column = source[ambiguous_line_start..ambiguous_start]
+        .chars()
+        .count()
+        + 1;
+    let ambiguous_forward = brokk_bifrost::searchtools::get_definitions_by_location(
+        &analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "hierarchy.h".to_string(),
+                line: Some(ambiguous_line),
+                column: Some(ambiguous_column),
+            }],
+        },
+    );
+    assert_eq!(
+        "ambiguous", ambiguous_forward.results[0].status,
+        "distinct aliases introduced by different direct bases must fail closed: {ambiguous_forward:#?}"
+    );
+
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&inherited_alias), &file),
+        expected,
+        "inverse lookup must collapse repeated paths to one logical alias, prefer the nearer alias, and exclude genuinely ambiguous paths"
+    );
+    let middle_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&middle_alias), &file);
+    assert!(
+        expected.is_subset(&middle_hits),
+        "inverse lookup for the forward-selected middle alias must retain inherited bare references through the outer alias chain: expected {expected:#?}, got {middle_hits:#?}"
+    );
+    assert!(
+        middle_hits.is_disjoint(&ambiguous),
+        "inverse lookup for the middle alias must still fail closed at a genuinely ambiguous inherited site: {middle_hits:#?}"
+    );
+    let underlying_hits =
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&underlying_alias), &file);
+    assert!(
+        expected.is_subset(&underlying_hits),
+        "inverse lookup for the canonical underlying alias must retain the same bare references through the complete alias chain: expected {expected:#?}, got {underlying_hits:#?}"
+    );
+    assert!(
+        underlying_hits.is_disjoint(&ambiguous),
+        "inverse lookup for the underlying alias must still fail closed at a genuinely ambiguous inherited site: {underlying_hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_direct_class_alias_canonical_target_keeps_bare_reference() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "callback.h",
+            r#"#pragma once
+namespace std {
+struct string {};
+}
+namespace base {
+template <typename Signature> struct OnceCallback {};
+}
+"#,
+        )
+        .file(
+            "gatt.h",
+            r#"#pragma once
+#include "callback.h"
+namespace bluez {
+class DEVICE_BLUETOOTH_EXPORT BluetoothGattCharacteristicClient {
+ public:
+    using ErrorCallback =
+        base::OnceCallback<void(const std::string& error_name,
+                                const std::string& error_message)>;
+    virtual void Start(ErrorCallback error_callback) = 0;
+};
+class DEVICE_BLUETOOTH_EXPORT OuterClient {
+ public:
+    class InnerClient {
+     public:
+        using NestedCallback = base::OnceCallback<void()>;
+        virtual void NestedStart(NestedCallback callback) = 0;
+    };
+};
+}
+"#,
+        )
+        .file(
+            "unrelated.h",
+            r#"#pragma once
+#include "callback.h"
+namespace bluez {
+class DEVICE_BLUETOOTH_EXPORT BluetoothDebugManagerClient {
+ public:
+    typedef base::OnceCallback<void(const std::string& error_name,
+                                    const std::string& error_message)>
+        ErrorCallback;
+};
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let canonical = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "base.OnceCallback"
+            && !unit.is_synthetic()
+    });
+    let gatt = project.file("gatt.h");
+    let source = gatt.read_to_string().expect("GATT source");
+    let line = "    virtual void Start(ErrorCallback error_callback) = 0;";
+    let line_start = source.find(line).expect("bare callback line");
+    let token_start = line_start + line.find("ErrorCallback").expect("bare callback token");
+    let line_number = source[..token_start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let column = source[line_start..token_start].chars().count() + 1;
+    let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+        &analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "gatt.h".to_string(),
+                line: Some(line_number),
+                column: Some(column),
+            }],
+        },
+    );
+    assert_eq!("resolved", forward.results[0].status, "{forward:#?}");
+    assert!(
+        forward.results[0]
+            .definitions
+            .iter()
+            .any(|definition| definition.fqn.as_deref() == Some("base.OnceCallback")),
+        "the direct class alias must forward-canonicalize to OnceCallback: {forward:#?}"
+    );
+
+    let nested_line = "        virtual void NestedStart(NestedCallback callback) = 0;";
+    let nested_line_start = source.find(nested_line).expect("nested callback line");
+    let nested_token_start = nested_line_start
+        + nested_line
+            .find("NestedCallback")
+            .expect("nested callback token");
+    let nested_line_number = source[..nested_token_start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let nested_column = source[nested_line_start..nested_token_start]
+        .chars()
+        .count()
+        + 1;
+    let nested_forward = brokk_bifrost::searchtools::get_definitions_by_location(
+        &analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "gatt.h".to_string(),
+                line: Some(nested_line_number),
+                column: Some(nested_column),
+            }],
+        },
+    );
+    assert_eq!(
+        "resolved", nested_forward.results[0].status,
+        "nested recovered class owners must retain outer-to-inner lexical order: {nested_forward:#?}"
+    );
+    assert!(
+        nested_forward.results[0]
+            .definitions
+            .iter()
+            .any(|definition| definition.fqn.as_deref() == Some("base.OnceCallback")),
+        "the nested direct class alias must forward-canonicalize to OnceCallback: {nested_forward:#?}"
+    );
+
+    let hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&canonical), &gatt);
+    assert!(
+        hits.iter().any(|&(start, end)| {
+            start <= token_start && token_start + "ErrorCallback".len() <= end
+        }),
+        "canonical inverse lookup must retain the bare reference through its directly enclosing class alias: {hits:#?}"
+    );
+    assert!(
+        hits.iter().any(|&(start, end)| {
+            start <= nested_token_start && nested_token_start + "NestedCallback".len() <= end
+        }),
+        "canonical inverse lookup must retain a bare alias through nested recovered class owners: {hits:#?}"
+    );
+}
+
+#[test]
 fn authoritative_cpp_usage_preserves_builtin_and_dependent_alias_identity() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

@@ -2022,7 +2022,7 @@ enum QualifiedOwnerResolution {
     Unresolved,
 }
 
-pub(super) enum LexicalScopeResolution {
+pub(in crate::analyzer::usages) enum LexicalScopeResolution {
     Resolved(Vec<String>),
     Ambiguous,
     Missing,
@@ -2171,7 +2171,7 @@ pub(super) fn enclosing_namespace_components(node: Node<'_>, source: &str) -> Ve
     namespaces.into_iter().flatten().collect()
 }
 
-pub(super) fn enclosing_lexical_scope_components(
+pub(in crate::analyzer::usages) fn enclosing_lexical_scope_components(
     node: Node<'_>,
     analyzer: &dyn IAnalyzer,
     visibility: &VisibilityIndex,
@@ -2213,6 +2213,14 @@ fn enclosing_lexical_scope_components_with_unresolved_owner(
         }
         current = parent.parent();
     }
+    if has_recovered_class_shape_ancestor(node)
+        && let Some(indexed_classes) = indexed_enclosing_class_components(analyzer, file, node)
+    {
+        classes = indexed_classes
+            .into_iter()
+            .map(|component| vec![component])
+            .collect();
+    }
 
     if !ignore_function_owner
         && let Some(function) = function_definition.and_then(function_definition_name_node)
@@ -2242,6 +2250,55 @@ fn enclosing_lexical_scope_components_with_unresolved_owner(
     classes.reverse();
     scope.extend(classes.into_iter().flatten());
     LexicalScopeResolution::Resolved(scope)
+}
+
+fn has_recovered_class_shape_ancestor(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "function_definition"
+            && parent.child_by_field_name("type").is_some_and(|type_node| {
+                matches!(
+                    type_node.kind(),
+                    "class_specifier" | "struct_specifier" | "union_specifier"
+                )
+            })
+        {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+fn indexed_enclosing_class_components(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    node: Node<'_>,
+) -> Option<Vec<String>> {
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    };
+    let mut current = analyzer.enclosing_code_unit(file, &range)?;
+    let mut classes = Vec::new();
+    loop {
+        let is_alias = analyzer
+            .type_alias_provider()
+            .is_some_and(|provider| provider.is_type_alias(&current));
+        if current.is_class() && !is_alias {
+            classes.push(current.identifier().to_string());
+        }
+        let Some(parent) = analyzer.parent_of(&current) else {
+            break;
+        };
+        current = parent;
+    }
+    if classes.is_empty() {
+        return None;
+    }
+    Some(classes)
 }
 
 pub(super) fn resolve_type_node_lexically(

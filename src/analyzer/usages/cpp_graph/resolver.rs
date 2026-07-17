@@ -28,7 +28,7 @@ pub(in crate::analyzer::usages) enum TargetKind {
     MemberField,
 }
 
-pub(super) enum LexicalTypeResolution {
+pub(in crate::analyzer::usages) enum LexicalTypeResolution {
     Resolved {
         unit: CodeUnit,
         components: Vec<String>,
@@ -36,6 +36,13 @@ pub(super) enum LexicalTypeResolution {
     },
     Ambiguous,
     Missing,
+}
+
+#[derive(Clone, Copy)]
+enum TypeCandidateResolution<'a> {
+    Canonical,
+    PreserveAlias,
+    PreserveTarget(&'a CodeUnit),
 }
 
 pub(super) enum LexicalCallableValueResolution {
@@ -600,7 +607,25 @@ impl VisibilityIndex {
             components,
             global,
             lexical_scope,
-            None,
+            TypeCandidateResolution::Canonical,
+        )
+    }
+
+    pub(in crate::analyzer::usages) fn resolve_type_components_lexically_for_forward(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        components: &[String],
+        global: bool,
+        lexical_scope: &[String],
+    ) -> LexicalTypeResolution {
+        self.resolve_type_components_lexically_inner(
+            analyzer,
+            file,
+            components,
+            global,
+            lexical_scope,
+            TypeCandidateResolution::PreserveAlias,
         )
     }
 
@@ -619,7 +644,7 @@ impl VisibilityIndex {
             components,
             global,
             lexical_scope,
-            Some(target),
+            TypeCandidateResolution::PreserveTarget(target),
         )
     }
 
@@ -630,12 +655,14 @@ impl VisibilityIndex {
         components: &[String],
         global: bool,
         lexical_scope: &[String],
-        direct_target: Option<&CodeUnit>,
+        resolution: TypeCandidateResolution<'_>,
     ) -> LexicalTypeResolution {
         if components.is_empty() {
             return LexicalTypeResolution::Missing;
         }
-        for qualified in lexical_component_tiers(components, global, lexical_scope) {
+        for (tier_index, qualified) in
+            lexical_component_tiers(components, global, lexical_scope).enumerate()
+        {
             let qualified_name = qualified.join("::");
             let candidates = self
                 .type_candidates(file, &qualified_name)
@@ -643,19 +670,21 @@ impl VisibilityIndex {
                 .filter(|candidate| cpp_name_for(candidate) == qualified_name)
                 .collect::<Vec<_>>();
             if candidates.is_empty() {
-                continue;
-            }
-            let unit = direct_target.map_or_else(
-                || self.unique_canonical_type_candidate(analyzer, file, &candidates),
-                |target| {
-                    self.unique_type_candidate_preserving_target(
+                if tier_index == 0 && !global && components.len() == 1 {
+                    match self.resolve_inherited_type_for_lexical_scope(
                         analyzer,
                         file,
-                        &candidates,
-                        target,
-                    )
-                },
-            );
+                        lexical_scope,
+                        &components[0],
+                        resolution,
+                    ) {
+                        LexicalTypeResolution::Missing => {}
+                        inherited => return inherited,
+                    }
+                }
+                continue;
+            }
+            let unit = self.resolve_type_candidates(analyzer, file, &candidates, resolution);
             let Some(unit) = unit else {
                 return LexicalTypeResolution::Ambiguous;
             };
@@ -666,6 +695,113 @@ impl VisibilityIndex {
             };
         }
         LexicalTypeResolution::Missing
+    }
+
+    fn resolve_inherited_type_for_lexical_scope(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        lexical_scope: &[String],
+        name: &str,
+        resolution: TypeCandidateResolution<'_>,
+    ) -> LexicalTypeResolution {
+        let Some(hierarchy) = analyzer.type_hierarchy_provider() else {
+            return LexicalTypeResolution::Missing;
+        };
+        let lexical_owner_name = lexical_scope.join("::");
+        if lexical_owner_name.is_empty() {
+            return LexicalTypeResolution::Missing;
+        }
+        let owner_candidates = self
+            .type_candidates(file, &lexical_owner_name)
+            .into_iter()
+            .filter(|candidate| {
+                cpp_name_for(candidate) == lexical_owner_name
+                    && !declared_type_alias(analyzer, candidate)
+            })
+            .collect::<Vec<_>>();
+        if owner_candidates.is_empty() {
+            return LexicalTypeResolution::Missing;
+        }
+        let Some(lexical_owner) = unique_logical_type_candidate(owner_candidates) else {
+            return LexicalTypeResolution::Ambiguous;
+        };
+
+        let mut frontier = hierarchy.get_direct_ancestors(&lexical_owner);
+        let mut visited_owners = HashSet::default();
+        while !frontier.is_empty() {
+            let mut level_matches: Vec<(CodeUnit, Vec<CodeUnit>)> = Vec::new();
+            let mut next_frontier = Vec::new();
+            for owner in frontier {
+                if !visited_owners.insert(owner.fq_name()) {
+                    continue;
+                }
+                let qualified_name = format!("{}::{name}", cpp_name_for(&owner));
+                let candidates = self
+                    .type_candidates(file, &qualified_name)
+                    .into_iter()
+                    .filter(|candidate| cpp_name_for(candidate) == qualified_name)
+                    .collect::<Vec<_>>();
+                if candidates.is_empty() {
+                    for ancestor in hierarchy.get_direct_ancestors(&owner) {
+                        if !next_frontier
+                            .iter()
+                            .any(|existing: &CodeUnit| existing.fq_name() == ancestor.fq_name())
+                        {
+                            next_frontier.push(ancestor);
+                        }
+                    }
+                    continue;
+                }
+                let Some(unit) =
+                    self.resolve_type_candidates(analyzer, file, &candidates, resolution)
+                else {
+                    return LexicalTypeResolution::Ambiguous;
+                };
+                level_matches.push((unit, candidates.into_iter().cloned().collect::<Vec<_>>()));
+            }
+            if let Some((unit, candidates)) = level_matches.first().cloned() {
+                let Some(first_declaration) = candidates.first() else {
+                    return LexicalTypeResolution::Ambiguous;
+                };
+                if !level_matches.iter().all(|(_, declarations)| {
+                    declarations
+                        .iter()
+                        .all(|declaration| same_logical_symbol(first_declaration, declaration))
+                }) {
+                    return LexicalTypeResolution::Ambiguous;
+                }
+                let mut components = lexical_scope.to_vec();
+                components.push(name.to_string());
+                return LexicalTypeResolution::Resolved {
+                    unit,
+                    components,
+                    candidates,
+                };
+            }
+            frontier = next_frontier;
+        }
+        LexicalTypeResolution::Missing
+    }
+
+    fn resolve_type_candidates(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        candidates: &[&CodeUnit],
+        resolution: TypeCandidateResolution<'_>,
+    ) -> Option<CodeUnit> {
+        match resolution {
+            TypeCandidateResolution::Canonical => {
+                self.unique_canonical_type_candidate(analyzer, file, candidates)
+            }
+            TypeCandidateResolution::PreserveAlias => {
+                unique_type_candidate_preserving_alias(analyzer, candidates)
+            }
+            TypeCandidateResolution::PreserveTarget(target) => {
+                self.unique_type_candidate_preserving_target(analyzer, file, candidates, target)
+            }
+        }
     }
 
     pub(super) fn resolve_callable_value_components_lexically(
@@ -840,20 +976,8 @@ impl VisibilityIndex {
     ) -> Option<CodeUnit> {
         let mut resolved_candidates = Vec::new();
         for candidate in candidates {
-            let is_direct_target = same_visible_symbol(candidate, target);
-            let is_alias = is_direct_target
-                && (is_type_alias(candidate)
-                    || analyzer
-                        .type_alias_provider()
-                        .is_some_and(|provider| provider.is_type_alias(candidate)));
-            let resolved = if is_direct_target
-                && (!is_alias
-                    || self.structured_alias_chain_is_acyclic(analyzer, visible_from, candidate))
-            {
-                (*candidate).clone()
-            } else {
-                self.canonical_type_unit(analyzer, visible_from, candidate)?
-            };
+            let resolved =
+                self.type_candidate_preserving_target(analyzer, visible_from, candidate, target)?;
             if resolved_candidates
                 .iter()
                 .any(|existing| same_visible_symbol(existing, &resolved))
@@ -868,29 +992,37 @@ impl VisibilityIndex {
         resolved_candidates.pop()
     }
 
-    fn structured_alias_chain_is_acyclic(
+    fn type_candidate_preserving_target(
         &self,
         analyzer: &dyn IAnalyzer,
         visible_from: &ProjectFile,
-        unit: &CodeUnit,
-    ) -> bool {
-        let mut current = unit.clone();
+        candidate: &CodeUnit,
+        target: &CodeUnit,
+    ) -> Option<CodeUnit> {
+        let mut current = candidate.clone();
+        let mut matched_target = same_visible_symbol(&current, target);
         let mut seen = HashSet::default();
         loop {
             if !seen.insert(current.clone()) {
-                return false;
+                return None;
             }
-            let Some(target) = self.structured_alias_target(analyzer, &current) else {
-                return true;
+            let Some(alias_target) = self.structured_alias_target(analyzer, &current) else {
+                return matched_target
+                    .then(|| target.clone())
+                    .or_else(|| current.is_class().then_some(current));
             };
-            if matches!(target, StructuredAliasTarget::Builtin) {
-                return true;
+            if matches!(alias_target, StructuredAliasTarget::Builtin) {
+                return matched_target
+                    .then(|| target.clone())
+                    .or_else(|| current.is_class().then_some(current));
             }
-            let Some(next) = self.resolve_structured_alias_target(visible_from, &current, &target)
+            let Some(next) =
+                self.resolve_structured_alias_target(visible_from, &current, &alias_target)
             else {
-                return true;
+                return matched_target.then(|| target.clone());
             };
             current = next;
+            matched_target |= same_visible_symbol(&current, target);
         }
     }
 
@@ -2025,6 +2157,36 @@ fn unique_logical_type_candidate(candidates: Vec<&CodeUnit>) -> Option<CodeUnit>
         .iter()
         .all(|candidate| candidate.kind() == first.kind() && candidate.fq_name() == first.fq_name())
         .then(|| (*first).clone())
+}
+
+fn unique_type_candidate_preserving_alias(
+    analyzer: &dyn IAnalyzer,
+    candidates: &[&CodeUnit],
+) -> Option<CodeUnit> {
+    let first = *candidates.first()?;
+    if declared_type_alias(analyzer, first) {
+        return candidates
+            .iter()
+            .all(|candidate| {
+                declared_type_alias(analyzer, candidate) && same_logical_symbol(first, candidate)
+            })
+            .then(|| first.clone());
+    }
+    candidates
+        .iter()
+        .all(|candidate| {
+            !declared_type_alias(analyzer, candidate)
+                && candidate.kind() == first.kind()
+                && candidate.fq_name() == first.fq_name()
+        })
+        .then(|| first.clone())
+}
+
+fn declared_type_alias(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
+    is_type_alias(unit)
+        || analyzer
+            .type_alias_provider()
+            .is_some_and(|provider| provider.is_type_alias(unit))
 }
 
 pub(in crate::analyzer::usages) fn field_declared_type_text(

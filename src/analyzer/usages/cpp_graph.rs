@@ -18,8 +18,13 @@ use crate::analyzer::usages::traits::{
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
 
+pub(in crate::analyzer::usages) use extractor::{
+    LexicalScopeResolution as CppLexicalScopeResolution,
+    enclosing_lexical_scope_components as cpp_enclosing_lexical_scope_components,
+};
 pub(in crate::analyzer::usages) use resolver::{
-    DesignatedInitializerOwner as CppDesignatedInitializerOwner, TargetKind as CppTargetKind,
+    DesignatedInitializerOwner as CppDesignatedInitializerOwner,
+    LexicalTypeResolution as CppLexicalTypeResolution, TargetKind as CppTargetKind,
     VisibilityIndex as CppVisibilityIndex, call_arity as cpp_call_arity,
     constructor_type_node as cpp_constructor_type_node, cpp_function_return_type_text,
     cpp_name_for, cpp_reference_fqn_candidates,
