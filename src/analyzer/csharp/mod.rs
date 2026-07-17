@@ -2,6 +2,8 @@ mod adapter;
 mod cache;
 mod clones;
 mod declarations;
+mod dependency_discovery;
+pub mod external;
 mod hierarchy;
 mod imports;
 pub(crate) mod structural;
@@ -10,10 +12,10 @@ mod tests;
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CallableArity, CodeUnit, IAnalyzer,
-    ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
-    UsageFactsIndex,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CSharpAnalyzerConfig, CallableArity,
+    CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TypeHierarchyProvider, UsageFactsIndex,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -24,6 +26,7 @@ use tree_sitter::Node;
 use adapter::CSharpAdapter;
 use cache::CSharpMemoCaches;
 use clones::{build_csharp_clone_candidate_data, refine_csharp_clone_similarity};
+use external::{CSharpExternalDeclarationIndex, CSharpExternalMember, CSharpExternalType};
 use imports::{
     csharp_static_using_from_import, csharp_using_alias_from_import, csharp_using_namespace,
 };
@@ -37,6 +40,8 @@ pub(crate) fn csharp_using_directive_is_static(node: Node<'_>) -> bool {
     node.children(&mut cursor)
         .any(|child| child.kind() == "static")
 }
+
+pub(crate) use dependency_discovery::is_csharp_dependency_input;
 
 pub(crate) fn csharp_using_directive_is_global(node: Node<'_>) -> bool {
     if node.kind() != "using_directive" {
@@ -76,6 +81,8 @@ pub(crate) fn csharp_as_expression_type_operand(parent: Node<'_>, node: Node<'_>
 pub struct CSharpAnalyzer {
     inner: TreeSitterAnalyzer<CSharpAdapter>,
     memo_caches: Arc<CSharpMemoCaches>,
+    csharp_config: CSharpAnalyzerConfig,
+    external_index: Arc<std::sync::OnceLock<CSharpExternalDeclarationIndex>>,
 }
 
 crate::analyzer::impl_forward_query_provider!(CSharpAnalyzer);
@@ -84,6 +91,7 @@ impl CSharpAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
+        clone.external_index = Arc::new(std::sync::OnceLock::new());
         clone
     }
 
@@ -93,9 +101,12 @@ impl CSharpAnalyzer {
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
+        let csharp_config = config.csharp.clone();
         Self {
             inner: TreeSitterAnalyzer::new_with_config(project, CSharpAdapter, config),
             memo_caches: Arc::new(CSharpMemoCaches::new(memo_budget)),
+            csharp_config,
+            external_index: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -106,6 +117,7 @@ impl CSharpAnalyzer {
         progress: Option<BuildProgress>,
     ) -> Result<Self, crate::analyzer::store::StoreError> {
         let memo_budget = config.memo_cache_budget_bytes();
+        let csharp_config = config.csharp.clone();
         let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             project,
             CSharpAdapter,
@@ -116,6 +128,8 @@ impl CSharpAnalyzer {
         Ok(Self {
             inner,
             memo_caches: Arc::new(CSharpMemoCaches::new(memo_budget)),
+            csharp_config,
+            external_index: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -184,6 +198,36 @@ impl CSharpAnalyzer {
             .map(|unit| unit.package_name().to_string())
             .find(|package| !package.is_empty())
             .unwrap_or_default()
+    }
+
+    pub fn external_declaration_index(&self) -> &CSharpExternalDeclarationIndex {
+        self.external_index.get_or_init(|| {
+            CSharpExternalDeclarationIndex::build_for_project(
+                &self.csharp_config,
+                self.inner.project(),
+            )
+        })
+    }
+
+    pub fn external_type_candidates(
+        &self,
+        file: &ProjectFile,
+        reference: &str,
+    ) -> Vec<&CSharpExternalType> {
+        self.external_declaration_index().resolve_in_file(
+            reference,
+            &self.namespace_of_file(file),
+            &self.using_namespaces_of(file),
+            &self.using_aliases_of(file),
+        )
+    }
+
+    pub fn external_member_candidates(
+        &self,
+        owner: &str,
+        name: &str,
+    ) -> Vec<&CSharpExternalMember> {
+        self.external_declaration_index().members_named(owner, name)
     }
 
     pub fn using_namespaces_of(&self, file: &ProjectFile) -> Vec<String> {
@@ -966,9 +1010,19 @@ impl IAnalyzer for CSharpAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        let external_index = if changed_files
+            .iter()
+            .any(dependency_discovery::is_csharp_dependency_input)
+        {
+            Arc::new(std::sync::OnceLock::new())
+        } else {
+            self.external_index.clone()
+        };
         Self {
             inner: self.inner.update(changed_files),
             memo_caches: Arc::new(CSharpMemoCaches::new(self.memo_caches.budget_bytes())),
+            csharp_config: self.csharp_config.clone(),
+            external_index,
         }
     }
 
@@ -976,6 +1030,8 @@ impl IAnalyzer for CSharpAnalyzer {
         Self {
             inner: self.inner.update_all(),
             memo_caches: Arc::new(CSharpMemoCaches::new(self.memo_caches.budget_bytes())),
+            csharp_config: self.csharp_config.clone(),
+            external_index: Arc::new(std::sync::OnceLock::new()),
         }
     }
 

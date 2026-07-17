@@ -167,6 +167,7 @@ impl AnalyzerDelegate {
     fn needs_config_update_for(&self, file: &ProjectFile) -> bool {
         match self {
             Self::Java(_) => crate::analyzer::java::is_java_dependency_input(file),
+            Self::CSharp(_) => crate::analyzer::csharp::is_csharp_dependency_input(file),
             Self::JavaScript(_) | Self::TypeScript(_) => is_js_ts_config_file(file),
             _ => false,
         }
@@ -1036,6 +1037,20 @@ mod tests {
             delegate.needs_config_update_for(&project_file("buildSrc/src/main/java/Plugin.java"))
         );
         assert!(!delegate.needs_config_update_for(&project_file("src/App.java")));
+    }
+
+    #[test]
+    fn csharp_dependency_inputs_are_routed_as_delegate_relevant_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = FileSetProject::new(
+            temp.path().canonicalize().unwrap(),
+            std::iter::empty::<std::path::PathBuf>(),
+        );
+        let delegate = AnalyzerDelegate::CSharp(CSharpAnalyzer::from_project(project));
+        assert!(delegate.needs_config_update_for(&project_file("obj/project.assets.json")));
+        assert!(delegate.needs_config_update_for(&project_file("App.csproj")));
+        assert!(delegate.needs_config_update_for(&project_file("bin/App.dll")));
+        assert!(!delegate.needs_config_update_for(&project_file("src/App.cs")));
     }
 
     #[test]

@@ -50,8 +50,9 @@ pub(crate) use capabilities::{
     resolve_imported_files_from_infos,
 };
 pub use config::{
-    AnalyzerConfig, JavaAnalyzerConfig, JavaDependencyDiscoveryConfig, JavaDependencyDiscoveryMode,
-    JavaExternalArtifact, JavaExternalDependencies, JavaMavenCoordinate,
+    AnalyzerConfig, CSharpAnalyzerConfig, JavaAnalyzerConfig, JavaDependencyDiscoveryConfig,
+    JavaDependencyDiscoveryMode, JavaExternalArtifact, JavaExternalDependencies,
+    JavaMavenCoordinate,
 };
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
@@ -60,6 +61,10 @@ pub(crate) use cpp::{
     resolve_include_targets_with_index,
 };
 pub use csharp::CSharpAnalyzer;
+pub use csharp::external::{
+    CSharpExternalDeclarationIndex, CSharpExternalDeclarationSource, CSharpExternalMember,
+    CSharpExternalMemberKind, CSharpExternalType, CSharpExternalTypeKind, CSharpVisibility,
+};
 pub(crate) use csharp::{
     CSharpMemberName, csharp_as_expression_type_operand, csharp_attribute_name_node,
     csharp_attribute_terminal_name, csharp_attribute_type_names, csharp_callable_arity,
