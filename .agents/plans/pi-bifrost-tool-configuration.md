@@ -17,7 +17,8 @@ The implementation must not alter Bifrost's Rust server, registry, or CLI. It co
 - [x] (2026-07-17 21:25Z) Added transactional selection reconciliation and independent, atomic per-workspace persistence under Pi's agent directory.
 - [x] (2026-07-17 21:20Z) Replaced the status-only `/bifrost` command with a SettingsList TUI and added the concise namespace/workspace prompt clarification.
 - [x] (2026-07-17 21:31Z) Added focused namespace, activation, restart, race, rollback, persistence, prompt, and settings tests; all 55 Node tests pass.
-- [x] (2026-07-17 21:31Z) Updated Pi package and maintainer documentation; package checks, clean install, manifest validation, npm audit, pack dry-run, and publish dry-run pass. A model-driven real-Pi smoke was attempted but explicitly denied, so it was not retried.
+- [x] (2026-07-17 21:31Z) Updated Pi package and maintainer documentation; package checks, clean install, manifest validation, npm audit, pack dry-run, and publish dry-run pass.
+- [x] (2026-07-17 21:50Z) Reproduced startup in a real interactive Pi session through Herdr, captured and corrected stale release archive hashes, then verified clean startup and the live `/bifrost` SettingsList with the expected defaults.
 
 ## Surprises & Discoveries
 
@@ -29,6 +30,9 @@ The implementation must not alter Bifrost's Rust server, registry, or CLI. It co
 
 - Observation: Enabling `text`, `slopcop`, or `nlp` after startup requires reconnecting because those descriptors are absent unless their existing server toolset is requested.
   Evidence: The MCP descriptor list is fixed by the launcher's `--mcp` expression and discovered once with `tools/list`.
+
+- Observation: The committed 0.8.4 release metadata predated the final GitHub release assets, so first-run installation rejected the current checksum sidecars.
+  Evidence: Interactive Pi reported expected Linux x86_64 hash `4248c1...` but sidecar hash `59a34f...`. All five GitHub sidecars differed from the metadata. The Linux archive itself hashes to `59a34fb3dadb74868a63e48eceebe799ab8dfc7247220deeea7b298966709eca`; updating all release projections removed the startup error.
 
 ## Decision Log
 
@@ -125,4 +129,6 @@ Revision note (2026-07-17): Rewrote the plan after reverting the out-of-scope Ru
 
 Revision note (2026-07-17 21:23Z): Recorded review-driven lifecycle and persistence hardening: transactional old-client use, stale-start protection, same-selection reconciliation, save rollback, corrupt-file repair, and independent per-workspace files.
 
-Revision note (2026-07-17 21:31Z): Marked implementation and automated validation complete after 55 passing tests and a no-blocker final review cycle. Recorded that the denied model-driven Pi smoke was not retried.
+Revision note (2026-07-17 21:31Z): Marked implementation and automated validation complete after 55 passing tests and a no-blocker final review cycle.
+
+Revision note (2026-07-17 21:50Z): Added real interactive Pi evidence after reproducing a transient startup failure through Herdr. Recorded and fixed stale 0.8.4 archive hashes across Pi/Amp release metadata and the VS Code manifest; clean startup and `/bifrost` rendering then succeeded.
