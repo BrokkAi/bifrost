@@ -1,9 +1,10 @@
 //! Shared SQLite schema and connection setup for bifrost's rebuildable cache DB.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
+use rusqlite::ffi::ErrorCode;
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 #[cfg(test)]
 use rusqlite_migration::{M, Migrations};
@@ -66,6 +67,10 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const INITIALIZATION_RETRY_DEADLINE: Duration = BUSY_TIMEOUT;
+const INITIALIZATION_RETRY_BACKOFF: Duration = Duration::from_millis(5);
+const INITIALIZATION_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(100);
 
 pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
     ensure_safe_cache_path(db_path)?;
@@ -78,8 +83,9 @@ pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    let initialized_before_open = unified_cache_initialized(&conn);
-    configure_connection(&mut conn)?;
+    install_busy_timeout(&conn)?;
+    configure_connection_after_busy_timeout(&mut conn)?;
+    let initialized_before_open = unified_cache_initialized(&conn)?;
     migrate(&mut conn)?;
     if !initialized_before_open {
         delete_legacy_cache_files(&db_path);
@@ -87,18 +93,26 @@ pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-fn unified_cache_initialized(conn: &Connection) -> bool {
-    conn.query_row(
-        "SELECT EXISTS(
+fn unified_cache_initialized(conn: &Connection) -> Result<bool> {
+    let has_cache_state: bool = conn
+        .query_row(
+            "SELECT EXISTS(
            SELECT 1 FROM sqlite_master
            WHERE type = 'table' AND name = 'cache_state'
-         ) AND EXISTS(
-           SELECT 1 FROM cache_state WHERE id = 1
          )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| format!("cache DB initialization-state query SQLite error: {err}"))?;
+    if !has_cache_state {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM cache_state WHERE id = 1)",
         [],
         |row| row.get(0),
     )
-    .unwrap_or(false)
+    .map_err(|err| format!("cache DB initialization-state query SQLite error: {err}"))
 }
 
 fn prepare_cache_db_path(db_path: &Path) -> Result<PathBuf> {
@@ -115,17 +129,29 @@ fn prepare_cache_db_path(db_path: &Path) -> Result<PathBuf> {
 }
 
 pub fn configure_connection(conn: &mut Connection) -> Result<()> {
-    conn.busy_timeout(Duration::from_millis(5000))
-        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    install_busy_timeout(conn)?;
+    configure_connection_after_busy_timeout(conn)
+}
+
+fn install_busy_timeout(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(BUSY_TIMEOUT)
+        .map_err(|err| format!("cache DB busy-timeout configuration SQLite error: {err}"))
+}
+
+fn configure_connection_after_busy_timeout(conn: &mut Connection) -> Result<()> {
+    if conn.path().is_some_and(|path| !path.is_empty()) {
+        retry_initialization_phase("auto-vacuum initialization", || {
+            ensure_incremental_auto_vacuum(conn)
+        })?;
+        retry_initialization_phase("journal-mode initialization", || {
+            ensure_wal_journal_mode(conn)
+        })?;
+    }
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "ignore_check_constraints", "OFF")
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "recursive_triggers", "ON")
-        .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
@@ -138,6 +164,117 @@ pub fn configure_connection(conn: &mut Connection) -> Result<()> {
     conn.pragma_update(None, "wal_autocheckpoint", 2000)
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     Ok(())
+}
+
+enum InitializationPhaseError {
+    Sqlite(rusqlite::Error),
+    Verification(String),
+}
+
+impl From<rusqlite::Error> for InitializationPhaseError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sqlite(error)
+    }
+}
+
+fn ensure_wal_journal_mode(conn: &Connection) -> std::result::Result<(), InitializationPhaseError> {
+    let current: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    if current.eq_ignore_ascii_case("wal") {
+        return Ok(());
+    }
+    let updated: String =
+        conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
+    if updated.eq_ignore_ascii_case("wal") {
+        Ok(())
+    } else {
+        Err(InitializationPhaseError::Verification(format!(
+            "requested WAL but SQLite reported {updated}"
+        )))
+    }
+}
+
+fn ensure_incremental_auto_vacuum(
+    conn: &Connection,
+) -> std::result::Result<(), InitializationPhaseError> {
+    let current: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
+    if current == 2 {
+        return Ok(());
+    }
+    let schema_is_empty: bool = conn.query_row(
+        "SELECT NOT EXISTS(
+           SELECT 1 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    // SQLite cannot change a populated mode-0 database without VACUUM. Cache
+    // compatibility wins over an implicit full rewrite; existing databases keep
+    // their current mode, while fresh databases are configured before migration.
+    if current == 0 && !schema_is_empty {
+        return Ok(());
+    }
+    conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+    let updated: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
+    if updated == 2 {
+        Ok(())
+    } else {
+        Err(InitializationPhaseError::Verification(format!(
+            "requested INCREMENTAL (2) but SQLite reported {updated}"
+        )))
+    }
+}
+
+fn retry_initialization_phase<T>(
+    phase: &str,
+    operation: impl FnMut() -> std::result::Result<T, InitializationPhaseError>,
+) -> Result<T> {
+    retry_initialization_phase_with(
+        phase,
+        INITIALIZATION_RETRY_DEADLINE,
+        std::thread::sleep,
+        operation,
+    )
+}
+
+fn retry_initialization_phase_with<T>(
+    phase: &str,
+    deadline: Duration,
+    mut sleep: impl FnMut(Duration),
+    mut operation: impl FnMut() -> std::result::Result<T, InitializationPhaseError>,
+) -> Result<T> {
+    let started = Instant::now();
+    let mut backoff = INITIALIZATION_RETRY_BACKOFF;
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(InitializationPhaseError::Sqlite(error))
+                if error.sqlite_error_code() == Some(ErrorCode::DatabaseBusy) =>
+            {
+                let elapsed = started.elapsed();
+                if elapsed >= deadline {
+                    return Err(format!(
+                        "cache DB {phase} timed out after {elapsed:?}: {error}"
+                    ));
+                }
+                sleep(backoff.min(deadline.saturating_sub(elapsed)));
+                let elapsed = started.elapsed();
+                if elapsed >= deadline {
+                    return Err(format!(
+                        "cache DB {phase} timed out after {elapsed:?}: {error}"
+                    ));
+                }
+                backoff = backoff
+                    .saturating_mul(2)
+                    .min(INITIALIZATION_RETRY_MAX_BACKOFF);
+            }
+            Err(InitializationPhaseError::Sqlite(error)) => {
+                return Err(format!("cache DB {phase} SQLite error: {error}"));
+            }
+            Err(InitializationPhaseError::Verification(error)) => {
+                return Err(format!("cache DB {phase} verification failed: {error}"));
+            }
+        }
+    }
 }
 
 fn ensure_safe_cache_path(db_path: &Path) -> Result<()> {
@@ -169,6 +306,10 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
 }
 
 fn migrate_with_sql(conn: &mut Connection, migrations: &[&str]) -> Result<()> {
+    let user_version = cache_migration_version(conn)?;
+    if current_schema_fast_path(migrations, user_version) {
+        return Ok(());
+    }
     // Ordinary migrations keep FK enforcement enabled because their DELETEs rely on
     // cascades. Rebuilding an invalid schema needs it disabled, but SQLite cannot
     // change foreign_keys inside a transaction. The first locked pass makes no
@@ -225,6 +366,11 @@ fn migrate_with_sql_locked(
             "cache DB migration error: DatabaseTooFarAhead: user_version {user_version} exceeds {}",
             migrations.len()
         ));
+    }
+    if current_schema_fast_path(migrations, user_version) {
+        tx.commit()
+            .map_err(|err| format!("cache DB migration fast-path commit error: {err}"))?;
+        return Ok(LockedMigrationOutcome::Complete);
     }
 
     let user_version = match prepare_baseline_migration(&tx, user_version, rebuild_invalid_schema)?
@@ -442,6 +588,10 @@ fn current_schema_is_valid(conn: &Connection) -> Result<bool> {
     Ok(matches!(versions, Ok(versions) if versions == BASELINE_CACHE_STATE_VERSIONS))
 }
 
+fn current_schema_fast_path(migrations: &[&str], user_version: i64) -> bool {
+    migrations == CACHE_MIGRATION_SQL.as_slice() && user_version == CURRENT_MIGRATION_VERSION
+}
+
 fn quick_check_is_ok(conn: &Connection) -> Result<bool> {
     let result: String = conn
         .query_row("PRAGMA quick_check", [], |row| row.get(0))
@@ -580,6 +730,22 @@ mod tests {
                         if foreign_keys != 1 {
                             return Err("concurrent opener left foreign keys disabled".into());
                         }
+                        let journal_mode: String = conn
+                            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                            .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+                        if !journal_mode.eq_ignore_ascii_case("wal") {
+                            return Err(format!(
+                                "concurrent opener observed journal_mode={journal_mode}"
+                            ));
+                        }
+                        let auto_vacuum: i64 = conn
+                            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+                            .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+                        if auto_vacuum != 2 {
+                            return Err(format!(
+                                "concurrent opener observed auto_vacuum={auto_vacuum}"
+                            ));
+                        }
                         Ok(())
                     })
                 })
@@ -601,6 +767,106 @@ mod tests {
         );
         assert!(current_schema_is_valid(&conn).unwrap());
         assert!(quick_check_is_ok(&conn).unwrap());
+        assert_eq!(
+            conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .unwrap()
+                .to_ascii_lowercase(),
+            "wal"
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA auto_vacuum", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn populated_mode_zero_cache_keeps_compatible_auto_vacuum_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join(CACHE_DB_FILE_NAME);
+        let mut conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("CREATE TABLE existing(value TEXT) STRICT;")
+            .unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA auto_vacuum", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        configure_connection(&mut conn).unwrap();
+
+        assert_eq!(
+            conn.query_row("PRAGMA auto_vacuum", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "populated mode-0 databases require an explicit VACUUM and must not be reported as converted"
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .unwrap()
+                .to_ascii_lowercase(),
+            "wal"
+        );
+    }
+
+    fn sqlite_initialization_error(code: i32) -> InitializationPhaseError {
+        InitializationPhaseError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            None,
+        ))
+    }
+
+    #[test]
+    fn initialization_retry_retries_busy_but_not_locked() {
+        let mut busy_attempts = 0;
+        let value = retry_initialization_phase_with(
+            "test busy phase",
+            Duration::from_secs(1),
+            |_| {},
+            || {
+                busy_attempts += 1;
+                if busy_attempts < 3 {
+                    Err(sqlite_initialization_error(rusqlite::ffi::SQLITE_BUSY))
+                } else {
+                    Ok(42)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(busy_attempts, 3);
+
+        let mut locked_attempts = 0;
+        let error = retry_initialization_phase_with(
+            "test locked phase",
+            Duration::from_secs(1),
+            |_| {},
+            || {
+                locked_attempts += 1;
+                Err::<(), _>(sqlite_initialization_error(rusqlite::ffi::SQLITE_LOCKED))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(locked_attempts, 1);
+        assert!(error.contains("test locked phase SQLite error"), "{error}");
+        assert!(!error.contains("timed out"), "{error}");
+    }
+
+    #[test]
+    fn initialization_retry_reports_busy_deadline_without_sleeping() {
+        let mut attempts = 0;
+        let error = retry_initialization_phase_with(
+            "test timeout phase",
+            Duration::ZERO,
+            |_| panic!("zero-deadline retry must not sleep"),
+            || {
+                attempts += 1;
+                Err::<(), _>(sqlite_initialization_error(rusqlite::ffi::SQLITE_BUSY))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert!(error.contains("test timeout phase timed out"), "{error}");
     }
 
     #[test]
@@ -1010,6 +1276,7 @@ mod tests {
         let writer = blocker
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
+        migrate(&mut conn).expect("a valid current schema must not wait for the write lock");
         let migrations =
             future_migration_sql("CREATE TABLE migration_probe(value TEXT NOT NULL) STRICT;");
 
@@ -1067,7 +1334,7 @@ mod tests {
         let unified = cache_dir.join(CACHE_DB_FILE_NAME);
         let connection = open_unified_connection(&unified).unwrap();
 
-        assert!(unified_cache_initialized(&connection));
+        assert!(unified_cache_initialized(&connection).unwrap());
         for name in [LEGACY_SEMANTIC_DB_FILE_NAME, LEGACY_ANALYZER_DB_FILE_NAME] {
             assert!(!cache_dir.join(name).exists());
         }
