@@ -32,6 +32,7 @@ function fakeSession(overrides = {}) {
     toolCount: 3,
     capabilities: ["symbols", "query", "files"],
   };
+  let errorHandler = () => {};
   return {
     starts,
     applied,
@@ -46,6 +47,12 @@ function fakeSession(overrides = {}) {
     },
     async shutdown() {},
     status: () => status,
+    setErrorHandler(handler) {
+      errorHandler = handler;
+    },
+    reportError(message) {
+      errorHandler(message);
+    },
     setStatus(next) {
       status = next;
     },
@@ -89,6 +96,22 @@ test("restores workspace settings and injects only the short Pi namespace note",
 
   session.setStatus({ state: "disconnected", workspace: "/workspace", toolCount: 0, capabilities: [] });
   assert.equal(await pi.handlers.get("before_agent_start")({ systemPrompt: "base" }), undefined);
+});
+
+test("routes background session failures through Pi UI notifications", async () => {
+  const pi = fakePi();
+  const session = fakeSession();
+  configureBifrostExtension(pi, dependencies(session));
+  const notifications = [];
+  await pi.handlers.get("session_start")({}, {
+    cwd: "/workspace",
+    hasUI: true,
+    ui: { notify: (...args) => notifications.push(args) },
+  });
+
+  session.reportError("Bifrost connection failed.");
+
+  assert.deepEqual(notifications, [["Bifrost connection failed.", "error"]]);
 });
 
 test("/bifrost requires TUI mode", async () => {

@@ -119,7 +119,9 @@ optional. Do not add workspace lifecycle tools to this UI. Per-workspace
 selections live in independent hashed files under the Pi agent directory at
 `bifrost/workspaces/`, not in the analyzed repository. Separate files prevent
 concurrent Pi sessions for different workspaces from losing each other's
-settings.
+settings. Route extension failures through the current `ExtensionContext` with
+`ctx.ui.notify(..., "error")`; never use `console.log` or `console.error` from
+the Pi extension because direct terminal writes corrupt or displace TUI output.
 
 Release CI runs `npm ci`, `npm test`, and `npm run check` in
 `plugins/bifrost-agent`, then places the npm tarball in the GitHub release next

@@ -55,6 +55,7 @@ export interface BifrostSessionController {
   applySelection(capabilities: readonly BifrostCapability[]): Promise<boolean>;
   shutdown(): Promise<void>;
   status(): BifrostSessionStatus;
+  setErrorHandler(handler: (message: string) => void): void;
 }
 
 export function createBifrostSession(
@@ -62,6 +63,7 @@ export function createBifrostSession(
   dependencies: BifrostSessionDependencies = defaultDependencies(),
 ): BifrostSessionController {
   let generation = 0;
+  let reportError = dependencies.reportError;
   let state: ConnectionState = "disconnected";
   let workspace: string | undefined;
   let selectedCapabilities: BifrostCapability[] = [];
@@ -83,7 +85,7 @@ export function createBifrostSession(
       return existing;
     }
     const closing = client.close().catch((error: unknown) => {
-      dependencies.reportError(`Bifrost MCP cleanup failed: ${formatError(error)}`);
+      reportError(`Bifrost MCP cleanup failed: ${formatError(error)}`);
     });
     closePromises.set(client, closing);
     return closing;
@@ -209,7 +211,7 @@ export function createBifrostSession(
         reconcileActiveTools([], advertisedMcpToolNames);
         state = "error";
         lastError = "Bifrost MCP connection closed unexpectedly.";
-        dependencies.reportError(lastError);
+        reportError(lastError);
       });
       await client.connect();
       if (ticket !== generation) {
@@ -248,7 +250,7 @@ export function createBifrostSession(
           previousIsUsable ? selectedCapabilities : [],
           advertisedMcpToolNames,
         );
-        dependencies.reportError(lastError);
+        reportError(lastError);
       }
       return false;
     } finally {
@@ -305,6 +307,9 @@ export function createBifrostSession(
       capabilities: [...selectedCapabilities],
       ...(lastError ? { error: lastError } : {}),
     }),
+    setErrorHandler(handler) {
+      reportError = handler;
+    },
   };
 }
 
@@ -367,7 +372,7 @@ function defaultDependencies(): BifrostSessionDependencies {
   return {
     resolveLaunch: (root, toolset) => resolveBifrostLaunch({ root, env: process.env, toolset }),
     createClient: createSdkSessionClient,
-    reportError: (message) => console.error(message),
+    reportError: () => {},
   };
 }
 

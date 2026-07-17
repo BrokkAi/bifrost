@@ -16,7 +16,8 @@ The implementation must not alter Bifrost's Rust server, registry, or CLI. It co
 - [x] (2026-07-17 21:15Z) Added one Pi-local capability registry over the existing MCP toolsets, with symbols, query, and files enabled by default.
 - [x] (2026-07-17 21:25Z) Added transactional selection reconciliation and independent, atomic per-workspace persistence under Pi's agent directory.
 - [x] (2026-07-17 21:20Z) Replaced the status-only `/bifrost` command with a SettingsList TUI and added the concise namespace/workspace prompt clarification.
-- [x] (2026-07-17 21:31Z) Added focused namespace, activation, restart, race, rollback, persistence, prompt, and settings tests; all 55 Node tests pass.
+- [x] (2026-07-17 21:31Z) Added focused namespace, activation, restart, race, rollback, persistence, prompt, and settings tests.
+- [x] (2026-07-17 22:20Z) Replaced direct console error output with Pi-native `ctx.ui.notify(..., "error")` routing for startup, reconnect, cleanup, settings, and background connection failures; all 56 Node tests pass.
 - [x] (2026-07-17 21:31Z) Updated Pi package and maintainer documentation; package checks, clean install, manifest validation, npm audit, pack dry-run, and publish dry-run pass.
 - [x] (2026-07-17 21:50Z) Reproduced startup in a real interactive Pi session through Herdr, captured and corrected stale release archive hashes, then verified clean startup and the live `/bifrost` SettingsList with the expected defaults.
 
@@ -33,6 +34,9 @@ The implementation must not alter Bifrost's Rust server, registry, or CLI. It co
 
 - Observation: The committed 0.8.4 release metadata predated the final GitHub release assets, so first-run installation rejected the current checksum sidecars.
   Evidence: Interactive Pi reported expected Linux x86_64 hash `4248c1...` but sidecar hash `59a34f...`. All five GitHub sidecars differed from the metadata. The Linux archive itself hashes to `59a34fb3dadb74868a63e48eceebe799ab8dfc7247220deeea7b298966709eca`; updating all release projections removed the startup error.
+
+- Observation: Writing extension failures with `console.error` prints directly into Pi's managed terminal surface and can flash or displace the editor before startup rendering settles.
+  Evidence: Pi's extension documentation uses `ctx.ui.notify(message, "error")` for user-visible failures and `ctx.ui.setStatus` for persistent footer state. The extension now installs an error handler bound to the current `ExtensionContext`; no console calls remain under `plugins/bifrost-agent/extensions`.
 
 ## Decision Log
 
@@ -132,3 +136,5 @@ Revision note (2026-07-17 21:23Z): Recorded review-driven lifecycle and persiste
 Revision note (2026-07-17 21:31Z): Marked implementation and automated validation complete after 55 passing tests and a no-blocker final review cycle.
 
 Revision note (2026-07-17 21:50Z): Added real interactive Pi evidence after reproducing a transient startup failure through Herdr. Recorded and fixed stale 0.8.4 archive hashes across Pi/Amp release metadata and the VS Code manifest; clean startup and `/bifrost` rendering then succeeded.
+
+Revision note (2026-07-17 22:20Z): Corrected extension error presentation after reviewing Pi's current extension UI guidance. Session errors now flow through the active context's native error notifications instead of direct console writes.

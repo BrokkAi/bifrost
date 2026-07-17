@@ -129,8 +129,10 @@ Changing a capability may restart the Bifrost child when it requires another
 existing MCP server toolset. Tools discovered earlier remain registered with Pi
 but are removed from Pi's active tool set when disabled. Semantic search can be
 enabled only when the selected Bifrost binary advertises it for the current Git
-workspace and accelerator environment. A failed change leaves the prior
-connection and saved selection active.
+workspace and accelerator environment. A failed change leaves the prior connection and saved selection active. In
+interactive Pi, startup, reconnect, and background connection failures use
+Pi's error notifications; the extension does not write directly into the TUI
+with `console.log` or `console.error`.
 
 Tool calls time out after 300 seconds; startup times out after 60 seconds.
 Cancellation stops the Pi request promptly, though the current Bifrost stdio

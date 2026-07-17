@@ -38,8 +38,18 @@ export function configureBifrostExtension(
   dependencies: BifrostExtensionDependencies,
 ): void {
   const session = dependencies.createSession(pi);
+  let uiContext: {
+    hasUI: boolean;
+    ui: { notify(message: string, level: "error"): void };
+  } | undefined;
+  session.setErrorHandler((message) => {
+    if (uiContext?.hasUI) {
+      uiContext.ui.notify(message, "error");
+    }
+  });
 
   pi.on("session_start", async (_event, ctx) => {
+    uiContext = ctx;
     let capabilities: readonly BifrostCapability[] = DEFAULT_BIFROST_CAPABILITIES;
     try {
       capabilities = await dependencies.settingsStore.load(ctx.cwd) ?? DEFAULT_BIFROST_CAPABILITIES;
@@ -51,6 +61,7 @@ export function configureBifrostExtension(
 
   pi.on("session_shutdown", async () => {
     await session.shutdown();
+    uiContext = undefined;
   });
 
   pi.on("before_agent_start", async (event) => {
@@ -185,8 +196,6 @@ function reportUiError(
 ): void {
   if (ctx.hasUI) {
     ctx.ui.notify(message, "error");
-  } else {
-    console.error(message);
   }
 }
 
