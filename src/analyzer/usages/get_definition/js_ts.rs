@@ -399,7 +399,7 @@ pub(super) fn resolve_js_ts(
                 exported_name,
                 analyzer,
                 support,
-                Some(&aliases),
+                Some(aliases),
                 value_position,
             );
         }
