@@ -327,6 +327,7 @@ struct DefinitionBatchContext<'a> {
     analyzer: &'a dyn IAnalyzer,
     bounded_support: AnalyzerDefinitionLookup<'a>,
     rust_support: Option<rust::AnalyzerRustDefinitionProvider<'a>>,
+    rust_type_cache: RustTypeLookupCache,
     sources: HashMap<ProjectFile, Result<Arc<String>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
     line_starts: HashMap<ProjectFile, Arc<Vec<usize>>>,
@@ -352,6 +353,7 @@ impl<'a> DefinitionBatchContext<'a> {
             bounded_support: AnalyzerDefinitionLookup::new(analyzer, Language::None),
             rust_support: resolve_analyzer::<RustAnalyzer>(analyzer)
                 .map(|rust| rust::AnalyzerRustDefinitionProvider::new(rust, cache_rust_lookups)),
+            rust_type_cache: RustTypeLookupCache::default(),
             sources: HashMap::default(),
             trees: HashMap::default(),
             line_starts: HashMap::default(),
@@ -596,19 +598,24 @@ fn resolve_one(
     }
     let _dispatch_scope = profiling::scope("get_definition::language_dispatch");
     let resolved = match language {
-        Language::Rust => context.rust_support.as_ref().map_or_else(
-            || no_definition("rust_analyzer_unavailable", "Rust analyzer is unavailable"),
-            |support| {
-                rust::resolve_rust(
-                    analyzer,
-                    support,
-                    &request.file,
-                    &source,
-                    tree.as_ref(),
-                    &site,
-                )
-            },
-        ),
+        Language::Rust => {
+            let (rust_support, rust_type_cache) =
+                (&context.rust_support, &mut context.rust_type_cache);
+            rust_support.as_ref().map_or_else(
+                || no_definition("rust_analyzer_unavailable", "Rust analyzer is unavailable"),
+                |support| {
+                    rust::resolve_rust(
+                        analyzer,
+                        support,
+                        &request.file,
+                        &source,
+                        tree.as_ref(),
+                        &site,
+                        rust_type_cache,
+                    )
+                },
+            )
+        }
         Language::JavaScript | Language::TypeScript => js_ts::resolve_js_ts(
             analyzer,
             context.bounded_support(),
@@ -965,6 +972,43 @@ mod tests {
         );
         assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
         assert!(context.python_contexts.is_empty());
+    }
+
+    #[test]
+    fn rust_batch_context_reuses_parsed_declaration_source_for_repeated_field_lookups() {
+        let source = "struct Inner { value: i32 }\nstruct Outer { inner: Inner }\nfn first(outer: Outer) -> i32 { outer.inner.value }\nfn second(outer: Outer) -> i32 { outer.inner.value }\n";
+        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
+        let analyzer = fixture.analyzer.analyzer();
+        let mut context = DefinitionBatchContext::new(analyzer, true);
+        let requests = source
+            .match_indices("value")
+            .skip(1)
+            .map(|(start_byte, reference)| DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(start_byte),
+                end_byte: Some(start_byte + reference.len()),
+            })
+            .collect();
+
+        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None);
+
+        assert!(outcomes.iter().all(|outcome| {
+            outcome.status == DefinitionLookupStatus::Resolved
+                && outcome
+                    .definitions
+                    .iter()
+                    .any(|unit| unit.fq_name() == "Inner.value")
+        }));
+        assert_eq!(
+            context
+                .rust_type_cache
+                .parsed_declaration_source_count_for_test(),
+            1,
+            "one definition batch should parse each Rust declaration source once"
+        );
     }
 
     #[test]

@@ -686,6 +686,9 @@ fn handle_request(
     if req.method == RunRqlQuery::METHOD {
         return handle_run_rql_query_request(connection, state, req);
     }
+    if req.method == SemanticTokensFullRequest::METHOD {
+        return handle_semantic_tokens_request(connection, state, req);
+    }
 
     let id = req.id.clone();
     let id_for_log = format!("{id:?}");
@@ -775,15 +778,6 @@ fn handle_request(
         DocumentHighlightRequest::METHOD => {
             decode_and_run::<DocumentHighlightRequest, _>(req, |params| {
                 Ok(document_highlight::handle(
-                    &state.workspace,
-                    state.project(),
-                    &params,
-                ))
-            })
-        }
-        SemanticTokensFullRequest::METHOD => {
-            decode_and_run::<SemanticTokensFullRequest, _>(req, |params| {
-                Ok(semantic_tokens::handle(
                     &state.workspace,
                     state.project(),
                     &params,
@@ -1057,6 +1051,143 @@ fn run_rql_query_result(
             })
             .collect(),
     }
+}
+
+fn handle_semantic_tokens_request(
+    connection: &Connection,
+    state: &ServerState,
+    req: Request,
+) -> Result<(), String> {
+    let id = req.id.clone();
+    let method = req.method.clone();
+    let params =
+        match req.extract::<lsp_types::SemanticTokensParams>(SemanticTokensFullRequest::METHOD) {
+            Ok((_, params)) => params,
+            Err(ExtractError::JsonError { error, .. }) => {
+                let response = Response::new_err(
+                    id,
+                    ErrorCode::InvalidParams as i32,
+                    format!("Failed to decode params for {method}: {error}"),
+                );
+                return connection
+                    .sender
+                    .send(Message::Response(response))
+                    .map_err(|err| format!("Failed to send LSP response: {err}"));
+            }
+            Err(ExtractError::MethodMismatch(_)) => {
+                let response = Response::new_err(
+                    id,
+                    ErrorCode::MethodNotFound as i32,
+                    format!("Method not implemented: {method}"),
+                );
+                return connection
+                    .sender
+                    .send(Message::Response(response))
+                    .map_err(|err| format!("Failed to send LSP response: {err}"));
+            }
+        };
+    let Some(slot) = state.request_jobs.try_acquire() else {
+        let response = Response::new_err(
+            id,
+            ErrorCode::ServerCancelled as i32,
+            "too many concurrent cancellable requests".to_string(),
+        );
+        return connection
+            .sender
+            .send(Message::Response(response))
+            .map_err(|err| format!("Failed to send LSP response: {err}"));
+    };
+    let Some(active_request) = state.active_request_ids.try_reserve(id.clone()) else {
+        let response = Response::new_err(
+            id,
+            ErrorCode::InvalidRequest as i32,
+            "request id is already active".to_string(),
+        );
+        return connection
+            .sender
+            .send(Message::Response(response))
+            .map_err(|err| format!("Failed to send LSP response: {err}"));
+    };
+    let cancellation = CancellationToken::default();
+    if !state.request_jobs.reserve(id.clone(), cancellation.clone()) {
+        let response = Response::new_err(
+            id,
+            ErrorCode::InvalidRequest as i32,
+            "request id is already active".to_string(),
+        );
+        return connection
+            .sender
+            .send(Message::Response(response))
+            .map_err(|err| format!("Failed to send LSP response: {err}"));
+    }
+
+    let worker_cancellation = cancellation.clone();
+    let project = Arc::new(state.overlay.snapshot());
+    let workspace = state
+        .workspace
+        .clone_with_project(Arc::clone(&project) as Arc<dyn Project>);
+    let sender = connection.sender.clone();
+    let worker_id = id.clone();
+    let worker_method = method.clone();
+    let context = RequestContext::new(
+        worker_cancellation.clone(),
+        None,
+        "Computing semantic tokens",
+        "Resolving symbols",
+        Arc::new(|_| Ok(())),
+    );
+    let handle = match thread::Builder::new()
+        .name("bifrost-lsp-semantic-tokens".to_string())
+        .spawn(move || {
+            let _query_scope = AnalyzerQueryScope::new(workspace.analyzer());
+            context.begin();
+            let response = finish_cancellable_request(
+                &worker_id,
+                &worker_method,
+                &context,
+                &worker_cancellation,
+                "semantic token request cancelled by client",
+                "Semantic tokens ready",
+                || {
+                    semantic_tokens::handle(
+                        &workspace,
+                        project.as_ref(),
+                        &params,
+                        &worker_cancellation,
+                    )
+                },
+            );
+            if let Some(error) = response.error.as_ref() {
+                eprintln!(
+                    "[bifrost-lsp] request error method={} id={:?} code={} message={}",
+                    worker_method, worker_id, error.code, error.message
+                );
+            }
+            if let Err(err) = sender.send(Message::Response(response)) {
+                eprintln!(
+                    "[bifrost-lsp] failed to send semantic-token response method={} id={:?}: {err}",
+                    worker_method, worker_id
+                );
+            }
+            drop(active_request);
+            drop(slot);
+        }) {
+        Ok(handle) => handle,
+        Err(err) => {
+            state.request_jobs.remove(&id);
+            let response = Response::new_err(
+                id,
+                ErrorCode::InternalError as i32,
+                format!("Failed to start semantic-token worker: {err}"),
+            );
+            return connection
+                .sender
+                .send(Message::Response(response))
+                .map_err(|send_err| format!("Failed to send LSP response: {send_err}"));
+        }
+    };
+    state.request_jobs.start(&id, handle);
+    Ok(())
 }
 
 fn handle_references_request(

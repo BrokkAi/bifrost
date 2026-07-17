@@ -76,11 +76,11 @@ pub(super) fn resolve_rust(
     source: &str,
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
+    cache: &mut RustTypeLookupCache,
 ) -> DefinitionLookupOutcome {
     let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
         return no_definition("rust_analyzer_unavailable", "Rust analyzer is unavailable");
     };
-    let mut cache = RustTypeLookupCache::default();
     let reference = site.text.as_str();
     if let Some(tree) = tree
         && let Some(outcome) =
@@ -119,7 +119,7 @@ pub(super) fn resolve_rust(
     if reference.contains('.')
         && let Some(tree) = tree
         && let Some(outcome) =
-            resolve_rust_field(analyzer, support, file, source, tree, site, &mut cache)
+            resolve_rust_field(analyzer, support, file, source, tree, site, cache)
     {
         return outcome;
     }
@@ -1147,6 +1147,11 @@ impl RustTypeLookupCache {
                 Some(RustParsedDeclarationSource { source, tree })
             })
             .as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parsed_declaration_source_count_for_test(&self) -> usize {
+        self.declarations.len()
     }
 }
 

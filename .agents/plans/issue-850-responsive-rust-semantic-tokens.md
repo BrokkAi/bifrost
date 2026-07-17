@@ -9,9 +9,9 @@ VS Code asks the Bifrost language server for semantic tokens to colour declarati
 ## Progress
 
 - [x] (2026-07-17 00:00Z) Fetched `origin`, inspected issue #850, current branch state, and the semantic-token, Rust resolution, query-cache, and LSP worker code paths.
-- [ ] Extend the analyzer query cache so one active query computes the complete live analyzed-file list at most once.
-- [ ] Share `RustTypeLookupCache` through a complete definition lookup batch and add a regression test for repeated Rust field resolution.
-- [ ] Run semantic tokens in the cancellable LSP worker path, add behavioural coverage for concurrent Rune IR/cancellation, and validate formatting, clippy, and focused tests.
+- [x] (2026-07-17 00:00Z) Extend the analyzer query cache so one active query computes the complete live analyzed-file list at most once.
+- [x] (2026-07-17 00:00Z) Share `RustTypeLookupCache` through a complete definition lookup batch and add a regression test for repeated nested Rust field resolution.
+- [ ] Run semantic tokens in the cancellable LSP worker path (completed: worker and cancellation plumbing; remaining: behavioural coverage for concurrent Rune IR/cancellation and full validation).
 
 ## Surprises & Discoveries
 
@@ -21,6 +21,8 @@ VS Code asks the Bifrost language server for semantic tokens to colour declarati
   Evidence: `src/lsp/handlers/semantic_tokens.rs` calls `resolve_definition_batch_with_source`; `src/analyzer/usages/get_definition/rust.rs::resolve_rust` constructs `RustTypeLookupCache::default()` locally.
 - Observation: The LSP already has a bounded, cancellable worker mechanism used by references and RQL queries.
   Evidence: `src/lsp/server.rs` owns `RequestJobs`, receives `$/cancelRequest`, snapshots the overlay, and runs workers with a cloned `WorkspaceAnalyzer`.
+- Observation: The machine cannot link the Python-enabled test build because its Python symbols are unavailable to the linker.
+  Evidence: `cargo test --features nlp,python ...` reaches Rust compilation, then fails with unresolved `_Py*` symbols from `pyo3` during dynamic-library linking.
 
 ## Decision Log
 
@@ -36,7 +38,7 @@ VS Code asks the Bifrost language server for semantic tokens to colour declarati
 
 ## Outcomes & Retrospective
 
-Implementation has not started. The expected outcome is that semantic token correctness is unchanged while repeated workspace validation is eliminated within a request and other LSP requests remain responsive.
+The request-local live-file cache, batch-local Rust declaration cache, and cancellable semantic-token worker are implemented. Remaining work is focused behavioural coverage and validation. The expected outcome is that semantic token correctness is unchanged while repeated workspace validation is eliminated within a request and other LSP requests remain responsive.
 
 ## Context and Orientation
 
@@ -106,4 +108,4 @@ The Rust resolver in `src/analyzer/usages/get_definition/rust.rs` must accept th
 
 The semantic token handler must accept `&CancellationToken` and return a cancellation-aware result. The LSP server must use its existing `RequestJobs`, `ActiveRequestIds`, `WorkspaceAnalyzer::clone_with_project`, `RequestContext`, and `finish_cancellable_request` interfaces; no new runtime or thread pool dependency is needed.
 
-Plan created on 2026-07-17 after diagnosing issue #850; it records the existing cache and worker architecture so implementation can resume from this file alone.
+Plan created on 2026-07-17 after diagnosing issue #850; updated after implementing the two caches and worker plumbing, with the local Python-linker limitation recorded for a future validation rerun.

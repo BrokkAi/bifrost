@@ -556,6 +556,7 @@ type SummaryFileProjectionCache = BoundedFileCache<SummaryFileProjection>;
 struct QueryReadCache {
     contexts: Vec<Arc<crate::analyzer::AnalyzerQueryContext>>,
     live_oids: HashMap<ProjectFile, Option<Oid>>,
+    analyzed_live_files: Option<Vec<ProjectFile>>,
     file_states: HashMap<FileStateCacheKey, Arc<FileState>>,
     prepared_syntax: HashMap<FileStateCacheKey, Arc<OnceLock<Option<Arc<PreparedSyntaxTree>>>>>,
 }
@@ -576,6 +577,7 @@ impl QueryReadCache {
     fn begin(&mut self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         if self.contexts.is_empty() {
             self.live_oids.clear();
+            self.analyzed_live_files = None;
             self.file_states.clear();
             self.prepared_syntax.clear();
         }
@@ -592,6 +594,7 @@ impl QueryReadCache {
         self.contexts.retain(|active| !Arc::ptr_eq(active, context));
         if self.contexts.is_empty() {
             self.live_oids.clear();
+            self.analyzed_live_files = None;
             self.file_states.clear();
             self.prepared_syntax.clear();
         }
@@ -599,6 +602,18 @@ impl QueryReadCache {
 
     fn is_active(&self) -> bool {
         !self.contexts.is_empty()
+    }
+
+    fn analyzed_live_files(&self) -> Option<Vec<ProjectFile>> {
+        self.is_active()
+            .then(|| self.analyzed_live_files.clone())
+            .flatten()
+    }
+
+    fn retain_analyzed_live_files(&mut self, files: Vec<ProjectFile>) {
+        if self.is_active() {
+            self.analyzed_live_files = Some(files);
+        }
     }
 
     fn file_state(&self, key: &FileStateCacheKey) -> Option<Arc<FileState>> {
@@ -3027,6 +3042,14 @@ where
     }
 
     fn analyzed_live_files(&self) -> Vec<ProjectFile> {
+        if let Some(files) = self
+            .query_read_cache
+            .lock()
+            .expect("query read cache mutex poisoned")
+            .analyzed_live_files()
+        {
+            return files;
+        }
         let snapshot = self.live_snapshot();
         let mut files = Vec::new();
         let mut persisted_candidates = Vec::new();
@@ -3069,6 +3092,10 @@ where
         }
         files.sort();
         files.dedup();
+        self.query_read_cache
+            .lock()
+            .expect("query read cache mutex poisoned")
+            .retain_analyzed_live_files(files.clone());
         files
     }
 
@@ -6925,6 +6952,24 @@ mod tests {
             "a new file must be prepared without retention at capacity"
         );
         assert_eq!(cache.prepared_syntax.len(), 1);
+    }
+
+    #[test]
+    fn query_read_cache_reuses_analyzed_live_files_until_the_outer_scope_ends() {
+        let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        let mut cache = QueryReadCache::default();
+        let files = vec![ProjectFile::new("/workspace", "src/lib.rs")];
+
+        cache.begin(&context);
+        assert!(cache.analyzed_live_files().is_none());
+        cache.retain_analyzed_live_files(files.clone());
+        assert_eq!(cache.analyzed_live_files(), Some(files));
+
+        cache.end(&context);
+        assert!(
+            cache.analyzed_live_files().is_none(),
+            "a later analyzer request must validate its own live-file snapshot"
+        );
     }
 
     #[test]
