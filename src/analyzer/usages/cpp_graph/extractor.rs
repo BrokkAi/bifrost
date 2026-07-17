@@ -537,7 +537,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     if ctx
         .visibility
-        .parser_alias_resolves_to_type(ctx.file, text, &ctx.spec.target)
+        .parser_alias_resolves_to_type(ctx.analyzer, ctx.file, text, &ctx.spec.target)
     {
         *ctx.raw_match_count += 1;
         push_type_hit(hit_node, ctx);

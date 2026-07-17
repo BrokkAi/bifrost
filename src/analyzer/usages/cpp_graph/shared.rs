@@ -94,6 +94,19 @@ impl<'a> CppAuthoritativeUsageBatch<'a> {
             &self.visibility,
         )
     }
+
+    #[cfg(test)]
+    pub(crate) fn alias_visible_source_files_for_test(
+        &self,
+        file: &ProjectFile,
+    ) -> HashSet<ProjectFile> {
+        self.visibility.visible_source_files_for_test(file)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn alias_source_parse_count_for_test(&self, file: &ProjectFile) -> usize {
+        self.visibility.alias_source_parse_count_for_test(file)
+    }
 }
 
 impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {

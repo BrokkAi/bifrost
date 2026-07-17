@@ -1786,6 +1786,185 @@ mod tests {
     }
 
     #[test]
+    fn cpp_alias_index_initializes_only_sources_visible_to_each_authoritative_root() {
+        const UNRELATED_ALIAS_COUNT: usize = 24;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        fs::create_dir(root.join("other")).expect("create unrelated alias directory");
+        fs::write(
+            root.join("target.h"),
+            "namespace canonical { template <typename T> struct Target {}; }\n",
+        )
+        .expect("write target");
+        fs::write(
+            root.join("declaration_free.h"),
+            "#pragma once\n// Transitively visible without analyzer declarations.\n",
+        )
+        .expect("write declaration-free include");
+        fs::write(
+            root.join("consumer_alias.h"),
+            "#include \"declaration_free.h\"\n#include \"target.h\"\nnamespace demo { template <typename T> using ConsumerAlias = canonical::Target<T>; }\n",
+        )
+        .expect("write consumer alias");
+        fs::write(
+            root.join("consumer.cpp"),
+            "#include \"consumer_alias.h\"\nvoid consume() { canonical::Target<int> exact; MissingType<int> ignored; }\n",
+        )
+        .expect("write consumer");
+
+        let mut second_root = String::new();
+        for index in 0..UNRELATED_ALIAS_COUNT {
+            let header = format!("other/alias_{index}.h");
+            fs::write(
+                root.join(&header),
+                format!(
+                    "#include \"../target.h\"\nnamespace other{index} {{ template <typename T> using Alias{index} = canonical::Target<T>; }}\n"
+                ),
+            )
+            .expect("write unrelated alias");
+            second_root.push_str(&format!("#include \"{header}\"\n"));
+        }
+        second_root.push_str(
+            "void consume_other() { canonical::Target<int> exact; MissingOther<int> ignored; }\n",
+        );
+        fs::write(root.join("second_root.cpp"), second_root).expect("write second root");
+
+        let project = Arc::new(TestProject::new(&root, Language::Cpp));
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
+        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+        let targets = cpp.get_definitions("canonical.Target");
+        assert_eq!(targets.len(), 1, "one canonical target: {targets:#?}");
+        let consumer = ProjectFile::new(&root, "consumer.cpp");
+        let second = ProjectFile::new(&root, "second_root.cpp");
+        let consumer_files = HashSet::from_iter([consumer.clone()]);
+        let second_files = HashSet::from_iter([second.clone()]);
+        let roots = HashSet::from_iter([consumer.clone(), second.clone()]);
+        let batch = CppAuthoritativeUsageBatch::new(workspace.analyzer(), &roots)
+            .expect("union authoritative batch");
+
+        let assert_exact_type_hit = |result: FuzzyResult, expected_file: &ProjectFile| {
+            let FuzzyResult::Success {
+                unproven_total_by_overload,
+                ..
+            } = &result
+            else {
+                panic!("type query must resolve successfully: {result:#?}");
+            };
+            assert_eq!(
+                unproven_total_by_overload.values().sum::<usize>(),
+                0,
+                "type query must remain fully proven: {result:#?}"
+            );
+            let hits = result.all_hits_including_imports();
+            assert_eq!(hits.len(), 1, "one exact type hit: {result:#?}");
+            assert_eq!(
+                &hits.first().expect("exact type hit").file,
+                expected_file,
+                "{result:#?}"
+            );
+        };
+
+        let consumer_result = batch
+            .find_usages(&targets, &consumer_files, 1000)
+            .into_fuzzy_result();
+        assert_exact_type_hit(consumer_result, &consumer);
+        let consumer_visible = batch.alias_visible_source_files_for_test(&consumer);
+        let declaration_free = ProjectFile::new(&root, "declaration_free.h");
+        assert!(
+            consumer_visible.contains(&declaration_free),
+            "exact include closure must retain declaration-free transitive sources: {consumer_visible:?}"
+        );
+        assert!(
+            consumer_visible
+                .iter()
+                .all(|file| { batch.alias_source_parse_count_for_test(file) == 1 }),
+            "each consumer-visible source must initialize exactly once: {:?}",
+            consumer_visible
+                .iter()
+                .map(|file| (
+                    file.rel_path().to_path_buf(),
+                    batch.alias_source_parse_count_for_test(file)
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            cpp.prepared_syntax_parse_count_for_test(&consumer),
+            1,
+            "alias fallback must reuse the consumer syntax prepared by the active scan query"
+        );
+        let second_visible = batch.alias_visible_source_files_for_test(&second);
+        let prematurely_initialized: Vec<_> = second_visible
+            .difference(&consumer_visible)
+            .filter_map(|file| {
+                let count = batch.alias_source_parse_count_for_test(file);
+                (count != 0).then(|| (file.rel_path().to_path_buf(), count))
+            })
+            .collect();
+        assert!(
+            prematurely_initialized.is_empty(),
+            "the consumer query must not initialize alias sources visible only from the other authoritative root: {prematurely_initialized:?}"
+        );
+
+        let second_result = batch
+            .find_usages(&targets, &second_files, 1000)
+            .into_fuzzy_result();
+        assert_exact_type_hit(second_result, &second);
+        assert!(
+            second_visible
+                .iter()
+                .all(|file| { batch.alias_source_parse_count_for_test(file) == 1 }),
+            "the second root's visible sources must initialize once on demand"
+        );
+        let counts_after_both: HashMap<_, _> = roots
+            .iter()
+            .chain(consumer_visible.iter())
+            .chain(second_visible.iter())
+            .map(|file| (file.clone(), batch.alias_source_parse_count_for_test(file)))
+            .collect();
+        let repeated = batch
+            .find_usages(&targets, &second_files, 1000)
+            .into_fuzzy_result();
+        assert_exact_type_hit(repeated, &second);
+        assert_eq!(
+            counts_after_both,
+            counts_after_both
+                .keys()
+                .map(|file| { (file.clone(), batch.alias_source_parse_count_for_test(file),) })
+                .collect(),
+            "repeated alias queries must reuse initialized per-source entries"
+        );
+
+        let concurrent_batch = CppAuthoritativeUsageBatch::new(
+            workspace.analyzer(),
+            &HashSet::from_iter([consumer.clone()]),
+        )
+        .expect("concurrent single-root batch");
+        let concurrent_results = std::thread::scope(|scope| {
+            (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        concurrent_batch
+                            .find_usages(&targets, &consumer_files, 1000)
+                            .into_fuzzy_result()
+                    })
+                })
+                .map(|handle| handle.join().expect("concurrent type query"))
+                .collect::<Vec<_>>()
+        });
+        for result in concurrent_results {
+            assert_exact_type_hit(result, &consumer);
+        }
+        assert!(
+            concurrent_batch
+                .alias_visible_source_files_for_test(&consumer)
+                .iter()
+                .all(|file| concurrent_batch.alias_source_parse_count_for_test(file) == 1),
+            "concurrent same-file queries must share one initialization"
+        );
+    }
+
+    #[test]
     fn cpp_union_visibility_preserves_each_groups_authoritative_roots() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");

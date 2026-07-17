@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 use std::hash::Hash;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use tree_sitter::{Node, Parser};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -468,11 +468,15 @@ impl CppScanBinding {
     }
 }
 
+type AliasCell = Arc<OnceLock<Box<[CppAlias]>>>;
+
 pub(in crate::analyzer::usages) struct VisibilityIndex {
     pub(super) visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
     visible_by_identifier: HashMap<ProjectFile, HashMap<String, Vec<CodeUnit>>>,
-    alias_source_files: HashSet<ProjectFile>,
-    aliases_by_file: OnceLock<HashMap<ProjectFile, Vec<CppAlias>>>,
+    visible_source_files_by_root: HashMap<ProjectFile, HashSet<ProjectFile>>,
+    alias_cells: Mutex<HashMap<ProjectFile, AliasCell>>,
+    #[cfg(test)]
+    alias_source_parse_counts: Mutex<HashMap<ProjectFile, usize>>,
     field_type_facts: Mutex<HashMap<CodeUnit, Option<DeclaredFieldTypeFact>>>,
     structured_alias_targets: Mutex<HashMap<CodeUnit, Option<StructuredAliasTarget>>>,
     #[cfg(test)]
@@ -518,7 +522,10 @@ impl VisibilityIndex {
         cancellation: Option<&CancellationToken>,
     ) -> Self {
         let include_targets = cpp.include_target_index();
-        let (include_graph, visible_by_file) = build_visibility_data(
+        let VisibilityData {
+            visible_by_file,
+            visible_source_files_by_root,
+        } = build_visibility_data(
             roots,
             cancellation,
             |file| {
@@ -536,8 +543,10 @@ impl VisibilityIndex {
         Self {
             visible_by_file,
             visible_by_identifier,
-            alias_source_files: include_graph.into_files(),
-            aliases_by_file: OnceLock::new(),
+            visible_source_files_by_root,
+            alias_cells: Mutex::new(HashMap::default()),
+            #[cfg(test)]
+            alias_source_parse_counts: Mutex::new(HashMap::default()),
             field_type_facts: Mutex::new(HashMap::default()),
             structured_alias_targets: Mutex::new(HashMap::default()),
             #[cfg(test)]
@@ -807,7 +816,7 @@ impl VisibilityIndex {
         };
         let candidates = self.type_candidates(file, &normalized);
         if candidates.is_empty() {
-            return self.parser_alias_resolves_to_type(file, raw_name, target);
+            return self.parser_alias_resolves_to_type(analyzer, file, raw_name, target);
         }
         let mut canonical_candidates = Vec::new();
         for candidate in candidates {
@@ -856,6 +865,7 @@ impl VisibilityIndex {
 
     pub(super) fn parser_alias_resolves_to_type(
         &self,
+        analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
         raw_name: &str,
         target: &CodeUnit,
@@ -863,27 +873,65 @@ impl VisibilityIndex {
         let Some(alias_name) = normalize_reference_name(raw_name) else {
             return false;
         };
-        let aliases_by_file = self
-            .aliases_by_file
-            .get_or_init(|| build_alias_index(&self.alias_source_files));
-        self.visible_source_files(file)
-            .into_iter()
-            .any(|source_file| {
-                aliases_by_file.get(&source_file).is_some_and(|aliases| {
-                    aliases.iter().any(|alias| {
-                        alias.name == alias_name && alias_target_matches_target(alias, target)
-                    })
-                })
-            })
+        let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) else {
+            return false;
+        };
+        let matches_file = |source_file: &ProjectFile| {
+            self.file_alias_matches(cpp, source_file, &alias_name, target)
+        };
+        self.visible_source_files_by_root.get(file).map_or_else(
+            || matches_file(file),
+            |files| files.iter().any(matches_file),
+        )
     }
 
-    pub(super) fn visible_source_files(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
-        let mut files = HashSet::default();
-        files.insert(file.clone());
-        if let Some(visible) = self.visible_by_file.get(file) {
-            files.extend(visible.iter().map(|unit| unit.source().clone()));
-        }
-        files
+    fn file_alias_matches(
+        &self,
+        cpp: &CppAnalyzer,
+        file: &ProjectFile,
+        alias_name: &str,
+        target: &CodeUnit,
+    ) -> bool {
+        let cell = {
+            let mut cells = self.alias_cells.lock().expect("alias cell map lock");
+            Arc::clone(
+                cells
+                    .entry(file.clone())
+                    .or_insert_with(|| Arc::new(OnceLock::new())),
+            )
+        };
+        cell.get_or_init(|| {
+            #[cfg(test)]
+            {
+                *self
+                    .alias_source_parse_counts
+                    .lock()
+                    .expect("alias source parse count lock")
+                    .entry(file.clone())
+                    .or_default() += 1;
+            }
+            aliases_from_prepared_source(cpp, file).into_boxed_slice()
+        })
+        .iter()
+        .any(|alias| alias.name == alias_name && alias_target_matches_target(alias, target))
+    }
+
+    #[cfg(test)]
+    pub(super) fn visible_source_files_for_test(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
+        self.visible_source_files_by_root
+            .get(file)
+            .cloned()
+            .unwrap_or_else(|| HashSet::from_iter([file.clone()]))
+    }
+
+    #[cfg(test)]
+    pub(super) fn alias_source_parse_count_for_test(&self, file: &ProjectFile) -> usize {
+        self.alias_source_parse_counts
+            .lock()
+            .expect("alias source parse count lock")
+            .get(file)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub(in crate::analyzer::usages) fn resolve_named(
@@ -1188,10 +1236,6 @@ impl IncludeGraph {
         self.targets_by_file.keys()
     }
 
-    fn into_files(self) -> HashSet<ProjectFile> {
-        self.targets_by_file.into_keys().collect()
-    }
-
     fn targets(&self, file: &ProjectFile) -> &[ProjectFile] {
         self.targets_by_file
             .get(file)
@@ -1200,12 +1244,17 @@ impl IncludeGraph {
     }
 }
 
+struct VisibilityData {
+    visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
+    visible_source_files_by_root: HashMap<ProjectFile, HashSet<ProjectFile>>,
+}
+
 fn build_visibility_data<F, D>(
     roots: &HashSet<ProjectFile>,
     cancellation: Option<&CancellationToken>,
     mut targets_for: F,
     mut declarations_for: D,
-) -> (IncludeGraph, HashMap<ProjectFile, HashSet<CodeUnit>>)
+) -> VisibilityData
 where
     F: FnMut(&ProjectFile) -> Vec<ProjectFile>,
     D: FnMut(&ProjectFile) -> BTreeSet<CodeUnit>,
@@ -1223,6 +1272,7 @@ where
         .map(|file| (file.clone(), declarations_for(file)))
         .collect();
     let mut visible_by_file = HashMap::default();
+    let mut visible_source_files_by_root = HashMap::default();
     for file in roots {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             break;
@@ -1238,8 +1288,12 @@ where
             cancellation,
         );
         visible_by_file.insert(file.clone(), visible);
+        visible_source_files_by_root.insert(file.clone(), visited);
     }
-    (include_graph, visible_by_file)
+    VisibilityData {
+        visible_by_file,
+        visible_source_files_by_root,
+    }
 }
 
 pub(super) enum VisibleMemberResolution {
@@ -1605,48 +1659,35 @@ fn unanimous_return_binding(
     resolved_return
 }
 
-fn build_alias_index(files: &HashSet<ProjectFile>) -> HashMap<ProjectFile, Vec<CppAlias>> {
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_cpp::LANGUAGE.into())
-        .is_err()
-    {
-        return HashMap::default();
-    }
-
-    let mut aliases_by_file = HashMap::default();
-    for file in files {
-        let Ok(source) = file.read_to_string() else {
-            continue;
-        };
-        let Some(tree) = parser.parse(source.as_str(), None) else {
-            continue;
-        };
-        let mut aliases = Vec::new();
-        collect_cpp_aliases(tree.root_node(), &source, &mut aliases);
-        if !aliases.is_empty() {
-            aliases_by_file.insert(file.clone(), aliases);
-        }
-    }
-    aliases_by_file
+fn aliases_from_prepared_source(cpp: &CppAnalyzer, file: &ProjectFile) -> Vec<CppAlias> {
+    let Some(prepared) = cpp.prepared_syntax(file) else {
+        return Vec::new();
+    };
+    let mut aliases = Vec::new();
+    collect_cpp_aliases(prepared.tree().root_node(), prepared.source(), &mut aliases);
+    aliases
 }
 
-fn collect_cpp_aliases(node: Node<'_>, source: &str, out: &mut Vec<CppAlias>) {
-    match node.kind() {
-        "alias_declaration" if alias_has_visible_file_scope(node) => {
-            if let Some(alias) = cpp_alias_from_alias_declaration(node, source) {
-                out.push(alias);
+fn collect_cpp_aliases(root: Node<'_>, source: &str, out: &mut Vec<CppAlias>) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "alias_declaration" if alias_has_visible_file_scope(node) => {
+                if let Some(alias) = cpp_alias_from_alias_declaration(node, source) {
+                    out.push(alias);
+                }
+            }
+            "type_definition" if alias_has_visible_file_scope(node) => {
+                collect_typedef_aliases(node, source, out)
+            }
+            _ => {}
+        }
+
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
             }
         }
-        "type_definition" if alias_has_visible_file_scope(node) => {
-            collect_typedef_aliases(node, source, out)
-        }
-        _ => {}
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_cpp_aliases(child, source, out);
     }
 }
 
@@ -3563,7 +3604,9 @@ mod tests {
 
         let roots = HashSet::from_iter([left.clone(), right.clone()]);
         let mut include_discovery_counts = HashMap::<ProjectFile, usize>::default();
-        let (_include_graph, visible_by_file) = build_visibility_data(
+        let VisibilityData {
+            visible_by_file, ..
+        } = build_visibility_data(
             &roots,
             None,
             |file| {
@@ -3624,7 +3667,9 @@ mod tests {
             (right_header.clone(), BTreeSet::from([right_collision])),
         ]);
         let roots = HashSet::from_iter([left.clone(), right.clone()]);
-        let (_, visible_by_file) = build_visibility_data(
+        let VisibilityData {
+            visible_by_file, ..
+        } = build_visibility_data(
             &roots,
             None,
             |file| adjacency.get(file).cloned().unwrap_or_default(),
@@ -3651,8 +3696,9 @@ mod tests {
         VisibilityIndex {
             visible_by_identifier: build_visible_identifier_index(&visible_by_file),
             visible_by_file,
-            alias_source_files: HashSet::default(),
-            aliases_by_file: OnceLock::new(),
+            visible_source_files_by_root: HashMap::default(),
+            alias_cells: Mutex::new(HashMap::default()),
+            alias_source_parse_counts: Mutex::new(HashMap::default()),
             field_type_facts: Mutex::new(HashMap::default()),
             structured_alias_targets: Mutex::new(HashMap::default()),
             qualified_candidate_inspections: AtomicUsize::new(0),
