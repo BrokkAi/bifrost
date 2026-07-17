@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
 use adapter::CppAdapter;
-use cache::{weight_code_unit_set_by_file, weight_project_file_set};
+use cache::{weight_code_unit_set_by_file, weight_code_unit_vec_by_file, weight_project_file_set};
 use clones::{build_clone_candidate_data, refine_cpp_clone_similarity};
 use tests::detect_cpp_test_assertion_smells;
 
@@ -41,9 +41,9 @@ pub struct CppAnalyzer {
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
+    visible_type_units_by_file: Cache<ProjectFile, Arc<Vec<CodeUnit>>>,
     include_target_index: Arc<OnceLock<IncludeTargetIndex>>,
     reverse_include_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
-    direct_ancestor_index: Arc<OnceLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
     direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
     #[cfg(test)]
     type_alias_classification_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -101,9 +101,12 @@ impl CppAnalyzer {
             ),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
+            visible_type_units_by_file: build_weighted_cache(
+                memo_budget / 8,
+                weight_code_unit_vec_by_file,
+            ),
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
-            direct_ancestor_index: Arc::new(OnceLock::new()),
             direct_descendant_index: Arc::new(OnceLock::new()),
             #[cfg(test)]
             type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -131,9 +134,12 @@ impl CppAnalyzer {
                 self.memo_budget / 8,
                 weight_code_unit_vec_by_unit,
             ),
+            visible_type_units_by_file: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_code_unit_vec_by_file,
+            ),
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
-            direct_ancestor_index: Arc::new(OnceLock::new()),
             direct_descendant_index: Arc::new(OnceLock::new()),
             #[cfg(test)]
             type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
