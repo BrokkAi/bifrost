@@ -511,9 +511,9 @@ fn go_local_binding_type_fqn(
                 GoLocalBinding::Value(value_node) => {
                     go_value_type_fqn(analyzer, support, file, source, root, value_node, byte)
                 }
-                GoLocalBinding::RangeElement(range_node) => go_range_binding_type_fqn(
-                    analyzer, support, file, source, root, range_node, byte,
-                ),
+                GoLocalBinding::RangeElement(range_node) => {
+                    go_range_binding_type_fqn(analyzer, support, file, source, root, range_node)
+                }
             };
         }
         scope = scope.parent()?;
@@ -879,13 +879,23 @@ fn go_range_binding_type_fqn(
     source: &str,
     root: Node<'_>,
     range_node: Node<'_>,
-    byte: usize,
 ) -> Option<String> {
     let right = range_node
         .child_by_field_name("right")
         .or_else(|| go_last_named_child(range_node))?;
-    let iterable_type =
-        go_expression_type_text(analyzer, support, file, source, root, right, byte)?;
+    // Go's range variables enter scope only after the range expression has
+    // been evaluated. Resolve the iterable at its own source position so a
+    // same-named range variable cannot resolve the RHS back to itself and
+    // create an unbounded type-inference cycle.
+    let iterable_type = go_expression_type_text(
+        analyzer,
+        support,
+        file,
+        source,
+        root,
+        right,
+        right.start_byte(),
+    )?;
     let element_type = go_iterable_element_type_text(&iterable_type)?;
     go_resolve_type_text_fqn(analyzer, support, file, source, element_type)
 }
@@ -910,10 +920,10 @@ fn go_expression_type_text(
                 GoLocalBinding::Value(value_node) => {
                     go_value_type_text(analyzer, support, file, source, root, value_node, byte)
                 }
-                GoLocalBinding::RangeElement(range_node) => go_range_binding_type_fqn(
-                    analyzer, support, file, source, root, range_node, byte,
-                )
-                .and_then(|fqn| go_type_text_from_fqn(&fqn).map(str::to_string)),
+                GoLocalBinding::RangeElement(range_node) => {
+                    go_range_binding_type_fqn(analyzer, support, file, source, root, range_node)
+                        .and_then(|fqn| go_type_text_from_fqn(&fqn).map(str::to_string))
+                }
             }
         }
         "selector_expression" => go_selector_expression_type_text(

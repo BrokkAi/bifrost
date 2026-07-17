@@ -9203,6 +9203,45 @@ func disable(groups []scheduledGroup) {
 }
 
 #[test]
+fn go_range_element_can_shadow_the_iterable_receiver_without_recursive_inference() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "history.go",
+            r#"
+package history
+
+type History struct {
+    Revision string
+}
+
+func visit(history []History) {
+    for _, history := range history {
+        _ = history.Revision
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        _ = history.Revision";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"history.go","line":10,"column":{}}}]}}"#,
+            column_of(line, "Revision")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.com/app.History.Revision",
+        "{value}"
+    );
+}
+
+#[test]
 fn go_range_element_from_method_return_resolves_field_definition() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n")

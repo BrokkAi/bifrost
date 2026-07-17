@@ -39,6 +39,10 @@ The observable result is three complete JSONL corpus records, one per language a
 - [x] (2026-07-17 13:19Z) Completed the definitive clean-head Java top-five run in 1h38m48s at 524% average CPU and 16.5 GiB peak RSS. Final raw missing counts are google-cloud-java 90, AWS 53, IntelliJ 149, Dragonwell 121, and Telegram 188; all five repository records report `431f1292`, `bifrost_dirty=false`, and successful completion.
 - [x] (2026-07-17 13:28Z) Exhaustively audited all 601 final Java raw rows with independent per-repository Oldskool partitions and root review. Every row is a receiver/qualifier/non-terminal scoped-type focus mismatch, an inferred receiver-to-class projection, or a same-FQN test-fixture collision. Zero final rows select the actual member/type terminal represented by the forward target, so zero legitimate Java defects remain.
 - [x] (2026-07-17 13:28Z) Completed the Java top-five run, triaged every raw missing site, filed/assigned/fixed every legitimate issue, passed the complete local gate, integrated to `origin/master`, reran from the fixing head, and prepared issue closure evidence and the Java summary.
+- [x] (2026-07-17 13:32Z) Started the Go top-five run with five repository jobs and twenty-four workers each. The deterministic Kubernetes sample reached forward file 533/699 before a reference-differential worker overflowed its stack; the `tee` pipeline masked the signal-6 abort, so root verified the missing JSONL artifact and durable log rather than accepting the pipeline status.
+- [x] (2026-07-17 13:37Z) Searched GitHub for duplicates, found no matching open or closed issue, created #875 assigned to `jbellis`, and delegated the narrow diagnosis/implementation to Oldskool. Root reproduced Kubernetes under GDB and captured infinite mutual recursion between `go_expression_type_text` and `go_range_binding_type_fqn` when a range element shadows its iterable.
+- [x] (2026-07-17 13:44Z) Reviewed the #875 implementation: range RHS inference now uses `right.start_byte()`, so the newly declared range variable is not visible while its iterable is evaluated. Added a public location-definition regression for `for _, history := range history` that still resolves `history.Revision` through the element type.
+- [x] (2026-07-17 13:49Z) Proved #875 on the exact production boundary. The same Kubernetes 10,000-site run now completes 699/699 forward files and 1,000/1,000 inverse targets in 33.9s instead of aborting. Formatting, all-target/all-feature Clippy, all Go definition tests, and the complete `cargo test --features nlp,python` suite pass.
 - [ ] Complete the Go top-five run under the same discipline and publish the Go summary.
 - [ ] Complete the Python top-five run under the same discipline and publish the Python summary.
 - [ ] Reconcile the final canonical campaign evidence, record outcomes and limitations, and leave the Optane worktree clean.
@@ -98,6 +102,12 @@ The observable result is three complete JSONL corpus records, one per language a
 
 - Observation: Java method-reference receiver ownership needs explicit structured handling for `this` and `super`.
   Evidence: `this::fillItems` and inherited `this::setDarkGradientLocation` both resolved forward but were absent from inverse results until the method-reference owner was derived from `ClassRangeIndex`; wrong-owner and overload-ambiguous controls remain rejected.
+
+- Observation: A successful shell pipeline status did not mean the first Go campaign succeeded.
+  Evidence: `time ... 2>&1 | tee ...` returned zero because `tee` exited normally, but the durable log ends with a Rust worker stack overflow and signal 6, and no JSONL output exists. Acceptance checks must verify both the expected artifact and repository record count; later campaign commands should preserve the producer's status with `pipefail` or avoid relying on the pipeline exit code.
+
+- Observation: Go range-variable type inference used the member-reference byte when evaluating the range RHS.
+  Evidence: GDB shows unbounded alternating frames in `go_expression_type_text` and `go_range_binding_type_fqn` for source shapes such as `for _, history := range history`. Evaluating the iterable at `right.start_byte()` restores Go scope order, keeps range element typing precise, and lets the exact Kubernetes sample complete.
 
 ## Decision Log
 
