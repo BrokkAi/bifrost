@@ -1,6 +1,6 @@
 use super::extractor::{ScanState, prepare_file, scan_prepared_file};
 use super::inverted;
-use super::resolver::{TargetSpec, VisibilityIndex};
+use super::resolver::{TargetSpec, TypeScanKey, VisibilityIndex};
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface};
@@ -40,6 +40,11 @@ fn scan_file_major<F, S, P, I, C, Prepare, Scan>(
             }
         }
     }
+}
+
+fn retain_scan_spec(seen_type_specs: &mut HashSet<TypeScanKey>, spec: &TargetSpec) -> bool {
+    spec.type_scan_key()
+        .is_none_or(|key| seen_type_specs.insert(key))
 }
 
 pub(crate) struct CppQueryResolver<'a> {
@@ -131,6 +136,7 @@ impl CppQueryResolver<'_> {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
         let mut specs = Vec::with_capacity(overloads.len());
+        let mut seen_type_specs = HashSet::default();
         for overload in overloads {
             let Some(spec) = TargetSpec::from_target(analyzer, overload) else {
                 return GraphUsageOutcome::fallback_safe(
@@ -139,7 +145,9 @@ impl CppQueryResolver<'_> {
                     "CppUsageGraphStrategy",
                 );
             };
-            specs.push(spec);
+            if retain_scan_spec(&mut seen_type_specs, &spec) {
+                specs.push(spec);
+            }
         }
         let target_group: HashSet<CodeUnit> = overloads.iter().cloned().collect();
         let files = self.scan_files(overloads, scan_scope);
@@ -162,6 +170,8 @@ impl CppQueryResolver<'_> {
             || scan_scope.is_cancelled(),
             |file| prepare_file(self.cpp, file),
             |file, prepared, spec| {
+                #[cfg(test)]
+                self.cpp.record_target_spec_scan_for_test();
                 scan_prepared_file(
                     analyzer,
                     visibility,
@@ -274,7 +284,47 @@ impl<'a> UsageEdgeResolver<'a> for CppEdgeResolver<'a> {
 mod tests {
     use std::cell::Cell;
 
-    use super::scan_file_major;
+    use super::{retain_scan_spec, scan_file_major};
+    use crate::analyzer::usages::cpp_graph::resolver::{TargetKind, TargetSpec};
+    use crate::analyzer::{CallableArity, CodeUnit, CodeUnitType, ProjectFile};
+    use crate::hash::HashSet;
+
+    #[test]
+    fn identical_method_redeclarations_remain_physically_distinct_scan_specs() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let method_spec = |path: &str| {
+            let source = ProjectFile::new(root.clone(), path);
+            let owner = CodeUnit::new(source.clone(), CodeUnitType::Class, "demo", "Owner");
+            let method = CodeUnit::with_signature(
+                source,
+                CodeUnitType::Function,
+                "demo",
+                "Owner.call",
+                Some("void call(int)".to_string()),
+                false,
+            );
+            TargetSpec::new(
+                method,
+                TargetKind::Method,
+                Some(owner),
+                "call".to_string(),
+                Some(CallableArity::exact(1)),
+                Some(vec!["int".to_string()]),
+            )
+        };
+        let specs = [method_spec("first.h"), method_spec("second.h")];
+        let mut seen = HashSet::default();
+
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|spec| retain_scan_spec(&mut seen, spec))
+                .count(),
+            2,
+            "non-Type specs retain source-sensitive declaration and owner behavior"
+        );
+    }
 
     #[test]
     fn file_major_scan_prepares_once_and_visits_every_spec_in_order() {

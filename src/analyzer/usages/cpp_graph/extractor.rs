@@ -11,7 +11,9 @@ use crate::analyzer::usages::cpp_graph::resolver::*;
 use crate::analyzer::usages::cpp_graph::syntax::explicit_qualified_callable_value;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
-use crate::analyzer::{CodeUnit, CppAnalyzer, IAnalyzer, ProjectFile, cpp_node_text as node_text};
+use crate::analyzer::{
+    CodeUnit, CppAnalyzer, IAnalyzer, ProjectFile, Range, cpp_node_text as node_text,
+};
 use crate::hash::{HashMap, HashSet};
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -34,6 +36,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) line_starts: &'a [usize],
     pub(super) spec: &'a TargetSpec,
     pub(super) target_group: &'a HashSet<CodeUnit>,
+    pub(super) target_declaration_ranges: Vec<Range>,
     pub(super) bindings: LocalInferenceEngine<CppScanBinding>,
     local_shadows: LocalInferenceEngine<()>,
     using_enum_owners: ScopedUsingEnumOwners,
@@ -75,6 +78,17 @@ pub(super) fn scan_prepared_file(
         return;
     }
     let needs_using_enum_member_resolution = spec.enum_owner_kind == EnumOwnerKind::Scoped;
+    let target_declaration_ranges = if spec.kind == TargetKind::Type {
+        target_group
+            .iter()
+            .filter(|target| target.source() == file && same_logical_symbol(target, &spec.target))
+            .flat_map(|target| analyzer.ranges(target))
+            .collect()
+    } else if spec.target.source() == file {
+        analyzer.ranges(&spec.target)
+    } else {
+        Vec::new()
+    };
     let mut ctx = ScanCtx {
         analyzer,
         visibility,
@@ -83,6 +97,7 @@ pub(super) fn scan_prepared_file(
         line_starts: prepared.line_starts(),
         spec,
         target_group,
+        target_declaration_ranges,
         bindings: LocalInferenceEngine::new(LocalInferenceConfig::default()),
         local_shadows: LocalInferenceEngine::new(LocalInferenceConfig::default()),
         using_enum_owners: ScopedUsingEnumOwners::new(),
@@ -1196,11 +1211,7 @@ fn maybe_record_method_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn node_inside_target_declaration(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    if ctx.file != ctx.spec.target.source() {
-        return false;
-    }
-    ctx.analyzer
-        .ranges(&ctx.spec.target)
+    ctx.target_declaration_ranges
         .iter()
         .any(|range| node.start_byte() >= range.start_byte && node.end_byte() <= range.end_byte)
 }

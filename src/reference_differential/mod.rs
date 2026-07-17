@@ -1544,6 +1544,86 @@ mod tests {
     }
 
     #[test]
+    fn cpp_inverse_logical_type_redeclarations_share_one_target_spec_scan() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let mut consumer = String::new();
+        for index in 0..32 {
+            let header = format!("forward_{index}.h");
+            fs::write(root.join(&header), "namespace gfx { class Size; }\n")
+                .expect("write forward declaration");
+            consumer.push_str(&format!("#include \"{header}\"\n"));
+        }
+        fs::write(
+            root.join("definition.h"),
+            "namespace gfx { class Size {}; }\n",
+        )
+        .expect("write full definition");
+        consumer.push_str("namespace gfx { void consume() { Size* value; } }\n");
+        fs::write(root.join("consumer.cpp"), consumer).expect("write consumer");
+
+        let project = Arc::new(TestProject::new(&root, Language::Cpp));
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
+        let mut targets = cpp.get_definitions("gfx.Size");
+        assert_eq!(
+            targets.len(),
+            33,
+            "the regression must preserve every physical declaration in the target group"
+        );
+        let actual_target_paths: BTreeSet<_> = targets
+            .iter()
+            .map(|target| rel_path_string(target.source()))
+            .collect();
+        let mut expected_target_paths: BTreeSet<_> =
+            (0..32).map(|index| format!("forward_{index}.h")).collect();
+        expected_target_paths.insert("definition.h".to_string());
+        assert_eq!(actual_target_paths, expected_target_paths);
+        targets.sort_by_key(|target| target.source().rel_path() == Path::new("definition.h"));
+        assert_ne!(
+            targets.first().expect("first target").source().rel_path(),
+            Path::new("definition.h"),
+            "the retained representative must be a forward declaration"
+        );
+        let consumer_file = ProjectFile::new(&root, "consumer.cpp");
+        let definition_file = ProjectFile::new(&root, "definition.h");
+        let candidate_files = HashSet::from_iter([consumer_file.clone(), definition_file.clone()]);
+        let batch = CppAuthoritativeUsageBatch::new(workspace.analyzer(), &candidate_files)
+            .expect("C++ authoritative batch");
+        let consumer_start = fs::read_to_string(root.join("consumer.cpp"))
+            .expect("read consumer")
+            .find("Size* value")
+            .expect("consumer type offset");
+        let assert_order = |ordered_targets: &[CodeUnit]| {
+            cpp.reset_target_spec_scan_count_for_test();
+            let result = batch
+                .find_usages(ordered_targets, &candidate_files, 100)
+                .into_fuzzy_result();
+            let hits = result.all_hits_including_imports();
+            assert_eq!(hits.len(), 1, "one exact consumer hit: {result:#?}");
+            let hit = hits.first().expect("consumer hit");
+            assert_eq!(hit.file, consumer_file, "{result:#?}");
+            assert_eq!(hit.start_offset, consumer_start, "{result:#?}");
+            assert_eq!(hit.end_offset, consumer_start + "Size".len(), "{result:#?}");
+            assert_eq!(hit.kind, UsageHitKind::Reference, "{result:#?}");
+            assert_eq!(
+                cpp.target_spec_scan_count_for_test(),
+                2,
+                "33 logical Type declarations should scan each candidate file once"
+            );
+        };
+        assert_order(&targets);
+
+        targets.sort_by_key(|target| target.source().rel_path() != Path::new("definition.h"));
+        assert_eq!(
+            targets.first().expect("first target").source().rel_path(),
+            Path::new("definition.h"),
+            "the second pass must retain the full definition as representative"
+        );
+        assert_order(&targets);
+    }
+
+    #[test]
     fn cpp_union_visibility_preserves_each_groups_authoritative_roots() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");

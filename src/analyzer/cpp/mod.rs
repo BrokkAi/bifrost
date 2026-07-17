@@ -49,6 +49,8 @@ pub struct CppAnalyzer {
     type_alias_classification_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     authoritative_visibility_build_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    target_spec_scan_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 crate::analyzer::impl_forward_query_provider!(CppAnalyzer);
@@ -103,6 +105,8 @@ impl CppAnalyzer {
             type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             authoritative_visibility_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            target_spec_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -127,6 +131,8 @@ impl CppAnalyzer {
             type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             authoritative_visibility_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            target_spec_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -166,6 +172,24 @@ impl CppAnalyzer {
     #[cfg(test)]
     pub(crate) fn authoritative_visibility_build_count_for_test(&self) -> usize {
         self.authoritative_visibility_build_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_target_spec_scan_for_test(&self) {
+        self.target_spec_scan_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_target_spec_scan_count_for_test(&self) {
+        self.target_spec_scan_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn target_spec_scan_count_for_test(&self) -> usize {
+        self.target_spec_scan_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
