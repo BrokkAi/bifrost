@@ -6958,7 +6958,7 @@ mod tests {
     fn query_read_cache_reuses_analyzed_live_files_until_the_outer_scope_ends() {
         let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
         let mut cache = QueryReadCache::default();
-        let files = vec![ProjectFile::new("/workspace", "src/lib.rs")];
+        let files = vec![ProjectFile::new(std::env::temp_dir(), "src/lib.rs")];
 
         cache.begin(&context);
         assert!(cache.analyzed_live_files().is_none());
