@@ -58,28 +58,51 @@ impl GoWorkspacePathIndex {
         if import_path.is_empty() {
             return Vec::new();
         }
-        let mut directories = Vec::new();
         if let Some(relative) = import_path.strip_prefix("./") {
-            directories.push(source_file.parent().join(relative));
-        } else {
-            let mut cursor = Some(source_file.parent());
-            while let Some(directory) = cursor {
-                directories.push(directory.join("vendor").join(import_path));
-                cursor = directory.parent().map(Path::to_path_buf);
-            }
-            for module in &self.module_roots {
-                if let Some(relative) = module_relative_import(&module.import_path, import_path) {
-                    directories.push(module.workspace_dir.join(relative));
-                }
-            }
-            directories.push(PathBuf::from(import_path));
+            return self
+                .representative_by_directory
+                .get(&source_file.parent().join(relative))
+                .cloned()
+                .into_iter()
+                .collect();
         }
-        directories.sort();
-        directories.dedup();
 
-        directories
+        // The nearest vendor package shadows both ancestor vendor copies and
+        // workspace modules with the same import path.
+        let mut cursor = Some(source_file.parent());
+        while let Some(directory) = cursor {
+            let vendored = directory.join("vendor").join(import_path);
+            if let Some(file) = self.representative_by_directory.get(&vendored) {
+                return vec![file.clone()];
+            }
+            cursor = directory.parent().map(Path::to_path_buf);
+        }
+
+        let mut module_files = self
+            .module_roots
+            .iter()
+            .filter_map(|module| {
+                let relative = module_relative_import(&module.import_path, import_path)?;
+                self.representative_by_directory
+                    .get(&module.workspace_dir.join(relative))
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        module_files.sort();
+        module_files.dedup();
+        if !module_files.is_empty() {
+            return module_files;
+        }
+
+        self.module_roots
+            .is_empty()
+            .then(|| {
+                self.representative_by_directory
+                    .get(Path::new(import_path))
+                    .cloned()
+            })
+            .flatten()
             .into_iter()
-            .filter_map(|directory| self.representative_by_directory.get(&directory).cloned())
             .collect()
     }
 
@@ -89,9 +112,10 @@ impl GoWorkspacePathIndex {
                 self.representative_by_directory
                     .contains_key(&module.workspace_dir.join(relative))
             })
-        }) || self
-            .representative_by_directory
-            .contains_key(Path::new(prefix))
+        }) || (self.module_roots.is_empty()
+            && self
+                .representative_by_directory
+                .contains_key(Path::new(prefix)))
     }
 }
 

@@ -18,10 +18,9 @@ use crate::analyzer::usages::csharp_graph::{
     member_access_receiver as csharp_member_access_receiver, seed_csharp_bindings_before,
 };
 use crate::analyzer::usages::go_graph::{
-    GoIndexedMemberLookup, GoReferenceResolution, default_go_import_local_name,
-    extract_go_import_path, go_embedded_field_unit_type_text, go_simple_type_name,
-    go_type_name_parts, go_unique_indexed_member_candidate_at_nearest_depth,
-    resolve_go_reference_with_namespaces,
+    GoIndexedMemberLookup, GoReferenceResolution, extract_go_import_path,
+    go_embedded_field_unit_type_text, go_simple_type_name, go_type_name_parts,
+    go_unique_indexed_member_candidate_at_nearest_depth, resolve_go_reference_with_namespaces,
 };
 use crate::analyzer::usages::inverted_edges::{ClassRangeIndex, first_precise};
 use crate::analyzer::usages::java_graph::java_signature_arity;

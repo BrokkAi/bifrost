@@ -634,7 +634,7 @@ fn is_parameter_owner(language: Language, kind: &str) -> bool {
         ),
         Language::Go => matches!(
             kind,
-            "function_declaration" | "method_declaration" | "func_literal"
+            "function_declaration" | "method_declaration" | "method_elem" | "func_literal"
         ),
         Language::Cpp => matches!(
             kind,

@@ -8630,11 +8630,80 @@ func Helper() {}
 }
 
 #[test]
+fn go_bare_names_respect_interface_parameters_and_package_scope() {
+    let source = r#"
+package app
+
+type nodeManaged struct {
+    nodeName string
+}
+
+type errArrayElem struct {
+    error
+}
+
+type DesiredStateOfWorld interface {
+    AddNode(nodeName string)
+}
+
+var ordinary = 1
+
+func marshal() error {
+    return nil
+}
+
+func use() int {
+    return ordinary
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file("main.go", source)
+        .build();
+
+    let interface_parameter = source
+        .find("nodeName string)")
+        .expect("interface parameter declaration");
+    let value = lookup(
+        project.root(),
+        &location_reference("main.go", source, interface_parameter),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["name"], "nodeName", "{value}");
+    assert_eq!(result["definitions"][0]["kind"], "parameter", "{value}");
+    assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
+
+    let builtin_error = source.find("marshal() error").expect("return type") + "marshal() ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("main.go", source, builtin_error),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert!(value["results"][0].get("definitions").is_none(), "{value}");
+
+    let ordinary_reference = source.rfind("ordinary").expect("ordinary reference");
+    let value = lookup(
+        project.root(),
+        &location_reference("main.go", source, ordinary_reference),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.com/app._module_.ordinary",
+        "{value}"
+    );
+}
+
+#[test]
 fn go_keyed_composite_labels_resolve_from_exact_struct_owner() {
     let source = r#"
 package main
 
-import "example.com/app/model"
+import (
+    "example.com/app/model"
+    main "example.com/dependency/endpoints"
+)
 
 type Local struct {
     LocalField string
@@ -8652,6 +8721,14 @@ type KeyCollision struct {
     LocalMapKey string
 }
 
+type Options struct {
+    ResolvedRegion string
+}
+
+type Outside struct {
+    Field string
+}
+
 const LocalMapKey = "local"
 
 var localValue = Local{LocalField: "local"}
@@ -8660,6 +8737,8 @@ var sliceValues = []Local{{LocalField: "slice"}}
 var arrayValues = [1]model.Imported{{ImportedOnly: "array"}}
 var nestedArrays = [1][1]model.Imported{{{ImportedOnly: "nested-array"}}}
 var mapValues = map[string]model.Imported{"value": {ImportedOnly: "map"}}
+var vendoredAliasCollision = main.Options{ResolvedRegion: "imported-vendor"}
+var unresolvedQualifiedOwner = main.Outside{Field: "must not fall back to local Outside.Field"}
 var invalidOwner = MissingFieldOwner{Shared: "must not guess Distractor.Shared"}
 var keyedMap = map[string]int{LocalMapKey: 1}
 "#;
@@ -8673,6 +8752,16 @@ package model
 
 type Imported struct {
     ImportedOnly string
+}
+"#,
+        )
+        .file(
+            "vendor/example.com/dependency/endpoints/endpoints.go",
+            r#"
+package endpoints
+
+type Options struct {
+    ResolvedRegion string
 }
 "#,
         )
@@ -8715,6 +8804,12 @@ type Imported struct {
             "example.com/app/model.Imported.ImportedOnly",
             "model/model.go",
         ),
+        (
+            "main.Options{ResolvedRegion: \"imported-vendor\"}",
+            "ResolvedRegion",
+            "example.com/app/vendor/example.com/dependency/endpoints.Options.ResolvedRegion",
+            "vendor/example.com/dependency/endpoints/endpoints.go",
+        ),
     ] {
         let marker_start = source.find(marker).expect("composite marker");
         let focus_start = marker_start + marker.find(focus).expect("focus in marker");
@@ -8743,6 +8838,19 @@ type Imported struct {
     );
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
 
+    let unresolved_marker = "main.Outside{Field:";
+    let unresolved_start = source
+        .find(unresolved_marker)
+        .expect("unresolved qualified owner marker")
+        + unresolved_marker
+            .find("Field")
+            .expect("unresolved qualified owner focus");
+    let value = lookup(
+        project.root(),
+        &location_reference("main.go", source, unresolved_start),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+
     let map_marker = "map[string]int{LocalMapKey:";
     let map_start = source.find(map_marker).expect("map-key marker")
         + map_marker.find("LocalMapKey").expect("map-key focus");
@@ -8753,6 +8861,64 @@ type Imported struct {
     assert_eq!(value["results"][0]["status"], "resolved", "{value}");
     assert_eq!(
         value["results"][0]["definitions"][0]["fqn"], "example.com/app._module_.LocalMapKey",
+        "{value}"
+    );
+}
+
+#[test]
+fn go_import_selector_prefers_nearest_visible_vendor() {
+    let source = r#"
+package tool
+
+import dep "example.com/dependency/endpoints"
+
+var value = dep.Options{Selected: "nearest"}
+"#;
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file("cmd/tool/main.go", source)
+        .file(
+            "vendor/example.com/dependency/endpoints/endpoints.go",
+            r#"
+package endpoints
+
+type Options struct {
+    Selected string
+}
+"#,
+        )
+        .file(
+            "cmd/tool/vendor/example.com/dependency/endpoints/endpoints.go",
+            r#"
+package endpoints
+
+type Options struct {
+    Selected string
+}
+"#,
+        )
+        .build();
+
+    let selected = source.find("Selected:").expect("composite field label");
+    let value = lookup(
+        project.root(),
+        &location_reference("cmd/tool/main.go", source, selected),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().unwrap().len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["fqn"],
+        "example.com/app/cmd/tool/vendor/example.com/dependency/endpoints.Options.Selected",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"],
+        "cmd/tool/vendor/example.com/dependency/endpoints/endpoints.go",
         "{value}"
     );
 }
@@ -8811,6 +8977,14 @@ var ErrDuplicate = errors.New("duplicate")
 fn go_external_import_selector_reports_boundary() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n")
+        .file(
+            "fmt/fmt.go",
+            r#"
+package fmt
+
+func Println(value string) {}
+"#,
+        )
         .file(
             "main.go",
             r#"

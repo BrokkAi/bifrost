@@ -4,7 +4,6 @@ use tree_sitter::Tree;
 
 pub(crate) trait GoDefinitionProvider {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit>;
-    fn file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit>;
     fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit>;
     fn fqn_prefix_exists(&self, prefix: &str) -> bool;
 
@@ -16,10 +15,6 @@ pub(crate) trait GoDefinitionProvider {
 impl GoDefinitionProvider for GlobalUsageDefinitionIndex {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
         GlobalUsageDefinitionIndex::fqn(self, fqn)
-    }
-
-    fn file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit> {
-        GlobalUsageDefinitionIndex::file_identifier(self, file, identifier)
     }
 
     fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
@@ -47,14 +42,6 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
         sort_units(&mut units);
         units.dedup();
         units
-    }
-
-    fn file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit> {
-        self.analyzer
-            .declarations(file)
-            .into_iter()
-            .filter(|unit| unit.identifier() == identifier)
-            .collect()
     }
 
     fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
@@ -197,10 +184,6 @@ pub(super) fn resolve_go(
     let candidates = go_package_member_candidates(support, &package, reference);
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
-    }
-    let same_file = support.file_identifier(file, reference);
-    if !same_file.is_empty() {
-        return candidates_outcome(same_file);
     }
     if let Some(import_path) = go_external_dot_import_path(go, support, file) {
         return boundary(format!(
@@ -418,28 +401,11 @@ fn go_import_paths(
     go: &crate::analyzer::GoAnalyzer,
     file: &ProjectFile,
 ) -> HashMap<String, String> {
-    let mut imports = HashMap::default();
-    for import in go.import_info_of(file) {
-        if matches!(import.alias.as_deref(), Some("_") | Some(".")) {
-            continue;
-        }
-        let Some(import_path) = extract_go_import_path(&import.raw_snippet) else {
-            continue;
-        };
-        let local = import
-            .alias
-            .as_deref()
-            .map(default_go_import_local_name)
-            .or_else(|| {
-                import
-                    .identifier
-                    .as_deref()
-                    .map(default_go_import_local_name)
-            })
-            .unwrap_or_else(|| default_go_import_local_name(&import_path));
-        imports.insert(local, import_path);
-    }
-    imports
+    go.definition_import_namespaces(file)
+        .0
+        .into_iter()
+        .filter_map(|(local, packages)| packages.into_iter().next().map(|package| (local, package)))
+        .collect()
 }
 
 fn go_import_path_is_workspace(support: &dyn GoDefinitionProvider, import_path: &str) -> bool {
@@ -1484,12 +1450,12 @@ fn go_resolve_go_field_type_fqn(
     field_file: &ProjectFile,
     type_text: &str,
 ) -> Option<String> {
-    if let Some(fqn) = go_resolve_qualified_type_from_file(analyzer, support, field_file, type_text)
-    {
-        return Some(fqn);
+    let (qualifier, name) = go_type_name_parts(type_text)?;
+    if qualifier.is_some() {
+        return go_resolve_qualified_type_from_file(analyzer, support, field_file, type_text);
     }
     let package = owner_fqn.rsplit_once('.').map(|(package, _)| package)?;
-    go_resolve_type_name_in_package(support, package, type_text)
+    go_resolve_type_name_in_package(support, package, name)
 }
 
 fn go_resolve_qualified_type_from_file(
@@ -1514,10 +1480,13 @@ fn go_resolve_type_fqn(
     source: &str,
     type_node: Node<'_>,
 ) -> Option<String> {
-    let type_text = go_node_text(type_node, source);
-    go_resolve_qualified_type_from_file(analyzer, support, file, type_text).or_else(|| {
-        go_resolve_type_name_in_package(support, &go_package_name(file, source), type_text)
-    })
+    go_resolve_type_text_fqn(
+        analyzer,
+        support,
+        file,
+        source,
+        go_node_text(type_node, source),
+    )
 }
 
 fn go_resolve_type_name_in_package(
