@@ -113,13 +113,35 @@ pub(super) fn resolve_python(
                     format!("`{text}` is a local Python value"),
                 );
             }
+            if let Some(candidates) = python_visible_module_binding_candidates(
+                analyzer,
+                py,
+                support,
+                &ctx,
+                source,
+                tree.root_node(),
+                identifier,
+                text,
+            ) {
+                if !candidates.is_empty() {
+                    return candidates_outcome(candidates);
+                }
+                return no_definition(
+                    "no_indexed_definition",
+                    format!("`{text}` is bound locally but has no indexed Python definition"),
+                );
+            }
             if let Some(fqn) = ctx.named.get(text).or_else(|| ctx.namespace.get(text)) {
                 return python_fqn_outcome(py, support, fqn, text);
             }
             if let Some(candidates) = ctx.same_file.get(text)
                 && !candidates.is_empty()
             {
-                return candidates_outcome(candidates.clone());
+                let candidates =
+                    python_visible_same_file_candidates(analyzer, file, identifier, candidates);
+                if !candidates.is_empty() {
+                    return candidates_outcome(candidates);
+                }
             }
             if python_unresolved_import_boundary(file, analyzer, text, None) {
                 return boundary(format!(
@@ -172,6 +194,171 @@ pub(super) fn resolve_python(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn python_visible_module_binding_candidates(
+    analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    context: &PythonDefinitionContext,
+    source: &str,
+    root: Node<'_>,
+    node: Node<'_>,
+    name: &str,
+) -> Option<Vec<CodeUnit>> {
+    let timeline = context.module_bindings(source, root);
+    let events = timeline.get(name)?;
+    let cutoff = if python_reference_is_deferred_function_body(node) {
+        usize::MAX
+    } else {
+        node.start_byte()
+    };
+    let visible: Vec<_> = events
+        .iter()
+        .filter(|event| event.visible_from <= cutoff)
+        .collect();
+    if visible.is_empty() {
+        return Some(Vec::new());
+    }
+    let start = visible
+        .iter()
+        .rposition(|event| !event.conditional)
+        .unwrap_or(0);
+    let mut candidates = Vec::new();
+    for event in &visible[start..] {
+        match &event.kind {
+            ModuleBindingEventKind::FromImport {
+                module,
+                imported_name,
+            } => {
+                let mut resolved = false;
+                for module_file in py.usage_resolve_module_files(&context.file, module) {
+                    let Some(module_fqn) = analyzer
+                        .declarations(&module_file)
+                        .into_iter()
+                        .find(CodeUnit::is_module)
+                        .map(|unit| unit.fq_name())
+                    else {
+                        continue;
+                    };
+                    resolved = true;
+                    let fqn = format!("{module_fqn}.{imported_name}");
+                    candidates.extend(
+                        py.resolve_fqn_candidates(&fqn, |candidate| support.fqn(candidate)),
+                    );
+                }
+                if !resolved {
+                    let fqn = if module.ends_with('.') {
+                        format!("{module}{imported_name}")
+                    } else {
+                        format!("{module}.{imported_name}")
+                    };
+                    candidates.extend(
+                        py.resolve_fqn_candidates(&fqn, |candidate| support.fqn(candidate)),
+                    );
+                }
+            }
+            ModuleBindingEventKind::ImportModule(module) => {
+                candidates
+                    .extend(py.resolve_fqn_candidates(module, |candidate| support.fqn(candidate)));
+            }
+            ModuleBindingEventKind::Other => {
+                if let Some(local) = context.same_file.get(name) {
+                    candidates.extend(python_visible_same_file_candidates(
+                        analyzer,
+                        &context.file,
+                        node,
+                        local,
+                    ));
+                }
+            }
+        }
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    Some(candidates)
+}
+
+fn python_visible_same_file_candidates(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    node: Node<'_>,
+    candidates: &[CodeUnit],
+) -> Vec<CodeUnit> {
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: 0,
+        end_line: 0,
+    };
+    let enclosing_class = analyzer
+        .enclosing_code_unit(file, &range)
+        .and_then(|mut scope| {
+            if scope.is_function() && !python_function_declaration_expression_is_class_scoped(node)
+            {
+                return None;
+            }
+            loop {
+                if scope.is_class() {
+                    break Some(scope);
+                }
+                if scope.is_module() {
+                    break None;
+                }
+                scope = analyzer.parent_of(&scope)?;
+            }
+        });
+    candidates
+        .iter()
+        .filter(|candidate| {
+            analyzer.parent_of(candidate).is_some_and(|parent| {
+                parent.is_module()
+                    || enclosing_class
+                        .as_ref()
+                        .is_some_and(|scope| scope == &parent)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+fn python_function_declaration_expression_is_class_scoped(node: Node<'_>) -> bool {
+    let site_start = node.start_byte();
+    let site_end = node.end_byte();
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "function_definition" {
+            return parent.child_by_field_name("body").is_none_or(|body| {
+                !(body.start_byte() <= site_start && site_end <= body.end_byte())
+            });
+        }
+        if parent.kind() == "decorated_definition" {
+            return current.kind() == "decorator";
+        }
+        if parent.kind() == "class_definition" {
+            break;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn python_reference_is_deferred_function_body(node: Node<'_>) -> bool {
+    let site_start = node.start_byte();
+    let site_end = node.end_byte();
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if matches!(parent.kind(), "function_definition" | "lambda")
+            && parent
+                .child_by_field_name("body")
+                .is_some_and(|body| body.start_byte() <= site_start && site_end <= body.end_byte())
+        {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
 pub(super) fn parse_python_tree(source: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser
@@ -186,6 +373,7 @@ pub(super) struct PythonDefinitionContext {
     namespace: HashMap<String, String>,
     same_file: HashMap<String, Vec<CodeUnit>>,
     scope_facts: OnceLock<Arc<HashMap<CodeUnit, LocalBindingsSnapshot<String>>>>,
+    module_bindings: OnceLock<Arc<ModuleBindingTimeline>>,
     receiver_types: Mutex<PythonReceiverTypeCache>,
     #[cfg(test)]
     build_counters: Arc<PythonDefinitionBuildCounters>,
@@ -247,6 +435,7 @@ impl PythonDefinitionContext {
             namespace,
             same_file,
             scope_facts: OnceLock::new(),
+            module_bindings: OnceLock::new(),
             receiver_types: Mutex::new(PythonReceiverTypeCache::new(
                 PYTHON_RECEIVER_TYPE_CACHE_LIMIT,
             )),
@@ -292,7 +481,7 @@ impl PythonDefinitionContext {
     ) -> Option<CodeUnit> {
         let raw_type = raw_type.trim();
         if &self.file != file {
-            return self.generic_receiver_type(analyzer, file, raw_type, target_self_file);
+            return self.generic_receiver_type(analyzer, py, file, raw_type, target_self_file);
         }
 
         let key = (raw_type.to_string(), target_self_file);
@@ -313,7 +502,7 @@ impl PythonDefinitionContext {
 
         let resolved = self
             .receiver_type_for_object(py, support, raw_type)
-            .or_else(|| self.generic_receiver_type(analyzer, file, raw_type, target_self_file));
+            .or_else(|| self.generic_receiver_type(analyzer, py, file, raw_type, target_self_file));
 
         let mut cache = self
             .receiver_types
@@ -328,6 +517,7 @@ impl PythonDefinitionContext {
     fn generic_receiver_type(
         &self,
         analyzer: &dyn IAnalyzer,
+        py: &PythonAnalyzer,
         file: &ProjectFile,
         raw_type: &str,
         target_self_file: bool,
@@ -336,7 +526,7 @@ impl PythonDefinitionContext {
         self.build_counters
             .generic_receiver_type_fallbacks
             .fetch_add(1, Ordering::Relaxed);
-        resolve_python_receiver_type(analyzer, file, raw_type, target_self_file)
+        resolve_python_receiver_type(analyzer, py, file, raw_type, target_self_file)
     }
 
     #[cfg(test)]
@@ -377,6 +567,12 @@ impl PythonDefinitionContext {
                     analyzer, py, file, source, root,
                 ))
             })
+            .clone()
+    }
+
+    fn module_bindings(&self, source: &str, root: Node<'_>) -> Arc<ModuleBindingTimeline> {
+        self.module_bindings
+            .get_or_init(|| Arc::new(collect_module_binding_timeline(root, source)))
             .clone()
     }
 }

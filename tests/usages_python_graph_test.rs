@@ -17,12 +17,16 @@ fn definition(analyzer: &PythonAnalyzer, fq_name: &str) -> CodeUnit {
 }
 
 fn assert_single_python_member_hit(service: &str, consumer: &str) {
+    assert_single_python_member_hit_for("service.Foo.bar", service, consumer);
+}
+
+fn assert_single_python_member_hit_for(fq_name: &str, service: &str, consumer: &str) {
     let project = InlineTestProject::with_language(Language::Python)
         .file("service.py", service)
         .file("consumer.py", consumer)
         .build();
     let analyzer = PythonAnalyzer::from_project(project.project().clone());
-    let target = definition(&analyzer, "service.Foo.bar");
+    let target = definition(&analyzer, fq_name);
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
 
     let result = PythonExportUsageGraphStrategy::new().find_usages(
@@ -60,6 +64,94 @@ fn assert_no_python_member_hit(service: &str, consumer: &str) {
         .into_either()
         .expect("graph should return success for member query");
     assert!(hits.is_empty(), "member query should not find proven hits");
+}
+
+#[test]
+fn constructor_keyword_argument_is_a_field_usage() {
+    assert_single_python_member_hit(
+        "class Foo:\n    bar: int\n",
+        "from service import Foo\n\nvalue = Foo(bar=1)\n",
+    );
+}
+
+#[test]
+fn subclass_constructor_keyword_argument_is_an_inherited_field_usage() {
+    assert_single_python_member_hit_for(
+        "service.Base.bar",
+        "class Base:\n    bar: int\n\nclass Child(Base):\n    pass\n",
+        "from service import Child\n\nvalue = Child(bar=1)\n",
+    );
+}
+
+#[test]
+fn call_result_receiver_resolves_member_usage() {
+    assert_single_python_member_hit(
+        "class Foo:\n    bar: int\n\ndef build() -> Foo:\n    return Foo()\n",
+        "from service import build\n\nbuild().bar = 1\n",
+    );
+}
+
+#[test]
+fn imported_alias_annotation_resolves_receiver_member_usage() {
+    assert_single_python_member_hit(
+        "class Foo:\n    bar: int\n",
+        "from service import Foo as Alias\n\ndef read(value: Alias):\n    return value.bar\n",
+    );
+}
+
+#[test]
+fn reexported_class_used_as_base_is_a_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/service.py", "class _Mixin:\n    pass\n")
+        .file("pkg/__init__.py", "from .service import _Mixin\n")
+        .file(
+            "consumer.py",
+            "from pkg import _Mixin\n\nclass Child(_Mixin):\n    pass\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.service._Mixin");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve the re-exported class base");
+
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected the class-base reference: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("consumer.py"))
+    );
+}
+
+#[test]
+fn private_class_is_not_reexported_by_wildcard() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/service.py", "class _Mixin:\n    pass\n")
+        .file("pkg/__init__.py", "from .service import *\n")
+        .file(
+            "consumer.py",
+            "from pkg import _Mixin\n\nclass Child(_Mixin):\n    pass\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.service._Mixin");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should return success for a private wildcard query");
+
+    assert!(
+        hits.is_empty(),
+        "wildcard must not expose private names: {hits:#?}"
+    );
 }
 
 #[test]

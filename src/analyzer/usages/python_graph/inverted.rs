@@ -17,10 +17,10 @@
 //! typing ([`collect_scope_facts`] + [`resolve_receiver_type`]).
 
 use super::extractor::{
-    collect_assigned_identifiers, collect_scope_facts_from_parsed_source, enclosing_scope_facts,
-    is_declaration_identifier, slice,
+    call_result_types, collect_assigned_identifiers, collect_scope_facts_from_parsed_source,
+    enclosing_scope_facts, is_declaration_identifier, slice,
 };
-use super::resolver::resolve_receiver_type;
+use super::resolver::{resolve_constructor_types, resolve_receiver_type};
 use crate::analyzer::PythonAnalyzer;
 use crate::analyzer::usages::inverted_edges::{
     EdgeCollector, UsageEdgeBuildOutput, build_edge_output, classify_reference_node,
@@ -178,7 +178,8 @@ impl PyScan<'_, '_> {
         // is gated on matching a known target owner; the inverted builder has no
         // target to validate against, so enabling it would let an unimported,
         // non-local type name bind to an unrelated same-named class elsewhere.
-        resolve_receiver_type(self.analyzer, self.file, type_name, false).map(|unit| unit.fq_name())
+        resolve_receiver_type(self.analyzer, self.py, self.file, type_name, false)
+            .map(|unit| unit.fq_name())
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
@@ -261,6 +262,12 @@ fn walk<'a>(
                 "attribute" => {
                     handle_attribute(node, ctx, scopes, facts);
                     push_children(node, facts, &mut stack);
+                }
+                "keyword_argument" => {
+                    handle_keyword_argument(node, ctx, scopes);
+                    if let Some(value) = node.child_by_field_name("value") {
+                        stack.push(WalkFrame::Enter { node: value, facts });
+                    }
                 }
                 _ => push_children(node, facts, &mut stack),
             },
@@ -345,6 +352,23 @@ fn handle_attribute<'a>(
     if object_text.is_empty() || attribute_text.is_empty() {
         return;
     }
+    if object.kind() == "call" {
+        for class in call_result_types(ctx.analyzer, ctx.py, ctx.file, ctx.source, object) {
+            let direct = format!("{}.{attribute_text}", class.fq_name());
+            if ctx.nodes.contains(&direct) {
+                ctx.record(direct, attribute);
+                continue;
+            }
+            if let Some(provider) = ctx.analyzer.type_hierarchy_provider() {
+                for ancestor in provider.get_ancestors(&class) {
+                    let inherited = format!("{}.{attribute_text}", ancestor.fq_name());
+                    if ctx.nodes.contains(&inherited) {
+                        ctx.record(inherited, attribute);
+                    }
+                }
+            }
+        }
+    }
     // `module.symbol` where the object is a namespace import: the callee is the
     // module prefix plus the accessed attribute. A local of the same name as the
     // module shadows the import.
@@ -387,6 +411,77 @@ fn handle_attribute<'a>(
             {
                 ctx.record_unproven_name(attribute_text, attribute);
             }
+        }
+    }
+}
+
+fn handle_keyword_argument(node: Node<'_>, ctx: &mut PyScan<'_, '_>, scopes: &[FunctionScope]) {
+    let (Some(name), Some(arguments)) = (node.child_by_field_name("name"), node.parent()) else {
+        return;
+    };
+    if name.kind() != "identifier" || arguments.kind() != "argument_list" {
+        return;
+    }
+    let Some(call) = arguments.parent().filter(|parent| parent.kind() == "call") else {
+        return;
+    };
+    let Some(function) = call.child_by_field_name("function") else {
+        return;
+    };
+    let member = slice(name, ctx.source);
+    if member.is_empty() {
+        return;
+    }
+    let classes = if function.kind() == "identifier" && slice(function, ctx.source) == "cls" {
+        lexical_class(ctx, function).into_iter().collect()
+    } else {
+        if leftmost_identifier(function)
+            .is_some_and(|root| is_shadowed(scopes, slice(root, ctx.source)))
+        {
+            return;
+        }
+        resolve_constructor_types(ctx.analyzer, ctx.py, ctx.file, ctx.source, function)
+    };
+    for class in classes {
+        let direct = format!("{}.{member}", class.fq_name());
+        if ctx.nodes.contains(&direct) {
+            ctx.record(direct, name);
+            continue;
+        }
+        if let Some(provider) = ctx.analyzer.type_hierarchy_provider() {
+            for ancestor in provider.get_ancestors(&class) {
+                let inherited = format!("{}.{member}", ancestor.fq_name());
+                if ctx.nodes.contains(&inherited) {
+                    ctx.record(inherited, name);
+                }
+            }
+        }
+    }
+}
+
+fn lexical_class(ctx: &PyScan<'_, '_>, node: Node<'_>) -> Option<CodeUnit> {
+    let range = crate::analyzer::Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: 0,
+        end_line: 0,
+    };
+    let enclosing = ctx.analyzer.enclosing_code_unit(ctx.file, &range)?;
+    if enclosing.is_class() {
+        Some(enclosing)
+    } else {
+        ctx.analyzer
+            .parent_of(&enclosing)
+            .filter(CodeUnit::is_class)
+    }
+}
+
+fn leftmost_identifier(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "identifier" => return Some(node),
+            "attribute" => node = node.child_by_field_name("object")?,
+            _ => return None,
         }
     }
 }

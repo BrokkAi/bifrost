@@ -8,7 +8,7 @@ use crate::analyzer::usages::python_graph::hits::{
 };
 use crate::analyzer::usages::python_graph::resolver::{
     member_name, normalized_receiver_type, receiver_annotation_matches_target,
-    resolve_receiver_type, target_owner_code_unit, top_level_identifier,
+    resolve_constructor_types, resolve_receiver_type, target_owner_code_unit, top_level_identifier,
 };
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline,
@@ -188,6 +188,7 @@ pub(super) fn scan_files_for_seeds(
         let line_starts = compute_line_starts(source_str);
 
         let mut scan_ctx = ScanCtx {
+            py,
             file,
             source: source_str,
             line_starts: &line_starts,
@@ -242,6 +243,7 @@ pub(super) struct ScanResult {
 }
 
 pub(super) struct ScanCtx<'a> {
+    py: &'a PythonAnalyzer,
     pub(super) file: &'a ProjectFile,
     pub(super) source: &'a str,
     pub(super) line_starts: &'a [usize],
@@ -462,11 +464,17 @@ impl ScanCtx<'_> {
         } else {
             node.start_byte()
         };
-        events
+        let visible: Vec<_> = events
             .iter()
-            .rev()
-            .find(|event| event.visible_from <= cutoff)
-            .is_some_and(|event| event.kind == ModuleBindingKind::TargetImport)
+            .filter(|event| event.visible_from <= cutoff)
+            .collect();
+        let start = visible
+            .iter()
+            .rposition(|event| !event.conditional)
+            .unwrap_or(0);
+        visible[start..]
+            .iter()
+            .any(|event| event.kind == ModuleBindingKind::TargetImport)
     }
 
     /// Whether the class enclosing `node` is the target member's owner (or a
@@ -517,9 +525,13 @@ impl ScanCtx<'_> {
         let Some(target_owner) = self.target_owner.as_ref() else {
             return false;
         };
-        let Some(receiver_type) =
-            resolve_receiver_type(self.analyzer, self.file, raw_type, self.target_self_file)
-        else {
+        let Some(receiver_type) = resolve_receiver_type(
+            self.analyzer,
+            self.py,
+            self.file,
+            raw_type,
+            self.target_self_file,
+        ) else {
             return false;
         };
         if &receiver_type == target_owner {
@@ -565,6 +577,13 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             }
             "identifier" => handle_identifier_candidate(node, ctx),
             "attribute" => handle_attribute_candidate(node, ctx),
+            "keyword_argument" => {
+                handle_keyword_argument_candidate(node, ctx);
+                if let Some(value) = node.child_by_field_name("value") {
+                    stack.push(value);
+                }
+                continue;
+            }
             _ => {}
         }
 
@@ -572,6 +591,69 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
         children.reverse();
         stack.extend(children);
+    }
+}
+
+fn handle_keyword_argument_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let (Some(target_member), Some(name), Some(arguments)) = (
+        ctx.target_member,
+        node.child_by_field_name("name"),
+        node.parent(),
+    ) else {
+        return;
+    };
+    if name.kind() != "identifier"
+        || slice(name, ctx.source) != target_member
+        || arguments.kind() != "argument_list"
+    {
+        return;
+    }
+    let Some(call) = arguments.parent().filter(|parent| parent.kind() == "call") else {
+        return;
+    };
+    let Some(function) = call.child_by_field_name("function") else {
+        return;
+    };
+    if function.kind() == "identifier" && slice(function, ctx.source) == "cls" {
+        if ctx.self_receiver_matches_target(function) {
+            record_hit(name, ctx);
+        }
+        return;
+    }
+    let Some(target_owner) = ctx.target_owner.as_ref() else {
+        return;
+    };
+    if let Some(root) = leftmost_identifier(function)
+        && ctx
+            .scope_facts_for_node(function)
+            .is_some_and(|facts| facts.is_shadowed(slice(root, ctx.source)))
+    {
+        return;
+    }
+    let matches = resolve_constructor_types(ctx.analyzer, ctx.py, ctx.file, ctx.source, function)
+        .into_iter()
+        .any(|class| {
+            &class == target_owner
+                || ctx
+                    .analyzer
+                    .type_hierarchy_provider()
+                    .map(|provider| provider.get_ancestors(&class))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .any(|ancestor| &ancestor == target_owner)
+        });
+    if matches {
+        record_hit(name, ctx);
+    }
+}
+
+fn leftmost_identifier(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "identifier" => return Some(node),
+            "attribute" => node = node.child_by_field_name("object")?,
+            _ => return None,
+        }
     }
 }
 
@@ -647,7 +729,9 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if let Some(member) = ctx.target_member
         && attribute_text == member
     {
-        if ctx.receiver_binds_target(object_text, node) {
+        if ctx.receiver_binds_target(object_text, node)
+            || (object.kind() == "call" && call_result_matches_target(object, ctx))
+        {
             record_hit(attribute, ctx);
         } else if member_receiver_match_is_unproven(object, object_text, node, ctx) {
             record_unproven_hit(attribute, ctx);
@@ -703,6 +787,80 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if ctx.target_member.is_none() && namespace_match {
         record_hit(attribute, ctx);
     }
+}
+
+fn call_result_matches_target(call: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(target_owner) = ctx.target_owner.as_ref() else {
+        return false;
+    };
+    call_result_types(ctx.analyzer, ctx.py, ctx.file, ctx.source, call)
+        .into_iter()
+        .any(|class| {
+            &class == target_owner
+                || ctx
+                    .analyzer
+                    .type_hierarchy_provider()
+                    .map(|provider| provider.get_ancestors(&class))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .any(|ancestor| &ancestor == target_owner)
+        })
+}
+
+pub(in crate::analyzer::usages) fn call_result_types(
+    analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    call: Node<'_>,
+) -> Vec<CodeUnit> {
+    let Some(function) = call.child_by_field_name("function") else {
+        return Vec::new();
+    };
+    let constructed = resolve_constructor_types(analyzer, py, file, source, function);
+    if !constructed.is_empty() {
+        return constructed;
+    }
+    let callable_fqn = match function.kind() {
+        "identifier" => {
+            let local = slice(function, source);
+            let binder = py.import_binder_of(file);
+            match binder.bindings.get(local) {
+                Some(binding)
+                    if binding.kind == crate::analyzer::usages::model::ImportKind::Named =>
+                {
+                    binding
+                        .imported_name
+                        .as_ref()
+                        .map(|imported| format!("{}.{}", binding.module_specifier, imported))
+                }
+                _ => analyzer
+                    .declarations(file)
+                    .into_iter()
+                    .find(|unit| unit.is_function() && unit.identifier() == local)
+                    .map(|unit| unit.fq_name()),
+            }
+        }
+        _ => None,
+    };
+    let Some(callable_fqn) = callable_fqn else {
+        return Vec::new();
+    };
+    let callables =
+        py.resolve_fqn_candidates(&callable_fqn, |name| analyzer.definitions(name).collect());
+    let mut classes = Vec::new();
+    for callable in callables.into_iter().filter(CodeUnit::is_function) {
+        let Some(raw_type) = callable_return_type_name(analyzer, &callable) else {
+            continue;
+        };
+        if let Some(class) = resolve_receiver_type(analyzer, py, callable.source(), &raw_type, true)
+        {
+            classes.push(class);
+        }
+    }
+    classes.sort();
+    classes.dedup();
+    classes
 }
 
 fn member_receiver_match_is_unproven(
@@ -778,10 +936,14 @@ enum ModuleBindingKind {
 #[derive(Clone, Copy, Debug)]
 struct ClassifiedModuleBindingEvent {
     visible_from: usize,
+    conditional: bool,
     kind: ModuleBindingKind,
 }
 
-fn collect_module_binding_timeline(root: Node<'_>, source: &str) -> ModuleBindingTimeline {
+pub(in crate::analyzer::usages) fn collect_module_binding_timeline(
+    root: Node<'_>,
+    source: &str,
+) -> ModuleBindingTimeline {
     let mut timeline = ModuleBindingTimeline::default();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
@@ -792,6 +954,7 @@ fn collect_module_binding_timeline(root: Node<'_>, source: &str) -> ModuleBindin
                         &mut timeline,
                         slice(name, source),
                         node.end_byte(),
+                        binding_is_conditional(node),
                         ModuleBindingEventKind::Other,
                     );
                 }
@@ -803,13 +966,25 @@ fn collect_module_binding_timeline(root: Node<'_>, source: &str) -> ModuleBindin
             }
             "assignment" | "augmented_assignment" | "named_expression" => {
                 if let Some(left) = node.child_by_field_name("left") {
-                    record_local_binding_targets(left, source, node.end_byte(), &mut timeline);
+                    record_local_binding_targets(
+                        left,
+                        source,
+                        node.end_byte(),
+                        binding_is_conditional(node),
+                        &mut timeline,
+                    );
                 }
                 continue;
             }
             "for_statement" => {
                 if let Some(left) = node.child_by_field_name("left") {
-                    record_local_binding_targets(left, source, left.end_byte(), &mut timeline);
+                    record_local_binding_targets(
+                        left,
+                        source,
+                        left.end_byte(),
+                        true,
+                        &mut timeline,
+                    );
                 }
             }
             _ => {}
@@ -846,6 +1021,7 @@ fn collect_import_binding_events(
                 timeline,
                 slice(local, source),
                 node.end_byte(),
+                binding_is_conditional(node),
                 ModuleBindingEventKind::ImportModule(module.to_string()),
             );
         }
@@ -876,6 +1052,7 @@ fn collect_import_binding_events(
             timeline,
             slice(local, source),
             node.end_byte(),
+            binding_is_conditional(node),
             ModuleBindingEventKind::FromImport {
                 module: module.to_string(),
                 imported_name: imported_name.to_string(),
@@ -930,6 +1107,7 @@ fn classify_module_binding_timeline(
                 };
                 ClassifiedModuleBindingEvent {
                     visible_from: event.visible_from,
+                    conditional: event.conditional,
                     kind: if targets_query {
                         ModuleBindingKind::TargetImport
                     } else {
@@ -958,6 +1136,7 @@ fn record_module_binding(
     timeline: &mut ModuleBindingTimeline,
     name: &str,
     visible_from: usize,
+    conditional: bool,
     kind: ModuleBindingEventKind,
 ) {
     let name = name.trim();
@@ -967,13 +1146,18 @@ fn record_module_binding(
     timeline
         .entry(name.to_string())
         .or_default()
-        .push(ModuleBindingEvent { visible_from, kind });
+        .push(ModuleBindingEvent {
+            visible_from,
+            conditional,
+            kind,
+        });
 }
 
 fn record_local_binding_targets(
     target: Node<'_>,
     source: &str,
     visible_from: usize,
+    conditional: bool,
     timeline: &mut ModuleBindingTimeline,
 ) {
     let mut stack = vec![target];
@@ -983,6 +1167,7 @@ fn record_local_binding_targets(
                 timeline,
                 slice(node, source),
                 visible_from,
+                conditional,
                 ModuleBindingEventKind::Other,
             );
             continue;
@@ -995,6 +1180,31 @@ fn record_local_binding_targets(
         children.reverse();
         stack.extend(children);
     }
+}
+
+fn binding_is_conditional(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if matches!(
+            parent.kind(),
+            "if_statement"
+                | "try_statement"
+                | "except_clause"
+                | "match_statement"
+                | "case_clause"
+                | "for_statement"
+                | "while_statement"
+        ) {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "module" | "function_definition" | "class_definition"
+        ) {
+            return false;
+        }
+        node = parent;
+    }
+    false
 }
 
 fn first_identifier(node: Node<'_>) -> Option<Node<'_>> {

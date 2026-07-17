@@ -11935,6 +11935,131 @@ fn python_from_import_resolves_to_definition() {
 }
 
 #[test]
+fn python_builtin_call_does_not_resolve_to_same_class_method() {
+    let source = concat!(
+        "class Operations:\n",
+        "    def list(self):\n",
+        "        pass\n",
+        "\n",
+        "    def run(self, args):\n",
+        "        return list(args)\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("operations.py", source)
+        .build();
+    let reference = source.rfind("list(args)").expect("built-in list call");
+
+    let value = lookup(
+        project.root(),
+        &location_reference("operations.py", source, reference),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn python_class_body_bare_member_resolves_to_sibling_method() {
+    let source = concat!(
+        "class Operations:\n",
+        "    def list(self):\n",
+        "        pass\n",
+        "\n",
+        "    alias = list\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("operations.py", source)
+        .build();
+    let reference = source.rfind("list").expect("class-body method reference");
+
+    let value = lookup(
+        project.root(),
+        &location_reference("operations.py", source, reference),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "operations.Operations.list",
+        "{value}"
+    );
+}
+
+#[test]
+fn python_module_rebinding_replaces_earlier_import_for_forward_lookup() {
+    let consumer = concat!(
+        "from service import TOKEN\n",
+        "TOKEN = object()\n",
+        "value = TOKEN\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", "TOKEN = object()\n")
+        .file("consumer.py", consumer)
+        .build();
+    let reference = consumer.rfind("TOKEN").expect("post-rebind use");
+
+    let value = lookup(
+        project.root(),
+        &location_reference("consumer.py", consumer, reference),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "consumer.TOKEN",
+        "{value}"
+    );
+}
+
+#[test]
+fn python_reference_before_later_import_does_not_see_future_binding() {
+    let consumer = concat!("value = TOKEN\n", "from service import TOKEN\n");
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", "TOKEN = object()\n")
+        .file("consumer.py", consumer)
+        .build();
+    let reference = consumer.find("TOKEN").expect("pre-import reference");
+
+    let value = lookup(
+        project.root(),
+        &location_reference("consumer.py", consumer, reference),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn python_conditional_module_rebinding_preserves_both_forward_candidates() {
+    let consumer = concat!(
+        "try:\n",
+        "    from service import TOKEN as selected\n",
+        "except ImportError:\n",
+        "    selected = object()\n",
+        "value = selected\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", "TOKEN = object()\n")
+        .file("consumer.py", consumer)
+        .build();
+    let reference = consumer.rfind("selected").expect("joined binding use");
+
+    let value = lookup(
+        project.root(),
+        &location_reference("consumer.py", consumer, reference),
+    );
+    let mut definitions: Vec<&str> = value["results"][0]["definitions"]
+        .as_array()
+        .expect("definitions array")
+        .iter()
+        .filter_map(|definition| definition["fqn"].as_str())
+        .collect();
+    definitions.sort_unstable();
+
+    assert_eq!(
+        definitions,
+        vec!["consumer.selected", "service.TOKEN"],
+        "{value}"
+    );
+}
+
+#[test]
 fn python_reexported_function_call_resolves_to_original_definition() {
     let project = InlineTestProject::with_language(Language::Python)
         .file("src/example/service.py", "def build_service():\n    pass\n")

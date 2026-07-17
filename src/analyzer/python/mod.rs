@@ -232,7 +232,7 @@ impl PythonAnalyzer {
         let mut local_names = HashSet::default();
         for code_unit in declarations {
             let identifier = code_unit.identifier().trim();
-            if identifier.is_empty() || identifier.starts_with('_') {
+            if identifier.is_empty() {
                 continue;
             }
             local_names.insert(identifier.to_string());
@@ -334,9 +334,6 @@ impl PythonAnalyzer {
             return;
         }
         let exported_name = alias.unwrap_or(name.clone());
-        if exported_name.starts_with('_') {
-            return;
-        }
         let imported_name = format!("{resolved_module}.{name}");
         if self.resolve_module_code_unit(&imported_name).is_some() {
             events.push((

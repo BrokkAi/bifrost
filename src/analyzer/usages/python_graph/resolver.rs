@@ -1,6 +1,8 @@
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
+use crate::analyzer::usages::model::{ImportBinder, ImportKind};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, PythonAnalyzer};
 use std::collections::BTreeSet;
+use tree_sitter::Node;
 
 pub(super) fn infer_export_names(analyzer: &PythonAnalyzer, target: &CodeUnit) -> BTreeSet<String> {
     if target_owner_code_unit(analyzer, target).is_some() {
@@ -97,6 +99,7 @@ pub(super) fn target_owner_code_unit(
 
 pub(in crate::analyzer::usages) fn resolve_receiver_type(
     analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
     file: &ProjectFile,
     raw_type: &str,
     target_self_file: bool,
@@ -104,6 +107,20 @@ pub(in crate::analyzer::usages) fn resolve_receiver_type(
     let raw_type = raw_type.trim();
     if raw_type.is_empty() || raw_type.contains('.') || raw_type.contains('|') {
         return None;
+    }
+
+    if let Some(binding) = py.import_binder_of(file).bindings.get(raw_type)
+        && binding.kind == ImportKind::Named
+        && let Some(imported) = binding.imported_name.as_ref()
+    {
+        let fqn = format!("{}.{}", binding.module_specifier, imported);
+        if let Some(class) = py
+            .resolve_fqn_candidates(&fqn, |name| analyzer.definitions(name).collect())
+            .into_iter()
+            .find(CodeUnit::is_class)
+        {
+            return Some(class);
+        }
     }
 
     if let Some(provider) = analyzer.import_analysis_provider()
@@ -125,6 +142,88 @@ pub(in crate::analyzer::usages) fn resolve_receiver_type(
             }
             resolve_indexed_receiver_type(analyzer, file, raw_type)
         })
+}
+
+/// Resolve the class constructed by a Python call callee without interpreting
+/// source text. Bare callees use the import binder or same-file declarations;
+/// qualified callees walk tree-sitter's `attribute` fields back to a namespace
+/// import and append each attribute component structurally.
+pub(in crate::analyzer::usages) fn resolve_constructor_types(
+    analyzer: &dyn IAnalyzer,
+    py: &PythonAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    function: Node<'_>,
+) -> Vec<CodeUnit> {
+    let binder = py.import_binder_of(file);
+    let fqn = match function.kind() {
+        "identifier" => {
+            let local = node_text(function, source);
+            if local.is_empty() {
+                return Vec::new();
+            }
+            match binder.bindings.get(local) {
+                Some(binding) if binding.kind == ImportKind::Named => binding
+                    .imported_name
+                    .as_ref()
+                    .map(|imported| format!("{}.{}", binding.module_specifier, imported)),
+                _ => analyzer
+                    .declarations(file)
+                    .into_iter()
+                    .find(|unit| unit.is_class() && unit.identifier() == local)
+                    .map(|unit| unit.fq_name()),
+            }
+        }
+        "attribute" => namespace_constructor_fqn(&binder, source, function),
+        _ => None,
+    };
+    let Some(fqn) = fqn else {
+        return Vec::new();
+    };
+    let mut classes: Vec<CodeUnit> = py
+        .resolve_fqn_candidates(&fqn, |name| analyzer.definitions(name).collect())
+        .into_iter()
+        .filter(CodeUnit::is_class)
+        .collect();
+    classes.sort();
+    classes.dedup();
+    classes
+}
+
+fn namespace_constructor_fqn(
+    binder: &ImportBinder,
+    source: &str,
+    function: Node<'_>,
+) -> Option<String> {
+    let mut attributes = Vec::new();
+    let mut current = function;
+    while current.kind() == "attribute" {
+        let attribute = current.child_by_field_name("attribute")?;
+        let text = node_text(attribute, source);
+        if text.is_empty() {
+            return None;
+        }
+        attributes.push(text);
+        current = current.child_by_field_name("object")?;
+    }
+    if current.kind() != "identifier" {
+        return None;
+    }
+    let root = node_text(current, source);
+    let binding = binder.bindings.get(root)?;
+    if binding.kind != ImportKind::Namespace {
+        return None;
+    }
+    let mut fqn = binding.module_specifier.clone();
+    for attribute in attributes.into_iter().rev() {
+        fqn.push('.');
+        fqn.push_str(attribute);
+    }
+    Some(fqn)
+}
+
+fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
 }
 
 fn resolve_indexed_receiver_type(

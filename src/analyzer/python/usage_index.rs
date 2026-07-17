@@ -44,6 +44,7 @@ pub(crate) type PythonScopeFacts = HashMap<CodeUnit, LocalBindingsSnapshot<Strin
 #[derive(Clone, Debug)]
 pub(crate) struct ModuleBindingEvent {
     pub(crate) visible_from: usize,
+    pub(crate) conditional: bool,
     pub(crate) kind: ModuleBindingEventKind,
 }
 
@@ -225,7 +226,9 @@ impl PythonUsageIndex {
                     }
                 }
             }
-            if let Some(star_files) = self.star_reexports.get(&seed.0) {
+            if !seed.1.starts_with('_')
+                && let Some(star_files) = self.star_reexports.get(&seed.0)
+            {
                 for star_file in star_files {
                     let next = (star_file.clone(), seed.1.clone());
                     if seeds.insert(next.clone()) {
@@ -367,6 +370,9 @@ fn build_importer_reverse(
                         continue;
                     };
                     for export_name in exports.exports_by_name.keys() {
+                        if export_name.starts_with('_') {
+                            continue;
+                        }
                         reverse
                             .entry(target_file.clone())
                             .or_default()
@@ -476,6 +482,7 @@ mod tests {
                 "target".to_string(),
                 vec![ModuleBindingEvent {
                     visible_from: 12,
+                    conditional: false,
                     kind: ModuleBindingEventKind::Other,
                 }],
             )])

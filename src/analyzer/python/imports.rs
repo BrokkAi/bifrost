@@ -206,11 +206,13 @@ impl PythonAnalyzer {
                 continue;
             }
 
-            for star in index.reexport_stars {
-                for target_file in
-                    self.resolve_module_files_for_export(&file, &star.module_specifier)
-                {
-                    queue.push_back((target_file, export_name.clone()));
+            if !export_name.starts_with('_') {
+                for star in index.reexport_stars {
+                    for target_file in
+                        self.resolve_module_files_for_export(&file, &star.module_specifier)
+                    {
+                        queue.push_back((target_file, export_name.clone()));
+                    }
                 }
             }
         }

@@ -37,7 +37,8 @@ use crate::analyzer::usages::php_graph::{
     resolve_php_function, resolve_php_type,
 };
 use crate::analyzer::usages::python_graph::{
-    collect_assigned_identifiers, collect_scope_facts_from_parsed_source, enclosing_scope_facts,
+    collect_assigned_identifiers, collect_module_binding_timeline,
+    collect_scope_facts_from_parsed_source, enclosing_scope_facts,
     is_declaration_identifier as python_is_declaration_identifier, python_slice,
     resolve_receiver_type as resolve_python_receiver_type,
 };
@@ -69,9 +70,10 @@ use crate::analyzer::usages::scala_graph::{
 use crate::analyzer::{
     AliasResolver, AnalyzerDefinitionLookup, AnalyzerQueryScope, BoundedDefinitionLookup,
     CSharpAnalyzer, CodeUnit, CppAnalyzer, GoAnalyzer, IAnalyzer, ImportAnalysisProvider,
-    ImportInfo, JavaAnalyzer, Language, PhpAnalyzer, ProjectFile, PythonAnalyzer, Range,
-    RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, cpp_include_paths, cpp_node_text,
-    csharp_callable_arity, resolve_analyzer, resolve_include_targets,
+    ImportInfo, JavaAnalyzer, Language, ModuleBindingEventKind, ModuleBindingTimeline, PhpAnalyzer,
+    ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer,
+    cpp_include_paths, cpp_node_text, csharp_callable_arity, resolve_analyzer,
+    resolve_include_targets,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
