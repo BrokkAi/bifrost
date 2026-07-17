@@ -110,7 +110,7 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
             files,
             &specs,
             || scan_scope.is_cancelled(),
-            prepare_file,
+            |file| prepare_file(self.cpp, file),
             |file, prepared, spec| {
                 scan_prepared_file(
                     analyzer,
@@ -291,5 +291,53 @@ mod tests {
 
         assert_eq!(prepared, vec!["first.cpp"]);
         assert_eq!(scanned, vec![("first.cpp", "first-spec")]);
+    }
+
+    #[test]
+    fn file_major_scan_does_not_prepare_when_already_cancelled() {
+        let mut prepared = 0;
+        let mut scanned = 0;
+
+        scan_file_major(
+            ["must-not-prepare.cpp"],
+            &["must-not-scan"],
+            || true,
+            |_| {
+                prepared += 1;
+                Some(())
+            },
+            |_, (), _| {
+                scanned += 1;
+                false
+            },
+        );
+
+        assert_eq!(prepared, 0);
+        assert_eq!(scanned, 0);
+    }
+
+    #[test]
+    fn file_major_scan_rechecks_cancellation_after_preparing() {
+        let cancelled = Cell::new(false);
+        let mut prepared = 0;
+        let mut scanned = 0;
+
+        scan_file_major(
+            ["prepared.cpp"],
+            &["must-not-scan"],
+            || cancelled.get(),
+            |_| {
+                prepared += 1;
+                cancelled.set(true);
+                Some(())
+            },
+            |_, (), _| {
+                scanned += 1;
+                false
+            },
+        );
+
+        assert_eq!(prepared, 1);
+        assert_eq!(scanned, 0);
     }
 }

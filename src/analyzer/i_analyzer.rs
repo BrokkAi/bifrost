@@ -613,6 +613,15 @@ impl<'a> AnalyzerQueryScope<'a> {
         analyzer.begin_query(&context);
         Self { analyzer, context }
     }
+
+    pub(crate) fn store_error(&self) -> Option<StoreError> {
+        self.context.store_error()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_store_error_for_test(&self, error: StoreError) {
+        self.context.record_store_error(error);
+    }
 }
 
 impl Drop for AnalyzerQueryScope<'_> {

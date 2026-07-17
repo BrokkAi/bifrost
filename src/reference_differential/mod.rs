@@ -903,6 +903,9 @@ fn compare_inverse(
     let total = prepared.len();
     let records = Mutex::new(records);
     let completed = Mutex::new(0usize);
+    // Nested UsageFinder queries share this outer request context, allowing
+    // immutable per-file syntax to be prepared once across target groups.
+    let query_scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
     worker_pool.install(|| {
         prepared.par_iter().for_each(|prepared| {
             let target = prepared
@@ -946,7 +949,16 @@ fn compare_inverse(
             });
         });
     });
-    Ok(())
+    finish_inverse_query(&query_scope)
+}
+
+fn finish_inverse_query(
+    query_scope: &crate::analyzer::AnalyzerQueryScope<'_>,
+) -> Result<(), String> {
+    match query_scope.store_error() {
+        Some(error) => Err(format!("inverse analyzer query failed: {error}")),
+        None => Ok(()),
+    }
 }
 
 fn classify_group_result(
@@ -1267,9 +1279,32 @@ fn file_error(path: &str, kind: &str, message: &str) -> ReferenceDifferentialFil
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{AnalyzerConfig, TestProject, WorkspaceAnalyzer};
+    use crate::analyzer::{
+        AnalyzerConfig, CppAnalyzer, TestProject, WorkspaceAnalyzer, resolve_analyzer,
+    };
     use std::cell::Cell;
     use std::fs;
+
+    #[test]
+    fn inverse_query_scope_propagates_store_errors_after_the_batch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let project = Arc::new(TestProject::new(root, Language::Cpp));
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+        scope.record_store_error_for_test(crate::analyzer::store::StoreError::new(
+            "injected inverse read failure",
+        ));
+
+        assert_eq!(
+            scope.store_error().map(|error| error.to_string()),
+            Some("injected inverse read failure".to_string())
+        );
+        assert_eq!(
+            finish_inverse_query(&scope),
+            Err("inverse analyzer query failed: injected inverse read failure".to_string())
+        );
+    }
 
     struct RoundTripFixture {
         corpus_language: &'static str,
@@ -1416,6 +1451,55 @@ mod tests {
                 fixture.corpus_language
             );
         }
+    }
+
+    #[test]
+    fn cpp_inverse_target_groups_share_one_prepared_consumer_syntax_tree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let source = concat!(
+            "void first() {}\n",
+            "void second() {}\n",
+            "void consumer() { first(); second(); }\n",
+        );
+        fs::write(root.join("multi_target.cpp"), source).expect("write fixture");
+        let project = Arc::new(TestProject::new(&root, Language::Cpp));
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
+        let file = ProjectFile::new(&root, "multi_target.cpp");
+        let config = ReferenceDifferentialConfig {
+            corpus_language: "cpp".to_string(),
+            max_files: 10,
+            max_sites: 100,
+            max_candidates_per_file: 100,
+            max_source_bytes: 10_000,
+            max_targets: 100,
+            max_usage_files: 10,
+            max_usages: 100,
+            ..ReferenceDifferentialConfig::default()
+        };
+
+        let report = run_reference_differential(workspace.analyzer(), &config).expect("run audit");
+        for target in ["first", "second"] {
+            let site = report
+                .sites
+                .iter()
+                .find(|site| {
+                    site.text == target && site.source_evidence.contains("void consumer()")
+                })
+                .unwrap_or_else(|| panic!("sampled {target} call: {:#?}", report.sites));
+            assert_eq!(site.forward_status, "resolved", "{site:#?}");
+            assert_eq!(
+                site.classification,
+                ReferenceClassification::Consistent,
+                "{site:#?}"
+            );
+        }
+        assert_eq!(
+            cpp.prepared_syntax_parse_count_for_test(&file),
+            1,
+            "both inverse target groups should reuse the same consumer syntax"
+        );
     }
 
     #[test]

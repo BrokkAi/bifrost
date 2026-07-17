@@ -133,6 +133,18 @@ impl CppAnalyzer {
 }
 
 impl CppAnalyzer {
+    pub(crate) fn prepared_syntax(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
+        self.inner.prepared_syntax(file)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepared_syntax_parse_count_for_test(&self, file: &ProjectFile) -> usize {
+        self.inner.prepared_syntax_parse_count_for_test(file)
+    }
+
     #[doc(hidden)]
     pub fn reset_enclosing_parent_query_counts_for_test(&self) {
         self.inner.reset_enclosing_parent_query_counts_for_test();

@@ -1,4 +1,4 @@
-use crate::analyzer::usages::common::language_for_file;
+use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::usages::cpp_call_match::{
     CppArgType, cpp_filter_candidates_by_args, cpp_literal_type_name, cpp_signature_param_types,
     cpp_type_text_pointer_depth, normalize_cpp_type_name,
@@ -11,12 +11,12 @@ use crate::analyzer::usages::cpp_graph::resolver::*;
 use crate::analyzer::usages::cpp_graph::syntax::explicit_qualified_callable_value;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, cpp_node_text as node_text};
+use crate::analyzer::{CodeUnit, CppAnalyzer, IAnalyzer, ProjectFile, cpp_node_text as node_text};
 use crate::hash::{HashMap, HashSet};
-use crate::text_utils::compute_line_starts;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
-use tree_sitter::{Node, Parser, Tree};
+use std::sync::Arc;
+use tree_sitter::Node;
 
 pub(super) struct ScanState<'a> {
     pub(super) max_usages: usize,
@@ -24,12 +24,6 @@ pub(super) struct ScanState<'a> {
     pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
     pub(super) raw_match_count: &'a mut usize,
     pub(super) limit_exceeded: &'a mut bool,
-}
-
-pub(super) struct PreparedFileScan {
-    source: String,
-    tree: Tree,
-    line_starts: Vec<usize>,
 }
 
 pub(super) struct ScanCtx<'a> {
@@ -61,32 +55,18 @@ pub(super) struct EnclosingContext {
     pub(super) owner: Option<CodeUnit>,
 }
 
-pub(super) fn prepare_file(file: &ProjectFile) -> Option<PreparedFileScan> {
-    if language_for_file(file) != Language::Cpp {
-        return None;
-    }
-    let source = file.read_to_string().ok()?;
-    if source.is_empty() {
-        return None;
-    }
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_cpp::LANGUAGE.into())
-        .ok()?;
-    let tree = parser.parse(source.as_str(), None)?;
-    let line_starts = compute_line_starts(&source);
-    Some(PreparedFileScan {
-        source,
-        tree,
-        line_starts,
-    })
+pub(super) fn prepare_file(
+    cpp: &CppAnalyzer,
+    file: &ProjectFile,
+) -> Option<Arc<PreparedSyntaxTree>> {
+    cpp.prepared_syntax(file)
 }
 
 pub(super) fn scan_prepared_file(
     analyzer: &dyn IAnalyzer,
     visibility: &VisibilityIndex,
     file: &ProjectFile,
-    prepared: &PreparedFileScan,
+    prepared: &PreparedSyntaxTree,
     spec: &TargetSpec,
     target_group: &HashSet<CodeUnit>,
     state: &mut ScanState<'_>,
@@ -99,8 +79,8 @@ pub(super) fn scan_prepared_file(
         analyzer,
         visibility,
         file,
-        source: &prepared.source,
-        line_starts: &prepared.line_starts,
+        source: prepared.source(),
+        line_starts: prepared.line_starts(),
         spec,
         target_group,
         bindings: LocalInferenceEngine::new(LocalInferenceConfig::default()),
@@ -118,9 +98,9 @@ pub(super) fn scan_prepared_file(
         member_owner_cache: RefCell::new(HashMap::default()),
     };
     if needs_using_enum_member_resolution {
-        collect_semantic_using_enums(prepared.tree.root_node(), &mut ctx);
+        collect_semantic_using_enums(prepared.tree().root_node(), &mut ctx);
     }
-    scan_node(prepared.tree.root_node(), &mut ctx);
+    scan_node(prepared.tree().root_node(), &mut ctx);
 }
 
 enum UsingEnumDeclarationScope {
