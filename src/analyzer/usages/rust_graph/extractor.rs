@@ -270,19 +270,14 @@ fn scan_node(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
                         .ok()
                         .map(str::trim)
                         .unwrap_or_default();
-                    if text == "Self" && self_reference_matches_target(node, ctx) {
-                        record_self_reference_hit(node, ctx);
-                    } else if !identifier_is_scoped_path_part(node)
+                    let matching_self_type =
+                        text == "Self" && self_reference_matches_target(node, ctx);
+                    let matching_identifier = !identifier_is_scoped_path_part(node)
                         && ctx.matches_identifier(text)
-                        && !is_shadowed_identifier(text, node, ctx)
-                    {
+                        && !is_shadowed_identifier(text, node, ctx);
+                    if matching_self_type || matching_identifier {
                         record_hit(node, ctx);
                     }
-                }
-                "self"
-                    if self_member_receiver(node) && self_reference_matches_target(node, ctx) =>
-                {
-                    record_self_reference_hit(node, ctx);
                 }
                 _ => {}
             }
@@ -298,15 +293,6 @@ fn identifier_is_scoped_path_part(node: Node<'_>) -> bool {
             parent.kind(),
             "scoped_identifier" | "scoped_type_identifier"
         )
-    })
-}
-
-fn self_member_receiver(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        parent.kind() == "field_expression"
-            && parent
-                .child_by_field_name("value")
-                .is_some_and(|value| same_node(value, node))
     })
 }
 
@@ -328,24 +314,6 @@ fn self_reference_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         Some(type_node.start_byte()),
     )
     .is_some_and(|fqn| fqn_matches_owner(ctx.rust, &fqn, ctx.target))
-}
-
-fn record_self_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    let start = node.start_byte();
-    let end = node.end_byte();
-    let Some(enclosing) = member_hit_enclosing(ctx.analyzer, ctx.file, ctx.line_starts, start, end)
-    else {
-        return;
-    };
-    push_self_receiver_member_hit(
-        ctx.file,
-        ctx.source,
-        ctx.line_starts,
-        start,
-        end,
-        enclosing,
-        ctx.hits,
-    );
 }
 
 fn record_use_import_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
