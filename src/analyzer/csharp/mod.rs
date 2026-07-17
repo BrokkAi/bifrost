@@ -86,6 +86,7 @@ pub struct CSharpAnalyzer {
 }
 
 crate::analyzer::impl_forward_query_provider!(CSharpAnalyzer);
+crate::analyzer::semantic::impl_forward_program_semantics_provider!(CSharpAnalyzer);
 
 impl CSharpAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {

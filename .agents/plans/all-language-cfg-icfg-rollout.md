@@ -22,8 +22,9 @@ This plan keeps CodeQuery and RQL exposure out of scope because issue #824 owns 
 - [x] (2026-07-17 10:35+02:00) Passed the 10-test `semantic_ir_contract` baseline and completed two pre-checkpoint architecture reviews; resolved sequencing, matched-return, budget, interface, self-containment, per-language checkpoint, and benchmark-gate findings.
 - [x] (2026-07-17 11:40+02:00) Milestone 1a: added procedure-local control-edge identities, immutable bidirectional adjacency, storage-independent traversal, defensive validation, bounded deterministic rendering, and focused graph-contract tests.
 - [x] (2026-07-17 11:40+02:00) Closed all post-milestone invariant, architecture, and adversarial-test findings; passed 65 semantic unit tests, 10 semantic IR contract tests, 6 CFG contract tests, formatting, diff checks, strict all-target/all-feature clippy, and the complete elevated `nlp,python` suite (1,017 library tests passed, 4 ignored, plus every binary, integration, and doc-test target).
-- [ ] Milestone 1b: add a request-scoped, file-aware production semantic provider and the private iterative CFG lowering engine.
-- [ ] Milestone 1c: implement the TypeScript and TSX callable CFG adapter plus source-backed assertion harness.
+- [x] (2026-07-17 14:34+02:00) Milestone 1b: added the request-scoped, file-aware production semantic provider, exact bounded source snapshots, complete-artifact cache lifecycle, and private iterative CFG lowering engine.
+- [x] (2026-07-17 14:34+02:00) Milestone 1c: implemented the TypeScript and TSX callable CFG adapter plus source-backed predecessor/successor assertion harness, typed advanced-control gaps, and disconnected dead-region sealing.
+- [x] (2026-07-17 14:34+02:00) Closed the Milestone 1b/1c post-review findings and passed 88 semantic unit tests, 29 CFG contract tests, 11 provider contract tests, 10 semantic IR contract tests, formatting, diff checks, strict all-target/all-feature clippy, and the complete elevated `nlp,python` suite.
 - [ ] Milestone 2: implement Java, run labeled TypeScript/Java differential cases, measure physical adjacency choices, and stabilize the CFG lowering contract without declaring the cross-procedural contract frozen.
 - [ ] Milestone 3: expose the location-first dispatch slice, implement one demand-materialized ICFG for TypeScript and Java, then freeze the shared CFG/dispatch/ICFG adapter contract after focused review.
 - [ ] Milestone 4a: roll the common CFG and ICFG contract through JavaScript and JSX, then review and checkpoint it independently.
@@ -70,6 +71,15 @@ This plan keeps CodeQuery and RQL exposure out of scope because issue #824 owns 
 - Observation: this macOS host needs PyO3 dynamic symbol lookup, and several full-suite tests need host process, GPG, filesystem, and sidecar access.
   Evidence: the first isolated feature-suite attempt failed at unresolved `_Py*` symbols, and the sandboxed corrected attempt passed compilation but failed six permission-dependent tests. The pinned Rust 1.96 invocation with `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup'`, semantic indexing disabled, and the final host-access rerun passed the complete suite.
 
+- Observation: a source-hash-only overlay key is insufficient even when adjacent overlay revisions contain identical bytes.
+  Evidence: the production provider now obtains bounded disk or overlay source, monotonic overlay revision, origin, dialect, tree, and line starts as one exact snapshot. Tests prove that adjacent overlay generations do not reuse stale artifacts and that TS and TSX remain distinct.
+
+- Observation: preserving syntactically present dead code requires a graph-level isolation rule in addition to syntax-specific abrupt-completion recognition.
+  Evidence: exhaustive switches and compound dead tails exposed how a future construct could leave an unreachable region connected to a real exit. The iterative reachability seal keeps dead-to-dead topology but removes every edge from an entry-unreachable source to an entry-reachable point or either real exit.
+
+- Observation: the current complete-artifact cache still prepares and parses syntax before it can discover a cache hit.
+  Evidence: post-milestone review found no correctness issue, but identified this as a measurement target for #817; moving lookup earlier requires retaining exact snapshot identity without reintroducing a source race.
+
 ## Decision Log
 
 - Decision: use semantic program points as canonical CFG nodes and derive basic blocks as maximal straight-line groups.
@@ -99,6 +109,22 @@ This plan keeps CodeQuery and RQL exposure out of scope because issue #824 owns 
 - Decision: lower from the exact `prepared_syntax` snapshot and make provider materialization file- and dialect-aware.
   Rationale: this prevents overlay races, preserves TS versus TSX identity, and keeps the provider cache keyed by the source snapshot actually lowered.
   Date/Author: 2026-07-17 / Codex and user.
+
+- Decision: discover source through a bounded atomic snapshot operation before parsing, and include source origin plus overlay revision in materialization identity.
+  Rationale: budget rejection must happen before retaining or parsing an oversized file, while two overlays with the same bytes can still be distinct editor generations. The key and artifact must describe exactly the syntax that was lowered.
+  Date/Author: 2026-07-17 / Codex after Milestone 1b implementation and review.
+
+- Decision: cache only complete immutable artifacts in a conservative byte-weighted per-analyzer cache with cancellation-aware per-key single flight.
+  Rationale: entry-count limits do not bound retained graph memory, partial or cancelled artifacts cannot satisfy later complete requests, and concurrent equal requests should lower once. Oversized artifacts are handed to current waiters without entering the cache, and content-valid entries survive analyzer updates.
+  Date/Author: 2026-07-17 / Codex after Milestone 1b implementation and review.
+
+- Decision: treat TypeScript call targets as unknown until the location-first dispatch slice lands.
+  Rationale: syntax lowering can model evaluation, call events, and both continuations exactly, but claiming a name-only callee would duplicate or preempt the authoritative resolver. The ICFG milestone owns resolved, ambiguous, unresolved, external, truncated, cancelled, and exhausted dispatch outcomes.
+  Date/Author: 2026-07-17 / Codex after Milestone 1c implementation.
+
+- Decision: seal unreachable regions generically before CFG freeze while preserving their internal topology.
+  Rationale: every adapter must retain dead source points, but no entry-unreachable point may reach live control or either actual procedure exit. A shared iterative graph rule enforces that acceptance invariant even when a language adapter encounters a newly abrupt construct.
+  Date/Author: 2026-07-17 / Codex after Milestone 1c post-review.
 
 - Decision: use one neutral ICFG provider fed by language CFG and dispatch adapters.
   Rationale: call, normal-return, exceptional-return, recursion, multiple targets, and unresolved boundaries have the same graph semantics across languages. Language differences belong in syntax lowering and dispatch evidence rather than eleven ICFG implementations.
@@ -134,13 +160,19 @@ This plan keeps CodeQuery and RQL exposure out of scope because issue #824 owns 
 
 ## Outcomes & Retrospective
 
-Milestone 1a is complete. The #814 flat edge list is now frozen into one canonical rich-edge table with procedure-local `ControlEdgeId`s, source-sliced outgoing rows, incoming edge-ID rows, exact allocation-free predecessor/successor traversal, scoped edge handles, corruption checks, and atomic retained-work accounting. Rich parallel edges remain distinct even when they share topology, invalid point IDs fail explicitly, and incoming rows cannot hydrate in a noncanonical order. Semantic IR schema version 2 renders literal edge IDs plus predecessor/successor adjacency within the existing transactional output budget.
+Milestone 1a is complete. The #814 flat edge list is now frozen into one canonical rich-edge table with procedure-local `ControlEdgeId`s, source-sliced outgoing rows, incoming edge-ID rows, exact allocation-free predecessor/successor traversal, scoped edge handles, corruption checks, and atomic retained-work accounting. Rich parallel edges remain distinct even when they share topology, invalid point IDs fail explicitly, and incoming rows cannot hydrate in a noncanonical order. Schema version 2 introduced the edge-ID substrate and literal predecessor/successor rendering; schema version 3 appends the later capability vocabulary without changing those adjacency APIs.
 
-The new `semantic_cfg_contract` multiline inline-project fixture proves exact successors and predecessors, adjacency symmetry, branches, cycles, disconnected points, parallel kinds and provenance, deterministic IDs under permuted construction, and source-backed rendering without asserting raw construction IDs as semantic identities. Post-milestone reviews found and verified fixes for topology over-counting, maximum-ID traversal, incoming-row ordering, and self-referential renderer assertions. All checkpoint gates are green. Milestone 1b now owns the file-aware request boundary and private iterative lowering engine; no production language adapter is claimed by this checkpoint.
+The new `semantic_cfg_contract` multiline inline-project fixture proves exact successors and predecessors, adjacency symmetry, branches, cycles, disconnected points, parallel kinds and provenance, deterministic IDs under permuted construction, and source-backed rendering without asserting raw construction IDs as semantic identities. Post-milestone reviews found and verified fixes for topology over-counting, maximum-ID traversal, incoming-row ordering, and self-referential renderer assertions.
+
+Milestones 1b and 1c are complete. `ProgramSemanticsProvider::materialize(file, request)` now routes through `AnalyzerDelegate` and `WorkspaceAnalyzer`, consumes one bounded disk-or-overlay syntax snapshot, preserves TS versus TSX dialect identity, and returns explicit complete, partial, cancelled, budget-exhausted, unsupported, or failed outcomes. Its byte-weighted complete-only cache deduplicates concurrent lowering, respects cancellation, hands oversized artifacts to current waiters without retaining them, and reuses content-valid entries across analyzer updates. Prospective builder accounting and one atomic publication charge keep budget failure and cancellation from publishing misleading complete work.
+
+TypeScript and TSX now enumerate real functions, methods, constructors, lambdas, expression bodies, and static initializers, then lower sequencing, branches, switch flow, loops, labeled and abrupt completion, nested-call evaluation, optional and short-circuit control, throw/catch/finally, and supported async topology through the private iterative engine. Advanced or inexact behavior such as resource management, generators, implicit exceptions, deferred execution, and unknown control is represented by capability- and point-scoped gaps. A shared iterative seal preserves dead-region topology while preventing disconnected source from reaching either real exit. The inline semantic-graph harness resolves readable source-backed aliases and asserts exact predecessor/successor edges, symmetry, reachability, and deterministic bounded topology without exposing raw dense identities.
+
+Post-milestone specialist review found no remaining blocker. All focused suites, strict clippy, formatting, diff checks, and the full `nlp,python` repository gate pass. The nonblocking follow-ups are to introduce a dedicated `ProcedureSelector` if later cross-language fixtures need more disambiguation than the current procedure qualifiers provide, and to measure whether exact cache identity can be obtained before syntax preparation. Milestone 2 now adds Java and uses the TypeScript/Java differential suite plus physical-layout measurements to stabilize the callable-CFG contract.
 
 ## Context and Orientation
 
-The semantic subsystem lives under `src/analyzer/semantic/`. `ids.rs` defines durable mounted-source identities plus dense artifact- and procedure-local IDs. `capabilities.rs` states whether a semantic feature is complete, partial, or unsupported. `provider.rs` defines budgets, outcomes, and `ProgramSemanticsProvider`; it currently has only mock implementations. `ir.rs` owns the immutable semantic artifact, procedure rows, program points, effects, calls, control edges, gaps, evidence, validation, and bounded rendering. `mod.rs` re-exports the supported surface.
+The semantic subsystem lives under `src/analyzer/semantic/`. `ids.rs` defines durable mounted-source identities plus dense artifact- and procedure-local IDs. `capabilities.rs` states whether a semantic feature is complete, partial, or unsupported. `provider.rs` defines budgets, outcomes, cancellation, and the atomic file-aware `ProgramSemanticsProvider`; `service.rs` owns one-snapshot publication and complete-artifact caching, while `cfg.rs` owns private iterative graph construction. Routed analyzers without a real adapter return an explicit unsupported outcome, and TypeScript is the first production lowerer. `ir.rs` owns the immutable semantic artifact, procedure rows, program points, effects, calls, control edges, gaps, evidence, validation, and bounded rendering. `mod.rs` re-exports the supported surface.
 
 `src/compact_graph.rs` contains checked compact row storage and a payloadless directed graph. Reuse or generalize its row primitives, but do not force rich CFG edges into the payloadless source-target abstraction.
 
@@ -563,3 +595,5 @@ Plan revision note (2026-07-17): Pre-checkpoint architecture review split the re
 Plan revision note (2026-07-17): A second pre-checkpoint review moved contract freeze after the TypeScript/Java ICFG review; replaced placeholder provider types with the existing cancellation token and `Arc<SemanticArtifact>`; defined cancellation, dispatch, transfer, snapshot-limit, and edge shapes; made builder accounting prospective with one atomic publication charge; corrected source paths and terminology; added exact per-milestone files and commands; and predeclared benchmark datasets, repetitions, output markers, overlay policy, and representation/persistence thresholds.
 
 Plan revision note (2026-07-17): Completed Milestone 1a after three specialist reviews. The semantic CFG now uses schema-v2 canonical rich-edge IDs, outgoing offsets, incoming edge-ID rows, exact bidirectional traversal, scoped handles, deterministic bounded rendering, and defensive corruption validation. Review tightened provenance-parallel topology accounting, invalid-ID behavior, canonical incoming hydration, and literal renderer-schema coverage. Focused tests, formatting, strict all-feature clippy, and the complete `nlp,python` suite pass; the latter requires the documented macOS PyO3 dynamic-lookup flags and host access for process-dependent tests.
+
+Plan revision note (2026-07-17): Completed Milestones 1b and 1c after specialist cache/provider, TypeScript-control, and final adversarial reviews. The production provider now atomically lowers one bounded, origin- and overlay-revision-aware syntax snapshot; publishes only validated outcomes; and shares complete artifacts through a byte-weighted, cancellation-aware single-flight cache. The first real adapter covers TypeScript and TSX callable control, retains dead syntax behind a generic reachability seal, and reports advanced omissions as exact typed gaps. The inline graph harness asserts source-backed predecessor/successor topology. All focused and repository gates pass; Java is the next checkpoint.

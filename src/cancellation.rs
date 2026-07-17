@@ -7,16 +7,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// loops stop at explicit checkpoints. The token does not forcibly terminate
 /// threads or encode a domain-specific error.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct CancellationToken {
+pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
 }
 
 impl CancellationToken {
-    pub(crate) fn cancel(&self) {
+    pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
 
-    pub(crate) fn is_cancelled(&self) -> bool {
+    pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }
 }

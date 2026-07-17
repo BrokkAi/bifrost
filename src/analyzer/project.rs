@@ -6,6 +6,7 @@ use ignore::{WalkBuilder, WalkState};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
@@ -33,6 +34,66 @@ const OVERLAY_REJECTION_LOG_THROTTLE: Duration = Duration::from_secs(60);
 /// if that doesn't reclaim enough, the rest are dropped wholesale (worst
 /// case: a few paths emit one redundant log line each).
 const OVERLAY_REJECTION_LOG_MAX_ENTRIES: usize = 256;
+
+/// Opaque, process-local revision assigned whenever an overlay is accepted.
+///
+/// Revisions are monotonic across live [`OverlayProject`] snapshots. Source
+/// consumers use them only as identity tokens; source content remains the
+/// authoritative semantic revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OverlayRevision(u64);
+
+impl OverlayRevision {
+    /// Construct a token from a producer-owned monotonic counter.
+    ///
+    /// Project implementations, rather than consumers, assign these values.
+    pub const fn from_monotonic_counter(value: u64) -> Self {
+        assert!(value != 0, "overlay revisions start at one");
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Origin captured together with one immutable project source snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProjectSourceOrigin {
+    Disk,
+    Overlay(OverlayRevision),
+}
+
+/// Immutable source text and its origin captured by one project read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectSourceSnapshot {
+    source: Arc<str>,
+    origin: ProjectSourceOrigin,
+}
+
+impl ProjectSourceSnapshot {
+    pub fn disk(source: impl Into<Arc<str>>) -> Self {
+        Self {
+            source: source.into(),
+            origin: ProjectSourceOrigin::Disk,
+        }
+    }
+
+    pub fn overlay(source: impl Into<Arc<str>>, revision: OverlayRevision) -> Self {
+        Self {
+            source: source.into(),
+            origin: ProjectSourceOrigin::Overlay(revision),
+        }
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub const fn origin(&self) -> ProjectSourceOrigin {
+        self.origin
+    }
+}
 
 pub trait Project: Send + Sync {
     fn root(&self) -> &Path;
@@ -83,9 +144,12 @@ pub trait Project: Send + Sync {
         file: &ProjectFile,
         max_bytes: usize,
     ) -> io::Result<Option<String>> {
-        let mut source = Vec::with_capacity(max_bytes.saturating_add(1));
+        let mut source = Vec::new();
+        let read_limit = u64::try_from(max_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
         std::fs::File::open(file.abs_path())?
-            .take(max_bytes.saturating_add(1) as u64)
+            .take(read_limit)
             .read_to_end(&mut source)?;
         if source.len() > max_bytes {
             return Ok(None);
@@ -93,6 +157,27 @@ pub trait Project: Send + Sync {
         String::from_utf8(source)
             .map(Some)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    }
+
+    /// Capture source text and its disk/overlay identity in one read.
+    ///
+    /// Ordinary projects are disk-backed. Overlay projects override this so
+    /// the text and its opaque revision are cloned under the same read lock.
+    fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
+        self.read_source(file).map(ProjectSourceSnapshot::disk)
+    }
+
+    /// Capture one source snapshot only when it fits in `max_bytes`.
+    ///
+    /// `None` means the exact snapshot exceeded the limit. Implementations
+    /// must decide that before returning source text to parser clients.
+    fn read_source_snapshot_limited(
+        &self,
+        file: &ProjectFile,
+        max_bytes: usize,
+    ) -> io::Result<Option<ProjectSourceSnapshot>> {
+        self.read_source_limited(file, max_bytes)
+            .map(|source| source.map(ProjectSourceSnapshot::disk))
     }
 
     /// True when an in-memory overlay is shadowing `file`'s disk content.
@@ -572,12 +657,19 @@ pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>>
 /// writing to disk.
 pub struct OverlayProject {
     delegate: Arc<dyn Project>,
-    overlays: Arc<RwLock<HashMap<PathBuf, Arc<str>>>>,
+    overlays: Arc<RwLock<HashMap<PathBuf, Arc<OverlayEntry>>>>,
+    next_overlay_revision: Arc<AtomicU64>,
     max_overlay_bytes: usize,
     /// Last instant we emitted a rejection log for a given path. Kept on a
     /// separate throttle helper so the per-keystroke read path doesn't
     /// contend with rejection logging on the main overlay lock.
     last_rejection_log: ThrottledLog<PathBuf>,
+}
+
+#[derive(Debug)]
+struct OverlayEntry {
+    source: Arc<str>,
+    revision: OverlayRevision,
 }
 
 impl OverlayProject {
@@ -591,6 +683,7 @@ impl OverlayProject {
         Self {
             delegate,
             overlays: Arc::new(RwLock::new(HashMap::new())),
+            next_overlay_revision: Arc::new(AtomicU64::new(0)),
             max_overlay_bytes,
             last_rejection_log: ThrottledLog::new(
                 OVERLAY_REJECTION_LOG_THROTTLE,
@@ -608,6 +701,7 @@ impl OverlayProject {
         Self {
             delegate: Arc::clone(&self.delegate),
             overlays: Arc::new(RwLock::new(overlays)),
+            next_overlay_revision: Arc::clone(&self.next_overlay_revision),
             max_overlay_bytes: self.max_overlay_bytes,
             last_rejection_log: ThrottledLog::new(
                 OVERLAY_REJECTION_LOG_THROTTLE,
@@ -633,10 +727,25 @@ impl OverlayProject {
                 .remove(&abs_path);
             return false;
         }
-        self.overlays
-            .write()
-            .expect("overlay lock poisoned")
-            .insert(abs_path, Arc::from(content));
+        let mut overlays = self.overlays.write().expect("overlay lock poisoned");
+        let previous = self
+            .next_overlay_revision
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("overlay revision space exhausted");
+        let revision = OverlayRevision::from_monotonic_counter(
+            previous
+                .checked_add(1)
+                .expect("successful overlay revision update cannot overflow"),
+        );
+        overlays.insert(
+            abs_path,
+            Arc::new(OverlayEntry {
+                source: Arc::from(content),
+                revision,
+            }),
+        );
         true
     }
 
@@ -724,15 +833,8 @@ impl Project for OverlayProject {
     }
 
     fn read_source(&self, file: &ProjectFile) -> io::Result<String> {
-        if let Some(text) = self
-            .overlays
-            .read()
-            .expect("overlay lock poisoned")
-            .get(&file.abs_path())
-        {
-            return Ok(text.to_string());
-        }
-        self.delegate.read_source(file)
+        self.read_source_snapshot(file)
+            .map(|snapshot| snapshot.source().to_owned())
     }
 
     fn read_source_limited(
@@ -740,15 +842,43 @@ impl Project for OverlayProject {
         file: &ProjectFile,
         max_bytes: usize,
     ) -> io::Result<Option<String>> {
-        if let Some(text) = self
+        self.read_source_snapshot_limited(file, max_bytes)
+            .map(|snapshot| snapshot.map(|snapshot| snapshot.source().to_owned()))
+    }
+
+    fn read_source_snapshot(&self, file: &ProjectFile) -> io::Result<ProjectSourceSnapshot> {
+        let entry = self
             .overlays
             .read()
             .expect("overlay lock poisoned")
             .get(&file.abs_path())
-        {
-            return Ok((text.len() <= max_bytes).then(|| text.to_string()));
+            .cloned();
+        if let Some(entry) = entry {
+            return Ok(ProjectSourceSnapshot::overlay(
+                Arc::clone(&entry.source),
+                entry.revision,
+            ));
         }
-        self.delegate.read_source_limited(file, max_bytes)
+        self.delegate.read_source_snapshot(file)
+    }
+
+    fn read_source_snapshot_limited(
+        &self,
+        file: &ProjectFile,
+        max_bytes: usize,
+    ) -> io::Result<Option<ProjectSourceSnapshot>> {
+        let entry = self
+            .overlays
+            .read()
+            .expect("overlay lock poisoned")
+            .get(&file.abs_path())
+            .cloned();
+        if let Some(entry) = entry {
+            return Ok((entry.source.len() <= max_bytes).then(|| {
+                ProjectSourceSnapshot::overlay(Arc::clone(&entry.source), entry.revision)
+            }));
+        }
+        self.delegate.read_source_snapshot_limited(file, max_bytes)
     }
 
     fn has_overlay(&self, file: &ProjectFile) -> bool {
@@ -904,6 +1034,62 @@ mod tests {
     }
 
     #[test]
+    fn source_snapshots_are_bounded_and_preserve_overlay_revision_identity() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let disk_source = "fn disk() {}\n";
+        let file = write_file(&root, "lib.rs", disk_source);
+        let delegate: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
+        let overlay = OverlayProject::new(delegate);
+
+        let disk = overlay.read_source_snapshot(&file).unwrap();
+        assert_eq!(disk.source(), disk_source);
+        assert_eq!(disk.origin(), ProjectSourceOrigin::Disk);
+        assert!(
+            overlay
+                .read_source_snapshot_limited(&file, disk_source.len() - 1)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            overlay
+                .read_source_snapshot_limited(&file, disk_source.len())
+                .unwrap()
+                .unwrap(),
+            disk
+        );
+
+        let repeated_source = "fn repeated() {}\n";
+        assert!(overlay.set(file.abs_path(), repeated_source.to_owned()));
+        let first = overlay.read_source_snapshot(&file).unwrap();
+        let ProjectSourceOrigin::Overlay(first_revision) = first.origin() else {
+            panic!("accepted overlay snapshot must carry an overlay revision");
+        };
+
+        assert!(overlay.set(file.abs_path(), "fn middle() {}\n".to_owned()));
+        let middle = overlay.read_source_snapshot(&file).unwrap();
+        let ProjectSourceOrigin::Overlay(middle_revision) = middle.origin() else {
+            panic!("replacement overlay snapshot must carry an overlay revision");
+        };
+        assert!(overlay.set(file.abs_path(), repeated_source.to_owned()));
+        let repeated = overlay.read_source_snapshot(&file).unwrap();
+        let ProjectSourceOrigin::Overlay(repeated_revision) = repeated.origin() else {
+            panic!("repeated overlay snapshot must carry an overlay revision");
+        };
+
+        assert_eq!(first.source(), repeated.source());
+        assert!(first_revision < middle_revision);
+        assert!(middle_revision < repeated_revision);
+        assert_ne!(first_revision, repeated_revision);
+        assert!(
+            overlay
+                .read_source_snapshot_limited(&file, repeated_source.len() - 1)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn overlay_project_snapshot_isolated_from_later_edits() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -921,10 +1107,18 @@ mod tests {
                 frozen.get(&file.abs_path()).unwrap(),
             ));
         }
+        let frozen_revision = match snapshot.read_source_snapshot(&file).unwrap().origin() {
+            ProjectSourceOrigin::Overlay(revision) => revision,
+            ProjectSourceOrigin::Disk => panic!("snapshot should retain its overlay"),
+        };
         assert!(overlay.set(file.abs_path(), "fn second() {}\n".to_string()));
 
         assert_eq!(snapshot.read_source(&file).unwrap(), "fn first() {}\n");
         assert_eq!(overlay.read_source(&file).unwrap(), "fn second() {}\n");
+        assert_eq!(
+            snapshot.read_source_snapshot(&file).unwrap().origin(),
+            ProjectSourceOrigin::Overlay(frozen_revision)
+        );
     }
 
     #[test]

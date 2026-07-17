@@ -48,6 +48,7 @@ pub struct JavaAnalyzer {
 }
 
 crate::analyzer::impl_forward_query_provider!(JavaAnalyzer);
+crate::analyzer::semantic::impl_forward_program_semantics_provider!(JavaAnalyzer);
 
 impl JavaAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {

@@ -114,7 +114,8 @@ pub(crate) use php::{
 pub(crate) use pool_memo::PoolSafeMemo;
 pub use project::{
     DEFAULT_MAX_OVERLAY_BYTES, FileSetProject, FilesystemProject, MultiRootProject, OverlayProject,
-    Project, TestProject, collect_workspace_files,
+    OverlayRevision, Project, ProjectSourceOrigin, ProjectSourceSnapshot, TestProject,
+    collect_workspace_files,
 };
 pub use python::PythonAnalyzer;
 pub(crate) use python::{

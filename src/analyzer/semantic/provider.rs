@@ -4,9 +4,9 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::analyzer::ProjectFile;
+use crate::cancellation::CancellationToken;
 
-use super::capabilities::{SemanticCapabilities, SemanticCapability};
-use super::ids::{SemanticArtifactKey, SemanticLanguage};
+use super::capabilities::SemanticCapability;
 use super::ir::{SemanticArtifact, SemanticIrError};
 
 /// Declare every independently bounded semantic-materialization dimension once.
@@ -60,10 +60,16 @@ macro_rules! semantic_budget_dimensions {
                 }
             }
 
-            fn checked_add(self, other: Self) -> Option<Self> {
+            pub(crate) fn checked_add(self, other: Self) -> Option<Self> {
                 Some(Self {
                     $($field: self.$field.checked_add(other.$field)?),+
                 })
+            }
+
+            pub(crate) fn component_max(self, other: Self) -> Self {
+                Self {
+                    $($field: self.$field.max(other.$field)),+
+                }
             }
 
             fn saturating_sub(self, other: Self) -> Self {
@@ -188,8 +194,8 @@ impl SemanticBudget {
         self.limits.saturating_sub(self.used)
     }
 
-    /// Atomically charge work; a failed charge leaves the budget unchanged.
-    pub fn charge(&mut self, work: SemanticWork) -> Result<(), SemanticBudgetExceeded> {
+    /// Check one atomic charge without mutating this budget.
+    pub fn check(&self, work: SemanticWork) -> Result<(), SemanticBudgetExceeded> {
         for dimension in SemanticBudgetDimension::ALL {
             let limit = self.limits.get(dimension);
             let Some(attempted) = self.used.get(dimension).checked_add(work.get(dimension)) else {
@@ -207,6 +213,12 @@ impl SemanticBudget {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// Atomically charge work; a failed charge leaves the budget unchanged.
+    pub fn charge(&mut self, work: SemanticWork) -> Result<(), SemanticBudgetExceeded> {
+        self.check(work)?;
         self.used = self
             .used
             .checked_add(work)
@@ -250,6 +262,10 @@ pub enum SemanticOutcome<T> {
         exceeded: SemanticBudgetExceeded,
         work: SemanticWork,
     },
+    Cancelled {
+        partial: Option<T>,
+        work: SemanticWork,
+    },
 }
 
 impl<T> SemanticOutcome<T> {
@@ -260,7 +276,8 @@ impl<T> SemanticOutcome<T> {
             | Self::Unknown { work, .. }
             | Self::Unsupported { work, .. }
             | Self::Unproven { work, .. }
-            | Self::ExceededBudget { work, .. } => *work,
+            | Self::ExceededBudget { work, .. }
+            | Self::Cancelled { work, .. } => *work,
         }
     }
 
@@ -275,7 +292,8 @@ impl<T> SemanticOutcome<T> {
             | Self::Ambiguous { .. }
             | Self::Unknown { .. }
             | Self::Unsupported { .. }
-            | Self::Unproven { .. } => None,
+            | Self::Unproven { .. }
+            | Self::Cancelled { .. } => None,
         }
     }
 
@@ -285,7 +303,8 @@ impl<T> SemanticOutcome<T> {
             Self::Ambiguous { candidates, .. } => Some(candidates),
             Self::Unknown { partial, .. }
             | Self::Unsupported { partial, .. }
-            | Self::ExceededBudget { partial, .. } => partial.as_ref(),
+            | Self::ExceededBudget { partial, .. }
+            | Self::Cancelled { partial, .. } => partial.as_ref(),
             Self::Unproven { partial, .. } => Some(partial),
         }
     }
@@ -326,6 +345,28 @@ impl<T> SemanticOutcome<T> {
                 exceeded,
                 work,
             },
+            Self::Cancelled { partial, work } => SemanticOutcome::Cancelled {
+                partial: partial.map(mapper),
+                work,
+            },
+        }
+    }
+}
+
+/// Request-local controls for one semantic materialization.
+///
+/// The provider borrows both values so cancellation and retained-payload
+/// accounting remain owned by the caller rather than hidden in an adapter.
+pub struct SemanticRequest<'a> {
+    pub budget: &'a mut SemanticBudget,
+    pub cancellation: &'a CancellationToken,
+}
+
+impl<'a> SemanticRequest<'a> {
+    pub fn new(budget: &'a mut SemanticBudget, cancellation: &'a CancellationToken) -> Self {
+        Self {
+            budget,
+            cancellation,
         }
     }
 }
@@ -387,133 +428,49 @@ impl std::error::Error for SemanticProviderError {
 
 /// A standalone per-language adapter boundary for immutable semantic artifacts.
 pub trait ProgramSemanticsProvider: Send + Sync {
-    fn language(&self) -> SemanticLanguage;
-
-    fn capabilities(&self) -> &SemanticCapabilities;
-
-    /// Derive the immutable snapshot identity while charging source reads,
-    /// hashing, and other key-materialization work to `budget`.
-    fn artifact_key(
+    /// Prepare one exact file snapshot, derive its identity, and lower it as
+    /// one linearized operation. Implementations cache only complete artifacts.
+    fn materialize(
         &self,
         file: &ProjectFile,
-        budget: &mut SemanticBudget,
-    ) -> Result<SemanticOutcome<SemanticArtifactKey>, SemanticProviderError>;
-
-    /// Materialize semantic rows and their nested payload while charging every
-    /// retained fact, edge, event, nested entry, and owned byte to `budget`.
-    fn artifact(
-        &self,
-        key: &SemanticArtifactKey,
-        budget: &mut SemanticBudget,
+        request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError>;
 }
+
+macro_rules! impl_forward_program_semantics_provider {
+    ($analyzer:ty) => {
+        impl crate::analyzer::semantic::ProgramSemanticsProvider for $analyzer {
+            fn materialize(
+                &self,
+                file: &crate::analyzer::ProjectFile,
+                request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+            ) -> Result<
+                crate::analyzer::semantic::SemanticOutcome<
+                    std::sync::Arc<crate::analyzer::semantic::SemanticArtifact>,
+                >,
+                crate::analyzer::semantic::SemanticProviderError,
+            > {
+                self.inner.materialize_unsupported_semantics(file, request)
+            }
+        }
+    };
+}
+
+pub(crate) use impl_forward_program_semantics_provider;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::Language;
 
-    use super::super::ids::{
-        AdapterSemanticsVersion, ConfigurationFingerprint, ContentIdentity, DependencyFingerprint,
-        SemanticIrVersion, SourceRevision, WorkspaceMountId, WorkspaceRelativePath,
-    };
+    struct FailingProgramSemanticsProvider(SemanticProviderError);
 
-    const KEY_WORK: SemanticWork = SemanticWork {
-        source_bytes: 3,
-        owned_text_bytes: 5,
-        procedures: 0,
-        blocks: 0,
-        program_points: 0,
-        values: 0,
-        allocations: 0,
-        call_sites: 0,
-        memory_locations: 0,
-        captures: 0,
-        source_mappings: 0,
-        evidence: 0,
-        gaps: 0,
-        events: 0,
-        control_edges: 0,
-        nested_entries: 0,
-    };
-
-    struct MockProgramSemanticsProvider {
-        capabilities: SemanticCapabilities,
-        key_error: Option<SemanticProviderError>,
-    }
-
-    impl MockProgramSemanticsProvider {
-        fn successful() -> Self {
-            Self {
-                capabilities: SemanticCapabilities::default(),
-                key_error: None,
-            }
-        }
-
-        fn failing(error: SemanticProviderError) -> Self {
-            Self {
-                capabilities: SemanticCapabilities::default(),
-                key_error: Some(error),
-            }
-        }
-
-        fn key_for(file: &ProjectFile) -> Result<SemanticArtifactKey, SemanticProviderError> {
-            let path = WorkspaceRelativePath::try_from_path(file.rel_path())
-                .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-            Ok(SemanticArtifactKey::new(
-                WorkspaceMountId::hash_bytes(b"mock mount"),
-                path,
-                SemanticLanguage::Standard(Language::TypeScript),
-                SourceRevision::Disk {
-                    content: ContentIdentity::hash_bytes(b"mock content"),
-                },
-                AdapterSemanticsVersion::hash_bytes("mock-typescript", b"adapter-v1")
-                    .expect("mock adapter name is non-empty"),
-                SemanticIrVersion::current(),
-                ConfigurationFingerprint::hash_bytes(b"mock configuration"),
-                DependencyFingerprint::hash_bytes(b"mock dependencies"),
-            ))
-        }
-    }
-
-    impl ProgramSemanticsProvider for MockProgramSemanticsProvider {
-        fn language(&self) -> SemanticLanguage {
-            SemanticLanguage::Standard(Language::TypeScript)
-        }
-
-        fn capabilities(&self) -> &SemanticCapabilities {
-            &self.capabilities
-        }
-
-        fn artifact_key(
+    impl ProgramSemanticsProvider for FailingProgramSemanticsProvider {
+        fn materialize(
             &self,
-            file: &ProjectFile,
-            budget: &mut SemanticBudget,
-        ) -> Result<SemanticOutcome<SemanticArtifactKey>, SemanticProviderError> {
-            if let Err(exceeded) = budget.charge(KEY_WORK) {
-                return Ok(SemanticOutcome::ExceededBudget {
-                    partial: None,
-                    exceeded,
-                    work: budget.used(),
-                });
-            }
-            if let Some(error) = &self.key_error {
-                return Err(error.clone());
-            }
-            Ok(SemanticOutcome::Complete {
-                value: Self::key_for(file)?,
-                work: KEY_WORK,
-            })
-        }
-
-        fn artifact(
-            &self,
-            _key: &SemanticArtifactKey,
-            _budget: &mut SemanticBudget,
+            _file: &ProjectFile,
+            _request: &mut SemanticRequest<'_>,
         ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
-            Err(SemanticProviderError::internal(
-                "mock artifact materialization is not configured",
-            ))
+            Err(self.0.clone())
         }
     }
 
@@ -578,34 +535,16 @@ mod tests {
     }
 
     #[test]
-    fn provider_trait_object_charges_key_work_and_returns_semantics_inside_result() {
-        let provider_impl = MockProgramSemanticsProvider::successful();
-        let provider: &dyn ProgramSemanticsProvider = &provider_impl;
-        let mut budget = SemanticBudget::uniform(10).unwrap();
-
-        let outcome = provider
-            .artifact_key(&mock_file(), &mut budget)
-            .expect("operational key derivation succeeds");
-
-        let SemanticOutcome::Complete { value, work } = outcome else {
-            panic!("semantic unknown/unsupported/budget outcomes remain inside operational Ok")
-        };
-        assert_eq!(value.path().as_str(), "src/mock.ts");
-        assert_eq!(work, KEY_WORK);
-        assert_eq!(budget.used(), KEY_WORK);
-        assert_eq!(provider.language(), value.language());
-        assert_eq!(provider.capabilities(), &SemanticCapabilities::default());
-    }
-
-    #[test]
     fn provider_trait_object_round_trips_operational_error() {
         let expected = SemanticProviderError::source_access("mock source is unavailable");
-        let provider_impl = MockProgramSemanticsProvider::failing(expected.clone());
+        let provider_impl = FailingProgramSemanticsProvider(expected.clone());
         let provider: &dyn ProgramSemanticsProvider = &provider_impl;
         let mut budget = SemanticBudget::uniform(10).unwrap();
+        let cancellation = CancellationToken::default();
+        let mut request = SemanticRequest::new(&mut budget, &cancellation);
 
         let actual = provider
-            .artifact_key(&mock_file(), &mut budget)
+            .materialize(&mock_file(), &mut request)
             .expect_err("source access failure is operational, not semantic unknown");
 
         assert_eq!(actual, expected);
@@ -613,7 +552,7 @@ mod tests {
             actual.to_string(),
             "semantic source access failed: mock source is unavailable"
         );
-        assert_eq!(budget.used(), KEY_WORK);
+        assert_eq!(budget.used(), SemanticWork::default());
     }
 
     #[test]
@@ -691,6 +630,10 @@ mod tests {
                     limit: 2,
                     attempted: 3,
                 },
+                work,
+            },
+            SemanticOutcome::Cancelled {
+                partial: Some(7),
                 work,
             },
         ];

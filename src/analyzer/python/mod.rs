@@ -60,6 +60,7 @@ pub struct PythonAnalyzer {
 }
 
 crate::analyzer::impl_forward_query_provider!(PythonAnalyzer);
+crate::analyzer::semantic::impl_forward_program_semantics_provider!(PythonAnalyzer);
 
 impl PythonAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {

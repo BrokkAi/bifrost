@@ -1,4 +1,5 @@
 use crate::analyzer::cognitive_complexity;
+use crate::analyzer::project::{OverlayRevision, ProjectSourceOrigin, ProjectSourceSnapshot};
 use crate::analyzer::store::liveness::{LivePathEntry, LivePathMap, LiveSnapshot, Liveness};
 use crate::analyzer::store::query::QueryResolver;
 use crate::analyzer::store::{
@@ -7,9 +8,9 @@ use crate::analyzer::store::{
 };
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, CppTemplateMetadata, DeclarationInfo,
-    GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language, Project, ProjectFile, Range,
-    RubyMethodDispatchMode, SearchSymbolCandidate, SignatureMetadata, SummaryFileProjection,
-    UsageFactsIndex,
+    GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language, LanguageDialect, Project,
+    ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate, SignatureMetadata,
+    SummaryFileProjection, UsageFactsIndex,
 };
 use crate::gitblob;
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
@@ -381,6 +382,9 @@ pub(crate) struct PreparedSyntaxTree {
     file_state: Arc<FileState>,
     tree: Tree,
     line_starts: Vec<usize>,
+    dialect: LanguageDialect,
+    origin: PreparedSourceOrigin,
+    overlay_revision: Option<OverlayRevision>,
 }
 
 impl PreparedSyntaxTree {
@@ -394,6 +398,40 @@ impl PreparedSyntaxTree {
 
     pub(crate) fn line_starts(&self) -> &[usize] {
         &self.line_starts
+    }
+
+    pub(crate) const fn dialect(&self) -> LanguageDialect {
+        self.dialect
+    }
+
+    pub(crate) const fn origin(&self) -> PreparedSourceOrigin {
+        self.origin
+    }
+
+    pub(crate) const fn overlay_revision(&self) -> Option<OverlayRevision> {
+        self.overlay_revision
+    }
+}
+
+/// How the exact source snapshot selected for a prepared syntax tree entered
+/// the analyzer. The content digest remains authoritative; this marker keeps
+/// disk and unsaved-overlay revisions distinct even when their bytes match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum PreparedSourceOrigin {
+    Disk,
+    Overlay,
+}
+
+/// The requested source snapshot exceeded a caller-supplied preparation cap.
+/// `minimum_source_bytes` is the smallest size proven by the bounded read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreparedSyntaxLimitExceeded {
+    minimum_source_bytes: usize,
+}
+
+impl PreparedSyntaxLimitExceeded {
+    pub(crate) const fn minimum_source_bytes(self) -> usize {
+        self.minimum_source_bytes
     }
 }
 
@@ -543,6 +581,24 @@ struct FileStateCacheKey {
     rel_path: std::path::PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PreparedSyntaxCacheKey {
+    file_state: FileStateCacheKey,
+    origin: PreparedSourceOrigin,
+    overlay_revision: Option<OverlayRevision>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedLiveSource {
+    oid: Oid,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedPreparedSource {
+    oid: Oid,
+    snapshot: ProjectSourceSnapshot,
+}
+
 #[derive(Debug)]
 struct BoundedFileCache<T> {
     capacity: usize,
@@ -558,8 +614,11 @@ struct QueryReadCache {
     contexts: Vec<Arc<crate::analyzer::AnalyzerQueryContext>>,
     live_oids: HashMap<ProjectFile, Option<Oid>>,
     analyzed_live_files: Option<Vec<ProjectFile>>,
+    live_sources: HashMap<ProjectFile, Option<ResolvedLiveSource>>,
+    prepared_sources: HashMap<ProjectFile, Option<ResolvedPreparedSource>>,
     file_states: HashMap<FileStateCacheKey, Arc<FileState>>,
-    prepared_syntax: HashMap<FileStateCacheKey, Arc<OnceLock<Option<Arc<PreparedSyntaxTree>>>>>,
+    prepared_syntax:
+        HashMap<PreparedSyntaxCacheKey, Arc<OnceLock<Option<Arc<PreparedSyntaxTree>>>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -579,6 +638,8 @@ impl QueryReadCache {
         if self.contexts.is_empty() {
             self.live_oids.clear();
             self.analyzed_live_files = None;
+            self.live_sources.clear();
+            self.prepared_sources.clear();
             self.file_states.clear();
             self.prepared_syntax.clear();
         }
@@ -596,6 +657,8 @@ impl QueryReadCache {
         if self.contexts.is_empty() {
             self.live_oids.clear();
             self.analyzed_live_files = None;
+            self.live_sources.clear();
+            self.prepared_sources.clear();
             self.file_states.clear();
             self.prepared_syntax.clear();
         }
@@ -629,16 +692,32 @@ impl QueryReadCache {
         }
     }
 
+    fn prepared_source(&self, file: &ProjectFile) -> Option<Option<ResolvedPreparedSource>> {
+        self.prepared_sources.get(file).cloned()
+    }
+
+    fn retain_prepared_source(
+        &mut self,
+        file: ProjectFile,
+        source: Option<ResolvedPreparedSource>,
+    ) {
+        if self.prepared_sources.contains_key(&file)
+            || self.prepared_sources.len() < QUERY_PREPARED_SYNTAX_CACHE_CAPACITY
+        {
+            self.prepared_sources.insert(file, source);
+        }
+    }
+
     fn prepared_syntax_cell(
         &mut self,
-        key: FileStateCacheKey,
+        key: PreparedSyntaxCacheKey,
     ) -> Option<Arc<OnceLock<Option<Arc<PreparedSyntaxTree>>>>> {
         self.prepared_syntax_cell_with_capacity(key, QUERY_PREPARED_SYNTAX_CACHE_CAPACITY)
     }
 
     fn prepared_syntax_cell_with_capacity(
         &mut self,
-        key: FileStateCacheKey,
+        key: PreparedSyntaxCacheKey,
         capacity: usize,
     ) -> Option<Arc<OnceLock<Option<Arc<PreparedSyntaxTree>>>>> {
         if !self.is_active() {
@@ -1074,6 +1153,7 @@ pub struct TreeSitterAnalyzer<A> {
     /// hash of the current in-memory source, so surviving stale entries are
     /// self-healing rather than wrong.
     structural_cache: Arc<crate::analyzer::structural::provider::StructuralFactsCache>,
+    semantic_cache: crate::analyzer::semantic::service::CompleteSemanticArtifactCache,
     store_context: AnalyzerStoreContext,
     /// Per-request persisted read model. Live OIDs are validated once and
     /// hydrated states remain available for the graph traversal.
@@ -1109,6 +1189,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             config: self.config.clone(),
             state: Arc::clone(&self.state),
             structural_cache: Arc::clone(&self.structural_cache),
+            semantic_cache: self.semantic_cache.clone(),
             store_context: self.store_context.clone(),
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
             #[cfg(test)]
@@ -1267,12 +1348,16 @@ where
         state.seed_snapshot_file_states(&mut source_snapshot_file_states);
 
         let structural_cache = Arc::new(Self::build_structural_cache(&config));
+        let semantic_cache = crate::analyzer::semantic::service::CompleteSemanticArtifactCache::new(
+            config.memo_cache_budget_bytes() / 8,
+        );
         Ok(Self {
             project,
             adapter,
             config,
             state,
             structural_cache,
+            semantic_cache,
             store_context,
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
             #[cfg(test)]
@@ -1317,6 +1402,42 @@ where
         &self,
     ) -> &crate::analyzer::structural::provider::StructuralFactsCache {
         &self.structural_cache
+    }
+
+    pub(crate) fn materialize_unsupported_semantics(
+        &self,
+        file: &ProjectFile,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::SemanticOutcome<
+            Arc<crate::analyzer::semantic::SemanticArtifact>,
+        >,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        let lowerer = crate::analyzer::semantic::service::UnsupportedProgramSemanticsLowerer::new(
+            self.adapter.language(),
+        );
+        self.materialize_semantics_with_lowerer(&lowerer, file, request)
+    }
+
+    pub(crate) fn materialize_semantics_with_lowerer(
+        &self,
+        lowerer: &dyn crate::analyzer::semantic::service::ProgramSemanticsLowerer,
+        file: &ProjectFile,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::SemanticOutcome<
+            Arc<crate::analyzer::semantic::SemanticArtifact>,
+        >,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        crate::analyzer::semantic::service::materialize_with_lowerer(
+            self,
+            &self.semantic_cache,
+            lowerer,
+            file,
+            request,
+        )
     }
 
     /// Resolve a persistence identity for the exact source string being
@@ -1382,6 +1503,7 @@ where
         config: AnalyzerConfig,
         state: AnalyzerRuntimeState,
         structural_cache: Arc<crate::analyzer::structural::provider::StructuralFactsCache>,
+        semantic_cache: crate::analyzer::semantic::service::CompleteSemanticArtifactCache,
         store_context: AnalyzerStoreContext,
     ) -> Self {
         let mut source_snapshot_file_states =
@@ -1393,6 +1515,7 @@ where
             config,
             state: Arc::new(state),
             structural_cache,
+            semantic_cache,
             store_context,
             query_read_cache: Arc::new(Mutex::new(QueryReadCache::default())),
             #[cfg(test)]
@@ -2618,6 +2741,15 @@ where
         file: &ProjectFile,
         key: &FileStateCacheKey,
     ) -> Option<Arc<FileState>> {
+        self.fetch_file_state_for_key_with_source(file, key, None)
+    }
+
+    fn fetch_file_state_for_key_with_source(
+        &self,
+        file: &ProjectFile,
+        key: &FileStateCacheKey,
+        exact_source: Option<&str>,
+    ) -> Option<Arc<FileState>> {
         let storage_key = self.adapter.storage_language_key_for_file(file);
         if let Some(state) = self.retry_dirty_file_state(key, &storage_key) {
             return Some(state);
@@ -2647,7 +2779,10 @@ where
         }
 
         self.full_hydration_count.fetch_add(1, Ordering::Relaxed);
-        let source = self.source_for_oid(file, key.oid)?;
+        let source = match exact_source {
+            Some(source) => source.to_owned(),
+            None => self.source_for_oid(file, key.oid)?,
+        };
         let mut state = match self
             .store_query_or_record(
                 self.store_context.store.hydrate_file_state_with_source(
@@ -2682,39 +2817,84 @@ where
     }
 
     pub(crate) fn prepared_syntax(&self, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>> {
-        let oid = self.resolve_live_oid_for_file(file)?;
-        let key = Self::transient_cache_key(oid, file);
+        self.prepared_syntax_with_limit(file, None).ok().flatten()
+    }
+
+    /// Prepare syntax from one atomically captured project source snapshot,
+    /// refusing snapshots larger than `max_source_bytes` before parsing.
+    pub(crate) fn prepared_syntax_limited(
+        &self,
+        file: &ProjectFile,
+        max_source_bytes: usize,
+    ) -> Result<Option<Arc<PreparedSyntaxTree>>, PreparedSyntaxLimitExceeded> {
+        self.prepared_syntax_with_limit(file, Some(max_source_bytes))
+    }
+
+    fn prepared_syntax_with_limit(
+        &self,
+        file: &ProjectFile,
+        max_source_bytes: Option<usize>,
+    ) -> Result<Option<Arc<PreparedSyntaxTree>>, PreparedSyntaxLimitExceeded> {
+        let Some(resolved) = self.resolve_prepared_source(file, max_source_bytes)? else {
+            return Ok(None);
+        };
+        let key = Self::transient_cache_key(resolved.oid, file);
+        let (origin, overlay_revision) = match resolved.snapshot.origin() {
+            ProjectSourceOrigin::Disk => (PreparedSourceOrigin::Disk, None),
+            ProjectSourceOrigin::Overlay(revision) => {
+                (PreparedSourceOrigin::Overlay, Some(revision))
+            }
+        };
+        let prepared_key = PreparedSyntaxCacheKey {
+            file_state: key.clone(),
+            origin,
+            overlay_revision,
+        };
         let cell = self
             .query_read_cache
             .lock()
             .expect("query read cache mutex poisoned")
-            .prepared_syntax_cell(key.clone());
+            .prepared_syntax_cell(prepared_key);
         let Some(cell) = cell else {
-            return self.prepare_syntax_for_key(file, &key);
+            return Ok(self.prepare_syntax_for_key(
+                file,
+                &key,
+                origin,
+                overlay_revision,
+                resolved.snapshot.source(),
+            ));
         };
-        cell.get_or_init(|| {
-            #[cfg(test)]
-            {
-                let mut counts = self
-                    .prepared_syntax_parse_counts
-                    .lock()
-                    .expect("prepared syntax parse count mutex poisoned");
-                *counts.entry(key.clone()).or_default() += 1;
-            }
-            self.prepare_syntax_for_key(file, &key)
-        })
-        .clone()
+        Ok(cell
+            .get_or_init(|| {
+                #[cfg(test)]
+                {
+                    let mut counts = self
+                        .prepared_syntax_parse_counts
+                        .lock()
+                        .expect("prepared syntax parse count mutex poisoned");
+                    *counts.entry(key.clone()).or_default() += 1;
+                }
+                self.prepare_syntax_for_key(
+                    file,
+                    &key,
+                    origin,
+                    overlay_revision,
+                    resolved.snapshot.source(),
+                )
+            })
+            .clone())
     }
 
     fn prepare_syntax_for_key(
         &self,
         file: &ProjectFile,
         key: &FileStateCacheKey,
+        origin: PreparedSourceOrigin,
+        overlay_revision: Option<OverlayRevision>,
+        exact_source: &str,
     ) -> Option<Arc<PreparedSyntaxTree>> {
-        let file_state = self.fetch_file_state_for_key(file, key)?;
-        if file_state.source.is_empty() {
-            return None;
-        }
+        let file_state =
+            self.fetch_file_state_for_key_with_source(file, key, Some(exact_source))?;
         let mut parser = Parser::new();
         parser
             .set_language(&self.adapter.parser_language_for_file(file))
@@ -2725,6 +2905,9 @@ where
             file_state,
             tree,
             line_starts,
+            dialect: LanguageDialect::for_path(self.adapter.language(), file.rel_path()),
+            origin,
+            overlay_revision,
         }))
     }
 
@@ -2912,16 +3095,73 @@ where
         out
     }
 
-    fn resolve_live_oid_for_file(&self, file: &ProjectFile) -> Option<Oid> {
+    fn resolve_prepared_source(
+        &self,
+        file: &ProjectFile,
+        max_source_bytes: Option<usize>,
+    ) -> Result<Option<ResolvedPreparedSource>, PreparedSyntaxLimitExceeded> {
         {
             let cache = self
                 .query_read_cache
                 .lock()
                 .expect("query read cache mutex poisoned");
             if cache.is_active()
-                && let Some(oid) = cache.live_oids.get(file).copied()
+                && let Some(cached) = cache.prepared_source(file)
             {
-                return oid;
+                if let (Some(source), Some(max_source_bytes)) = (&cached, max_source_bytes)
+                    && source.snapshot.source().len() > max_source_bytes
+                {
+                    return Err(PreparedSyntaxLimitExceeded {
+                        minimum_source_bytes: source.snapshot.source().len(),
+                    });
+                }
+                return Ok(cached);
+            }
+        }
+
+        let snapshot = match max_source_bytes {
+            Some(max_source_bytes) => {
+                match self
+                    .project
+                    .read_source_snapshot_limited(file, max_source_bytes)
+                {
+                    Ok(Some(snapshot)) => Some(snapshot),
+                    Ok(None) => {
+                        return Err(PreparedSyntaxLimitExceeded {
+                            minimum_source_bytes: max_source_bytes.saturating_add(1),
+                        });
+                    }
+                    Err(_) => None,
+                }
+            }
+            None => self.project.read_source_snapshot(file).ok(),
+        };
+        let resolved = snapshot.and_then(|snapshot| {
+            Oid::hash_object(ObjectType::Blob, snapshot.source().as_bytes())
+                .ok()
+                .map(|oid| ResolvedPreparedSource { oid, snapshot })
+        });
+
+        let mut cache = self
+            .query_read_cache
+            .lock()
+            .expect("query read cache mutex poisoned");
+        if cache.is_active() {
+            cache.retain_prepared_source(file.clone(), resolved.clone());
+        }
+        Ok(resolved)
+    }
+
+    fn resolve_live_source_for_file(&self, file: &ProjectFile) -> Option<ResolvedLiveSource> {
+        {
+            let cache = self
+                .query_read_cache
+                .lock()
+                .expect("query read cache mutex poisoned");
+            if cache.is_active()
+                && let Some(source) = cache.live_sources.get(file).copied()
+            {
+                return source;
             }
         }
         #[cfg(test)]
@@ -2933,36 +3173,44 @@ where
                 .entry(file.clone())
                 .or_default() += 1;
         }
-        let oid = if self.project.has_overlay(file) {
+        let source = if self.project.has_overlay(file) {
             let source = self.project.read_source(file).ok()?;
-            Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok()
+            Oid::hash_object(ObjectType::Blob, source.as_bytes())
+                .ok()
+                .map(|oid| ResolvedLiveSource { oid })
         } else if let Some(oid) = self
             .store_context
             .live_paths
             .snapshot()
             .validated_oid_for_path(file)
         {
-            Some(oid)
+            Some(ResolvedLiveSource { oid })
         } else if let Some(liveness) = self.store_context.liveness.as_ref()
             && let Ok(Some(oid)) = liveness.oid_for_path(file)
         {
-            Some(oid)
+            Some(ResolvedLiveSource { oid })
         } else if file.exists()
             && let Ok(bytes) = std::fs::read(file.abs_path())
             && let Ok(oid) = Oid::hash_object(ObjectType::Blob, &bytes)
         {
-            Some(oid)
+            Some(ResolvedLiveSource { oid })
         } else {
             self.git_index_oid_for_file(file)
+                .map(|oid| ResolvedLiveSource { oid })
         };
         let mut cache = self
             .query_read_cache
             .lock()
             .expect("query read cache mutex poisoned");
         if cache.is_active() {
-            cache.live_oids.insert(file.clone(), oid);
+            cache.live_sources.insert(file.clone(), source);
         }
-        oid
+        source
+    }
+
+    fn resolve_live_oid_for_file(&self, file: &ProjectFile) -> Option<Oid> {
+        self.resolve_live_source_for_file(file)
+            .map(|source| source.oid)
     }
 
     #[cfg(test)]
@@ -4993,6 +5241,7 @@ where
             self.config.clone(),
             state,
             Arc::clone(&self.structural_cache),
+            self.semantic_cache.clone(),
             store_context,
         )
     }
@@ -5013,6 +5262,7 @@ where
             self.config.clone(),
             state,
             Arc::clone(&self.structural_cache),
+            self.semantic_cache.clone(),
             store_context,
         )
     }
@@ -5492,7 +5742,9 @@ mod tests {
     use crate::analyzer::rust::RustAdapter;
     use crate::analyzer::store::AnalyzerStore;
     use crate::analyzer::typescript::TypescriptAdapter;
-    use crate::analyzer::{AnalyzerConfig, IAnalyzer, JavaAnalyzer, Language, TestProject};
+    use crate::analyzer::{
+        AnalyzerConfig, IAnalyzer, JavaAnalyzer, Language, OverlayProject, TestProject,
+    };
     use git2::{ObjectType, Oid};
     use std::path::{Path, PathBuf};
     use std::sync::{Barrier, Condvar, RwLock};
@@ -5500,7 +5752,7 @@ mod tests {
     #[derive(Clone)]
     struct CountingOverlayProject {
         delegate: TestProject,
-        source: Arc<RwLock<String>>,
+        source: Arc<RwLock<(String, u64)>>,
         reads: Arc<AtomicUsize>,
     }
 
@@ -5508,13 +5760,18 @@ mod tests {
         fn new(root: impl Into<std::path::PathBuf>, source: impl Into<String>) -> Self {
             Self {
                 delegate: TestProject::new(root, Language::Rust),
-                source: Arc::new(RwLock::new(source.into())),
+                source: Arc::new(RwLock::new((source.into(), 1))),
                 reads: Arc::new(AtomicUsize::new(0)),
             }
         }
 
         fn set_source(&self, source: impl Into<String>) {
-            *self.source.write().expect("source lock poisoned") = source.into();
+            let mut current = self.source.write().expect("source lock poisoned");
+            current.0 = source.into();
+            current.1 = current
+                .1
+                .checked_add(1)
+                .expect("test overlay revision space exhausted");
         }
 
         fn reset_reads(&self) {
@@ -5549,7 +5806,19 @@ mod tests {
 
         fn read_source(&self, _file: &ProjectFile) -> std::io::Result<String> {
             self.reads.fetch_add(1, Ordering::Relaxed);
-            Ok(self.source.read().expect("source lock poisoned").clone())
+            Ok(self.source.read().expect("source lock poisoned").0.clone())
+        }
+
+        fn read_source_snapshot(
+            &self,
+            _file: &ProjectFile,
+        ) -> std::io::Result<ProjectSourceSnapshot> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let current = self.source.read().expect("source lock poisoned");
+            Ok(ProjectSourceSnapshot::overlay(
+                current.0.clone(),
+                OverlayRevision::from_monotonic_counter(current.1),
+            ))
         }
 
         fn has_overlay(&self, _file: &ProjectFile) -> bool {
@@ -6329,6 +6598,9 @@ mod tests {
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_cache(
                 &config,
             )),
+            crate::analyzer::semantic::service::CompleteSemanticArtifactCache::new(
+                config.memo_cache_budget_bytes() / 8,
+            ),
             store_context,
         );
 
@@ -6468,6 +6740,9 @@ mod tests {
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_cache(
                 &config,
             )),
+            crate::analyzer::semantic::service::CompleteSemanticArtifactCache::new(
+                config.memo_cache_budget_bytes() / 8,
+            ),
             store_context,
         );
 
@@ -6538,6 +6813,9 @@ mod tests {
             Arc::new(TreeSitterAnalyzer::<PythonAdapter>::build_structural_cache(
                 &config,
             )),
+            crate::analyzer::semantic::service::CompleteSemanticArtifactCache::new(
+                config.memo_cache_budget_bytes() / 8,
+            ),
             store_context,
         );
 
@@ -6962,13 +7240,21 @@ mod tests {
         let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
         let mut cache = QueryReadCache::default();
         cache.begin(&context);
-        let first = FileStateCacheKey {
-            oid: Oid::hash_object(ObjectType::Blob, b"first").expect("first oid"),
-            rel_path: PathBuf::from("first.cpp"),
+        let first = PreparedSyntaxCacheKey {
+            file_state: FileStateCacheKey {
+                oid: Oid::hash_object(ObjectType::Blob, b"first").expect("first oid"),
+                rel_path: PathBuf::from("first.cpp"),
+            },
+            origin: PreparedSourceOrigin::Disk,
+            overlay_revision: None,
         };
-        let second = FileStateCacheKey {
-            oid: Oid::hash_object(ObjectType::Blob, b"second").expect("second oid"),
-            rel_path: PathBuf::from("second.cpp"),
+        let second = PreparedSyntaxCacheKey {
+            file_state: FileStateCacheKey {
+                oid: Oid::hash_object(ObjectType::Blob, b"second").expect("second oid"),
+                rel_path: PathBuf::from("second.cpp"),
+            },
+            origin: PreparedSourceOrigin::Disk,
+            overlay_revision: None,
         };
 
         let first_cell = cache
@@ -7097,6 +7383,93 @@ mod tests {
             first.tree().root_node().to_sexp(),
             second.tree().root_node().to_sexp()
         );
+    }
+
+    #[test]
+    fn prepared_syntax_limited_rejects_oversized_source_before_parsing() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/main.rs");
+        let source = "fn target() {}\nfn consumer() { target(); }\n";
+        file.write(source).expect("rust source");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+        let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+
+        let exceeded = analyzer
+            .prepared_syntax_limited(&file, source.len() - 1)
+            .expect_err("source larger than the caller cap must not be parsed");
+        assert_eq!(exceeded.minimum_source_bytes(), source.len());
+        assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 0);
+
+        let prepared = analyzer
+            .prepared_syntax_limited(&file, source.len())
+            .expect("exact source-size cap should be accepted")
+            .expect("bounded source should prepare");
+        assert_eq!(prepared.source(), source);
+        assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 1);
+    }
+
+    #[test]
+    fn prepared_syntax_accepts_an_empty_source_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/empty.rs");
+        file.write("").expect("empty rust source");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+
+        let prepared = analyzer
+            .prepared_syntax_limited(&file, 0)
+            .expect("empty source fits a zero-byte preparation cap")
+            .expect("empty source remains valid syntax input");
+
+        assert_eq!(prepared.source(), "");
+        assert_eq!(prepared.origin(), PreparedSourceOrigin::Disk);
+        assert_eq!(prepared.overlay_revision(), None);
+    }
+
+    #[test]
+    fn prepared_syntax_cache_identity_distinguishes_repeated_overlay_content() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/main.rs");
+        file.write("fn disk() {}\n").expect("rust source");
+        let base: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
+        let overlay = Arc::new(OverlayProject::new(base));
+        let analyzer =
+            TreeSitterAnalyzer::new(Arc::clone(&overlay) as Arc<dyn Project>, RustAdapter);
+        let repeated_source = "fn repeated() {}\n";
+
+        assert!(overlay.set(file.abs_path(), repeated_source.to_owned()));
+        let first = {
+            let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            analyzer.prepared_syntax(&file).expect("first overlay")
+        };
+        assert!(overlay.set(file.abs_path(), "fn middle() {}\n".to_owned()));
+        let middle = {
+            let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            analyzer.prepared_syntax(&file).expect("middle overlay")
+        };
+        assert!(overlay.set(file.abs_path(), repeated_source.to_owned()));
+        let repeated = {
+            let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            analyzer.prepared_syntax(&file).expect("repeated overlay")
+        };
+
+        assert_eq!(first.source(), repeated.source());
+        assert_eq!(first.origin(), PreparedSourceOrigin::Overlay);
+        assert_eq!(middle.origin(), PreparedSourceOrigin::Overlay);
+        assert_eq!(repeated.origin(), PreparedSourceOrigin::Overlay);
+        let first_revision = first.overlay_revision().expect("first overlay revision");
+        let middle_revision = middle.overlay_revision().expect("middle overlay revision");
+        let repeated_revision = repeated
+            .overlay_revision()
+            .expect("repeated overlay revision");
+        assert!(first_revision < middle_revision);
+        assert!(middle_revision < repeated_revision);
+        assert_ne!(first_revision, repeated_revision);
+        assert!(!Arc::ptr_eq(&first, &repeated));
     }
 
     #[test]

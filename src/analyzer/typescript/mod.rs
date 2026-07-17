@@ -47,6 +47,9 @@ use crate::analyzer::usages::js_ts_graph::{
     JsTsUsageIndex, build_jsts_usage_index, build_jsts_usage_index_with_cancellation,
 };
 use crate::cancellation::CancellationToken;
+
+mod semantic;
+
 #[derive(Debug, Clone, Default)]
 pub struct TypescriptAdapter;
 
