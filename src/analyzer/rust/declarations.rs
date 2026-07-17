@@ -901,19 +901,23 @@ pub(super) fn collect_rust_type_identifiers(
     source: &str,
     identifiers: &mut HashSet<String>,
 ) {
-    match node.kind() {
-        "identifier" | "type_identifier" | "field_identifier" => {
-            let text = rust_node_text(node, source).trim();
-            if !text.is_empty() {
-                identifiers.insert(text.to_string());
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "identifier" | "type_identifier" | "field_identifier" => {
+                let text = rust_node_text(node, source).trim();
+                if !text.is_empty() {
+                    identifiers.insert(text.to_string());
+                }
+            }
+            _ => {}
+        }
+
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                pending.push(child);
             }
         }
-        _ => {}
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_rust_type_identifiers(child, source, identifiers);
     }
 }
 

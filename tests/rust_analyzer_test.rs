@@ -25,6 +25,32 @@ fn definition(analyzer: &RustAnalyzer, fq_name: &str) -> CodeUnit {
 }
 
 #[test]
+fn rust_identifier_collection_handles_deep_valid_type_on_small_stack() {
+    let depth = 1_024;
+    let mut source = String::from("struct Wrap<T>(T);\nstruct Leaf;\ntype Deep = ");
+    source.push_str(&"Wrap<".repeat(depth));
+    source.push_str("Leaf");
+    source.push_str(&">".repeat(depth));
+    source.push_str(";\n");
+
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", "struct Marker;\n")
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let identifiers = std::thread::Builder::new()
+        .name("deep-rust-identifier-collection".to_string())
+        .stack_size(256 * 1024)
+        .spawn(move || analyzer.extract_type_identifiers(&source))
+        .expect("spawn deep Rust identifier collector")
+        .join()
+        .expect("deep Rust identifier collector must not overflow");
+
+    assert!(identifiers.contains("Deep"));
+    assert!(identifiers.contains("Wrap"));
+    assert!(identifiers.contains("Leaf"));
+}
+
+#[test]
 fn test_module_class_and_function_code_units() {
     let analyzer = RustAnalyzer::from_project(rust_project(&[(
         "lib.rs",
