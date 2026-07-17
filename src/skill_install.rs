@@ -88,6 +88,10 @@ const CODE_SKILL_NAMES: &[&str] = &[
 
 const EMBEDDED_SKILLS: &[EmbeddedSkill] = &[
     EmbeddedSkill {
+        name: "adversarial-test-sweep",
+        content: include_str!("../plugins/bifrost-agent/skills/adversarial-test-sweep/SKILL.md"),
+    },
+    EmbeddedSkill {
         name: "bifrost-code-navigation",
         content: include_str!("../plugins/bifrost-agent/skills/bifrost-code-navigation/SKILL.md"),
     },

@@ -105,6 +105,9 @@ tools:
   `get_summaries` and `get_symbol_sources`.
 - `bifrost-codebase-search`: symbol, usage, file, and related-file discovery
   with shell grep reserved for arbitrary text.
+- `brokk-adversarial-test-sweep`: comprehensive test-suite hardening across
+  edge cases, malformed inputs, concurrency, resource pressure, corrupted
+  state, invalid assumptions, and weak or redundant coverage.
 - `brokk-git-exploration`: git-history exploration and commit inspection.
 - `brokk-guided-issue`: end-to-end GitHub issue resolution.
 - `brokk-guided-review`: interactive review of local changes, branches, or

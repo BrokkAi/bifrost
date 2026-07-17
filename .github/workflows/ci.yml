@@ -56,6 +56,17 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --check
 
+  csharp-external-fixture:
+    name: C# external fixture provenance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.418
+      - name: Rebuild and verify managed fixture
+        run: bash scripts/verify-csharp-external-fixture.sh
+
   vscode:
     name: vscode
     runs-on: ubuntu-latest
