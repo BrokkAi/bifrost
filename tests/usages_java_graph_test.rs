@@ -1600,6 +1600,105 @@ public class GrandChild extends MiddleShadow {
 }
 
 #[test]
+fn java_usage_finder_finds_bare_inherited_field_write_and_excludes_shadows() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "p/VoiceStatus.java",
+            r#"
+package p;
+
+public class VoiceStatus {
+    protected boolean active;
+}
+"#,
+        ),
+        (
+            "p/SoftVoice.java",
+            r#"
+package p;
+
+public class SoftVoice extends VoiceStatus {
+    Object controller = new Object() {
+        boolean active = false;
+
+        void update() {
+            active = true; // negative-anonymous-class-field
+        }
+    };
+
+    void activate(boolean enabled) {
+        if (enabled) {
+            active = true; // positive-inherited-write
+        }
+    }
+
+    void localShadow() {
+        boolean active = false;
+        active = true; // negative-local-shadow
+    }
+
+    void parameterShadow(boolean active) {
+        active = true; // negative-parameter-shadow
+    }
+}
+"#,
+        ),
+        (
+            "p/ShadowSoftVoice.java",
+            r#"
+package p;
+
+public class ShadowSoftVoice extends VoiceStatus {
+    boolean active;
+
+    void activateShadow() {
+        active = true; // negative-derived-field-shadow
+    }
+}
+"#,
+        ),
+        (
+            "p/MiddleShadow.java",
+            r#"
+package p;
+
+public class MiddleShadow extends VoiceStatus {
+    protected boolean active;
+}
+"#,
+        ),
+        (
+            "p/GrandChild.java",
+            r#"
+package p;
+
+public class GrandChild extends MiddleShadow {
+    void activateShadow() {
+        active = true; // negative-intermediate-field-shadow
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "p.VoiceStatus.active");
+    let hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+
+    assert_eq!(
+        1,
+        hits.len(),
+        "expected only the inherited bare field write"
+    );
+    assert_hit_contains(&hits, "positive-inherited-write");
+    assert_no_hit_contains(&hits, "negative-local-shadow");
+    assert_no_hit_contains(&hits, "negative-parameter-shadow");
+    assert_no_hit_contains(&hits, "negative-anonymous-class-field");
+    assert_no_hit_contains(&hits, "negative-derived-field-shadow");
+    assert_no_hit_contains(&hits, "negative-intermediate-field-shadow");
+}
+
+#[test]
 fn java_usage_finder_finds_bare_inherited_method_call_and_excludes_self_and_wrong_owner() {
     let (_project, analyzer) = java_analyzer_with_files(&[
         (
@@ -1885,6 +1984,78 @@ public class Consumer {
 }
 
 #[test]
+fn java_graph_strategy_counts_annotated_spread_parameter_calls_precisely() {
+    let (_project, analyzer) = java_analyzer_with_files(&[(
+        "org/example/Fixtures.java",
+        r#"
+package org.example;
+
+@interface N {}
+
+public class JavaCompilerBundle {
+    public static String message(String key, Object @N ... params) { return key; }
+}
+
+public class TokenSet {
+    public static TokenSet create(String @N ... tokens) { return new TokenSet(); }
+}
+
+public class Consumer {
+    void call() {
+        JavaCompilerBundle.message("days"); // positive-message-zero-spread
+        JavaCompilerBundle.message("weeks", 1, "x"); // positive-message-expanded
+        JavaCompilerBundle.message(); // negative-message-too-few
+
+        TokenSet.create(); // positive-create-zero-spread
+        TokenSet.create("A", "B"); // positive-create-expanded
+    }
+}
+"#,
+    )]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let message_target = analyzer
+        .get_definitions("org.example.JavaCompilerBundle.message")
+        .into_iter()
+        .find(|cu| cu.signature() == Some("(String, Object[])"))
+        .expect("missing annotated-spread message overload");
+    let message_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&message_target),
+        &candidates,
+        1000,
+    ));
+
+    assert_eq!(
+        2,
+        message_hits.len(),
+        "expected zero and expanded annotated-spread message calls"
+    );
+    assert_hit_contains(&message_hits, "positive-message-zero-spread");
+    assert_hit_contains(&message_hits, "positive-message-expanded");
+    assert_no_hit_line(&message_hits, 18);
+
+    let create_target = analyzer
+        .get_definitions("org.example.TokenSet.create")
+        .into_iter()
+        .find(|cu| cu.signature() == Some("(String[])"))
+        .expect("missing annotated-spread create overload");
+    let create_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&create_target),
+        &candidates,
+        1000,
+    ));
+    assert_eq!(
+        2,
+        create_hits.len(),
+        "expected zero and expanded annotated-spread create calls"
+    );
+    assert_hit_contains(&create_hits, "positive-create-zero-spread");
+    assert_hit_contains(&create_hits, "positive-create-expanded");
+}
+
+#[test]
 fn java_graph_strategy_counts_static_field_usages() {
     let (_project, analyzer) = java_analyzer_with_files(&[
         (
@@ -1967,6 +2138,74 @@ public class Consumer {
 }
 
 #[test]
+fn java_graph_strategy_keeps_static_wildcard_field_visible_with_unrelated_wildcards() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Flags.java",
+            "package com.example; public class Flags { public static final int FINAL = 1; }\n",
+        ),
+        (
+            "com/example/Names.java",
+            "package com.example; public class Names { public static final int OTHER = 2; }\n",
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+import static com.example.Flags.*;
+import static com.example.Names.*;
+
+public class Consumer {
+    int readImported() {
+        return FINAL; // positive-target-only
+    }
+}
+"#,
+        ),
+        (
+            "com/example/OtherFlags.java",
+            "package com.example; public class OtherFlags { public static final int FINAL = 3; }\n",
+        ),
+        (
+            "com/example/AmbiguousConsumer.java",
+            r#"
+package com.example;
+
+import static com.example.Flags.*;
+import static com.example.OtherFlags.*;
+
+public class AmbiguousConsumer {
+    int readImported() {
+        return FINAL; // negative-colliding-wildcard
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let target = definition(&analyzer, "com.example.Flags.FINAL");
+
+    let result = JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let proven_hits: Vec<_> = result
+        .clone()
+        .into_either()
+        .expect("static wildcard field success")
+        .into_iter()
+        .filter(|hit| hit.kind == UsageHitKind::Reference)
+        .collect();
+    assert_hit_contains(&proven_hits, "positive-target-only");
+    assert_no_hit_contains(&proven_hits, "negative-colliding-wildcard");
+    assert_success_counts(result, &target, 1, 0);
+}
+
+#[test]
 fn java_graph_strategy_counts_static_imported_method_usage() {
     let (_project, analyzer) = java_analyzer_with_files(&[
         (
@@ -2001,6 +2240,57 @@ public class Consumer {
         .into_either()
         .expect("static import success");
     assert_eq!(1, hits.len());
+}
+
+#[test]
+fn java_graph_strategy_records_exact_static_import_references_for_fields_and_methods() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "java/time/temporal/ChronoUnit.java",
+            "package java.time.temporal; public class ChronoUnit { public static final ChronoUnit WEEKS = new ChronoUnit(); }\n",
+        ),
+        (
+            "app/Strings.java",
+            "package app; public class Strings { public static String trimEnd(String value) { return value; } public static String trimEnd(String value, String suffix) { return value + suffix; } }\n",
+        ),
+        (
+            "app/Consumer.java",
+            r#"
+package app;
+
+import static java.time.temporal.ChronoUnit.WEEKS;
+import static app.Strings.trimEnd;
+
+public class Consumer {
+    ChronoUnit unit = WEEKS;
+    String value = trimEnd("x");
+}
+"#,
+        ),
+    ]);
+
+    let weeks_target = definition(&analyzer, "java.time.temporal.ChronoUnit.WEEKS");
+    let weeks_result = UsageFinder::new().find_usages_default(&analyzer, &[weeks_target]);
+    let weeks_hits = weeks_result
+        .all_hits_including_imports()
+        .into_iter()
+        .collect::<Vec<_>>();
+    assert_hit_contains(
+        &weeks_hits,
+        "import static java.time.temporal.ChronoUnit.WEEKS",
+    );
+
+    let trim_end_target = analyzer
+        .get_definitions("app.Strings.trimEnd")
+        .into_iter()
+        .find(|cu| cu.signature() == Some("(String)"))
+        .expect("trimEnd(String) overload");
+    let trim_end_result = UsageFinder::new().find_usages_default(&analyzer, &[trim_end_target]);
+    let trim_end_hits = trim_end_result
+        .all_hits_including_imports()
+        .into_iter()
+        .collect::<Vec<_>>();
+    assert_hit_contains(&trim_end_hits, "import static app.Strings.trimEnd");
 }
 
 #[test]
@@ -2039,7 +2329,7 @@ public class Consumer {
         &candidates,
         1000,
     );
-    assert_success_counts(result, &method_target, 0, 1);
+    assert_success_counts(result, &method_target, 1, 1);
 }
 
 #[test]
@@ -2143,6 +2433,97 @@ public class Consumer {
 
     assert_eq!(1, zero_hits.len(), "zero-arg overload should stay narrow");
     assert_eq!(1, one_hits.len(), "one-arg overload should stay narrow");
+}
+
+#[test]
+fn java_graph_strategy_matches_method_references_only_when_owner_and_overload_are_proven() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "app/GridUtil.java",
+            "package app; public class GridUtil { public static void suggestPlugin() {} }\n",
+        ),
+        (
+            "app/OtherGridUtil.java",
+            "package app; public class OtherGridUtil { public static void suggestPlugin() {} }\n",
+        ),
+        (
+            "app/Formatter.java",
+            "package app; public class Formatter { public String trim() { return \"\"; } public String replace(String value) { return value; } public String replace(Object value) { return String.valueOf(value); } }\n",
+        ),
+        (
+            "app/BaseFormatter.java",
+            "package app; public class BaseFormatter { public String inheritedTrim() { return \"\"; } }\n",
+        ),
+        (
+            "app/ChildFormatter.java",
+            "package app; public class ChildFormatter extends BaseFormatter {}\n",
+        ),
+        (
+            "app/Helper.java",
+            "package app; public class Helper { public void suggestPlugin() {} }\n",
+        ),
+        (
+            "app/Consumer.java",
+            r#"
+package app;
+
+public class Consumer {
+    void call(Helper helper) {
+        Runnable staticRef = GridUtil::suggestPlugin; // positive-static-reference
+        java.util.function.Function<Formatter, String> instanceRef = Formatter::trim; // positive-instance-reference
+        java.util.function.Function<ChildFormatter, String> inheritedRef = ChildFormatter::inheritedTrim; // positive-inherited-reference
+        Runnable wrongOwner = OtherGridUtil::suggestPlugin; // negative-wrong-owner
+        Runnable shadowed = helper::suggestPlugin; // negative-local-shadow
+        java.util.function.BiFunction<Formatter, Object, String> ambiguous = Formatter::replace; // negative-ambiguous-overload
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let static_target = definition(&analyzer, "app.GridUtil.suggestPlugin");
+    let static_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&static_target),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&static_hits, "positive-static-reference");
+    assert_no_hit_contains(&static_hits, "negative-wrong-owner");
+    assert_no_hit_contains(&static_hits, "negative-local-shadow");
+
+    let instance_target = definition(&analyzer, "app.Formatter.trim");
+    let instance_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&instance_target),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&instance_hits, "positive-instance-reference");
+
+    let inherited_target = definition(&analyzer, "app.BaseFormatter.inheritedTrim");
+    let inherited_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&inherited_target),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&inherited_hits, "positive-inherited-reference");
+
+    let ambiguous_target = analyzer
+        .get_definitions("app.Formatter.replace")
+        .into_iter()
+        .find(|cu| cu.signature() == Some("(String)"))
+        .expect("replace(String) overload");
+    let ambiguous_result = JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&ambiguous_target),
+        &candidates,
+        1000,
+    );
+    assert_success_counts(ambiguous_result, &ambiguous_target, 0, 1);
 }
 
 #[test]

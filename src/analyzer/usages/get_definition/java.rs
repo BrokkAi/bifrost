@@ -10,6 +10,12 @@ pub(crate) enum JavaTypeLookupResolution {
     InappropriateSymbolContext,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JavaMemberLookupKind {
+    Field,
+    Method,
+}
+
 pub(crate) fn java_type_lookup_resolution(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -318,11 +324,19 @@ fn resolve_java_method_invocation(
     if name.is_empty() {
         return no_definition("no_method_name", "Java method invocation has a blank name");
     }
-    let arity = Some(java_argument_count(node));
+    let arity = java_argument_count(node);
 
     if let Some(object) = node.child_by_field_name("object") {
         if let Some(owner) = java_receiver_type(analyzer, file, source, root, object) {
-            return java_member_candidates(analyzer, support, &owner.fq_name(), name, true, arity);
+            return java_member_candidates(
+                analyzer,
+                support,
+                &owner.fq_name(),
+                name,
+                JavaMemberLookupKind::Method,
+                true,
+                Some(arity),
+            );
         }
         return no_definition(
             "unsupported_java_receiver",
@@ -330,14 +344,41 @@ fn resolve_java_method_invocation(
         );
     }
 
-    let static_import = java_static_import_candidates(analyzer, support, file, name, arity);
-    if static_import.status != DefinitionLookupStatus::NoDefinition {
+    let static_import = java_static_import_candidates(
+        analyzer,
+        support,
+        file,
+        name,
+        JavaMemberLookupKind::Method,
+        Some(arity),
+    );
+    if static_import.status != DefinitionLookupStatus::NoDefinition
+        && static_import
+            .definitions
+            .iter()
+            .any(|unit| java_callable_accepts_arity(analyzer, unit, arity))
+    {
         return static_import;
     }
 
     let class_ranges = ClassRangeIndex::build(analyzer, file);
     if let Some(owner_fqn) = class_ranges.enclosing(name_node.start_byte()) {
-        return java_member_candidates(analyzer, support, owner_fqn, name, true, arity);
+        let outcome = java_member_candidates(
+            analyzer,
+            support,
+            owner_fqn,
+            name,
+            JavaMemberLookupKind::Method,
+            true,
+            Some(arity),
+        );
+        if outcome
+            .definitions
+            .iter()
+            .any(|unit| java_callable_accepts_arity(analyzer, unit, arity))
+        {
+            return outcome;
+        }
     }
 
     no_definition(
@@ -402,7 +443,15 @@ fn resolve_java_method_reference(
             )
         });
     if let Some(owner) = owner {
-        return java_member_candidates(analyzer, support, &owner.fq_name(), member, true, None);
+        return java_member_candidates(
+            analyzer,
+            support,
+            &owner.fq_name(),
+            member,
+            JavaMemberLookupKind::Method,
+            true,
+            None,
+        );
     }
 
     no_definition(
@@ -586,7 +635,15 @@ fn resolve_java_field_access(
         return no_definition("no_field_receiver", "Java field access has no receiver");
     };
     if let Some(owner) = java_receiver_type(analyzer, file, source, root, object) {
-        return java_member_candidates(analyzer, support, &owner.fq_name(), field, false, None);
+        return java_member_candidates(
+            analyzer,
+            support,
+            &owner.fq_name(),
+            field,
+            JavaMemberLookupKind::Field,
+            false,
+            None,
+        );
     }
     no_definition(
         "unsupported_java_receiver",
@@ -607,7 +664,14 @@ fn resolve_java_bare_identifier(
     if let Some(unit) = java.resolve_type_name_in_file(file, name) {
         return candidates_outcome(vec![unit]);
     }
-    let static_import = java_static_import_candidates(analyzer, support, file, name, None);
+    let static_import = java_static_import_candidates(
+        analyzer,
+        support,
+        file,
+        name,
+        JavaMemberLookupKind::Field,
+        None,
+    );
     if static_import.status != DefinitionLookupStatus::NoDefinition {
         return static_import;
     }
@@ -618,7 +682,15 @@ fn resolve_java_bare_identifier(
     if !java_local_binding_before(source, root, name, node.start_byte()) {
         let class_ranges = ClassRangeIndex::build(analyzer, file);
         if let Some(owner_fqn) = class_ranges.enclosing(node.start_byte()) {
-            let outcome = java_member_candidates(analyzer, support, owner_fqn, name, false, None);
+            let outcome = java_member_candidates(
+                analyzer,
+                support,
+                owner_fqn,
+                name,
+                JavaMemberLookupKind::Field,
+                false,
+                None,
+            );
             if outcome.status == DefinitionLookupStatus::Resolved {
                 return outcome;
             }
@@ -666,7 +738,7 @@ fn java_receiver_type_for_java(
         "object_creation_expression" => object.child_by_field_name("type").and_then(|type_node| {
             java_type_from_node_with_context(analyzer, java, file, source, type_node)
         }),
-        "type_identifier" | "scoped_type_identifier" | "generic_type" => {
+        "type_identifier" | "scoped_type_identifier" | "generic_type" | "annotated_type" => {
             let raw = java_node_text(object, source);
             java_type_text_with_context(
                 analyzer,
@@ -1545,10 +1617,12 @@ fn java_member_candidates(
     support: &dyn BoundedDefinitionLookup,
     owner_fqn: &str,
     member: &str,
+    kind: JavaMemberLookupKind,
     allow_generated_accessors: bool,
     arity: Option<usize>,
 ) -> DefinitionLookupOutcome {
-    let mut candidates = support.fqn(&format!("{owner_fqn}.{member}"));
+    let mut candidates =
+        java_filter_member_candidates(support.fqn(&format!("{owner_fqn}.{member}")), kind);
     sort_units(&mut candidates);
     candidates.dedup();
     if let Some(filtered_candidates) = java_arity_candidates(analyzer, &candidates, arity) {
@@ -1581,7 +1655,10 @@ fn java_member_candidates(
                 if !seen.insert(ancestor.clone()) {
                     continue;
                 }
-                level_candidates.extend(support.fqn(&format!("{}.{}", ancestor.fq_name(), member)));
+                level_candidates.extend(java_filter_member_candidates(
+                    support.fqn(&format!("{}.{}", ancestor.fq_name(), member)),
+                    kind,
+                ));
                 next_level.extend(provider.get_direct_ancestors(&ancestor));
             }
             sort_units(&mut level_candidates);
@@ -1607,6 +1684,19 @@ fn java_member_candidates(
         "no_indexed_definition",
         format!("`{owner_fqn}.{member}` is not indexed as a Java definition"),
     )
+}
+
+fn java_filter_member_candidates(
+    candidates: Vec<CodeUnit>,
+    kind: JavaMemberLookupKind,
+) -> Vec<CodeUnit> {
+    candidates
+        .into_iter()
+        .filter(|unit| match kind {
+            JavaMemberLookupKind::Field => unit.is_field(),
+            JavaMemberLookupKind::Method => unit.is_function(),
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1832,6 +1922,7 @@ fn java_static_import_candidates(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     member: &str,
+    kind: JavaMemberLookupKind,
     arity: Option<usize>,
 ) -> DefinitionLookupOutcome {
     let mut candidates = Vec::new();
@@ -1841,7 +1932,8 @@ fn java_static_import_candidates(
             continue;
         };
         if let Some(owner) = path.strip_suffix(".*") {
-            let owner_candidates = support.fqn(&format!("{owner}.{member}"));
+            let owner_candidates =
+                java_filter_member_candidates(support.fqn(&format!("{owner}.{member}")), kind);
             if owner_candidates.is_empty() && !java_workspace_fqn_exists(support, owner) {
                 saw_external = true;
             }
@@ -1854,7 +1946,7 @@ fn java_static_import_candidates(
         if imported_member != member {
             continue;
         }
-        let imported = support.fqn(path);
+        let imported = java_filter_member_candidates(support.fqn(path), kind);
         if imported.is_empty() && !java_workspace_fqn_exists(support, owner) {
             saw_external = true;
         }

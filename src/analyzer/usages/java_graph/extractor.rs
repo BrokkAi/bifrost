@@ -14,7 +14,7 @@ use crate::analyzer::usages::local_inference::{
 };
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
-use crate::analyzer::{IAnalyzer, JavaAnalyzer, ProjectFile};
+use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, ProjectFile};
 use crate::hash::HashMap;
 use crate::text_utils::compute_line_starts;
 use std::cell::RefCell;
@@ -51,6 +51,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) method_return_cache: &'a MethodReturnCache,
     pub(super) file_return_cache: &'a FileReturnCache,
     pub(super) enclosing_cache: HashMap<(usize, usize), hits::EnclosingContext>,
+    class_scope_depths: Vec<usize>,
 }
 
 pub(super) fn scan_file(
@@ -104,6 +105,7 @@ pub(super) fn scan_file(
         method_return_cache,
         file_return_cache,
         enclosing_cache: HashMap::default(),
+        class_scope_depths: Vec::new(),
     };
     scan_node(tree.root_node(), &mut ctx);
 }
@@ -112,19 +114,24 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if *ctx.limit_exceeded {
         return;
     }
-    let enters_scope = matches!(
-        node.kind(),
-        "method_declaration"
-            | "constructor_declaration"
-            | "block"
-            | "lambda_expression"
-            | "catch_clause"
-            | "enhanced_for_statement"
-            | "for_statement"
-    );
+    let enters_class_scope = node.kind() == "class_body";
+    let enters_scope = enters_class_scope
+        || matches!(
+            node.kind(),
+            "method_declaration"
+                | "constructor_declaration"
+                | "block"
+                | "lambda_expression"
+                | "catch_clause"
+                | "enhanced_for_statement"
+                | "for_statement"
+        );
 
     if enters_scope {
         ctx.bindings.enter_scope();
+        if enters_class_scope {
+            ctx.class_scope_depths.push(ctx.bindings.scope_depth());
+        }
         seed_declarations(node, ctx);
     } else {
         seed_inline_declarations(node, ctx);
@@ -144,6 +151,9 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
     }
 
+    if enters_class_scope {
+        ctx.class_scope_depths.pop();
+    }
     if enters_scope {
         ctx.bindings.exit_scope();
     }
@@ -335,13 +345,32 @@ fn is_member_access_object(node: Node<'_>) -> bool {
 }
 
 fn maybe_record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if ctx.spec.kind != TargetKind::Type {
+    let Some(path) = node.named_child(0) else {
         return;
+    };
+    match ctx.spec.kind {
+        TargetKind::Type => {
+            if node_text(path, ctx.source) == ctx.spec.owner.fq_name() {
+                hits::push_import_hit(path, ctx);
+                return;
+            }
+        }
+        TargetKind::Field | TargetKind::Method => {
+            if node_text(path, ctx.source)
+                == format!("{}.{}", ctx.spec.owner.fq_name(), ctx.spec.member_name)
+            {
+                if let Some(member) = expression_name_node(path) {
+                    hits::push_import_hit(member, ctx);
+                } else {
+                    hits::push_import_hit(path, ctx);
+                }
+                return;
+            }
+        }
+        TargetKind::Constructor => return,
     }
-    if let Some(path) = node.named_child(0)
-        && node_text(path, ctx.source) == ctx.spec.owner.fq_name()
-    {
-        hits::push_import_hit(path, ctx);
+
+    if ctx.spec.kind != TargetKind::Type {
         return;
     }
     walk_tree_iterative(
@@ -395,6 +424,10 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         maybe_record_method_declaration_hit(node, ctx);
         return;
     }
+    if node.kind() == "method_reference" {
+        maybe_record_method_reference_hit(node, ctx);
+        return;
+    }
     if node.kind() != "method_invocation" {
         return;
     }
@@ -419,6 +452,116 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     } else {
         hits::push_unproven_hit(name_node, ctx);
     }
+}
+
+fn maybe_record_method_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some((receiver, member)) = method_reference_parts(node) else {
+        return;
+    };
+    if node_text(member, ctx.source) != ctx.spec.member_name {
+        return;
+    }
+    match method_reference_target_resolution(receiver, ctx) {
+        MethodReferenceTargetResolution::NotTarget => {}
+        MethodReferenceTargetResolution::Proven => hits::push_hit(member, ctx),
+        MethodReferenceTargetResolution::Unproven => hits::push_unproven_hit(member, ctx),
+    }
+}
+
+enum MethodReferenceTargetResolution {
+    NotTarget,
+    Proven,
+    Unproven,
+}
+
+fn method_reference_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.named_children(&mut cursor).collect();
+    let (member, rest) = children.split_last()?;
+    let receiver = rest.last().copied()?;
+    Some((receiver, *member))
+}
+
+fn method_reference_target_resolution(
+    receiver: Node<'_>,
+    ctx: &mut ScanCtx<'_>,
+) -> MethodReferenceTargetResolution {
+    let owners = method_reference_owner_fq_names(receiver, ctx);
+    let mut candidates = Vec::new();
+    for owner in &owners {
+        candidates.extend(method_reference_candidates_for_owner(owner, ctx));
+    }
+    let matching = candidates
+        .iter()
+        .filter(|candidate| {
+            method_reference_candidate_has_target_owner(candidate, ctx)
+                && java_method_signatures_match(ctx.java, &ctx.spec.target, candidate)
+        })
+        .count();
+    if matching == 0 {
+        return MethodReferenceTargetResolution::NotTarget;
+    }
+    if matching == 1 && candidates.len() == 1 && owners.len() == 1 {
+        MethodReferenceTargetResolution::Proven
+    } else {
+        MethodReferenceTargetResolution::Unproven
+    }
+}
+
+fn method_reference_candidate_has_target_owner(candidate: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
+    let fqn = candidate.fq_name();
+    let Some((owner, _)) = fqn.rsplit_once('.') else {
+        return false;
+    };
+    ctx.spec.declaration_owner_fq_names.contains(owner)
+}
+
+fn method_reference_owner_fq_names(receiver: Node<'_>, ctx: &mut ScanCtx<'_>) -> Vec<String> {
+    match receiver.kind() {
+        "identifier" => ctx
+            .bindings
+            .resolve_symbol(node_text(receiver, ctx.source))
+            .as_precise()
+            .map(|targets| targets.iter().cloned().collect())
+            .unwrap_or_else(|| {
+                resolve_type_from_node(receiver, ctx)
+                    .map(|unit| vec![unit.fq_name()])
+                    .unwrap_or_default()
+            }),
+        _ => resolve_type_from_node(receiver, ctx)
+            .map(|unit| vec![unit.fq_name()])
+            .unwrap_or_default(),
+    }
+}
+
+fn method_reference_candidates_for_owner(owner_fq_name: &str, ctx: &ScanCtx<'_>) -> Vec<CodeUnit> {
+    let mut candidates = ctx
+        .java
+        .global_usage_definition_index()
+        .by_fqn(&format!("{owner_fq_name}.{}", ctx.spec.member_name))
+        .iter()
+        .filter(|unit| unit.is_function())
+        .cloned()
+        .collect::<Vec<_>>();
+    let Some(owner) = ctx.analyzer.definitions(owner_fq_name).next() else {
+        return candidates;
+    };
+    let Some(provider) = ctx.analyzer.type_hierarchy_provider() else {
+        return candidates;
+    };
+    for ancestor in provider.get_ancestors(&owner) {
+        candidates.extend(
+            ctx.java
+                .global_usage_definition_index()
+                .by_fqn(&format!("{}.{}", ancestor.fq_name(), ctx.spec.member_name))
+                .iter()
+                .filter(|unit| unit.is_function())
+                .cloned(),
+        );
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 fn maybe_record_method_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -480,12 +623,18 @@ fn maybe_record_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let same_owner = same_owner_context(node, ctx);
-    let shadowed = if same_owner {
-        ctx.bindings
-            .is_shadowed_in_non_root_scope(ctx.spec.member_name.as_str())
-    } else {
-        ctx.bindings.is_shadowed(ctx.spec.member_name.as_str())
-    };
+    let shadowed = ctx.class_scope_depths.last().map_or_else(
+        || ctx.bindings.is_shadowed(ctx.spec.member_name.as_str()),
+        |depth| {
+            if !same_owner {
+                return ctx
+                    .bindings
+                    .is_shadowed_at_or_below_scope(*depth, ctx.spec.member_name.as_str());
+            }
+            ctx.bindings
+                .is_shadowed_below_scope(*depth, ctx.spec.member_name.as_str())
+        },
+    );
     if !shadowed && (bare_field_context_matches_target(node, ctx) || has_proven_static_import(ctx))
     {
         hits::push_hit(node, ctx);

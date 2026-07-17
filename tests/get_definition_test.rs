@@ -10367,6 +10367,110 @@ public class RegExpInspectionConfigurationCellRenderer extends ColoredListCellRe
 }
 
 #[test]
+fn java_unqualified_inherited_method_call_with_only_external_base_match_returns_no_definition() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "pkg/JBList.java",
+            r#"
+package pkg;
+
+public class JBList extends ExternalBaseList {
+    public void repaint(long tm, int x, int y, int width, int height) {}
+
+    public void setBusy(boolean busy) {
+        Runnable callback = () -> {
+            if (busy) {
+                repaint();
+            }
+        };
+        callback.run();
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "                repaint();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"pkg/JBList.java","line":10,"column":{}}}]}}"#,
+            column_of(line, "repaint")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn java_bare_inherited_field_lookup_does_not_return_same_named_methods() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "pkg/GridBag.java",
+            "package pkg; public class GridBag { protected int insets = 7; }\n",
+        )
+        .file(
+            "pkg/FormBuilder.java",
+            r#"
+package pkg;
+
+public class FormBuilder extends GridBag {
+    int readInsets() {
+        return insets;
+    }
+
+    void insets() {}
+
+    void callInsets() {
+        insets();
+    }
+}
+"#,
+        )
+        .build();
+
+    let field_line = "        return insets;";
+    let field_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"pkg/FormBuilder.java","line":6,"column":{}}}]}}"#,
+            column_of(field_line, "insets")
+        ),
+    );
+
+    let field_result = &field_value["results"][0];
+    assert_eq!(field_result["status"], "resolved", "{field_value}");
+    assert_eq!(
+        field_result["definitions"][0]["fqn"], "pkg.GridBag.insets",
+        "{field_value}"
+    );
+    assert_eq!(
+        field_result["definitions"][0]["kind"], "field",
+        "{field_value}"
+    );
+
+    let call_line = "        insets();";
+    let call_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"pkg/FormBuilder.java","line":12,"column":{}}}]}}"#,
+            column_of(call_line, "insets")
+        ),
+    );
+
+    let call_result = &call_value["results"][0];
+    assert_eq!(call_result["status"], "resolved", "{call_value}");
+    assert_eq!(
+        call_result["definitions"][0]["fqn"], "pkg.FormBuilder.insets",
+        "{call_value}"
+    );
+    assert_eq!(
+        call_result["definitions"][0]["kind"], "function",
+        "{call_value}"
+    );
+}
+
+#[test]
 fn java_unqualified_method_call_keeps_matching_local_overload() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

@@ -146,6 +146,7 @@ impl JavaReturnTypeContext for JavaScan<'_, '_> {
 }
 
 const SCOPE_NODES: &[&str] = &[
+    "class_body",
     "method_declaration",
     "constructor_declaration",
     "block",
@@ -222,6 +223,22 @@ fn record_reference(
                 ctx.record_unproven(name, name_node);
             }
         }
+        "method_reference" => {
+            let Some((receiver, member_node)) = method_reference_parts(node) else {
+                return;
+            };
+            let member = node_text(member_node, ctx.source);
+            if member.is_empty() {
+                return;
+            }
+            if let Some(owner) = receiver_type_fqn(receiver, ctx, bindings)
+                && let Some(callee) = method_reference_callee(&owner, member, ctx)
+            {
+                ctx.record(callee, member_node);
+            } else {
+                ctx.record_unproven(member, member_node);
+            }
+        }
         "field_access" => {
             let Some(field_node) = node.child_by_field_name("field") else {
                 return;
@@ -240,6 +257,44 @@ fn record_reference(
         }
         _ => {}
     }
+}
+
+fn method_reference_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.named_children(&mut cursor).collect();
+    let (member, rest) = children.split_last()?;
+    let receiver = rest.last().copied()?;
+    Some((receiver, *member))
+}
+
+fn method_reference_callee(
+    owner_fq_name: &str,
+    member: &str,
+    ctx: &JavaScan<'_, '_>,
+) -> Option<String> {
+    let mut candidates = ctx
+        .java
+        .global_usage_definition_index()
+        .by_fqn(&format!("{owner_fq_name}.{member}"))
+        .iter()
+        .filter(|unit| unit.is_function())
+        .cloned()
+        .collect::<Vec<_>>();
+    let owner = ctx.java.definitions(owner_fq_name).next()?;
+    let provider = ctx.java.type_hierarchy_provider()?;
+    for ancestor in provider.get_ancestors(&owner) {
+        candidates.extend(
+            ctx.java
+                .global_usage_definition_index()
+                .by_fqn(&format!("{}.{}", ancestor.fq_name(), member))
+                .iter()
+                .filter(|unit| unit.is_function())
+                .cloned(),
+        );
+    }
+    candidates.sort();
+    candidates.dedup();
+    (candidates.len() == 1).then(|| candidates[0].fq_name())
 }
 
 /// The fqn of the type that owns a method invocation: the receiver's type, or —

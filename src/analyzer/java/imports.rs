@@ -364,7 +364,22 @@ impl JavaAnalyzer {
             target_name = stripped.to_string();
         }
 
+        let target_type_fqn = if target_package.is_empty() {
+            target_name.clone()
+        } else {
+            format!("{target_package}.{target_name}")
+        };
+
         for import in imports {
+            if let Some(raw) = static_import_path(import) {
+                if raw
+                    .strip_prefix(&target_type_fqn)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+                {
+                    return true;
+                }
+                continue;
+            }
             let Some(raw) = non_static_import_path(import) else {
                 continue;
             };
@@ -671,15 +686,18 @@ pub(super) fn parse_import_info(raw: String) -> ImportInfo {
 }
 
 pub(super) fn non_static_import_path(import: &ImportInfo) -> Option<&str> {
-    if import
-        .raw_snippet
-        .trim_start()
-        .starts_with("import static ")
-    {
+    let path = import_path_from_raw(&import.raw_snippet);
+    if path.starts_with("static ") {
         return None;
     }
 
-    Some(import_path_from_raw(&import.raw_snippet))
+    Some(path)
+}
+
+fn static_import_path(import: &ImportInfo) -> Option<&str> {
+    import_path_from_raw(&import.raw_snippet)
+        .strip_prefix("static ")
+        .map(str::trim)
 }
 
 fn import_path_from_raw(raw: &str) -> &str {

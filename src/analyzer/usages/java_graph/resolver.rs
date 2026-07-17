@@ -282,7 +282,7 @@ pub(super) fn has_proven_static_import(ctx: &ScanCtx<'_>) -> bool {
         if let Some(owner) = path.strip_suffix(".*") {
             if owner == target_fq_name {
                 target_visible = true;
-            } else {
+            } else if java_static_import_owner_matches_target(owner, ctx) {
                 return false;
             }
             continue;
@@ -296,12 +296,41 @@ pub(super) fn has_proven_static_import(ctx: &ScanCtx<'_>) -> bool {
         }
         if owner == target_fq_name {
             target_visible = true;
-        } else {
+        } else if java_static_import_owner_matches_target(owner, ctx) {
             return false;
         }
     }
 
     target_visible
+}
+
+fn java_static_import_owner_matches_target(owner_fq_name: &str, ctx: &ScanCtx<'_>) -> bool {
+    ctx.java
+        .global_usage_definition_index()
+        .by_fqn(&format!("{owner_fq_name}.{}", ctx.spec.member_name))
+        .iter()
+        .any(|candidate| java_static_import_candidate_matches_target(candidate, ctx))
+}
+
+fn java_static_import_candidate_matches_target(candidate: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
+    match ctx.spec.kind {
+        TargetKind::Field => candidate.is_field(),
+        TargetKind::Method => {
+            candidate.is_function() && java_static_import_callable_matches_target(candidate, ctx)
+        }
+        TargetKind::Type | TargetKind::Constructor => false,
+    }
+}
+
+fn java_static_import_callable_matches_target(candidate: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
+    if java_method_signatures_match(ctx.java, &ctx.spec.target, candidate) {
+        return true;
+    }
+    let Some(expected_arities) = ctx.spec.callable_arities.as_ref() else {
+        return false;
+    };
+    let candidate_arity = java_callable_arity(ctx.java, candidate);
+    expected_arities.contains(&candidate_arity)
 }
 
 pub(super) fn bare_method_context_matches_target(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {

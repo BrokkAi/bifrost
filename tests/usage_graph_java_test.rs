@@ -124,6 +124,54 @@ fn nested_class_calls_attribute_to_the_nested_fqn() {
 }
 
 #[test]
+fn inherited_method_reference_edges_to_the_declaring_method() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "com/example/BaseFormatter.java",
+            r#"
+package com.example;
+
+class BaseFormatter {
+    String trim() { return ""; }
+}
+"#,
+        )
+        .file(
+            "com/example/ChildFormatter.java",
+            r#"
+package com.example;
+
+class ChildFormatter extends BaseFormatter {}
+"#,
+        )
+        .file(
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+class Consumer {
+    java.util.function.Function<ChildFormatter, String> reference() {
+        return ChildFormatter::trim;
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        find_edge(
+            &value,
+            "com.example.Consumer.reference",
+            "com.example.BaseFormatter.trim"
+        )
+        .is_some(),
+        "inherited method reference should edge to its declaration: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn untyped_local_named_like_a_type_produces_no_static_edge() {
     let value = usage_graph();
 
