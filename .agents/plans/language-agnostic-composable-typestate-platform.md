@@ -31,6 +31,7 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [x] (2026-07-16 18:01+02:00) Completed #814 after specialist review and final invariant audits; all focused tests, the complete `nlp,python` suite, all-target/all-feature clippy, formatting, and diff checks passed, and the reviewed implementation was checkpointed as `296c1de1` after rebasing onto current `master`.
 - [x] (2026-07-16 19:20+02:00) Addressed all guided-review findings in `1faf8b9b`, including converged typed continuations, targetless uncertain callable creation, and shared bounded-renderer/registry utilities; all repository gates passed.
 - [x] (2026-07-17 10:10+02:00) Started #815 execution with the focused living plan `.agents/plans/all-language-cfg-icfg-rollout.md`, spanning callable CFGs, the #816 dispatch prerequisite, one #818 ICFG, all eleven analyzable-language adapters, and the evidence-gated CFG/ICFG slice of #817.
+- [x] (2026-07-17 11:40+02:00) Completed #815 Milestone 1a: canonical rich control-edge IDs, immutable bidirectional adjacency, storage-independent predecessor/successor traversal, corruption validation, bounded schema-v2 rendering, shared CFG contract tests, full repository gates, and post-milestone specialist review are green.
 - [ ] Complete #815 and the first adapter children: build equivalent per-callable CFGs for TypeScript and Java.
 - [ ] Complete #816 in parallel: expose reusable dispatch, value, heap, and bounded access-path oracles for the reference languages.
 - [ ] Complete #818: stitch CFG fragments through existing call relations into a demand-materialized ICFG.
@@ -81,6 +82,9 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 
 - Observation: #815's predecessor/successor contract requires a rich-edge graph shape that the existing payloadless compact graph cannot directly supply.
   Evidence: semantic CFGs preserve parallel source-target edges with different kinds or evidence, so one canonical `ControlEdge` table plus edge-ID adjacency is required. The focused implementation and rollout are tracked in `.agents/plans/all-language-cfg-icfg-rollout.md`.
+
+- Observation: #815 Milestone 1a validated the initial bidirectional shape without freezing later adapter or ICFG boundaries.
+  Evidence: schema-v2 `ControlFlowGraph` now owns canonical rich edges, outgoing offsets, and incoming edge-ID rows; exact traversal and rendering are deterministic under permuted construction and corrupted incoming order is rejected. TypeScript/Java lowering and the provider boundary remain intentionally unimplemented until the next focused checkpoints.
 
 ## Decision Log
 
@@ -198,6 +202,8 @@ The planning milestone produced root epic #813, thirteen native subissues, and t
 Issue #814 is the first completed implementation milestone. Checkpoint `296c1de1` plus guided-review fixes `1faf8b9b` provide the immutable language-neutral IR/event contract, durable and dense identities, total capabilities, typed outcomes and errors, finite budgets, provider boundary, invariant validation, scoped handles, and bounded renderer. TypeScript and Java remained the right contract fixtures, but they intentionally build neutral artifacts rather than claiming real adapters. The file-level artifact and procedure-local row model survived review without prematurely selecting CSR/CSC or persistence.
 
 The handoff remains narrow: #815 builds real TypeScript/Java callable CFG adapters, #816 refines dynamic dispatch plus value/heap targets, #818 adds matched ICFG call/return edges, and #817 measures lifecycle/storage before persisting anything. Review made this boundary stricter by introducing typed unavailable continuations, exact invoke/suspend outgoing topology, exact gap/evidence correlations, constrained partial local targets, bounded atomic construction, streaming rendering, and materialization-scoped handles.
+
+#815 Milestone 1a is the first implementation checkpoint after #814. It preserves the rich edge payload once, assigns canonical procedure-local edge IDs, and supplies exact outgoing and incoming views without selecting persistence or exposing query vocabulary. Specialist review corrected topology counting for provenance-parallel edges, made invalid procedure-local point IDs fail explicitly, required canonical incoming hydration order, and strengthened renderer-schema assertions. The complete feature suite and strict all-feature clippy pass; production semantic lowering remains the next checkpoint rather than an implied capability of this graph substrate.
 
 ## Context and Orientation
 
@@ -1406,3 +1412,5 @@ Plan revision note (2026-07-16): Guided review against rebased `origin/master` p
 Plan revision note (2026-07-17): Began #815 implementation through `.agents/plans/all-language-cfg-icfg-rollout.md`. The focused plan carries the TypeScript/Java CFG reference slice through the dispatch prerequisite, one matched-return ICFG, all eleven analyzable-language adapters, and a measured CFG/ICFG lifecycle decision under #817 while keeping public query, solver, value/heap, and typestate layers outside its scope.
 
 Plan revision note (2026-07-17): Pre-checkpoint review clarified that remaining adapter children begin after the TypeScript/Java CFG/ICFG contract review and may run alongside later solver/pilot work, rather than waiting until after #825. This preserves the focused plan's all-language endpoint without making that rollout a prerequisite for the first TypeScript/Java typestate release.
+
+Plan revision note (2026-07-17): Recorded completion of #815 Milestone 1a. The language-neutral semantic contract now includes canonical procedure-local rich-edge IDs, immutable outgoing/incoming adjacency, exact traversal, defensive hydration checks, scoped handles, and bounded schema-v2 rendering. This is only the CFG storage substrate; the file-aware provider, iterative builder, TypeScript/TSX lowering, Java differential contract, and shared ICFG remain tracked in the focused all-language plan.

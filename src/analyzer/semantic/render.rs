@@ -9,7 +9,8 @@ use crate::analyzer::bounded_output::{BalancedWriter, TruncationStyle, quoted};
 
 use super::capabilities::{CapabilitySupport, SemanticCapabilities};
 use super::ids::{
-    DeclarationSegmentKind, ProcedureId, SemanticArtifactKey, SemanticLocator, SourceRevision,
+    ControlEdgeId, DeclarationSegmentKind, ProcedureId, SemanticArtifactKey, SemanticLocator,
+    SourceRevision,
 };
 use super::ir::{
     AllocationKind, AllocationSite, BasicBlock, CallableTarget, CallableTargetResolution,
@@ -373,7 +374,7 @@ fn render_points(state: &mut RenderState, procedure: &ProcedureSemantics) -> boo
         return false;
     }
     for point in procedure.points() {
-        if !render_point(state, point) {
+        if !render_point(state, procedure, point) {
             return false;
         }
     }
@@ -384,8 +385,10 @@ fn render_control_edges(state: &mut RenderState, procedure: &ProcedureSemantics)
     if !state.writer.open(3, "(control-edges") {
         return false;
     }
-    for edge in procedure.control_edges() {
-        if !state.row_with(4, |writer| write_control_edge(writer, edge)) {
+    for (index, edge) in procedure.cfg().edges().iter().enumerate() {
+        let edge_id = ControlEdgeId::try_from_index(index)
+            .expect("validated semantic control-edge count must fit in a u32");
+        if !state.row_with(4, |writer| write_control_edge(writer, edge_id, edge)) {
             return false;
         }
     }
@@ -661,12 +664,30 @@ fn write_block(writer: &mut dyn fmt::Write, block: &BasicBlock) -> fmt::Result {
     )
 }
 
-fn render_point(state: &mut RenderState, point: &ProgramPoint) -> bool {
+fn render_point(
+    state: &mut RenderState,
+    procedure: &ProcedureSemantics,
+    point: &ProgramPoint,
+) -> bool {
     if !state.open_row_with(4, |writer| {
         write!(
             writer,
             "(program-point :id {} :block {} :source {} :evidence {}",
             point.id, point.block, point.source, point.evidence
+        )?;
+        writer.write_str(" :predecessor-edges ")?;
+        write_id_list(
+            writer,
+            procedure
+                .predecessor_edges(point.id)
+                .map(|(edge_id, _)| edge_id),
+        )?;
+        writer.write_str(" :successor-edges ")?;
+        write_id_list(
+            writer,
+            procedure
+                .successor_edges(point.id)
+                .map(|(edge_id, _)| edge_id),
         )
     }) {
         return false;
@@ -820,10 +841,15 @@ fn write_target_resolution(
     writer.write_char(')')
 }
 
-fn write_control_edge(writer: &mut dyn fmt::Write, edge: &ControlEdge) -> fmt::Result {
+fn write_control_edge(
+    writer: &mut dyn fmt::Write,
+    edge_id: ControlEdgeId,
+    edge: &ControlEdge,
+) -> fmt::Result {
     write!(
         writer,
-        "(control-edge :source-point {} :target-point {} :kind {} :source {} :evidence {})",
+        "(control-edge :id {} :source-point {} :target-point {} :kind {} :source {} :evidence {})",
+        edge_id,
         edge.source_point,
         edge.target_point,
         quoted(edge.kind.label()),
@@ -1166,6 +1192,98 @@ mod tests {
     }
 
     #[test]
+    fn control_edge_ids_and_point_adjacency_are_rendered_deterministically() {
+        let artifact = fixture_artifact(1);
+        let procedure = &artifact.procedures()[0];
+        let first = render_semantic_ir(
+            &artifact,
+            SemanticIrSelection::Artifact,
+            SemanticIrLimits::default(),
+        )
+        .unwrap();
+        let second = render_semantic_ir(
+            &artifact,
+            SemanticIrSelection::Artifact,
+            SemanticIrLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+        assert!(!first.truncated);
+        assert_eq!(
+            first.semantic_ir.matches("(control-edge :id ").count(),
+            procedure.cfg().edges().len()
+        );
+        assert!(first.semantic_ir.contains(
+            "(control-edge :id 0 :source-point 0 :target-point 2 :kind \"exceptional\" :source 0 :evidence 0)"
+        ));
+        assert!(first.semantic_ir.contains(
+            "(program-point :id 0 :block 0 :source 0 :evidence 0 :predecessor-edges () :successor-edges (0 1)"
+        ));
+
+        for point in procedure.points() {
+            let mut predecessors = String::new();
+            write_id_list(
+                &mut predecessors,
+                procedure
+                    .predecessor_edges(point.id)
+                    .map(|(edge_id, _)| edge_id),
+            )
+            .unwrap();
+            let mut successors = String::new();
+            write_id_list(
+                &mut successors,
+                procedure
+                    .successor_edges(point.id)
+                    .map(|(edge_id, _)| edge_id),
+            )
+            .unwrap();
+            let expected = format!(
+                "(program-point :id {} :block {} :source {} :evidence {} :predecessor-edges {} :successor-edges {}",
+                point.id, point.block, point.source, point.evidence, predecessors, successors,
+            );
+            assert!(first.semantic_ir.contains(&expected), "{expected:?}");
+        }
+
+        for (index, edge) in procedure.cfg().edges().iter().enumerate() {
+            let edge_id = ControlEdgeId::try_from_index(index).unwrap();
+            let mut expected = String::new();
+            write_control_edge(&mut expected, edge_id, edge).unwrap();
+            assert!(first.semantic_ir.contains(&expected), "{expected:?}");
+        }
+        assert_balanced(&first.semantic_ir);
+    }
+
+    #[test]
+    fn high_degree_adjacency_rows_truncate_transactionally_and_stay_balanced() {
+        const DEGREE: usize = 4_096;
+        let artifact = fixture_high_degree_artifact(DEGREE);
+        let procedure = &artifact.procedures()[0];
+        assert!(procedure.successor_edges(ProgramPointId::new(0)).len() > DEGREE);
+        assert!(procedure.predecessor_edges(ProgramPointId::new(1)).len() > DEGREE);
+
+        for point_id in [ProgramPointId::new(0), ProgramPointId::new(1)] {
+            let limits = SemanticIrLimits {
+                max_output_bytes: 512,
+                ..SemanticIrLimits::default()
+            };
+            let mut state = RenderState::new(limits);
+            assert!(state.writer.open(0, "(semantic-ir"));
+            assert!(state.writer.open(1, "(program-points"));
+            let point = procedure.point(point_id).unwrap();
+
+            assert!(!render_point(&mut state, procedure, point));
+            let (output, truncated) = state.writer.finish();
+
+            assert!(truncated);
+            assert!(output.contains("output byte limit reached"), "{output:?}");
+            assert!(!output.contains(&format!("(program-point :id {point_id} ")));
+            assert!(output.len() <= limits.max_output_bytes);
+            assert_balanced(&output);
+        }
+    }
+
+    #[test]
     fn selected_procedure_keeps_artifact_scope_and_lexical_parent() {
         let artifact = fixture_artifact(3);
         let rendered = render_semantic_ir(
@@ -1421,6 +1539,55 @@ mod tests {
             .map(|index| fixture_procedure(&key, index))
             .collect();
         SemanticArtifact::try_new(key, capabilities, procedures).unwrap()
+    }
+
+    fn fixture_high_degree_artifact(degree: usize) -> SemanticArtifact {
+        let key = fixture_key();
+        let source = SourceMappingId::new(0);
+        let evidence = EvidenceId::new(0);
+        let mut procedure = fixture_procedure(&key, 0);
+        for _ in 0..degree {
+            let point_id = ProgramPointId::try_from_index(procedure.points.len()).unwrap();
+            procedure.points.push(ProgramPoint {
+                id: point_id,
+                block: BlockId::new(0),
+                events: Vec::new().into_boxed_slice(),
+                source,
+                evidence,
+            });
+            procedure.control_edges.push(ControlEdge {
+                source_point: ProgramPointId::new(0),
+                target_point: point_id,
+                kind: ControlEdgeKind::SwitchCase,
+                source,
+                evidence,
+            });
+            procedure.control_edges.push(ControlEdge {
+                source_point: point_id,
+                target_point: ProgramPointId::new(1),
+                kind: ControlEdgeKind::Normal,
+                source,
+                evidence,
+            });
+        }
+        procedure.blocks[0].points = procedure
+            .points
+            .iter()
+            .map(|point| point.id)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        let capabilities = SemanticCapabilities::builder()
+            .complete(SemanticCapability::Procedures)
+            .complete(SemanticCapability::EntryBoundary)
+            .complete(SemanticCapability::NormalExitBoundary)
+            .complete(SemanticCapability::ExceptionalExitBoundary)
+            .complete(SemanticCapability::BasicBlocks)
+            .complete(SemanticCapability::ProgramPoints)
+            .complete(SemanticCapability::NormalControlFlow)
+            .complete(SemanticCapability::ExceptionalControlFlow)
+            .build();
+        SemanticArtifact::try_new(key, capabilities, vec![procedure]).unwrap()
     }
 
     fn fixture_feature_artifact() -> SemanticArtifact {

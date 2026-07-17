@@ -20,7 +20,8 @@ This plan keeps CodeQuery and RQL exposure out of scope because issue #824 owns 
 - [x] (2026-07-17 10:10+02:00) Audited the #814 semantic IR, provider contract, compact graph rows, prepared syntax snapshot, call-relation service, supported language registry, and inline-project test harness.
 - [x] (2026-07-17 10:10+02:00) Recorded the agreed all-language rollout, TypeScript/Java vertical slice, adjacency API, lazy ICFG, and evidence-gated persistence policy in this focused ExecPlan.
 - [x] (2026-07-17 10:35+02:00) Passed the 10-test `semantic_ir_contract` baseline and completed two pre-checkpoint architecture reviews; resolved sequencing, matched-return, budget, interface, self-containment, per-language checkpoint, and benchmark-gate findings.
-- [ ] Milestone 1a: add procedure-local control-edge identities, immutable bidirectional adjacency, storage-independent traversal, validation, rendering, and focused graph-contract tests.
+- [x] (2026-07-17 11:40+02:00) Milestone 1a: added procedure-local control-edge identities, immutable bidirectional adjacency, storage-independent traversal, defensive validation, bounded deterministic rendering, and focused graph-contract tests.
+- [x] (2026-07-17 11:40+02:00) Closed all post-milestone invariant, architecture, and adversarial-test findings; passed 65 semantic unit tests, 10 semantic IR contract tests, 6 CFG contract tests, formatting, diff checks, strict all-target/all-feature clippy, and the complete elevated `nlp,python` suite (1,017 library tests passed, 4 ignored, plus every binary, integration, and doc-test target).
 - [ ] Milestone 1b: add a request-scoped, file-aware production semantic provider and the private iterative CFG lowering engine.
 - [ ] Milestone 1c: implement the TypeScript and TSX callable CFG adapter plus source-backed assertion harness.
 - [ ] Milestone 2: implement Java, run labeled TypeScript/Java differential cases, measure physical adjacency choices, and stabilize the CFG lowering contract without declaring the cross-procedural contract frozen.
@@ -60,6 +61,15 @@ This plan keeps CodeQuery and RQL exposure out of scope because issue #824 owns 
 - Observation: source may contain deliberately unreachable statements and exceptional exits may be unreachable.
   Evidence: reachability cannot be a construction invariant. Adapters retain source-backed disconnected points and tests assert reachability only where the fixture requires it.
 
+- Observation: rich edges with distinct provenance can represent one control-topology tuple, including at call continuations.
+  Evidence: post-milestone review found that counting every rich edge made a provenance-parallel continuation appear to own several topological arms. `ControlEdgeIndex` now deduplicates `(source, target, kind)` for topology counts while the immutable edge table and adjacency rows preserve every exact rich edge.
+
+- Observation: deterministic hydration requires validating incoming-row order, not only edge membership and symmetry.
+  Evidence: `ControlFlowGraph::try_from_parts` now rejects incoming rows that are not strictly increasing by canonical `ControlEdgeId`; a reversed two-predecessor corruption fixture proves that persisted parts cannot change traversal or rendering order.
+
+- Observation: this macOS host needs PyO3 dynamic symbol lookup, and several full-suite tests need host process, GPG, filesystem, and sidecar access.
+  Evidence: the first isolated feature-suite attempt failed at unresolved `_Py*` symbols, and the sandboxed corrected attempt passed compilation but failed six permission-dependent tests. The pinned Rust 1.96 invocation with `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup'`, semantic indexing disabled, and the final host-access rerun passed the complete suite.
+
 ## Decision Log
 
 - Decision: use semantic program points as canonical CFG nodes and derive basic blocks as maximal straight-line groups.
@@ -73,6 +83,10 @@ This plan keeps CodeQuery and RQL exposure out of scope because issue #824 owns 
 - Decision: provide both predecessor and successor APIs as part of the semantic graph contract.
   Rationale: tests and later solvers need both directions. Storage experiments may change the physical layout but must not leak into consumers.
   Date/Author: 2026-07-17 / Codex and user.
+
+- Decision: adjacency traversal fails explicitly for a program-point ID outside its procedure, while a valid disconnected point returns an empty row.
+  Rationale: silently treating an invalid scoped ID as disconnected can hide cross-procedure or stale-handle bugs. Membership assertions execute before row arithmetic, including for the maximum dense ID, and defensive hydration separately validates canonical row bounds and order.
+  Date/Author: 2026-07-17 / Codex after specialist review.
 
 - Decision: keep construction private, iterative, and continuation-driven.
   Rationale: language adapters need shared graph mechanics without a universal syntax mini-language. Explicit work and continuation stacks are stack safe and can correctly route return, throw, break, continue, handlers, and cleanup.
@@ -120,7 +134,9 @@ This plan keeps CodeQuery and RQL exposure out of scope because issue #824 owns 
 
 ## Outcomes & Retrospective
 
-The plan is now executable but implementation is in progress. The first observable checkpoint will make predecessor and successor traversal real over the existing #814 contract. Later milestone entries will record delivered languages, conformance counts, measurements, review findings, and any remaining scoped gaps.
+Milestone 1a is complete. The #814 flat edge list is now frozen into one canonical rich-edge table with procedure-local `ControlEdgeId`s, source-sliced outgoing rows, incoming edge-ID rows, exact allocation-free predecessor/successor traversal, scoped edge handles, corruption checks, and atomic retained-work accounting. Rich parallel edges remain distinct even when they share topology, invalid point IDs fail explicitly, and incoming rows cannot hydrate in a noncanonical order. Semantic IR schema version 2 renders literal edge IDs plus predecessor/successor adjacency within the existing transactional output budget.
+
+The new `semantic_cfg_contract` multiline inline-project fixture proves exact successors and predecessors, adjacency symmetry, branches, cycles, disconnected points, parallel kinds and provenance, deterministic IDs under permuted construction, and source-backed rendering without asserting raw construction IDs as semantic identities. Post-milestone reviews found and verified fixes for topology over-counting, maximum-ID traversal, incoming-row ordering, and self-referential renderer assertions. All checkpoint gates are green. Milestone 1b now owns the file-aware request boundary and private iterative lowering engine; no production language adapter is claimed by this checkpoint.
 
 ## Context and Orientation
 
@@ -545,3 +561,5 @@ Plan revision note (2026-07-17): Created this focused living ExecPlan from the a
 Plan revision note (2026-07-17): Pre-checkpoint architecture review split the remaining language rollout into nine independently reviewed and committed milestones, made context-bearing bounded snapshot nodes the mechanism that prevents cross-return, suppressed local call-to-continuation scaffolding unless an explicit summary/external model supplies a bypass, added ICFG predecessor/successor and context-selector contracts, and narrowed milestone 5 to the CFG/ICFG slice of #817.
 
 Plan revision note (2026-07-17): A second pre-checkpoint review moved contract freeze after the TypeScript/Java ICFG review; replaced placeholder provider types with the existing cancellation token and `Arc<SemanticArtifact>`; defined cancellation, dispatch, transfer, snapshot-limit, and edge shapes; made builder accounting prospective with one atomic publication charge; corrected source paths and terminology; added exact per-milestone files and commands; and predeclared benchmark datasets, repetitions, output markers, overlay policy, and representation/persistence thresholds.
+
+Plan revision note (2026-07-17): Completed Milestone 1a after three specialist reviews. The semantic CFG now uses schema-v2 canonical rich-edge IDs, outgoing offsets, incoming edge-ID rows, exact bidirectional traversal, scoped handles, deterministic bounded rendering, and defensive corruption validation. Review tightened provenance-parallel topology accounting, invalid-ID behavior, canonical incoming hydration, and literal renderer-schema coverage. Focused tests, formatting, strict all-feature clippy, and the complete `nlp,python` suite pass; the latter requires the documented macOS PyO3 dynamic-lookup flags and host access for process-dependent tests.
