@@ -131,15 +131,30 @@ impl GoAnalyzer {
             let Some(path) = extract_go_import_path(&import.raw_snippet) else {
                 continue;
             };
+            let mut packages: Vec<String> = self
+                .direct_import_files(file, &path)
+                .into_iter()
+                .filter_map(|target| self.go_package_of(&target))
+                .collect();
+            packages.sort();
+            packages.dedup();
+            if packages.is_empty() {
+                // Preserve the source import path for packages outside the
+                // indexed workspace so callers can report an import boundary.
+                packages.push(path.clone());
+            }
             match alias {
-                Some(".") => dot_imports.push(path),
-                Some(explicit) => by_alias.entry(explicit.to_string()).or_default().push(path),
+                Some(".") => dot_imports.extend(packages),
+                Some(explicit) => by_alias
+                    .entry(explicit.to_string())
+                    .or_default()
+                    .extend(packages),
                 None => {
                     let local = self
                         .workspace_package_clause(file, &path)
                         .or(import.identifier)
                         .unwrap_or_else(|| default_import_local_name(&path));
-                    by_alias.entry(local).or_default().push(path);
+                    by_alias.entry(local).or_default().extend(packages);
                 }
             }
         }
