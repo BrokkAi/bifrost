@@ -1,132 +1,140 @@
 ---
 name: brokk-adversarial-test-sweep
 description: >-
-  Harden a test suite through a comprehensive adversarial sweep of edge cases,
-  malformed inputs, concurrency, boundaries, resource pressure, corrupted
-  state, invalid assumptions, and weak or redundant tests. Use when the user
-  asks for an adversarial test audit, test-suite hardening, regression hunting,
-  or a comprehensive test cleanup.
+  Harden a test suite with a risk-ranked adversarial audit, root-cause fixes,
+  minimized regression tests, redundancy review, and complete validation. Use
+  for adversarial test audits, test-suite hardening, regression hunting, or
+  comprehensive test cleanup.
 ---
 
 # Adversarial Test Sweep
 
-Run a persistent, evidence-driven test hardening campaign. The goal is not to
-maximize the number of tests. Every retained or added test must protect a
-meaningful behavior, fail for a plausible defect, and avoid duplicating stronger
-coverage.
+## Outcome
 
-This workflow is based on a prompt shared by
+Within the authorized scope, find meaningful gaps in the test suite, reproduce
+real defects, fix their root causes, retain the smallest useful regressions, and
+finish with clean validation and no unexplained failures. Optimize for defended
+behavior, not test count or a coverage percentage.
+
+## Scope and authority
+
+- Follow repository instructions and preserve unrelated work.
+- For an audit or plan request, inspect and report without changing code.
+- For a hardening, change, or fix request, make in-scope local edits and run
+  non-destructive tests without pausing for approval.
+- Ask before external writes, destructive or costly actions, or material scope
+  expansion. Stop when a newly found bug requires an unresolved product or
+  architectural decision.
+- Model choice and reasoning effort belong to the host configuration. Do not
+  ask the model to “think harder” or claim that the prompt changes its effort.
+
+For a repository-wide or multi-milestone sweep, create or update the
+repository's required execution plan. Define a bounded current milestone and
+continue through it; keep later waves in the plan instead of silently widening
+the active scope.
+
+## Non-goals
+
+- Exhaustive Cartesian combinations with no plausible failure model.
+- Tests that mirror implementation-shaped lists unless membership or order is
+  a user-visible contract.
+- Real host exhaustion, timing-only assertions, long sleeps, retries, ignored
+  tests, or weakened assertions used to manufacture a green result.
+- Unrelated refactors discovered during the sweep.
+
+## Workflow
+
+### 1. Establish the baseline
+
+1. Inspect the worktree, repository instructions, supported platforms, feature
+   combinations, and external dependencies.
+2. Inventory the scoped production surfaces and existing tests. Use Bifrost
+   code intelligence for symbols, usages, and related files when available;
+   use shell search for arbitrary text, test names, and bounded counts.
+3. Record exact baseline commands and outcomes, including ignored tests,
+   flakes, timeouts, and environment limitations. Do not treat an existing
+   failure as background noise.
+4. State the current milestone, required gates, and evidence needed to call it
+   complete.
+
+For Bifrost itself, treat `AGENTS.md` and `.agents/PLANS.md` as authoritative.
+Prefer `tests/common/inline_project.rs::InlineTestProject` for small analyzer
+projects, use `scripts/with-isolated-cargo-target.sh` for isolated Cargo builds,
+and include the feature-complete `nlp,python` suite in full validation.
+
+### 2. Build a risk-ranked matrix
+
+For each scoped subsystem, select only categories with a plausible failure
+model. Rank by impact, likelihood, and missing evidence:
+
+- Empty, missing, duplicate, reordered, malformed, truncated, oversized, and
+  minimally valid inputs.
+- Zero, one, maximum, off-by-one, overflow, underflow, Unicode, and path
+  boundaries.
+- Races, re-entrancy, cancellation, deadlocks, stale generations, and
+  nondeterministic ordering.
+- Deep or wide structures, many files or symbols, response budgets, timeouts,
+  cleanup, and other controlled resource pressure.
+- Partial writes, stale or incompatible caches, interrupted initialization,
+  invalidation, corruption, and retry after failure.
+- Ambiguity and invalid assumptions across APIs, languages, platforms, and
+  optional features.
+
+Record each selected probe, the existing evidence, the expected behavior, and
+the result. Briefly justify skipped high-risk categories; do not document every
+obviously inapplicable pairing.
+
+Prefer deterministic controls such as barriers, channels, injected providers,
+explicit low budgets, and bounded watchdogs.
+
+### 3. Make each test earn its place
+
+Retain or add a test only when it protects a distinct observable contract,
+would fail for a plausible defect, has discriminating assertions, and uses the
+smallest realistic fixture. Remove or consolidate a test only after mapping its
+behavior to stronger retained coverage.
+
+### 4. Close each finding
+
+For every defect:
+
+1. Minimize a meaningful reproduction and verify it fails before the fix.
+2. Trace the structured code and data flow to the root cause.
+3. Fix production behavior or correct a demonstrably wrong test contract.
+4. Keep the minimized regression and name the behavior it protects.
+5. Run the focused test, neighboring suites, and affected cross-feature or
+   cross-language coverage before continuing the matrix.
+
+### 5. Validate from narrow to broad
+
+Run focused regressions first, then neighboring suites, formatting and linting,
+and finally the complete matrix required by the milestone. Repeat concurrency
+or flake tests only when multiple runs provide relevant evidence. Review every
+ignored, skipped, filtered, timed-out, or environment-gated result before
+calling the milestone clean.
+
+## Completion and report
+
+Mark the milestone complete only when every selected matrix entry is resolved,
+all required gates pass, every bug has a permanent regression, removed tests
+have replacement coverage, and no failure or skip remains unexplained.
+
+Report, in this order:
+
+1. Scope and completion status.
+2. Bugs found, root causes, fixes, and regression tests.
+3. Tests removed or consolidated and their replacement coverage.
+4. Exact validation commands and outcomes.
+5. Remaining blockers or deliberately deferred risks with evidence and next
+   action. Omit this section when there are none.
+
+Do not claim completion when required evidence is missing. Report the precise
+blocker or incomplete milestone and preserve the smallest reproduction.
+
+## Attribution
+
+This workflow is adapted from a prompt shared by
 [Paul Hudson](https://x.com/twostraws) in his
 [original post](https://x.com/twostraws/status/2078039730759811369):
 
 > Run a comprehensive adversarial unit test sweep that deliberately targets edge cases, malformed inputs, race conditions, boundary values, resource exhaustion, state corruption, and invalid assumptions; ensure every test earns its place by being necessary, non-duplicative, and validating meaningful behavior as completely as is practical; remove or consolidate weak or redundant tests; fix every failing test, add permanent regression tests for each bug found, and repeat until the suite passes cleanly with no unexplained failures and strong coverage.
-
-## 1. Establish the Contract
-
-Before changing code:
-
-1. Inspect the worktree, branch, remotes, and repository instructions. Preserve
-   unrelated changes and follow the repository's rules for branches, commits,
-   temporary storage, and required checks.
-2. Identify the supported test surfaces, feature combinations, platforms, and
-   external dependencies. Do not mistake a featureless or filtered run for the
-   complete suite.
-3. Inventory the production subsystems and their existing tests. Use Bifrost
-   code intelligence for symbols, usages, and related files when available;
-   use shell search for arbitrary text and test names.
-4. For a repository-wide or multi-milestone sweep, create or update the
-   repository's required execution plan before implementation.
-5. Record a clean baseline: exact commands, pass/fail counts, ignored tests,
-   flakes, timeouts, and environment limitations. An existing failure is part
-   of the sweep until it is explained and resolved, not background noise.
-
-For Bifrost itself, treat `AGENTS.md` and `.agents/PLANS.md` as authoritative.
-Use `tests/common/inline_project.rs::InlineTestProject` for small ad hoc analyzer
-projects, run isolated Cargo builds through
-`scripts/with-isolated-cargo-target.sh`, and exercise the feature-complete
-`nlp,python` suite rather than relying on featureless `cargo test`.
-
-## 2. Build an Adversarial Matrix
-
-For each subsystem, select every applicable attack class below and record why
-any class is inapplicable:
-
-- Empty, missing, duplicate, reordered, truncated, oversized, and minimally
-  valid inputs.
-- Malformed syntax, invalid encodings, bad paths, unsupported variants, and
-  contradictory metadata.
-- Numeric and collection boundaries: zero, one, maximum supported values,
-  off-by-one transitions, overflow, underflow, and limit enforcement.
-- Concurrency hazards: races, re-entrancy, cancellation, deadlocks, lost
-  wakeups, stale generations, and nondeterministic ordering.
-- Resource pressure: bounded memory, very deep or wide structures, many files
-  or symbols, large responses, timeouts, and cleanup after failure.
-- State corruption and lifecycle transitions: partial writes, stale caches,
-  interrupted initialization, incompatible persisted state, invalidation, and
-  retry after failure.
-- Invalid assumptions at API and language boundaries: platform-specific paths,
-  Unicode positions, ambiguous resolution, absent optional features, and
-  unexpected but valid caller behavior.
-
-Prefer deterministic tests. When timing or scheduling matters, use controlled
-barriers, injected clocks/providers, bounded watchdogs, or explicit state
-transitions instead of sleeps and fragile wall-clock thresholds.
-
-## 3. Make Every Test Earn Its Place
-
-Audit nearby existing tests before adding new ones. A worthwhile test should:
-
-- Assert observable behavior or a stable contract, not mirror an
-  implementation-shaped registry or list unless that exact membership or order
-  is public behavior.
-- Contain assertions strong enough to distinguish the intended result from a
-  plausible wrong result.
-- Cover a distinct risk that is not already proven more clearly elsewhere.
-- Use the narrowest realistic fixture and avoid unnecessary setup, mocks, and
-  incidental assertions.
-- Be deterministic, isolated, and safe to run repeatedly and in parallel.
-
-Remove or consolidate weak and redundant tests only after proving that stronger
-coverage retains every meaningful behavior they protected. Treat unexplained
-test deletion as lost coverage, not cleanup.
-
-## 4. Use a Regression Loop
-
-For every defect or weakness found:
-
-1. Reduce it to the smallest meaningful failing test and verify the test fails
-   against the unfixed behavior.
-2. Diagnose the root cause through structured code and data flows. Do not add
-   ignore annotations, sleeps, retries, string-scanning fallbacks, or weakened
-   assertions to manufacture a green result.
-3. Fix the production defect or the incorrect test contract.
-4. Keep a permanent regression test that names the behavior and protects the
-   relevant boundary.
-5. Run the focused test, its neighboring suite, and any cross-language or
-   cross-feature coverage affected by the change.
-6. Continue the matrix from the new state; do not stop after the first green
-   fix.
-
-If a newly discovered bug requires a material product or architectural choice
-outside the user's authorized scope, preserve the failing evidence, explain the
-decision required, and treat it as a blocker rather than silently choosing new
-semantics.
-
-## 5. Prove the Final State
-
-Finish only when all applicable gates are clean:
-
-- Formatting and repository lint checks.
-- Focused regression suites for every bug fixed.
-- The complete supported test matrix, including required feature combinations.
-- Repeated runs for concurrency or flake fixes where one pass is insufficient
-  evidence.
-- A review of ignored, skipped, filtered, timed-out, or environment-gated tests
-  so none are presented as unexplained success.
-- `git diff --check` and a final diff review for accidental weakening or
-  unrelated churn.
-
-Report the exact commands and outcomes, defects fixed, regression tests added,
-tests removed or consolidated with their replacement coverage, and any honest
-residual limitation. Do not claim strong coverage solely from a percentage;
-tie the conclusion to the adversarial matrix and observed behaviors.
