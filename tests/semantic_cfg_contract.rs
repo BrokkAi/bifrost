@@ -2366,3 +2366,745 @@ fn typescript_adapter_lowers_deep_control_iteratively() {
         "real adapter fixture should retain every nested control point"
     );
 }
+
+fn assert_reference_common_control_topology(language: Language, path: &str, source: &str) {
+    let project = InlineTestProject::with_language(language)
+        .file(path, source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, path);
+    graph
+        .bind(
+            "entry",
+            PointSelector::new("select")
+                .procedure("select")
+                .effect("entry"),
+        )
+        .bind(
+            "branch",
+            PointSelector::new("positiveFlag")
+                .occurrence(1)
+                .procedure("select")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "positive_statement",
+            PointSelector::new("positive();").procedure("select"),
+        )
+        .bind(
+            "negative_statement",
+            PointSelector::new("negative();").procedure("select"),
+        )
+        .bind(
+            "loop_condition",
+            PointSelector::new("index < 2")
+                .procedure("select")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "body_statement",
+            PointSelector::new("body();").procedure("select"),
+        )
+        .bind("break", PointSelector::new("break;").procedure("select"))
+        .bind(
+            "continue",
+            PointSelector::new("continue;").procedure("select"),
+        )
+        .bind(
+            "done_statement",
+            PointSelector::new("done();").procedure("select"),
+        )
+        .bind(
+            "return",
+            PointSelector::new("return index;")
+                .procedure("select")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "normal_exit",
+            PointSelector::new("select")
+                .procedure("select")
+                .effect("normal_exit"),
+        );
+
+    graph.assert_successors(
+        "branch",
+        &[
+            expected_edge("positive_statement", ControlEdgeKind::ConditionalTrue),
+            expected_edge("negative_statement", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "return",
+        &[expected_edge("normal_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("entry", "branch");
+    graph.assert_reachable("positive_statement", "loop_condition");
+    graph.assert_reachable("negative_statement", "loop_condition");
+    graph.assert_reachable("continue", "loop_condition");
+    graph.assert_reachable("loop_condition", "body_statement");
+    graph.assert_reachable("break", "done_statement");
+    graph.assert_reachable("done_statement", "return");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn typescript_java_common_control_topology_is_label_equivalent() {
+    assert_reference_common_control_topology(
+        Language::TypeScript,
+        "src/reference.ts",
+        r#"
+            function select(positiveFlag: boolean): number {
+                start();
+                if (positiveFlag) positive();
+                else negative();
+                let index = 0;
+                while (index < 2) {
+                    body();
+                    if (index === 1) break;
+                    index++;
+                    continue;
+                }
+                done();
+                return index;
+            }
+        "#,
+    );
+    assert_reference_common_control_topology(
+        Language::Java,
+        "src/Reference.java",
+        r#"
+            class Reference {
+                static int select(boolean positiveFlag) {
+                    start();
+                    if (positiveFlag) positive();
+                    else negative();
+                    int index = 0;
+                    while (index < 2) {
+                        body();
+                        if (index == 1) break;
+                        index++;
+                        continue;
+                    }
+                    done();
+                    return index;
+                }
+            }
+        "#,
+    );
+}
+
+#[test]
+fn java_enumerates_methods_constructors_initializers_and_lambdas() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/CallableShapes.java",
+            r#"
+                class CallableShapes {
+                    static { Hooks.staticInit(); }
+                    { Hooks.instanceInit(); }
+
+                    CallableShapes() { Hooks.constructed(); }
+
+                    void method() {
+                        Runnable task = () -> Hooks.nested();
+                        task.run();
+                    }
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "src/CallableShapes.java");
+    let procedures = graph.artifact().procedures();
+
+    assert_eq!(
+        procedures
+            .iter()
+            .filter(|procedure| procedure.kind() == ProcedureKind::Initializer)
+            .count(),
+        2
+    );
+    assert_eq!(
+        procedures
+            .iter()
+            .filter(|procedure| procedure.kind() == ProcedureKind::Constructor)
+            .count(),
+        1
+    );
+    assert_eq!(
+        procedures
+            .iter()
+            .filter(|procedure| procedure.kind() == ProcedureKind::Method)
+            .count(),
+        1
+    );
+    let lambda = procedures
+        .iter()
+        .find(|procedure| procedure.kind() == ProcedureKind::Lambda)
+        .expect("Java lambda should be a distinct procedure");
+    let parent = graph
+        .artifact()
+        .procedure(
+            lambda
+                .lexical_parent()
+                .expect("lambda should have a lexical parent"),
+        )
+        .expect("lambda parent should exist");
+    assert_eq!(parent.kind(), ProcedureKind::Method);
+}
+
+#[test]
+fn java_adapter_lowers_deep_control_iteratively() {
+    const DEPTH: usize = 1_024;
+    let mut source = String::from(
+        r#"
+            class Deep {
+                static void deep(boolean flag) {
+        "#,
+    );
+    for _ in 0..DEPTH {
+        source.push_str("if (flag) {");
+    }
+    source.push_str("leaf();");
+    for _ in 0..DEPTH {
+        source.push('}');
+    }
+    source.push_str("}} ");
+
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/Deep.java", source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/Deep.java");
+    graph
+        .bind(
+            "deep_entry",
+            PointSelector::new("deep").procedure("deep").effect("entry"),
+        )
+        .bind(
+            "leaf_invoke",
+            PointSelector::new("leaf()")
+                .procedure("deep")
+                .effect("invoke"),
+        );
+    graph.assert_reachable("deep_entry", "leaf_invoke");
+    graph.assert_adjacency_symmetric();
+    assert!(
+        graph.artifact().procedures()[0].points().len() > DEPTH,
+        "real Java adapter fixture should retain every nested control point"
+    );
+}
+
+#[test]
+fn java_switch_yield_runs_finally_and_never_targets_procedure_exit() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/SwitchYield.java",
+            r#"
+                class SwitchYield {
+                    static int choose(int input) {
+                        int selected = switch (input) {
+                            case 0 -> {
+                                try {
+                                    yield primary();
+                                } finally {
+                                    cleanup();
+                                }
+                            }
+                            default -> fallback();
+                        };
+                        after(selected);
+                        return selected;
+                    }
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/SwitchYield.java");
+    graph
+        .bind(
+            "yield_terminal",
+            PointSelector::new("yield primary();")
+                .procedure("choose")
+                .outgoing_kind(ControlEdgeKind::Cleanup),
+        )
+        .bind(
+            "primary_call",
+            PointSelector::new("primary()")
+                .procedure("choose")
+                .effect("invoke"),
+        )
+        .bind(
+            "after_call",
+            PointSelector::new("after(selected)")
+                .procedure("choose")
+                .effect("invoke"),
+        )
+        .bind(
+            "after_statement",
+            PointSelector::new("after(selected);").procedure("choose"),
+        )
+        .bind(
+            "switch_merge",
+            PointSelector::new("switch (input)")
+                .procedure("choose")
+                .anchor_occurrence(2)
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "return",
+            PointSelector::new("return selected;")
+                .procedure("choose")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "normal_exit",
+            PointSelector::new("choose")
+                .procedure("choose")
+                .effect("normal_exit"),
+        );
+
+    graph.assert_reachable("primary_call", "yield_terminal");
+    graph.assert_successors(
+        "switch_merge",
+        &[expected_edge("after_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("yield_terminal", "after_call");
+    graph.assert_predecessors(
+        "normal_exit",
+        &[expected_edge("return", ControlEdgeKind::Normal)],
+    );
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn java_resource_and_monitor_omissions_are_point_scoped_gaps() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/Managed.java",
+            r#"
+                class Managed {
+                    static void run(Object lock) throws Exception {
+                        try (AutoCloseable resource = open()) {
+                            use(resource);
+                        }
+                        synchronized (lock) {
+                            guarded();
+                        }
+                        after();
+                    }
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/Managed.java");
+    graph
+        .bind(
+            "entry",
+            PointSelector::new("run").procedure("run").effect("entry"),
+        )
+        .bind(
+            "resource_use",
+            PointSelector::new("use(resource)")
+                .procedure("run")
+                .effect("invoke"),
+        )
+        .bind(
+            "guarded_call",
+            PointSelector::new("guarded()")
+                .procedure("run")
+                .effect("invoke"),
+        )
+        .bind(
+            "after_call",
+            PointSelector::new("after()")
+                .procedure("run")
+                .effect("invoke"),
+        );
+
+    graph.assert_reachable("entry", "resource_use");
+    graph.assert_reachable("resource_use", "guarded_call");
+    graph.assert_reachable("guarded_call", "after_call");
+    graph.assert_adjacency_symmetric();
+
+    let procedure = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("run")
+        })
+        .expect("managed fixture should expose its method procedure");
+    for capability in [
+        SemanticCapability::ResourceManagement,
+        SemanticCapability::CleanupControlFlow,
+    ] {
+        assert!(
+            procedure.gaps().iter().any(|gap| {
+                gap.capability == capability
+                    && gap.kind == SemanticGapKind::Unsupported
+                    && gap.subject == SemanticGapSubject::Point
+            }),
+            "{capability:?} should be represented by an unsupported point-scoped gap"
+        );
+    }
+}
+
+fn assert_reference_exceptional_cleanup_edge_kinds(language: Language, path: &str, source: &str) {
+    let project = InlineTestProject::with_language(language)
+        .file(path, source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, path);
+    graph
+        .bind(
+            "throw",
+            PointSelector::new("throw problem;")
+                .procedure("fail")
+                .effect("throw"),
+        )
+        .bind(
+            "cleanup_branch",
+            PointSelector::new("flag")
+                .procedure("fail")
+                .anchor_occurrence(0)
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "cleanup_statement",
+            PointSelector::new("cleanup();")
+                .procedure("fail")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "completion_relay",
+            PointSelector::new("{ if (flag) cleanup(); }")
+                .procedure("fail")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "exceptional_exit",
+            PointSelector::new("fail")
+                .procedure("fail")
+                .effect("exceptional_exit"),
+        );
+
+    graph.assert_successors(
+        "cleanup_branch",
+        &[
+            expected_edge("cleanup_statement", ControlEdgeKind::ConditionalTrue),
+            expected_edge("completion_relay", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "completion_relay",
+        &[expected_edge(
+            "exceptional_exit",
+            ControlEdgeKind::Exceptional,
+        )],
+    );
+    graph.assert_reachable("throw", "completion_relay");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn typescript_java_cleanup_relays_preserve_completion_edge_kinds() {
+    assert_reference_exceptional_cleanup_edge_kinds(
+        Language::TypeScript,
+        "src/cleanup-relay.ts",
+        r#"
+            declare const problem: Error;
+            declare function cleanup(): void;
+            function fail(flag: boolean): void {
+                try { throw problem; }
+                finally { if (flag) cleanup(); }
+            }
+        "#,
+    );
+    assert_reference_exceptional_cleanup_edge_kinds(
+        Language::Java,
+        "src/CleanupRelay.java",
+        r#"
+            class CleanupRelay {
+                static void fail(boolean flag, RuntimeException problem) {
+                    try { throw problem; }
+                    finally { if (flag) cleanup(); }
+                }
+            }
+        "#,
+    );
+}
+
+#[test]
+fn java_executable_initializer_fragments_and_method_reference_qualifiers_are_retained() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/InitializerFragments.java",
+            r#"
+                enum Mode {
+                    FIRST(makeArg()),
+                    SECOND;
+
+                    Mode(Object argument) {}
+                }
+
+                class InitializerFragments {
+                    static Object staticValue = staticFactory();
+                    Object instanceValue = instanceFactory();
+                    static Runnable task = () -> callback();
+                    Object noValue;
+
+                    static void use() {
+                        Runnable reference = receiverFactory()::run;
+                        after();
+                    }
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph =
+        SemanticGraph::materialize(&project, &analyzer, "src/InitializerFragments.java");
+    graph
+        .bind(
+            "static_initializer_entry",
+            PointSelector::new("staticValue")
+                .procedure("staticValue")
+                .effect("entry"),
+        )
+        .bind(
+            "static_factory",
+            PointSelector::new("staticFactory()")
+                .procedure("staticValue")
+                .effect("invoke"),
+        )
+        .bind(
+            "static_initializer_normal",
+            PointSelector::new("staticValue")
+                .procedure("staticValue")
+                .effect("normal_exit"),
+        )
+        .bind(
+            "instance_factory",
+            PointSelector::new("instanceFactory()")
+                .procedure("instanceValue")
+                .effect("invoke"),
+        )
+        .bind(
+            "enum_argument",
+            PointSelector::new("makeArg()")
+                .procedure("FIRST")
+                .effect("invoke"),
+        )
+        .bind(
+            "second_constructor",
+            PointSelector::new("SECOND")
+                .procedure("SECOND")
+                .effect("invoke"),
+        )
+        .bind(
+            "receiver_factory",
+            PointSelector::new("receiverFactory()")
+                .procedure("use")
+                .effect("invoke"),
+        )
+        .bind(
+            "method_reference",
+            PointSelector::new("receiverFactory()::run")
+                .procedure("use")
+                .effect("callable_reference"),
+        )
+        .bind(
+            "after_call",
+            PointSelector::new("after()")
+                .procedure("use")
+                .effect("invoke"),
+        );
+
+    graph.assert_reachable("static_initializer_entry", "static_factory");
+    graph.assert_reachable("static_factory", "static_initializer_normal");
+    graph.assert_reachable("receiver_factory", "method_reference");
+    graph.assert_reachable("method_reference", "after_call");
+    graph.assert_adjacency_symmetric();
+
+    let procedures = graph.artifact().procedures();
+    let initializers = procedures
+        .iter()
+        .filter(|procedure| procedure.kind() == ProcedureKind::Initializer)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        initializers.len(),
+        5,
+        "three initialized fields and two enum constants should be retained; the declaration without a value should not"
+    );
+    assert!(initializers.iter().all(|procedure| {
+        procedure.gaps().iter().any(|gap| {
+            gap.capability == SemanticCapability::DeferredExecution
+                && gap.subject == SemanticGapSubject::Procedure
+        })
+    }));
+
+    let named_initializer = |name: &str| {
+        initializers
+            .iter()
+            .copied()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .unwrap_or_else(|| panic!("missing initializer fragment {name}"))
+    };
+    assert!(named_initializer("staticValue").properties().is_static);
+    assert!(!named_initializer("instanceValue").properties().is_static);
+    assert!(named_initializer("FIRST").properties().is_static);
+    for name in ["staticValue", "instanceValue", "FIRST", "SECOND"] {
+        assert!(
+            !named_initializer(name).call_sites().is_empty(),
+            "initializer fragment {name} should retain its constructor or nested call site"
+        );
+    }
+
+    let lambda = procedures
+        .iter()
+        .find(|procedure| procedure.kind() == ProcedureKind::Lambda)
+        .expect("field initializer lambda should remain a nested callable");
+    let parent = graph
+        .artifact()
+        .procedure(
+            lambda
+                .lexical_parent()
+                .expect("lambda should have an initializer parent"),
+        )
+        .expect("initializer parent should exist");
+    assert_eq!(parent.kind(), ProcedureKind::Initializer);
+    assert_eq!(
+        parent
+            .locator()
+            .declaration()
+            .segments()
+            .last()
+            .and_then(|segment| segment.name()),
+        Some("task")
+    );
+}
+
+#[test]
+fn java_switch_groups_fall_through_and_catch_dispatch_remains_explicit() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/Dispatch.java",
+            r#"
+                class Dispatch {
+                    static void run(int choice, RuntimeException problem) {
+                        switch (choice) {
+                            case 0:
+                                first();
+                            case 1:
+                                second();
+                                break;
+                            default:
+                                other();
+                        }
+
+                        try {
+                            throw problem;
+                        } catch (IllegalArgumentException specificProblem) {
+                            specific();
+                        } catch (RuntimeException broadProblem) {
+                            broad();
+                        } finally {
+                            cleanup();
+                        }
+                        after();
+                    }
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/Dispatch.java");
+    graph
+        .bind(
+            "first_call",
+            PointSelector::new("first()")
+                .procedure("run")
+                .effect("invoke"),
+        )
+        .bind(
+            "second_statement",
+            PointSelector::new("second();").procedure("run"),
+        )
+        .bind("break", PointSelector::new("break;").procedure("run"))
+        .bind(
+            "default_call",
+            PointSelector::new("other()")
+                .procedure("run")
+                .effect("invoke"),
+        )
+        .bind(
+            "throw",
+            PointSelector::new("throw problem;")
+                .procedure("run")
+                .effect("throw"),
+        )
+        .bind(
+            "specific_call",
+            PointSelector::new("specific()")
+                .procedure("run")
+                .effect("invoke"),
+        )
+        .bind(
+            "broad_call",
+            PointSelector::new("broad()")
+                .procedure("run")
+                .effect("invoke"),
+        )
+        .bind(
+            "after_call",
+            PointSelector::new("after()")
+                .procedure("run")
+                .effect("invoke"),
+        );
+
+    graph.assert_reachable("first_call", "second_statement");
+    graph.assert_unreachable("break", "default_call");
+    graph.assert_reachable("throw", "specific_call");
+    graph.assert_reachable("throw", "broad_call");
+    graph.assert_reachable("specific_call", "after_call");
+    graph.assert_reachable("broad_call", "after_call");
+    graph.assert_adjacency_symmetric();
+
+    let run = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("run")
+        })
+        .expect("dispatch fixture should expose run");
+    assert!(run.gaps().iter().any(|gap| {
+        gap.capability == SemanticCapability::ExceptionalControlFlow
+            && gap.kind == SemanticGapKind::Unknown
+            && gap.detail.contains("catch-type compatibility")
+    }));
+}

@@ -2970,10 +2970,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     ));
                 }
                 self.point_metadata.push(metadata);
+                let body_next = if next.kind == ControlEdgeKind::Normal {
+                    next
+                } else {
+                    let relay = self.point(builder, region.body, Vec::new())?;
+                    self.edge(builder, relay, next)?;
+                    EdgeTarget::normal(relay)
+                };
                 stack.push(Work::Statement {
                     node: region.body,
                     entry,
-                    next,
+                    next: body_next,
                     scope: region.outer_scope,
                 });
             }
@@ -3456,5 +3463,6 @@ const fn completion_label(kind: CompletionKind) -> &'static str {
         CompletionKind::Throw => "throw",
         CompletionKind::Break => "break",
         CompletionKind::Continue => "continue",
+        CompletionKind::Yield => "yield",
     }
 }

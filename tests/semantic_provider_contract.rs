@@ -72,14 +72,14 @@ fn workspace_routes_semantics_by_exact_file_language() {
             &mut SemanticRequest::new(&mut java_budget, &cancellation),
         )
         .expect("Java provider should read its exact source snapshot");
-    let SemanticOutcome::Unsupported {
-        capability: SemanticCapability::Procedures,
-        partial: None,
+    let SemanticOutcome::Complete {
+        value: artifact,
         work,
     } = java_outcome
     else {
-        panic!("Java should report its unimplemented procedure capability explicitly");
+        panic!("Java semantics should be complete");
     };
+    assert_eq!(artifact.procedures().len(), 1);
     assert!(work.source_bytes > 0);
     assert_eq!(java_budget.used(), work);
 }

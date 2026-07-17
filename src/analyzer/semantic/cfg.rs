@@ -252,6 +252,7 @@ impl ProcedureCfgBuilder {
                         }
                         CompletionKind::Break => (*control_target, ControlEdgeKind::Normal),
                         CompletionKind::Continue => (*control_target, ControlEdgeKind::LoopBack),
+                        CompletionKind::Yield => (*control_target, ControlEdgeKind::Normal),
                         CompletionKind::Normal => {
                             cursor = frame.parent;
                             continue;
@@ -286,8 +287,24 @@ impl ProcedureCfgBuilder {
                             cleanups,
                         ));
                     }
-                    CompletionKind::Normal | CompletionKind::Break | CompletionKind::Continue => {}
+                    CompletionKind::Normal
+                    | CompletionKind::Break
+                    | CompletionKind::Continue
+                    | CompletionKind::Yield => {}
                 },
+                ScopeBinding::Yieldable {
+                    yield_target,
+                    yield_edge_kind,
+                } if request.kind == CompletionKind::Yield => {
+                    return Some(CompletionRoute::new(
+                        CompletionTarget::new(
+                            CompletionKind::Yield,
+                            *yield_target,
+                            *yield_edge_kind,
+                        ),
+                        cleanups,
+                    ));
+                }
                 ScopeBinding::Loop {
                     label,
                     break_target,
@@ -347,7 +364,7 @@ impl ProcedureCfgBuilder {
                     ));
                 }
                 ScopeBinding::Cleanup { region } => cleanups.push(*region),
-                ScopeBinding::Handler { .. } => {}
+                ScopeBinding::Handler { .. } | ScopeBinding::Yieldable { .. } => {}
             }
             cursor = frame.parent;
         }
@@ -589,6 +606,12 @@ pub(crate) enum ScopeBinding {
         return_target: ProgramPointId,
         throw_target: ProgramPointId,
     },
+    /// Merge target for a construct-specific value-producing completion, such
+    /// as Java switch-expression `yield`. The nearest frame wins.
+    Yieldable {
+        yield_target: ProgramPointId,
+        yield_edge_kind: ControlEdgeKind,
+    },
     Breakable {
         label: Option<Box<str>>,
         break_target: ProgramPointId,
@@ -616,6 +639,7 @@ pub(crate) enum CompletionKind {
     Throw,
     Break,
     Continue,
+    Yield,
 }
 
 pub(crate) struct CompletionRequest<'a> {
@@ -951,7 +975,112 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_scope_intercepts_labeled_control_before_live_outer_scopes() {
+    fn yield_bypasses_other_control_scopes_and_routes_through_cleanup_to_switch_merge() {
+        let mut builder = builder();
+        let normal_exit = point(&mut builder, SemanticEffect::NormalExit);
+        let exceptional_exit = point(&mut builder, SemanticEffect::ExceptionalExit);
+        let outer_switch_merge = point(&mut builder, SemanticEffect::Entry);
+        let switch_merge = point(&mut builder, SemanticEffect::Entry);
+        let loop_continue = point(&mut builder, SemanticEffect::Entry);
+        let handler_entry = point(&mut builder, SemanticEffect::Entry);
+        let function = builder.push_scope(
+            None,
+            ScopeBinding::Function {
+                return_target: normal_exit,
+                throw_target: exceptional_exit,
+            },
+        );
+        let outer_yieldable = builder.push_scope(
+            Some(function),
+            ScopeBinding::Yieldable {
+                yield_target: outer_switch_merge,
+                yield_edge_kind: ControlEdgeKind::Normal,
+            },
+        );
+        let yieldable = builder.push_scope(
+            Some(outer_yieldable),
+            ScopeBinding::Yieldable {
+                yield_target: switch_merge,
+                yield_edge_kind: ControlEdgeKind::Normal,
+            },
+        );
+        let loop_scope = builder.push_scope(
+            Some(yieldable),
+            ScopeBinding::Loop {
+                label: None,
+                break_target: switch_merge,
+                break_edge_kind: ControlEdgeKind::Normal,
+                continue_target: loop_continue,
+                continue_edge_kind: ControlEdgeKind::LoopBack,
+            },
+        );
+        let breakable = builder.push_scope(
+            Some(loop_scope),
+            ScopeBinding::Breakable {
+                label: None,
+                break_target: switch_merge,
+                break_edge_kind: ControlEdgeKind::Normal,
+            },
+        );
+        let handler = builder.push_scope(
+            Some(breakable),
+            ScopeBinding::Handler {
+                entry: handler_entry,
+            },
+        );
+        let cleanup = builder.push_scope(
+            Some(handler),
+            ScopeBinding::Cleanup {
+                region: CleanupRegionId::new(7),
+            },
+        );
+
+        let route = builder
+            .resolve_completion(
+                cleanup,
+                &CompletionRequest::new(CompletionKind::Yield, None),
+            )
+            .expect("yield should resolve to the surrounding switch expression");
+
+        assert_eq!(route.destination().kind, CompletionKind::Yield);
+        assert_eq!(route.destination().target(), switch_merge);
+        assert_ne!(route.destination().target(), outer_switch_merge);
+        assert_ne!(route.destination().target(), normal_exit);
+        assert_eq!(route.destination().edge_kind(), ControlEdgeKind::Normal);
+        assert_eq!(route.cleanups(), &[CleanupRegionId::new(7)]);
+        let (cleanup_entry, created) = builder
+            .cleanup_specialization(&route, 0, SourceMappingId::new(0), EvidenceId::new(0))
+            .expect("yield cleanup specialization");
+        assert!(created);
+        assert_ne!(cleanup_entry, switch_merge);
+        assert_ne!(cleanup_entry, normal_exit);
+    }
+
+    #[test]
+    fn function_scope_does_not_treat_yield_as_procedure_return() {
+        let mut builder = builder();
+        let normal_exit = point(&mut builder, SemanticEffect::NormalExit);
+        let exceptional_exit = point(&mut builder, SemanticEffect::ExceptionalExit);
+        let function = builder.push_scope(
+            None,
+            ScopeBinding::Function {
+                return_target: normal_exit,
+                throw_target: exceptional_exit,
+            },
+        );
+
+        assert!(
+            builder
+                .resolve_completion(
+                    function,
+                    &CompletionRequest::new(CompletionKind::Yield, None),
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn disconnected_scope_intercepts_control_completions_before_live_outer_scopes() {
         let mut builder = builder();
         let live_exit = point(&mut builder, SemanticEffect::NormalExit);
         let dead_normal = point(&mut builder, SemanticEffect::NormalExit);
@@ -976,12 +1105,21 @@ mod tests {
             },
         );
 
-        for (kind, edge_kind) in [
-            (CompletionKind::Break, ControlEdgeKind::Normal),
-            (CompletionKind::Continue, ControlEdgeKind::LoopBack),
+        for (kind, label, edge_kind) in [
+            (
+                CompletionKind::Break,
+                Some("outer"),
+                ControlEdgeKind::Normal,
+            ),
+            (
+                CompletionKind::Continue,
+                Some("outer"),
+                ControlEdgeKind::LoopBack,
+            ),
+            (CompletionKind::Yield, None, ControlEdgeKind::Normal),
         ] {
             let route = builder
-                .resolve_completion(disconnected, &CompletionRequest::new(kind, Some("outer")))
+                .resolve_completion(disconnected, &CompletionRequest::new(kind, label))
                 .expect("disconnected completion should resolve");
             assert_eq!(route.destination().target(), dead_control);
             assert_eq!(route.destination().edge_kind(), edge_kind);
@@ -1136,8 +1274,17 @@ mod tests {
                 throw_target: exceptional,
             },
         );
-        let outer = builder.push_scope(
+        let yieldable = builder.push_scope(
             Some(function),
+            ScopeBinding::Yieldable {
+                // Match the function return target deliberately: the cleanup
+                // cache must distinguish these routes by completion kind.
+                yield_target: normal,
+                yield_edge_kind: ControlEdgeKind::Normal,
+            },
+        );
+        let outer = builder.push_scope(
+            Some(yieldable),
             ScopeBinding::Cleanup {
                 region: CleanupRegionId::new(1),
             },
@@ -1154,6 +1301,9 @@ mod tests {
         let throwing = builder
             .resolve_completion(inner, &CompletionRequest::new(CompletionKind::Throw, None))
             .expect("throw route");
+        let yielding = builder
+            .resolve_completion(inner, &CompletionRequest::new(CompletionKind::Yield, None))
+            .expect("yield route");
 
         let (return_entry, created) = builder
             .cleanup_specialization(&returning, 0, SourceMappingId::new(0), EvidenceId::new(0))
@@ -1169,5 +1319,11 @@ mod tests {
             .expect("throw cleanup");
         assert!(created);
         assert_ne!(throw_entry, return_entry);
+        let (yield_entry, created) = builder
+            .cleanup_specialization(&yielding, 0, SourceMappingId::new(0), EvidenceId::new(0))
+            .expect("yield cleanup");
+        assert!(created);
+        assert_ne!(yield_entry, return_entry);
+        assert_ne!(yield_entry, throw_entry);
     }
 }

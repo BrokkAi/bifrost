@@ -25,7 +25,8 @@ This plan keeps CodeQuery and RQL exposure out of scope because issue #824 owns 
 - [x] (2026-07-17 14:34+02:00) Milestone 1b: added the request-scoped, file-aware production semantic provider, exact bounded source snapshots, complete-artifact cache lifecycle, and private iterative CFG lowering engine.
 - [x] (2026-07-17 14:34+02:00) Milestone 1c: implemented the TypeScript and TSX callable CFG adapter plus source-backed predecessor/successor assertion harness, typed advanced-control gaps, and disconnected dead-region sealing.
 - [x] (2026-07-17 14:34+02:00) Closed the Milestone 1b/1c post-review findings and passed 88 semantic unit tests, 29 CFG contract tests, 11 provider contract tests, 10 semantic IR contract tests, formatting, diff checks, strict all-target/all-feature clippy, and the complete elevated `nlp,python` suite.
-- [ ] Milestone 2: implement Java, run labeled TypeScript/Java differential cases, measure physical adjacency choices, and stabilize the CFG lowering contract without declaring the cross-procedural contract frozen.
+- [x] (2026-07-17 16:05+02:00) Milestone 2: implemented Java, passed labeled TypeScript/Java differential cases, measured all three physical adjacency choices, and stabilized the CFG lowering contract without declaring the cross-procedural contract frozen.
+- [x] (2026-07-17 16:05+02:00) Closed the Milestone 2 specialist review with no remaining blocker; passed 37 CFG contract tests, 11 provider contract tests, 10 semantic IR contract tests, the representation self-test, formatting, diff checks, strict all-target/all-feature clippy, and the complete elevated `nlp,python` repository suite (1,046 library tests passed, 4 ignored, plus every binary, integration, and doc-test target).
 - [ ] Milestone 3: expose the location-first dispatch slice, implement one demand-materialized ICFG for TypeScript and Java, then freeze the shared CFG/dispatch/ICFG adapter contract after focused review.
 - [ ] Milestone 4a: roll the common CFG and ICFG contract through JavaScript and JSX, then review and checkpoint it independently.
 - [ ] Milestone 4b: roll the contract through C#, then review and checkpoint it independently.
@@ -80,6 +81,15 @@ This plan keeps CodeQuery and RQL exposure out of scope because issue #824 owns 
 - Observation: the current complete-artifact cache still prepares and parses syntax before it can discover a cache hit.
   Evidence: post-milestone review found no correctness issue, but identified this as a measurement target for #817; moving lookup earlier requires retaining exact snapshot identity without reintroducing a source race.
 
+- Observation: Java switch-expression `yield` cannot share the procedure-return completion channel, especially when the yield crosses `finally`.
+  Evidence: a distinct shared `Yield` completion now targets the nearest switch-expression merge, cleanup specialization keeps it separate from return/throw/break/continue, and the differential fixture proves the yield never becomes a predecessor of procedure exit.
+
+- Observation: Java executable field, interface-constant, and enum-constant initializers are callable semantic fragments even though their scheduling relative to constructors and class initialization is not yet exact.
+  Evidence: the Java adapter emits source-backed `Initializer` procedures and exact expression/call topology while attaching point-scoped `DeferredExecution` gaps for the unmodeled scheduling and source-order composition.
+
+- Observation: outgoing-only rows save meaningful retained memory but make the contractual reverse traversal prohibitively expensive without another retained index.
+  Evidence: on the Apple M4 release benchmark, outgoing-only storage saved about 22.1% for the 100k branch graph, 23.3% for the 100k call graph, and 29.5-29.8% for the TypeScript/Java corpora. Reverse traversal rose from about 1.08/0.84 ms to 8.50/6.51 seconds on the synthetic graphs and from 0.0073/0.0036 ms to 0.0525/0.0217 ms on the real corpora. Flat storage made both directions linear scans with the same multi-second synthetic cost.
+
 ## Decision Log
 
 - Decision: use semantic program points as canonical CFG nodes and derive basic blocks as maximal straight-line groups.
@@ -126,6 +136,14 @@ This plan keeps CodeQuery and RQL exposure out of scope because issue #824 owns 
   Rationale: every adapter must retain dead source points, but no entry-unreachable point may reach live control or either actual procedure exit. A shared iterative graph rule enforces that acceptance invariant even when a language adapter encounters a newly abrupt construct.
   Date/Author: 2026-07-17 / Codex after Milestone 1c post-review.
 
+- Decision: represent Java switch-expression `yield` as its own shared abrupt-completion kind and bind it to a switch-local yieldable continuation.
+  Rationale: reusing procedure return would target the wrong exit, while reusing break would conflate two language constructs and their cleanup specialization. The neutral builder now routes yield through intervening cleanup to the nearest switch merge and keeps it unavailable to adapters that do not emit it.
+  Date/Author: 2026-07-17 / Codex after TypeScript/Java differential lowering.
+
+- Decision: retain the bidirectional edge-ID representation after the Milestone 2 measurement rather than switching to flat or outgoing-only storage.
+  Rationale: outgoing-only rows met the memory-reduction signal but failed the contractual reverse-traversal gate by orders of magnitude on synthetic graphs and by 5-7x on the real TypeScript/Java corpora. Adding a lazy or rebuilt reverse index would either move the same memory back into retained state or make first reverse use unpredictable. Flat rows fail both traversal directions. The public traversal APIs remain unchanged.
+  Date/Author: 2026-07-17 / Codex after the release representation matrix.
+
 - Decision: use one neutral ICFG provider fed by language CFG and dispatch adapters.
   Rationale: call, normal-return, exceptional-return, recursion, multiple targets, and unresolved boundaries have the same graph semantics across languages. Language differences belong in syntax lowering and dispatch evidence rather than eleven ICFG implementations.
   Date/Author: 2026-07-17 / Codex and user.
@@ -169,6 +187,10 @@ Milestones 1b and 1c are complete. `ProgramSemanticsProvider::materialize(file, 
 TypeScript and TSX now enumerate real functions, methods, constructors, lambdas, expression bodies, and static initializers, then lower sequencing, branches, switch flow, loops, labeled and abrupt completion, nested-call evaluation, optional and short-circuit control, throw/catch/finally, and supported async topology through the private iterative engine. Advanced or inexact behavior such as resource management, generators, implicit exceptions, deferred execution, and unknown control is represented by capability- and point-scoped gaps. A shared iterative seal preserves dead-region topology while preventing disconnected source from reaching either real exit. The inline semantic-graph harness resolves readable source-backed aliases and asserts exact predecessor/successor edges, symmetry, reachability, and deterministic bounded topology without exposing raw dense identities.
 
 Post-milestone specialist review found no remaining blocker. All focused suites, strict clippy, formatting, diff checks, and the full `nlp,python` repository gate pass. The nonblocking follow-ups are to introduce a dedicated `ProcedureSelector` if later cross-language fixtures need more disambiguation than the current procedure qualifiers provide, and to measure whether exact cache identity can be obtained before syntax preparation. Milestone 2 now adds Java and uses the TypeScript/Java differential suite plus physical-layout measurements to stabilize the callable-CFG contract.
+
+Milestone 2 is complete. Java now emits real callable-local CFGs for methods, constructors, lambdas, executable initializer fragments, branches, loops, switch statements and expressions, calls, abrupt completion, explicit throw, catch dispatch, and cleanup relays. Try-with-resources, synchronized monitor behavior, implicit exceptions, assertion enablement, initializer scheduling, and other incomplete semantics remain exact capability- and point-scoped gaps. The shared builder gained a cleanup-safe switch-yield channel, and TypeScript cleanup relays now preserve the originating completion edge kind.
+
+The checked-in measurement harness compares flat edges, outgoing-only CSR, and canonical bidirectional edge-ID rows per procedure, validates rich-edge equivalence, and records machine/source provenance. The full release matrix rejected both alternatives: outgoing-only memory savings were real, but reverse traversal violated the acceptance gate by several orders of magnitude at scale; flat rows made both directions unacceptable. The bidirectional representation is therefore the reviewed CFG substrate entering Milestone 3.
 
 ## Context and Orientation
 
@@ -597,3 +619,5 @@ Plan revision note (2026-07-17): A second pre-checkpoint review moved contract f
 Plan revision note (2026-07-17): Completed Milestone 1a after three specialist reviews. The semantic CFG now uses schema-v2 canonical rich-edge IDs, outgoing offsets, incoming edge-ID rows, exact bidirectional traversal, scoped handles, deterministic bounded rendering, and defensive corruption validation. Review tightened provenance-parallel topology accounting, invalid-ID behavior, canonical incoming hydration, and literal renderer-schema coverage. Focused tests, formatting, strict all-feature clippy, and the complete `nlp,python` suite pass; the latter requires the documented macOS PyO3 dynamic-lookup flags and host access for process-dependent tests.
 
 Plan revision note (2026-07-17): Completed Milestones 1b and 1c after specialist cache/provider, TypeScript-control, and final adversarial reviews. The production provider now atomically lowers one bounded, origin- and overlay-revision-aware syntax snapshot; publishes only validated outcomes; and shares complete artifacts through a byte-weighted, cancellation-aware single-flight cache. The first real adapter covers TypeScript and TSX callable control, retains dead syntax behind a generic reachability seal, and reports advanced omissions as exact typed gaps. The inline graph harness asserts source-backed predecessor/successor topology. All focused and repository gates pass; Java is the next checkpoint.
+
+Plan revision note (2026-07-17): Completed Milestone 2 after Java-semantic and measurement reviews. Java now covers the common callable-control core plus switch expressions, yield, handlers, cleanup relays, initializer fragments, and method-reference evaluation while advanced omissions remain point-scoped. The release matrix rejected flat and outgoing-only physical rows because their reverse traversal failed the contract despite outgoing-only memory savings, so canonical bidirectional edge-ID rows enter the ICFG checkpoint unchanged. All focused tests, strict clippy, and the complete `nlp,python` suite pass.
