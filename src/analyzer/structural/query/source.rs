@@ -6,8 +6,7 @@ use super::schema::{
     RqlForm, RqlFormClass, RqlProperty, StringPredicateField, reference_kind_from_label,
     usage_proof_from_label, usage_surface_from_label,
 };
-use super::sexp::query_to_json;
-use super::syntax::{Expr, ExprKind, parse_rql};
+use super::sexp::{parse_query_sexp, query_to_json};
 use super::{
     CodeQuery, CodeQueryResultDetail, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES,
     MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_QUERY_BRANCHES,
@@ -18,6 +17,7 @@ use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{
     ALL_KINDS, ALL_ROLES, NormalizedKind, Role, RoleValueShape,
 };
+use crate::sexp::{Expr, ExprKind};
 use json_spanned_value::{ErrorExt, spanned};
 use regex::Regex;
 use serde_json::{Map, Value};
@@ -395,19 +395,52 @@ impl Analysis {
     }
 
     fn semantic_error(&mut self, error: super::QueryError, fallback: Range<usize>) {
-        let mut path = error.path.as_str();
-        let range = loop {
+        let range = self.range_for_path(&error.path, fallback);
+        self.error(range, "invalid-query", error.message);
+    }
+
+    fn range_for_path(&self, path: &str, fallback: Range<usize>) -> Range<usize> {
+        let mut path = path;
+        loop {
             if let Some(range) = self.paths.get(path) {
-                break range.clone();
+                return range.clone();
             }
             if let Some(index) = path.rfind(['.', '[']) {
                 path = &path[..index];
             } else {
-                break fallback;
+                return fallback;
             }
-        };
-        self.error(range, "invalid-query", error.message);
+        }
     }
+
+    fn path_for_range(&self, target: &Range<usize>) -> Option<String> {
+        self.paths
+            .iter()
+            .filter(|(_, range)| range.start <= target.start && target.end <= range.end)
+            .min_by(|(left_path, left_range), (right_path, right_range)| {
+                let left_width = left_range.end.saturating_sub(left_range.start);
+                let right_width = right_range.end.saturating_sub(right_range.start);
+                left_width
+                    .cmp(&right_width)
+                    .then_with(|| right_path.len().cmp(&left_path.len()))
+                    .then_with(|| left_path.cmp(right_path))
+            })
+            .map(|(path, _)| path.clone())
+    }
+}
+
+pub(super) fn query_expr_range_for_path(expr: &Expr, path: &str) -> Range<usize> {
+    let mut analysis = Analysis::default();
+    let mut plan_budget = SourcePlanBudget::default();
+    validate_rql_query(expr, "match", &mut analysis, 0, &mut plan_budget);
+    analysis.range_for_path(path, expr.range.clone())
+}
+
+pub(super) fn query_expr_path_for_range(expr: &Expr, range: &Range<usize>) -> Option<String> {
+    let mut analysis = Analysis::default();
+    let mut plan_budget = SourcePlanBudget::default();
+    validate_rql_query(expr, "match", &mut analysis, 0, &mut plan_budget);
+    analysis.path_for_range(range)
 }
 
 fn analyze_source(source: &str) -> Analysis {
@@ -420,7 +453,7 @@ fn analyze_source(source: &str) -> Analysis {
 
 fn analyze_rql(source: &str) -> Analysis {
     let mut analysis = Analysis::default();
-    let parsed = match parse_rql(source) {
+    let parsed = match parse_query_sexp(source) {
         Ok(parsed) => parsed,
         Err(error) => {
             analysis.error(error.range, "invalid-syntax", error.message);
@@ -442,7 +475,7 @@ fn analyze_rql(source: &str) -> Analysis {
                     analysis.semantic_error(error, expr.range.clone());
                 }
             }
-            Err(message) => analysis.error(expr.range.clone(), "invalid-query", message),
+            Err(error) => analysis.error(error.range, "invalid-query", error.message),
         }
     }
     analysis

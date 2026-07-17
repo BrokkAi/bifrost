@@ -1,8 +1,8 @@
-//! Shared byte-spanned syntax for the RQL frontend.
+//! Shared byte-spanned S-expression syntax.
 
 use std::ops::Range;
 
-pub(crate) const MAX_RQL_DEPTH: usize = 128;
+pub(crate) const MAX_SEXP_DEPTH: usize = 128;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Expr {
@@ -62,21 +62,21 @@ pub(crate) struct ParseError {
     pub(crate) message: String,
 }
 
-pub(crate) struct ParsedRql {
+pub(crate) struct ParsedSexp {
     pub(crate) expr: Option<Expr>,
     pub(crate) incomplete: Option<ParseError>,
 }
 
-pub(crate) struct ParsedRqlDocument {
+pub(crate) struct ParsedSexpDocument {
     pub(crate) exprs: Vec<Expr>,
     pub(crate) incomplete: Option<ParseError>,
 }
 
-pub(crate) fn parse_rql(source: &str) -> Result<ParsedRql, ParseError> {
+pub(crate) fn parse_sexp(source: &str) -> Result<ParsedSexp, ParseError> {
     Parser::new(source).parse()
 }
 
-pub(crate) fn parse_rql_document(source: &str) -> Result<ParsedRqlDocument, ParseError> {
+pub(crate) fn parse_sexp_document(source: &str) -> Result<ParsedSexpDocument, ParseError> {
     Parser::new(source).parse_document()
 }
 
@@ -95,10 +95,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse(mut self) -> Result<ParsedRql, ParseError> {
+    fn parse(mut self) -> Result<ParsedSexp, ParseError> {
         self.skip_trivia();
         if self.pos == self.source.len() {
-            return Ok(ParsedRql {
+            return Ok(ParsedSexp {
                 expr: None,
                 incomplete: None,
             });
@@ -106,15 +106,15 @@ impl<'a> Parser<'a> {
         let expr = self.expr(0)?;
         self.skip_trivia();
         if self.pos != self.source.len() {
-            return Err(self.error_here("unexpected input after the query"));
+            return Err(self.error_here("unexpected input after the expression"));
         }
-        Ok(ParsedRql {
+        Ok(ParsedSexp {
             expr: Some(expr),
             incomplete: self.incomplete,
         })
     }
 
-    fn parse_document(mut self) -> Result<ParsedRqlDocument, ParseError> {
+    fn parse_document(mut self) -> Result<ParsedSexpDocument, ParseError> {
         let mut exprs = Vec::new();
         loop {
             self.skip_trivia();
@@ -126,16 +126,16 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        Ok(ParsedRqlDocument {
+        Ok(ParsedSexpDocument {
             exprs,
             incomplete: self.incomplete,
         })
     }
 
     fn expr(&mut self, depth: usize) -> Result<Expr, ParseError> {
-        if depth > MAX_RQL_DEPTH {
+        if depth > MAX_SEXP_DEPTH {
             return Err(self.error_here(&format!(
-                "S-expression nesting exceeds maximum depth {MAX_RQL_DEPTH}"
+                "S-expression nesting exceeds maximum depth {MAX_SEXP_DEPTH}"
             )));
         }
         self.skip_trivia();
@@ -292,5 +292,21 @@ impl<'a> Parser<'a> {
             range: self.pos..self.pos.saturating_add(1).min(self.source.len()),
             message: message.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_expression_parser_uses_schema_neutral_trailing_input_wording() {
+        let error = match parse_sexp("(first) (second)") {
+            Ok(_) => panic!("second expression must fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.message, "unexpected input after the expression");
+        assert_eq!(&"(first) (second)"[error.range], "(");
     }
 }

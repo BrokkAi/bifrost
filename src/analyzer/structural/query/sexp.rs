@@ -1,22 +1,30 @@
 use super::ir::{CodeQuery, CodeQueryResultDetail};
 use super::schema::{RqlForm, RqlFormClass, RqlProperty};
-#[cfg(test)]
-use super::syntax::MAX_RQL_DEPTH;
-use super::syntax::{Expr, ExprKind, parse_rql};
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{NormalizedKind, Role, RoleValueShape};
+#[cfg(test)]
+use crate::sexp::MAX_SEXP_DEPTH;
+use crate::sexp::{Expr, ExprKind, ParseError, ParsedSexp, parse_sexp};
 use serde_json::{Map, Number, Value, json};
+use std::fmt;
+use std::ops::Range;
 
 const MAX_SEXP_INPUT_BYTES: usize = 64 * 1024;
 
 impl CodeQuery {
     pub fn from_sexp(input: &str) -> Result<Self, String> {
-        let value = sexp_to_json(input)?;
-        Self::from_json(&value).map_err(|error| error.to_string())
+        let expr = parse_query_expr(input)?;
+        code_query_from_expr(&expr, super::SCHEMA_VERSION as u32)
+            .map_err(QueryExprError::into_rql_message)
     }
 }
 
 pub fn sexp_to_json(input: &str) -> Result<Value, String> {
+    let expr = parse_query_expr(input)?;
+    query_expr_to_json(&expr).map_err(|error| error.message)
+}
+
+fn parse_query_expr(input: &str) -> Result<Expr, String> {
     if input.len() > MAX_SEXP_INPUT_BYTES {
         return Err(format!(
             "S-expression query is too large: {} bytes exceeds {}",
@@ -24,24 +32,147 @@ pub fn sexp_to_json(input: &str) -> Result<Value, String> {
             MAX_SEXP_INPUT_BYTES
         ));
     }
-    let parsed = parse_rql(input).map_err(|error| error.message)?;
+    let parsed = parse_query_sexp(input).map_err(parse_error_message)?;
     if let Some(error) = parsed.incomplete {
         return Err(error.message);
     }
     let expr = parsed
         .expr
         .ok_or_else(|| "expected expression, found end of input".to_string())?;
-    query_to_json(&expr)
+    Ok(expr)
 }
 
-pub(crate) fn query_to_json(expr: &Expr) -> Result<Value, String> {
+fn parse_error_message(error: ParseError) -> String {
+    error.message
+}
+
+pub(super) fn parse_query_sexp(input: &str) -> Result<ParsedSexp, ParseError> {
+    parse_sexp(input).map_err(|mut error| {
+        if error.message == "unexpected input after the expression" {
+            error.message = "unexpected input after the query".to_string();
+        }
+        error
+    })
+}
+
+/// An error lowering one already-parsed RQL subtree.
+///
+/// `range` always points into the original enclosing S-expression source, so
+/// RQLP can surface a nested selector error without rendering and reparsing
+/// the selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueryExprError {
+    pub(crate) path: String,
+    pub(crate) range: Range<usize>,
+    pub(crate) message: String,
+    kind: QueryExprErrorKind,
+}
+
+#[derive(Debug)]
+pub(super) struct QueryLowerError {
+    pub(super) range: Range<usize>,
+    pub(super) message: String,
+}
+
+type LowerResult<T> = Result<T, QueryLowerError>;
+
+trait LocateLoweringError<T> {
+    fn at(self, expr: &Expr) -> LowerResult<T>;
+}
+
+impl<T> LocateLoweringError<T> for Result<T, String> {
+    fn at(self, expr: &Expr) -> LowerResult<T> {
+        self.map_err(|message| QueryLowerError {
+            range: expr.range.clone(),
+            message,
+        })
+    }
+}
+
+fn lower_error(expr: &Expr, message: impl Into<String>) -> QueryLowerError {
+    QueryLowerError {
+        range: expr.range.clone(),
+        message: message.into(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryExprErrorKind {
+    Lowering,
+    Semantic,
+}
+
+impl QueryExprError {
+    fn into_rql_message(self) -> String {
+        match self.kind {
+            QueryExprErrorKind::Lowering => self.message,
+            QueryExprErrorKind::Semantic => self.to_string(),
+        }
+    }
+}
+
+impl fmt::Display for QueryExprError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.path.is_empty() {
+            formatter.write_str(&self.message)
+        } else {
+            write!(
+                formatter,
+                "invalid query at {}: {}",
+                self.path, self.message
+            )
+        }
+    }
+}
+
+impl std::error::Error for QueryExprError {}
+
+/// Lower an already-parsed RQL subtree to the canonical query JSON shape.
+pub(crate) fn query_expr_to_json(expr: &Expr) -> Result<Value, QueryExprError> {
+    query_to_json(expr).map_err(|error| {
+        let path = super::source::query_expr_path_for_range(expr, &error.range)
+            .unwrap_or_else(|| "match".to_string());
+        QueryExprError {
+            path,
+            range: error.range,
+            message: error.message,
+            kind: QueryExprErrorKind::Lowering,
+        }
+    })
+}
+
+/// Lower and validate an already-parsed RQL subtree exactly once.
+///
+/// The caller supplies the independently resolved RQL schema version. Inline
+/// policy selectors therefore do not need a source-text reconstruction step.
+pub(crate) fn code_query_from_expr(
+    expr: &Expr,
+    schema_version: u32,
+) -> Result<CodeQuery, QueryExprError> {
+    let mut value = query_expr_to_json(expr)?;
+    let object = value
+        .as_object_mut()
+        .expect("RQL lowering always produces a query object");
+    object.insert("schema_version".to_string(), json!(schema_version));
+    CodeQuery::from_json(&value).map_err(|error| {
+        let range = super::source::query_expr_range_for_path(expr, &error.path);
+        QueryExprError {
+            path: error.path,
+            range,
+            message: error.message,
+            kind: QueryExprErrorKind::Semantic,
+        }
+    })
+}
+
+pub(super) fn query_to_json(expr: &Expr) -> LowerResult<Value> {
     if let Some(value) = wrapper_query_to_json(expr)? {
         return Ok(value);
     }
     Ok(json!({ "match": pattern_to_json(expr)? }))
 }
 
-fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
+fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
     let Some(items) = expr.as_list() else {
         return Ok(None);
     };
@@ -57,58 +188,68 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
     match form {
         RqlForm::Where => {
             if items.len() < 3 {
-                return Err("(where ...) requires at least one glob and a query".to_string());
+                return Err(lower_error(
+                    expr,
+                    "(where ...) requires at least one glob and a query",
+                ));
             }
             let mut query = query_object(&items[items.len() - 1])?;
             let globs = items[1..items.len() - 1]
                 .iter()
                 .map(string_arg)
                 .collect::<Result<Vec<_>, _>>()?;
-            insert_unique(&mut query, "where", array_of_strings(globs))?;
+            insert_unique(&mut query, "where", array_of_strings(globs)).at(expr)?;
             Ok(Some(Value::Object(query)))
         }
         RqlForm::Language => {
             if items.len() < 3 {
-                return Err("(language ...) requires at least one label and a query".to_string());
+                return Err(lower_error(
+                    expr,
+                    "(language ...) requires at least one label and a query",
+                ));
             }
             let mut query = query_object(&items[items.len() - 1])?;
             let labels = items[1..items.len() - 1]
                 .iter()
                 .map(language_arg)
                 .collect::<Result<Vec<_>, _>>()?;
-            insert_unique(&mut query, "languages", array_of_strings(labels))?;
+            insert_unique(&mut query, "languages", array_of_strings(labels)).at(expr)?;
             Ok(Some(Value::Object(query)))
         }
         RqlForm::Limit => {
-            expect_len(items, 3, "limit")?;
+            expect_len(expr, items, 3, "limit")?;
             let mut query = query_object(&items[2])?;
-            insert_unique(&mut query, "limit", number_value(&items[1], "limit")?)?;
+            insert_unique(&mut query, "limit", number_value(&items[1], "limit")?).at(expr)?;
             Ok(Some(Value::Object(query)))
         }
         RqlForm::ResultDetail => {
-            expect_len(items, 3, head)?;
+            expect_len(expr, items, 3, head)?;
             let mut query = query_object(&items[2])?;
             insert_unique(
                 &mut query,
                 "result_detail",
                 Value::String(result_detail_arg(&items[1])?),
-            )?;
+            )
+            .at(expr)?;
             Ok(Some(Value::Object(query)))
         }
         RqlForm::Inside | RqlForm::NotInside => {
-            expect_len(items, 3, head)?;
+            expect_len(expr, items, 3, head)?;
             let mut query = query_object(&items[2])?;
             let field = if form == RqlForm::Inside {
                 "inside"
             } else {
                 "not_inside"
             };
-            insert_unique(&mut query, field, pattern_to_json(&items[1])?)?;
+            insert_unique(&mut query, field, pattern_to_json(&items[1])?).at(expr)?;
             Ok(Some(Value::Object(query)))
         }
         RqlForm::Union | RqlForm::Intersect | RqlForm::Except => {
             if items.len() < 3 {
-                return Err(format!("({head} ...) requires at least two queries"));
+                return Err(lower_error(
+                    expr,
+                    format!("({head} ...) requires at least two queries"),
+                ));
             }
             let branches = items[1..]
                 .iter()
@@ -124,13 +265,13 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
         | RqlForm::ImportersOf
         | RqlForm::Members
         | RqlForm::Owner => {
-            expect_len(items, 2, head)?;
+            expect_len(expr, items, 2, head)?;
             let mut query = query_object(&items[1])?;
             let steps = query
                 .entry("steps".to_string())
                 .or_insert_with(|| Value::Array(Vec::new()))
                 .as_array_mut()
-                .ok_or_else(|| "internal error: steps must be an array".to_string())?;
+                .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?;
             let op = match form {
                 RqlForm::EnclosingDecl => "enclosing_decl",
                 RqlForm::FileOf => "file_of",
@@ -145,8 +286,9 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
         }
         RqlForm::ReferencesOf | RqlForm::UsedBy | RqlForm::Uses => {
             if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
-                return Err(format!(
-                    "({head} ...) expects option/value pairs followed by a query"
+                return Err(lower_error(
+                    expr,
+                    format!("({head} ...) expects option/value pairs followed by a query"),
                 ));
             }
             let query_expr = items.last().expect("reference wrapper has a query");
@@ -160,13 +302,19 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
             let mut step = Map::new();
             step.insert("op".to_string(), Value::String(op.to_string()));
             for pair in items[1..items.len() - 1].chunks_exact(2) {
-                let key = pair[0]
-                    .as_symbol()
-                    .ok_or_else(|| format!("({head} ...) option names must be symbols"))?;
+                let key = pair[0].as_symbol().ok_or_else(|| {
+                    lower_error(
+                        &pair[0],
+                        format!("({head} ...) option names must be symbols"),
+                    )
+                })?;
                 let (field, value) = match key {
                     ":reference-kinds" => {
                         let values = pair[1].as_sequence().ok_or_else(|| {
-                            format!("({head} :reference-kinds ...) requires a vector")
+                            lower_error(
+                                &pair[1],
+                                format!("({head} :reference-kinds ...) requires a vector"),
+                            )
                         })?;
                         let labels = values
                             .iter()
@@ -186,27 +334,34 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
                         Value::String(symbol_or_string(&pair[1])?.replace('-', "_")),
                     ),
                     _ => {
-                        return Err(format!(
-                            "({head} ...) accepts only :reference-kinds, :proof, and :surface"
+                        return Err(lower_error(
+                            &pair[0],
+                            format!(
+                                "({head} ...) accepts only :reference-kinds, :proof, and :surface"
+                            ),
                         ));
                     }
                 };
                 if step.insert(field.to_string(), value).is_some() {
-                    return Err(format!("({head} ...) repeats option {key}"));
+                    return Err(lower_error(
+                        &pair[0],
+                        format!("({head} ...) repeats option {key}"),
+                    ));
                 }
             }
             query
                 .entry("steps".to_string())
                 .or_insert_with(|| Value::Array(Vec::new()))
                 .as_array_mut()
-                .ok_or_else(|| "internal error: steps must be an array".to_string())?
+                .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
                 .push(Value::Object(step));
             Ok(Some(Value::Object(query)))
         }
         RqlForm::Callers | RqlForm::Callees | RqlForm::CallSitesTo | RqlForm::CallSitesFrom => {
             if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
-                return Err(format!(
-                    "({head} ...) expects option/value pairs followed by a query"
+                return Err(lower_error(
+                    expr,
+                    format!("({head} ...) expects option/value pairs followed by a query"),
                 ));
             }
             let query_expr = items.last().expect("call wrapper has a query");
@@ -221,9 +376,12 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
             let mut step = Map::new();
             step.insert("op".to_string(), Value::String(op.to_string()));
             for pair in items[1..items.len() - 1].chunks_exact(2) {
-                let key = pair[0]
-                    .as_symbol()
-                    .ok_or_else(|| format!("({head} ...) option names must be symbols"))?;
+                let key = pair[0].as_symbol().ok_or_else(|| {
+                    lower_error(
+                        &pair[0],
+                        format!("({head} ...) option names must be symbols"),
+                    )
+                })?;
                 let (field, value) = match key {
                     ":depth" if matches!(form, RqlForm::Callers | RqlForm::Callees) => {
                         ("depth", number_value(&pair[1], head)?)
@@ -233,43 +391,53 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
                         Value::String(symbol_or_string(&pair[1])?.replace('-', "_")),
                     ),
                     _ => {
-                        return Err(format!(
-                            "({head} ...) accepts :proof{}",
-                            if matches!(form, RqlForm::Callers | RqlForm::Callees) {
-                                " and :depth"
-                            } else {
-                                ""
-                            }
+                        return Err(lower_error(
+                            &pair[0],
+                            format!(
+                                "({head} ...) accepts :proof{}",
+                                if matches!(form, RqlForm::Callers | RqlForm::Callees) {
+                                    " and :depth"
+                                } else {
+                                    ""
+                                }
+                            ),
                         ));
                     }
                 };
                 if step.insert(field.to_string(), value).is_some() {
-                    return Err(format!("({head} ...) repeats option {key}"));
+                    return Err(lower_error(
+                        &pair[0],
+                        format!("({head} ...) repeats option {key}"),
+                    ));
                 }
             }
             query
                 .entry("steps".to_string())
                 .or_insert_with(|| Value::Array(Vec::new()))
                 .as_array_mut()
-                .ok_or_else(|| "internal error: steps must be an array".to_string())?
+                .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
                 .push(Value::Object(step));
             Ok(Some(Value::Object(query)))
         }
         RqlForm::CallInput => {
             if items.len() != 4 {
-                return Err(format!(
-                    "({head} ...) expects one selector option followed by a query"
+                return Err(lower_error(
+                    expr,
+                    format!("({head} ...) expects one selector option followed by a query"),
                 ));
             }
-            let key = items[1]
-                .as_symbol()
-                .ok_or_else(|| format!("({head} ...) selector must be a symbol"))?;
+            let key = items[1].as_symbol().ok_or_else(|| {
+                lower_error(&items[1], format!("({head} ...) selector must be a symbol"))
+            })?;
             let (field, value) = match key {
                 ":receiver" if items[2].as_symbol() == Some("true") => {
                     ("receiver", Value::Bool(true))
                 }
                 ":receiver" => {
-                    return Err(format!("({head} :receiver ...) requires true"));
+                    return Err(lower_error(
+                        &items[2],
+                        format!("({head} :receiver ...) requires true"),
+                    ));
                 }
                 ":parameter-index" => ("parameter_index", number_value(&items[2], head)?),
                 ":parameter-name" => (
@@ -277,8 +445,11 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
                     Value::String(symbol_or_string(&items[2])?),
                 ),
                 _ => {
-                    return Err(format!(
-                        "({head} ...) requires :receiver, :parameter-index, or :parameter-name"
+                    return Err(lower_error(
+                        &items[1],
+                        format!(
+                            "({head} ...) requires :receiver, :parameter-index, or :parameter-name"
+                        ),
                     ));
                 }
             };
@@ -290,7 +461,7 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
                 .entry("steps".to_string())
                 .or_insert_with(|| Value::Array(Vec::new()))
                 .as_array_mut()
-                .ok_or_else(|| "internal error: steps must be an array".to_string())?
+                .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
                 .push(Value::Object(step));
             Ok(Some(Value::Object(query)))
         }
@@ -301,8 +472,11 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
                     (&items[3], Some(symbol_or_string(&items[2])?))
                 }
                 _ => {
-                    return Err(format!(
-                        "({head} ...) expects an optional :capture name followed by a query"
+                    return Err(lower_error(
+                        expr,
+                        format!(
+                            "({head} ...) expects an optional :capture name followed by a query"
+                        ),
                     ));
                 }
             };
@@ -322,7 +496,7 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
                 .entry("steps".to_string())
                 .or_insert_with(|| Value::Array(Vec::new()))
                 .as_array_mut()
-                .ok_or_else(|| "internal error: steps must be an array".to_string())?
+                .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
                 .push(Value::Object(step));
             Ok(Some(Value::Object(query)))
         }
@@ -331,8 +505,11 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
                 2 => (&items[1], None),
                 4 => (&items[3], Some((&items[1], &items[2]))),
                 _ => {
-                    return Err(format!(
-                        "({head} ...) expects a query, optionally preceded by :depth count or :transitive true"
+                    return Err(lower_error(
+                        expr,
+                        format!(
+                            "({head} ...) expects a query, optionally preceded by :depth count or :transitive true"
+                        ),
                     ));
                 }
             };
@@ -351,13 +528,17 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
                     }
                     Some(":transitive") => {
                         if value.as_symbol() != Some("true") {
-                            return Err(format!("({head} :transitive ...) requires true"));
+                            return Err(lower_error(
+                                value,
+                                format!("({head} :transitive ...) requires true"),
+                            ));
                         }
                         step.insert("transitive".to_string(), Value::Bool(true));
                     }
                     _ => {
-                        return Err(format!(
-                            "({head} ...) accepts only :depth count or :transitive true"
+                        return Err(lower_error(
+                            key,
+                            format!("({head} ...) accepts only :depth count or :transitive true"),
                         ));
                     }
                 }
@@ -366,7 +547,7 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
                 .entry("steps".to_string())
                 .or_insert_with(|| Value::Array(Vec::new()))
                 .as_array_mut()
-                .ok_or_else(|| "internal error: steps must be an array".to_string())?
+                .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
                 .push(Value::Object(step));
             Ok(Some(Value::Object(query)))
         }
@@ -380,65 +561,74 @@ fn wrapper_query_to_json(expr: &Expr) -> Result<Option<Value>, String> {
     }
 }
 
-fn query_object(expr: &Expr) -> Result<Map<String, Value>, String> {
+fn query_object(expr: &Expr) -> LowerResult<Map<String, Value>> {
     match query_to_json(expr)? {
         Value::Object(object) => Ok(object),
         _ => unreachable!("query_to_json always returns an object"),
     }
 }
 
-fn pattern_to_json(expr: &Expr) -> Result<Value, String> {
+fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
     let Some(items) = expr.as_list() else {
-        return Err("pattern must be an S-expression list".to_string());
+        return Err(lower_error(expr, "pattern must be an S-expression list"));
     };
     let Some(head) = head_symbol(items)? else {
-        return Err("pattern list must not be empty".to_string());
+        return Err(lower_error(expr, "pattern list must not be empty"));
     };
 
     let mut object = Map::new();
     if NormalizedKind::from_label(head).is_some() {
-        insert_unique(&mut object, "kind", Value::String(head.to_string()))?;
+        insert_unique(&mut object, "kind", Value::String(head.to_string())).at(&items[0])?;
         parse_pattern_tail(&mut object, &items[1..])?;
         return Ok(Value::Object(object));
     }
 
     let Some(form) = RqlForm::from_label(head) else {
-        return Err(format!("unknown S-expression form `{head}`"));
+        return Err(lower_error(
+            &items[0],
+            format!("unknown S-expression form `{head}`"),
+        ));
     };
     if form.class() != RqlFormClass::Predicate {
-        return Err(format!("S-expression wrapper `{head}` is not a pattern"));
+        return Err(lower_error(
+            &items[0],
+            format!("S-expression wrapper `{head}` is not a pattern"),
+        ));
     }
     match form {
         RqlForm::Name => {
-            expect_len(items, 2, "name")?;
-            insert_unique(&mut object, "name", Value::String(string_arg(&items[1])?))?;
+            expect_len(expr, items, 2, "name")?;
+            insert_unique(&mut object, "name", Value::String(string_arg(&items[1])?)).at(expr)?;
         }
         RqlForm::NameRegex => {
-            expect_len(items, 2, "name/regex")?;
+            expect_len(expr, items, 2, "name/regex")?;
             insert_unique(
                 &mut object,
                 "name".to_string(),
                 json!({ "regex": string_arg(&items[1])? }),
-            )?;
+            )
+            .at(expr)?;
         }
         RqlForm::TextRegex => {
-            expect_len(items, 2, "text/regex")?;
+            expect_len(expr, items, 2, "text/regex")?;
             insert_unique(
                 &mut object,
                 "text".to_string(),
                 json!({ "regex": string_arg(&items[1])? }),
-            )?;
+            )
+            .at(expr)?;
         }
         RqlForm::Capture => {
-            expect_len(items, 2, "capture")?;
+            expect_len(expr, items, 2, "capture")?;
             insert_unique(
                 &mut object,
                 "capture",
                 Value::String(string_arg(&items[1])?),
-            )?;
+            )
+            .at(expr)?;
         }
         RqlForm::Has | RqlForm::NotHas => {
-            expect_len(items, 2, head)?;
+            expect_len(expr, items, 2, head)?;
             insert_unique(
                 &mut object,
                 if form == RqlForm::Has {
@@ -448,11 +638,12 @@ fn pattern_to_json(expr: &Expr) -> Result<Value, String> {
                 }
                 .to_string(),
                 pattern_to_json(&items[1])?,
-            )?;
+            )
+            .at(expr)?;
         }
         RqlForm::NotKind => {
-            expect_len(items, 2, "not-kind")?;
-            insert_unique(&mut object, "not_kind", kind_value(&items[1])?)?;
+            expect_len(expr, items, 2, "not-kind")?;
+            insert_unique(&mut object, "not_kind", kind_value(&items[1])?).at(expr)?;
         }
         RqlForm::Where
         | RqlForm::Language
@@ -486,25 +677,31 @@ fn pattern_to_json(expr: &Expr) -> Result<Value, String> {
     Ok(Value::Object(object))
 }
 
-fn parse_pattern_tail(object: &mut Map<String, Value>, tail: &[Expr]) -> Result<(), String> {
+fn parse_pattern_tail(object: &mut Map<String, Value>, tail: &[Expr]) -> LowerResult<()> {
     let mut index = 0;
     while index < tail.len() {
         match &tail[index].kind {
             ExprKind::Symbol(keyword) if keyword.starts_with(':') => {
                 if index + 1 >= tail.len() {
-                    return Err(format!("keyword `{keyword}` requires a value"));
+                    return Err(lower_error(
+                        &tail[index],
+                        format!("keyword `{keyword}` requires a value"),
+                    ));
                 }
-                insert_keyword(object, &keyword[1..], &tail[index + 1])?;
+                insert_keyword(object, &tail[index], &keyword[1..], &tail[index + 1])?;
                 index += 2;
             }
             ExprKind::List(_) => {
-                merge_pattern_fragment(object, pattern_to_json(&tail[index])?)?;
+                merge_pattern_fragment(object, pattern_to_json(&tail[index])?, &tail[index])?;
                 index += 1;
             }
             _ => {
-                return Err(format!(
-                    "unexpected pattern argument {}; use :field value or a predicate form",
-                    describe_expr(&tail[index])
+                return Err(lower_error(
+                    &tail[index],
+                    format!(
+                        "unexpected pattern argument {}; use :field value or a predicate form",
+                        describe_expr(&tail[index])
+                    ),
                 ));
             }
         }
@@ -512,40 +709,67 @@ fn parse_pattern_tail(object: &mut Map<String, Value>, tail: &[Expr]) -> Result<
     Ok(())
 }
 
-fn insert_keyword(object: &mut Map<String, Value>, key: &str, value: &Expr) -> Result<(), String> {
+fn insert_keyword(
+    object: &mut Map<String, Value>,
+    key_expr: &Expr,
+    key: &str,
+    value: &Expr,
+) -> LowerResult<()> {
     if let Some(property) = RqlProperty::from_label(key) {
         return match property {
-            RqlProperty::Name => insert_unique(object, "name", Value::String(string_arg(value)?)),
+            RqlProperty::Name => {
+                insert_unique(object, "name", Value::String(string_arg(value)?)).at(key_expr)
+            }
             RqlProperty::NameRegex => {
-                insert_unique(object, "name", json!({ "regex": string_arg(value)? }))
+                insert_unique(object, "name", json!({ "regex": string_arg(value)? })).at(key_expr)
             }
             RqlProperty::TextRegex => {
-                insert_unique(object, "text", json!({ "regex": string_arg(value)? }))
+                insert_unique(object, "text", json!({ "regex": string_arg(value)? })).at(key_expr)
             }
             RqlProperty::Capture => {
-                insert_unique(object, "capture", Value::String(string_arg(value)?))
+                insert_unique(object, "capture", Value::String(string_arg(value)?)).at(key_expr)
             }
-            RqlProperty::NotKind => insert_unique(object, "not_kind", kind_value(value)?),
-            RqlProperty::Has => insert_unique(object, "has", pattern_to_json(value)?),
-            RqlProperty::NotHas => insert_unique(object, "not_has", pattern_to_json(value)?),
+            RqlProperty::NotKind => {
+                insert_unique(object, "not_kind", kind_value(value)?).at(key_expr)
+            }
+            RqlProperty::Has => insert_unique(object, "has", pattern_to_json(value)?).at(key_expr),
+            RqlProperty::NotHas => {
+                insert_unique(object, "not_has", pattern_to_json(value)?).at(key_expr)
+            }
         };
     }
     let Some(role) = Role::from_label(key) else {
-        return Err(format!("unknown pattern field `:{key}`"));
+        return Err(lower_error(
+            key_expr,
+            format!("unknown pattern field `:{key}`"),
+        ));
     };
     match role.value_shape() {
-        RoleValueShape::Pattern => insert_unique(object, role.label(), single_role_value(value)?),
-        RoleValueShape::PatternList => insert_unique(object, role.label(), pattern_array(value)?),
-        RoleValueShape::PatternMap => insert_unique(object, role.label(), kwargs_object(value)?),
+        RoleValueShape::Pattern => {
+            insert_unique(object, role.label(), single_role_value(value)?).at(key_expr)
+        }
+        RoleValueShape::PatternList => {
+            insert_unique(object, role.label(), pattern_array(value)?).at(key_expr)
+        }
+        RoleValueShape::PatternMap => {
+            insert_unique(object, role.label(), kwargs_object(value)?).at(key_expr)
+        }
     }
 }
 
-fn merge_pattern_fragment(object: &mut Map<String, Value>, fragment: Value) -> Result<(), String> {
+fn merge_pattern_fragment(
+    object: &mut Map<String, Value>,
+    fragment: Value,
+    origin: &Expr,
+) -> LowerResult<()> {
     let Value::Object(fragment) = fragment else {
-        return Err("pattern fragment must lower to an object".to_string());
+        return Err(lower_error(
+            origin,
+            "pattern fragment must lower to an object",
+        ));
     };
     for (key, value) in fragment {
-        insert_unique(object, key, value)?;
+        insert_unique(object, key, value).at(origin)?;
     }
     Ok(())
 }
@@ -564,17 +788,17 @@ fn insert_unique(
     }
 }
 
-fn single_role_value(expr: &Expr) -> Result<Value, String> {
+fn single_role_value(expr: &Expr) -> LowerResult<Value> {
     match expr.as_string() {
         Some(value) => Ok(json!({ "name": value })),
         None => pattern_to_json(expr),
     }
 }
 
-fn pattern_array(expr: &Expr) -> Result<Value, String> {
+fn pattern_array(expr: &Expr) -> LowerResult<Value> {
     let items = expr
         .as_sequence()
-        .ok_or_else(|| "expected a list/vector of patterns".to_string())?;
+        .ok_or_else(|| lower_error(expr, "expected a list/vector of patterns"))?;
     items
         .iter()
         .map(pattern_to_json)
@@ -582,23 +806,23 @@ fn pattern_array(expr: &Expr) -> Result<Value, String> {
         .map(Value::Array)
 }
 
-fn kwargs_object(expr: &Expr) -> Result<Value, String> {
+fn kwargs_object(expr: &Expr) -> LowerResult<Value> {
     let pairs = expr
         .as_sequence()
-        .ok_or_else(|| "expected a list/vector of keyword argument pairs".to_string())?;
+        .ok_or_else(|| lower_error(expr, "expected a list/vector of keyword argument pairs"))?;
     let mut object = Map::new();
     for pair in pairs {
         let Some(items) = pair.as_list() else {
-            return Err("keyword argument entry must be a list".to_string());
+            return Err(lower_error(pair, "keyword argument entry must be a list"));
         };
-        expect_len(items, 2, "kwargs entry")?;
+        expect_len(pair, items, 2, "kwargs entry")?;
         let key = symbol_or_string(&items[0])?;
-        insert_unique(&mut object, key, pattern_to_json(&items[1])?)?;
+        insert_unique(&mut object, key, pattern_to_json(&items[1])?).at(&items[0])?;
     }
     Ok(Value::Object(object))
 }
 
-fn kind_value(expr: &Expr) -> Result<Value, String> {
+fn kind_value(expr: &Expr) -> LowerResult<Value> {
     match expr.as_sequence() {
         Some(items) => items
             .iter()
@@ -609,71 +833,88 @@ fn kind_value(expr: &Expr) -> Result<Value, String> {
     }
 }
 
-fn kind_label(expr: &Expr) -> Result<String, String> {
+fn kind_label(expr: &Expr) -> LowerResult<String> {
     let label = symbol_or_string(expr)?;
     if NormalizedKind::from_label(&label).is_some() {
         Ok(label)
     } else {
-        Err(format!("unknown normalized kind `{label}`"))
+        Err(lower_error(
+            expr,
+            format!("unknown normalized kind `{label}`"),
+        ))
     }
 }
 
-fn language_arg(expr: &Expr) -> Result<String, String> {
+fn language_arg(expr: &Expr) -> LowerResult<String> {
     let label = symbol_or_string(expr)?;
     Language::from_config_label(&label)
         .map(|language| language.config_label().to_string())
-        .ok_or_else(|| format!("unknown language label `{label}`"))
+        .ok_or_else(|| lower_error(expr, format!("unknown language label `{label}`")))
 }
 
-fn result_detail_arg(expr: &Expr) -> Result<String, String> {
+fn result_detail_arg(expr: &Expr) -> LowerResult<String> {
     let label = symbol_or_string(expr)?;
     CodeQueryResultDetail::from_label(&label)
         .map(|detail| detail.label().to_string())
-        .ok_or_else(|| format!("unknown result detail `{label}`"))
+        .ok_or_else(|| lower_error(expr, format!("unknown result detail `{label}`")))
 }
 
-fn string_arg(expr: &Expr) -> Result<String, String> {
-    expr.as_string()
-        .map(str::to_string)
-        .ok_or_else(|| format!("expected string, got {}", describe_expr(expr)))
+fn string_arg(expr: &Expr) -> LowerResult<String> {
+    expr.as_string().map(str::to_string).ok_or_else(|| {
+        lower_error(
+            expr,
+            format!("expected string, got {}", describe_expr(expr)),
+        )
+    })
 }
 
-fn symbol_or_string(expr: &Expr) -> Result<String, String> {
+fn symbol_or_string(expr: &Expr) -> LowerResult<String> {
     expr.as_string()
         .or_else(|| expr.as_symbol())
         .map(str::to_string)
-        .ok_or_else(|| format!("expected symbol or string, got {}", describe_expr(expr)))
+        .ok_or_else(|| {
+            lower_error(
+                expr,
+                format!("expected symbol or string, got {}", describe_expr(expr)),
+            )
+        })
 }
 
-fn number_value(expr: &Expr, context: &str) -> Result<Value, String> {
+fn number_value(expr: &Expr, context: &str) -> LowerResult<Value> {
     expr.as_number()
         .map(|value| Value::Number(Number::from(value)))
-        .ok_or_else(|| format!("({context} ...) requires a number"))
+        .ok_or_else(|| lower_error(expr, format!("({context} ...) requires a number")))
 }
 
 fn array_of_strings(values: Vec<String>) -> Value {
     Value::Array(values.into_iter().map(Value::String).collect())
 }
 
-fn head_symbol(items: &[Expr]) -> Result<Option<&str>, String> {
+fn head_symbol(items: &[Expr]) -> LowerResult<Option<&str>> {
     match items.first() {
         Some(expr) if expr.as_symbol().is_some() => Ok(expr.as_symbol()),
-        Some(other) => Err(format!(
-            "S-expression head must be a symbol, got {}",
-            describe_expr(other)
+        Some(other) => Err(lower_error(
+            other,
+            format!(
+                "S-expression head must be a symbol, got {}",
+                describe_expr(other)
+            ),
         )),
         None => Ok(None),
     }
 }
 
-fn expect_len(items: &[Expr], len: usize, form: &str) -> Result<(), String> {
+fn expect_len(expr: &Expr, items: &[Expr], len: usize, form: &str) -> LowerResult<()> {
     if items.len() == len {
         Ok(())
     } else {
-        Err(format!(
-            "({form} ...) expects {} argument{}",
-            len - 1,
-            if len == 2 { "" } else { "s" }
+        Err(lower_error(
+            expr,
+            format!(
+                "({form} ...) expects {} argument{}",
+                len - 1,
+                if len == 2 { "" } else { "s" }
+            ),
         ))
     }
 }
@@ -699,6 +940,126 @@ mod tests {
 
     fn canonical_json(value: Value) -> Value {
         CodeQuery::from_json(&value).unwrap().to_canonical_json()
+    }
+
+    #[test]
+    fn parsed_subtree_lowers_without_source_reconstruction() {
+        let source = r#"(policy :selector (call :callee (name "eval")))"#;
+        let parsed = parse_sexp(source).unwrap();
+        let document = parsed.expr.unwrap();
+        let selector = document
+            .as_list()
+            .and_then(|items| items.last())
+            .expect("selector subtree");
+
+        let query = code_query_from_expr(selector, super::super::SCHEMA_VERSION as u32).unwrap();
+
+        assert_eq!(
+            query.to_canonical_json(),
+            canonical_json(json!({
+                "match": { "kind": "call", "callee": { "name": "eval" } }
+            }))
+        );
+        assert_eq!(
+            &source[selector.range.clone()],
+            r#"(call :callee (name "eval"))"#
+        );
+    }
+
+    #[test]
+    fn parsed_subtree_error_retains_semantic_path_and_original_range() {
+        let source = "(policy :selector (limit 0 (call)))";
+        let parsed = parse_sexp(source).unwrap();
+        let document = parsed.expr.unwrap();
+        let selector = document
+            .as_list()
+            .and_then(|items| items.last())
+            .expect("selector subtree");
+
+        let error = code_query_from_expr(selector, super::super::SCHEMA_VERSION as u32)
+            .expect_err("zero limit must fail");
+
+        assert_eq!(error.path, "limit");
+        assert_eq!(&source[error.range], "0");
+    }
+
+    #[test]
+    fn parsed_subtree_lowering_error_retains_narrow_original_range() {
+        let source = r#"(policy :selector (call :unknown "value"))"#;
+        let parsed = parse_sexp(source).unwrap();
+        let document = parsed.expr.unwrap();
+        let selector = document
+            .as_list()
+            .and_then(|items| items.last())
+            .expect("selector subtree");
+
+        let error = code_query_from_expr(selector, super::super::SCHEMA_VERSION as u32)
+            .expect_err("unknown field must fail");
+
+        assert_eq!(error.path, "match");
+        assert_eq!(&source[error.range], ":unknown");
+    }
+
+    #[test]
+    fn parsed_subtree_incomplete_property_error_retains_keyword_range() {
+        let source = "(policy :selector (call :callee))";
+        let parsed = parse_sexp(source).unwrap();
+        let document = parsed.expr.unwrap();
+        let selector = document
+            .as_list()
+            .and_then(|items| items.last())
+            .expect("selector subtree");
+
+        let error = code_query_from_expr(selector, super::super::SCHEMA_VERSION as u32)
+            .expect_err("missing property value must fail");
+
+        assert_eq!(error.path, "match");
+        assert_eq!(&source[error.range], ":callee");
+    }
+
+    #[test]
+    fn parsed_subtree_lowering_range_follows_first_failing_branch() {
+        for source in [
+            "(policy :selector (union (call :callee) (call :receiver)))",
+            r#"(policy :selector (union (call :callee) (call :unknown "value")))"#,
+        ] {
+            let parsed = parse_sexp(source).unwrap();
+            let document = parsed.expr.unwrap();
+            let selector = document
+                .as_list()
+                .and_then(|items| items.last())
+                .expect("selector subtree");
+
+            let error = code_query_from_expr(selector, super::super::SCHEMA_VERSION as u32)
+                .expect_err("first malformed branch must fail");
+
+            assert!(error.message.contains("requires a value"), "{error}");
+            assert_eq!(&source[error.range], ":callee", "{source}");
+        }
+    }
+
+    #[test]
+    fn lowering_range_ignores_earlier_decoder_only_diagnostic() {
+        let source = r#"(policy :selector (assignment :callee (name "run") :unknown "value"))"#;
+        let parsed = parse_sexp(source).unwrap();
+        let document = parsed.expr.unwrap();
+        let selector = document
+            .as_list()
+            .and_then(|items| items.last())
+            .expect("selector subtree");
+
+        let error = code_query_from_expr(selector, super::super::SCHEMA_VERSION as u32)
+            .expect_err("unknown field must fail during lowering");
+
+        assert!(error.message.contains("unknown pattern field"), "{error}");
+        assert_eq!(&source[error.range], ":unknown");
+    }
+
+    #[test]
+    fn standalone_rql_preserves_query_specific_trailing_input_wording() {
+        let error = CodeQuery::from_sexp("(call) (call)").unwrap_err();
+
+        assert_eq!(error, "unexpected input after the query");
     }
 
     #[test]
@@ -873,11 +1234,11 @@ mod tests {
     #[test]
     fn structural_query_sexp_reports_excessive_parser_depth() {
         let mut input = String::new();
-        for _ in 0..=MAX_RQL_DEPTH + 1 {
+        for _ in 0..=MAX_SEXP_DEPTH + 1 {
             input.push('(');
         }
         input.push_str("call");
-        for _ in 0..=MAX_RQL_DEPTH + 1 {
+        for _ in 0..=MAX_SEXP_DEPTH + 1 {
             input.push(')');
         }
         let error = CodeQuery::from_sexp(&input).unwrap_err();

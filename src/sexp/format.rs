@@ -1,8 +1,8 @@
-//! Width-aware formatting for RQL and Rune IR S-expressions.
+//! Width-aware formatting for S-expression documents.
 
 use std::ops::Range;
 
-use super::syntax::{Expr, ExprKind, parse_rql_document};
+use super::{Expr, ExprKind, ParsedSexpDocument, parse_sexp_document};
 
 pub(crate) const DEFAULT_SEXP_LINE_WIDTH: usize = 120;
 
@@ -16,7 +16,7 @@ pub(crate) struct SexpFormatOptions<'a> {
 /// blank lines verbatim. Invalid or incomplete input is left to the caller so
 /// an editor formatting request never damages a document that is being typed.
 pub(crate) fn format_sexp_document(source: &str, options: SexpFormatOptions<'_>) -> Option<String> {
-    let parsed = parse_rql_document(source).ok()?;
+    let parsed: ParsedSexpDocument = parse_sexp_document(source).ok()?;
     if parsed.incomplete.is_some() {
         return None;
     }

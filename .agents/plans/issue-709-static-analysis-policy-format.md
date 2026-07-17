@@ -38,8 +38,9 @@ Running it with `bifrost --policy-file policies/dynamic-eval.rqlp` reports each 
 - [x] (2026-07-17 10:42Z) Ran parallel format/surface/ExecPlan/contract reviews; closed the report-metadata, failure-state, semantic-hash, budget, stable-anchor, severity, registry-authority, query-diagnostic, dependency-pin, acceptance-transcript, and #709/#824 ownership gaps; and synchronized the umbrella roadmap's planning contract.
 - [x] (2026-07-17 13:14Z) Incorporated the intended library workflow: compatible omitted schema versions, diagnostic-neutral categorized match models loaded from explicit directories, generated broad flow messages with deterministic specific-rule precedence, and typestate reuse of the same bound source/sink models plus explicit and implicit terminal expectations.
 - [x] (2026-07-17 13:33+02:00) Began implementation on the existing `709-create-static-analysis-policy-format` branch, fetched `origin/master` at `5395b789`, confirmed the branch was seven commits behind with no overlapping policy-plan changes, and completed the pre-implementation plan/adversarial review checkpoint. The refreshed Bifrost MCP methods were still absent from the callable tool catalog, so implementation continues with narrow repository search/direct-source fallbacks.
+- [x] (2026-07-17 11:27Z) Merged `origin/master` at `5395b789` into the existing issue branch without conflicts, preserving the repository's no-rebase/no-branch-switch rule and placing implementation on the current analyzer/LSP baseline.
 - [ ] Pre-implementation issue sync: mirror this plan's reviewed #709/#824 catalog/classification ownership split into both live issue bodies or record maintainer acknowledgement in their discussions.
-- [ ] Milestone 1a implementation: extract the shared spanned S-expression parser/AST/generic formatter and keep RQL behavior unchanged.
+- [x] (2026-07-17 11:50Z) Milestone 1a implementation: extracted the shared spanned S-expression parser/AST/generic formatter into crate-internal `src/sexp/`; kept the query lowerer in `analyzer::structural::query::sexp`; preserved RQL/Rune formatting and query-specific trailing-input wording; and added direct AST-subtree query lowering whose syntax/lowering/semantic errors retain original absolute byte ranges without render/reparse.
 - [ ] Milestone 1b implementation: add compatible schema-version registries plus declarative policy/endpoint schemas, typed authoring models, parser, canonical serializer, and source diagnostics for both document kinds and all three policy variants.
 - [ ] Milestone 1c implementation: add the policy-aware formatter and incomplete/schema-invalid editor behavior.
 - [ ] Milestone 1 validation/review/checkpoint: run query-regression and policy-source suites, inspect 80/100/120-column formatting golds, fix accepted review findings, update this plan, and commit only milestone files with a multiline rationale.
@@ -70,7 +71,7 @@ Running it with `bifrost --policy-file policies/dynamic-eval.rqlp` reports each 
   Evidence: `src/analyzer/structural/search.rs` defines the current result union. The match adapter must deliberately choose reportable terminal domains rather than assume every row is a `CodeQueryMatch`.
 
 - Observation: the generic S-expression parser already has every primitive schema version 1 needs: byte-spanned lists, vectors, JSON-escaped strings, symbols, unsigned integers, comments, and a bounded nesting depth.
-  Evidence: `src/analyzer/structural/query/syntax.rs` and `format.rs` parse and format schema-agnostic expressions. Large policy maps can use tagged records and vectors of records without a new lexer, map literal, set literal, decimal, or raw-string syntax.
+  Evidence: `src/sexp/syntax.rs` and `format.rs` now parse and format schema-agnostic expressions. Large policy maps can use tagged records and vectors of records without a new lexer, map literal, set literal, decimal, or raw-string syntax.
 
 - Observation: standalone `CodeQuery` JSON and RQL already resolve an omitted query version to current schema version 2, but the current decoder conflates that default with its only supported version and does not retain version-origin provenance.
   Evidence: `CodeQuery::from_json` uses `SCHEMA_VERSION` when `schema_version` is absent, and `CodeQuery::from_sexp` lowers through that path. Policy loading should preserve that behavior while separating an implicit compatibility head from an explicit pin before more versions exist.
@@ -104,6 +105,9 @@ Running it with `bifrost --policy-file policies/dynamic-eval.rqlp` reports each 
 
 - Observation: implementation began with the issue branch seven commits behind current `origin/master`, but none of those commits touched the policy plans or the structural-query concrete-syntax files targeted by Milestone 1.
   Evidence: after `git fetch origin`, `git rev-list --left-right --count HEAD...origin/master` printed `0 7`; `git diff --name-status HEAD..origin/master` showed C#/definition/LSP/skill changes and no issue-709 or RQL syntax/formatter files.
+
+- Observation: the generic parser could be moved without changing RQL behavior, but a policy-safe AST lowering seam needed range-bearing errors before the existing JSON decoder.
+  Evidence: lowering-stage errors occur before `CodeQuery::from_json`, while decoder errors carry semantic JSON paths. The RQL lowerer now propagates the exact offending `Expr` range through recursive and multi-branch forms; the query source path table maps that range to a semantic path, and decoder paths map back through the same table. Focused tests prove an unknown field selects only `:unknown`, a missing value selects only its keyword, a bad limit selects only `0`, multi-branch lowering reports the first failing branch, and a prior decoder-only diagnostic cannot displace a later lowering error.
 
 ## Decision Log
 
@@ -199,9 +203,13 @@ Running it with `bifrost --policy-file policies/dynamic-eval.rqlp` reports each 
   Rationale: the repository requires work to land on the already checked-out branch and forbids an unrequested rebase/branch switch. Merging preserves the published issue-branch history while ensuring implementation and validation use the current analyzer/LSP/dependency baseline.
   Date/Author: 2026-07-17 / Codex
 
+- Decision: place compatibility-lineage mechanics in a neutral crate-internal `src/schema_version.rs`, with RQL and RQLP declaring their own descriptors in their schema modules.
+  Rationale: omitted-version resolution is shared behavior, but query must not depend on policy and the two languages must not duplicate lineage validation. The neutral registry owns exact versus compatible-head resolution; query schema registers version 2 and policy schema registers version 1. Public policy types may re-export the resolution/origin values without exposing registry internals.
+  Date/Author: 2026-07-17 / Codex
+
 ## Outcomes & Retrospective
 
-Planning is complete; implementation has not started. The selected format uses the existing S-expression strengths without making policy metadata part of `CodeQuery`, and it leaves the diagnostic-neutral solver roadmap intact. The main implementation risks are compatibility-head drift, nondeterministic endpoint-directory composition, ambiguous broad-versus-specific precedence, completeness drift in `CodeQueryResult`, unstable finding fingerprints, accidental exposure of internal taint/typestate types, catalog collisions, CVSS inference from missing evidence, and renderer divergence. Each is assigned an explicit public type and acceptance test below.
+Planning is complete and Milestone 1a has established the shared concrete-syntax boundary. RQL and Rune formatting remain unchanged at 120 columns, the parser is schema-neutral, and nested selectors lower from their original AST ranges without rendering or reparsing. Validation passed `cargo check --lib`, 29 shared/S-expression tests, all 78 structural-query tests, the focused RQL/Rune LSP formatting integration test, `cargo fmt --check`, and `git diff --check`; the two accepted adversarial findings (lowering-stage range loss, including multi-branch ordering, and query-specific wording in the shared parser) were fixed with regressions. The remaining implementation risks are compatibility-head drift, nondeterministic endpoint-directory composition, ambiguous broad-versus-specific precedence, completeness drift in `CodeQueryResult`, unstable finding fingerprints, accidental exposure of internal taint/typestate types, catalog collisions, CVSS inference from missing evidence, and renderer divergence. Each is assigned an explicit public type and acceptance test below.
 
 Update this section after every milestone with observable behavior, exact validation evidence, accepted review findings, and any contract changes. At completion, record the implemented schema version, dependency versions, fixture hashes, CLI exit behavior, SARIF schema revision, and the precise #824/#825 handoff.
 

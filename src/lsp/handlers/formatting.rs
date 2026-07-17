@@ -7,9 +7,6 @@ use lsp_types::{DocumentFormattingParams, TextEdit};
 use serde::Deserialize;
 
 use crate::analyzer::common::language_for_file;
-use crate::analyzer::structural::query::format::{
-    DEFAULT_SEXP_LINE_WIDTH, SexpFormatOptions, format_sexp_document,
-};
 use crate::analyzer::{Language, Project, ProjectFile, Range as ByteRange};
 use crate::cancellation::CancellationToken;
 use crate::lsp::conversion::byte_range_to_lsp_range;
@@ -17,6 +14,7 @@ use crate::lsp::handlers::util::read_document_for_uri;
 #[cfg(windows)]
 use crate::path_normalization::NormalizePath;
 use crate::process::{BoundedProcessRequest, run_bounded_process};
+use crate::sexp::{DEFAULT_SEXP_LINE_WIDTH, SexpFormatOptions, format_sexp_document};
 use crate::text_utils::compute_line_starts;
 
 const MAX_ERROR_OUTPUT_CHARS: usize = 1_000;

@@ -37,6 +37,7 @@ pub mod scoped_project;
 pub mod searchtools;
 pub mod searchtools_render;
 pub mod searchtools_service;
+mod sexp;
 pub mod skill_install;
 pub mod structured_data;
 pub mod summary;
