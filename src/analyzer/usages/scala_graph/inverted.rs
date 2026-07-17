@@ -33,8 +33,8 @@ use super::syntax::{
     scala_source_facts,
 };
 use crate::analyzer::scala::{
-    ScalaAdapter, scala_class_parameter_field_keyword, scala_normalize_full_name,
-    scala_simple_type_name,
+    ScalaAdapter, ScalaSupertypeLookupPath, scala_class_parameter_field_keyword,
+    scala_normalize_full_name, scala_simple_type_name,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usage_facts::CallableFacts;
@@ -99,10 +99,7 @@ impl ProjectTypes {
         }
     }
 
-    pub(crate) fn build_from_file_states(
-        scala: &ScalaAnalyzer,
-        file_states: HashMap<ProjectFile, FileState>,
-    ) -> Self {
+    pub(crate) fn build_from_file_states(file_states: HashMap<ProjectFile, FileState>) -> Self {
         let mut declarations = Vec::new();
         let mut seen = HashSet::default();
         for state in file_states.values() {
@@ -162,13 +159,16 @@ impl ProjectTypes {
             extension_methods_by_owner_member: Mutex::new(HashMap::default()),
             override_targets_by_method: Mutex::new(HashMap::default()),
         };
-        let direct_ancestors_by_owner = types.build_direct_ancestors_from_file_states(
-            scala,
-            types
-                .bulk_file_states
-                .as_ref()
-                .expect("bulk Scala file states were just installed"),
-        );
+        let direct_ancestors_by_owner = types
+            .resolve_direct_ancestors_from_file_states(
+                types
+                    .bulk_file_states
+                    .as_ref()
+                    .expect("bulk Scala file states were just installed"),
+            )
+            .into_iter()
+            .map(|(owner, ancestors)| (owner.fq_name(), ancestors))
+            .collect();
         types.direct_ancestors_by_owner = Some(direct_ancestors_by_owner);
         types
     }
@@ -177,31 +177,48 @@ impl ProjectTypes {
         self.bulk_file_states.as_ref()?.get(file)
     }
 
-    fn build_direct_ancestors_from_file_states(
+    pub(crate) fn resolve_direct_ancestors_from_file_states(
         &self,
-        scala: &ScalaAnalyzer,
         file_states: &HashMap<ProjectFile, FileState>,
-    ) -> HashMap<String, Vec<CodeUnit>> {
+    ) -> HashMap<CodeUnit, Vec<CodeUnit>> {
         let mut ancestors_by_owner = HashMap::default();
         for (file, state) in file_states {
-            if state.raw_supertypes.is_empty() {
+            if state.supertype_lookup_paths.is_empty() {
                 continue;
             }
-            let resolver = NameResolver::for_file_with_facts(
-                scala,
+            let lookup_paths_by_owner = state
+                .supertype_lookup_paths
+                .iter()
+                .filter_map(|(owner, encoded)| {
+                    let paths = encoded
+                        .iter()
+                        .map(|path| ScalaSupertypeLookupPath::decode(path))
+                        .collect::<Option<Vec<_>>>()?;
+                    Some((owner.clone(), paths))
+                })
+                .collect::<HashMap<_, _>>();
+            let required_names = lookup_paths_by_owner
+                .values()
+                .flatten()
+                .filter_map(|path| path.segments().first().cloned())
+                .collect();
+            let resolver = NameResolver::for_type_hierarchy_file(
                 Some(file),
                 Some(&state.package_name),
                 &state.imports,
                 self,
+                &required_names,
             );
-            for (owner, raw_supertypes) in &state.raw_supertypes {
+            for (owner, lookup_paths) in lookup_paths_by_owner {
                 if !owner.is_class() {
                     continue;
                 }
                 let mut ancestors = Vec::new();
                 let mut seen = HashSet::default();
-                for raw in raw_supertypes {
-                    let Some(fqn) = resolver.resolve(raw) else {
+                for path in lookup_paths {
+                    let Some(fqn) =
+                        self.resolve_type_in_declaration_context(&resolver, path.segments())
+                    else {
                         continue;
                     };
                     if !seen.insert(fqn.clone()) {
@@ -214,7 +231,7 @@ impl ProjectTypes {
                     }
                 }
                 if !ancestors.is_empty() {
-                    ancestors_by_owner.insert(owner.fq_name(), ancestors);
+                    ancestors_by_owner.insert(owner.clone(), ancestors);
                 }
             }
         }
@@ -431,7 +448,6 @@ impl ProjectTypes {
         {
             return types;
         }
-
         let mut values = Vec::new();
         for ((candidate_package, simple), units) in self.index.package_types() {
             if candidate_package != package {
@@ -1013,6 +1029,57 @@ impl VisibleNameBindings {
     }
 }
 
+fn add_hierarchy_package_type_bindings<F>(
+    names: &mut VisibleNameBindings,
+    types: &ProjectTypes,
+    package: &str,
+    simple: &str,
+    priority: F,
+) where
+    F: Fn(&CodeUnit) -> u8,
+{
+    let package_level = types
+        .index
+        .types_in_package(package, simple)
+        .iter()
+        .filter(|unit| unit.is_class() && is_package_level_type(unit))
+        .collect::<Vec<_>>();
+    let ordinary = package_level
+        .iter()
+        .copied()
+        .filter(|unit| !unit.short_name().ends_with('$'))
+        .collect::<Vec<_>>();
+    let selected = if ordinary.is_empty() {
+        package_level
+    } else {
+        ordinary
+    };
+    for decl in selected {
+        names.add(simple.to_string(), decl.fq_name(), priority(decl));
+    }
+}
+
+fn add_hierarchy_package_object_bindings<F>(
+    object_names: &mut VisibleNameBindings,
+    types: &ProjectTypes,
+    package: &str,
+    simple: &str,
+    priority: F,
+) where
+    F: Fn(&CodeUnit) -> u8,
+{
+    for decl in types
+        .index
+        .types_in_package(package, simple)
+        .iter()
+        .filter(|unit| {
+            unit.is_class() && is_package_level_type(unit) && unit.short_name().ends_with('$')
+        })
+    {
+        object_names.add(simple.to_string(), decl.fq_name(), priority(decl));
+    }
+}
+
 impl NameResolver {
     pub(crate) fn for_file(
         scala: &ScalaAnalyzer,
@@ -1048,6 +1115,87 @@ impl NameResolver {
         types: &ProjectTypes,
     ) -> Self {
         Self::for_file_with_facts_impl(scala, source_file, package, imports, types, true)
+    }
+
+    fn for_type_hierarchy_file(
+        source_file: Option<&ProjectFile>,
+        package: Option<&str>,
+        imports: &[crate::analyzer::ImportInfo],
+        types: &ProjectTypes,
+        required_names: &HashSet<String>,
+    ) -> Self {
+        let mut names = VisibleNameBindings::default();
+        let mut object_names = VisibleNameBindings::default();
+        let file_package = package.unwrap_or_default();
+        for required in required_names {
+            add_hierarchy_package_type_bindings(
+                &mut names,
+                types,
+                file_package,
+                required,
+                |decl| u8::from(source_file == Some(decl.source())) * 3,
+            );
+            add_hierarchy_package_object_bindings(
+                &mut object_names,
+                types,
+                file_package,
+                required,
+                |decl| u8::from(source_file == Some(decl.source())) * 3,
+            );
+        }
+        for import in imports {
+            let Some(path) = scala_import_path(import) else {
+                continue;
+            };
+            if import.is_wildcard {
+                for package in import_candidate_paths(&path, file_package) {
+                    for required in required_names {
+                        add_hierarchy_package_type_bindings(
+                            &mut names,
+                            types,
+                            &package,
+                            required,
+                            |_| 1,
+                        );
+                        add_hierarchy_package_object_bindings(
+                            &mut object_names,
+                            types,
+                            &package,
+                            required,
+                            |_| 1,
+                        );
+                    }
+                }
+                continue;
+            }
+            let local_name = import
+                .identifier
+                .as_deref()
+                .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path));
+            if !required_names.contains(local_name) {
+                continue;
+            }
+            for normalized in import_candidate_normalized_paths(&path, file_package) {
+                if let Some(decl) = types.type_by_normalized_fqn(&normalized) {
+                    names.add(local_name.to_string(), decl.fq_name(), 2);
+                }
+                if let Some(decl) = types
+                    .index
+                    .by_normalized_fqn(&normalized)
+                    .iter()
+                    .find(|unit| unit.is_class() && unit.short_name().ends_with('$'))
+                {
+                    object_names.add(local_name.to_string(), decl.fq_name(), 2);
+                }
+            }
+        }
+        Self {
+            names,
+            object_names,
+            member_names: HashMap::default(),
+            direct_extension_methods: HashMap::default(),
+            wildcard_extension_owners: Vec::new(),
+        }
     }
 
     fn for_file_types(scala: &ScalaAnalyzer, file: &ProjectFile, types: &ProjectTypes) -> Self {

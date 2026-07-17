@@ -155,6 +155,104 @@ class Worker extends Base with Audited
 }
 
 #[test]
+fn scala_descendant_index_batches_file_hierarchy_facts_and_preserves_visibility() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "lib/Types.scala",
+            r#"
+package lib
+class Base
+trait Runnable
+"#,
+        ),
+        (
+            "alias/Children.scala",
+            r#"
+package alias
+import lib.Base as Parent
+import lib.Runnable
+class First extends Parent with Runnable
+class Second extends Parent
+class Third extends Parent
+"#,
+        ),
+        (
+            "wild/Child.scala",
+            r#"
+package wild
+import lib._
+class WildcardChild extends Base with Runnable
+"#,
+        ),
+        (
+            "same/Types.scala",
+            r#"
+package same
+class Peer
+class SamePackageChild extends Peer
+"#,
+        ),
+        (
+            "companion/Types.scala",
+            r#"
+package companion
+class Foo
+object Foo { trait Base }
+class Child extends Foo.Base
+"#,
+        ),
+    ]);
+    let base = definition(&analyzer, "lib.Base");
+    let runnable = definition(&analyzer, "lib.Runnable");
+    let peer = definition(&analyzer, "same.Peer");
+    let first = definition(&analyzer, "alias.First");
+    let companion_base = definition(&analyzer, "companion.Foo$.Base");
+    let companion_child = definition(&analyzer, "companion.Child");
+
+    analyzer.reset_full_hydration_count_for_test();
+
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&base)),
+        BTreeSet::from([
+            "alias.First".to_string(),
+            "alias.Second".to_string(),
+            "alias.Third".to_string(),
+            "wild.WildcardChild".to_string(),
+        ])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&runnable)),
+        BTreeSet::from(["alias.First".to_string(), "wild.WildcardChild".to_string(),])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&peer)),
+        BTreeSet::from(["same.SamePackageChild".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&first)),
+        BTreeSet::from(["lib.Base".to_string(), "lib.Runnable".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&companion_base)),
+        BTreeSet::from(["companion.Child".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&companion_child)),
+        BTreeSet::from(["companion.Foo$.Base".to_string()])
+    );
+    assert_eq!(
+        analyzer.full_hydration_count_for_test(),
+        0,
+        "descendant construction must not point-hydrate once per declaration"
+    );
+    assert_eq!(
+        analyzer.bulk_hydration_count_for_test(),
+        5,
+        "descendant construction should project each Scala file once"
+    );
+}
+
+#[test]
 fn scala_object_resolves_trait_parents() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "Types.scala",

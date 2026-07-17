@@ -120,7 +120,7 @@ impl<'a> UsageEdgeResolver<'a> for ScalaEdgeResolver<'a> {
             .into_iter()
             .collect();
         let file_states = scala.bulk_file_states(files.clone(), BulkFileStateSource::Include);
-        let types = ProjectTypes::build_from_file_states(scala, file_states);
+        let types = ProjectTypes::build_from_file_states(file_states);
 
         Some(Self {
             scala,

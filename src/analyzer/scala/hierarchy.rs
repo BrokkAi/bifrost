@@ -17,12 +17,45 @@ impl TypeHierarchyProvider for ScalaAnalyzer {
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
         self.direct_descendant_index
-            .get_or_init(|| build_direct_descendant_index(self, self))
+            .get_or_init(|| self.build_direct_descendant_index())
             .descendants(code_unit)
     }
 }
 
 impl ScalaAnalyzer {
+    fn build_direct_descendant_index(&self) -> DirectDescendantIndex {
+        let _scope = crate::profiling::scope("ScalaAnalyzer::build_direct_descendant_index");
+        let file_states = self.bulk_file_states(self.analyzed_files(), BulkFileStateSource::Omit);
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::default();
+        for state in file_states.values() {
+            for candidate in state
+                .definition_lookup_units
+                .iter()
+                .chain(&state.declarations)
+                .filter(|candidate| candidate.is_class())
+            {
+                if seen.insert(candidate.clone()) {
+                    candidates.push(candidate.clone());
+                }
+            }
+        }
+
+        let ancestors_by_owner = self
+            .project_types()
+            .resolve_direct_ancestors_from_file_states(&file_states);
+        for (owner, ancestors) in &ancestors_by_owner {
+            self.direct_ancestors
+                .insert(owner.clone(), Arc::new(ancestors.clone()));
+        }
+        build_direct_descendant_index_from_candidates(candidates, |candidate| {
+            ancestors_by_owner
+                .get(candidate)
+                .cloned()
+                .unwrap_or_default()
+        })
+    }
+
     #[allow(dead_code)]
     pub(crate) fn type_relations(&self) -> &[TypeRelation] {
         self.type_relations
