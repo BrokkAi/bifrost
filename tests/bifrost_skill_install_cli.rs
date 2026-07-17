@@ -51,6 +51,7 @@ fn project_copy_installs_default_code_skills() {
     assert!(skill_file(&skills_root, "bifrost-code-navigation").is_file());
     assert!(skill_file(&skills_root, "bifrost-code-reading").is_file());
     assert!(skill_file(&skills_root, "bifrost-codebase-search").is_file());
+    assert!(!skill_file(&skills_root, "adversarial-test-sweep").exists());
     assert!(!skill_file(&skills_root, "guided-review").exists());
     assert!(
         skills_root
@@ -280,6 +281,7 @@ fn all_skill_set_installs_workflow_skills() {
     assert_success(&output);
 
     assert!(skill_file(&skills_root, "guided-review").is_file());
+    assert!(skill_file(&skills_root, "adversarial-test-sweep").is_file());
 }
 
 #[cfg(unix)]

@@ -145,6 +145,7 @@ fs.accessSync("plugins/bifrost-agent/bin/bifrost-launcher.mjs", fsConstants.X_OK
 const skillsRoot = "plugins/bifrost-agent/skills";
 const codexSkillsRoot = CODEX_SKILL_BUNDLE_ROOT;
 const expectedSkills = [
+  ["adversarial-test-sweep", "brokk-adversarial-test-sweep", "Adversarial Test Sweep", "Paul Hudson", "resource pressure"],
   ["bifrost-code-navigation", "bifrost-code-navigation", "search_symbols", "scan_usages_by_location", "get_symbol_locations"],
   ["bifrost-code-reading", "bifrost-code-reading", "get_summaries", "get_symbol_sources"],
   ["bifrost-codebase-search", "bifrost-codebase-search", "search_symbols", "query_code", "find_filenames", "list_files"],
