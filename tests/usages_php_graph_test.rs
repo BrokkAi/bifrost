@@ -1728,6 +1728,78 @@ function mixed(Target $target): void {
 }
 
 #[test]
+fn php_graph_visits_self_reassignment_rhs_before_mutating_receiver() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Target.php",
+            r#"<?php
+namespace App;
+class Replacement {}
+class Target {
+    public function replace(): Replacement { return new Replacement(); }
+}
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App;
+function consume(Target $target): void {
+    $target = $target->replace();
+}
+"#,
+        ),
+    ]);
+
+    let hits = graph_hits(&analyzer, "App.Target.replace");
+    assert_eq!(
+        1,
+        hits.len(),
+        "self-reassignment RHS must retain its incoming receiver: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("$target = $target->replace()")),
+        "expected exact self-reassignment RHS hit: {hits:#?}"
+    );
+}
+
+#[test]
+fn php_graph_infers_self_static_and_parent_factory_assignment_results() {
+    let (_project, analyzer) = php_analyzer_with_files(&[(
+        "Factories.php",
+        r#"<?php
+namespace App;
+class Product {
+    public function consume(): void {}
+}
+class BaseFactory {
+    protected static function fromParent(): Product { return new Product(); }
+}
+class Factory extends BaseFactory {
+    private static function fromSelf(): Product { return new Product(); }
+
+    public function run(): void {
+        $selfProduct = self::fromSelf();
+        $selfProduct->consume();
+        $staticProduct = static::fromSelf();
+        $staticProduct->consume();
+        $parentProduct = parent::fromParent();
+        $parentProduct->consume();
+    }
+}
+"#,
+    )]);
+
+    let hits = graph_hits(&analyzer, "App.Product.consume");
+    assert_eq!(
+        3,
+        hits.len(),
+        "all relative static scopes must seed the declared Product result: {hits:#?}"
+    );
+}
+
+#[test]
 fn php_graph_resolves_simple_local_receiver_aliases() {
     let (_project, analyzer) = php_analyzer_with_files(&[
         (

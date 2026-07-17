@@ -13,8 +13,8 @@ The observable result is three definitive JSONL artifacts under `/mnt/optane/tmp
 - [x] (2026-07-17) Read `AGENTS.md`, `.agents/PLANS.md`, the original N=1 campaign plan, and the completed Java/Go/Python top-five plan. Verified the worktree is clean, detached at `b0d6a31f`, and exactly matches `origin/master`.
 - [x] (2026-07-17) Deterministically selected and validated all fifteen PHP/Rust/Scala clones through `run-corpus --dry-run`. Every clone is clean. Moodle, GritQL, and IntelliJ Scala have persisted caches of 685 MiB, 30 MiB, and 167 MiB; the other twelve are cold. The clone volume has 803 GiB free and Optane has 642 GiB free.
 - [x] (2026-07-17) Delegated read-only prior-campaign reconciliation and high-risk production-shape research to the Oldskool subagent while the root session owns this plan, GitHub mutations, acceptance decisions, gates, commits, merges, and pushes.
-- [ ] Commit and publish this plan as a clean campaign checkpoint, then rebuild the release differential runner so embedded Bifrost metadata names that pushed head.
-- [ ] Complete, integrate, prove, and summarize the PHP top-five leg.
+- [x] (2026-07-17) Committed the initial plan as detached `4b61d137` and rebuilt the release runner from that clean head. Direct publication was not attempted a second time after the managed approval layer rejected the first `HEAD:master` push as lacking fresh explicit approval for this new campaign. Corpus work continues from the commit-pinned clean head; integration still requires approval.
+- [ ] Complete, integrate, prove, and summarize the PHP top-five leg. Baseline `php-top5-4b61d137.jsonl` completed all five repositories in 8m15s with 4.0 GiB peak RSS. Its seven raw rows reconcile to one wrong-forward artifact covered by assigned #890 and six genuine inverse misses filed as assigned issues #904 and #905. Oldskool implemented both inverse roots; independent review, 49 targeted graph tests, 16 whole-workspace graph tests, formatting, all-target/all-feature Clippy, the complete feature-enabled suite, and all six dirty-tree production exact witnesses pass. A host-wide inotify instance ceiling required running the aggregate suite with one test thread while excluding the 43 selector tests, then running every excluded selector test in a fresh process; all coverage passed. Commit, current-master merge, repeated gates, push, and clean-head proof remain.
 - [ ] Complete, integrate, prove, and summarize the Rust top-five leg.
 - [ ] Complete, integrate, prove, and summarize the Scala top-five leg.
 - [ ] Reconcile all final artifacts, issue states, local gates, and `origin/master`; leave the detached worktree clean.
@@ -29,6 +29,21 @@ The observable result is three definitive JSONL artifacts under `/mnt/optane/tmp
 
 - Observation: Prior N=1 work is a source of exact preflight leads, not proof about the current five-repository result.
   Evidence: the earlier campaign fixed PHP #671-#674, Rust #643-#660, and Scala #651/#661-#664 on older Bifrost heads. Current code and different sampled repositories can expose new shapes, so every retained raw row still requires current source/identity review.
+
+- Observation: The PHP top-five baseline is already actionable-zero in three repositories and has only seven raw rows overall.
+  Evidence: Moodle, Magento, and EduSoho reported zero `missing`; Psalm reported five and Symfony two. All five JSONL records are `status=completed`, name clean Bifrost head `4b61d137`, and match the selected repository heads.
+
+- Observation: One Psalm raw row is a wrong forward identity, not an inverse omission.
+  Evidence: `ArithmeticOpAnalyzer.php:754` is inside an outer `TLiteralString` refinement and a mutually exclusive nested `elseif`, but linear forward binding replay imports the preceding branch's `TLiteralInt` assignment and reports `TLiteralInt.value`. The open PHP CFG/branch-modeling issue #890 is assigned to David, so the campaign records and skips it under the ownership rule.
+
+- Observation: The six legitimate PHP inverse misses form two structured roots.
+  Evidence: four `$x = $x->method()` sites mutate or shadow `$x` before visiting the RHS; two variables assigned from `self::method()` lose the declared return type because targeted scoped-call inference sends `self` through ordinary namespace type resolution. Exact baseline reproductions were preserved for a representative of each family.
+
+- Observation: PHP assignment extraction must observe evaluation order, and static scope words are owner-relative rather than namespace-relative types.
+  Evidence: the accepted implementation records assignment RHS references before applying the new binding in both targeted and whole-workspace graph traversals. A shared structured helper maps `self`/`static` to the enclosing declaration owner and `parent` to its declared direct class parent. The four #904 and two #905 production exact reruns all changed from one actionable miss to zero.
+
+- Observation: The host's fixed `fs.inotify.max_user_instances=1024` ceiling can make a highly parallel full suite fail before a temporary workspace watcher starts even when the test behavior is correct.
+  Evidence: the sole aggregate failure passed immediately in an isolated one-thread process. The complete suite then passed with `--test-threads=1` while excluding the 43 `searchtools_definition_selectors` cases, and all 43 excluded cases passed individually in fresh processes. Managed approval rejected a temporary host-wide sysctl increase, so the coverage-preserving process partition is the recorded local gate.
 
 ## Decision Log
 
@@ -56,9 +71,25 @@ The observable result is three definitive JSONL artifacts under `/mnt/optane/tmp
   Rationale: the user explicitly made the complete local feature-enabled test suite the blocking gate and will report later CI regressions separately.
   Date/Author: 2026-07-17 / Codex
 
+- Decision: Treat the Psalm `ArithmeticOpAnalyzer.php:754` row as a wrong-forward artifact covered by #890 and do not implement it in this campaign.
+  Rationale: the semantic receiver is `TLiteralString`; making inverse lookup agree with the reported `TLiteralInt.value` would cement a false identity. The required branch-sensitive control-flow work is already assigned to another owner, and the campaign rule requires skipping such work.
+  Date/Author: 2026-07-17 / Codex
+
+- Decision: Track the six genuine PHP inverse misses in #904 and #905, both assigned to `jbellis` before implementation.
+  Rationale: repository-wide open/closed issue searches found no duplicate for either concrete behavior. Keeping RHS evaluation order separate from scoped static-return inference gives each root a precise acceptance boundary and production witnesses.
+  Date/Author: 2026-07-17 / Codex
+
+- Decision: Accept Oldskool's PHP fix after independent structural review and preserve the shared static-scope resolver in the PHP syntax layer.
+  Rationale: applying assignments after traversing their RHS follows PHP evaluation order in targeted and whole-workspace extraction, while resolving `self`, `static`, and `parent` from declaration structure avoids a second ad hoc namespace/type interpretation. Behavior tests cover reassignment, positive static factories, and the negative parent-owner boundary.
+  Date/Author: 2026-07-17 / Codex
+
+- Decision: Satisfy the full local gate by process partition instead of changing the host-wide inotify limit.
+  Rationale: one-thread execution removes concurrent watcher pressure, and individually running all 43 excluded selector cases preserves the exact test surface. The approval layer rejected the global sysctl mutation, so no host configuration was changed.
+  Date/Author: 2026-07-17 / Codex
+
 ## Outcomes & Retrospective
 
-The campaign has started from a clean current `origin/master`. No PHP, Rust, or Scala top-five corpus has run yet. Update this section after each language with selected repositories, record counts, runtime and memory, exhaustive residual partition, issues and fixes, exact pushed-head proofs, local gates, and the final integrated head.
+The campaign started from clean `origin/master` at `b0d6a31f`; the initial plan is committed locally at `4b61d137`. During the PHP run, `origin/master` advanced to merge `ab0af33f` with unrelated C++ changes. The PHP baseline is complete and exhaustively reconciled. The #904/#905 implementation and integration-candidate validation are complete: candidate artifacts `php-exact-904-cast-4b61d137-dirty.jsonl`, `php-exact-904-reconciler-4b61d137-dirty.jsonl`, `php-exact-904-symfony-descriptor-4b61d137-dirty.jsonl`, `php-exact-904-symfony-dump-4b61d137-dirty.jsonl`, `php-exact-905-function-call-4b61d137-dirty.jsonl`, and `php-exact-905-type-hint-4b61d137-dirty.jsonl` are actionable-zero. Commit, merge, repeated gates, publication approval, clean pushed-head proof, issue closure, and the final PHP summary remain outstanding. Rust and Scala have not run.
 
 ## Context and Orientation
 
@@ -144,7 +175,7 @@ Also run the affected language definition, targeted usage, whole-workspace graph
 
 ## Validation and Acceptance
 
-A language is complete only when its definitive artifact contains exactly five `status=completed` records from the expected repository heads, every record names the same clean pushed Bifrost head with `bifrost_dirty=false`, and all configured limits and errors are interpreted honestly. Every raw missing row must appear in an exhaustive disjoint ledger. A genuine defect requires a valid forward identity, a complete inverse query, and no covering proven or unproven hit; it must have an assigned issue, a structured root-cause fix, behavior-focused regression coverage, a clean exact production proof, and final corpus proof before closure.
+A language is complete only when its definitive artifact contains exactly five `status=completed` records from the expected repository heads, every record names the same clean pushed Bifrost head with `bifrost_dirty=false`, and all configured limits and errors are interpreted honestly. Every raw missing row must appear in an exhaustive disjoint ledger. A genuine defect requires a valid forward identity, a complete inverse query, and no covering proven or unproven hit; unless it is explicitly skipped because an existing issue is assigned to another owner, it must have an issue assigned to `jbellis`, a structured root-cause fix, behavior-focused regression coverage, a clean exact production proof, and final corpus proof before closure. An owned skip remains in the ledger with the covering issue and assignee; it is never disguised as inverse parity.
 
 The full campaign is complete only when PHP, Rust, and Scala each satisfy that language boundary; every legitimate issue is assigned to `jbellis`, fixed on `origin/master`, and closed with evidence; all three fixing heads are ancestors of final `origin/master`; the complete local feature-enabled gate passed after every code integration; both campaign plans describe current reality; and the worktree is clean. Do not use GitHub CI as a blocking gate.
 
@@ -169,3 +200,5 @@ Initial dry-run selection transcript:
 Do not add a second differential engine or a second cache. Reuse `reference_differential::run_reference_differential`, `WorkspaceAnalyzer`, `UsageFinder`, language-specific forward resolvers, language-specific usage graphs, the persisted `AnalyzerStore`, `InlineTestProject`, and existing public SearchTools/Python API fixtures. New resolver vocabulary must come from tree-sitter nodes and shared structured indexes; do not use regex, string splitting, substring scans, or delimiter mini-parsers in place of analyzer structure. Preserve configured usage/file/target caps and explicit `unproven`/`inconclusive` outcomes.
 
 Revision note (2026-07-17): Created the self-contained PHP/Rust/Scala top-five campaign plan from clean `origin/master`, recorded deterministic selection and cache/disk preflight, and established the Oldskool/root division of labor and per-language acceptance workflow.
+
+Revision note (2026-07-17): Recorded the exhaustive PHP baseline audit, assigned #904/#905, the reviewed Oldskool implementation, six actionable-zero integration-candidate production proofs, and the complete coverage-preserving local gate under the host inotify ceiling.
