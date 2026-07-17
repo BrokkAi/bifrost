@@ -74,10 +74,12 @@ BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" node plugins/bifrost-agent/bin
 
 Pi loads a native extension from this package. The extension resolves the same
 pinned, checksum-verified Bifrost binary as the other hosts, starts one stdio
-MCP child for the session's workspace, discovers the `symbol|extended` tools,
-and closes the child on session shutdown or reload. The Pi manifest exposes
-only the three generic code-intelligence skills: `bifrost-code-navigation`,
-`bifrost-code-reading`, and `bifrost-codebase-search`.
+MCP child for the session's workspace, and closes the child on session shutdown
+or reload. Pi-visible tools use a `bifrost_` namespace, so Bifrost's canonical
+MCP `query_code` tool appears as `bifrost_query_code`. The extension adds a
+short system-prompt note that explains this host-specific rendering; the three
+canonical `bifrost-code-navigation`, `bifrost-code-reading`, and
+`bifrost-codebase-search` skills remain shared without Pi-specific copies.
 
 Install a local checkout after installing its package dependencies:
 
@@ -112,8 +114,25 @@ After `@brokk/bifrost-agent` is published to npm, install a pinned release with:
 pi install npm:@brokk/bifrost-agent@0.8.4
 ```
 
-Run `/bifrost` to inspect the connection state, workspace, and discovered tool
-count. Tool calls time out after 300 seconds; startup times out after 60 seconds.
+Run `/bifrost` in Pi's interactive TUI to configure Bifrost for the current
+workspace. The default enables symbol navigation, structural queries, and file
+discovery/ranking. The settings list can also enable code-quality reports, Git
+history, raw text search, JSON/XML transforms, or semantic search. It never
+offers Bifrost workspace-switching tools because Pi owns the session workspace.
+Selections are stored in separate canonical-workspace files under
+`<Pi agent directory>/bifrost/workspaces/` (normally
+`~/.pi/agent/bifrost/workspaces/`), so they survive new sessions without
+adding configuration to the repository or making concurrent workspaces rewrite
+the same settings document.
+
+Changing a capability may restart the Bifrost child when it requires another
+existing MCP server toolset. Tools discovered earlier remain registered with Pi
+but are removed from Pi's active tool set when disabled. Semantic search can be
+enabled only when the selected Bifrost binary advertises it for the current Git
+workspace and accelerator environment. A failed change leaves the prior
+connection and saved selection active.
+
+Tool calls time out after 300 seconds; startup times out after 60 seconds.
 Cancellation stops the Pi request promptly, though the current Bifrost stdio
 server may finish analyzer work before it reads the MCP cancellation
 notification.
@@ -126,7 +145,7 @@ cargo build --bin bifrost
 BIFROST_BINARY_PATH="$PWD/target/debug/bifrost" \
 BIFROST_LAUNCHER_AUTO_INSTALL=0 \
 pi --no-session -e "$PWD/plugins/bifrost-agent" -p \
-  'Use the Bifrost tools directly. First call get_summaries for src/mcp_common.rs. Then call query_code with inline canonical JSON fields match.kind=declaration and limit=1. Then call query_code with only query_file="docs/fixtures/ten-minute-evaluation/queries/find-audit.rql". Report whether all three calls succeeded and include one repository-relative path from each result.'
+  'Use the Bifrost tools directly. First call bifrost_get_summaries for src/mcp_common.rs. Then call bifrost_query_code with inline canonical JSON fields match.kind=declaration and limit=1. Then call bifrost_query_code with only query_file="docs/fixtures/ten-minute-evaluation/queries/find-audit.rql". Report whether all three calls succeeded and include one repository-relative path from each result.'
 ```
 
 Expect all three calls to succeed. The saved query should return

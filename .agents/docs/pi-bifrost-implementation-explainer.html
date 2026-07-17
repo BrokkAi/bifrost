@@ -210,7 +210,7 @@
       <span><strong>Commit</strong> 2380835a</span>
       <span><strong>Scope</strong> 22 files</span>
       <span><strong>Rust changes</strong> None</span>
-      <span><strong>Automated tests</strong> 37 passing</span>
+      <span><strong>Automated tests</strong> 55 passing</span>
     </div>
   </header>
 
@@ -265,7 +265,7 @@
             <div class="flow-item"><b>Session controller</b><span>Owns state, tools, races, and cleanup</span></div>
             <div class="flow-item"><b>Trusted resolver</b><span>Selects a verified Bifrost binary</span></div>
             <div class="flow-item"><b>MCP SDK</b><span>Owns child stdio and protocol messages</span></div>
-            <div class="flow-item"><b>Bifrost</b><span>Runs with explicit root and symbol|extended</span></div>
+            <div class="flow-item"><b>Bifrost</b><span>Runs with an explicit root and selected existing toolsets</span></div>
           </div>
         </div>
         <p class="callout"><strong>The central boundary:</strong> the launcher decides which executable is trusted and how it must start. The MCP SDK owns the process and protocol after that. This keeps trust policy and transport lifecycle separate.</p>
@@ -286,7 +286,7 @@
             <h3>The launcher resolves a trusted binary</h3>
             <p><code>resolveBifrostLaunch</code> validates the workspace and resolves Bifrost using the established policy. An explicit <code>BIFROST_WORKSPACE_ROOT</code> environment value cannot redirect this Pi session.</p>
             <pre>command: &lt;resolved bifrost executable&gt;
-args:    --root &lt;absolute Pi workspace&gt; --mcp symbol|extended
+args:    --root &lt;absolute Pi workspace&gt; --mcp &lt;selected existing toolsets&gt;
 cwd:     &lt;absolute Pi workspace&gt;</pre>
           </article>
           <article class="step" data-step="4">
@@ -295,7 +295,7 @@ cwd:     &lt;absolute Pi workspace&gt;</pre>
           </article>
           <article class="step" data-step="5">
             <h3>Pi gets native tool definitions</h3>
-            <p>The controller calls <code>tools/list</code>, rejects duplicate or conflicting names, preserves each advertised JSON Schema, and registers the tools with Pi. Only then does the session become connected.</p>
+            <p>The controller calls <code>tools/list</code>, rejects duplicate or conflicting names, preserves each advertised JSON Schema, and registers each operation as <code>bifrost_&lt;canonical-name&gt;</code>. Only then does the session become connected.</p>
           </article>
         </div>
       </section>
@@ -353,8 +353,10 @@ cwd:     &lt;absolute Pi workspace&gt;</pre>
           <div class="file-row"><code class="path">plugins/bifrost-agent/package.json</code><p>Defines <code>@brokk/bifrost-agent</code>, its extension, the three skills, publication allowlist, pinned MCP SDK, peer dependencies, and validation scripts.</p></div>
           <div class="file-row"><code class="path">plugins/bifrost-agent/package-lock.json</code><p>Locks the runtime and development dependency graph for repeatable CI and release builds.</p></div>
           <div class="file-row"><code class="path">plugins/bifrost-agent/tsconfig.json</code><p>Runs strict, no-output NodeNext type checking across the extension.</p></div>
-          <div class="file-row"><code class="path">extensions/bifrost.ts</code><p>Wires Pi session start and shutdown events and adds the read-only <code>/bifrost</code> status command.</p></div>
-          <div class="file-row"><code class="path">extensions/bifrost-session.ts</code><p>Owns startup, discovery, dynamic registration, collisions, current-client dispatch, race protection, error state, and shutdown.</p></div>
+          <div class="file-row"><code class="path">extensions/bifrost.ts</code><p>Wires Pi lifecycle events, injects the short namespace rule, and provides the settings-style <code>/bifrost</code> capability UI.</p></div>
+          <div class="file-row"><code class="path">extensions/bifrost-capabilities.ts</code><p>Defines the Pi-local capability groups, defaults, existing server-toolset mapping, and namespaced Pi tool names.</p></div>
+          <div class="file-row"><code class="path">extensions/bifrost-session.ts</code><p>Owns transactional startup, discovery, namespaced registration, active-tool reconciliation, races, error state, and shutdown.</p></div>
+          <div class="file-row"><code class="path">extensions/bifrost-settings.ts</code><p>Persists each canonical workspace selection in its own atomic settings file under Pi's agent directory.</p></div>
           <div class="file-row"><code class="path">extensions/mcp-adapter.ts</code><p>Forms the anti-corruption layer between MCP schemas/results and Pi's TypeBox/tool contracts.</p></div>
         </div>
 
@@ -414,9 +416,9 @@ cwd:     &lt;absolute Pi workspace&gt;</pre>
             <p class="instead"><strong>Cost:</strong> TypeScript cannot statically infer each runtime-discovered argument shape.</p>
           </article>
           <article class="card choice">
-            <h3>Limit the toolset</h3>
-            <p><code>symbol|extended</code> provides analyzer navigation and structural queries. Workspace switching and broad text/file tools stay out because Pi already owns the workspace and filesystem.</p>
-            <p class="instead"><strong>Cost:</strong> Bifrost tools outside those two sets are intentionally unavailable through this package.</p>
+            <h3>Configure capabilities in Pi</h3>
+            <p>The default activates symbols, structural queries, and file discovery. <code>/bifrost</code> can add quality, Git, text, transforms, or semantic search using Bifrost's existing server toolsets. Workspace switching always stays out because Pi owns the workspace.</p>
+            <p class="instead"><strong>Cost:</strong> Pi maintains a small host-local classification for the broad existing <code>extended</code> set.</p>
           </article>
           <article class="card choice">
             <h3>Do not bundle Bifrost</h3>
@@ -445,7 +447,7 @@ cwd:     &lt;absolute Pi workspace&gt;</pre>
       <section id="validation">
         <h2>What was proved</h2>
         <div class="proof-grid">
-          <article class="card proof"><b>37 / 37</b><small>Node package and process tests passed</small></article>
+          <article class="card proof"><b>55 / 55</b><small>Node package, settings, lifecycle, and process tests passed</small></article>
           <article class="card proof"><b>11 files</b><small>Intentional npm publication surface</small></article>
           <article class="card proof"><b>0</b><small>npm production vulnerabilities</small></article>
           <article class="card proof"><b>3 real calls</b><small>Navigation, inline query, and saved RQL succeeded in Pi</small></article>

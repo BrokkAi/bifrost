@@ -2,7 +2,12 @@
   "name": "@brokk/bifrost-agent",
   "version": "0.8.4",
   "description": "Bifrost code intelligence tools and skills for Pi",
-  "keywords": ["pi-package", "bifrost", "code-intelligence", "mcp"],
+  "keywords": [
+    "pi-package",
+    "bifrost",
+    "code-intelligence",
+    "mcp"
+  ],
   "type": "module",
   "license": "LGPL-3.0-or-later",
   "repository": {
@@ -43,10 +48,12 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.80.10",
+    "@earendil-works/pi-tui": "0.80.10",
     "@types/node": "26.1.1",
     "typebox": "1.1.38",
     "typescript": "7.0.2"

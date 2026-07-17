@@ -109,6 +109,18 @@ Keep `package.json`, `package-lock.json`, `bifrost-release.json`, and
 `Cargo.toml` version-aligned. Changes to the MCP SDK require a deliberate
 version update and process-boundary test review.
 
+Pi registers every discovered MCP operation as `bifrost_<canonical-name>` and
+forwards the canonical name over MCP. Keep the short `before_agent_start`
+namespace clarification in the extension instead of forking the canonical
+skills. The `/bifrost` SettingsList controls a Pi-local capability model over
+Bifrost's existing server toolsets. Its default is symbols, structural queries,
+and file discovery; quality, Git, text, transforms, and semantic search are
+optional. Do not add workspace lifecycle tools to this UI. Per-workspace
+selections live in independent hashed files under the Pi agent directory at
+`bifrost/workspaces/`, not in the analyzed repository. Separate files prevent
+concurrent Pi sessions for different workspaces from losing each other's
+settings.
+
 Release CI runs `npm ci`, `npm test`, and `npm run check` in
 `plugins/bifrost-agent`, then places the npm tarball in the GitHub release next
 to the shared agent archive. Publishing `@brokk/bifrost-agent` to npm remains a

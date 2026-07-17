@@ -73,9 +73,16 @@ assert.deepStrictEqual(
   "1.29.0",
   `${piManifestPath} should pin the reviewed MCP SDK`,
 );
+assert.deepStrictEqual(
+  piManifest.peerDependencies?.["@earendil-works/pi-tui"],
+  "*",
+  `${piManifestPath} should use Pi's host-provided TUI`,
+);
 for (const packageFile of [
   "plugins/bifrost-agent/extensions/bifrost.ts",
+  "plugins/bifrost-agent/extensions/bifrost-capabilities.ts",
   "plugins/bifrost-agent/extensions/bifrost-session.ts",
+  "plugins/bifrost-agent/extensions/bifrost-settings.ts",
   "plugins/bifrost-agent/extensions/mcp-adapter.ts",
   "plugins/bifrost-agent/package-lock.json",
 ]) {

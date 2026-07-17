@@ -19,6 +19,7 @@ assert.deepEqual(manifest.pi.extensions, ["./extensions/bifrost.ts"]);
 assert.deepEqual(manifest.pi.skills, canonicalSkills);
 assert.equal(manifest.dependencies["@modelcontextprotocol/sdk"], "1.29.0");
 assert.equal(manifest.peerDependencies["@earendil-works/pi-coding-agent"], "*");
+assert.equal(manifest.peerDependencies["@earendil-works/pi-tui"], "*");
 assert.equal(manifest.peerDependencies.typebox, "*");
 assert.equal(manifest.version, release.binaryVersion);
 
@@ -33,7 +34,9 @@ const requiredFiles = [
   "bin/bifrost-launcher.d.mts",
   "bifrost-release.json",
   "extensions/bifrost.ts",
+  "extensions/bifrost-capabilities.ts",
   "extensions/bifrost-session.ts",
+  "extensions/bifrost-settings.ts",
   "extensions/mcp-adapter.ts",
   "skills/bifrost-code-navigation/SKILL.md",
   "skills/bifrost-code-reading/SKILL.md",
