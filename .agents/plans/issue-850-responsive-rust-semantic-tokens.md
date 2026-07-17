@@ -12,6 +12,7 @@ VS Code asks the Bifrost language server for semantic tokens to colour declarati
 - [x] (2026-07-17 00:00Z) Extend the analyzer query cache so one active query computes the complete live analyzed-file list at most once.
 - [x] (2026-07-17 00:00Z) Share `RustTypeLookupCache` through a complete definition lookup batch and add a regression test for repeated nested Rust field resolution.
 - [ ] Run semantic tokens in the cancellable LSP worker path (completed: worker and cancellation plumbing; remaining: behavioural coverage for concurrent Rune IR/cancellation and full validation).
+- [x] (2026-07-17 00:00Z) Extend batch-local lookup state to the other high-frequency targets: JS/TS shares imports, path aliases, and receiver syntax facts; Go shares package and import namespaces by reference; Scala shares package and import facts. Added focused regression coverage for each target.
 
 ## Surprises & Discoveries
 
@@ -23,6 +24,8 @@ VS Code asks the Bifrost language server for semantic tokens to colour declarati
   Evidence: `src/lsp/server.rs` owns `RequestJobs`, receives `$/cancelRequest`, snapshots the overlay, and runs workers with a cloned `WorkspaceAnalyzer`.
 - Observation: The machine cannot link the Python-enabled test build because its Python symbols are unavailable to the linker.
   Evidence: `cargo test --features nlp,python ...` reaches Rust compilation, then fails with unresolved `_Py*` symbols from `pyo3` during dynamic-library linking.
+- Observation: all-features Clippy currently fails before crate analysis because Cargo's dependency metadata was produced by a different build of the same Rust release.
+  Evidence: both isolated and worktree-target `cargo clippy --all-targets --all-features -- -D warnings` stop with `E0514` for third-party `.rmeta` files; the compiler reports 1.96.0 in both cases but treats the metadata as incompatible.
 
 ## Decision Log
 
@@ -35,10 +38,13 @@ VS Code asks the Bifrost language server for semantic tokens to colour declarati
 - Decision: Model semantic tokens after the existing cancellable request workers, with an overlay snapshot and the two-job limit.
   Rationale: this protects the main LSP loop and gives standard `$/cancelRequest` semantics without adding an unbounded thread path or changing the token protocol.
   Date/Author: 2026-07-17 / Codex
+- Decision: Generalize only the per-document facts that are reconstructed for every definition candidate, keeping result and AST-node caches request-local to their existing providers.
+  Rationale: JS/TS import binding, alias configuration, and receiver syntax indexing; Go package/import namespaces; and Scala package/import facts are immutable for a file during a definition batch. Sharing them removes repeated setup without extending tree-node lifetimes or turning mutable provider caches into global state.
+  Date/Author: 2026-07-17 / Codex
 
 ## Outcomes & Retrospective
 
-The request-local live-file cache, batch-local Rust declaration cache, and cancellable semantic-token worker are implemented. Remaining work is focused behavioural coverage and validation. The expected outcome is that semantic token correctness is unchanged while repeated workspace validation is eliminated within a request and other LSP requests remain responsive.
+The request-local live-file cache, batch-local Rust declaration cache, and cancellable semantic-token worker are implemented. The same batch boundary now avoids repeated JS/TS, Go, and Scala resolver setup for a document. Focused featureless compile and regression coverage pass; all-features lint/test validation remains blocked by the local Rust metadata mismatch and the separately recorded Python linker limitation. The expected outcome is that semantic token correctness is unchanged while repeated workspace validation and language-specific resolver setup are eliminated within a request and other LSP requests remain responsive.
 
 ## Context and Orientation
 
@@ -47,6 +53,8 @@ The request-local live-file cache, batch-local Rust declaration cache, and cance
 `src/lsp/handlers/semantic_tokens.rs` reads the current document, emits declaration tokens, collects tree-sitter reference candidates, and resolves all unresolved candidates through `resolve_definition_batch_with_source`. A semantic token is a small protocol record that tells the editor where a named declaration or reference appears and which style to apply.
 
 `src/analyzer/usages/get_definition/mod.rs` owns `DefinitionBatchContext`, the reusable state for every batch of definition lookups. Its Rust branch dispatches to `src/analyzer/usages/get_definition/rust.rs`, which performs structured AST-based receiver and type inference. `RustTypeLookupCache` stores a parsed declaration source by `ProjectFile`; it must remain local to the batch because its tree nodes borrow the cached source.
+
+The same context now owns immutable per-file facts for the other targets where semantic tokens may resolve many references in one document. JS/TS uses a shared `ImportBinder`, `AliasResolver`, and receiver syntax index; Go lends cached package and import namespaces to its structured resolver; Scala reuses package and import facts to construct its forward name resolver. These values are still scoped to one definition batch.
 
 `src/analyzer/i_analyzer.rs::AnalyzerQueryScope` marks one top-level analyzer request. `TreeSitterAnalyzer` maintains `QueryReadCache` for that lifetime. Its `analyzed_live_files()` implementation in `src/analyzer/tree_sitter_analyzer.rs` filters the live filesystem snapshot to the adapter language and asks the SQLite analyzer store which `(OID, language)` entries are complete at the active generation. That SQLite query performs intentional integrity validation and is expensive for hundreds of files, so only the result—not the validation rules—should be memoized for the active scope.
 
@@ -108,4 +116,4 @@ The Rust resolver in `src/analyzer/usages/get_definition/rust.rs` must accept th
 
 The semantic token handler must accept `&CancellationToken` and return a cancellation-aware result. The LSP server must use its existing `RequestJobs`, `ActiveRequestIds`, `WorkspaceAnalyzer::clone_with_project`, `RequestContext`, and `finish_cancellable_request` interfaces; no new runtime or thread pool dependency is needed.
 
-Plan created on 2026-07-17 after diagnosing issue #850; updated after implementing the two caches and worker plumbing, with the local Python-linker limitation recorded for a future validation rerun.
+Plan created on 2026-07-17 after diagnosing issue #850; updated after implementing the Rust caches/worker plumbing and the corresponding JS/TS, Go, and Scala batch-state reuse, with local all-features and Python-linker validation limitations recorded for a future rerun.

@@ -95,7 +95,7 @@ fn js_ts_alias_preference(unit: &CodeUnit) -> (usize, String) {
 
 pub(super) fn resolve_js_ts(
     analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
+    context: &mut DefinitionBatchContext<'_>,
     file: &ProjectFile,
     language: Language,
     source: &str,
@@ -105,15 +105,17 @@ pub(super) fn resolve_js_ts(
     let Some(tree) = tree else {
         return no_definition("jsts_parse_failed", "JS/TS source could not be parsed");
     };
+    let batch = context.js_ts_context(file, language, source, tree);
+    let support = context.bounded_support();
     let reference = site.text.as_str();
     let value_position = jsts_reference_is_value_position(tree, site);
-    let imports = compute_jsts_import_binder(source, tree);
-    let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
+    let imports = &batch.imports;
+    let aliases = batch.aliases.as_ref();
     let focused =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte);
 
     if let Some(targets) = focused.and_then(|node| {
-        JsTsReceiverFactProvider::new(
+        JsTsReceiverFactProvider::new_with_batch_data(
             analyzer,
             support,
             language,
@@ -121,6 +123,8 @@ pub(super) fn resolve_js_ts(
             source,
             tree.root_node(),
             imports.clone(),
+            Arc::clone(&batch.aliases),
+            Arc::clone(&batch.syntax_index),
         )
         .resolve_jsx_attribute_targets(node, ReceiverAnalysisBudget::default())
     }) {
@@ -136,7 +140,7 @@ pub(super) fn resolve_js_ts(
 
     if language == Language::TypeScript {
         let contextual_members = ts_contextual_object_literal_key_candidates(
-            analyzer, support, file, source, tree, site, &imports, &aliases,
+            analyzer, support, file, source, tree, site, imports, aliases,
         );
         if !contextual_members.is_empty() {
             return js_ts_candidates_outcome(analyzer, contextual_members);
@@ -191,7 +195,7 @@ pub(super) fn resolve_js_ts(
                 name,
                 analyzer,
                 support,
-                Some(&aliases),
+                Some(aliases),
                 value_position,
             );
         }
@@ -210,7 +214,7 @@ pub(super) fn resolve_js_ts(
                 file,
                 &binding.module_specifier,
                 exported_name,
-                Some(&aliases),
+                Some(aliases),
                 value_position,
             )
         } else {
@@ -231,7 +235,7 @@ pub(super) fn resolve_js_ts(
             return js_ts_candidates_outcome(analyzer, member_candidates);
         }
         match jsts_receiver_provider_member_candidates(
-            analyzer, support, file, language, source, tree, site, name,
+            analyzer, support, file, language, source, tree, site, name, &batch,
         ) {
             ReceiverAnalysisOutcome::Precise(candidates) if !candidates.is_empty() => {
                 return js_ts_candidates_outcome(
@@ -264,8 +268,8 @@ pub(super) fn resolve_js_ts(
             language,
             source,
             tree.root_node(),
-            &imports,
-            &aliases,
+            imports,
+            aliases,
             qualifier,
             site.range.start_byte,
             0,
@@ -329,7 +333,7 @@ pub(super) fn resolve_js_ts(
         }
         if language == Language::TypeScript {
             let inferred_receivers = ts_local_receiver_owner_candidates(
-                analyzer, support, file, source, tree, site, &imports, &aliases, qualifier,
+                analyzer, support, file, source, tree, site, imports, aliases, qualifier,
             );
             let inferred_member_candidates =
                 ts_member_candidates(analyzer, support, inferred_receivers, name, value_position);
@@ -337,7 +341,7 @@ pub(super) fn resolve_js_ts(
                 return js_ts_candidates_outcome(analyzer, inferred_member_candidates);
             }
             let inferred_receivers = ts_local_receiver_owner_candidates(
-                analyzer, support, file, source, tree, site, &imports, &aliases, qualifier,
+                analyzer, support, file, source, tree, site, imports, aliases, qualifier,
             );
             let inferred_member_candidates = jsts_file_scoped_member_candidates(
                 analyzer,
@@ -1134,20 +1138,23 @@ fn jsts_receiver_provider_member_candidates(
     tree: &Tree,
     site: &ResolvedReferenceSite,
     member: &str,
+    batch: &JsTsDefinitionContext,
 ) -> ReceiverAnalysisOutcome<CodeUnit> {
     let node =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte);
     let Some(node) = node else {
         return ReceiverAnalysisOutcome::Unknown;
     };
-    let provider = JsTsReceiverFactProvider::new(
+    let provider = JsTsReceiverFactProvider::new_with_batch_data(
         analyzer,
         support,
         language,
         file,
         source,
         tree.root_node(),
-        compute_jsts_import_binder(source, tree),
+        batch.imports.clone(),
+        Arc::clone(&batch.aliases),
+        Arc::clone(&batch.syntax_index),
     );
     provider
         .resolve_member_targets_at_site(

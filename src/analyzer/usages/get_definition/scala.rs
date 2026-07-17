@@ -39,8 +39,8 @@ enum ScalaNameResolution {
 struct ForwardScalaNameResolver<'a> {
     scala: &'a ScalaAnalyzer,
     support: &'a dyn BoundedDefinitionLookup,
-    package: String,
-    imports: Vec<ImportInfo>,
+    package: Arc<str>,
+    imports: Arc<Vec<ImportInfo>>,
 }
 
 type ScalaNameResolver<'a> = ForwardScalaNameResolver<'a>;
@@ -51,11 +51,26 @@ impl<'a> ForwardScalaNameResolver<'a> {
         support: &'a dyn BoundedDefinitionLookup,
         file: &ProjectFile,
     ) -> Self {
+        Self::for_batch(
+            scala,
+            support,
+            &ScalaDefinitionContext {
+                package: Arc::from(scala_package_name_of(scala, file).unwrap_or_default()),
+                imports: Arc::new(scala.import_info_of(file)),
+            },
+        )
+    }
+
+    fn for_batch(
+        scala: &'a ScalaAnalyzer,
+        support: &'a dyn BoundedDefinitionLookup,
+        batch: &ScalaDefinitionContext,
+    ) -> Self {
         Self {
             scala,
             support,
-            package: scala_package_name_of(scala, file).unwrap_or_default(),
-            imports: scala.import_info_of(file),
+            package: Arc::clone(&batch.package),
+            imports: Arc::clone(&batch.imports),
         }
     }
 
@@ -376,6 +391,7 @@ pub(super) fn resolve_scala(
     let Some(tree) = tree else {
         return no_definition("scala_parse_failed", "Scala source could not be parsed");
     };
+    let batch = context.scala_context(scala, file);
     let support = context.bounded_support();
     let root = tree.root_node();
     let Some(node) = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
@@ -401,7 +417,7 @@ pub(super) fn resolve_scala(
         return outcome;
     }
 
-    let resolver = ScalaNameResolver::for_file(scala, support, file);
+    let resolver = ScalaNameResolver::for_batch(scala, support, &batch);
     let ctx = ScalaLookupCtx {
         scala,
         analyzer,
