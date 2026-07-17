@@ -5934,6 +5934,47 @@ fn scan_usages_paths_scope_blocks_rust_empty_scope_fallback() {
 }
 
 #[test]
+fn scan_usages_by_location_exposes_rust_self_type_references() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"pub struct Service { value: usize }
+
+impl Service {
+    fn new() -> Self {
+        Self { value: 0 }
+    }
+
+    fn read(&self) -> usize {
+        self.value
+    }
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"lib.rs","line":1,"column":12}],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+
+    assert_eq!("found", usage["status"], "payload: {value}");
+    assert_eq!(3, usage["total_hits"], "payload: {value}");
+    let hits = usage["files"][0]["hits"].as_array().unwrap();
+    let lines: Vec<_> = hits
+        .iter()
+        .map(|hit| hit["line"].as_u64().unwrap())
+        .collect();
+    assert_eq!(vec![3, 4, 5], lines, "payload: {value}");
+}
+
+#[test]
 fn scan_usages_by_reference_finds_exact_rust_module_path_segment() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(

@@ -127,3 +127,14 @@ fn ra_find_all_refs_cross_file_import_and_call() {
         &[("bar.rs", 0), ("bar.rs", 2)],
     );
 }
+
+#[test]
+fn rust_type_references_include_capital_self_but_not_lowercase_self() {
+    assert_refs(
+        &[(
+            "lib.rs",
+            "pub struct Service<caret> {\n    value: usize,\n}\n\nimpl Service {\n    fn new() -> Self {\n        Self { value: 0 }\n    }\n\n    fn read(&self) -> usize {\n        self.value\n    }\n}\n",
+        )],
+        &[("lib.rs", 4), ("lib.rs", 5), ("lib.rs", 6)],
+    );
+}
