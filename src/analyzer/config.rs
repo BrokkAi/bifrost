@@ -6,6 +6,13 @@ pub struct AnalyzerConfig {
     pub parallelism: Option<usize>,
     pub memo_cache_budget_bytes: Option<u64>,
     pub java: JavaAnalyzerConfig,
+    pub csharp: CSharpAnalyzerConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CSharpAnalyzerConfig {
+    /// Extra assemblies to index in addition to already-restored project assets.
+    pub assembly_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -97,6 +104,7 @@ impl Default for AnalyzerConfig {
             parallelism: Some(default_parallelism()),
             memo_cache_budget_bytes: Some(256 * 1024 * 1024),
             java: JavaAnalyzerConfig::default(),
+            csharp: CSharpAnalyzerConfig::default(),
         }
     }
 }

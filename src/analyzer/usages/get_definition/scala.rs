@@ -39,8 +39,8 @@ enum ScalaNameResolution {
 struct ForwardScalaNameResolver<'a> {
     scala: &'a ScalaAnalyzer,
     support: &'a dyn BoundedDefinitionLookup,
-    package: String,
-    imports: Vec<ImportInfo>,
+    package: Arc<str>,
+    imports: Arc<Vec<ImportInfo>>,
 }
 
 type ScalaNameResolver<'a> = ForwardScalaNameResolver<'a>;
@@ -51,11 +51,26 @@ impl<'a> ForwardScalaNameResolver<'a> {
         support: &'a dyn BoundedDefinitionLookup,
         file: &ProjectFile,
     ) -> Self {
+        Self::for_batch(
+            scala,
+            support,
+            &ScalaDefinitionContext {
+                package: Arc::from(scala_package_name_of(scala, file).unwrap_or_default()),
+                imports: Arc::new(scala.import_info_of(file)),
+            },
+        )
+    }
+
+    fn for_batch(
+        scala: &'a ScalaAnalyzer,
+        support: &'a dyn BoundedDefinitionLookup,
+        batch: &ScalaDefinitionContext,
+    ) -> Self {
         Self {
             scala,
             support,
-            package: scala_package_name_of(scala, file).unwrap_or_default(),
-            imports: scala.import_info_of(file),
+            package: Arc::clone(&batch.package),
+            imports: Arc::clone(&batch.imports),
         }
     }
 
@@ -107,7 +122,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
         };
         let mut matching_explicit_import = false;
         let mut explicit_candidates = Vec::new();
-        for import in &self.imports {
+        for import in self.imports.iter() {
             let Some(path) = scala_import_path(import) else {
                 continue;
             };
@@ -136,7 +151,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
         }
 
         let mut wildcard_candidates = Vec::new();
-        for import in &self.imports {
+        for import in self.imports.iter() {
             let Some(path) = scala_import_path(import) else {
                 continue;
             };
@@ -159,7 +174,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
         }
         if !self.package.is_empty() {
             local_candidates.extend(scala_nested_type_candidates(
-                self.package.clone(),
+                self.package.to_string(),
                 segments,
                 false,
             ));
@@ -239,7 +254,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
 
     fn visible_extension_methods(&self, member: &str) -> Vec<ForwardScalaExtensionMethod> {
         let mut units = Vec::new();
-        for import in &self.imports {
+        for import in self.imports.iter() {
             let Some(path) = scala_import_path(import) else {
                 continue;
             };
@@ -376,6 +391,7 @@ pub(super) fn resolve_scala(
     let Some(tree) = tree else {
         return no_definition("scala_parse_failed", "Scala source could not be parsed");
     };
+    let batch = context.scala_context(scala, file);
     let support = context.bounded_support();
     let root = tree.root_node();
     let Some(node) = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
@@ -401,7 +417,7 @@ pub(super) fn resolve_scala(
         return outcome;
     }
 
-    let resolver = ScalaNameResolver::for_file(scala, support, file);
+    let resolver = ScalaNameResolver::for_batch(scala, support, &batch);
     let ctx = ScalaLookupCtx {
         scala,
         analyzer,

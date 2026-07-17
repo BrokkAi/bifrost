@@ -38,6 +38,15 @@ impl TypeHierarchyProvider for JavaAnalyzer {
 }
 
 impl JavaAnalyzer {
+    pub(crate) fn is_interface(&self, code_unit: &CodeUnit) -> bool {
+        code_unit.is_class()
+            && self.signatures(code_unit).iter().any(|signature| {
+                signature
+                    .split_whitespace()
+                    .any(|token| token == "interface")
+            })
+    }
+
     fn build_direct_descendant_index(&self) -> DirectDescendantIndex {
         let _scope = crate::profiling::scope("JavaAnalyzer::build_direct_descendant_index");
         let mut candidates = self

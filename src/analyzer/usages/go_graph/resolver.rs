@@ -1,5 +1,5 @@
 use crate::analyzer::go::go_field_declaration_is_embedded;
-use crate::analyzer::go::packages::{canonical_go_package_name, read_go_module_path};
+use crate::analyzer::go::packages::{GoWorkspacePathIndex, canonical_go_package_name};
 use crate::analyzer::usages::common::language_for_file;
 pub(super) use crate::analyzer::usages::common::node_text;
 use crate::analyzer::usages::go_graph::extractor::{
@@ -396,7 +396,6 @@ pub(crate) fn build_go_edge_index(
         .filter(|file| language_for_file(file) == Language::Go)
         .cloned()
         .collect();
-    let module_path = read_go_module_path(go_files.first()?.root());
 
     let parsed_files: Vec<_> = go_files
         .par_iter()
@@ -409,17 +408,12 @@ pub(crate) fn build_go_edge_index(
         .iter()
         .map(|(file, parsed)| (file.clone(), parsed))
         .collect();
-    Some(build_go_edge_index_from_parsed(
-        analyzer,
-        &parsed_refs,
-        module_path,
-    ))
+    Some(build_go_edge_index_from_parsed(analyzer, &parsed_refs))
 }
 
 fn build_go_edge_index_from_parsed(
     analyzer: &GoAnalyzer,
     parsed_files: &[(ProjectFile, &ParsedFile)],
-    module_path: Option<String>,
 ) -> GoEdgeIndex {
     let package_names: HashMap<ProjectFile, String> = parsed_files
         .iter()
@@ -448,9 +442,10 @@ fn build_go_edge_index_from_parsed(
             (
                 file.clone(),
                 namespace_packages_from_imports(
+                    file,
                     &parsed.imports,
                     &dir_index,
-                    module_path.as_deref(),
+                    analyzer.workspace_path_index(),
                     |target| package_names.get(target).cloned(),
                 ),
             )
@@ -473,7 +468,7 @@ fn build_go_edge_index_from_parsed(
         parsed_files,
         &package_names,
         &dir_index,
-        module_path.as_deref(),
+        analyzer.workspace_path_index(),
         &declaration_facts.type_fqns,
     );
 
@@ -602,7 +597,7 @@ fn collect_go_embedded_field_type_fqns(
     parsed_files: &[(ProjectFile, &ParsedFile)],
     package_names: &HashMap<ProjectFile, String>,
     dir_index: &ParentDirIndex,
-    module_path: Option<&str>,
+    workspace_paths: &GoWorkspacePathIndex,
     type_fqns: &HashSet<String>,
 ) -> HashMap<String, Vec<String>> {
     let mut embedded_by_owner: HashMap<String, Vec<String>> = HashMap::default();
@@ -610,7 +605,7 @@ fn collect_go_embedded_field_type_fqns(
         analyzer,
         package_names,
         dir_index,
-        module_path,
+        workspace_paths,
         type_fqns,
     };
     for (file, parsed) in parsed_files {
@@ -697,7 +692,7 @@ struct GoEdgeTypeResolver<'a> {
     analyzer: &'a GoAnalyzer,
     package_names: &'a HashMap<ProjectFile, String>,
     dir_index: &'a ParentDirIndex,
-    module_path: Option<&'a str>,
+    workspace_paths: &'a GoWorkspacePathIndex,
     type_fqns: &'a HashSet<String>,
 }
 
@@ -713,7 +708,7 @@ impl GoEdgeTypeResolver<'_> {
                 self.analyzer,
                 file,
                 self.dir_index,
-                self.module_path,
+                self.workspace_paths,
                 |target| self.package_names.get(target).cloned(),
             );
             return namespaces.get(qualifier).and_then(|packages| {
@@ -762,17 +757,24 @@ fn namespace_packages_from(
     analyzer: &GoAnalyzer,
     file: &ProjectFile,
     dir_index: &ParentDirIndex,
-    module_path: Option<&str>,
+    workspace_paths: &GoWorkspacePathIndex,
     target_package_name: impl Fn(&ProjectFile) -> Option<String>,
 ) -> NamespacePackages {
     let imports = analyzer.import_info_of(file);
-    namespace_packages_from_imports(&imports, dir_index, module_path, target_package_name)
+    namespace_packages_from_imports(
+        file,
+        &imports,
+        dir_index,
+        workspace_paths,
+        target_package_name,
+    )
 }
 
 fn namespace_packages_from_imports(
+    file: &ProjectFile,
     imports: &[ImportInfo],
     dir_index: &ParentDirIndex,
-    module_path: Option<&str>,
+    workspace_paths: &GoWorkspacePathIndex,
     target_package_name: impl Fn(&ProjectFile) -> Option<String>,
 ) -> NamespacePackages {
     let mut by_alias: HashMap<String, Vec<String>> = HashMap::default();
@@ -785,7 +787,7 @@ fn namespace_packages_from_imports(
         let Some(path) = extract_go_import_path(&import.raw_snippet) else {
             continue;
         };
-        let resolved = resolve_go_module(&path, dir_index, module_path);
+        let resolved = resolve_go_module(file, &path, dir_index, workspace_paths);
         // Each resolved package is `(clause name, canonical fqn prefix)`: the
         // source refers to it by its `package` clause name (`row`), while the
         // node fqn it must map to uses the canonical, module-qualified path
@@ -834,12 +836,11 @@ pub(crate) fn resolve_go_import_namespaces(
     package_names: &HashMap<ProjectFile, String>,
 ) -> NamespacePackages {
     let dir_index = build_parent_dir_index(package_names.keys());
-    let module_path = read_go_module_path(file.root());
     namespace_packages_from(
         analyzer,
         file,
         &dir_index,
-        module_path.as_deref(),
+        analyzer.workspace_path_index(),
         |target| package_names.get(target).cloned(),
     )
 }
@@ -869,7 +870,6 @@ pub(super) fn build_go_graph(
 ) -> GoProjectGraph {
     let mut parsed: HashMap<ProjectFile, Arc<ParsedFile>> = HashMap::default();
     let mut files = Vec::new();
-    let mut module_path = None;
     let scoped_files: BTreeSet<ProjectFile> = candidate_files
         .iter()
         .filter(|file| language_for_file(file) == Language::Go)
@@ -883,9 +883,6 @@ pub(super) fn build_go_graph(
         }
         if language_for_file(&file) != Language::Go {
             continue;
-        }
-        if module_path.is_none() {
-            module_path = read_go_module_path(file.root());
         }
         let parsed_file = match parse_go_file(&file) {
             Some(parsed_file) => Arc::new(parsed_file),
@@ -908,7 +905,8 @@ pub(super) fn build_go_graph(
         .iter()
         .map(|(file, parsed)| (file.clone(), parsed.as_ref()))
         .collect();
-    let edge_index = build_go_edge_index_from_parsed(analyzer, &parsed_refs, module_path.clone());
+    let workspace_paths = analyzer.workspace_path_index();
+    let edge_index = build_go_edge_index_from_parsed(analyzer, &parsed_refs);
 
     let mut exports_by_file = HashMap::default();
     let mut binders_by_file = HashMap::default();
@@ -919,11 +917,12 @@ pub(super) fn build_go_graph(
         exports_by_file.insert(file.clone(), export_index_of(analyzer, file));
         binders_by_file.insert(
             file.clone(),
-            import_binder_of(analyzer, file, &parsed, &dir_index, module_path.as_deref()),
+            import_binder_of(analyzer, file, &parsed, &dir_index, workspace_paths),
         );
     }
 
-    let resolve = |module: &str| resolve_go_module(module, &dir_index, module_path.as_deref());
+    let resolve =
+        |module: &str| resolve_go_module(target_file, module, &dir_index, workspace_paths);
     let (reexport_edges, star_reexports) =
         build_reexport_edges(&exports_by_file, &binders_by_file, &resolve);
     let importer_reverse =
@@ -960,7 +959,7 @@ fn import_binder_of(
     file: &ProjectFile,
     parsed: &HashMap<ProjectFile, Arc<ParsedFile>>,
     dir_index: &ParentDirIndex,
-    module_path: Option<&str>,
+    workspace_paths: &GoWorkspacePathIndex,
 ) -> ImportBinder {
     let mut binder = ImportBinder::empty();
     for import in analyzer.import_info_of(file) {
@@ -985,7 +984,7 @@ fn import_binder_of(
                 let locals = match import.alias.clone() {
                     Some(alias) => vec![default_go_import_local_name(&alias)],
                     None => {
-                        let resolved = resolve_go_module(&path, dir_index, module_path);
+                        let resolved = resolve_go_module(file, &path, dir_index, workspace_paths);
                         let mut names: Vec<_> = resolved
                             .iter()
                             .filter_map(|target| parsed.get(target))
@@ -994,7 +993,8 @@ fn import_binder_of(
                             .collect();
                         names.sort();
                         names.dedup();
-                        if names.is_empty() && is_local_like_go_import(&path, module_path) {
+                        if names.is_empty() && is_local_like_go_import(file, &path, workspace_paths)
+                        {
                             names.push(default_go_import_local_name(
                                 import.identifier.as_deref().unwrap_or(path.as_str()),
                             ));
@@ -1034,47 +1034,32 @@ fn build_parent_dir_index<'a>(files: impl Iterator<Item = &'a ProjectFile>) -> P
 }
 
 fn resolve_go_module(
+    source_file: &ProjectFile,
     module: &str,
     dir_index: &ParentDirIndex,
-    module_path: Option<&str>,
+    workspace_paths: &GoWorkspacePathIndex,
 ) -> Vec<ProjectFile> {
-    let local_rel = local_go_import_rel_path(module, module_path);
-    let vendor_rel = format!("vendor/{}", module.trim_matches('/'));
     let mut resolved: Vec<ProjectFile> = Vec::new();
-    if let Some(files) = dir_index.get(&vendor_rel) {
-        resolved.extend(files.iter().cloned());
-    }
-    // `local_rel == Some("")` means the import refers to the module root, whose
-    // files have an empty parent — the `index.get("")` lookup covers that case.
-    if let Some(rel) = local_rel.as_ref()
-        && let Some(files) = dir_index.get(rel)
-    {
-        resolved.extend(files.iter().cloned());
+    for representative in workspace_paths.import_files(source_file, module) {
+        let directory = representative.parent().to_string_lossy().replace('\\', "/");
+        if let Some(files) = dir_index.get(&directory) {
+            resolved.extend(files.iter().cloned());
+        }
     }
     resolved.sort();
     resolved.dedup();
     resolved
 }
 
-fn local_go_import_rel_path(import_path: &str, module_path: Option<&str>) -> Option<String> {
-    let import_path = import_path.trim().trim_matches('/');
-    if let Some(relative) = import_path.strip_prefix("./") {
-        return Some(relative.trim_matches('/').to_string());
-    }
-    if import_path == "." {
-        return Some(String::new());
-    }
-    let module_path = module_path?.trim_matches('/');
-    if import_path == module_path {
-        return Some(String::new());
-    }
-    import_path
-        .strip_prefix(&format!("{module_path}/"))
-        .map(|suffix| suffix.trim_matches('/').to_string())
-}
-
-fn is_local_like_go_import(import_path: &str, module_path: Option<&str>) -> bool {
-    local_go_import_rel_path(import_path, module_path).is_some()
+fn is_local_like_go_import(
+    source_file: &ProjectFile,
+    import_path: &str,
+    workspace_paths: &GoWorkspacePathIndex,
+) -> bool {
+    !workspace_paths
+        .import_files(source_file, import_path)
+        .is_empty()
+        || workspace_paths.package_prefix_exists(import_path)
         || import_path.starts_with("./")
         || import_path == "."
 }

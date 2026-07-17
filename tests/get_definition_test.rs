@@ -2758,6 +2758,47 @@ public class UseWidget {
 }
 
 #[test]
+fn java_type_lookup_bare_local_named_type_does_not_become_default_package_class() {
+    let source = r#"
+package app;
+
+import models.Widget;
+
+public class UseWidget {
+    public Widget render() {
+        Widget type = new Widget();
+        return type;
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("type.java", "public class type {}\n")
+        .file(
+            "models/Widget.java",
+            "package models; public class Widget {}\n",
+        )
+        .file("app/UseWidget.java", source)
+        .build();
+
+    let value = lookup_type(
+        project.root(),
+        &location_reference(
+            "app/UseWidget.java",
+            source,
+            source.rfind("type;").expect("bare local expression"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "models.Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "models/Widget.java",
+        "{value}"
+    );
+}
+
+#[test]
 fn csharp_type_lookup_resolves_using_explicit_parameter_type() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
@@ -8589,6 +8630,134 @@ func Helper() {}
 }
 
 #[test]
+fn go_keyed_composite_labels_resolve_from_exact_struct_owner() {
+    let source = r#"
+package main
+
+import "example.com/app/model"
+
+type Local struct {
+    LocalField string
+}
+
+type MissingFieldOwner struct {
+    Other string
+}
+
+type Distractor struct {
+    Shared string
+}
+
+type KeyCollision struct {
+    LocalMapKey string
+}
+
+const LocalMapKey = "local"
+
+var localValue = Local{LocalField: "local"}
+var importedValue = model.Imported{ImportedOnly: "imported"}
+var sliceValues = []Local{{LocalField: "slice"}}
+var arrayValues = [1]model.Imported{{ImportedOnly: "array"}}
+var nestedArrays = [1][1]model.Imported{{{ImportedOnly: "nested-array"}}}
+var mapValues = map[string]model.Imported{"value": {ImportedOnly: "map"}}
+var invalidOwner = MissingFieldOwner{Shared: "must not guess Distractor.Shared"}
+var keyedMap = map[string]int{LocalMapKey: 1}
+"#;
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file("main.go", source)
+        .file(
+            "model/model.go",
+            r#"
+package model
+
+type Imported struct {
+    ImportedOnly string
+}
+"#,
+        )
+        .build();
+
+    for (marker, focus, expected_fqn, expected_path) in [
+        (
+            "Local{LocalField: \"local\"}",
+            "LocalField",
+            "example.com/app.Local.LocalField",
+            "main.go",
+        ),
+        (
+            "model.Imported{ImportedOnly: \"imported\"}",
+            "ImportedOnly",
+            "example.com/app/model.Imported.ImportedOnly",
+            "model/model.go",
+        ),
+        (
+            "[]Local{{LocalField: \"slice\"}}",
+            "LocalField",
+            "example.com/app.Local.LocalField",
+            "main.go",
+        ),
+        (
+            "[1]model.Imported{{ImportedOnly: \"array\"}}",
+            "ImportedOnly",
+            "example.com/app/model.Imported.ImportedOnly",
+            "model/model.go",
+        ),
+        (
+            "[1][1]model.Imported{{{ImportedOnly: \"nested-array\"}}}",
+            "ImportedOnly",
+            "example.com/app/model.Imported.ImportedOnly",
+            "model/model.go",
+        ),
+        (
+            "{\"value\": {ImportedOnly: \"map\"}}",
+            "ImportedOnly",
+            "example.com/app/model.Imported.ImportedOnly",
+            "model/model.go",
+        ),
+    ] {
+        let marker_start = source.find(marker).expect("composite marker");
+        let focus_start = marker_start + marker.find(focus).expect("focus in marker");
+        let value = lookup(
+            project.root(),
+            &location_reference("main.go", source, focus_start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{marker}: {value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], expected_fqn,
+            "{marker}: {value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["path"], expected_path,
+            "{marker}: {value}"
+        );
+    }
+
+    let invalid_marker = "MissingFieldOwner{Shared:";
+    let invalid_start = source.find(invalid_marker).expect("invalid owner marker")
+        + invalid_marker.find("Shared").expect("invalid owner focus");
+    let value = lookup(
+        project.root(),
+        &location_reference("main.go", source, invalid_start),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+
+    let map_marker = "map[string]int{LocalMapKey:";
+    let map_start = source.find(map_marker).expect("map-key marker")
+        + map_marker.find("LocalMapKey").expect("map-key focus");
+    let value = lookup(
+        project.root(),
+        &location_reference("main.go", source, map_start),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "example.com/app._module_.LocalMapKey",
+        "{value}"
+    );
+}
+
+#[test]
 fn go_import_selector_resolves_package_var_definition() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n")
@@ -9157,6 +9326,45 @@ func disable(groups []scheduledGroup) {
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
         result["definitions"][0]["fqn"], "example.com/app.scheduledGroup.group",
+        "{value}"
+    );
+}
+
+#[test]
+fn go_range_element_can_shadow_the_iterable_receiver_without_recursive_inference() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file(
+            "history.go",
+            r#"
+package history
+
+type History struct {
+    Revision string
+}
+
+func visit(history []History) {
+    for _, history := range history {
+        _ = history.Revision
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        _ = history.Revision";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"history.go","line":10,"column":{}}}]}}"#,
+            column_of(line, "Revision")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "example.com/app.History.Revision",
         "{value}"
     );
 }
@@ -10293,6 +10501,228 @@ public class UseUtil {
 }
 
 #[test]
+fn java_unqualified_inherited_method_call_filters_out_wrong_arity_override() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "com/intellij/ui/SimpleTextAttributes.java",
+            "package com.intellij.ui; public class SimpleTextAttributes { public static final SimpleTextAttributes GRAY_ATTRIBUTES = new SimpleTextAttributes(); }\n",
+        )
+        .file(
+            "com/intellij/ui/SimpleColoredComponent.java",
+            "package com.intellij.ui; public class SimpleColoredComponent { public void append(String text, SimpleTextAttributes attributes) {} public void appendMany(String text, SimpleTextAttributes... attributes) {} }\n",
+        )
+        .file(
+            "com/intellij/ui/ColoredListCellRenderer.java",
+            "package com.intellij.ui; public class ColoredListCellRenderer extends SimpleColoredComponent { public void append(String text, SimpleTextAttributes attributes, boolean isMainText) {} public void appendMany(String text) {} }\n",
+        )
+        .file(
+            "com/intellij/lang/RegExpInspectionConfigurationCellRenderer.java",
+            r#"
+package com.intellij.lang;
+
+import com.intellij.ui.ColoredListCellRenderer;
+import com.intellij.ui.SimpleTextAttributes;
+
+public class RegExpInspectionConfigurationCellRenderer extends ColoredListCellRenderer {
+    public void render() {
+        append("'", SimpleTextAttributes.GRAY_ATTRIBUTES);
+        appendMany("'", SimpleTextAttributes.GRAY_ATTRIBUTES, SimpleTextAttributes.GRAY_ATTRIBUTES);
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        append(\"'\", SimpleTextAttributes.GRAY_ATTRIBUTES);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"com/intellij/lang/RegExpInspectionConfigurationCellRenderer.java","line":9,"column":{}}}]}}"#,
+            column_of(line, "append")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "com.intellij.ui.SimpleColoredComponent.append",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["signature"], "(String, SimpleTextAttributes)",
+        "{value}"
+    );
+
+    let varargs_line = "        appendMany(\"'\", SimpleTextAttributes.GRAY_ATTRIBUTES, SimpleTextAttributes.GRAY_ATTRIBUTES);";
+    let varargs_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"com/intellij/lang/RegExpInspectionConfigurationCellRenderer.java","line":10,"column":{}}}]}}"#,
+            column_of(varargs_line, "appendMany")
+        ),
+    );
+    let varargs_result = &varargs_value["results"][0];
+    assert_eq!(varargs_result["status"], "resolved", "{varargs_value}");
+    assert_eq!(
+        varargs_result["definitions"][0]["fqn"],
+        "com.intellij.ui.SimpleColoredComponent.appendMany",
+        "{varargs_value}"
+    );
+    assert_eq!(
+        varargs_result["definitions"][0]["signature"], "(String, SimpleTextAttributes[])",
+        "{varargs_value}"
+    );
+}
+
+#[test]
+fn java_unqualified_inherited_method_call_with_only_external_base_match_returns_no_definition() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "pkg/JBList.java",
+            r#"
+package pkg;
+
+public class JBList extends ExternalBaseList {
+    public void repaint(long tm, int x, int y, int width, int height) {}
+
+    public void setBusy(boolean busy) {
+        Runnable callback = () -> {
+            if (busy) {
+                repaint();
+            }
+        };
+        callback.run();
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "                repaint();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"pkg/JBList.java","line":10,"column":{}}}]}}"#,
+            column_of(line, "repaint")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn java_bare_inherited_field_lookup_does_not_return_same_named_methods() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "pkg/GridBag.java",
+            "package pkg; public class GridBag { protected int insets = 7; }\n",
+        )
+        .file(
+            "pkg/FormBuilder.java",
+            r#"
+package pkg;
+
+public class FormBuilder extends GridBag {
+    int readInsets() {
+        return insets;
+    }
+
+    void insets() {}
+
+    void callInsets() {
+        insets();
+    }
+}
+"#,
+        )
+        .build();
+
+    let field_line = "        return insets;";
+    let field_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"pkg/FormBuilder.java","line":6,"column":{}}}]}}"#,
+            column_of(field_line, "insets")
+        ),
+    );
+
+    let field_result = &field_value["results"][0];
+    assert_eq!(field_result["status"], "resolved", "{field_value}");
+    assert_eq!(
+        field_result["definitions"][0]["fqn"], "pkg.GridBag.insets",
+        "{field_value}"
+    );
+    assert_eq!(
+        field_result["definitions"][0]["kind"], "field",
+        "{field_value}"
+    );
+
+    let call_line = "        insets();";
+    let call_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"pkg/FormBuilder.java","line":12,"column":{}}}]}}"#,
+            column_of(call_line, "insets")
+        ),
+    );
+
+    let call_result = &call_value["results"][0];
+    assert_eq!(call_result["status"], "resolved", "{call_value}");
+    assert_eq!(
+        call_result["definitions"][0]["fqn"], "pkg.FormBuilder.insets",
+        "{call_value}"
+    );
+    assert_eq!(
+        call_result["definitions"][0]["kind"], "function",
+        "{call_value}"
+    );
+}
+
+#[test]
+fn java_unqualified_method_call_keeps_matching_local_overload() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "pkg/BaseRenderer.java",
+            "package pkg; public class BaseRenderer { public void append(String text, String attrs) {} }\n",
+        )
+        .file(
+            "pkg/ChildRenderer.java",
+            r#"
+package pkg;
+
+public class ChildRenderer extends BaseRenderer {
+    public void append(String text, String attrs, boolean primary) {}
+
+    public void render() {
+        append("value", "gray", true);
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        append(\"value\", \"gray\", true);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"pkg/ChildRenderer.java","line":8,"column":{}}}]}}"#,
+            column_of(line, "append")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "pkg.ChildRenderer.append",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["signature"], "(String, String, boolean)",
+        "{value}"
+    );
+}
+
+#[test]
 fn java_static_method_receiver_prefers_nearest_declaring_type() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
@@ -10445,6 +10875,41 @@ public class UseList {
         .expect("diagnostic message");
     assert!(message.contains("outside the indexed workspace"), "{value}");
     assert!(message.contains("partial workspace"), "{value}");
+}
+
+#[test]
+fn java_packaged_external_import_does_not_fall_back_to_default_package_type() {
+    let source = r#"
+package app;
+
+import java.util.HashMap;
+
+public class UseMap {
+    public Object build() {
+        return new HashMap();
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("HashMap.java", "public class HashMap {}\n")
+        .file("app/UseMap.java", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/UseMap.java",
+            source,
+            source.find("HashMap()").expect("constructor type"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    let message = result["diagnostics"][0]["message"]
+        .as_str()
+        .expect("diagnostic message");
+    assert!(message.contains("outside the indexed workspace"), "{value}");
 }
 
 #[test]
@@ -17999,6 +18464,218 @@ fn java_reference_context_resolves_field_access_member_to_field() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "app.Types.JSON", "{value}");
+}
+
+#[test]
+fn java_nested_type_beats_imported_nested_type_in_constructor_context() {
+    let source = r#"
+package app;
+
+import pkg.Symbol.Visitor;
+
+public class Enclosing {
+    static class Visitor {}
+
+    class Runner {
+        Visitor current = new Visitor();
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "pkg/Symbol.java",
+            "package pkg; public class Symbol { public static class Visitor {} }\n",
+        )
+        .file("app/Enclosing.java", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/Enclosing.java",
+            source,
+            source.rfind("new Visitor()").expect("nested constructor"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Enclosing.Visitor",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "app/Enclosing.java",
+        "{value}"
+    );
+}
+
+#[test]
+fn java_nested_type_beats_imported_nested_type_in_parameter_context() {
+    let source = r#"
+package app;
+
+import pkg.Symbol.Visitor;
+
+public class Enclosing {
+    static class Visitor {}
+
+    void accept(Visitor visitor) {}
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "pkg/Symbol.java",
+            "package pkg; public class Symbol { public static class Visitor {} }\n",
+        )
+        .file("app/Enclosing.java", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/Enclosing.java",
+            source,
+            source.find("Visitor visitor").expect("parameter type"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Enclosing.Visitor",
+        "{value}"
+    );
+}
+
+#[test]
+fn java_terminal_token_in_scoped_source_type_resolves_whole_type() {
+    let source = r#"
+package app;
+
+public class Outer {
+    public static class Inner {}
+}
+
+class UseInner {
+    private app.Outer.Inner value;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("app/Outer.java", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/Outer.java",
+            source,
+            source.rfind("Inner value").expect("scoped terminal type"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Outer.Inner",
+        "{value}"
+    );
+}
+
+#[test]
+fn java_terminal_token_in_fully_qualified_external_type_stays_on_boundary() {
+    let source = r#"
+package app;
+
+public class EvaluateInstancesRequest {
+    static class Builder {}
+
+    private com.google.cloud.aiplatform.v1.ExactMatchInput.Builder builder;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("app/EvaluateInstancesRequest.java", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/EvaluateInstancesRequest.java",
+            source,
+            source.rfind("Builder builder").expect("fq terminal type"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    let message = result["diagnostics"][0]["message"]
+        .as_str()
+        .expect("diagnostic message");
+    assert!(message.contains("ExactMatchInput.Builder"), "{value}");
+}
+
+#[test]
+fn java_terminal_token_in_scoped_external_type_does_not_fall_back_to_same_package() {
+    let source = r#"
+package app;
+
+public class UseValue {
+    private com.google.protobuf.Value payload;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("app/Value.java", "package app; public class Value {}\n")
+        .file("app/UseValue.java", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/UseValue.java",
+            source,
+            source
+                .rfind("Value payload")
+                .expect("scoped external terminal"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    let message = result["diagnostics"][0]["message"]
+        .as_str()
+        .expect("diagnostic message");
+    assert!(message.contains("com.google.protobuf.Value"), "{value}");
+}
+
+#[test]
+fn java_terminal_token_in_missing_workspace_type_is_not_an_import_boundary() {
+    let source = r#"
+package app;
+
+public class UseMissing {
+    private app.Missing payload;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("app/Known.java", "package app; public class Known {}\n")
+        .file("app/UseMissing.java", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/UseMissing.java",
+            source,
+            source.find("Missing payload").expect("missing scoped type"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "no_indexed_definition",
+        "{value}"
+    );
 }
 
 #[test]

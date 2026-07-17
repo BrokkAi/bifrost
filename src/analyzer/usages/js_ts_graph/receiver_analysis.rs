@@ -38,7 +38,7 @@ pub(crate) struct JsTsReceiverFactProvider<'tree, 'a> {
     source: &'a str,
     root: Node<'tree>,
     imports: ImportBinder,
-    aliases: AliasResolver,
+    aliases: Arc<AliasResolver>,
     syntax_index: Arc<JsTsReceiverSyntaxIndex>,
     member_target_cache:
         RefCell<HashMap<ReceiverAnalysisCacheKey, ReceiverAnalysisOutcome<CodeUnit>>>,
@@ -98,7 +98,31 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         imports: ImportBinder,
         syntax_index: Arc<JsTsReceiverSyntaxIndex>,
     ) -> Self {
-        let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
+        Self::new_with_batch_data(
+            analyzer,
+            support,
+            language,
+            file,
+            source,
+            root,
+            imports,
+            Arc::new(AliasResolver::new(analyzer.project().root().to_path_buf())),
+            syntax_index,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::analyzer::usages) fn new_with_batch_data(
+        analyzer: &'a dyn IAnalyzer,
+        support: &'a dyn BoundedDefinitionLookup,
+        language: Language,
+        file: &'a ProjectFile,
+        source: &'a str,
+        root: Node<'tree>,
+        imports: ImportBinder,
+        aliases: Arc<AliasResolver>,
+        syntax_index: Arc<JsTsReceiverSyntaxIndex>,
+    ) -> Self {
         Self {
             analyzer,
             support,

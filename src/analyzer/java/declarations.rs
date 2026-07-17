@@ -1,6 +1,6 @@
 use super::*;
-use crate::analyzer::SignatureMetadata;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
+use crate::analyzer::{CallableArity, SignatureMetadata};
 use tree_sitter::{Node, Parser, Tree};
 
 pub(super) fn determine_package_name(root: Node<'_>, source: &str) -> String {
@@ -349,7 +349,12 @@ fn visit_callable(
     );
     parsed.add_signature_with_metadata(
         code_unit.clone(),
-        SignatureMetadata::with_parameter_labels(callable_sig, parameter_labels),
+        SignatureMetadata::with_parameter_labels(callable_sig, parameter_labels)
+            .with_callable_arity(
+                node.child_by_field_name("parameters")
+                    .map(callable_arity_for_parameters)
+                    .unwrap_or_else(|| CallableArity::exact(0)),
+            ),
     );
 
     if let Some(body) = node.child_by_field_name("body") {
@@ -845,22 +850,19 @@ fn canonical_parameters_signature(parameters: Node<'_>, source: &str) -> String 
                 }
             }
             "spread_parameter" => {
-                let mut spread_cursor = child.walk();
-                for grandchild in child.named_children(&mut spread_cursor) {
-                    if grandchild.kind() == "variable_declarator" {
-                        continue;
-                    }
-                    if grandchild.kind() == "modifiers"
-                        || grandchild.kind() == "annotation"
-                        || grandchild.kind() == "marker_annotation"
-                    {
-                        continue;
-                    }
+                if let Some(type_node) = spread_parameter_type_node(child) {
                     parts.push(format!(
                         "{}[]",
-                        normalize_whitespace(node_text(grandchild, source))
+                        normalize_whitespace(node_text(type_node, source))
                     ));
-                    break;
+                }
+            }
+            "ERROR" => {
+                if let Some(type_node) = malformed_spread_parameter_type_node(child) {
+                    parts.push(format!(
+                        "{}[]",
+                        normalize_whitespace(node_text(type_node, source))
+                    ));
                 }
             }
             "receiver_parameter" => {
@@ -882,6 +884,7 @@ fn parameter_labels(parameters: Node<'_>, source: &str) -> Vec<String> {
         let name = match child.kind() {
             "formal_parameter" => child.child_by_field_name("name"),
             "spread_parameter" => spread_parameter_name(child),
+            "ERROR" => malformed_spread_parameter_name(child),
             _ => None,
         };
         if let Some(name) = name {
@@ -894,6 +897,38 @@ fn parameter_labels(parameters: Node<'_>, source: &str) -> Vec<String> {
     labels
 }
 
+fn callable_arity_for_parameters(parameters: Node<'_>) -> CallableArity {
+    let mut total = 0usize;
+    let mut repeated = false;
+    let mut cursor = parameters.walk();
+    for child in parameters.named_children(&mut cursor) {
+        match child.kind() {
+            "formal_parameter" => total += 1,
+            "spread_parameter" => {
+                total += 1;
+                repeated = true;
+            }
+            "ERROR" if malformed_spread_parameter_name(child).is_some() => {
+                total += 1;
+                repeated = true;
+            }
+            _ => {}
+        }
+    }
+    let required = total.saturating_sub(usize::from(repeated));
+    CallableArity::new(required, total, repeated)
+}
+
+fn spread_parameter_type_node(parameter: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = parameter.walk();
+    parameter.named_children(&mut cursor).find(|child| {
+        !matches!(
+            child.kind(),
+            "variable_declarator" | "modifiers" | "annotation" | "marker_annotation"
+        )
+    })
+}
+
 fn spread_parameter_name(parameter: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = parameter.walk();
     for child in parameter.named_children(&mut cursor) {
@@ -902,6 +937,45 @@ fn spread_parameter_name(parameter: Node<'_>) -> Option<Node<'_>> {
         }
     }
     None
+}
+
+fn malformed_spread_parameter_type_node(parameter: Node<'_>) -> Option<Node<'_>> {
+    if parameter.kind() != "ERROR" {
+        return None;
+    }
+    let mut cursor = parameter.walk();
+    parameter
+        .named_children(&mut cursor)
+        .find(|child| is_malformed_spread_parameter_type_node(child.kind()))
+}
+
+fn malformed_spread_parameter_name(parameter: Node<'_>) -> Option<Node<'_>> {
+    let type_end = malformed_spread_parameter_type_node(parameter)?.end_byte();
+    let mut stack = vec![parameter];
+    let mut last = None;
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" && node.start_byte() > type_end {
+            last = Some(node);
+        }
+        let mut cursor = node.walk();
+        let mut children: Vec<_> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
+    }
+    last
+}
+
+fn is_malformed_spread_parameter_type_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier"
+            | "type_identifier"
+            | "scoped_identifier"
+            | "scoped_type_identifier"
+            | "generic_type"
+            | "annotated_type"
+            | "array_type"
+    )
 }
 
 fn field_signature(field_node: Node<'_>, declarator: Node<'_>, source: &str) -> String {

@@ -8,7 +8,7 @@ use crate::analyzer::usages::java_graph::return_type::{
 };
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
-use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, ProjectFile};
+use crate::analyzer::{CallableArity, CodeUnit, IAnalyzer, JavaAnalyzer, ProjectFile};
 use crate::hash::HashSet;
 use tree_sitter::Node;
 
@@ -27,13 +27,13 @@ pub(super) struct TargetSpec {
     pub(super) receiver_owner_fq_names: HashSet<String>,
     pub(super) declaration_owner_fq_names: HashSet<String>,
     pub(super) member_name: String,
-    pub(super) method_arities: Option<HashSet<usize>>,
+    pub(super) callable_arities: Option<HashSet<CallableArity>>,
 }
 
 impl TargetSpec {
     pub(super) fn from_targets(analyzer: &JavaAnalyzer, targets: &[CodeUnit]) -> Option<Self> {
         let mut spec = Self::from_target(analyzer, targets.first()?)?;
-        if let Some(arities) = spec.method_arities.as_mut() {
+        if let Some(arities) = spec.callable_arities.as_mut() {
             for target in &targets[1..] {
                 if target.fq_name() == spec.target.fq_name() && target.is_function() {
                     arities.insert(java_callable_arity(analyzer, target));
@@ -53,7 +53,7 @@ impl TargetSpec {
                 receiver_owner_fq_names: [fq_name.clone()].into_iter().collect(),
                 declaration_owner_fq_names: [fq_name].into_iter().collect(),
                 member_name: target.identifier().to_string(),
-                method_arities: None,
+                callable_arities: None,
             });
         }
 
@@ -74,7 +74,7 @@ impl TargetSpec {
             receiver_owner_fq_names: owner_sets.receiver,
             declaration_owner_fq_names: owner_sets.declarations,
             member_name: target.identifier().to_string(),
-            method_arities: (kind == TargetKind::Method || kind == TargetKind::Constructor)
+            callable_arities: (kind == TargetKind::Method || kind == TargetKind::Constructor)
                 .then(|| HashSet::from_iter([java_callable_arity(analyzer, target)])),
             owner,
         })
@@ -149,12 +149,12 @@ pub(super) fn java_method_signatures_match(
     }
 }
 
-pub(super) fn java_callable_arity(analyzer: &JavaAnalyzer, unit: &CodeUnit) -> usize {
+pub(super) fn java_callable_arity(analyzer: &JavaAnalyzer, unit: &CodeUnit) -> CallableArity {
     analyzer
         .signature_metadata(unit)
         .first()
-        .map(|metadata| metadata.parameters().len())
-        .unwrap_or_else(|| signature_arity(unit.signature()))
+        .and_then(|metadata| metadata.callable_arity())
+        .unwrap_or_else(|| CallableArity::exact(signature_arity(unit.signature())))
 }
 
 fn normalize_java_signature(signature: &str) -> String {
@@ -282,7 +282,7 @@ pub(super) fn has_proven_static_import(ctx: &ScanCtx<'_>) -> bool {
         if let Some(owner) = path.strip_suffix(".*") {
             if owner == target_fq_name {
                 target_visible = true;
-            } else {
+            } else if java_static_import_owner_matches_target(owner, ctx) {
                 return false;
             }
             continue;
@@ -296,12 +296,122 @@ pub(super) fn has_proven_static_import(ctx: &ScanCtx<'_>) -> bool {
         }
         if owner == target_fq_name {
             target_visible = true;
-        } else {
+        } else if java_static_import_owner_matches_target(owner, ctx) {
             return false;
         }
     }
 
     target_visible
+}
+
+fn java_static_import_owner_matches_target(owner_fq_name: &str, ctx: &ScanCtx<'_>) -> bool {
+    ctx.java
+        .global_usage_definition_index()
+        .by_fqn(&format!("{owner_fq_name}.{}", ctx.spec.member_name))
+        .iter()
+        .any(|candidate| java_static_import_candidate_matches_target(candidate, ctx))
+}
+
+fn java_static_import_candidate_matches_target(candidate: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
+    match ctx.spec.kind {
+        TargetKind::Field => candidate.is_field(),
+        TargetKind::Method => {
+            candidate.is_function() && java_static_import_callable_matches_target(candidate, ctx)
+        }
+        TargetKind::Type | TargetKind::Constructor => false,
+    }
+}
+
+fn java_static_import_callable_matches_target(candidate: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
+    if java_method_signatures_match(ctx.java, &ctx.spec.target, candidate) {
+        return true;
+    }
+    let Some(expected_arities) = ctx.spec.callable_arities.as_ref() else {
+        return false;
+    };
+    let candidate_arity = java_callable_arity(ctx.java, candidate);
+    expected_arities.contains(&candidate_arity)
+}
+
+pub(super) fn bare_method_context_matches_target(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
+    let context = enclosing_context(node, ctx);
+    let Some(owner) = context.owner.as_ref() else {
+        return false;
+    };
+    if owner.fq_name() == ctx.spec.owner.fq_name() {
+        return true;
+    }
+    if java_owner_declares_matching_method(ctx.java, owner, &ctx.spec.target) {
+        return false;
+    }
+    nearest_declaring_ancestor_matches_target(ctx, owner, |ancestor| {
+        java_owner_declares_matching_method(ctx.java, ancestor, &ctx.spec.target)
+    })
+}
+
+pub(super) fn bare_field_context_matches_target(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
+    let context = enclosing_context(node, ctx);
+    let Some(owner) = context.owner.as_ref() else {
+        return false;
+    };
+    if owner.fq_name() == ctx.spec.owner.fq_name() {
+        return true;
+    }
+    if ctx
+        .java
+        .global_usage_definition_index()
+        .by_fqn(&format!("{}.{}", owner.fq_name(), ctx.spec.member_name))
+        .iter()
+        .any(CodeUnit::is_field)
+    {
+        return false;
+    }
+    nearest_declaring_ancestor_matches_target(ctx, owner, |ancestor| {
+        ctx.java
+            .global_usage_definition_index()
+            .by_fqn(&format!("{}.{}", ancestor.fq_name(), ctx.spec.member_name))
+            .iter()
+            .any(CodeUnit::is_field)
+    })
+}
+
+fn nearest_declaring_ancestor_matches_target(
+    ctx: &ScanCtx<'_>,
+    owner: &CodeUnit,
+    mut declares_target_member: impl FnMut(&CodeUnit) -> bool,
+) -> bool {
+    let Some(provider) = ctx.analyzer.type_hierarchy_provider() else {
+        return false;
+    };
+    let mut seen = HashSet::from_iter([owner.clone()]);
+    let mut level = provider.get_direct_ancestors(owner);
+    while !level.is_empty() {
+        let mut declaring_owners = Vec::new();
+        let mut next_level = Vec::new();
+        for ancestor in level {
+            if !seen.insert(ancestor.clone()) {
+                continue;
+            }
+            if declares_target_member(&ancestor) {
+                declaring_owners.push(ancestor.clone());
+            }
+            next_level.extend(provider.get_direct_ancestors(&ancestor));
+        }
+        if !declaring_owners.is_empty() {
+            let class_owners = declaring_owners
+                .iter()
+                .filter(|owner| !ctx.java.is_interface(owner))
+                .collect::<Vec<_>>();
+            let preferred = if class_owners.is_empty() {
+                declaring_owners.iter().collect::<Vec<_>>()
+            } else {
+                class_owners
+            };
+            return preferred.len() == 1 && preferred[0].fq_name() == ctx.spec.owner.fq_name();
+        }
+        level = next_level;
+    }
+    false
 }
 
 pub(super) fn same_owner_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
@@ -311,7 +421,7 @@ pub(super) fn same_owner_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool 
         .is_some_and(|owner| owner.fq_name() == ctx.spec.owner.fq_name())
 }
 
-fn owner_matches_target_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
+pub(super) fn owner_matches_target_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
     let context = enclosing_context(node, ctx);
     let Some(owner) = context.owner.as_ref() else {
         return false;
@@ -350,11 +460,14 @@ pub(super) fn argument_list_arity(node: Node<'_>) -> usize {
         return 0;
     };
     let mut cursor = arguments.walk();
-    arguments.named_children(&mut cursor).count()
+    arguments
+        .children(&mut cursor)
+        .filter(|child| child.is_named() && !child.is_extra())
+        .count()
 }
 
 pub(super) fn resolve_type_from_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
-    if node.kind() == "scoped_type_identifier"
+    if matches!(node.kind(), "scoped_type_identifier" | "scoped_identifier")
         && let Some(resolved) = resolve_nested_type_from_scoped_node(node, ctx)
     {
         return Some(resolved);
@@ -377,7 +490,11 @@ fn resolve_nested_type_from_scoped_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> Op
         .filter(|child| {
             matches!(
                 child.kind(),
-                "type_identifier" | "scoped_type_identifier" | "generic_type"
+                "identifier"
+                    | "type_identifier"
+                    | "scoped_identifier"
+                    | "scoped_type_identifier"
+                    | "generic_type"
             )
         })
         .collect();

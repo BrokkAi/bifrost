@@ -287,7 +287,11 @@ impl JavaAnalyzer {
         }
 
         let same_package_fqn = self.same_package_fqn(file, normalized);
-        source_type_by_fqn(&same_package_fqn).or_else(|| source_type_by_fqn(normalized))
+        source_type_by_fqn(&same_package_fqn).or_else(|| {
+            self.file_is_in_default_package(file)
+                .then(|| source_type_by_fqn(normalized))
+                .flatten()
+        })
     }
 
     fn forward_source_type_by_fqn(&self, fqn: &str) -> Option<CodeUnit> {
@@ -364,7 +368,22 @@ impl JavaAnalyzer {
             target_name = stripped.to_string();
         }
 
+        let target_type_fqn = if target_package.is_empty() {
+            target_name.clone()
+        } else {
+            format!("{target_package}.{target_name}")
+        };
+
         for import in imports {
+            if let Some(raw) = static_import_path(import) {
+                if raw
+                    .strip_prefix(&target_type_fqn)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+                {
+                    return true;
+                }
+                continue;
+            }
             let Some(raw) = non_static_import_path(import) else {
                 continue;
             };
@@ -467,7 +486,9 @@ impl JavaAnalyzer {
             return Some(code_unit);
         }
 
-        self.source_type_by_fqn(normalized)
+        self.file_is_in_default_package(file)
+            .then(|| self.source_type_by_fqn(normalized))
+            .flatten()
     }
 
     pub(crate) fn resolve_type_name_with_external(
@@ -610,8 +631,11 @@ impl JavaAnalyzer {
             return Some(code_unit.clone());
         }
         let same_package_fqn = self.same_package_fqn(file, name);
-        self.source_type_by_fqn(&same_package_fqn)
-            .or_else(|| self.source_type_by_fqn(name))
+        self.source_type_by_fqn(&same_package_fqn).or_else(|| {
+            self.file_is_in_default_package(file)
+                .then(|| self.source_type_by_fqn(name))
+                .flatten()
+        })
     }
 
     fn source_type_by_fqn(&self, fqn: &str) -> Option<CodeUnit> {
@@ -646,6 +670,11 @@ impl JavaAnalyzer {
             format!("{}.{}", package_name, name)
         }
     }
+
+    fn file_is_in_default_package(&self, file: &ProjectFile) -> bool {
+        self.cached_package_name(file)
+            .is_none_or(|package| package.is_empty())
+    }
 }
 
 pub(super) fn parse_import_info(raw: String) -> ImportInfo {
@@ -671,15 +700,18 @@ pub(super) fn parse_import_info(raw: String) -> ImportInfo {
 }
 
 pub(super) fn non_static_import_path(import: &ImportInfo) -> Option<&str> {
-    if import
-        .raw_snippet
-        .trim_start()
-        .starts_with("import static ")
-    {
+    let path = import_path_from_raw(&import.raw_snippet);
+    if path.starts_with("static ") {
         return None;
     }
 
-    Some(import_path_from_raw(&import.raw_snippet))
+    Some(path)
+}
+
+fn static_import_path(import: &ImportInfo) -> Option<&str> {
+    import_path_from_raw(&import.raw_snippet)
+        .strip_prefix("static ")
+        .map(str::trim)
 }
 
 fn import_path_from_raw(raw: &str) -> &str {

@@ -26,7 +26,8 @@ use crate::analyzer::usages::go_graph::{
 use crate::analyzer::usages::inverted_edges::{ClassRangeIndex, first_precise};
 use crate::analyzer::usages::java_graph::java_signature_arity;
 use crate::analyzer::usages::js_ts_graph::{
-    JsTsReceiverFactProvider, cached_jsts_index, compute_jsts_import_binder,
+    JsTsReceiverFactProvider, JsTsReceiverSyntaxIndex, build_js_ts_receiver_syntax_index,
+    cached_jsts_index, compute_jsts_import_binder,
 };
 use crate::analyzer::usages::local_inference::{
     LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine,
@@ -69,9 +70,9 @@ use crate::analyzer::usages::scala_graph::{
 use crate::analyzer::{
     AliasResolver, AnalyzerDefinitionLookup, AnalyzerQueryScope, BoundedDefinitionLookup,
     CSharpAnalyzer, CodeUnit, CppAnalyzer, GoAnalyzer, IAnalyzer, ImportAnalysisProvider,
-    JavaAnalyzer, Language, PhpAnalyzer, ProjectFile, PythonAnalyzer, Range, RubyAnalyzer,
-    RustAnalyzer, ScalaAnalyzer, cpp_include_paths, cpp_node_text, csharp_callable_arity,
-    resolve_analyzer, resolve_include_targets,
+    ImportInfo, JavaAnalyzer, Language, PhpAnalyzer, ProjectFile, PythonAnalyzer, Range,
+    RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, cpp_include_paths, cpp_node_text,
+    csharp_callable_arity, resolve_analyzer, resolve_include_targets,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -323,10 +324,34 @@ pub(crate) fn resolve_call_reference_definition_with_source(
     Some(resolve_one(analyzer, &mut context, request))
 }
 
+#[derive(Clone)]
+pub(super) struct JsTsDefinitionContext {
+    pub(super) imports: ImportBinder,
+    pub(super) aliases: Arc<AliasResolver>,
+    pub(super) syntax_index: Arc<JsTsReceiverSyntaxIndex>,
+}
+
+#[derive(Clone)]
+struct GoDefinitionContext {
+    package: String,
+    aliases: HashMap<String, Vec<String>>,
+    dot_imports: Vec<String>,
+}
+
+#[derive(Clone)]
+pub(super) struct ScalaDefinitionContext {
+    pub(super) package: Arc<str>,
+    pub(super) imports: Arc<Vec<ImportInfo>>,
+}
+
 struct DefinitionBatchContext<'a> {
     analyzer: &'a dyn IAnalyzer,
     bounded_support: AnalyzerDefinitionLookup<'a>,
     rust_support: Option<rust::AnalyzerRustDefinitionProvider<'a>>,
+    rust_type_cache: RustTypeLookupCache,
+    js_ts_contexts: HashMap<(ProjectFile, Language), JsTsDefinitionContext>,
+    go_contexts: HashMap<ProjectFile, GoDefinitionContext>,
+    scala_contexts: HashMap<ProjectFile, ScalaDefinitionContext>,
     sources: HashMap<ProjectFile, Result<Arc<String>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
     line_starts: HashMap<ProjectFile, Arc<Vec<usize>>>,
@@ -352,6 +377,10 @@ impl<'a> DefinitionBatchContext<'a> {
             bounded_support: AnalyzerDefinitionLookup::new(analyzer, Language::None),
             rust_support: resolve_analyzer::<RustAnalyzer>(analyzer)
                 .map(|rust| rust::AnalyzerRustDefinitionProvider::new(rust, cache_rust_lookups)),
+            rust_type_cache: RustTypeLookupCache::default(),
+            js_ts_contexts: HashMap::default(),
+            go_contexts: HashMap::default(),
+            scala_contexts: HashMap::default(),
             sources: HashMap::default(),
             trees: HashMap::default(),
             line_starts: HashMap::default(),
@@ -395,6 +424,61 @@ impl<'a> DefinitionBatchContext<'a> {
         self.line_starts
             .entry(file.clone())
             .or_insert_with(|| Arc::new(compute_line_starts(source)))
+            .clone()
+    }
+
+    fn js_ts_context(
+        &mut self,
+        file: &ProjectFile,
+        language: Language,
+        source: &str,
+        tree: &Tree,
+    ) -> JsTsDefinitionContext {
+        self.js_ts_contexts
+            .entry((file.clone(), language))
+            .or_insert_with(|| {
+                let (syntax_index, _) =
+                    build_js_ts_receiver_syntax_index(tree.root_node(), source, None)
+                        .expect("uncancelled JS/TS syntax index build");
+                JsTsDefinitionContext {
+                    imports: compute_jsts_import_binder(source, tree),
+                    aliases: Arc::new(AliasResolver::new(
+                        self.analyzer.project().root().to_path_buf(),
+                    )),
+                    syntax_index,
+                }
+            })
+            .clone()
+    }
+
+    fn go_context(
+        &mut self,
+        go: &GoAnalyzer,
+        file: &ProjectFile,
+        source: &str,
+        tree: &Tree,
+    ) -> &GoDefinitionContext {
+        self.go_contexts.entry(file.clone()).or_insert_with(|| {
+            let (aliases, dot_imports) = go.definition_import_namespaces(file);
+            GoDefinitionContext {
+                package: go.canonical_package_name_from_tree(file, source, tree.root_node()),
+                aliases,
+                dot_imports,
+            }
+        })
+    }
+
+    fn scala_context(
+        &mut self,
+        scala: &ScalaAnalyzer,
+        file: &ProjectFile,
+    ) -> ScalaDefinitionContext {
+        self.scala_contexts
+            .entry(file.clone())
+            .or_insert_with(|| ScalaDefinitionContext {
+                package: Arc::from(scala_package_name_of(scala, file).unwrap_or_default()),
+                imports: Arc::new(scala.import_info_of(file)),
+            })
             .clone()
     }
 
@@ -596,22 +680,27 @@ fn resolve_one(
     }
     let _dispatch_scope = profiling::scope("get_definition::language_dispatch");
     let resolved = match language {
-        Language::Rust => context.rust_support.as_ref().map_or_else(
-            || no_definition("rust_analyzer_unavailable", "Rust analyzer is unavailable"),
-            |support| {
-                rust::resolve_rust(
-                    analyzer,
-                    support,
-                    &request.file,
-                    &source,
-                    tree.as_ref(),
-                    &site,
-                )
-            },
-        ),
+        Language::Rust => {
+            let (rust_support, rust_type_cache) =
+                (&context.rust_support, &mut context.rust_type_cache);
+            rust_support.as_ref().map_or_else(
+                || no_definition("rust_analyzer_unavailable", "Rust analyzer is unavailable"),
+                |support| {
+                    rust::resolve_rust(
+                        analyzer,
+                        support,
+                        &request.file,
+                        &source,
+                        tree.as_ref(),
+                        &site,
+                        rust_type_cache,
+                    )
+                },
+            )
+        }
         Language::JavaScript | Language::TypeScript => js_ts::resolve_js_ts(
             analyzer,
-            context.bounded_support(),
+            context,
             &request.file,
             language,
             &source,
@@ -622,15 +711,13 @@ fn resolve_one(
             let go = resolve_analyzer::<GoAnalyzer>(analyzer);
             let resolution = go.and_then(|go| {
                 let tree = tree.as_ref()?;
-                let file_package =
-                    go.canonical_package_name_from_tree(&request.file, &source, tree.root_node());
-                let (aliases, dot_imports) = go.definition_import_namespaces(&request.file);
+                let batch = context.go_context(go, &request.file, &source, tree);
                 Some(resolve_go_reference_with_namespaces(
                     tree.root_node(),
                     &source,
-                    &file_package,
-                    aliases,
-                    dot_imports,
+                    &batch.package,
+                    &batch.aliases,
+                    &batch.dot_imports,
                     &site,
                 ))
             });
@@ -640,6 +727,7 @@ fn resolve_one(
                     &go::AnalyzerGoDefinitionProvider::new(go_analyzer),
                     &request.file,
                     &source,
+                    tree.as_ref(),
                     &site,
                     resolution,
                 )
@@ -965,6 +1053,117 @@ mod tests {
         );
         assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
         assert!(context.python_contexts.is_empty());
+    }
+
+    #[test]
+    fn rust_batch_context_reuses_parsed_declaration_source_for_repeated_field_lookups() {
+        let source = "struct Inner { value: i32 }\nstruct Outer { inner: Inner }\nfn first(outer: Outer) -> i32 { outer.inner.value }\nfn second(outer: Outer) -> i32 { outer.inner.value }\n";
+        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
+        let analyzer = fixture.analyzer.analyzer();
+        let mut context = DefinitionBatchContext::new(analyzer, true);
+        let requests = source
+            .match_indices("value")
+            .skip(1)
+            .map(|(start_byte, reference)| DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(start_byte),
+                end_byte: Some(start_byte + reference.len()),
+            })
+            .collect();
+
+        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None);
+
+        assert!(outcomes.iter().all(|outcome| {
+            outcome.status == DefinitionLookupStatus::Resolved
+                && outcome
+                    .definitions
+                    .iter()
+                    .any(|unit| unit.fq_name() == "Inner.value")
+        }));
+        assert_eq!(
+            context
+                .rust_type_cache
+                .parsed_declaration_source_count_for_test(),
+            1,
+            "one definition batch should parse each Rust declaration source once"
+        );
+    }
+
+    #[test]
+    fn js_ts_batch_context_reuses_import_alias_and_receiver_syntax_state() {
+        let source = "import { Value } from './value';\nconst first: Value = {} as Value;\nconst second: Value = {} as Value;\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::TypeScript,
+            &[
+                ("value.ts", "export class Value {}\n"),
+                ("consumer.ts", source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "consumer.ts");
+        let analyzer = fixture.analyzer.analyzer();
+        let tree = parse_tree_for_language(&file, Language::TypeScript, source)
+            .expect("parse TypeScript source");
+        let mut context = DefinitionBatchContext::new(analyzer, true);
+
+        let first = context.js_ts_context(&file, Language::TypeScript, source, &tree);
+        let second = context.js_ts_context(&file, Language::TypeScript, source, &tree);
+
+        assert_eq!(context.js_ts_contexts.len(), 1);
+        assert!(Arc::ptr_eq(&first.aliases, &second.aliases));
+        assert!(Arc::ptr_eq(&first.syntax_index, &second.syntax_index));
+        assert_eq!(first.imports.bindings, second.imports.bindings);
+    }
+
+    #[test]
+    fn go_batch_context_reuses_package_and_import_namespaces() {
+        let source =
+            "package consumer\nimport dep \"example.com/dep\"\nfunc run() { dep.Call() }\n";
+        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("consumer.go", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "consumer.go");
+        let analyzer = fixture.analyzer.analyzer();
+        let go = resolve_analyzer::<GoAnalyzer>(analyzer).expect("Go analyzer");
+        let tree = parse_tree_for_language(&file, Language::Go, source).expect("parse Go source");
+        let mut context = DefinitionBatchContext::new(analyzer, true);
+
+        {
+            let first = context.go_context(go, &file, source, &tree);
+            assert_eq!(first.package, "consumer");
+            assert_eq!(first.aliases.len(), 1);
+        }
+        let second_aliases = {
+            let second = context.go_context(go, &file, source, &tree);
+            assert_eq!(second.package, "consumer");
+            second.aliases.len()
+        };
+        assert_eq!(context.go_contexts.len(), 1);
+        assert_eq!(second_aliases, 1);
+    }
+
+    #[test]
+    fn scala_batch_context_reuses_package_and_import_facts() {
+        let source =
+            "package demo\nimport demo.shared.Widget\nobject Main { val widget = new Widget }\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Scala,
+            &[
+                ("shared.scala", "package demo.shared\nclass Widget\n"),
+                ("main.scala", source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "main.scala");
+        let analyzer = fixture.analyzer.analyzer();
+        let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer).expect("Scala analyzer");
+        let mut context = DefinitionBatchContext::new(analyzer, true);
+
+        let first = context.scala_context(scala, &file);
+        let second = context.scala_context(scala, &file);
+
+        assert_eq!(context.scala_contexts.len(), 1);
+        assert_eq!(first.package.as_ref(), "demo");
+        assert_eq!(first.imports, second.imports);
     }
 
     #[test]

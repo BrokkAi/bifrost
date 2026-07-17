@@ -57,7 +57,7 @@ where
         .global_usage_definition_index()
         .by_fqn(&fqn)
         .iter()
-        .filter(|unit| unit.is_function() && java_callable_arity(ctx.java(), unit) == arity)
+        .filter(|unit| unit.is_function() && java_callable_arity(ctx.java(), unit).accepts(arity))
         .cloned()
         .collect::<Vec<_>>();
     if units.is_empty() {
@@ -233,7 +233,7 @@ fn java_type_name_components(type_node: Node<'_>, source: &str) -> Option<Vec<St
                     .find(|child| is_java_nominal_type_node(child.kind()))?;
                 stack.push(nominal);
             }
-            "scoped_type_identifier" => {
+            "scoped_identifier" | "scoped_type_identifier" => {
                 let mut cursor = node.walk();
                 let nominal_children = node
                     .named_children(&mut cursor)
@@ -255,6 +255,7 @@ fn is_java_nominal_type_node(kind: &str) -> bool {
         kind,
         "identifier"
             | "type_identifier"
+            | "scoped_identifier"
             | "scoped_type_identifier"
             | "generic_type"
             | "array_type"

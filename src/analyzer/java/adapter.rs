@@ -65,7 +65,12 @@ impl LanguageAdapter for JavaAdapter {
         _signature: &str,
         metadata: Option<&SignatureMetadata>,
     ) -> Option<usize> {
-        metadata.map(|metadata| metadata.parameters().len())
+        metadata.map(|metadata| {
+            metadata
+                .callable_arity()
+                .map(|arity| arity.total())
+                .unwrap_or_else(|| metadata.parameters().len())
+        })
     }
 
     fn callable_return_type_text<'a>(&self, signature: &'a str) -> Option<&'a str> {

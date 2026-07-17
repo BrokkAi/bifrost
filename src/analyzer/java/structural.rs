@@ -75,7 +75,11 @@ pub(crate) fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Nod
                     .child_by_field_name("name")
                     .or_else(|| last_named_child(current))?;
             }
-            "generic_type" => current = current.child_by_field_name("type")?,
+            "generic_type" => {
+                current = current
+                    .child_by_field_name("type")
+                    .or_else(|| first_named_child(current))?;
+            }
             "field_access" => current = current.child_by_field_name("field")?,
             "method_invocation" => current = current.child_by_field_name("name")?,
             "object_creation_expression" => current = current.child_by_field_name("type")?,

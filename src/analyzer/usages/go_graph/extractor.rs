@@ -647,9 +647,17 @@ fn scan_direct_identifier(
 /// distinguishes `Owner{Field: value}` from `map[string]T{Field: value}` and
 /// from another struct with a same-named field.
 fn scan_composite_literal_field_label(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
-    let Some(type_node) = direct_composite_literal_type_for_key(node) else {
+    let Some(type_node) = composite_literal_owner_type_for_key(node) else {
         return false;
     };
+    // A keyed element in a map literal is an ordinary key expression, not a
+    // struct-field label. Let the normal identifier/selector scanners resolve
+    // it (for example `map[Feature]Spec{MyFeature: {...}}`). The explicit
+    // composite-literal type is the structured distinction; guessing from the
+    // key spelling would conflate same-named fields and constants.
+    if type_node.kind() == "map_type" {
+        return false;
+    }
     if node_text(node, ctx.source) == ctx.spec.identifier
         && type_ref_from_node(type_node, ctx.source)
             .is_some_and(|ty| ctx.bindings.matches_owner_type(&ty))
@@ -724,7 +732,8 @@ pub(super) fn is_definition_identifier(node: Node<'_>, _source: &str) -> bool {
         return false;
     };
     if keyed_element_for_key(node).is_some() {
-        return true;
+        return composite_literal_owner_type_for_key(node)
+            .is_none_or(|type_node| type_node.kind() != "map_type");
     }
     if parent.kind() == "field_declaration"
         && parent.child_by_field_name("type").is_some_and(|ty| {
@@ -756,19 +765,76 @@ pub(super) fn is_definition_identifier(node: Node<'_>, _source: &str) -> bool {
         .is_some_and(|name| same_node(name, node))
 }
 
-/// Return the type syntax for a key belonging directly to a composite literal.
-/// Keys in nested elided literal values intentionally return `None`: without an
-/// explicit type at that literal boundary, attributing a field would require
-/// additional element-type propagation rather than guessing from source text.
-fn direct_composite_literal_type_for_key(node: Node<'_>) -> Option<Node<'_>> {
+/// Return the structured owner type for a keyed composite-literal element.
+///
+/// An elided value such as `[1]Owner{{Field: value}}` has no type node at the
+/// inner literal boundary. Its type is nevertheless explicit in the enclosing
+/// array/slice element or map value. Walk through only those AST relationships
+/// and peel one container type per elided boundary; do not infer an owner from
+/// the field spelling.
+fn composite_literal_owner_type_for_key(node: Node<'_>) -> Option<Node<'_>> {
     let keyed = keyed_element_for_key(node)?;
-    let literal = keyed
+    let mut literal = keyed
         .parent()
         .filter(|parent| parent.kind() == "literal_value")?;
-    let composite = literal
-        .parent()
-        .filter(|parent| parent.kind() == "composite_literal")?;
-    composite.child_by_field_name("type")
+    let mut elided_depth = 0usize;
+
+    loop {
+        let parent = literal.parent()?;
+        match parent.kind() {
+            "composite_literal" => {
+                let mut owner = parent.child_by_field_name("type")?;
+                for _ in 0..elided_depth {
+                    owner = go_container_element_or_value_type(owner)?;
+                }
+                return Some(owner);
+            }
+            "keyed_element" => {
+                let value = parent.child_by_field_name("value")?;
+                if !same_node(value, literal) {
+                    return None;
+                }
+                literal = parent
+                    .parent()
+                    .filter(|ancestor| ancestor.kind() == "literal_value")?;
+                elided_depth += 1;
+            }
+            "literal_value" => {
+                literal = parent;
+                elided_depth += 1;
+            }
+            "literal_element" => {
+                let container = parent.parent()?;
+                literal = match container.kind() {
+                    "keyed_element" => {
+                        let value = container.child_by_field_name("value")?;
+                        if !same_node(value, parent) {
+                            return None;
+                        }
+                        container
+                            .parent()
+                            .filter(|ancestor| ancestor.kind() == "literal_value")?
+                    }
+                    "literal_value" => container,
+                    _ => return None,
+                };
+                elided_depth += 1;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn go_container_element_or_value_type(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "array_type" => node.child_by_field_name("element"),
+        "slice_type" => node.named_child(0),
+        "map_type" => node.child_by_field_name("value"),
+        "pointer_type" | "parenthesized_type" => node
+            .named_child(0)
+            .and_then(go_container_element_or_value_type),
+        _ => None,
+    }
 }
 
 fn keyed_element_for_key(node: Node<'_>) -> Option<Node<'_>> {

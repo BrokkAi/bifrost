@@ -686,6 +686,9 @@ fn handle_request(
     if req.method == RunRqlQuery::METHOD {
         return handle_run_rql_query_request(connection, state, req);
     }
+    if req.method == SemanticTokensFullRequest::METHOD {
+        return handle_semantic_tokens_request(connection, state, req);
+    }
 
     let id = req.id.clone();
     let id_for_log = format!("{id:?}");
@@ -781,15 +784,6 @@ fn handle_request(
                 ))
             })
         }
-        SemanticTokensFullRequest::METHOD => {
-            decode_and_run::<SemanticTokensFullRequest, _>(req, |params| {
-                Ok(semantic_tokens::handle(
-                    &state.workspace,
-                    state.project(),
-                    &params,
-                ))
-            })
-        }
         DocumentDiagnosticRequest::METHOD => {
             decode_and_run::<DocumentDiagnosticRequest, _>(req, |params| {
                 Ok(diagnostic::handle(
@@ -868,6 +862,137 @@ fn handle_request(
         .map_err(|err| format!("Failed to send LSP response: {err}"))
 }
 
+#[derive(Clone, Copy)]
+struct CancellableWorkerConfig {
+    worker_name: &'static str,
+    progress_title: &'static str,
+    progress_initial_message: &'static str,
+    cancellation_message: &'static str,
+    success_message: &'static str,
+}
+
+fn start_cancellable_worker<T, F>(
+    connection: &Connection,
+    state: &ServerState,
+    id: RequestId,
+    method: String,
+    work_done_token: Option<ProgressToken>,
+    config: CancellableWorkerConfig,
+    run: F,
+) -> Result<(), String>
+where
+    T: serde::Serialize,
+    F: FnOnce(
+            &WorkspaceAnalyzer,
+            &dyn Project,
+            &RequestContext,
+            &CancellationToken,
+        ) -> Result<T, RequestCancelled>
+        + Send
+        + 'static,
+{
+    let Some(slot) = state.request_jobs.try_acquire() else {
+        let response = Response::new_err(
+            id,
+            ErrorCode::ServerCancelled as i32,
+            "too many concurrent cancellable requests".to_string(),
+        );
+        return connection
+            .sender
+            .send(Message::Response(response))
+            .map_err(|err| format!("Failed to send LSP response: {err}"));
+    };
+    let Some(active_request) = state.active_request_ids.try_reserve(id.clone()) else {
+        let response = Response::new_err(
+            id,
+            ErrorCode::InvalidRequest as i32,
+            "request id is already active".to_string(),
+        );
+        return connection
+            .sender
+            .send(Message::Response(response))
+            .map_err(|err| format!("Failed to send LSP response: {err}"));
+    };
+    let cancellation = CancellationToken::default();
+    if !state.request_jobs.reserve(id.clone(), cancellation.clone()) {
+        let response = Response::new_err(
+            id,
+            ErrorCode::InvalidRequest as i32,
+            "request id is already active".to_string(),
+        );
+        return connection
+            .sender
+            .send(Message::Response(response))
+            .map_err(|err| format!("Failed to send LSP response: {err}"));
+    }
+
+    let worker_cancellation = cancellation.clone();
+    let project = Arc::new(state.overlay.snapshot());
+    let workspace = state
+        .workspace
+        .clone_with_project(Arc::clone(&project) as Arc<dyn Project>);
+    let sender = connection.sender.clone();
+    let progress_sender = sender.clone();
+    let worker_id = id.clone();
+    let worker_method = method.clone();
+    let context = RequestContext::new(
+        worker_cancellation.clone(),
+        work_done_token,
+        config.progress_title,
+        config.progress_initial_message,
+        Arc::new(move |message| {
+            progress_sender
+                .send(message)
+                .map_err(|err| format!("Failed to send LSP progress: {err}"))
+        }),
+    );
+    let handle = match thread::Builder::new()
+        .name(config.worker_name.to_string())
+        .spawn(move || {
+            let _query_scope = AnalyzerQueryScope::new(workspace.analyzer());
+            context.begin();
+            let response = finish_cancellable_request(
+                &worker_id,
+                &worker_method,
+                &context,
+                &worker_cancellation,
+                config.cancellation_message,
+                config.success_message,
+                || run(&workspace, project.as_ref(), &context, &worker_cancellation),
+            );
+            if let Some(error) = response.error.as_ref() {
+                eprintln!(
+                    "[bifrost-lsp] request error method={} id={:?} code={} message={}",
+                    worker_method, worker_id, error.code, error.message
+                );
+            }
+            if let Err(err) = sender.send(Message::Response(response)) {
+                eprintln!(
+                    "[bifrost-lsp] failed to send request response method={} id={:?}: {err}",
+                    worker_method, worker_id
+                );
+            }
+            drop(active_request);
+            drop(slot);
+        }) {
+        Ok(handle) => handle,
+        Err(err) => {
+            state.request_jobs.remove(&id);
+            let response = Response::new_err(
+                id,
+                ErrorCode::InternalError as i32,
+                format!("Failed to start cancellable worker: {err}"),
+            );
+            return connection
+                .sender
+                .send(Message::Response(response))
+                .map_err(|send_err| format!("Failed to send LSP response: {send_err}"));
+        }
+    };
+    state.request_jobs.start(&id, handle);
+    Ok(())
+}
+
 fn handle_run_rql_query_request(
     connection: &Connection,
     state: &ServerState,
@@ -916,117 +1041,32 @@ fn handle_run_rql_query_request(
         }
     };
 
-    let Some(slot) = state.request_jobs.try_acquire() else {
-        let response = Response::new_err(
-            id,
-            ErrorCode::ServerCancelled as i32,
-            "too many concurrent cancellable requests".to_string(),
-        );
-        return connection
-            .sender
-            .send(Message::Response(response))
-            .map_err(|err| format!("Failed to send LSP response: {err}"));
-    };
-    let Some(active_request) = state.active_request_ids.try_reserve(id.clone()) else {
-        let response = Response::new_err(
-            id,
-            ErrorCode::InvalidRequest as i32,
-            "request id is already active".to_string(),
-        );
-        return connection
-            .sender
-            .send(Message::Response(response))
-            .map_err(|err| format!("Failed to send LSP response: {err}"));
-    };
-    let cancellation = CancellationToken::default();
-    if !state.request_jobs.reserve(id.clone(), cancellation.clone()) {
-        let response = Response::new_err(
-            id,
-            ErrorCode::InvalidRequest as i32,
-            "request id is already active".to_string(),
-        );
-        return connection
-            .sender
-            .send(Message::Response(response))
-            .map_err(|err| format!("Failed to send LSP response: {err}"));
-    }
-
-    let worker_cancellation = cancellation.clone();
-    let project = Arc::new(state.overlay.snapshot());
-    let workspace = state
-        .workspace
-        .clone_with_project(Arc::clone(&project) as Arc<dyn Project>);
-    let sender = connection.sender.clone();
-    let progress_sender = sender.clone();
-    let worker_id = id.clone();
-    let worker_method = method.clone();
-    let context = RequestContext::new(
-        worker_cancellation.clone(),
+    start_cancellable_worker(
+        connection,
+        state,
+        id,
+        method,
         None,
-        "Running code query",
-        "Traversing references",
-        Arc::new(move |message| {
-            progress_sender
-                .send(message)
-                .map_err(|err| format!("Failed to send LSP progress: {err}"))
-        }),
-    );
-    let handle = match thread::Builder::new()
-        .name("bifrost-lsp-query-code".to_string())
-        .spawn(move || {
-            let _query_scope = AnalyzerQueryScope::new(workspace.analyzer());
-            context.begin();
-            let response = finish_cancellable_request(
-                &worker_id,
-                &worker_method,
-                &context,
-                &worker_cancellation,
-                "query request cancelled by client",
-                "Query ready",
-                || {
-                    let result = execute_with_cancellation(
-                        workspace.analyzer(),
-                        &query,
-                        CodeQueryExecutionLimits::default(),
-                        &worker_cancellation,
-                    );
-                    if worker_cancellation.is_cancelled() {
-                        return Err(RequestCancelled);
-                    }
-                    Ok(run_rql_query_result(&workspace, result))
-                },
+        CancellableWorkerConfig {
+            worker_name: "bifrost-lsp-query-code",
+            progress_title: "Running code query",
+            progress_initial_message: "Traversing references",
+            cancellation_message: "query request cancelled by client",
+            success_message: "Query ready",
+        },
+        move |workspace, _project, _context, cancellation| {
+            let result = execute_with_cancellation(
+                workspace.analyzer(),
+                &query,
+                CodeQueryExecutionLimits::default(),
+                cancellation,
             );
-            if let Some(error) = response.error.as_ref() {
-                eprintln!(
-                    "[bifrost-lsp] request error method={} id={:?} code={} message={}",
-                    worker_method, worker_id, error.code, error.message
-                );
+            if cancellation.is_cancelled() {
+                return Err(RequestCancelled);
             }
-            if let Err(err) = sender.send(Message::Response(response)) {
-                eprintln!(
-                    "[bifrost-lsp] failed to send query response method={} id={:?}: {err}",
-                    worker_method, worker_id
-                );
-            }
-            drop(active_request);
-            drop(slot);
-        }) {
-        Ok(handle) => handle,
-        Err(err) => {
-            state.request_jobs.remove(&id);
-            let response = Response::new_err(
-                id,
-                ErrorCode::InternalError as i32,
-                format!("Failed to start query worker: {err}"),
-            );
-            return connection
-                .sender
-                .send(Message::Response(response))
-                .map_err(|send_err| format!("Failed to send LSP response: {send_err}"));
-        }
-    };
-    state.request_jobs.start(&id, handle);
-    Ok(())
+            Ok(run_rql_query_result(workspace, result))
+        },
+    )
 }
 
 fn run_rql_query_result(
@@ -1057,6 +1097,58 @@ fn run_rql_query_result(
             })
             .collect(),
     }
+}
+
+fn handle_semantic_tokens_request(
+    connection: &Connection,
+    state: &ServerState,
+    req: Request,
+) -> Result<(), String> {
+    let id = req.id.clone();
+    let method = req.method.clone();
+    let params =
+        match req.extract::<lsp_types::SemanticTokensParams>(SemanticTokensFullRequest::METHOD) {
+            Ok((_, params)) => params,
+            Err(ExtractError::JsonError { error, .. }) => {
+                let response = Response::new_err(
+                    id,
+                    ErrorCode::InvalidParams as i32,
+                    format!("Failed to decode params for {method}: {error}"),
+                );
+                return connection
+                    .sender
+                    .send(Message::Response(response))
+                    .map_err(|err| format!("Failed to send LSP response: {err}"));
+            }
+            Err(ExtractError::MethodMismatch(_)) => {
+                let response = Response::new_err(
+                    id,
+                    ErrorCode::MethodNotFound as i32,
+                    format!("Method not implemented: {method}"),
+                );
+                return connection
+                    .sender
+                    .send(Message::Response(response))
+                    .map_err(|err| format!("Failed to send LSP response: {err}"));
+            }
+        };
+    start_cancellable_worker(
+        connection,
+        state,
+        id,
+        method,
+        None,
+        CancellableWorkerConfig {
+            worker_name: "bifrost-lsp-semantic-tokens",
+            progress_title: "Computing semantic tokens",
+            progress_initial_message: "Resolving symbols",
+            cancellation_message: "semantic token request cancelled by client",
+            success_message: "Semantic tokens ready",
+        },
+        move |workspace, project, _context, cancellation| {
+            semantic_tokens::handle(workspace, project, &params, cancellation)
+        },
+    )
 }
 
 fn handle_references_request(
@@ -1092,107 +1184,24 @@ fn handle_references_request(
         }
     };
 
-    let Some(slot) = state.request_jobs.try_acquire() else {
-        let response = Response::new_err(
-            id,
-            ErrorCode::ServerCancelled as i32,
-            "too many concurrent cancellable requests".to_string(),
-        );
-        return connection
-            .sender
-            .send(Message::Response(response))
-            .map_err(|err| format!("Failed to send LSP response: {err}"));
-    };
-    let Some(active_request) = state.active_request_ids.try_reserve(id.clone()) else {
-        let response = Response::new_err(
-            id,
-            ErrorCode::InvalidRequest as i32,
-            "request id is already active".to_string(),
-        );
-        return connection
-            .sender
-            .send(Message::Response(response))
-            .map_err(|err| format!("Failed to send LSP response: {err}"));
-    };
-
-    let cancellation = CancellationToken::default();
-    if !state.request_jobs.reserve(id.clone(), cancellation.clone()) {
-        let response = Response::new_err(
-            id,
-            ErrorCode::InvalidRequest as i32,
-            "request id is already active".to_string(),
-        );
-        return connection
-            .sender
-            .send(Message::Response(response))
-            .map_err(|err| format!("Failed to send LSP response: {err}"));
-    }
-    let worker_cancellation = cancellation.clone();
-    let project = Arc::new(state.overlay.snapshot());
-    let workspace = state
-        .workspace
-        .clone_with_project(Arc::clone(&project) as Arc<dyn Project>);
-    let sender = connection.sender.clone();
-    let progress_sender = sender.clone();
     let work_done_token = params.work_done_progress_params.work_done_token.clone();
-    let worker_id = id.clone();
-    let worker_method = method.clone();
-    let context = RequestContext::new(
-        worker_cancellation.clone(),
+    start_cancellable_worker(
+        connection,
+        state,
+        id,
+        method,
         work_done_token,
-        "Finding references",
-        "Resolving symbol",
-        Arc::new(move |message| {
-            progress_sender
-                .send(message)
-                .map_err(|err| format!("Failed to send LSP progress: {err}"))
-        }),
-    );
-    let handle = match thread::Builder::new()
-        .name("bifrost-lsp-references".to_string())
-        .spawn(move || {
-            let _query_scope = AnalyzerQueryScope::new(workspace.analyzer());
-            context.begin();
-            let response = finish_cancellable_request(
-                &worker_id,
-                &worker_method,
-                &context,
-                &worker_cancellation,
-                "reference request cancelled by client",
-                "References ready",
-                || references::handle(&workspace, project.as_ref(), &params, &context),
-            );
-            if let Some(error) = response.error.as_ref() {
-                eprintln!(
-                    "[bifrost-lsp] request error method={} id={:?} code={} message={}",
-                    worker_method, worker_id, error.code, error.message
-                );
-            }
-            if let Err(err) = sender.send(Message::Response(response)) {
-                eprintln!(
-                    "[bifrost-lsp] failed to send reference response method={} id={:?}: {err}",
-                    worker_method, worker_id
-                );
-            }
-            drop(active_request);
-            drop(slot);
-        }) {
-        Ok(handle) => handle,
-        Err(err) => {
-            state.request_jobs.remove(&id);
-            let response = Response::new_err(
-                id,
-                ErrorCode::InternalError as i32,
-                format!("Failed to start reference worker: {err}"),
-            );
-            return connection
-                .sender
-                .send(Message::Response(response))
-                .map_err(|send_err| format!("Failed to send LSP response: {send_err}"));
-        }
-    };
-    state.request_jobs.start(&id, handle);
-    Ok(())
+        CancellableWorkerConfig {
+            worker_name: "bifrost-lsp-references",
+            progress_title: "Finding references",
+            progress_initial_message: "Resolving symbol",
+            cancellation_message: "reference request cancelled by client",
+            success_message: "References ready",
+        },
+        move |workspace, project, context, _cancellation| {
+            references::handle(workspace, project, &params, context)
+        },
+    )
 }
 
 fn finish_cancellable_request<T: serde::Serialize>(

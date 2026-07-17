@@ -6,14 +6,16 @@ use crate::analyzer::reference_candidates::{
     ReferenceCandidateRanges, semantic_token_candidate_ranges,
 };
 use crate::analyzer::usages::get_definition::{
-    DefinitionLookupRequest, resolve_definition_batch_with_source,
+    DefinitionLookupRequest, resolve_definition_batch_with_source_and_cancellation,
 };
 use crate::analyzer::{
     CodeUnitType, IAnalyzer, Language, Project, Range as ByteRange, WorkspaceAnalyzer,
 };
+use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 use crate::lsp::conversion::byte_offset_to_position;
 use crate::lsp::handlers::util::read_document_for_uri;
+use crate::lsp::request_context::RequestCancelled;
 use lsp_types::{
     SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens, SemanticTokensLegend,
     SemanticTokensParams, SemanticTokensResult,
@@ -47,33 +49,41 @@ pub fn handle(
     workspace: &WorkspaceAnalyzer,
     project: &dyn Project,
     params: &SemanticTokensParams,
-) -> Option<SemanticTokensResult> {
-    Some(SemanticTokensResult::Tokens(build_tokens(
-        workspace, project, params,
-    )))
+    cancellation: &CancellationToken,
+) -> Result<SemanticTokensResult, RequestCancelled> {
+    Ok(SemanticTokensResult::Tokens(build_tokens(
+        workspace,
+        project,
+        params,
+        cancellation,
+    )?))
 }
 
 fn build_tokens(
     workspace: &WorkspaceAnalyzer,
     project: &dyn Project,
     params: &SemanticTokensParams,
-) -> SemanticTokens {
+    cancellation: &CancellationToken,
+) -> Result<SemanticTokens, RequestCancelled> {
+    if cancellation.is_cancelled() {
+        return Err(RequestCancelled);
+    }
     let Some((file, content, line_starts)) =
         read_document_for_uri(project, &params.text_document.uri)
     else {
-        return empty_tokens();
+        return Ok(empty_tokens());
     };
     let language = language_for_file(&file);
     if language == Language::None
         || !source_within_budget(&content)
         || is_unparseable_source(&content)
     {
-        return empty_tokens();
+        return Ok(empty_tokens());
     }
 
     let context = DeclarationNameRangeContext::new(&file, content);
     let Some(root) = context.root_node() else {
-        return empty_tokens();
+        return Ok(empty_tokens());
     };
     let analyzer = workspace.analyzer();
 
@@ -88,11 +98,14 @@ fn build_tokens(
     }
     declarations.sort_unstable();
     declarations.dedup();
+    if cancellation.is_cancelled() {
+        return Err(RequestCancelled);
+    }
 
     let candidate_ranges =
         match semantic_token_candidate_ranges(root, language, MAX_SEMANTIC_TOKEN_CANDIDATES) {
             ReferenceCandidateRanges::Complete(ranges) => ranges,
-            ReferenceCandidateRanges::LimitExceeded { .. } => return empty_tokens(),
+            ReferenceCandidateRanges::LimitExceeded { .. } => return Ok(empty_tokens()),
         };
     let declaration_ranges: HashSet<_> = declarations.iter().map(AbsoluteToken::key).collect();
     let unresolved_ranges: Vec<_> = if reference_resolution_within_budget(analyzer, language) {
@@ -115,7 +128,16 @@ fn build_tokens(
         })
         .collect();
     let source = context.shared_content();
-    let outcomes = resolve_definition_batch_with_source(analyzer, requests, file, source);
+    let outcomes = resolve_definition_batch_with_source_and_cancellation(
+        analyzer,
+        requests,
+        file,
+        source,
+        cancellation,
+    );
+    if cancellation.is_cancelled() {
+        return Err(RequestCancelled);
+    }
 
     let mut references = Vec::new();
     for (range, outcome) in unresolved_ranges.into_iter().zip(outcomes) {
@@ -133,10 +155,10 @@ fn build_tokens(
     declarations.dedup();
     let absolute = discard_overlaps(declarations);
 
-    SemanticTokens {
+    Ok(SemanticTokens {
         result_id: None,
         data: encode_relative_tokens(context.content(), &line_starts, &absolute),
-    }
+    })
 }
 
 fn empty_tokens() -> SemanticTokens {

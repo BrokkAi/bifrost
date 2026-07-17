@@ -212,6 +212,29 @@ fn same_package_files_reference_without_import() {
 }
 
 #[test]
+fn default_package_file_resolves_default_package_type() {
+    let analyzer = analyzer_for(&[
+        ("HashMap.java", "public class HashMap {}"),
+        (
+            "UseMap.java",
+            "public class UseMap { private HashMap map = new HashMap(); }",
+        ),
+    ]);
+
+    let use_map = analyzer
+        .get_definitions("UseMap")
+        .into_iter()
+        .next()
+        .unwrap();
+    let resolved = analyzer
+        .resolve_type_name_in_file(use_map.source(), "HashMap")
+        .expect("default-package type should resolve for default-package consumers");
+
+    assert_eq!("HashMap", resolved.fq_name());
+    assert_eq!(Path::new("HashMap.java"), resolved.source().rel_path());
+}
+
+#[test]
 fn resolves_direct_ancestors() {
     let analyzer = analyzer_for(&[(
         "AllInOne.java",

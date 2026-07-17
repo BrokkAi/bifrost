@@ -3057,6 +3057,252 @@ public class Child extends Base {
 }
 
 #[test]
+fn java_scan_usages_surfaces_find_bare_inherited_fields_without_local_shadows() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "p/Base.java",
+            "package p;\npublic class Base {\n    protected static final int YEAR = 2026;\n}\n",
+        )
+        .file(
+            "p/Child.java",
+            r#"package p;
+public class Child extends Base {
+    int inherited() { return YEAR; } // positive-inherited-read
+    int localShadow() {
+        int YEAR = 1;
+        return YEAR; // negative-local-shadow
+    }
+    int parameterShadow(int YEAR) {
+        return YEAR; // negative-parameter-shadow
+    }
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    for (tool, args) in [
+        (
+            "scan_usages_by_reference",
+            serde_json::json!({"symbols": ["p.Base.YEAR"], "include_tests": true}),
+        ),
+        (
+            "scan_usages_by_location",
+            serde_json::json!({
+                "targets": [{"path": "p/Base.java", "line": 3}],
+                "include_tests": true,
+            }),
+        ),
+    ] {
+        let payload = service
+            .call_tool_json(tool, &args.to_string())
+            .expect("scan succeeds");
+        let value: Value = serde_json::from_str(&payload).expect("valid response");
+        let usage = only_result(&value);
+
+        assert_eq!("found", usage["status"], "{tool}: {value}");
+        assert_eq!(1, usage["total_hits"], "{tool}: {value}");
+        let snippets: Vec<_> = usage["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+            .filter_map(|hit| hit["snippet"].as_str())
+            .collect();
+        assert!(
+            snippets
+                .iter()
+                .any(|snippet| snippet.contains("positive-inherited-read")),
+            "{tool}: {value}"
+        );
+        assert!(
+            snippets
+                .iter()
+                .all(|snippet| !snippet.contains("negative-")),
+            "{tool}: {value}"
+        );
+    }
+}
+
+#[test]
+fn scan_usages_by_reference_finds_bare_inherited_java_methods_without_self_confusion() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "p/Base.java",
+            "package p;\npublic class Base {\n    protected void ping(String left, String right) {}\n}\n",
+        )
+        .file(
+            "p/Child.java",
+            r#"package p;
+public class Child extends Base {
+    void inherited() {
+        ping("left", "right"); // positive-inherited-call
+    }
+}
+"#,
+        )
+        .file(
+            "p/OverrideChild.java",
+            r#"package p;
+public class OverrideChild extends Base {
+    @Override
+    protected void ping(String left, String right) {}
+    void selfCall() {
+        ping("left", "right"); // negative-self-call
+    }
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["p.Base.ping"],"include_tests":true}"#,
+        )
+        .expect("scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let usage = only_result(&value);
+
+    assert_eq!("found", usage["status"], "{value}");
+    assert_eq!(2, usage["total_hits"], "{value}");
+    let hits: Vec<_> = usage["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+        .collect();
+    assert!(
+        hits.iter()
+            .filter_map(|hit| hit["snippet"].as_str())
+            .any(|snippet| snippet.contains("positive-inherited-call")),
+        "{value}"
+    );
+    assert!(
+        hits.iter()
+            .filter_map(|hit| hit["line"].as_u64())
+            .all(|line| line != 6),
+        "{value}"
+    );
+    assert_eq!(1, usage["unproven_hits"], "{value}");
+}
+
+#[test]
+fn scan_usages_java_varargs_calls_stay_narrow() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "p/Target.java",
+            r#"package p;
+public class Target<T> {
+    public void join(String left) {}
+    public void join(String left, String right, String... rest) {}
+    public Target(String left) {}
+    public Target(String left, String right, String... rest) {}
+}
+"#,
+        )
+        .file(
+            "p/Consumer.java",
+            r#"package p;
+public class Consumer {
+    void call(Target target) {
+        target.join("a", "b", "c"); // positive-varargs-expanded-method
+        target.join("a", "b", new String[]{"c"}); // positive-varargs-array-method
+        target.join("a"); // negative-non-varargs-method
+
+        new Target<>("a", "b", "c"); // positive-varargs-expanded-constructor
+        new Target<>("a", "b", new String[]{"c"}); // positive-varargs-array-constructor
+        new Target<>("a"); // negative-non-varargs-constructor
+    }
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let method_payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"p/Target.java","line":4}],"include_tests":true}"#,
+        )
+        .expect("method scan succeeds");
+    let method_value: Value = serde_json::from_str(&method_payload).expect("valid response");
+    let method_usage = only_result(&method_value);
+    assert_eq!("found", method_usage["status"], "{method_value}");
+    assert_eq!(2, method_usage["total_hits"], "{method_value}");
+    let method_hits: Vec<_> = method_usage["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+        .collect();
+    assert!(
+        method_hits
+            .iter()
+            .filter_map(|hit| hit["snippet"].as_str())
+            .any(|snippet| snippet.contains("positive-varargs-expanded-method")),
+        "{method_value}"
+    );
+    assert!(
+        method_hits
+            .iter()
+            .filter_map(|hit| hit["snippet"].as_str())
+            .any(|snippet| snippet.contains("positive-varargs-array-method")),
+        "{method_value}"
+    );
+    assert!(
+        method_hits
+            .iter()
+            .filter_map(|hit| hit["line"].as_u64())
+            .all(|line| line != 7),
+        "{method_value}"
+    );
+
+    let constructor_payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"p/Target.java","line":6}],"include_tests":true}"#,
+        )
+        .expect("constructor scan succeeds");
+    let constructor_value: Value =
+        serde_json::from_str(&constructor_payload).expect("valid response");
+    let constructor_usage = only_result(&constructor_value);
+    assert_eq!("found", constructor_usage["status"], "{constructor_value}");
+    assert_eq!(2, constructor_usage["total_hits"], "{constructor_value}");
+    let constructor_hits: Vec<_> = constructor_usage["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+        .collect();
+    assert!(
+        constructor_hits
+            .iter()
+            .filter_map(|hit| hit["snippet"].as_str())
+            .any(|snippet| snippet.contains("positive-varargs-expanded-constructor")),
+        "{constructor_value}"
+    );
+    assert!(
+        constructor_hits
+            .iter()
+            .filter_map(|hit| hit["snippet"].as_str())
+            .any(|snippet| snippet.contains("positive-varargs-array-constructor")),
+        "{constructor_value}"
+    );
+    assert!(
+        constructor_hits
+            .iter()
+            .filter_map(|hit| hit["line"].as_u64())
+            .all(|line| line != 11),
+        "{constructor_value}"
+    );
+}
+
+#[test]
 fn scan_usages_distinguishes_resolved_zero_from_unresolved_symbol() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
