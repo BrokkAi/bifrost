@@ -8630,6 +8630,134 @@ func Helper() {}
 }
 
 #[test]
+fn go_keyed_composite_labels_resolve_from_exact_struct_owner() {
+    let source = r#"
+package main
+
+import "example.com/app/model"
+
+type Local struct {
+    LocalField string
+}
+
+type MissingFieldOwner struct {
+    Other string
+}
+
+type Distractor struct {
+    Shared string
+}
+
+type KeyCollision struct {
+    LocalMapKey string
+}
+
+const LocalMapKey = "local"
+
+var localValue = Local{LocalField: "local"}
+var importedValue = model.Imported{ImportedOnly: "imported"}
+var sliceValues = []Local{{LocalField: "slice"}}
+var arrayValues = [1]model.Imported{{ImportedOnly: "array"}}
+var nestedArrays = [1][1]model.Imported{{{ImportedOnly: "nested-array"}}}
+var mapValues = map[string]model.Imported{"value": {ImportedOnly: "map"}}
+var invalidOwner = MissingFieldOwner{Shared: "must not guess Distractor.Shared"}
+var keyedMap = map[string]int{LocalMapKey: 1}
+"#;
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n")
+        .file("main.go", source)
+        .file(
+            "model/model.go",
+            r#"
+package model
+
+type Imported struct {
+    ImportedOnly string
+}
+"#,
+        )
+        .build();
+
+    for (marker, focus, expected_fqn, expected_path) in [
+        (
+            "Local{LocalField: \"local\"}",
+            "LocalField",
+            "example.com/app.Local.LocalField",
+            "main.go",
+        ),
+        (
+            "model.Imported{ImportedOnly: \"imported\"}",
+            "ImportedOnly",
+            "example.com/app/model.Imported.ImportedOnly",
+            "model/model.go",
+        ),
+        (
+            "[]Local{{LocalField: \"slice\"}}",
+            "LocalField",
+            "example.com/app.Local.LocalField",
+            "main.go",
+        ),
+        (
+            "[1]model.Imported{{ImportedOnly: \"array\"}}",
+            "ImportedOnly",
+            "example.com/app/model.Imported.ImportedOnly",
+            "model/model.go",
+        ),
+        (
+            "[1][1]model.Imported{{{ImportedOnly: \"nested-array\"}}}",
+            "ImportedOnly",
+            "example.com/app/model.Imported.ImportedOnly",
+            "model/model.go",
+        ),
+        (
+            "{\"value\": {ImportedOnly: \"map\"}}",
+            "ImportedOnly",
+            "example.com/app/model.Imported.ImportedOnly",
+            "model/model.go",
+        ),
+    ] {
+        let marker_start = source.find(marker).expect("composite marker");
+        let focus_start = marker_start + marker.find(focus).expect("focus in marker");
+        let value = lookup(
+            project.root(),
+            &location_reference("main.go", source, focus_start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{marker}: {value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], expected_fqn,
+            "{marker}: {value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["path"], expected_path,
+            "{marker}: {value}"
+        );
+    }
+
+    let invalid_marker = "MissingFieldOwner{Shared:";
+    let invalid_start = source.find(invalid_marker).expect("invalid owner marker")
+        + invalid_marker.find("Shared").expect("invalid owner focus");
+    let value = lookup(
+        project.root(),
+        &location_reference("main.go", source, invalid_start),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+
+    let map_marker = "map[string]int{LocalMapKey:";
+    let map_start = source.find(map_marker).expect("map-key marker")
+        + map_marker.find("LocalMapKey").expect("map-key focus");
+    let value = lookup(
+        project.root(),
+        &location_reference("main.go", source, map_start),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "example.com/app._module_.LocalMapKey",
+        "{value}"
+    );
+}
+
+#[test]
 fn go_import_selector_resolves_package_var_definition() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n")

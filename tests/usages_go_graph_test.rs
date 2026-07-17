@@ -279,6 +279,114 @@ func run() {
 }
 
 #[test]
+fn go_graph_strategy_resolves_root_and_nested_go_modules_without_crossing_siblings() {
+    let (project, analyzer) = go_analyzer_with_files(&[
+        ("go.mod", "module example.com/root\n\ngo 1.22\n"),
+        (
+            "pb/message.go",
+            r#"
+package pb
+
+type Message struct{}
+
+func (Message) Render() {}
+"#,
+        ),
+        ("nested/go.mod", "module example.com/nested/v2\n\ngo 1.22\n"),
+        (
+            "nested/pb/message.go",
+            r#"
+package pb
+
+type Message struct{}
+
+func (Message) Render() {}
+"#,
+        ),
+        (
+            "root_use.go",
+            r#"
+package root
+
+import wire "example.com/nested/v2/pb"
+
+func rootUse(value wire.Message) {
+    value.Render()
+}
+"#,
+        ),
+        (
+            "nested/client/use.go",
+            r#"
+package client
+
+import inner "example.com/nested/v2/pb"
+
+func nestedUse(value inner.Message) {
+    value.Render()
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = GoUsageGraphStrategy::new();
+    let expected_usage_files = BTreeSet::from([
+        project.file("root_use.go"),
+        project.file("nested/client/use.go"),
+    ]);
+
+    for (fq_name, expected_files) in [
+        (
+            "example.com/nested/v2/pb.Message",
+            BTreeSet::from([
+                project.file("root_use.go"),
+                project.file("nested/client/use.go"),
+                project.file("nested/pb/message.go"),
+            ]),
+        ),
+        (
+            "example.com/nested/v2/pb.Message.Render",
+            expected_usage_files.clone(),
+        ),
+    ] {
+        let target = definition(&analyzer, fq_name);
+        let hits = strategy
+            .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+            .into_either()
+            .unwrap_or_else(|err| panic!("nested-module target {fq_name} should resolve: {err}"));
+        assert_eq!(
+            expected_files,
+            hits.iter()
+                .map(|hit| hit.file.clone())
+                .collect::<BTreeSet<_>>(),
+            "qualified types and their receiver members should follow the aliased nested-module import: {hits:#?}"
+        );
+    }
+
+    for (fq_name, expected_files) in [
+        (
+            "example.com/root/pb.Message",
+            BTreeSet::from([project.file("pb/message.go")]),
+        ),
+        ("example.com/root/pb.Message.Render", BTreeSet::new()),
+    ] {
+        let target = definition(&analyzer, fq_name);
+        let hits = strategy
+            .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+            .into_either()
+            .unwrap_or_else(|err| panic!("root-module sibling query should succeed: {err}"));
+        assert_eq!(
+            expected_files,
+            hits.iter()
+                .map(|hit| hit.file.clone())
+                .collect::<BTreeSet<_>>(),
+            "same-named root-module siblings must not capture nested-module usages: {hits:#?}"
+        );
+    }
+}
+
+#[test]
 fn go_graph_strategy_uses_resolved_package_clause_for_unaliased_imports() {
     let (_project, analyzer) = go_analyzer_with_files(&[
         (
@@ -415,6 +523,8 @@ type Wanted struct {
 type Other struct {
     Field string
 }
+
+const BareMapKey = "Field"
 "#,
         ),
         (
@@ -438,6 +548,7 @@ func build() {
     _ = Other{Field: "wrong owner"}
     Field := "local"
     _ = map[string]string{Field: "map key"}
+    _ = map[string]string{BareMapKey: "bare map expression"}
     _ = map[string]string{keys.MapKey: "map expression"}
     _ = Field
 }
@@ -464,6 +575,74 @@ func build() {
         .into_either()
         .expect("a qualified map-key expression remains an ordinary reference");
     assert_eq!(1, map_key_hits.len(), "map-key hits: {map_key_hits:?}");
+
+    let bare_map_key = definition(&analyzer, "example.com/app._module_.BareMapKey");
+    let bare_map_key_hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, &[bare_map_key], &candidates, 1000)
+        .into_either()
+        .expect("a bare map-key expression remains an ordinary reference");
+    assert_eq!(
+        1,
+        bare_map_key_hits.len(),
+        "bare map-key hits: {bare_map_key_hits:?}"
+    );
+}
+
+#[test]
+fn go_graph_strategy_propagates_owner_through_elided_composite_values() {
+    let (project, analyzer) = go_analyzer_with_files(&[
+        (
+            "model/model.go",
+            r#"
+package model
+
+type Wanted struct {
+    Field string
+}
+"#,
+        ),
+        (
+            "other/other.go",
+            r#"
+package other
+
+type Other struct {
+    Field string
+}
+"#,
+        ),
+        (
+            "consumer.go",
+            r#"
+package main
+
+import (
+    "example.com/app/model"
+    "example.com/app/other"
+)
+
+var keyedArray = [1]model.Wanted{0: {Field: "array-keyed"}}
+var positionalArray = [1]model.Wanted{{Field: "array-positional"}}
+var sliceValues = []model.Wanted{{Field: "slice"}}
+var mapValues = map[string]model.Wanted{"key": {Field: "map-value"}}
+var nestedArrays = [1][1]model.Wanted{{{Field: "nested-array"}}}
+var wrongOwner = []other.Other{{Field: "wrong"}}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "example.com/app/model.Wanted.Field");
+    let candidates = [project.file("consumer.go")].into_iter().collect();
+    let hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("elided composite values should retain their container element/value owner");
+
+    assert_eq!(5, hits.len(), "elided field-label hits: {hits:?}");
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("consumer.go"))
+    );
 }
 
 #[test]

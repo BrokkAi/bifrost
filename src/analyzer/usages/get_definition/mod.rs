@@ -727,6 +727,7 @@ fn resolve_one(
                     &go::AnalyzerGoDefinitionProvider::new(go_analyzer),
                     &request.file,
                     &source,
+                    tree.as_ref(),
                     &site,
                     resolution,
                 )

@@ -98,6 +98,7 @@ pub(super) fn resolve_go(
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
+    tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
     resolution: Option<GoReferenceResolution>,
 ) -> DefinitionLookupOutcome {
@@ -105,6 +106,11 @@ pub(super) fn resolve_go(
         return no_definition("go_analyzer_unavailable", "Go analyzer is unavailable");
     };
     let reference = site.text.as_str();
+    if let Some(outcome) = tree.and_then(|tree| {
+        go_keyed_composite_label_outcome(analyzer, support, file, source, tree.root_node(), site)
+    }) {
+        return outcome;
+    }
     if let Some(resolution) = resolution {
         let candidates = go_fqn_candidates(support, resolution.fqn_candidates);
         if !candidates.is_empty() {
@@ -205,6 +211,151 @@ pub(super) fn resolve_go(
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed Go definition"),
     )
+}
+
+/// Resolve a keyed struct-composite label from the literal's structured owner.
+///
+/// The same `keyed_element` node represents struct labels, map keys, and
+/// array/slice indexes in Go. A direct map/array/slice key remains an ordinary
+/// expression; only a named literal owner, or a named element/value reached
+/// through an elided literal boundary, owns a struct-field label.
+fn go_keyed_composite_label_outcome(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn GoDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    site: &ResolvedReferenceSite,
+) -> Option<DefinitionLookupOutcome> {
+    let selected = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
+    let keyed = go_keyed_element_containing_key(selected)?;
+    let key = keyed.child_by_field_name("key")?;
+    let label_node = go_simple_composite_key_identifier(key, selected)?;
+
+    let owner_type = go_composite_label_owner_type(keyed)?;
+    if matches!(owner_type.kind(), "map_type" | "array_type" | "slice_type") {
+        return None;
+    }
+
+    let label = go_node_text(label_node, source);
+    let Some(owner_fqn) = go_resolve_type_fqn(analyzer, support, file, source, owner_type) else {
+        return Some(no_definition(
+            "go_literal_owner_unresolved",
+            format!(
+                "could not resolve the exact Go composite-literal owner for field label `{label}`"
+            ),
+        ));
+    };
+    let candidates: Vec<_> = support
+        .fqn(&format!("{owner_fqn}.{label}"))
+        .into_iter()
+        .filter(CodeUnit::is_field)
+        .collect();
+    if candidates.is_empty() {
+        return Some(no_definition(
+            "no_indexed_definition",
+            format!("`{label}` is not a direct field of Go literal owner `{owner_fqn}`"),
+        ));
+    }
+    Some(candidates_outcome(candidates))
+}
+
+fn go_keyed_element_containing_key(mut node: Node<'_>) -> Option<Node<'_>> {
+    let selected_start = node.start_byte();
+    let selected_end = node.end_byte();
+    loop {
+        if node.kind() == "keyed_element" {
+            let key = node.child_by_field_name("key")?;
+            return (key.start_byte() <= selected_start && selected_end <= key.end_byte())
+                .then_some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+fn go_simple_composite_key_identifier<'tree>(
+    key: Node<'tree>,
+    selected: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let identifier = if matches!(key.kind(), "identifier" | "field_identifier") {
+        key
+    } else if key.kind() == "literal_element" {
+        let mut cursor = key.walk();
+        let mut children = key.named_children(&mut cursor);
+        let child = children.next()?;
+        if children.next().is_some() || !matches!(child.kind(), "identifier" | "field_identifier") {
+            return None;
+        }
+        child
+    } else {
+        return None;
+    };
+    (identifier.start_byte() <= selected.start_byte()
+        && selected.end_byte() <= identifier.end_byte())
+    .then_some(identifier)
+}
+
+fn go_composite_label_owner_type(keyed: Node<'_>) -> Option<Node<'_>> {
+    let mut literal = keyed
+        .parent()
+        .filter(|parent| parent.kind() == "literal_value")?;
+    let mut elided_depth = 0usize;
+    loop {
+        let parent = literal.parent()?;
+        match parent.kind() {
+            "composite_literal" => {
+                let mut owner = parent.child_by_field_name("type")?;
+                for _ in 0..elided_depth {
+                    owner = go_composite_container_element_or_value_type(owner)?;
+                }
+                return Some(owner);
+            }
+            "keyed_element" => {
+                let value = parent.child_by_field_name("value")?;
+                if value.id() != literal.id() {
+                    return None;
+                }
+                literal = parent
+                    .parent()
+                    .filter(|ancestor| ancestor.kind() == "literal_value")?;
+                elided_depth += 1;
+            }
+            "literal_value" => {
+                literal = parent;
+                elided_depth += 1;
+            }
+            "literal_element" => {
+                let container = parent.parent()?;
+                literal = match container.kind() {
+                    "keyed_element" => {
+                        let value = container.child_by_field_name("value")?;
+                        if value.id() != parent.id() {
+                            return None;
+                        }
+                        container
+                            .parent()
+                            .filter(|ancestor| ancestor.kind() == "literal_value")?
+                    }
+                    "literal_value" => container,
+                    _ => return None,
+                };
+                elided_depth += 1;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn go_composite_container_element_or_value_type(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "array_type" => node.child_by_field_name("element"),
+        "slice_type" => node.named_child(0),
+        "map_type" => node.child_by_field_name("value"),
+        "pointer_type" | "parenthesized_type" => node
+            .named_child(0)
+            .and_then(go_composite_container_element_or_value_type),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
