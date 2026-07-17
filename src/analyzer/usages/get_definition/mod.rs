@@ -1161,7 +1161,7 @@ mod tests {
         let second = context.scala_context(scala, &file);
 
         assert_eq!(context.scala_contexts.len(), 1);
-        assert_eq!(first.package, "demo");
+        assert_eq!(first.package.as_ref(), "demo");
         assert_eq!(first.imports, second.imports);
     }
 

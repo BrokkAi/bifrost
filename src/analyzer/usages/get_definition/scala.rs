@@ -122,7 +122,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
         };
         let mut matching_explicit_import = false;
         let mut explicit_candidates = Vec::new();
-        for import in &self.imports {
+        for import in self.imports.iter() {
             let Some(path) = scala_import_path(import) else {
                 continue;
             };
@@ -151,7 +151,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
         }
 
         let mut wildcard_candidates = Vec::new();
-        for import in &self.imports {
+        for import in self.imports.iter() {
             let Some(path) = scala_import_path(import) else {
                 continue;
             };
@@ -174,7 +174,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
         }
         if !self.package.is_empty() {
             local_candidates.extend(scala_nested_type_candidates(
-                self.package.clone(),
+                self.package.to_string(),
                 segments,
                 false,
             ));
@@ -254,7 +254,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
 
     fn visible_extension_methods(&self, member: &str) -> Vec<ForwardScalaExtensionMethod> {
         let mut units = Vec::new();
-        for import in &self.imports {
+        for import in self.imports.iter() {
             let Some(path) = scala_import_path(import) else {
                 continue;
             };

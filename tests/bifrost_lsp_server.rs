@@ -454,6 +454,68 @@ fn bifrost_lsp_server_semantic_tokens_bound_large_go_workspace_references() {
 }
 
 #[test]
+fn bifrost_lsp_server_semantic_tokens_cancel_without_blocking_rune_ir() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let token_path = root.join("slow.rs");
+    let rune_path = root.join("rune.rs");
+    let mut source = String::from("struct Thing;\nimpl Thing { fn run(&self) {} }\n");
+    for index in 0..1_500 {
+        source.push_str(&format!(
+            "fn call_{index}(thing: Thing) {{ thing.run(); let _copy = thing; }}\n"
+        ));
+    }
+    fs::write(&token_path, &source).expect("write semantic-token fixture");
+    fs::write(&rune_path, "fn rune_target() {}\n").expect("write Rune IR fixture");
+    let token_uri = uri_for(&token_path);
+    let rune_uri = uri_for(&rune_path);
+    let mut server =
+        LspServer::start_with_params(&root, semantic_token_initialize_params(uri_for(&root)));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "textDocument/semanticTokens/full",
+        "params": {"textDocument": {"uri": token_uri}}
+    }));
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 11,
+        "method": "bifrost/runeIr",
+        "params": {
+            "textDocument": {"uri": rune_uri},
+            "position": {"line": 0, "character": 4}
+        }
+    }));
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "$/cancelRequest",
+        "params": {"id": 10}
+    }));
+
+    let rune_response = server.read_message();
+    assert_eq!(
+        rune_response["id"], 11,
+        "semantic tokens blocked Rune IR: {rune_response}"
+    );
+    assert!(
+        rune_response["result"]["runeIr"].is_string(),
+        "{rune_response}"
+    );
+
+    let token_response = server.read_response_for_id(10);
+    assert_eq!(token_response["error"]["code"], -32800, "{token_response}");
+    assert!(
+        token_response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cancelled")),
+        "{token_response}"
+    );
+
+    server.shutdown_with_id(12);
+}
+
+#[test]
 fn bifrost_lsp_server_malformed_initialize_returns_error_response() {
     let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

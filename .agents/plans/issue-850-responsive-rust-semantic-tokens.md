@@ -11,7 +11,7 @@ VS Code asks the Bifrost language server for semantic tokens to colour declarati
 - [x] (2026-07-17 00:00Z) Fetched `origin`, inspected issue #850, current branch state, and the semantic-token, Rust resolution, query-cache, and LSP worker code paths.
 - [x] (2026-07-17 00:00Z) Extend the analyzer query cache so one active query computes the complete live analyzed-file list at most once.
 - [x] (2026-07-17 00:00Z) Share `RustTypeLookupCache` through a complete definition lookup batch and add a regression test for repeated nested Rust field resolution.
-- [ ] Run semantic tokens in the cancellable LSP worker path (completed: worker and cancellation plumbing; remaining: behavioural coverage for concurrent Rune IR/cancellation and full validation).
+- [x] (2026-07-17 00:00Z) Run semantic tokens in the cancellable LSP worker path, share the request lifecycle with RQL and references, and add an integration test proving Rune IR responds before a cancelled semantic-token request.
 - [x] (2026-07-17 00:00Z) Extend batch-local lookup state to the other high-frequency targets: JS/TS shares imports, path aliases, and receiver syntax facts; Go shares package and import namespaces by reference; Scala shares package and import facts. Added focused regression coverage for each target.
 
 ## Surprises & Discoveries
@@ -44,7 +44,7 @@ VS Code asks the Bifrost language server for semantic tokens to colour declarati
 
 ## Outcomes & Retrospective
 
-The request-local live-file cache, batch-local Rust declaration cache, and cancellable semantic-token worker are implemented. The same batch boundary now avoids repeated JS/TS, Go, and Scala resolver setup for a document. Focused featureless compile and regression coverage pass; all-features lint/test validation remains blocked by the local Rust metadata mismatch and the separately recorded Python linker limitation. The expected outcome is that semantic token correctness is unchanged while repeated workspace validation and language-specific resolver setup are eliminated within a request and other LSP requests remain responsive.
+The request-local live-file cache, batch-local Rust declaration cache, and cancellable semantic-token worker are implemented. The same batch boundary now avoids repeated JS/TS, Go, and Scala resolver setup for a document. A real-LSP regression proves Rune IR is serviced before the cancelled semantic-token response, and all three cancellable worker types now share their lifecycle implementation. Focused featureless compile and regression coverage pass; all-features lint/test validation remains blocked by the local Rust metadata mismatch and the separately recorded Python linker limitation. The expected outcome is that semantic token correctness is unchanged while repeated workspace validation and language-specific resolver setup are eliminated within a request and other LSP requests remain responsive.
 
 ## Context and Orientation
 
