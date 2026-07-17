@@ -1,0 +1,43 @@
+{
+  "binding": {
+    "type": "return_value"
+  },
+  "categories": [
+    "input.user-controlled",
+    "io.external"
+  ],
+  "description": "A value supplied by an external HTTP request.",
+  "display_name": "User-controlled I/O",
+  "id": "bifrost.sources.http-request-parameter",
+  "name": "HTTP request parameter",
+  "role": "source",
+  "schema_version": 1,
+  "selector": {
+    "query": {
+      "languages": [
+        "python"
+      ],
+      "match": {
+        "callee": {
+          "name": "request_parameter"
+        },
+        "kind": "call"
+      },
+      "schema_version": 2
+    },
+    "schema_version": 2,
+    "type": "inline"
+  },
+  "supersedes": [],
+  "taint": {
+    "evidence": {
+      "system_entry": "vulnerable_system_network_stack",
+      "trust_boundary": "external"
+    },
+    "labels": [
+      "attacker-controlled"
+    ],
+    "type": "source"
+  },
+  "type": "endpoint"
+}

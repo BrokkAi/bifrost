@@ -19,6 +19,7 @@ pub(crate) mod lexical_definitions;
 mod model;
 mod multi_analyzer;
 mod php;
+pub mod policy;
 mod pool_memo;
 mod project;
 mod python;

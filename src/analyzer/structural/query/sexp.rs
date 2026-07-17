@@ -1,7 +1,8 @@
 use super::ir::{CodeQuery, CodeQueryResultDetail};
-use super::schema::{RqlForm, RqlFormClass, RqlProperty};
+use super::schema::{RqlForm, RqlFormClass, RqlProperty, resolve_rql_schema_version};
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{NormalizedKind, Role, RoleValueShape};
+use crate::schema_version::SchemaVersionResolution;
 #[cfg(test)]
 use crate::sexp::MAX_SEXP_DEPTH;
 use crate::sexp::{Expr, ExprKind, ParseError, ParsedSexp, parse_sexp};
@@ -14,8 +15,9 @@ const MAX_SEXP_INPUT_BYTES: usize = 64 * 1024;
 impl CodeQuery {
     pub fn from_sexp(input: &str) -> Result<Self, String> {
         let expr = parse_query_expr(input)?;
-        code_query_from_expr(&expr, super::SCHEMA_VERSION as u32)
-            .map_err(QueryExprError::into_rql_message)
+        let version = resolve_rql_schema_version(None)
+            .expect("the RQL registry always resolves an omitted schema version");
+        code_query_from_expr(&expr, version).map_err(QueryExprError::into_rql_message)
     }
 }
 
@@ -147,13 +149,13 @@ pub(crate) fn query_expr_to_json(expr: &Expr) -> Result<Value, QueryExprError> {
 /// policy selectors therefore do not need a source-text reconstruction step.
 pub(crate) fn code_query_from_expr(
     expr: &Expr,
-    schema_version: u32,
+    schema: SchemaVersionResolution,
 ) -> Result<CodeQuery, QueryExprError> {
     let mut value = query_expr_to_json(expr)?;
     let object = value
         .as_object_mut()
         .expect("RQL lowering always produces a query object");
-    object.insert("schema_version".to_string(), json!(schema_version));
+    object.insert("schema_version".to_string(), json!(schema.version));
     CodeQuery::from_json(&value).map_err(|error| {
         let range = super::source::query_expr_range_for_path(expr, &error.path);
         QueryExprError {
@@ -163,6 +165,43 @@ pub(crate) fn code_query_from_expr(
             kind: QueryExprErrorKind::Semantic,
         }
     })
+}
+
+/// Reject query output controls that an embedding must own itself.
+///
+/// Policy evaluation fixes its result detail and finding budget independently
+/// of authored selectors. Keeping this check beside the RQL form registry
+/// prevents the policy frontend from growing a second list of query keywords.
+pub(crate) fn validate_policy_selector_expr(expr: &Expr) -> Result<(), QueryExprError> {
+    let mut stack = vec![expr];
+    while let Some(current) = stack.pop() {
+        let items = match &current.kind {
+            ExprKind::List(items) | ExprKind::Vector(items) => items,
+            ExprKind::String(_) | ExprKind::Symbol(_) | ExprKind::Number(_) => continue,
+        };
+        if matches!(&current.kind, ExprKind::List(_))
+            && let Some(head) = items.first()
+            && let Some(label) = head.as_symbol()
+            && let Some(form @ (RqlForm::Limit | RqlForm::ResultDetail)) =
+                RqlForm::from_label(label)
+        {
+            let (path, authored_label) = match form {
+                RqlForm::Limit => ("limit", "limit"),
+                RqlForm::ResultDetail => ("result_detail", "result-detail"),
+                _ => unreachable!("output-control forms were filtered above"),
+            };
+            return Err(QueryExprError {
+                path: path.to_string(),
+                range: head.range.clone(),
+                message: format!(
+                    "policy selectors cannot author `{authored_label}`; policy evaluation owns query output controls"
+                ),
+                kind: QueryExprErrorKind::Semantic,
+            });
+        }
+        stack.extend(items.iter().rev());
+    }
+    Ok(())
 }
 
 pub(super) fn query_to_json(expr: &Expr) -> LowerResult<Value> {
@@ -942,6 +981,28 @@ mod tests {
         CodeQuery::from_json(&value).unwrap().to_canonical_json()
     }
 
+    fn rql_schema_resolution() -> SchemaVersionResolution {
+        resolve_rql_schema_version(None).unwrap()
+    }
+
+    #[test]
+    fn policy_selector_validation_rejects_output_controls_at_their_head() {
+        for (source, expected) in [
+            ("(limit 10 (call))", "limit"),
+            (
+                "(union (call) (result-detail full (call)))",
+                "result-detail",
+            ),
+        ] {
+            let expr = parse_query_expr(source).unwrap();
+            let error = validate_policy_selector_expr(&expr).unwrap_err();
+            assert_eq!(&source[error.range], expected);
+        }
+
+        let expr = parse_query_expr(r#"(call :callee (name "limit"))"#).unwrap();
+        validate_policy_selector_expr(&expr).unwrap();
+    }
+
     #[test]
     fn parsed_subtree_lowers_without_source_reconstruction() {
         let source = r#"(policy :selector (call :callee (name "eval")))"#;
@@ -952,7 +1013,7 @@ mod tests {
             .and_then(|items| items.last())
             .expect("selector subtree");
 
-        let query = code_query_from_expr(selector, super::super::SCHEMA_VERSION as u32).unwrap();
+        let query = code_query_from_expr(selector, rql_schema_resolution()).unwrap();
 
         assert_eq!(
             query.to_canonical_json(),
@@ -976,11 +1037,48 @@ mod tests {
             .and_then(|items| items.last())
             .expect("selector subtree");
 
-        let error = code_query_from_expr(selector, super::super::SCHEMA_VERSION as u32)
+        let error = code_query_from_expr(selector, rql_schema_resolution())
             .expect_err("zero limit must fail");
 
         assert_eq!(error.path, "limit");
         assert_eq!(&source[error.range], "0");
+    }
+
+    #[test]
+    fn nested_set_semantic_error_retains_canonical_path_and_absolute_leaf_range() {
+        let invalid_name = "x".repeat(super::super::MAX_STRING_PREDICATE_LENGTH + 1);
+        let source = format!(
+            r#"(policy :selector (union (call) (intersect (call) (call :name "{invalid_name}"))))"#
+        );
+        let parsed = parse_sexp(&source).unwrap();
+        let document = parsed.expr.unwrap();
+        let selector = document
+            .as_list()
+            .and_then(|items| items.last())
+            .expect("selector subtree");
+
+        let error = code_query_from_expr(selector, rql_schema_resolution())
+            .expect_err("oversized nested name must fail");
+
+        assert_eq!(error.path, "union[1].intersect[1].match.name");
+        assert_eq!(&source[error.range], format!(r#""{invalid_name}""#));
+    }
+
+    #[test]
+    fn nested_wrapper_semantic_error_retains_canonical_path_and_absolute_leaf_range() {
+        let source = r#"(policy :selector (union (call) (intersect (where "[" (call)) (call))))"#;
+        let parsed = parse_sexp(source).unwrap();
+        let document = parsed.expr.unwrap();
+        let selector = document
+            .as_list()
+            .and_then(|items| items.last())
+            .expect("selector subtree");
+
+        let error = code_query_from_expr(selector, rql_schema_resolution())
+            .expect_err("invalid nested glob must fail");
+
+        assert_eq!(error.path, "union[1].intersect[0].where[0]");
+        assert_eq!(&source[error.range], r#""[""#);
     }
 
     #[test]
@@ -993,7 +1091,7 @@ mod tests {
             .and_then(|items| items.last())
             .expect("selector subtree");
 
-        let error = code_query_from_expr(selector, super::super::SCHEMA_VERSION as u32)
+        let error = code_query_from_expr(selector, rql_schema_resolution())
             .expect_err("unknown field must fail");
 
         assert_eq!(error.path, "match");
@@ -1010,7 +1108,7 @@ mod tests {
             .and_then(|items| items.last())
             .expect("selector subtree");
 
-        let error = code_query_from_expr(selector, super::super::SCHEMA_VERSION as u32)
+        let error = code_query_from_expr(selector, rql_schema_resolution())
             .expect_err("missing property value must fail");
 
         assert_eq!(error.path, "match");
@@ -1030,7 +1128,7 @@ mod tests {
                 .and_then(|items| items.last())
                 .expect("selector subtree");
 
-            let error = code_query_from_expr(selector, super::super::SCHEMA_VERSION as u32)
+            let error = code_query_from_expr(selector, rql_schema_resolution())
                 .expect_err("first malformed branch must fail");
 
             assert!(error.message.contains("requires a value"), "{error}");
@@ -1048,7 +1146,7 @@ mod tests {
             .and_then(|items| items.last())
             .expect("selector subtree");
 
-        let error = code_query_from_expr(selector, super::super::SCHEMA_VERSION as u32)
+        let error = code_query_from_expr(selector, rql_schema_resolution())
             .expect_err("unknown field must fail during lowering");
 
         assert!(error.message.contains("unknown pattern field"), "{error}");

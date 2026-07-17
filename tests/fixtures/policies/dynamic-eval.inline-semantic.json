@@ -1,0 +1,45 @@
+{
+  "analysis": {
+    "selector": {
+      "query": {
+        "languages": [
+          "python"
+        ],
+        "match": {
+          "callee": {
+            "name": "eval"
+          },
+          "kind": "call"
+        },
+        "schema_version": 2
+      },
+      "schema_version": 2
+    },
+    "type": "match"
+  },
+  "description": "Reject calls that execute source text as Python code.",
+  "id": "bifrost.security.dynamic-eval",
+  "message": {
+    "text": "Dynamic evaluation is forbidden",
+    "type": "static"
+  },
+  "name": "No dynamic evaluation",
+  "report": {
+    "origins_per_finding": 8,
+    "witness": {
+      "max_bytes": 16384,
+      "max_steps": 64
+    },
+    "witnesses_per_finding": 8
+  },
+  "schema_version": 1,
+  "severity": {
+    "level": "warning",
+    "type": "fixed"
+  },
+  "tags": [
+    "code-execution",
+    "security"
+  ],
+  "type": "policy"
+}

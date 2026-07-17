@@ -7,8 +7,34 @@
 //! generated enum exhaustively.
 
 use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
+use crate::schema_version::{
+    SchemaInference, SchemaVersionDescriptor, SchemaVersionRegistry, SchemaVersionResolution,
+    UnsupportedSchemaVersion,
+};
+use std::sync::OnceLock;
 
-use super::ir::{MAX_CAPTURE_LENGTH, MAX_KWARG_NAME_LENGTH};
+use super::ir::{MAX_CAPTURE_LENGTH, MAX_KWARG_NAME_LENGTH, SCHEMA_VERSION};
+
+const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[SchemaVersionDescriptor::new(
+    SCHEMA_VERSION as u32,
+    None,
+    SchemaInference::AutoCompatible,
+)];
+
+static RQL_SCHEMA_VERSION_REGISTRY: OnceLock<SchemaVersionRegistry> = OnceLock::new();
+
+pub(crate) fn rql_schema_version_registry() -> &'static SchemaVersionRegistry {
+    RQL_SCHEMA_VERSION_REGISTRY.get_or_init(|| {
+        SchemaVersionRegistry::new(RQL_SCHEMA_VERSIONS)
+            .expect("the compiled-in RQL schema lineage must be valid")
+    })
+}
+
+pub(crate) fn resolve_rql_schema_version(
+    authored_version: Option<u32>,
+) -> Result<SchemaVersionResolution, UnsupportedSchemaVersion> {
+    rql_schema_version_registry().resolve(authored_version)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueShape {
@@ -58,7 +84,7 @@ impl ValueShape {
             Self::PositiveInteger => "a positive integer",
             Self::NonNegativeInteger => "a non-negative integer",
             Self::ResultDetail => "compact or full",
-            Self::SchemaVersion => "schema version 2",
+            Self::SchemaVersion => "a supported schema version",
             Self::TrueBoolean => "the boolean true",
             Self::ReferenceKindList => "one or more structured reference kinds",
             Self::UsageProof => "proven or unproven",
@@ -699,7 +725,7 @@ json_fields! {
     Steps { label: "steps", shape: QuerySteps, signature: "\"steps\": [{ \"op\": \"file_of\" }, ...]", description: "Apply ordered typed transformations to structural matches." }
     Limit { label: "limit", shape: PositiveInteger, signature: "\"limit\": positive integer", description: "Set the maximum number of matches returned." }
     ResultDetail { label: "result_detail", shape: ResultDetail, signature: "\"result_detail\": \"compact\" | \"full\"", description: "Choose compact output or full capture and source details." }
-    SchemaVersion { label: "schema_version", shape: SchemaVersion, signature: "\"schema_version\": 2", description: "Select the CodeQuery schema version." }
+    SchemaVersion { label: "schema_version", shape: SchemaVersion, signature: "\"schema_version\": supported positive integer", description: "Pin one exact CodeQuery schema version; omission selects the compatible lineage head." }
 }
 
 json_fields! {
@@ -799,7 +825,30 @@ json_fields! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
     use std::collections::HashSet;
+
+    #[test]
+    fn rql_schema_lineage_defaults_to_version_two_and_accepts_exact_pins() {
+        assert_eq!(
+            resolve_rql_schema_version(None).unwrap(),
+            SchemaVersionResolution {
+                version: 2,
+                origin: SchemaVersionOrigin::ImplicitCompatible,
+            }
+        );
+        assert_eq!(
+            resolve_rql_schema_version(Some(2)).unwrap(),
+            SchemaVersionResolution {
+                version: 2,
+                origin: SchemaVersionOrigin::Explicit,
+            }
+        );
+
+        let error = resolve_rql_schema_version(Some(1)).unwrap_err();
+        assert_eq!(error.requested, 1);
+        assert_eq!(error.supported, vec![2]);
+    }
 
     #[test]
     fn schema_metadata_has_unique_spellings_and_help() {

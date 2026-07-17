@@ -33,6 +33,7 @@ mod project_watcher;
 mod python_module;
 pub mod reference_differential;
 mod relevance;
+mod schema_version;
 pub mod scoped_project;
 pub mod searchtools;
 pub mod searchtools_render;
@@ -47,6 +48,7 @@ mod test_support;
 mod text_utils;
 pub mod tool_arguments;
 mod util;
+pub use analyzer::policy;
 pub use analyzer::usages;
 
 pub use analyzer::{

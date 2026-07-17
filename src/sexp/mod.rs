@@ -11,5 +11,10 @@ pub(crate) use format::{DEFAULT_SEXP_LINE_WIDTH, SexpFormatOptions, format_sexp_
 #[cfg(test)]
 pub(crate) use syntax::MAX_SEXP_DEPTH;
 pub(crate) use syntax::{
-    Expr, ExprKind, ParseError, ParsedSexp, ParsedSexpDocument, parse_sexp, parse_sexp_document,
+    Expr, ExprKind, ParseError, ParsedSexp, ParsedSexpDocument, SexpParseLimits, parse_sexp,
+    parse_sexp_document_with_limits, parse_sexp_with_limits,
 };
+
+pub(crate) fn parse_sexp_document(source: &str) -> Result<ParsedSexpDocument, ParseError> {
+    parse_sexp_document_with_limits(source, SexpParseLimits::default())
+}

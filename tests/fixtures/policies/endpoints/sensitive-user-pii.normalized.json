@@ -1,0 +1,41 @@
+{
+  "binding": {
+    "index": 0,
+    "type": "argument_index"
+  },
+  "categories": [
+    "data.pii",
+    "data.sensitive"
+  ],
+  "display_name": "sensitive user PII",
+  "id": "bifrost.sinks.sensitive-user-pii",
+  "name": "Sensitive user PII",
+  "role": "sink",
+  "schema_version": 1,
+  "selector": {
+    "query": {
+      "languages": [
+        "python"
+      ],
+      "match": {
+        "callee": {
+          "name": "store_user_profile"
+        },
+        "kind": "call"
+      },
+      "schema_version": 2
+    },
+    "schema_version": 2,
+    "type": "inline"
+  },
+  "supersedes": [],
+  "taint": {
+    "accepts": [
+      "attacker-controlled"
+    ],
+    "impacts": [],
+    "tags": [],
+    "type": "sink"
+  },
+  "type": "endpoint"
+}
