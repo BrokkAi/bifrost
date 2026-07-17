@@ -3105,6 +3105,16 @@ fn precise_parent_resolution(
     analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
 ) -> Option<ResolvedTypeOwner> {
+    #[cfg(test)]
+    if let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) {
+        cpp.record_cpp_parent_resolution_for_test();
+    }
+    if let Some(unit) = exact_structural_type_parent(analyzer, code_unit) {
+        return Some(ResolvedTypeOwner {
+            unit,
+            is_forward_declaration: false,
+        });
+    }
     let fallback = analyzer.parent_of(code_unit);
     let Some(owner_name) = code_unit
         .short_name()
@@ -3175,6 +3185,23 @@ fn precise_parent_resolution(
             }
         }
     }
+}
+
+fn exact_structural_type_parent(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+) -> Option<CodeUnit> {
+    if !code_unit.is_function() && !code_unit.is_field() {
+        return None;
+    }
+    let encoded_owner = code_unit.short_name().rsplit_once('.')?.0;
+    let cpp = resolve_analyzer::<CppAnalyzer>(analyzer)?;
+    let parent = cpp.structural_parent_of(code_unit)?;
+    (!parent.is_module()
+        && parent.source() == code_unit.source()
+        && parent.package_name() == code_unit.package_name()
+        && parent.short_name() == encoded_owner)
+        .then_some(parent)
 }
 
 fn same_source_owner(
@@ -3333,6 +3360,10 @@ fn cpp_class_declaration_strength(
     let Some(source) = analyzer.indexed_source(candidate.source()) else {
         return CppClassDeclarationStrength::Unknown;
     };
+    #[cfg(test)]
+    if let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) {
+        cpp.record_cpp_class_strength_parse_for_test();
+    }
     let mut parser = Parser::new();
     if parser
         .set_language(&tree_sitter_cpp::LANGUAGE.into())

@@ -49,6 +49,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) limit_exceeded: &'a mut bool,
     pub(super) enclosing_cache: RefCell<HashMap<(usize, usize), EnclosingContext>>,
     pub(super) enclosing_owner_cache: RefCell<HashMap<CodeUnit, Option<CodeUnit>>>,
+    lexical_free_function_cache: RefCell<HashMap<(String, String), bool>>,
     member_owner_cache: RefCell<HashMap<CodeUnit, EnclosingMemberOwnerResolution>>,
 }
 
@@ -110,6 +111,7 @@ pub(super) fn scan_prepared_file(
         limit_exceeded: state.limit_exceeded,
         enclosing_cache: RefCell::new(HashMap::default()),
         enclosing_owner_cache: RefCell::new(HashMap::default()),
+        lexical_free_function_cache: RefCell::new(HashMap::default()),
         member_owner_cache: RefCell::new(HashMap::default()),
     };
     if needs_using_enum_member_resolution {
@@ -1020,13 +1022,22 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 fn resolves_to_lexical_free_function(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     let name = node_text(node, ctx.source);
     let namespace = enclosing_namespace_components(node, ctx.source).join(".");
-    ctx.visibility
+    let key = (namespace.clone(), name.to_string());
+    if let Some(resolved) = ctx.lexical_free_function_cache.borrow().get(&key).copied() {
+        return resolved;
+    }
+    let resolved = ctx
+        .visibility
         .visible_identifier_candidates(ctx.file, name)
         .any(|unit| {
             unit.is_function()
                 && type_owner_of(ctx.analyzer, unit).is_none()
                 && unit.package_name() == namespace
-        })
+        });
+    ctx.lexical_free_function_cache
+        .borrow_mut()
+        .insert(key, resolved);
+    resolved
 }
 
 fn maybe_record_qualified_method_value_hit(

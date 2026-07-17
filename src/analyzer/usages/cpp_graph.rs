@@ -31,6 +31,14 @@ pub(in crate::analyzer::usages) use resolver::{
 };
 pub(crate) use shared::CppAuthoritativeUsageBatch;
 
+#[cfg(test)]
+pub(crate) fn cpp_type_owner_for_test(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+) -> Option<CodeUnit> {
+    resolver::type_owner_of(analyzer, unit)
+}
+
 pub(crate) fn build_cpp_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
     nodes: &HashSet<String>,
