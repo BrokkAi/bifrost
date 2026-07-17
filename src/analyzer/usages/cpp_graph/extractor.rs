@@ -16,7 +16,7 @@ use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 pub(super) struct ScanState<'a> {
     pub(super) max_usages: usize,
@@ -24,6 +24,12 @@ pub(super) struct ScanState<'a> {
     pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
     pub(super) raw_match_count: &'a mut usize,
     pub(super) limit_exceeded: &'a mut bool,
+}
+
+pub(super) struct PreparedFileScan {
+    source: String,
+    tree: Tree,
+    line_starts: Vec<usize>,
 }
 
 pub(super) struct ScanCtx<'a> {
@@ -55,41 +61,46 @@ pub(super) struct EnclosingContext {
     pub(super) owner: Option<CodeUnit>,
 }
 
-pub(super) fn scan_file(
+pub(super) fn prepare_file(file: &ProjectFile) -> Option<PreparedFileScan> {
+    if language_for_file(file) != Language::Cpp {
+        return None;
+    }
+    let source = file.read_to_string().ok()?;
+    if source.is_empty() {
+        return None;
+    }
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(source.as_str(), None)?;
+    let line_starts = compute_line_starts(&source);
+    Some(PreparedFileScan {
+        source,
+        tree,
+        line_starts,
+    })
+}
+
+pub(super) fn scan_prepared_file(
     analyzer: &dyn IAnalyzer,
     visibility: &VisibilityIndex,
     file: &ProjectFile,
+    prepared: &PreparedFileScan,
     spec: &TargetSpec,
     target_group: &HashSet<CodeUnit>,
     state: &mut ScanState<'_>,
 ) {
-    if *state.limit_exceeded || language_for_file(file) != Language::Cpp {
+    if *state.limit_exceeded {
         return;
     }
-    let Ok(source) = file.read_to_string() else {
-        return;
-    };
-    if source.is_empty() {
-        return;
-    }
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_cpp::LANGUAGE.into())
-        .is_err()
-    {
-        return;
-    }
-    let Some(tree) = parser.parse(source.as_str(), None) else {
-        return;
-    };
-    let line_starts = compute_line_starts(&source);
     let needs_using_enum_member_resolution = spec.enum_owner_kind == EnumOwnerKind::Scoped;
     let mut ctx = ScanCtx {
         analyzer,
         visibility,
         file,
-        source: &source,
-        line_starts: &line_starts,
+        source: &prepared.source,
+        line_starts: &prepared.line_starts,
         spec,
         target_group,
         bindings: LocalInferenceEngine::new(LocalInferenceConfig::default()),
@@ -107,9 +118,9 @@ pub(super) fn scan_file(
         member_owner_cache: RefCell::new(HashMap::default()),
     };
     if needs_using_enum_member_resolution {
-        collect_semantic_using_enums(tree.root_node(), &mut ctx);
+        collect_semantic_using_enums(prepared.tree.root_node(), &mut ctx);
     }
-    scan_node(tree.root_node(), &mut ctx);
+    scan_node(prepared.tree.root_node(), &mut ctx);
 }
 
 enum UsingEnumDeclarationScope {

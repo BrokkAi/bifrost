@@ -1,4 +1,4 @@
-use super::extractor::{ScanState, scan_file};
+use super::extractor::{ScanState, prepare_file, scan_prepared_file};
 use super::inverted;
 use super::resolver::{TargetSpec, VisibilityIndex};
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
@@ -9,6 +9,38 @@ use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver, Usa
 use crate::analyzer::{CodeUnit, CppAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
+
+fn scan_file_major<F, S, P, I, C, Prepare, Scan>(
+    files: I,
+    specs: &[S],
+    mut is_cancelled: C,
+    mut prepare: Prepare,
+    mut scan: Scan,
+) where
+    I: IntoIterator<Item = F>,
+    C: FnMut() -> bool,
+    Prepare: FnMut(&F) -> Option<P>,
+    Scan: FnMut(&F, &P, &S) -> bool,
+{
+    let mut capped = false;
+    for file in files {
+        if capped || is_cancelled() {
+            break;
+        }
+        let Some(prepared) = prepare(&file) else {
+            continue;
+        };
+        for spec in specs {
+            if is_cancelled() {
+                break;
+            }
+            capped = scan(&file, &prepared, spec);
+            if capped {
+                break;
+            }
+        }
+    }
+}
 
 pub(crate) struct CppQueryResolver<'a> {
     cpp: &'a CppAnalyzer,
@@ -74,27 +106,24 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
             limit_exceeded: &mut limit_exceeded,
         };
 
-        for file in files {
-            if scan_scope.is_cancelled() {
-                break;
-            }
-            for spec in &specs {
-                if scan_scope.is_cancelled() {
-                    break;
-                }
-                scan_file(
+        scan_file_major(
+            files,
+            &specs,
+            || scan_scope.is_cancelled(),
+            prepare_file,
+            |file, prepared, spec| {
+                scan_prepared_file(
                     analyzer,
                     &visibility,
-                    &file,
+                    file,
+                    prepared,
                     spec,
                     &target_group,
                     &mut state,
                 );
-                if *state.limit_exceeded {
-                    break;
-                }
-            }
-        }
+                *state.limit_exceeded
+            },
+        );
 
         let external_hit_count = hits
             .iter()
@@ -169,5 +198,98 @@ impl<'a> UsageEdgeResolver<'a> for CppEdgeResolver<'a> {
             .collect();
         let visibility = VisibilityIndex::build(self.cpp, analyzer, &roots);
         inverted::build_cpp_edges(analyzer, &self.files, &visibility, nodes, keep_file)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::scan_file_major;
+
+    #[test]
+    fn file_major_scan_prepares_once_and_visits_every_spec_in_order() {
+        let files = ["first.cpp", "unreadable.cpp", "second.cpp"];
+        let specs = ["arity-0", "arity-1", "arity-2"];
+        let mut prepared = Vec::new();
+        let mut scanned = Vec::new();
+
+        scan_file_major(
+            files,
+            &specs,
+            || false,
+            |file| {
+                prepared.push(*file);
+                (*file != "unreadable.cpp").then_some(file.len())
+            },
+            |file, preparation, spec| {
+                scanned.push((*file, *preparation, *spec));
+                false
+            },
+        );
+
+        assert_eq!(prepared, files);
+        assert_eq!(
+            scanned,
+            vec![
+                ("first.cpp", "first.cpp".len(), "arity-0"),
+                ("first.cpp", "first.cpp".len(), "arity-1"),
+                ("first.cpp", "first.cpp".len(), "arity-2"),
+                ("second.cpp", "second.cpp".len(), "arity-0"),
+                ("second.cpp", "second.cpp".len(), "arity-1"),
+                ("second.cpp", "second.cpp".len(), "arity-2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn file_major_scan_stops_before_preparing_a_later_file_after_cap() {
+        let mut prepared = Vec::new();
+        let mut scanned = Vec::new();
+
+        scan_file_major(
+            ["first.cpp", "must-not-prepare.cpp"],
+            &["first-spec", "capping-spec", "must-not-scan"],
+            || false,
+            |file| {
+                prepared.push(*file);
+                Some(())
+            },
+            |file, (), spec| {
+                scanned.push((*file, *spec));
+                *spec == "capping-spec"
+            },
+        );
+
+        assert_eq!(prepared, vec!["first.cpp"]);
+        assert_eq!(
+            scanned,
+            vec![("first.cpp", "first-spec"), ("first.cpp", "capping-spec")]
+        );
+    }
+
+    #[test]
+    fn file_major_scan_checks_cancellation_before_each_spec_and_later_file() {
+        let cancelled = Cell::new(false);
+        let mut prepared = Vec::new();
+        let mut scanned = Vec::new();
+
+        scan_file_major(
+            ["first.cpp", "must-not-prepare.cpp"],
+            &["first-spec", "must-not-scan"],
+            || cancelled.get(),
+            |file| {
+                prepared.push(*file);
+                Some(())
+            },
+            |file, (), spec| {
+                scanned.push((*file, *spec));
+                cancelled.set(true);
+                false
+            },
+        );
+
+        assert_eq!(prepared, vec!["first.cpp"]);
+        assert_eq!(scanned, vec![("first.cpp", "first-spec")]);
     }
 }
