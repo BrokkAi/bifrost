@@ -2620,6 +2620,215 @@ void use(ContainerAlias *container) {
 }
 
 #[test]
+fn authoritative_cpp_usage_preserves_unresolved_alias_target_identity() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "aliases.h",
+            r#"#pragma once
+namespace api {
+using ExternalAlias = external::Unindexed;
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "aliases.h"
+
+api::ExternalAlias make(api::ExternalAlias value);
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let alias = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "api.ExternalAlias"
+            && !unit.is_synthetic()
+    });
+    assert_eq!(
+        "api.ExternalAlias",
+        alias.fq_name(),
+        "must query the alias CodeUnit itself"
+    );
+
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let expected = source
+        .match_indices("api::ExternalAlias")
+        .map(|(start, token)| (start, start + token.len()))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        2,
+        expected.len(),
+        "fixture must contain two alias references"
+    );
+    for &(start, _) in &expected {
+        let terminal_start = start + "api::".len();
+        let line_start = source[..terminal_start]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let line = source[..terminal_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let column = source[line_start..terminal_start].chars().count() + 1;
+        let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "consumer.cc".to_string(),
+                    line: Some(line),
+                    column: Some(column),
+                }],
+            },
+        );
+        let result = &forward.results[0];
+        assert_eq!(
+            "resolved", result.status,
+            "forward lookup must resolve the alias at {terminal_start}: {result:#?}"
+        );
+        assert!(
+            result
+                .definitions
+                .iter()
+                .any(|definition| definition.fqn.as_deref() == Some("api.ExternalAlias")),
+            "forward lookup must preserve direct alias identity at {terminal_start}: {result:#?}"
+        );
+    }
+
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&alias), &consumer),
+        expected,
+        "inverse lookup must retain exact references to an alias whose RHS has no CodeUnit"
+    );
+}
+
+#[test]
+fn authoritative_cpp_usage_preserves_builtin_and_dependent_alias_identity() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "aliases.h",
+            r#"#pragma once
+namespace api {
+using Byte = unsigned char;
+template <typename T> using Identity = T;
+template <typename T> using ExternalBox = external::Box<T>;
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "aliases.h"
+
+api::Byte copy_byte(api::Byte value);
+api::Identity<int> copy_identity(api::Identity<int> value);
+api::ExternalBox<int> copy_external(api::ExternalBox<int> value);
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let alias = |fq_name: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Class && unit.fq_name() == fq_name && !unit.is_synthetic()
+        })
+    };
+    let expected_ranges = |token: &str| {
+        source
+            .match_indices(token)
+            .map(|(start, matched)| (start, start + matched.len()))
+            .collect::<BTreeSet<_>>()
+    };
+
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, &[alias("api.Byte")], &consumer),
+        expected_ranges("api::Byte"),
+        "builtin aliases must retain their own direct reference identity"
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, &[alias("api.Identity")], &consumer),
+        expected_ranges("api::Identity<int>"),
+        "dependent aliases must retain their own direct reference identity"
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, &[alias("api.ExternalBox")], &consumer),
+        expected_ranges("api::ExternalBox<int>"),
+        "template aliases with unresolved external RHS types must retain their own direct reference identity"
+    );
+}
+
+#[test]
+fn authoritative_cpp_usage_preserves_alias_identity_and_canonical_scoped_enum_owner() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "modes.h",
+            r#"#pragma once
+namespace blink {
+enum class WebLoaderFreezeMode { kNone };
+using LoaderFreezeMode = WebLoaderFreezeMode;
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "modes.h"
+
+blink::LoaderFreezeMode qualified(blink::LoaderFreezeMode value);
+namespace blink {
+LoaderFreezeMode bare(LoaderFreezeMode value);
+LoaderFreezeMode current() { return LoaderFreezeMode::kNone; }
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let target = |fq_name: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Class && unit.fq_name() == fq_name && !unit.is_synthetic()
+        })
+    };
+    let mut expected = BTreeSet::new();
+    for (line, token) in [
+        (
+            "blink::LoaderFreezeMode qualified(blink::LoaderFreezeMode value);",
+            "blink::LoaderFreezeMode",
+        ),
+        (
+            "LoaderFreezeMode bare(LoaderFreezeMode value);",
+            "LoaderFreezeMode",
+        ),
+        (
+            "LoaderFreezeMode current() { return LoaderFreezeMode::kNone; }",
+            "LoaderFreezeMode",
+        ),
+    ] {
+        let line_start = source
+            .find(line)
+            .unwrap_or_else(|| panic!("missing fixture line {line:?}"));
+        expected.extend(
+            line.match_indices(token)
+                .map(|(start, matched)| (line_start + start, line_start + start + matched.len())),
+        );
+    }
+
+    let alias = target("blink.LoaderFreezeMode");
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&alias), &consumer),
+        expected,
+        "qualified, bare, and scoped-enum references must retain alias identity"
+    );
+    let canonical = target("blink.WebLoaderFreezeMode");
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&canonical), &consumer),
+        expected,
+        "a differently named alias must still resolve every direct and scoped reference to its canonical enum target"
+    );
+}
+
+#[test]
 fn authoritative_c_usage_resolves_tagged_typedef_despite_member_type_reference() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
         (
@@ -8710,13 +8919,25 @@ template <typename T> using Loop = Loop<T>;
 "#,
         )
         .file(
+            "mutual.h",
+            r#"#pragma once
+namespace mutual {
+template <typename T> using Left = Right<T>;
+template <typename T> using Right = Left<T>;
+}
+"#,
+        )
+        .file(
             "consumer.cc",
             r#"#include "left.h"
 #include "right.h"
 #include "cycle.h"
+#include "mutual.h"
 void consume() {
     api::Choice<int> ambiguous;
     cycle::Loop<int> cyclic;
+    mutual::Left<int> mutual_left;
+    mutual::Right<int> mutual_right;
     canonical::Left<int> left_control;
     canonical::Right<int> right_control;
     canonical::Loop<int> loop_control;
@@ -8729,15 +8950,12 @@ void consume() {
     let source = consumer.read_to_string().expect("consumer source");
     let provider =
         ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
-    let exact_hits = |fq_name: &str| {
-        let target = definition_by(&analyzer, |unit| {
-            unit.kind() == CodeUnitType::Class && unit.fq_name() == fq_name && !unit.is_synthetic()
-        });
+    let exact_hits_for_target = |target: &CodeUnit| {
         let result = UsageFinder::new()
             .with_authoritative_scope(true)
             .query_with_provider(
                 &analyzer,
-                std::slice::from_ref(&target),
+                std::slice::from_ref(target),
                 Some(&provider),
                 1,
                 1000,
@@ -8750,12 +8968,18 @@ void consume() {
             panic!("expected authoritative fail-closed alias query for {target:#?}");
         };
         hits_by_overload
-            .get(&target)
+            .get(target)
             .into_iter()
             .flatten()
             .map(|hit| (hit.start_offset, hit.end_offset))
             .collect::<BTreeSet<_>>()
     };
+    let target = |fq_name: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Class && unit.fq_name() == fq_name && !unit.is_synthetic()
+        })
+    };
+    let exact_hits = |fq_name: &str| exact_hits_for_target(&target(fq_name));
     let range = |token: &str| {
         let start = source
             .find(token)
@@ -8777,5 +9001,38 @@ void consume() {
         exact_hits("canonical.Loop"),
         BTreeSet::from([range("canonical::Loop<int>")]),
         "a cyclic template alias must not fan out by terminal name"
+    );
+    let ambiguous_aliases = analyzer
+        .get_all_declarations()
+        .iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.fq_name() == "api.Choice"
+                && !unit.is_synthetic()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        2,
+        ambiguous_aliases.len(),
+        "fixture must retain both conflicting aliases"
+    );
+    for alias in &ambiguous_aliases {
+        assert!(
+            exact_hits_for_target(alias).is_empty(),
+            "a directly queried ambiguous alias must fail closed: {alias:#?}"
+        );
+    }
+    assert!(
+        exact_hits("cycle.Loop").is_empty(),
+        "a directly queried self-cyclic alias must fail closed"
+    );
+    assert!(
+        exact_hits("mutual.Left").is_empty(),
+        "a directly queried mutually cyclic left alias must fail closed"
+    );
+    assert!(
+        exact_hits("mutual.Right").is_empty(),
+        "a directly queried mutually cyclic right alias must fail closed"
     );
 }

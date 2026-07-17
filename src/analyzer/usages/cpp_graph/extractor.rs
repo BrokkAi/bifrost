@@ -511,8 +511,14 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     let hit_node = node;
     let text = node_text(hit_node, ctx.source);
-    let type_resolution =
-        resolve_type_node_lexically(hit_node, ctx.analyzer, ctx.visibility, ctx.file, ctx.source);
+    let type_resolution = resolve_type_node_lexically_for_target(
+        hit_node,
+        ctx.analyzer,
+        ctx.visibility,
+        ctx.file,
+        ctx.source,
+        &ctx.spec.target,
+    );
     match type_resolution {
         LexicalTypeResolution::Resolved {
             unit, candidates, ..
@@ -543,13 +549,16 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         push_type_hit(hit_node, ctx);
         return;
     }
+    if let Some(scope) = static_qualifier_type_scope(node, ctx) {
+        *ctx.raw_match_count += 1;
+        push_hit(scope, ctx);
+        return;
+    }
     if !name_mentions(text, &ctx.spec.member_name) {
         return;
     }
     *ctx.raw_match_count += 1;
-    if let Some(scope) = static_qualifier_type_scope(node, ctx) {
-        push_hit(scope, ctx);
-    } else if !ctx.visibility.is_visible(ctx.file, &ctx.spec.target) {
+    if !ctx.visibility.is_visible(ctx.file, &ctx.spec.target) {
         if let Some(scope) = static_qualifier_name_scope(node, ctx) {
             push_unproven_hit(scope, ctx);
         } else {
@@ -570,7 +579,7 @@ fn static_qualifier_type_scope<'tree>(node: Node<'tree>, ctx: &ScanCtx<'_>) -> O
         if let Some((components, global)) =
             qualified_callable_owner_components_in_context(current, ctx.source)
         {
-            match resolve_type_components_lexically_at(
+            match resolve_type_components_lexically_at_for_target(
                 current,
                 &components,
                 global,
@@ -578,6 +587,7 @@ fn static_qualifier_type_scope<'tree>(node: Node<'tree>, ctx: &ScanCtx<'_>) -> O
                 ctx.visibility,
                 ctx.file,
                 ctx.source,
+                &ctx.spec.target,
             ) {
                 LexicalTypeResolution::Resolved {
                     unit, candidates, ..
@@ -2255,6 +2265,29 @@ pub(super) fn resolve_type_node_lexically(
     )
 }
 
+fn resolve_type_node_lexically_for_target(
+    node: Node<'_>,
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    target: &CodeUnit,
+) -> LexicalTypeResolution {
+    let Some((components, global)) = type_reference_components(node, source) else {
+        return LexicalTypeResolution::Missing;
+    };
+    resolve_type_components_lexically_at_for_target(
+        node,
+        &components,
+        global,
+        analyzer,
+        visibility,
+        file,
+        source,
+        target,
+    )
+}
+
 pub(super) fn resolve_using_enum_declaration_owner(
     node: Node<'_>,
     analyzer: &dyn IAnalyzer,
@@ -2301,6 +2334,45 @@ fn resolve_type_components_lexically_at(
     file: &ProjectFile,
     source: &str,
 ) -> LexicalTypeResolution {
+    resolve_type_components_lexically_at_inner(
+        node, components, global, analyzer, visibility, file, source, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_type_components_lexically_at_for_target(
+    node: Node<'_>,
+    components: &[String],
+    global: bool,
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    target: &CodeUnit,
+) -> LexicalTypeResolution {
+    resolve_type_components_lexically_at_inner(
+        node,
+        components,
+        global,
+        analyzer,
+        visibility,
+        file,
+        source,
+        Some(target),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_type_components_lexically_at_inner(
+    node: Node<'_>,
+    components: &[String],
+    global: bool,
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    direct_target: Option<&CodeUnit>,
+) -> LexicalTypeResolution {
     let lexical_scope = if global {
         Vec::new()
     } else {
@@ -2318,7 +2390,27 @@ fn resolve_type_components_lexically_at(
             LexicalScopeResolution::Missing => return LexicalTypeResolution::Missing,
         }
     };
-    visibility.resolve_type_components_lexically(analyzer, file, components, global, &lexical_scope)
+    direct_target.map_or_else(
+        || {
+            visibility.resolve_type_components_lexically(
+                analyzer,
+                file,
+                components,
+                global,
+                &lexical_scope,
+            )
+        },
+        |target| {
+            visibility.resolve_type_components_lexically_for_target(
+                analyzer,
+                file,
+                components,
+                global,
+                &lexical_scope,
+                target,
+            )
+        },
+    )
 }
 
 fn same_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {

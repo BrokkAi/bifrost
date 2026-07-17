@@ -594,6 +594,44 @@ impl VisibilityIndex {
         global: bool,
         lexical_scope: &[String],
     ) -> LexicalTypeResolution {
+        self.resolve_type_components_lexically_inner(
+            analyzer,
+            file,
+            components,
+            global,
+            lexical_scope,
+            None,
+        )
+    }
+
+    pub(super) fn resolve_type_components_lexically_for_target(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        components: &[String],
+        global: bool,
+        lexical_scope: &[String],
+        target: &CodeUnit,
+    ) -> LexicalTypeResolution {
+        self.resolve_type_components_lexically_inner(
+            analyzer,
+            file,
+            components,
+            global,
+            lexical_scope,
+            Some(target),
+        )
+    }
+
+    fn resolve_type_components_lexically_inner(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        components: &[String],
+        global: bool,
+        lexical_scope: &[String],
+        direct_target: Option<&CodeUnit>,
+    ) -> LexicalTypeResolution {
         if components.is_empty() {
             return LexicalTypeResolution::Missing;
         }
@@ -607,8 +645,18 @@ impl VisibilityIndex {
             if candidates.is_empty() {
                 continue;
             }
-            let Some(unit) = self.unique_canonical_type_candidate(analyzer, file, &candidates)
-            else {
+            let unit = direct_target.map_or_else(
+                || self.unique_canonical_type_candidate(analyzer, file, &candidates),
+                |target| {
+                    self.unique_type_candidate_preserving_target(
+                        analyzer,
+                        file,
+                        &candidates,
+                        target,
+                    )
+                },
+            );
+            let Some(unit) = unit else {
                 return LexicalTypeResolution::Ambiguous;
             };
             return LexicalTypeResolution::Resolved {
@@ -783,6 +831,69 @@ impl VisibilityIndex {
         canonical.pop()
     }
 
+    fn unique_type_candidate_preserving_target(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        visible_from: &ProjectFile,
+        candidates: &[&CodeUnit],
+        target: &CodeUnit,
+    ) -> Option<CodeUnit> {
+        let mut resolved_candidates = Vec::new();
+        for candidate in candidates {
+            let is_direct_target = same_visible_symbol(candidate, target);
+            let is_alias = is_direct_target
+                && (is_type_alias(candidate)
+                    || analyzer
+                        .type_alias_provider()
+                        .is_some_and(|provider| provider.is_type_alias(candidate)));
+            let resolved = if is_direct_target
+                && (!is_alias
+                    || self.structured_alias_chain_is_acyclic(analyzer, visible_from, candidate))
+            {
+                (*candidate).clone()
+            } else {
+                self.canonical_type_unit(analyzer, visible_from, candidate)?
+            };
+            if resolved_candidates
+                .iter()
+                .any(|existing| same_visible_symbol(existing, &resolved))
+            {
+                continue;
+            }
+            resolved_candidates.push(resolved);
+            if resolved_candidates.len() > 1 {
+                return None;
+            }
+        }
+        resolved_candidates.pop()
+    }
+
+    fn structured_alias_chain_is_acyclic(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        visible_from: &ProjectFile,
+        unit: &CodeUnit,
+    ) -> bool {
+        let mut current = unit.clone();
+        let mut seen = HashSet::default();
+        loop {
+            if !seen.insert(current.clone()) {
+                return false;
+            }
+            let Some(target) = self.structured_alias_target(analyzer, &current) else {
+                return true;
+            };
+            if matches!(target, StructuredAliasTarget::Builtin) {
+                return true;
+            }
+            let Some(next) = self.resolve_structured_alias_target(visible_from, &current, &target)
+            else {
+                return true;
+            };
+            current = next;
+        }
+    }
+
     fn resolve_unique_type_for_declaration(
         &self,
         visible_from: &ProjectFile,
@@ -818,30 +929,12 @@ impl VisibilityIndex {
         if candidates.is_empty() {
             return self.parser_alias_resolves_to_type(analyzer, file, raw_name, target);
         }
-        let mut canonical_candidates = Vec::new();
-        for candidate in candidates {
-            let resolved = if same_visible_symbol(candidate, target) {
-                candidate.clone()
-            } else {
-                let Some(canonical) = self.canonical_type_unit(analyzer, file, candidate) else {
-                    return false;
-                };
-                canonical
-            };
-            if !canonical_candidates
-                .iter()
-                .any(|existing| same_visible_symbol(existing, &resolved))
-            {
-                canonical_candidates.push(resolved);
-                if canonical_candidates.len() > 1 {
-                    return false;
-                }
-            }
-        }
-        let Some(canonical) = canonical_candidates.pop() else {
+        let Some(resolved) =
+            self.unique_type_candidate_preserving_target(analyzer, file, &candidates, target)
+        else {
             return false;
         };
-        same_symbol(&canonical, target) || same_visible_symbol(&canonical, target)
+        same_symbol(&resolved, target) || same_visible_symbol(&resolved, target)
     }
 
     pub(super) fn alias_target(&self, alias: &CodeUnit) -> Option<CodeUnit> {
