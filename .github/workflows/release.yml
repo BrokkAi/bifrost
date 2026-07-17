@@ -273,11 +273,17 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: editors/vscode/package-lock.json
+          cache-dependency-path: |
+            editors/vscode/package-lock.json
+            plugins/bifrost-agent/package-lock.json
 
       - name: Install extension dependencies
         run: npm ci
         working-directory: editors/vscode
+
+      - name: Install agent package dependencies
+        run: npm ci
+        working-directory: plugins/bifrost-agent
 
       - name: Prepare extension manifest
         run: >
@@ -296,6 +302,14 @@ jobs:
       - name: Validate agent plugin manifests
         run: node scripts/check-codex-plugin-manifest.mjs
 
+      - name: Test Pi package
+        run: npm test
+        working-directory: plugins/bifrost-agent
+
+      - name: Check Pi package
+        run: npm run check
+        working-directory: plugins/bifrost-agent
+
       - name: Test extension
         run: npm test
         working-directory: editors/vscode
@@ -309,7 +323,15 @@ jobs:
         run: |
           cp -R plugins/bifrost-agent "${RUNNER_TEMP}/bifrost-agent"
           cp LICENSE.md licenses/GPL-3.0.md licenses/SOURCE.md "${RUNNER_TEMP}/bifrost-agent/"
-          tar -C "${RUNNER_TEMP}" -czf "dist/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz" bifrost-agent
+          tar --exclude='bifrost-agent/node_modules' -C "${RUNNER_TEMP}" -czf "dist/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz" bifrost-agent
+          if tar -tzf "dist/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz" | rg '/node_modules/'; then
+            echo "Agent plugin archive unexpectedly contains node_modules" >&2
+            exit 1
+          fi
+
+      - name: Package Pi package
+        run: npm pack --pack-destination ../../dist
+        working-directory: plugins/bifrost-agent
 
       - name: Upload editor and agent plugin artifacts to GitHub Release
         uses: softprops/action-gh-release@v3
@@ -318,6 +340,7 @@ jobs:
           files: |
             dist/*.vsix
             dist/bifrost-agent-*.tar.gz
+            dist/brokk-bifrost-agent-*.tgz
 
       - name: Publish extension to Visual Studio Marketplace
         run: >

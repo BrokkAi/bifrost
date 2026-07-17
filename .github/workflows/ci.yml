@@ -162,6 +162,34 @@ jobs:
           grep -Fx 'extension/SOURCE.md' /tmp/bifrost-vsix-files.txt
           grep -Fx 'extension/THIRD_PARTY_LICENSES.txt' /tmp/bifrost-vsix-files.txt
 
+  pi-package:
+    name: Pi package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: plugins/bifrost-agent/package-lock.json
+
+      - name: Install package dependencies
+        run: npm ci
+        working-directory: plugins/bifrost-agent
+
+      - name: Check package
+        run: npm run check
+        working-directory: plugins/bifrost-agent
+
+      - name: Test package
+        run: npm test
+        working-directory: plugins/bifrost-agent
+
+      - name: Validate shared plugin manifests
+        run: node scripts/check-codex-plugin-manifest.mjs
+
   rust:
     name: rust (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}

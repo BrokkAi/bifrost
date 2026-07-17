@@ -91,6 +91,41 @@ code-intelligence skills aligned with the default Bifrost MCP toolset, and keep
 the workflow skills and agents in the same plugin so `brokk@bifrost` remains a
 single installable bundle for code intelligence plus GitHub/review workflows.
 
+## Pi package
+
+`plugins/bifrost-agent/package.json` also makes the shared directory a Pi
+package named `@brokk/bifrost-agent`. Its `pi` manifest exposes the native
+TypeScript extension under `extensions/` and exactly the three canonical
+generic skills: navigation, code reading, and codebase search. Do not expose
+the generated Codex or Amp skill trees through Pi, and do not copy the
+canonical skills into a Pi-specific directory.
+
+The Pi extension imports the launch-resolution functions from
+`bin/bifrost-launcher.mjs`, then gives the resolved Bifrost binary directly to
+the reviewed, pinned MCP SDK. This keeps binary selection, version checks,
+release checksums, managed cache behavior, and `BIFROST_BINARY_PATH` aligned
+across every host while allowing the SDK to own the child's stdio and shutdown.
+Keep `package.json`, `package-lock.json`, `bifrost-release.json`, and
+`Cargo.toml` version-aligned. Changes to the MCP SDK require a deliberate
+version update and process-boundary test review.
+
+Release CI runs `npm ci`, `npm test`, and `npm run check` in
+`plugins/bifrost-agent`, then places the npm tarball in the GitHub release next
+to the shared agent archive. Publishing `@brokk/bifrost-agent` to npm remains a
+separate credentialed action until the repository has an approved npm trusted
+publisher or token. Do not document npm installation as available until that
+publication is configured and the matching version exists in the registry.
+Local validation and pre-publication inspection use:
+
+```bash
+cd plugins/bifrost-agent
+npm ci
+npm test
+npm run check
+npm pack --dry-run
+npm publish --dry-run
+```
+
 ## Local testing
 
 Build the local binary:
