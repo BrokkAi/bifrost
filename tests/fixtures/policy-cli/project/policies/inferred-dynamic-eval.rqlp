@@ -1,0 +1,12 @@
+(policy
+  :id "bifrost.security.inferred-dynamic-eval"
+  :name "No dynamic evaluation (inferred schemas)"
+  :message "Dynamic evaluation is forbidden"
+  :severity warning
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql
+          (language python
+            (call :callee (name "eval"))))))

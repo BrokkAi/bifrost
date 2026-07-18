@@ -283,7 +283,7 @@ impl PolicyRegistry {
         identity: PolicySourceIdentity,
         bytes: &[u8],
     ) -> Result<&LoadedPolicy, PolicyRegistryError> {
-        validate_source_identity(&identity)?;
+        validate_policy_source_identity(&identity)?;
         let parsed = parse_policy_bytes(identity, bytes)?;
         self.finish_policy_registration(parsed, bytes)
     }
@@ -308,7 +308,7 @@ impl PolicyRegistry {
         identity: PolicySourceIdentity,
         bytes: &[u8],
     ) -> Result<&LoadedEndpoint, PolicyRegistryError> {
-        validate_source_identity(&identity)?;
+        validate_policy_source_identity(&identity)?;
         let parsed = parse_policy_bytes(identity, bytes)?;
         self.finish_endpoint_registration(parsed, bytes)
     }
@@ -1356,16 +1356,18 @@ fn extend_set_uses(
     Ok(())
 }
 
-fn validate_source_identity(identity: &PolicySourceIdentity) -> Result<(), PolicyRegistryError> {
+pub(crate) fn validate_policy_source_identity(
+    identity: &PolicySourceIdentity,
+) -> Result<(), PolicySourceIdentityError> {
     let label = identity.as_str();
     if label.is_empty() {
-        return Err(PolicySourceIdentityError::Empty.into());
+        return Err(PolicySourceIdentityError::Empty);
     }
     if label.len() > MAX_POLICY_SOURCE_IDENTITY_BYTES {
-        return Err(PolicySourceIdentityError::TooLong.into());
+        return Err(PolicySourceIdentityError::TooLong);
     }
     if label.chars().any(char::is_control) {
-        return Err(PolicySourceIdentityError::ControlCharacter.into());
+        return Err(PolicySourceIdentityError::ControlCharacter);
     }
     Ok(())
 }

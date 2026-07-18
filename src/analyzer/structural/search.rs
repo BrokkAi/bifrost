@@ -1070,6 +1070,7 @@ pub(crate) struct DetailedCodeQueryEvidence {
     pub file: ProjectFile,
     pub byte_span: Option<std::ops::Range<usize>>,
     pub stable_owner_candidate: Option<CodeQueryStableOwnerCandidate>,
+    pub identities: DetailedCodeQueryProvenanceIdentities,
     pub source_slice_sha256: Option<[u8; 32]>,
     pub provenance: Vec<DetailedCodeQueryProvenanceEvidence>,
 }
@@ -1456,6 +1457,7 @@ impl DetailedCodeQueryResult {
                     | CodeQueryStableOwnerDerivation::CanonicalAstIdentity => {}
                 }
             }
+            assert_detailed_terminal_identities(evidence.domain, &evidence.identities);
             let _ = &evidence.file;
             assert_eq!(
                 result.provenance.len(),
@@ -1495,6 +1497,30 @@ fn assert_detailed_provenance_ref(evidence: &DetailedCodeQueryProvenanceRefEvide
     }
 }
 
+fn assert_detailed_terminal_identities(
+    domain: DetailedCodeQueryDomain,
+    identities: &DetailedCodeQueryProvenanceIdentities,
+) {
+    assert!(matches!(
+        (domain, identities),
+        (
+            DetailedCodeQueryDomain::StructuralMatch | DetailedCodeQueryDomain::Declaration,
+            DetailedCodeQueryProvenanceIdentities::Primary(_),
+        ) | (
+            DetailedCodeQueryDomain::File
+                | DetailedCodeQueryDomain::ExpressionSite
+                | DetailedCodeQueryDomain::ReceiverAnalysis,
+            DetailedCodeQueryProvenanceIdentities::None,
+        ) | (
+            DetailedCodeQueryDomain::ReferenceSite,
+            DetailedCodeQueryProvenanceIdentities::ReferenceTarget(_),
+        ) | (
+            DetailedCodeQueryDomain::CallSite,
+            DetailedCodeQueryProvenanceIdentities::Call { .. },
+        )
+    ));
+}
+
 fn detailed_result_without_evidence(
     result: CodeQueryResult,
     budget: CodeQueryExecutionBudget,
@@ -1530,6 +1556,7 @@ fn detailed_evidence_for_pipeline_value(
             let span = fact.span();
             let byte_span = span.start_byte..span.end_byte;
             let path = rel_path_string(&seed.file);
+            let stable_owner_candidate = canonical_ast_candidate(seed);
             DetailedCodeQueryEvidence {
                 result_index,
                 domain: DetailedCodeQueryDomain::StructuralMatch,
@@ -1540,7 +1567,15 @@ fn detailed_evidence_for_pipeline_value(
                 file: seed.file.clone(),
                 source_slice_sha256: source_slice_sha256(seed.facts.source(), &byte_span),
                 byte_span: Some(byte_span),
-                stable_owner_candidate: canonical_ast_candidate(seed),
+                identities: DetailedCodeQueryProvenanceIdentities::Primary(
+                    stable_owner_candidate.clone().map(|candidate| {
+                        DetailedCodeQueryIdentityCandidate {
+                            file: seed.file.clone(),
+                            candidate,
+                        }
+                    }),
+                ),
+                stable_owner_candidate,
                 provenance: Vec::new(),
             }
         }
@@ -1562,6 +1597,9 @@ fn detailed_evidence_for_pipeline_value(
                 source_slice_sha256: retained_source
                     .and_then(|source| source_slice_sha256(source, &byte_span)),
                 byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::Primary(
+                    detailed_identity_candidate_for_unit(&declaration.unit),
+                ),
                 stable_owner_candidate: stable_owner_candidate_for_unit(&file, &declaration.unit),
                 provenance: Vec::new(),
             }
@@ -1572,6 +1610,7 @@ fn detailed_evidence_for_pipeline_value(
             key: DetailedCodeQueryKey::File,
             file: file.clone(),
             byte_span: None,
+            identities: DetailedCodeQueryProvenanceIdentities::None,
             stable_owner_candidate: None,
             source_slice_sha256: None,
             provenance: Vec::new(),
@@ -1597,6 +1636,9 @@ fn detailed_evidence_for_pipeline_value(
                 source_slice_sha256: retained_source
                     .and_then(|source| source_slice_sha256(source, &byte_span)),
                 byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::ReferenceTarget(
+                    detailed_identity_candidate_for_unit(&site.target.unit),
+                ),
                 stable_owner_candidate: site.enclosing.as_ref().and_then(|declaration| {
                     stable_owner_candidate_for_unit(&site.file, &declaration.unit)
                 }),
@@ -1617,6 +1659,10 @@ fn detailed_evidence_for_pipeline_value(
                 source_slice_sha256: retained_source
                     .and_then(|source| source_slice_sha256(source, &byte_span)),
                 byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::Call {
+                    caller: detailed_identity_candidate_for_unit(&site.0.caller),
+                    callee: detailed_identity_candidate_for_unit(&site.0.callee),
+                },
                 stable_owner_candidate: stable_owner_candidate_for_unit(file, &site.0.caller),
                 provenance: Vec::new(),
             }
@@ -1639,6 +1685,7 @@ fn detailed_evidence_for_pipeline_value(
                 source_slice_sha256: retained_source
                     .and_then(|source| source_slice_sha256(source, &byte_span)),
                 byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: stable_owner_candidate_for_unit(
                     file,
                     &site.call_site.0.caller,
@@ -1660,6 +1707,7 @@ fn detailed_evidence_for_pipeline_value(
                 file: site.file.clone(),
                 source_slice_sha256: None,
                 byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
             }

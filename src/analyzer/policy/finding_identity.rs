@@ -643,6 +643,42 @@ pub struct MatchWeakAnchor {
     typed_key: OpaqueFindingKey,
 }
 
+impl MatchStrongAnchor {
+    pub const fn result_domain(&self) -> MatchResultDomain {
+        self.result_domain
+    }
+
+    pub const fn path(&self) -> &WorkspaceRelativePath {
+        &self.path
+    }
+
+    pub const fn semantic_owner(&self) -> Option<&StableSemanticIdentity> {
+        self.semantic_owner.as_ref()
+    }
+
+    pub const fn selected_source_sha256(&self) -> Option<SourceSliceHash> {
+        self.selected_source_sha256
+    }
+
+    pub const fn occurrence_ordinal(&self) -> u32 {
+        self.occurrence_ordinal
+    }
+}
+
+impl MatchWeakAnchor {
+    pub const fn result_domain(&self) -> MatchResultDomain {
+        self.result_domain
+    }
+
+    pub const fn path(&self) -> &WorkspaceRelativePath {
+        &self.path
+    }
+
+    pub const fn typed_key(&self) -> &OpaqueFindingKey {
+        &self.typed_key
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchFindingAnchor {
     Strong(MatchStrongAnchor),
@@ -1069,7 +1105,16 @@ mod tests {
             .unwrap_err(),
             MatchFindingAnchorError::FileAnchorMustUseOnlyPath
         );
-        MatchFindingAnchor::strong(MatchResultDomain::File, path(), None, None, 0).unwrap();
+        let file_anchor =
+            MatchFindingAnchor::strong(MatchResultDomain::File, path(), None, None, 0).unwrap();
+        let MatchFindingAnchor::Strong(fields) = file_anchor else {
+            panic!("expected strong anchor");
+        };
+        assert_eq!(fields.result_domain(), MatchResultDomain::File);
+        assert_eq!(fields.path(), &path());
+        assert_eq!(fields.semantic_owner(), None);
+        assert_eq!(fields.selected_source_sha256(), None);
+        assert_eq!(fields.occurrence_ordinal(), 0);
 
         let cross_file_owner = StableSemanticIdentity::analyzer_declaration_id(
             "rust",
@@ -1148,6 +1193,12 @@ mod tests {
         let key = OpaqueFindingKey::try_new("test-adapter", "snapshot-key-7").unwrap();
         let anchor = MatchFindingAnchor::weak(MatchResultDomain::CallSite, path(), key);
         assert_eq!(anchor.stability(), FindingIdentityStability::Weak);
+        let MatchFindingAnchor::Weak(fields) = &anchor else {
+            panic!("expected weak anchor");
+        };
+        assert_eq!(fields.result_domain(), MatchResultDomain::CallSite);
+        assert_eq!(fields.path(), &path());
+        assert_eq!(fields.typed_key().as_str(), "test-adapter:snapshot-key-7");
         assert_eq!(
             serde_json::to_value(anchor).unwrap(),
             json!({

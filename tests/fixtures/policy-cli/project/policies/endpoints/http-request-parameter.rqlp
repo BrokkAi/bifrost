@@ -1,0 +1,21 @@
+(endpoint
+  :schema-version 1
+  :id "bifrost.sources.http-request-parameter"
+  :name "HTTP request parameter"
+  :display-name "User-controlled I/O"
+  :role source
+  :categories [input.user-controlled io.external]
+  :selector
+    (rql
+      :schema-version 2
+      (language python
+        (call :callee (name "request_parameter"))))
+  :binding return-value
+  :taint
+    (source-semantics
+      :labels [attacker-controlled]
+      :evidence
+        (evidence
+          :trust-boundary external
+          :system-entry vulnerable-system-network-stack))
+  :supersedes [])

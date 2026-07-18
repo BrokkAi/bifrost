@@ -2386,8 +2386,9 @@ mod tests {
     use crate::analyzer::policy::finding::{
         FindingCertainty, FindingCompleteness, FindingIncompleteReason, MatchFindingEvidence,
         PolicyByteSpan, PolicyCapability, PolicyDiagnosticCode, PolicyDisplayRegion,
-        PolicyFailureReason, PolicyFindingEvidence, PolicyQueryProvenance, PolicyQueryResultRef,
-        PolicySourceLocation, PolicyWorkReport, ProofMetadata, ProofReason, ProofState,
+        PolicyFailureReason, PolicyFindingEvidence, PolicyQueryProof, PolicyQueryProvenance,
+        PolicyQueryResultRef, PolicySourceLocation, PolicyWorkReport, ProofMetadata, ProofReason,
+        ProofState,
     };
     use crate::analyzer::policy::finding_identity::{
         MatchFindingAnchor, MatchResultDomain, OpaqueFindingKey, SourceSliceHash,
@@ -2506,6 +2507,18 @@ mod tests {
                 evidence: MatchFindingEvidence::try_new(
                     MatchResultDomain::CallSite,
                     anchor,
+                    PolicyQueryResultRef::CallSite {
+                        location: PolicySourceLocation::span(
+                            WorkspaceRelativePath::new("src/app.rs").unwrap(),
+                            PolicyByteSpan::new(0, 1).unwrap(),
+                            PolicyDisplayRegion::new(1, 1, 1, 2).unwrap(),
+                        ),
+                        caller_fq_name: "crate::caller".to_string(),
+                        caller_identity: None,
+                        callee_fq_name: "crate::callee".to_string(),
+                        callee_identity: None,
+                        proof: PolicyQueryProof::Exact,
+                    },
                     provenance,
                     false,
                 )

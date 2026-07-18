@@ -2439,6 +2439,14 @@ fn adapt_match_candidate(
         }
         None => OwnerCandidate::Absent,
     };
+    let (terminal, terminal_identity_uncertain) = adapt_terminal_result(
+        &item.value,
+        evidence.domain,
+        &evidence.key,
+        &evidence.identities,
+        &path,
+        &location,
+    )?;
 
     let anchor = if result_domain == MatchResultDomain::File {
         MatchFindingAnchor::strong(result_domain, path.clone(), None, None, 0).map_err(|_| ())?
@@ -2478,7 +2486,10 @@ fn adapt_match_candidate(
         return Err(());
     }
     let mut provenance_partial = false;
-    let mut provenance_identity_uncertain = false;
+    let mut provenance_identity_uncertain = terminal_identity_uncertain;
+    if terminal_identity_uncertain {
+        candidate_reasons.push(CertaintyReason::NameBasedResolution);
+    }
     let provenance = item
         .provenance
         .into_iter()
@@ -2521,9 +2532,14 @@ fn adapt_match_candidate(
         FindingCompleteness::partial(finding_incomplete).map_err(|_| ())?
     };
     let id = PolicyFindingId::from_match_anchor(policy_id, &anchor);
-    let evidence =
-        MatchFindingEvidence::try_new(result_domain, anchor, provenance, provenance_truncated)
-            .map_err(|_| ())?;
+    let evidence = MatchFindingEvidence::try_new(
+        result_domain,
+        anchor,
+        terminal,
+        provenance,
+        provenance_truncated,
+    )
+    .map_err(|_| ())?;
     Ok(EvaluatedMatchCandidate {
         id,
         location,
@@ -2631,6 +2647,144 @@ fn terminal_presentation(
     let proof =
         ProofMetadata::try_new(proof_state, vec![proof_reason], Vec::new()).map_err(|_| ())?;
     Ok((location, certainty, proof))
+}
+
+fn adapt_terminal_result(
+    value: &CodeQueryResultValue,
+    expected_domain: DetailedCodeQueryDomain,
+    key: &DetailedCodeQueryKey,
+    identities: &DetailedCodeQueryProvenanceIdentities,
+    expected_path: &WorkspaceRelativePath,
+    location: &PolicySourceLocation,
+) -> Result<(PolicyQueryResultRef, bool), ()> {
+    match (value, expected_domain, key, identities) {
+        (
+            CodeQueryResultValue::StructuralMatch { value },
+            DetailedCodeQueryDomain::StructuralMatch,
+            DetailedCodeQueryKey::StructuralMatch { kind, .. },
+            DetailedCodeQueryProvenanceIdentities::Primary(identity),
+        ) if value.path == expected_path.as_str() && value.kind == kind => Ok((
+            PolicyQueryResultRef::StructuralMatch {
+                kind: kind.clone(),
+                location: location.clone(),
+                identity: validated_provenance_identity(identity.as_ref()),
+            },
+            false,
+        )),
+        (
+            CodeQueryResultValue::Declaration { value },
+            DetailedCodeQueryDomain::Declaration,
+            DetailedCodeQueryKey::Declaration { kind, fq_name, .. },
+            DetailedCodeQueryProvenanceIdentities::Primary(identity),
+        ) if value.path == expected_path.as_str()
+            && value.kind == kind
+            && value.fq_name == *fq_name =>
+        {
+            Ok((
+                PolicyQueryResultRef::Declaration {
+                    kind: kind.clone(),
+                    fq_name: fq_name.clone(),
+                    location: location.clone(),
+                    identity: validated_provenance_identity(identity.as_ref()),
+                },
+                false,
+            ))
+        }
+        (
+            CodeQueryResultValue::File { value },
+            DetailedCodeQueryDomain::File,
+            DetailedCodeQueryKey::File,
+            DetailedCodeQueryProvenanceIdentities::None,
+        ) if value.path == expected_path.as_str() => {
+            Ok((PolicyQueryResultRef::file(expected_path.clone()), false))
+        }
+        (
+            CodeQueryResultValue::ReferenceSite { value },
+            DetailedCodeQueryDomain::ReferenceSite,
+            DetailedCodeQueryKey::ReferenceSite { target_fq_name, .. },
+            DetailedCodeQueryProvenanceIdentities::ReferenceTarget(target_identity),
+        ) if value.path == expected_path.as_str() && value.target.fq_name == *target_fq_name => {
+            let target_identity = validated_provenance_identity(target_identity.as_ref());
+            let identity_uncertain = value.proof == "proven" && target_identity.is_none();
+            Ok((
+                PolicyQueryResultRef::ReferenceSite {
+                    location: location.clone(),
+                    target_fq_name: target_fq_name.clone(),
+                    target_identity,
+                    usage_kind: Some(value.usage_kind.to_string()),
+                    proof: if identity_uncertain {
+                        PolicyQueryProof::NameBased
+                    } else {
+                        policy_query_proof(value.proof)
+                    },
+                },
+                identity_uncertain,
+            ))
+        }
+        (
+            CodeQueryResultValue::CallSite { value },
+            DetailedCodeQueryDomain::CallSite,
+            DetailedCodeQueryKey::CallSite {
+                caller_fq_name,
+                callee_fq_name,
+            },
+            DetailedCodeQueryProvenanceIdentities::Call { caller, callee },
+        ) if value.path == expected_path.as_str()
+            && value.caller.fq_name == *caller_fq_name
+            && value.callee.fq_name == *callee_fq_name =>
+        {
+            let caller_identity = validated_provenance_identity(caller.as_ref());
+            let callee_identity = validated_provenance_identity(callee.as_ref());
+            let identity_uncertain =
+                value.proof == "proven" && (caller_identity.is_none() || callee_identity.is_none());
+            Ok((
+                PolicyQueryResultRef::CallSite {
+                    location: location.clone(),
+                    caller_fq_name: caller_fq_name.clone(),
+                    caller_identity,
+                    callee_fq_name: callee_fq_name.clone(),
+                    callee_identity,
+                    proof: if identity_uncertain {
+                        PolicyQueryProof::NameBased
+                    } else {
+                        policy_query_proof(value.proof)
+                    },
+                },
+                identity_uncertain,
+            ))
+        }
+        (
+            CodeQueryResultValue::ExpressionSite { value },
+            DetailedCodeQueryDomain::ExpressionSite,
+            DetailedCodeQueryKey::ExpressionSite {
+                input_kind,
+                parameter_index,
+                parameter_name,
+            },
+            DetailedCodeQueryProvenanceIdentities::None,
+        ) if value.path == expected_path.as_str()
+            && value.input_kind == input_kind
+            && value
+                .parameter_index
+                .and_then(|index| u32::try_from(index).ok())
+                == *parameter_index
+            && value.parameter_name == *parameter_name =>
+        {
+            Ok((
+                PolicyQueryResultRef::ExpressionSite {
+                    location: location.clone(),
+                    input_kind: input_kind.clone(),
+                    parameter_index: *parameter_index,
+                    parameter_name: parameter_name.clone(),
+                },
+                false,
+            ))
+        }
+        (CodeQueryResultValue::ReceiverAnalysis { .. }, _, _, _)
+        | (_, DetailedCodeQueryDomain::ReceiverAnalysis, _, _)
+        | (_, _, DetailedCodeQueryKey::ReceiverAnalysis { .. }, _) => Err(()),
+        _ => Err(()),
+    }
 }
 
 fn proof_certainty(proof: &str) -> (Vec<CertaintyReason>, ProofState) {
@@ -3359,7 +3513,8 @@ mod tests {
     use crate::analyzer::policy::registry::{PolicyRegistry, PolicyRegistryLimits};
     use crate::analyzer::policy::source::PolicySourceIdentity;
     use crate::analyzer::policy::{CvssMetricValueToken, EvidenceRef};
-    use crate::analyzer::structural::CodeQuery;
+    use crate::analyzer::structural::search::CodeQueryStableOwnerCandidate;
+    use crate::analyzer::structural::{CodeQuery, CodeQueryCallSite, CodeQueryDeclaration};
     use crate::analyzer::{ProjectFile, TestProject, TypescriptAnalyzer};
     use serde_json::json;
 
@@ -4502,6 +4657,18 @@ export function invoke(service: Service) { service.run(); }
                 expected
             );
             assert_eq!(
+                evaluated.candidates[0].evidence.terminal().result_domain(),
+                Some(expected)
+            );
+            assert_eq!(
+                evaluated.candidates[0].evidence.terminal().path(),
+                Some(evaluated.candidates[0].location.path())
+            );
+            assert_eq!(
+                evaluated.candidates[0].evidence.terminal().location(),
+                (expected != MatchResultDomain::File).then_some(&evaluated.candidates[0].location)
+            );
+            assert_eq!(
                 evaluated.candidates[0].location.is_artifact_only(),
                 expected == MatchResultDomain::File
             );
@@ -4524,6 +4691,95 @@ export function invoke(service: Service) { service.run(); }
             PolicyRunCompletion::Failed { .. }
         ));
         assert_eq!(evaluated.work.pipeline_rows(), 0);
+    }
+
+    #[test]
+    fn direct_call_terminal_downgrades_proven_proof_when_caller_identity_is_unavailable() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(root, "app.ts");
+        let policy_id = PolicyId::new("test.direct-terminal-identity").expect("policy id");
+        let call_range = CodeQueryRange {
+            start_line: 2,
+            start_column: 1,
+            end_line: 2,
+            end_column: 10,
+        };
+        let declaration = |fq_name: &str, id: Option<&str>| CodeQueryDeclaration {
+            path: "app.ts".to_string(),
+            language: "typescript",
+            kind: "function",
+            fq_name: fq_name.to_string(),
+            start_line: 1,
+            end_line: 2,
+            signature: None,
+            id: id.map(str::to_string),
+            node_range: Some(call_range),
+        };
+        let item = CodeQueryResultItem {
+            value: CodeQueryResultValue::CallSite {
+                value: Box::new(CodeQueryCallSite {
+                    path: "app.ts".to_string(),
+                    language: "typescript",
+                    range: call_range,
+                    callee_range: call_range,
+                    caller: declaration("<anonymous>", None),
+                    callee: declaration("target", Some("function:target")),
+                    call_kind: "direct",
+                    proof: "proven",
+                    receiver: None,
+                    arguments: Vec::new(),
+                }),
+            },
+            provenance: Vec::new(),
+            provenance_truncated: false,
+        };
+        let evidence = DetailedCodeQueryEvidence {
+            result_index: 0,
+            domain: DetailedCodeQueryDomain::CallSite,
+            key: DetailedCodeQueryKey::CallSite {
+                caller_fq_name: "<anonymous>".to_string(),
+                callee_fq_name: "target".to_string(),
+            },
+            file: file.clone(),
+            byte_span: Some(30..39),
+            stable_owner_candidate: None,
+            identities: DetailedCodeQueryProvenanceIdentities::Call {
+                caller: None,
+                callee: Some(DetailedCodeQueryIdentityCandidate {
+                    file,
+                    candidate: CodeQueryStableOwnerCandidate {
+                        namespace: "typescript".to_string(),
+                        derivation: CodeQueryStableOwnerDerivation::AnalyzerDeclarationId,
+                        semantic_key: "function:target".to_string(),
+                    },
+                }),
+            },
+            source_slice_sha256: Some([7; 32]),
+            provenance: Vec::new(),
+        };
+        let candidate = adapt_match_candidate(&policy_id, item, evidence, &[], &mut HashMap::new())
+            .expect("synthetic detailed/public terminal pair adapts");
+
+        assert!(
+            matches!(
+                candidate.evidence.terminal(),
+                PolicyQueryResultRef::CallSite {
+                    caller_identity: None,
+                    callee_identity: Some(_),
+                    proof: PolicyQueryProof::NameBased,
+                    ..
+                }
+            ),
+            "unexpected terminal: {:?}",
+            candidate.evidence.terminal()
+        );
+        assert!(matches!(
+            candidate.certainty,
+            FindingCertainty::Possible { ref reasons }
+                if reasons.contains(&CertaintyReason::NameBasedResolution)
+        ));
+        assert_eq!(candidate.proof.state(), ProofState::Unproven);
     }
 
     #[test]
@@ -4739,6 +4995,7 @@ export function invoke(service: Service) { service.run(); }
             },
             file,
             byte_span: Some(0..4),
+            identities: DetailedCodeQueryProvenanceIdentities::Primary(None),
             stable_owner_candidate: Some(
                 crate::analyzer::structural::search::CodeQueryStableOwnerCandidate {
                     namespace: "INVALID".to_string(),
@@ -4786,6 +5043,7 @@ export function invoke(service: Service) { service.run(); }
             },
             file: file.clone(),
             byte_span: Some(span),
+            identities: DetailedCodeQueryProvenanceIdentities::Primary(None),
             stable_owner_candidate: None,
             source_slice_sha256: None,
             provenance: Vec::new(),

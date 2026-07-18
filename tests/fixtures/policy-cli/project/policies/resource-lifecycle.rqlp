@@ -1,0 +1,47 @@
+(policy
+  :schema-version 1
+  :id "bifrost.test.resource-lifecycle"
+  :name "Resource lifecycle"
+  :message "Resource can leave its analysis root without being closed"
+  :severity error
+  :analysis
+    (analysis
+      :type typestate
+      :mode may
+      :subjects
+        (subject-set
+          :include-matches [
+            (match-directory
+              :path "policies/endpoints"
+              :scope recursive
+              :categories (all [resource.acquire]))]
+          :entries [])
+      :uncertainty
+        (uncertainty
+          :unknown-call inconclusive
+          :escape inconclusive)
+      :automaton
+        (automaton
+          :states [open closed violated]
+          :initial open
+          :accepting-states [closed]
+          :error-states [violated]
+          :events [
+            (event
+              :id close
+              :matches
+                (match-directory
+                  :path "policies/endpoints"
+                  :scope recursive
+                  :role sink
+                  :phase after-normal-return
+                  :categories (all [resource.close]))
+              :supersedes [])]
+          :transitions [
+            (transition :from open :on close :to closed)]
+          :terminal-expectations [
+            (terminal-expectation
+              :id "normal-exit-closed"
+              :on (normal-procedure-exit :scope analysis-root)
+              :expected-states [closed]
+              :supersedes [])])))

@@ -520,6 +520,7 @@ impl std::error::Error for PolicyLocationError {}
 pub struct MatchFindingEvidence {
     result_domain: MatchResultDomain,
     anchor: MatchFindingAnchor,
+    terminal: PolicyQueryResultRef,
     provenance: Vec<PolicyQueryProvenance>,
     provenance_truncated: bool,
 }
@@ -528,12 +529,24 @@ impl MatchFindingEvidence {
     pub fn try_new(
         result_domain: MatchResultDomain,
         anchor: MatchFindingAnchor,
+        mut terminal: PolicyQueryResultRef,
         mut provenance: Vec<PolicyQueryProvenance>,
         provenance_truncated: bool,
     ) -> Result<Self, ReportValueError> {
         if result_domain != anchor.result_domain() {
             return Err(ReportValueError::AnchorDomainMismatch);
         }
+        terminal.validate()?;
+        let Some((terminal_domain, terminal_path, _)) = terminal.terminal_shape() else {
+            return Err(ReportValueError::UnsupportedTerminalResult);
+        };
+        if result_domain != terminal_domain {
+            return Err(ReportValueError::TerminalDomainMismatch);
+        }
+        if terminal_path != anchor.path().as_str() {
+            return Err(ReportValueError::TerminalAnchorPathMismatch);
+        }
+        terminal.tighten_owned_storage();
         if provenance.len() > MAX_QUERY_PROVENANCE {
             return Err(ReportValueError::TooManyItems {
                 field: "query_provenance",
@@ -544,6 +557,7 @@ impl MatchFindingEvidence {
         let evidence = Self {
             result_domain,
             anchor,
+            terminal,
             provenance,
             provenance_truncated,
         };
@@ -564,6 +578,10 @@ impl MatchFindingEvidence {
         &self.anchor
     }
 
+    pub const fn terminal(&self) -> &PolicyQueryResultRef {
+        &self.terminal
+    }
+
     pub fn provenance(&self) -> &[PolicyQueryProvenance] {
         &self.provenance
     }
@@ -577,6 +595,7 @@ impl RetainedSize for MatchFindingEvidence {
     fn retained_size(&self) -> usize {
         size_of::<Self>()
             .saturating_add(retained_extra(&self.anchor))
+            .saturating_add(retained_extra(&self.terminal))
             .saturating_add(retained_extra(&self.provenance))
     }
 }
@@ -806,6 +825,38 @@ impl PolicyQueryResultRef {
         Self::File { path }
     }
 
+    pub const fn result_domain(&self) -> Option<MatchResultDomain> {
+        match self {
+            Self::StructuralMatch { .. } => Some(MatchResultDomain::StructuralMatch),
+            Self::Declaration { .. } => Some(MatchResultDomain::Declaration),
+            Self::File { .. } => Some(MatchResultDomain::File),
+            Self::ReferenceSite { .. } => Some(MatchResultDomain::ReferenceSite),
+            Self::CallSite { .. } => Some(MatchResultDomain::CallSite),
+            Self::ExpressionSite { .. } => Some(MatchResultDomain::ExpressionSite),
+            Self::ReceiverAnalysis { .. } | Self::Unsupported { .. } => None,
+        }
+    }
+
+    pub const fn location(&self) -> Option<&PolicySourceLocation> {
+        match self {
+            Self::StructuralMatch { location, .. }
+            | Self::Declaration { location, .. }
+            | Self::ReferenceSite { location, .. }
+            | Self::CallSite { location, .. }
+            | Self::ExpressionSite { location, .. }
+            | Self::ReceiverAnalysis { location, .. } => Some(location),
+            Self::File { .. } => None,
+            Self::Unsupported { location, .. } => location.as_ref(),
+        }
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::File { path } => Some(path.as_str()),
+            _ => self.location().map(PolicySourceLocation::path),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), ReportValueError> {
         match self {
             Self::StructuralMatch {
@@ -882,6 +933,10 @@ impl PolicyQueryResultRef {
             validate_report_prose(fq_name)?;
         }
         Ok(())
+    }
+
+    fn terminal_shape(&self) -> Option<(MatchResultDomain, &str, Option<&PolicySourceLocation>)> {
+        Some((self.result_domain()?, self.path()?, self.location()))
     }
 
     fn tighten_owned_storage(&mut self) {
@@ -1248,6 +1303,11 @@ impl BoundedWitness {
         truncated: bool,
         omitted_steps_lower_bound: u64,
     ) -> Result<Self, ReportValueError> {
+        if steps.is_empty() {
+            return Err(ReportValueError::EmptyCollection {
+                field: "witness_steps",
+            });
+        }
         if steps.len() > MAX_WITNESS_STEPS {
             return Err(ReportValueError::TooManyItems {
                 field: "witness_steps",
@@ -2022,6 +2082,7 @@ pub enum PolicyFindingError {
     EmptyMessage,
     PrimaryEvidencePathMismatch,
     PrimaryLocationDomainMismatch,
+    PrimaryTerminalLocationMismatch,
     MissingCompletenessReason { reason: FindingIncompleteReason },
     DuplicateWitnessId,
     DanglingWitnessReference { witness_id: WitnessId },
@@ -2056,6 +2117,9 @@ impl fmt::Display for PolicyFindingError {
             }
             Self::PrimaryLocationDomainMismatch => formatter
                 .write_str("finding primary location shape does not match its analysis domain"),
+            Self::PrimaryTerminalLocationMismatch => formatter.write_str(
+                "finding primary location does not match its typed terminal result location",
+            ),
             Self::MissingCompletenessReason { reason } => {
                 write!(
                     formatter,
@@ -2197,6 +2261,14 @@ impl PolicyRun {
     pub fn findings(&self) -> &[PolicyFinding] {
         &self.findings
     }
+
+    pub(crate) fn take_findings(&mut self) -> Vec<PolicyFinding> {
+        let findings = std::mem::take(&mut self.findings);
+        self.work.retained_findings = 0;
+        self.refresh_retained_bytes();
+        findings
+    }
+
     pub fn diagnostics(&self) -> &[PolicyDiagnostic] {
         &self.diagnostics
     }
@@ -2404,6 +2476,12 @@ fn validate_primary_evidence_shape(
     );
     if primary.is_artifact_only() != artifact_expected {
         return Err(PolicyFindingError::PrimaryLocationDomainMismatch);
+    }
+    if let PolicyFindingEvidence::Match { evidence } = evidence
+        && let Some((_, _, Some(terminal_location))) = evidence.terminal().terminal_shape()
+        && terminal_location != primary
+    {
+        return Err(PolicyFindingError::PrimaryTerminalLocationMismatch);
     }
     Ok(())
 }
@@ -2696,6 +2774,9 @@ fn completion_has_incomplete_reason(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReportValueError {
     EmptyIdentifier,
+    EmptyCollection {
+        field: &'static str,
+    },
     IdentifierTooLong {
         max_bytes: usize,
     },
@@ -2705,6 +2786,9 @@ pub enum ReportValueError {
     },
     InvalidWorkspacePath,
     AnchorDomainMismatch,
+    TerminalDomainMismatch,
+    TerminalAnchorPathMismatch,
+    UnsupportedTerminalResult,
     ResultLocationMustHaveSpan,
     StableIdentityPathMismatch,
     TooManyItems {
@@ -2729,6 +2813,9 @@ impl fmt::Display for ReportValueError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyIdentifier => formatter.write_str("report identifier must not be empty"),
+            Self::EmptyCollection { field } => {
+                write!(formatter, "{field} must contain at least one item")
+            }
             Self::IdentifierTooLong { max_bytes } => {
                 write!(
                     formatter,
@@ -2747,6 +2834,13 @@ impl fmt::Display for ReportValueError {
             Self::AnchorDomainMismatch => {
                 formatter.write_str("match evidence domain does not match its anchor domain")
             }
+            Self::TerminalDomainMismatch => formatter
+                .write_str("match evidence terminal domain does not match its declared domain"),
+            Self::TerminalAnchorPathMismatch => {
+                formatter.write_str("match evidence terminal path does not match its anchor path")
+            }
+            Self::UnsupportedTerminalResult => formatter
+                .write_str("match evidence terminal must be an accepted diagnostic result domain"),
             Self::ResultLocationMustHaveSpan => formatter
                 .write_str("non-file query provenance requires a span-bearing source location"),
             Self::StableIdentityPathMismatch => formatter
@@ -2998,6 +3092,21 @@ mod tests {
         )
     }
 
+    fn call_terminal_at(location: PolicySourceLocation) -> PolicyQueryResultRef {
+        PolicyQueryResultRef::CallSite {
+            location,
+            caller_fq_name: "crate::caller".to_string(),
+            caller_identity: None,
+            callee_fq_name: "crate::callee".to_string(),
+            callee_identity: None,
+            proof: PolicyQueryProof::Exact,
+        }
+    }
+
+    fn call_terminal() -> PolicyQueryResultRef {
+        call_terminal_at(location())
+    }
+
     fn loaded_match_policy() -> LoadedPolicy {
         let source = include_str!("../../../tests/fixtures/policies/dynamic-eval.rqlp");
         let identity = PolicySourceIdentity::new("policy.rqlp");
@@ -3051,6 +3160,7 @@ mod tests {
             evidence: MatchFindingEvidence::try_new(
                 MatchResultDomain::CallSite,
                 anchor,
+                call_terminal(),
                 Vec::new(),
                 false,
             )
@@ -3197,7 +3307,7 @@ mod tests {
     }
 
     #[test]
-    fn match_evidence_rejects_domain_mismatch_and_unbounded_provenance() {
+    fn match_evidence_rejects_anchor_terminal_mismatches_and_unbounded_provenance() {
         let anchor = MatchFindingAnchor::strong(
             MatchResultDomain::CallSite,
             path(),
@@ -3210,11 +3320,60 @@ mod tests {
             MatchFindingEvidence::try_new(
                 MatchResultDomain::Declaration,
                 anchor.clone(),
+                call_terminal(),
                 Vec::new(),
                 false,
             )
             .unwrap_err(),
             ReportValueError::AnchorDomainMismatch
+        );
+        assert_eq!(
+            MatchFindingEvidence::try_new(
+                MatchResultDomain::CallSite,
+                anchor.clone(),
+                PolicyQueryResultRef::Declaration {
+                    kind: "function".to_string(),
+                    fq_name: "crate::callee".to_string(),
+                    location: location(),
+                    identity: None,
+                },
+                Vec::new(),
+                false,
+            )
+            .unwrap_err(),
+            ReportValueError::TerminalDomainMismatch
+        );
+        let other_location = PolicySourceLocation::span(
+            WorkspaceRelativePath::new("src/other.rs").unwrap(),
+            PolicyByteSpan::new(4, 9).unwrap(),
+            PolicyDisplayRegion::new(2, 3, 2, 8).unwrap(),
+        );
+        assert_eq!(
+            MatchFindingEvidence::try_new(
+                MatchResultDomain::CallSite,
+                anchor.clone(),
+                call_terminal_at(other_location),
+                Vec::new(),
+                false,
+            )
+            .unwrap_err(),
+            ReportValueError::TerminalAnchorPathMismatch
+        );
+        assert_eq!(
+            MatchFindingEvidence::try_new(
+                MatchResultDomain::CallSite,
+                anchor.clone(),
+                PolicyQueryResultRef::ReceiverAnalysis {
+                    location: location(),
+                    analysis_kind: "receiver_targets".to_string(),
+                    outcome: "unknown".to_string(),
+                    capture: None,
+                },
+                Vec::new(),
+                false,
+            )
+            .unwrap_err(),
+            ReportValueError::UnsupportedTerminalResult
         );
 
         let seed = PolicyQueryResultRef::file(path());
@@ -3223,10 +3382,51 @@ mod tests {
             MatchFindingEvidence::try_new(
                 MatchResultDomain::CallSite,
                 anchor,
+                call_terminal(),
                 vec![provenance; MAX_QUERY_PROVENANCE + 1],
                 true,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn finding_primary_must_equal_the_typed_terminal_location() {
+        let loaded = loaded_match_policy();
+        let anchor = MatchFindingAnchor::strong(
+            MatchResultDomain::CallSite,
+            path(),
+            None,
+            Some(SourceSliceHash::from_bytes([4; 32])),
+            0,
+        )
+        .unwrap();
+        let terminal_location = PolicySourceLocation::span(
+            path(),
+            PolicyByteSpan::new(10, 15).unwrap(),
+            PolicyDisplayRegion::new(3, 1, 3, 6).unwrap(),
+        );
+        let evidence = PolicyFindingEvidence::Match {
+            evidence: MatchFindingEvidence::try_new(
+                MatchResultDomain::CallSite,
+                anchor,
+                call_terminal_at(terminal_location),
+                Vec::new(),
+                false,
+            )
+            .unwrap(),
+        };
+
+        assert_eq!(
+            finding_with(
+                &loaded,
+                evidence,
+                Vec::new(),
+                None,
+                &PolicyBudget::default(),
+            )
+            .unwrap_err(),
+            PolicyFindingError::PrimaryTerminalLocationMismatch
         );
     }
 
@@ -3285,9 +3485,14 @@ mod tests {
             path(),
             OpaqueFindingKey::try_new("query", "run-key").unwrap(),
         );
-        let evidence =
-            MatchFindingEvidence::try_new(MatchResultDomain::CallSite, anchor, Vec::new(), false)
-                .unwrap();
+        let evidence = MatchFindingEvidence::try_new(
+            MatchResultDomain::CallSite,
+            anchor,
+            call_terminal(),
+            Vec::new(),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             evidence.anchor().stability(),
             super::super::finding_identity::FindingIdentityStability::Weak
@@ -3412,6 +3617,7 @@ mod tests {
             MatchFindingEvidence::try_new(
                 MatchResultDomain::CallSite,
                 anchor,
+                call_terminal(),
                 vec![large_trace; MAX_QUERY_PROVENANCE],
                 false,
             ),

@@ -95,6 +95,14 @@ fn public_match_evaluator_returns_a_complete_typed_finding_and_clean_empty_run()
         finding.evidence(),
         PolicyFindingEvidence::Match { evidence }
             if evidence.result_domain() == MatchResultDomain::StructuralMatch
+                && matches!(
+                    evidence.terminal(),
+                    brokk_bifrost::policy::PolicyQueryResultRef::StructuralMatch {
+                        kind,
+                        location,
+                        ..
+                    } if kind == "function" && location == finding.primary()
+                )
     ));
 
     let clean = r#"(policy
