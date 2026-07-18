@@ -7,7 +7,7 @@ use std::time::Duration;
 use moka::sync::Cache;
 
 use crate::analyzer::tree_sitter_analyzer::{PreparedSourceOrigin, PreparedSyntaxTree};
-use crate::analyzer::{Language, LanguageAdapter, ProjectFile, TreeSitterAnalyzer};
+use crate::analyzer::{LanguageAdapter, ProjectFile, TreeSitterAnalyzer};
 use crate::hash::HashMap;
 
 use super::{
@@ -305,50 +305,6 @@ pub(crate) trait ProgramSemanticsLowerer: Send + Sync {
         budget: &super::SemanticBudget,
         cancellation: &super::CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError>;
-}
-
-/// Honest placeholder used by routed analyzers until their real execution
-/// adapter lands. It never publishes or caches an empty artifact.
-pub(crate) struct UnsupportedProgramSemanticsLowerer {
-    language: Language,
-}
-
-impl UnsupportedProgramSemanticsLowerer {
-    pub(crate) const fn new(language: Language) -> Self {
-        Self { language }
-    }
-}
-
-impl ProgramSemanticsLowerer for UnsupportedProgramSemanticsLowerer {
-    fn identity(&self) -> SemanticAdapterIdentity {
-        SemanticAdapterIdentity {
-            adapter: AdapterSemanticsVersion::hash_bytes(
-                format!("{}-semantic-adapter", self.language.config_label()),
-                b"unimplemented-v1",
-            )
-            .expect("analyzable language labels are non-empty"),
-            configuration: ConfigurationFingerprint::hash_bytes(b"no-intrafile-configuration"),
-            dependencies: DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
-        }
-    }
-
-    fn capabilities(&self) -> SemanticCapabilities {
-        SemanticCapabilities::default()
-    }
-
-    fn lower(
-        &self,
-        _file: &ProjectFile,
-        _prepared: &PreparedSyntaxTree,
-        _budget: &super::SemanticBudget,
-        _cancellation: &super::CancellationToken,
-    ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
-        Ok(SemanticOutcome::Unsupported {
-            capability: super::SemanticCapability::Procedures,
-            partial: None,
-            work: SemanticWork::default(),
-        })
-    }
 }
 
 /// Materialize against exactly one prepared syntax snapshot.
@@ -791,7 +747,7 @@ mod tests {
     use super::*;
     use crate::analyzer::semantic::SemanticBudget;
     use crate::analyzer::typescript::TypescriptAdapter;
-    use crate::analyzer::{IAnalyzer, OverlayProject, TestProject};
+    use crate::analyzer::{IAnalyzer, Language, OverlayProject, TestProject};
 
     #[derive(Clone, Copy)]
     enum FakeMode {

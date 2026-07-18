@@ -862,6 +862,7 @@ fn ruby_capabilities() -> SemanticCapabilities {
         SemanticCapability::ExceptionalControlFlow,
         SemanticCapability::CleanupControlFlow,
         SemanticCapability::Calls,
+        SemanticCapability::DynamicDispatch,
         SemanticCapability::CallableReferences,
         SemanticCapability::Values,
         SemanticCapability::GeneratorSuspension,
@@ -3091,6 +3092,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.edge(builder, normal, next)?;
         self.route_call_exceptional(builder, exceptional, next, scope, stack)?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+        self.add_gap(
+            builder,
+            invoke,
+            SemanticGapSubject::CallSite(call_site),
+            SemanticCapability::DynamicDispatch,
+            SemanticGapKind::Unknown,
+            "Ruby method dispatch may select an override or method_missing target; complete receiver-class coverage requires runtime refinement",
+        )?;
         self.ruby_call_gaps(
             builder,
             invoke,
@@ -3896,7 +3905,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )?;
         self.edge(builder, normal, next)?;
         self.route_call_exceptional(builder, exceptional, next, scope, stack)?;
-        self.resolution_gaps(builder, invoke, callee, call_site, &resolution)
+        self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+        self.add_gap(
+            builder,
+            invoke,
+            SemanticGapSubject::CallSite(call_site),
+            SemanticCapability::DynamicDispatch,
+            SemanticGapKind::Unknown,
+            "bare Ruby calls dispatch through the implicit receiver and may use method_missing; complete target coverage requires runtime refinement",
+        )
     }
 
     fn unsupported_super(

@@ -8,11 +8,11 @@ use crate::analyzer::lexical_definitions::{
 };
 use crate::analyzer::structural::FileFacts;
 use crate::analyzer::usages::get_definition::{
-    CallSiteSyntax, CallSyntaxKind, DefinitionLookupOutcome, DefinitionLookupRequest,
-    DefinitionLookupStatus, ExactCallReference, ExactCallReferenceGap,
-    call_reference_ranges_in_tree, call_site_syntax_for_reference, exact_call_reference_for_call,
-    parse_tree_for_language, resolve_definition_batch_with_source,
-    resolve_definition_batch_with_source_and_cancellation,
+    CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC, CallSiteSyntax, CallSyntaxKind, DefinitionLookupOutcome,
+    DefinitionLookupRequest, DefinitionLookupStatus, ExactCallReference, ExactCallReferenceGap,
+    call_reference_ranges_in_tree, call_reference_requires_point_lookup,
+    call_site_syntax_for_reference, exact_call_reference_for_call, parse_tree_for_language,
+    resolve_definition_batch_with_source, resolve_definition_batch_with_source_and_cancellation,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
@@ -60,6 +60,18 @@ pub(crate) struct CallDispatchTarget {
     pub(crate) proof: UsageProof,
 }
 
+/// Keep exact source identity after location-first dispatch. C/C++ declaration
+/// and body candidates are related by the structured include graph in the
+/// definition resolver; external linkage alone is not a workspace-global
+/// identity because one workspace can contain several independently linked
+/// binaries or modules.
+pub(crate) fn call_dispatch_equivalence_source(
+    _analyzer: &dyn IAnalyzer,
+    definition: &CodeUnit,
+) -> Option<ProjectFile> {
+    Some(definition.source().clone())
+}
+
 /// A dispatch arm that has no workspace procedure target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CallDispatchBoundaryKind {
@@ -69,6 +81,9 @@ pub(crate) enum CallDispatchBoundaryKind {
     /// The exact resolver status is retained rather than collapsed into an
     /// empty target list.
     Unresolved(DefinitionLookupStatus),
+    /// Structured declaration/body evidence exists, but no build graph proves
+    /// that the retained C/C++ body belongs to this call's link unit.
+    UnprovenTargetIdentity,
     /// A candidate set was retained only up to the supplied target bound.
     Truncated,
 }
@@ -243,6 +258,7 @@ impl CallRelationService {
             analyzer,
             &location.file,
             Arc::clone(&exact_source),
+            &tree,
             std::slice::from_ref(&callee_range),
             cancellation,
         );
@@ -476,6 +492,7 @@ impl CallRelationService {
             analyzer,
             caller.source(),
             Arc::clone(&source),
+            &tree,
             &candidates,
             cancellation,
         );
@@ -540,6 +557,7 @@ fn resolve_call_references_with_source(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: Arc<String>,
+    tree: &tree_sitter::Tree,
     references: &[Range],
     cancellation: Option<&CancellationToken>,
 ) -> CallReferenceResolutionBatch {
@@ -550,7 +568,8 @@ fn resolve_call_references_with_source(
             line: None,
             column: None,
             start_byte: Some(range.start_byte),
-            end_byte: Some(range.end_byte),
+            end_byte: (!call_reference_requires_point_lookup(tree, language_for_file(file), range))
+                .then_some(range.end_byte),
         })
         .collect();
     let outcomes = match cancellation {
@@ -596,6 +615,9 @@ fn apply_dispatch_outcome(
         diagnostics,
         reference: _,
     } = outcome;
+    let unproven_target_identity = diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.kind == CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC);
     lookup.status = Some(status);
     lookup.diagnostics.extend(
         diagnostics
@@ -611,7 +633,7 @@ fn apply_dispatch_outcome(
         lookup.budget_exhausted = true;
         lookup.boundaries.push(CallDispatchBoundaryKind::Truncated);
     }
-    let proof = if status == DefinitionLookupStatus::Resolved {
+    let proof = if status == DefinitionLookupStatus::Resolved && !unproven_target_identity {
         UsageProof::Proven
     } else {
         UsageProof::Unproven
@@ -621,6 +643,11 @@ fn apply_dispatch_outcome(
             .into_iter()
             .map(|definition| CallDispatchTarget { definition, proof }),
     );
+    if unproven_target_identity {
+        lookup
+            .boundaries
+            .push(CallDispatchBoundaryKind::UnprovenTargetIdentity);
+    }
 
     match status {
         DefinitionLookupStatus::Resolved | DefinitionLookupStatus::Ambiguous
@@ -1038,6 +1065,129 @@ mod tests {
         assert_eq!(lookup.targets.len(), 1, "{lookup:#?}");
         assert_eq!(lookup.targets[0].definition.fq_name(), "Example.helper");
         assert_eq!(lookup.targets[0].proof, UsageProof::Proven);
+        assert!(lookup.boundaries.is_empty(), "{lookup:#?}");
+    }
+
+    #[test]
+    fn exact_dispatch_resolves_cpp_template_operator_and_destructor_names() {
+        let source = r#"
+namespace ns {
+template <typename T> void make(T) {}
+template <typename T> struct Box { Box() {} };
+struct Widget {
+  template <typename T> void run(T) {}
+  Widget& operator+(int) { return *this; }
+  ~Widget() {}
+};
+}
+void caller(ns::Widget& receiver) {
+  ns::make<int>(1);
+  new ns::Box<int>();
+  receiver.run<int>(1);
+  receiver.operator+(1);
+  receiver.~Widget();
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Cpp, &[("calls.cpp", source)]);
+
+        for (call, identifier) in [
+            ("ns::make<int>(1)", "make"),
+            ("new ns::Box<int>()", "Box"),
+            ("receiver.run<int>(1)", "run"),
+            ("receiver.operator+(1)", "operator+"),
+            ("receiver.~Widget()", "~Widget"),
+        ] {
+            let lookup = CallRelationService::dispatch_at_bounded(
+                fixture.analyzer.analyzer(),
+                &ExactCallLocation {
+                    file: ProjectFile::new(fixture.project_root(), "calls.cpp"),
+                    call_span: call_span(source, call),
+                },
+                Arc::new(source.to_string()),
+                generous_limits(),
+                None,
+            );
+
+            assert_eq!(
+                lookup.status,
+                Some(DefinitionLookupStatus::Resolved),
+                "{call}: {lookup:#?}"
+            );
+            assert_eq!(lookup.targets.len(), 1, "{call}: {lookup:#?}");
+            assert_eq!(lookup.targets[0].definition.identifier(), identifier);
+            assert!(lookup.boundaries.is_empty(), "{call}: {lookup:#?}");
+        }
+    }
+
+    #[test]
+    fn exact_dispatch_keeps_cpp_function_pointer_calls_as_a_typed_boundary() {
+        let source = r#"
+void target() {}
+void caller() {
+  void (*callable)() = &target;
+  callable();
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Cpp, &[("calls.cpp", source)]);
+        let lookup = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            &ExactCallLocation {
+                file: ProjectFile::new(fixture.project_root(), "calls.cpp"),
+                call_span: call_span(source, "callable()"),
+            },
+            Arc::new(source.to_string()),
+            generous_limits(),
+            None,
+        );
+
+        assert_eq!(lookup.status, Some(DefinitionLookupStatus::NoDefinition));
+        assert!(lookup.targets.is_empty(), "{lookup:#?}");
+        assert_eq!(
+            lookup.boundaries,
+            vec![CallDispatchBoundaryKind::Unresolved(
+                DefinitionLookupStatus::NoDefinition
+            )]
+        );
+        assert!(
+            lookup
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("no_indexed_definition")),
+            "{lookup:#?}"
+        );
+    }
+
+    #[test]
+    fn exact_dispatch_keeps_cpp_internal_linkage_in_its_translation_unit() {
+        let caller_source = r#"
+static int local_target(int value) { return value + 1; }
+int caller() { return local_target(1); }
+"#;
+        let unrelated_source = "static int local_target(int value) { return value + 2; }\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Cpp,
+            &[
+                ("caller.c", caller_source),
+                ("unrelated.c", unrelated_source),
+            ],
+        );
+        let lookup = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            &ExactCallLocation {
+                file: ProjectFile::new(fixture.project_root(), "caller.c"),
+                call_span: call_span(caller_source, "local_target(1)"),
+            },
+            Arc::new(caller_source.to_string()),
+            generous_limits(),
+            None,
+        );
+
+        assert_eq!(lookup.status, Some(DefinitionLookupStatus::Resolved));
+        assert_eq!(lookup.targets.len(), 1, "{lookup:#?}");
+        assert_eq!(
+            lookup.targets[0].definition.source().rel_path(),
+            std::path::Path::new("caller.c")
+        );
         assert!(lookup.boundaries.is_empty(), "{lookup:#?}");
     }
 

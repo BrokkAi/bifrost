@@ -437,27 +437,6 @@ pub trait ProgramSemanticsProvider: Send + Sync {
     ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError>;
 }
 
-macro_rules! impl_forward_program_semantics_provider {
-    ($analyzer:ty) => {
-        impl crate::analyzer::semantic::ProgramSemanticsProvider for $analyzer {
-            fn materialize(
-                &self,
-                file: &crate::analyzer::ProjectFile,
-                request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
-            ) -> Result<
-                crate::analyzer::semantic::SemanticOutcome<
-                    std::sync::Arc<crate::analyzer::semantic::SemanticArtifact>,
-                >,
-                crate::analyzer::semantic::SemanticProviderError,
-            > {
-                self.inner.materialize_unsupported_semantics(file, request)
-            }
-        }
-    };
-}
-
-pub(crate) use impl_forward_program_semantics_provider;
-
 #[cfg(test)]
 mod tests {
     use super::*;

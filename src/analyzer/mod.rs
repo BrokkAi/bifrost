@@ -98,7 +98,7 @@ pub use model::{
     TestAssertionSmell, TestAssertionWeights, metrics_from_declarations,
 };
 pub(crate) use model::{
-    CppTemplateAliasTargetMetadata, CppTemplateExpression, CppTemplateMetadata,
+    CallableLinkage, CppTemplateAliasTargetMetadata, CppTemplateExpression, CppTemplateMetadata,
     CppTemplateParameterKind, CppTemplateParameterMetadata, CppTemplateTerm, SemanticDiagnostic,
 };
 pub(crate) use multi_analyzer::resolve_analyzer;

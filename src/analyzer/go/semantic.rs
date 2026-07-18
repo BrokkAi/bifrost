@@ -156,6 +156,7 @@ fn go_capabilities() -> SemanticCapabilities {
         SemanticCapability::ExceptionalControlFlow,
         SemanticCapability::CleanupControlFlow,
         SemanticCapability::Calls,
+        SemanticCapability::DynamicDispatch,
         SemanticCapability::CallableReferences,
         SemanticCapability::Values,
         SemanticCapability::DeferredExecution,
@@ -1839,6 +1840,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.edge(builder, normal, next)?;
         self.abrupt(builder, exceptional, scope, CompletionKind::Throw, None)?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+
+        if receiver.is_some() {
+            self.add_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::DynamicDispatch,
+                SemanticGapKind::Unknown,
+                "selector dispatch may target an interface method or promoted method; receiver type and complete method-set coverage require type refinement",
+            )?;
+        }
 
         let evaluations = call_operand_evaluations(node, false)?;
         self.note_deterministic_evaluation_order(builder, entry, node, &evaluations)?;

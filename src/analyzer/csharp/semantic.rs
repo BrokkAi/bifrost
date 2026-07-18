@@ -156,6 +156,7 @@ fn csharp_capabilities() -> SemanticCapabilities {
         SemanticCapability::ExceptionalControlFlow,
         SemanticCapability::CleanupControlFlow,
         SemanticCapability::Calls,
+        SemanticCapability::DynamicDispatch,
         SemanticCapability::CallableReferences,
         SemanticCapability::Values,
         SemanticCapability::NonLocalControl,
@@ -2765,6 +2766,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             stack,
         )?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+
+        if !constructor {
+            self.add_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::DynamicDispatch,
+                SemanticGapKind::Unknown,
+                "invocation may select a virtual member or delegate target; static/final dispatch and complete override coverage require type-hierarchy refinement",
+            )?;
+        }
 
         if function.is_some_and(|function| function.kind() == "conditional_access_expression") {
             let function = function.expect("guarded conditional function");

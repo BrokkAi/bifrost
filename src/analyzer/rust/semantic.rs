@@ -156,6 +156,7 @@ fn rust_capabilities() -> SemanticCapabilities {
         SemanticCapability::ExceptionalControlFlow,
         SemanticCapability::CleanupControlFlow,
         SemanticCapability::Calls,
+        SemanticCapability::DynamicDispatch,
         SemanticCapability::CallableReferences,
         SemanticCapability::Values,
         SemanticCapability::AsyncSuspendResume,
@@ -2258,6 +2259,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.abrupt(builder, exceptional, scope, CompletionKind::Throw, None)?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
         if receiver_node.is_some() {
+            self.add_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::DynamicDispatch,
+                SemanticGapKind::Unknown,
+                "method dispatch may use a trait implementation after autoderef; receiver type and complete implementation coverage require type refinement",
+            )?;
             self.add_gap(
                 builder,
                 invoke,

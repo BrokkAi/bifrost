@@ -60,7 +60,15 @@ pub(super) fn resolve_php(
     match php_reference_node(node) {
         Some(PhpReferenceNode::Type(type_node)) => {
             let raw = php_qualified_candidate_text(type_node, source);
-            php_fqn_outcome(support, resolve_php_type(&raw, &ctx), &raw)
+            let relative_class_keyword = ["self", "static", "parent"]
+                .into_iter()
+                .any(|keyword| raw.eq_ignore_ascii_case(keyword));
+            let owner = if type_node.kind() == "relative_scope" || relative_class_keyword {
+                php_static_scope_fqn(php, support, type_node, source, &ctx, &class_ranges)
+            } else {
+                resolve_php_type(&raw, &ctx)
+            };
+            php_fqn_outcome(support, owner, &raw)
         }
         Some(PhpReferenceNode::Function(name_node)) => {
             let raw = php_qualified_candidate_text(name_node, source);
@@ -202,7 +210,7 @@ fn php_reference_node<'tree>(node: Node<'tree>) -> Option<PhpReferenceNode<'tree
             let name = node.child_by_field_name("name")?;
             Some(PhpReferenceNode::InstanceMember { object, name })
         }
-        "name" | "qualified_name" => {
+        "name" | "qualified_name" | "relative_scope" => {
             let parent = node.parent()?;
             match parent.kind() {
                 "object_creation_expression" | "named_type" => Some(PhpReferenceNode::Type(node)),
@@ -432,12 +440,14 @@ fn php_static_scope_fqn(
     class_ranges: &ClassRangeIndex,
 ) -> Option<String> {
     let text = php_node_text(scope, source);
-    match text {
-        "self" | "static" => class_ranges
+    if text.eq_ignore_ascii_case("self") || text.eq_ignore_ascii_case("static") {
+        class_ranges
             .enclosing(scope.start_byte())
-            .map(str::to_string),
-        "parent" => php_parent_fqn(php, support, class_ranges.enclosing(scope.start_byte())?),
-        _ => resolve_php_type(text, ctx),
+            .map(str::to_string)
+    } else if text.eq_ignore_ascii_case("parent") {
+        php_parent_fqn(php, support, class_ranges.enclosing(scope.start_byte())?)
+    } else {
+        resolve_php_type(text, ctx)
     }
 }
 

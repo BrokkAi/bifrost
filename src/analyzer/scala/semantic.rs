@@ -151,6 +151,7 @@ fn scala_capabilities() -> SemanticCapabilities {
         SemanticCapability::ExceptionalControlFlow,
         SemanticCapability::CleanupControlFlow,
         SemanticCapability::Calls,
+        SemanticCapability::DynamicDispatch,
         SemanticCapability::CallableReferences,
         SemanticCapability::Values,
         SemanticCapability::DeferredExecution,
@@ -2033,6 +2034,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.abrupt(builder, exceptional, scope, CompletionKind::Throw, stack)?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
 
+        if !constructor_application {
+            self.add_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::DynamicDispatch,
+                SemanticGapKind::Unknown,
+                "application may dispatch through a virtual member or callable value; static/final dispatch and complete override coverage require type refinement",
+            )?;
+        }
+
         if curried || has_implicit_arguments {
             self.add_gap(
                 builder,
@@ -2346,6 +2358,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.edge(builder, normal, next)?;
         self.abrupt(builder, exceptional, scope, CompletionKind::Throw, stack)?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+        if receiver.is_some() {
+            self.add_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::DynamicDispatch,
+                SemanticGapKind::Unknown,
+                "operator or postfix dispatch may select an override; receiver type and complete target coverage require type refinement",
+            )?;
+        }
         if !argument_nodes.is_empty() {
             self.add_gap(
                 builder,

@@ -156,6 +156,7 @@ fn java_capabilities() -> SemanticCapabilities {
         SemanticCapability::ExceptionalControlFlow,
         SemanticCapability::CleanupControlFlow,
         SemanticCapability::Calls,
+        SemanticCapability::DynamicDispatch,
         SemanticCapability::CallableReferences,
         SemanticCapability::Values,
         SemanticCapability::NonLocalControl,
@@ -2322,6 +2323,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             stack,
         )?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+
+        if node.kind() == "method_invocation" {
+            self.add_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::DynamicDispatch,
+                SemanticGapKind::Unknown,
+                "method invocation may select an override; static/final dispatch and complete override coverage require type-hierarchy refinement",
+            )?;
+        }
 
         let mut evaluations =
             Vec::with_capacity(arguments.len() + usize::from(receiver_node.is_some()));

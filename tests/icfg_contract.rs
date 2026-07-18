@@ -3,8 +3,8 @@ mod common;
 use std::sync::Arc;
 
 use brokk_bifrost::analyzer::semantic::{
-    CancellationToken, ControlEdgeKind, IcfgEdgeKind, IcfgLimitKind, IcfgProvider,
-    IcfgSnapshotLimits, SemanticBudget, SemanticOutcome, SemanticRequest,
+    CancellationToken, ControlEdgeKind, DispatchBoundaryKind, IcfgEdgeKind, IcfgLimitKind,
+    IcfgProvider, IcfgSnapshotLimits, SemanticBudget, SemanticOutcome, SemanticRequest,
 };
 use brokk_bifrost::{
     AnalyzerConfig, Language, OverlayProject, ProjectFile, TestProject, WorkspaceAnalyzer,
@@ -21,6 +21,49 @@ use common::{
 
 fn root() -> CallContextSelector {
     CallContextSelector::root()
+}
+
+fn assert_callable_parameter_boundary(
+    language: Language,
+    path: &str,
+    source: &str,
+    procedure: PointSelector,
+) {
+    let project = InlineTestProject::with_language(language)
+        .file(path, source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let caller = resolve_procedure_handle(&project, &analyzer, path, procedure);
+    let call = caller
+        .semantics()
+        .call_sites()
+        .first()
+        .expect("callable-parameter fixture must publish one call site");
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let outcome = analyzer
+        .icfg_provider()
+        .call_transfers(
+            &caller,
+            call.id,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("callable-parameter dispatch");
+    assert!(
+        !matches!(&outcome, SemanticOutcome::Complete { .. }),
+        "{language:?} callable parameter must not produce a Complete dispatch: {outcome:#?}"
+    );
+    let transfers = outcome
+        .available_value()
+        .expect("non-complete callable-parameter outcome must retain typed boundaries");
+    assert!(transfers.transfers.is_empty(), "{transfers:#?}");
+    assert!(
+        transfers
+            .boundaries
+            .iter()
+            .any(|boundary| { boundary.dispatch.kind == DispatchBoundaryKind::Unresolved }),
+        "{transfers:#?}"
+    );
 }
 
 #[test]
@@ -99,7 +142,12 @@ fn typescript_direct_call_has_matched_entry_and_normal_return() {
             root(),
         );
 
-    graph.assert_outcome(IcfgOutcomeKind::Complete);
+    graph.assert_outcome(IcfgOutcomeKind::Unproven);
+    graph.assert_boundary(
+        "leaf_invoke",
+        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
+            .originating_call("leaf_call"),
+    );
     graph.assert_successors(
         "leaf_invoke",
         &[icfg_edge("leaf_entry", IcfgEdgeKind::Call).originating_call("leaf_call")],
@@ -207,7 +255,12 @@ fn typescript_cross_file_call_materializes_target_on_demand() {
             root(),
         );
 
-    graph.assert_outcome(IcfgOutcomeKind::Complete);
+    graph.assert_outcome(IcfgOutcomeKind::Unproven);
+    graph.assert_boundary(
+        "invoke",
+        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
+            .originating_call("target_call"),
+    );
     graph.assert_successors(
         "invoke",
         &[icfg_edge("target_entry", IcfgEdgeKind::Call).originating_call("target_call")],
@@ -332,6 +385,17 @@ fn two_call_sites_to_one_callee_never_cross_return_contexts() {
         "second_continuation",
         &[icfg_edge("second_exit", IcfgEdgeKind::NormalReturn).originating_call("second_call")],
     );
+    graph.assert_outcome(IcfgOutcomeKind::Unproven);
+    graph.assert_boundary(
+        "first_invoke",
+        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
+            .originating_call("first_call"),
+    );
+    graph.assert_boundary(
+        "second_invoke",
+        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
+            .originating_call("second_call"),
+    );
     graph.assert_adjacency_symmetric();
 }
 
@@ -404,7 +468,12 @@ fn java_static_method_dispatch_selects_the_arity_overload() {
             root(),
         );
 
-    graph.assert_outcome(IcfgOutcomeKind::Complete);
+    graph.assert_outcome(IcfgOutcomeKind::Unproven);
+    graph.assert_boundary(
+        "invoke",
+        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
+            .originating_call("target_call"),
+    );
     graph.assert_successors(
         "invoke",
         &[icfg_edge("string_target_entry", IcfgEdgeKind::Call).originating_call("target_call")],
@@ -476,10 +545,15 @@ fn java_same_arity_overloads_preserve_every_dispatch_candidate() {
             ["target_call"],
         );
 
-    // This resolver path reports `Resolved` with multiple proven candidate
-    // bodies. Candidate multiplicity, rather than the outer outcome, carries
-    // the multi-target dispatch fact.
-    graph.assert_outcome(IcfgOutcomeKind::Complete);
+    // The resolver retains both same-arity candidates, while the exact
+    // dynamic-dispatch gap prevents candidate multiplicity from masquerading
+    // as complete target coverage.
+    graph.assert_outcome(IcfgOutcomeKind::Unproven);
+    graph.assert_boundary(
+        "invoke",
+        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
+            .originating_call("target_call"),
+    );
     graph.assert_successors(
         "invoke",
         &[
@@ -543,11 +617,420 @@ fn java_instance_method_dispatch_enters_the_selected_method() {
             ["run_call"],
         );
 
-    graph.assert_outcome(IcfgOutcomeKind::Complete);
+    graph.assert_outcome(IcfgOutcomeKind::Unproven);
+    graph.assert_boundary(
+        "invoke",
+        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
+            .originating_call("run_call"),
+    );
     graph.assert_successors(
         "invoke",
         &[icfg_edge("run_entry", IcfgEdgeKind::Call).originating_call("run_call")],
     );
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn java_bodyless_dynamic_target_keeps_unmaterialized_and_open_world_boundaries() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/Bodyless.java",
+            r#"
+                interface Work {
+                    int run();
+                }
+
+                class Caller {
+                    static int caller(Work work) {
+                        return work.run();
+                    }
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = IcfgGraph::materialize(
+        &project,
+        &analyzer,
+        "src/Bodyless.java",
+        PointSelector::new("static int caller")
+            .procedure("caller")
+            .effect("entry"),
+    );
+    graph
+        .bind_call(
+            "run_call",
+            "src/Bodyless.java",
+            PointSelector::new("work.run()")
+                .procedure("caller")
+                .effect("invoke"),
+        )
+        .bind_node(
+            "invoke",
+            "src/Bodyless.java",
+            PointSelector::new("work.run()")
+                .procedure("caller")
+                .effect("invoke"),
+            root(),
+        );
+
+    graph.assert_outcome(IcfgOutcomeKind::Unproven);
+    graph.assert_boundary(
+        "invoke",
+        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnmaterialized)
+            .originating_call("run_call"),
+    );
+    graph.assert_boundary(
+        "invoke",
+        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
+            .originating_call("run_call"),
+    );
+    graph.assert_successors("invoke", &[]);
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn cpp_implicit_object_call_keeps_virtual_dispatch_open() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "dispatch.cpp",
+            r#"
+                struct Base {
+                    virtual int run() { return 1; }
+                    int caller() { return run(); }
+                };
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = IcfgGraph::materialize(
+        &project,
+        &analyzer,
+        "dispatch.cpp",
+        PointSelector::new("int caller()")
+            .procedure("caller")
+            .effect("entry"),
+    );
+    graph
+        .bind_call(
+            "run_call",
+            "dispatch.cpp",
+            PointSelector::new("run()")
+                .procedure("caller")
+                .effect("invoke"),
+        )
+        .bind_node(
+            "invoke",
+            "dispatch.cpp",
+            PointSelector::new("run()")
+                .procedure("caller")
+                .effect("invoke"),
+            root(),
+        )
+        .bind_node(
+            "run_entry",
+            "dispatch.cpp",
+            PointSelector::new("virtual int run()")
+                .procedure("run")
+                .effect("entry"),
+            ["run_call"],
+        );
+
+    graph.assert_outcome(IcfgOutcomeKind::Unproven);
+    graph.assert_boundary(
+        "invoke",
+        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
+            .originating_call("run_call"),
+    );
+    graph.assert_successors(
+        "invoke",
+        &[icfg_edge("run_entry", IcfgEdgeKind::Call).originating_call("run_call")],
+    );
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn cpp_default_argument_and_conversion_evaluation_keep_call_transfer_partial() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "defaults.cpp",
+            r#"
+                int hidden() { return 1; }
+                int target(int value = hidden()) { return value; }
+                int caller() { return target(); }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = IcfgGraph::materialize(
+        &project,
+        &analyzer,
+        "defaults.cpp",
+        PointSelector::new("int caller()")
+            .procedure("caller")
+            .effect("entry"),
+    );
+    graph
+        .bind_call(
+            "target_call",
+            "defaults.cpp",
+            PointSelector::new("target()")
+                .procedure("caller")
+                .effect("invoke"),
+        )
+        .bind_node(
+            "invoke",
+            "defaults.cpp",
+            PointSelector::new("target()")
+                .procedure("caller")
+                .effect("invoke"),
+            root(),
+        )
+        .bind_node(
+            "target_entry",
+            "defaults.cpp",
+            PointSelector::new("int target(int value = hidden())")
+                .procedure("target")
+                .effect("entry"),
+            ["target_call"],
+        );
+
+    let expected = icfg_edge("target_entry", IcfgEdgeKind::Call).originating_call("target_call");
+    graph.assert_outcome(IcfgOutcomeKind::Unproven);
+    graph.assert_successors("invoke", &[expected]);
+    graph.assert_edge_proven_partial("invoke", expected);
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn php_runtime_class_dispatch_keeps_current_targets_unproven() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "dispatch.php",
+            r#"<?php
+                class Base {
+                    public function __construct() {}
+                    public static function target(): int { return 1; }
+                    public static function caller(): int { return STATIC::target(); }
+                    public static function create(): Base { return new static(); }
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+
+    for (procedure, call_text, target_declaration, target_procedure) in [
+        ("caller", "STATIC::target()", "function target()", "target"),
+        (
+            "create",
+            "new static()",
+            "function __construct()",
+            "__construct",
+        ),
+    ] {
+        let mut graph = IcfgGraph::materialize(
+            &project,
+            &analyzer,
+            "dispatch.php",
+            PointSelector::new(format!("function {procedure}()"))
+                .procedure(procedure)
+                .effect("entry"),
+        );
+        graph
+            .bind_call(
+                "runtime_call",
+                "dispatch.php",
+                PointSelector::new(call_text)
+                    .procedure(procedure)
+                    .effect("invoke"),
+            )
+            .bind_node(
+                "invoke",
+                "dispatch.php",
+                PointSelector::new(call_text)
+                    .procedure(procedure)
+                    .effect("invoke"),
+                root(),
+            )
+            .bind_node(
+                "target_entry",
+                "dispatch.php",
+                PointSelector::new(target_declaration)
+                    .procedure(target_procedure)
+                    .effect("entry"),
+                ["runtime_call"],
+            );
+
+        graph.assert_outcome(IcfgOutcomeKind::Unproven);
+        graph.assert_boundary(
+            "invoke",
+            ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
+                .originating_call("runtime_call"),
+        );
+        graph.assert_successors(
+            "invoke",
+            &[icfg_edge("target_entry", IcfgEdgeKind::Call).originating_call("runtime_call")],
+        );
+        graph.assert_adjacency_symmetric();
+    }
+}
+
+#[test]
+fn go_defer_gap_downgrades_only_return_paths_that_cross_it() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "defer.go",
+            r#"
+                package sample
+
+                func mayPanic() {}
+                func liveTarget() { defer mayPanic() }
+                func deadTarget() {
+                    return
+                    defer mayPanic()
+                }
+                func liveCaller() { liveTarget() }
+                func deadCaller() { deadTarget() }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+
+    for (caller, target, expected_complete) in [
+        ("liveCaller", "liveTarget", false),
+        ("deadCaller", "deadTarget", true),
+    ] {
+        let call_text = format!("{target}()");
+        let mut graph = IcfgGraph::materialize(
+            &project,
+            &analyzer,
+            "defer.go",
+            PointSelector::new(format!("func {caller}()"))
+                .procedure(caller)
+                .effect("entry"),
+        );
+        graph
+            .bind_call(
+                "target_call",
+                "defer.go",
+                PointSelector::new(&call_text)
+                    .procedure(caller)
+                    .effect("invoke"),
+            )
+            .bind_node(
+                "target_exit",
+                "defer.go",
+                PointSelector::new(format!("func {target}()"))
+                    .procedure(target)
+                    .effect("normal_exit"),
+                ["target_call"],
+            )
+            .bind_node(
+                "continuation",
+                "defer.go",
+                PointSelector::new(&call_text)
+                    .procedure(caller)
+                    .effect("call_continuation")
+                    .outgoing_kind(ControlEdgeKind::Normal),
+                root(),
+            );
+        let expected =
+            icfg_edge("continuation", IcfgEdgeKind::NormalReturn).originating_call("target_call");
+        graph.assert_successors("target_exit", &[expected]);
+        if expected_complete {
+            graph.assert_edge_proven_complete("target_exit", expected);
+        } else {
+            graph.assert_edge_unproven_partial("target_exit", expected);
+        }
+        graph.assert_adjacency_symmetric();
+    }
+
+    let live_caller = resolve_procedure_handle(
+        &project,
+        &analyzer,
+        "defer.go",
+        PointSelector::new("func liveCaller()")
+            .procedure("liveCaller")
+            .effect("entry"),
+    );
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let outcome = analyzer
+        .icfg_provider()
+        .snapshot(
+            &live_caller,
+            IcfgSnapshotLimits::default(),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("Go defer ICFG snapshot");
+    assert!(matches!(
+        outcome,
+        SemanticOutcome::Unsupported {
+            capability: brokk_bifrost::analyzer::semantic::SemanticCapability::CleanupControlFlow,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn rust_local_drop_gap_downgrades_matched_normal_return() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "drop.rs",
+            r#"
+                struct Guard;
+                impl Drop for Guard {
+                    fn drop(&mut self) {}
+                }
+
+                fn target() {
+                    let guard = Guard;
+                }
+
+                fn caller() {
+                    target();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = IcfgGraph::materialize(
+        &project,
+        &analyzer,
+        "drop.rs",
+        PointSelector::new("fn caller()")
+            .procedure("caller")
+            .effect("entry"),
+    );
+    graph
+        .bind_call(
+            "target_call",
+            "drop.rs",
+            PointSelector::new("target()")
+                .procedure("caller")
+                .effect("invoke"),
+        )
+        .bind_node(
+            "target_exit",
+            "drop.rs",
+            PointSelector::new("fn target()")
+                .procedure("target")
+                .effect("normal_exit"),
+            ["target_call"],
+        )
+        .bind_node(
+            "continuation",
+            "drop.rs",
+            PointSelector::new("target()")
+                .procedure("caller")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+            root(),
+        );
+    let expected =
+        icfg_edge("continuation", IcfgEdgeKind::NormalReturn).originating_call("target_call");
+    graph.assert_successors("target_exit", &[expected]);
+    graph.assert_edge_unproven_partial("target_exit", expected);
     graph.assert_adjacency_symmetric();
 }
 
@@ -808,12 +1291,66 @@ fn unresolved_and_external_calls_remain_typed_boundaries() {
                 .effect("invoke"),
             root(),
         );
+    external.assert_outcome(IcfgOutcomeKind::Unproven);
     external.assert_boundary(
         "external_invoke",
         ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchExternal)
             .originating_call("external_call"),
     );
+    external.assert_boundary(
+        "external_invoke",
+        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
+            .originating_call("external_call"),
+    );
     external.assert_successors("external_invoke", &[]);
+}
+
+#[test]
+fn callable_parameters_are_unresolved_and_never_complete_across_languages() {
+    assert_callable_parameter_boundary(
+        Language::CSharp,
+        "Delegate.cs",
+        r#"
+            using System;
+            class DelegateSample {
+                static void Caller(Action callback) { callback(); }
+            }
+        "#,
+        PointSelector::new("static void Caller")
+            .procedure("Caller")
+            .effect("entry"),
+    );
+    assert_callable_parameter_boundary(
+        Language::Go,
+        "delegate.go",
+        r#"
+            package sample
+            func caller(callback func()) { callback() }
+        "#,
+        PointSelector::new("func caller(callback func())")
+            .procedure("caller")
+            .effect("entry"),
+    );
+    assert_callable_parameter_boundary(
+        Language::Rust,
+        "delegate.rs",
+        r#"
+            fn caller(callback: fn()) { callback(); }
+        "#,
+        PointSelector::new("fn caller(callback: fn())")
+            .procedure("caller")
+            .effect("entry"),
+    );
+    assert_callable_parameter_boundary(
+        Language::Cpp,
+        "delegate.cpp",
+        r#"
+            void caller(void (*callback)()) { callback(); }
+        "#,
+        PointSelector::new("void caller(void (*callback)())")
+            .procedure("caller")
+            .effect("entry"),
+    );
 }
 
 #[test]

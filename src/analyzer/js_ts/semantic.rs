@@ -205,6 +205,7 @@ fn js_ts_capabilities() -> SemanticCapabilities {
         SemanticCapability::ExceptionalControlFlow,
         SemanticCapability::CleanupControlFlow,
         SemanticCapability::Calls,
+        SemanticCapability::DynamicDispatch,
         SemanticCapability::CallableReferences,
         SemanticCapability::Values,
         SemanticCapability::NormalControlFlow,
@@ -1466,12 +1467,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "using_declaration" => self.resource_declaration(builder, node, entry, scope, stack),
             "lexical_declaration" | "variable_declaration" => {
                 if has_child_kind(node, "using") {
-                    self.add_gap(
+                    self.add_resource_cleanup_gaps(
                         builder,
                         entry,
-                        SemanticGapSubject::Point,
-                        SemanticCapability::ResourceManagement,
-                        SemanticGapKind::Unsupported,
                         "explicit resource-management cleanup is not yet lowered",
                     )?;
                 }
@@ -1903,12 +1901,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), TsLoweringError> {
         let initializer = required_field(node, "right")?;
         let terminal = self.point(builder, node, Vec::new())?;
-        self.add_gap(
+        self.add_resource_cleanup_gaps(
             builder,
             terminal,
-            SemanticGapSubject::Point,
-            SemanticCapability::ResourceManagement,
-            SemanticGapKind::Unsupported,
             "using declaration disposal and cleanup are not yet lowered",
         )?;
         if node
@@ -1944,12 +1939,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), TsLoweringError> {
         let terminal = self.point(builder, node, Vec::new())?;
-        self.add_gap(
+        self.add_resource_cleanup_gaps(
             builder,
             terminal,
-            SemanticGapSubject::Point,
-            SemanticCapability::ResourceManagement,
-            SemanticGapKind::Unsupported,
             "using declaration disposal and cleanup are not yet lowered",
         )?;
         if has_child_kind(node, "await") {
@@ -2157,12 +2149,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let is_await = has_child_kind(node, "await");
         let is_using = has_child_kind(node, "using");
         if is_using {
-            self.add_gap(
+            self.add_resource_cleanup_gaps(
                 builder,
                 test,
-                SemanticGapSubject::Point,
-                SemanticCapability::ResourceManagement,
-                SemanticGapKind::Unsupported,
                 "for-using per-iteration disposal and cleanup are not yet lowered",
             )?;
             if is_await {
@@ -2552,6 +2541,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             stack,
         )?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+
+        self.add_gap(
+            builder,
+            invoke,
+            SemanticGapSubject::CallSite(call_site),
+            SemanticCapability::DynamicDispatch,
+            SemanticGapKind::Unknown,
+            if receiver.is_some() {
+                "property dispatch may resolve through a prototype, accessor, proxy, or runtime mutation; complete target coverage requires value and type refinement"
+            } else {
+                "callable bindings and imports may be rebound or replaced at runtime; complete target coverage requires lexical and value-flow refinement"
+            },
+        )?;
 
         if has_child_kind(node, "?.") {
             let decision = self.point(builder, node, Vec::new())?;
@@ -3293,6 +3295,38 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         })?;
         self.next_gap += 1;
         self.append_effect(builder, point, SemanticEffect::Gap { gap: id })
+    }
+
+    fn add_resource_cleanup_gaps(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        context: &str,
+    ) -> Result<(), TsLoweringError> {
+        for (capability, omission) in [
+            (
+                SemanticCapability::ResourceManagement,
+                "resource acquisition, lifetime, and disposal are incomplete",
+            ),
+            (
+                SemanticCapability::CleanupControlFlow,
+                "disposal is not stitched onto every scope-completion path",
+            ),
+            (
+                SemanticCapability::ExceptionalControlFlow,
+                "disposal failure and suppressed-error behavior are not lowered",
+            ),
+        ] {
+            self.add_gap(
+                builder,
+                point,
+                SemanticGapSubject::Point,
+                capability,
+                SemanticGapKind::Unsupported,
+                &format!("{context}; {omission}"),
+            )?;
+        }
+        Ok(())
     }
 
     fn edge(

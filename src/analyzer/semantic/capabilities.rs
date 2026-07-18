@@ -54,6 +54,7 @@ semantic_capabilities! {
     StaticMemory => "static_memory",
     IndexMemory => "index_memory",
     Calls => "calls",
+    DynamicDispatch => "dynamic_dispatch",
     NormalCallContinuation => "normal_call_continuation",
     ExceptionalCallContinuation => "exceptional_call_continuation",
     Captures => "captures",
@@ -225,6 +226,7 @@ mod tests {
             (SemanticCapability::StaticMemory, "static_memory"),
             (SemanticCapability::IndexMemory, "index_memory"),
             (SemanticCapability::Calls, "calls"),
+            (SemanticCapability::DynamicDispatch, "dynamic_dispatch"),
             (
                 SemanticCapability::NormalCallContinuation,
                 "normal_call_continuation",

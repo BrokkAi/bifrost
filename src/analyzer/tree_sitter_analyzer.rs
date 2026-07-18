@@ -612,7 +612,6 @@ type SummaryFileProjectionCache = BoundedFileCache<SummaryFileProjection>;
 #[derive(Debug, Default)]
 struct QueryReadCache {
     contexts: Vec<Arc<crate::analyzer::AnalyzerQueryContext>>,
-    live_oids: HashMap<ProjectFile, Option<Oid>>,
     analyzed_live_files: Option<Vec<ProjectFile>>,
     live_sources: HashMap<ProjectFile, Option<ResolvedLiveSource>>,
     prepared_sources: HashMap<ProjectFile, Option<ResolvedPreparedSource>>,
@@ -636,7 +635,6 @@ struct DefinitionSortCandidate {
 impl QueryReadCache {
     fn begin(&mut self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         if self.contexts.is_empty() {
-            self.live_oids.clear();
             self.analyzed_live_files = None;
             self.live_sources.clear();
             self.prepared_sources.clear();
@@ -655,7 +653,6 @@ impl QueryReadCache {
     fn end(&mut self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.contexts.retain(|active| !Arc::ptr_eq(active, context));
         if self.contexts.is_empty() {
-            self.live_oids.clear();
             self.analyzed_live_files = None;
             self.live_sources.clear();
             self.prepared_sources.clear();
@@ -1402,22 +1399,6 @@ where
         &self,
     ) -> &crate::analyzer::structural::provider::StructuralFactsCache {
         &self.structural_cache
-    }
-
-    pub(crate) fn materialize_unsupported_semantics(
-        &self,
-        file: &ProjectFile,
-        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
-    ) -> Result<
-        crate::analyzer::semantic::SemanticOutcome<
-            Arc<crate::analyzer::semantic::SemanticArtifact>,
-        >,
-        crate::analyzer::semantic::SemanticProviderError,
-    > {
-        let lowerer = crate::analyzer::semantic::service::UnsupportedProgramSemanticsLowerer::new(
-            self.adapter.language(),
-        );
-        self.materialize_semantics_with_lowerer(&lowerer, file, request)
     }
 
     pub(crate) fn materialize_semantics_with_lowerer(

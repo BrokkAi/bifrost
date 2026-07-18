@@ -11753,6 +11753,29 @@ fn php_parent_constructor_resolves_to_nearest_inherited_definition() {
 }
 
 #[test]
+fn php_late_static_constructor_resolves_to_enclosing_class() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Base.php",
+            "<?php\nnamespace App;\nclass Base {\n    public function __construct() {}\n    public static function create(): Base { return new static(); }\n}\n",
+        )
+        .build();
+
+    let line = "    public static function create(): Base { return new static(); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Base.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "static();")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "App.Base", "{value}");
+}
+
+#[test]
 fn php_inherited_member_resolves_parent_with_multiline_extends() {
     let project = InlineTestProject::with_language(Language::Php)
         .file(

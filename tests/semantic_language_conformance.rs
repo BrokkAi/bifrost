@@ -1,15 +1,16 @@
 mod common;
 
 use brokk_bifrost::analyzer::semantic::{
-    CallableReferenceKind, CallableTargetResolution, ControlEdgeKind, DeclarationSegmentKind,
-    DeferredInvocationKind, IcfgEdgeKind, ProcedureInvocationKind, ProcedureKind,
-    ProcedureSemantics, SemanticCallSite, SemanticCapability, SemanticEffect, SemanticGapKind,
-    SemanticGapSubject, SemanticLanguage,
+    CallableReferenceKind, CallableTargetResolution, CancellationToken, ControlEdgeKind,
+    DeclarationSegmentKind, DeferredInvocationKind, IcfgEdgeKind, ProcedureInvocationKind,
+    ProcedureKind, ProcedureSemantics, SemanticBudget, SemanticBudgetDimension, SemanticCallSite,
+    SemanticCapability, SemanticEffect, SemanticGapKind, SemanticGapSubject, SemanticLanguage,
+    SemanticOutcome, SemanticRequest,
 };
 use brokk_bifrost::{AnalyzerConfig, Language};
 
 use common::{
-    InlineTestProject,
+    BuiltInlineTestProject, InlineTestProject,
     semantic_graph::{
         CallContextSelector, ExpectedIcfgBoundary, ExpectedIcfgBoundaryKind, IcfgGraph,
         IcfgOutcomeKind, PointSelector, SemanticGraph, edge as cfg_edge, icfg_edge,
@@ -126,13 +127,80 @@ fn assert_call_site_gap(
     );
 }
 
+fn assert_procedure_gap(
+    procedure: &ProcedureSemantics,
+    capability: SemanticCapability,
+    kind: SemanticGapKind,
+) {
+    assert!(
+        procedure.gaps().iter().any(|gap| {
+            gap.subject == SemanticGapSubject::Procedure
+                && gap.capability == capability
+                && gap.kind == kind
+        }),
+        "missing Procedure-scoped {capability:?}:{kind:?} gap for {:?}",
+        procedure.locator().declaration()
+    );
+}
+
+fn assert_source_point_gap(
+    procedure: &ProcedureSemantics,
+    source: &str,
+    expected_source: &str,
+    capability: SemanticCapability,
+    kind: SemanticGapKind,
+) {
+    assert!(
+        procedure.points().iter().any(|point| {
+            let Some(mapping) = procedure.source_mapping(point.source) else {
+                return false;
+            };
+            let span = mapping.locator.anchor().span();
+            if source.get(span.start_byte() as usize..span.end_byte() as usize)
+                != Some(expected_source)
+            {
+                return false;
+            }
+            point.events.iter().any(|event| {
+                let SemanticEffect::Gap { gap } = &event.effect else {
+                    return false;
+                };
+                procedure.gap(*gap).is_some_and(|gap| {
+                    gap.point == point.id
+                        && gap.subject == SemanticGapSubject::Point
+                        && gap.capability == capability
+                        && gap.kind == kind
+                })
+            })
+        }),
+        "missing exact source-backed Point-scoped {capability:?}:{kind:?} gap for {expected_source:?}"
+    );
+}
+
 fn assert_direct_call_conformance(fixture: DirectCallFixture) {
     let project = InlineTestProject::with_language(fixture.language)
         .file(fixture.callee_path, fixture.callee_source)
         .file(fixture.caller_path, fixture.caller_source)
         .build();
+    assert_direct_call_project_conformance(&project, fixture, false, false);
+}
+
+fn assert_return_partial_direct_call_conformance(fixture: DirectCallFixture) {
+    let project = InlineTestProject::with_language(fixture.language)
+        .file(fixture.callee_path, fixture.callee_source)
+        .file(fixture.caller_path, fixture.caller_source)
+        .build();
+    assert_direct_call_project_conformance(&project, fixture, false, true);
+}
+
+fn assert_direct_call_project_conformance(
+    project: &BuiltInlineTestProject,
+    fixture: DirectCallFixture,
+    expect_unproven_link_unit: bool,
+    expect_unproven_return: bool,
+) {
     let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
-    let mut cfg = SemanticGraph::materialize(&project, &analyzer, fixture.caller_path);
+    let mut cfg = SemanticGraph::materialize(project, &analyzer, fixture.caller_path);
 
     assert_eq!(cfg.artifact().key().language(), fixture.dialect);
     cfg.bind(
@@ -191,8 +259,37 @@ fn assert_direct_call_conformance(fixture: DirectCallFixture) {
     assert!(!first_cfg_render.contains("ProgramPointId"));
     assert!(!first_cfg_render.contains("ControlEdgeId"));
 
+    assert!(
+        cfg.artifact()
+            .capabilities()
+            .is_available(SemanticCapability::DynamicDispatch),
+        "{:?} must publish its dynamic-dispatch capability",
+        fixture.language
+    );
+    let caller = cfg
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some(fixture.caller_name)
+        })
+        .expect("direct-call caller procedure");
+    let direct_call = exact_call_site(caller, fixture.caller_source, fixture.call);
+    let has_dynamic_dispatch_gap = caller.gaps().iter().any(|gap| {
+        gap.point == direct_call.point
+            && gap.capability == SemanticCapability::DynamicDispatch
+            && (gap.subject == SemanticGapSubject::Point
+                || gap.subject == SemanticGapSubject::CallSite(direct_call.id))
+    });
+
     let mut icfg = IcfgGraph::materialize(
-        &project,
+        project,
         &analyzer,
         fixture.caller_path,
         PointSelector::new(fixture.caller_declaration)
@@ -248,7 +345,18 @@ fn assert_direct_call_conformance(fixture: DirectCallFixture) {
         root(),
     );
 
-    icfg.assert_outcome(IcfgOutcomeKind::Complete);
+    if has_dynamic_dispatch_gap || expect_unproven_link_unit || expect_unproven_return {
+        icfg.assert_outcome(IcfgOutcomeKind::Unproven);
+    } else {
+        icfg.assert_outcome(IcfgOutcomeKind::Complete);
+    }
+    if has_dynamic_dispatch_gap || expect_unproven_link_unit {
+        icfg.assert_boundary(
+            "icfg_invoke",
+            ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
+                .originating_call("direct_call"),
+        );
+    }
     icfg.assert_successors(
         "icfg_invoke",
         &[icfg_edge("callee_entry", IcfgEdgeKind::Call).originating_call("direct_call")],
@@ -257,13 +365,14 @@ fn assert_direct_call_conformance(fixture: DirectCallFixture) {
         "callee_entry",
         &[icfg_edge("icfg_invoke", IcfgEdgeKind::Call).originating_call("direct_call")],
     );
-    icfg.assert_successors(
-        "callee_normal_exit",
-        &[
-            icfg_edge("icfg_normal_continuation", IcfgEdgeKind::NormalReturn)
-                .originating_call("direct_call"),
-        ],
-    );
+    let return_edge = icfg_edge("icfg_normal_continuation", IcfgEdgeKind::NormalReturn)
+        .originating_call("direct_call");
+    icfg.assert_successors("callee_normal_exit", &[return_edge]);
+    if has_dynamic_dispatch_gap || expect_unproven_link_unit || expect_unproven_return {
+        icfg.assert_edge_unproven_partial("callee_normal_exit", return_edge);
+    } else {
+        icfg.assert_edge_proven_complete("callee_normal_exit", return_edge);
+    }
     icfg.assert_predecessors(
         "icfg_normal_continuation",
         &[icfg_edge("callee_normal_exit", IcfgEdgeKind::NormalReturn)
@@ -275,6 +384,155 @@ fn assert_direct_call_conformance(fixture: DirectCallFixture) {
     assert_eq!(first_icfg_render, icfg.render_topology());
     assert!(!first_icfg_render.contains("IcfgNodeId"));
     assert!(!first_icfg_render.contains("IcfgEdgeId"));
+}
+
+#[test]
+fn receiver_calls_publish_point_specific_dynamic_dispatch_gaps() {
+    let fixtures = [
+        (
+            "dispatch/Member.java",
+            r#"class Member {
+    int run() { return 1; }
+    int caller(Member receiver) { return receiver.run(); }
+}
+"#,
+            "caller",
+            "receiver.run()",
+        ),
+        (
+            "dispatch/member.go",
+            r#"package dispatch
+type Member struct{}
+func (Member) Run() int { return 1 }
+func caller(receiver Member) int { return receiver.Run() }
+"#,
+            "caller",
+            "receiver.Run()",
+        ),
+        (
+            "dispatch/member.js",
+            r#"export function caller(receiver) {
+    return receiver.run();
+}
+"#,
+            "caller",
+            "receiver.run()",
+        ),
+        (
+            "dispatch/member.ts",
+            r#"export function caller(receiver: { run(): number }): number {
+    return receiver.run();
+}
+"#,
+            "caller",
+            "receiver.run()",
+        ),
+        (
+            "dispatch/member.py",
+            r#"def caller(receiver):
+    return receiver.run()
+"#,
+            "caller",
+            "receiver.run()",
+        ),
+        (
+            "dispatch/member.rs",
+            r#"struct Member;
+impl Member { fn run(&self) -> i32 { 1 } }
+fn caller(receiver: Member) -> i32 { receiver.run() }
+"#,
+            "caller",
+            "receiver.run()",
+        ),
+        (
+            "dispatch/member.php",
+            r#"<?php
+function caller($receiver) {
+    return $receiver->run();
+}
+"#,
+            "caller",
+            "$receiver->run()",
+        ),
+        (
+            "dispatch/Member.scala",
+            r#"class Member { def run(): Int = 1 }
+def caller(receiver: Member): Int = receiver.run()
+"#,
+            "caller",
+            "receiver.run()",
+        ),
+        (
+            "dispatch/Member.cs",
+            r#"class Member {
+    int Run() => 1;
+    static int Caller(Member receiver) => receiver.Run();
+}
+"#,
+            "Caller",
+            "receiver.Run()",
+        ),
+        (
+            "dispatch/member.rb",
+            r#"def caller(receiver)
+  receiver.run
+end
+"#,
+            "caller",
+            "receiver.run",
+        ),
+    ];
+    let mut project_builder = InlineTestProject::new();
+    for (path, source, _, _) in fixtures {
+        project_builder = project_builder.file(path, source);
+    }
+    let project = project_builder.build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+
+    for (path, source, procedure_name, call_source) in fixtures {
+        let graph = SemanticGraph::materialize(&project, &analyzer, path);
+        assert!(
+            graph
+                .artifact()
+                .capabilities()
+                .is_available(SemanticCapability::DynamicDispatch),
+            "{path} must publish dynamic-dispatch support"
+        );
+        let procedure = graph
+            .artifact()
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(procedure_name)
+            })
+            .unwrap_or_else(|| panic!("missing {procedure_name} in {path}"));
+        assert_call_site_gap(
+            procedure,
+            source,
+            call_source,
+            SemanticCapability::DynamicDispatch,
+            SemanticGapKind::Unknown,
+        );
+    }
+}
+
+fn assert_declared_cpp_direct_call_conformance(
+    header_path: &'static str,
+    header_source: &'static str,
+    fixture: DirectCallFixture,
+) {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(header_path, header_source)
+        .file(fixture.callee_path, fixture.callee_source)
+        .file(fixture.caller_path, fixture.caller_source)
+        .build();
+    assert_direct_call_project_conformance(&project, fixture, true, false);
 }
 
 #[test]
@@ -392,6 +650,68 @@ fn rust_direct_call_conformance() {
         caller_name: "rust_root",
         call: "rust_leaf()",
     });
+}
+
+#[test]
+fn c_direct_free_call_coalesces_header_declaration_with_definition() {
+    assert_declared_cpp_direct_call_conformance(
+        "c/conformance/library.h",
+        "int c_leaf(int value);\n",
+        DirectCallFixture {
+            language: Language::Cpp,
+            dialect: SemanticLanguage::Standard(Language::Cpp),
+            callee_path: "c/conformance/library.c",
+            callee_source: r#"#include "library.h"
+
+int c_leaf(int value) {
+    return value + 1;
+}
+"#,
+            callee_declaration: "int c_leaf(int value)",
+            callee_name: "c_leaf",
+            caller_path: "c/conformance/caller.c",
+            caller_source: r#"#include "library.h"
+
+int c_root(int value) {
+    return c_leaf(value);
+}
+"#,
+            caller_declaration: "int c_root(int value)",
+            caller_name: "c_root",
+            call: "c_leaf(value)",
+        },
+    );
+}
+
+#[test]
+fn cpp_direct_free_call_coalesces_header_declaration_with_definition() {
+    assert_declared_cpp_direct_call_conformance(
+        "cpp/conformance/library.hpp",
+        "int cpp_leaf(int value);\n",
+        DirectCallFixture {
+            language: Language::Cpp,
+            dialect: SemanticLanguage::Standard(Language::Cpp),
+            callee_path: "cpp/conformance/library.cpp",
+            callee_source: r#"#include "library.hpp"
+
+int cpp_leaf(int value) {
+    return value + 1;
+}
+"#,
+            callee_declaration: "int cpp_leaf(int value)",
+            callee_name: "cpp_leaf",
+            caller_path: "cpp/conformance/caller.cpp",
+            caller_source: r#"#include "library.hpp"
+
+int cpp_root(int value) {
+    return cpp_leaf(value);
+}
+"#,
+            caller_declaration: "int cpp_root(int value)",
+            caller_name: "cpp_root",
+            call: "cpp_leaf(value)",
+        },
+    );
 }
 
 #[test]
@@ -2193,6 +2513,1593 @@ fn rust_parameter_pattern_and_assignment_drop_omissions_are_point_scoped() {
     ] {
         graph.assert_point_gap("assignment", capability, SemanticGapKind::Unknown);
     }
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn c_branches_loops_abrupt_flow_and_calls_have_exact_topology() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "c/common_control.c",
+            r#"void c_tick(int value);
+void c_done(void);
+void c_dead(void);
+
+void c_flow(int value) {
+    if (value < 0) {
+        return;
+        c_dead();
+    }
+    while (value > 0) {
+        if (value == 3) {
+            --value;
+            continue;
+        }
+        if (value == 1) {
+            break;
+        }
+        c_tick(value);
+        --value;
+    }
+    c_done();
+}
+"#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "c/common_control.c");
+    graph
+        .bind(
+            "entry",
+            PointSelector::new("void c_flow(int value)")
+                .procedure("c_flow")
+                .effect("entry"),
+        )
+        .bind(
+            "early_return",
+            PointSelector::new("return;")
+                .procedure("c_flow")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "dead_invoke",
+            PointSelector::new("c_dead()")
+                .procedure("c_flow")
+                .effect("invoke"),
+        )
+        .bind(
+            "loop_condition",
+            PointSelector::new("value > 0")
+                .procedure("c_flow")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "continue",
+            PointSelector::new("continue;")
+                .procedure("c_flow")
+                .outgoing_kind(ControlEdgeKind::LoopBack),
+        )
+        .bind(
+            "break",
+            PointSelector::new("break;")
+                .procedure("c_flow")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "tick_invoke",
+            PointSelector::new("c_tick(value)")
+                .procedure("c_flow")
+                .effect("invoke"),
+        )
+        .bind(
+            "tick_normal",
+            PointSelector::new("c_tick(value)")
+                .procedure("c_flow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "tick_exceptional",
+            PointSelector::new("c_tick(value)")
+                .procedure("c_flow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "decrement_after_tick",
+            PointSelector::new("--value;")
+                .occurrence(1)
+                .procedure("c_flow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "done_invoke",
+            PointSelector::new("c_done()")
+                .procedure("c_flow")
+                .effect("invoke"),
+        )
+        .bind(
+            "done_normal",
+            PointSelector::new("c_done()")
+                .procedure("c_flow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "normal_exit",
+            PointSelector::new("void c_flow(int value)")
+                .procedure("c_flow")
+                .effect("normal_exit"),
+        )
+        .bind(
+            "exceptional_exit",
+            PointSelector::new("void c_flow(int value)")
+                .procedure("c_flow")
+                .effect("exceptional_exit"),
+        );
+
+    graph.assert_successors(
+        "early_return",
+        &[cfg_edge("normal_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "tick_invoke",
+        &[
+            cfg_edge("tick_normal", ControlEdgeKind::Normal),
+            cfg_edge("tick_exceptional", ControlEdgeKind::Exceptional),
+        ],
+    );
+    graph.assert_predecessors(
+        "tick_normal",
+        &[cfg_edge("tick_invoke", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "tick_normal",
+        &[cfg_edge("decrement_after_tick", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "tick_exceptional",
+        &[cfg_edge("exceptional_exit", ControlEdgeKind::Exceptional)],
+    );
+    graph.assert_successors(
+        "done_normal",
+        &[cfg_edge("normal_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("entry", "loop_condition");
+    graph.assert_reachable("entry", "continue");
+    graph.assert_reachable("continue", "done_invoke");
+    graph.assert_reachable("entry", "break");
+    graph.assert_reachable("break", "done_invoke");
+    graph.assert_reachable("entry", "done_invoke");
+    graph.assert_unreachable("entry", "dead_invoke");
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn cpp_nested_lambda_is_a_separate_immediate_procedure() {
+    let source = r#"int cpp_leaf(int value);
+
+int cpp_outer(bool take_branch) {
+    auto nested = [take_branch]() {
+        return cpp_leaf(1);
+    };
+    if (take_branch) {
+        return cpp_leaf(2);
+    }
+    return 0;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("cpp/nested_lambda.cpp", source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "cpp/nested_lambda.cpp");
+    graph
+        .bind(
+            "outer_entry",
+            PointSelector::new("int cpp_outer(bool take_branch)")
+                .procedure("cpp_outer")
+                .effect("entry"),
+        )
+        .bind(
+            "outer_invoke",
+            PointSelector::new("cpp_leaf(2)")
+                .procedure("cpp_outer")
+                .effect("invoke"),
+        )
+        .bind(
+            "outer_normal",
+            PointSelector::new("cpp_leaf(2)")
+                .procedure("cpp_outer")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "outer_exceptional",
+            PointSelector::new("cpp_leaf(2)")
+                .procedure("cpp_outer")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "lambda_entry",
+            PointSelector::new("[take_branch]()")
+                .procedure("nested")
+                .effect("entry"),
+        )
+        .bind(
+            "lambda_invoke",
+            PointSelector::new("cpp_leaf(1)")
+                .procedure("nested")
+                .effect("invoke"),
+        )
+        .bind(
+            "lambda_normal",
+            PointSelector::new("cpp_leaf(1)")
+                .procedure("nested")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "lambda_return",
+            PointSelector::new("return cpp_leaf(1);")
+                .procedure("nested")
+                .effect("procedure_return"),
+        );
+
+    let outer = procedure_named(&graph, "cpp_outer", ProcedureKind::Function);
+    let lambda = procedure_named(&graph, "nested", ProcedureKind::Lambda);
+    assert_eq!(lambda.lexical_parent(), Some(outer.id()));
+    assert_eq!(
+        lambda.properties().invocation,
+        ProcedureInvocationKind::Immediate
+    );
+    assert_no_exact_call_site(outer, source, "cpp_leaf(1)");
+    assert_eq!(
+        call_site_source(
+            lambda,
+            source,
+            exact_call_site(lambda, source, "cpp_leaf(1)")
+        ),
+        "cpp_leaf(1)"
+    );
+    graph.assert_successors(
+        "outer_invoke",
+        &[
+            cfg_edge("outer_normal", ControlEdgeKind::Normal),
+            cfg_edge("outer_exceptional", ControlEdgeKind::Exceptional),
+        ],
+    );
+    graph.assert_successors(
+        "lambda_normal",
+        &[cfg_edge("lambda_return", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("outer_entry", "outer_invoke");
+    graph.assert_reachable("lambda_entry", "lambda_invoke");
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn cpp_switch_fallthrough_goto_and_try_have_exact_topology() {
+    let switch_source = r#"switch (tag) {
+    case 0:
+        cpp_first();
+    case 1:
+        cpp_second();
+        break;
+    default:
+        cpp_fallback();
+    }"#;
+    let try_source = r#"try {
+        if (fail) {
+            throw 7;
+            cpp_dead_throw();
+        }
+        cpp_normal();
+    } catch (int value) {
+        cpp_handled();
+    }"#;
+    let catch_source = r#"catch (int value) {
+        cpp_handled();
+    }"#;
+    let source = format!(
+        r#"struct JumpGuard {{}};
+
+void cpp_first();
+void cpp_second();
+void cpp_fallback();
+void cpp_after_switch();
+void cpp_dead();
+void cpp_live();
+void cpp_done();
+void cpp_dead_throw();
+void cpp_normal();
+void cpp_handled();
+void cpp_after_try();
+
+void cpp_switch(int tag) {{
+    {switch_source}
+    cpp_after_switch();
+}}
+
+void cpp_jump(bool repeat) {{
+    JumpGuard guard;
+    goto cpp_target;
+    cpp_dead();
+cpp_target:
+    cpp_live();
+    if (repeat) {{
+        goto cpp_target;
+    }}
+    cpp_done();
+}}
+
+void cpp_try(bool fail) {{
+    {try_source}
+    cpp_after_try();
+}}
+"#
+    );
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("cpp/nonlocal_control.cpp", &source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "cpp/nonlocal_control.cpp");
+    graph
+        .bind(
+            "switch_dispatch",
+            PointSelector::new(switch_source)
+                .procedure("cpp_switch")
+                .outgoing_kind(ControlEdgeKind::SwitchCase),
+        )
+        .bind(
+            "first_invoke",
+            PointSelector::new("cpp_first()")
+                .procedure("cpp_switch")
+                .effect("invoke"),
+        )
+        .bind(
+            "first_normal",
+            PointSelector::new("cpp_first()")
+                .procedure("cpp_switch")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "second_invoke",
+            PointSelector::new("cpp_second()")
+                .procedure("cpp_switch")
+                .effect("invoke"),
+        )
+        .bind(
+            "second_normal",
+            PointSelector::new("cpp_second()")
+                .procedure("cpp_switch")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "switch_break",
+            PointSelector::new("break;")
+                .procedure("cpp_switch")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "fallback_invoke",
+            PointSelector::new("cpp_fallback()")
+                .procedure("cpp_switch")
+                .effect("invoke"),
+        )
+        .bind(
+            "fallback_normal",
+            PointSelector::new("cpp_fallback()")
+                .procedure("cpp_switch")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "after_switch_invoke",
+            PointSelector::new("cpp_after_switch()")
+                .procedure("cpp_switch")
+                .effect("invoke"),
+        )
+        .bind(
+            "forward_goto",
+            PointSelector::new("goto cpp_target;")
+                .occurrence(0)
+                .procedure("cpp_jump")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "backward_goto",
+            PointSelector::new("goto cpp_target;")
+                .occurrence(1)
+                .procedure("cpp_jump")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "dead_jump_invoke",
+            PointSelector::new("cpp_dead()")
+                .procedure("cpp_jump")
+                .effect("invoke"),
+        )
+        .bind(
+            "live_invoke",
+            PointSelector::new("cpp_live()")
+                .procedure("cpp_jump")
+                .effect("invoke"),
+        )
+        .bind(
+            "jump_done_invoke",
+            PointSelector::new("cpp_done()")
+                .procedure("cpp_jump")
+                .effect("invoke"),
+        )
+        .bind(
+            "try_entry",
+            PointSelector::new("void cpp_try(bool fail)")
+                .procedure("cpp_try")
+                .effect("entry"),
+        )
+        .bind(
+            "throw",
+            PointSelector::new("throw 7;")
+                .procedure("cpp_try")
+                .effect("throw"),
+        )
+        .bind(
+            "catch_dispatch",
+            PointSelector::new(try_source)
+                .procedure("cpp_try")
+                .outgoing_kind(ControlEdgeKind::SwitchCase),
+        )
+        .bind(
+            "catch_entry",
+            PointSelector::new(catch_source)
+                .procedure("cpp_try")
+                .effect("gap"),
+        )
+        .bind(
+            "dead_throw_invoke",
+            PointSelector::new("cpp_dead_throw()")
+                .procedure("cpp_try")
+                .effect("invoke"),
+        )
+        .bind(
+            "normal_invoke",
+            PointSelector::new("cpp_normal()")
+                .procedure("cpp_try")
+                .effect("invoke"),
+        )
+        .bind(
+            "normal_exceptional",
+            PointSelector::new("cpp_normal()")
+                .procedure("cpp_try")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "handled_invoke",
+            PointSelector::new("cpp_handled()")
+                .procedure("cpp_try")
+                .effect("invoke"),
+        )
+        .bind(
+            "after_try_invoke",
+            PointSelector::new("cpp_after_try()")
+                .procedure("cpp_try")
+                .effect("invoke"),
+        )
+        .bind(
+            "try_exceptional_exit",
+            PointSelector::new("void cpp_try(bool fail)")
+                .procedure("cpp_try")
+                .effect("exceptional_exit"),
+        );
+
+    graph.assert_reachable("switch_dispatch", "first_invoke");
+    graph.assert_reachable("switch_dispatch", "second_invoke");
+    graph.assert_reachable("switch_dispatch", "fallback_invoke");
+    graph.assert_reachable("first_normal", "second_invoke");
+    graph.assert_successors(
+        "second_normal",
+        &[cfg_edge("switch_break", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "switch_break",
+        &[cfg_edge("second_normal", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("switch_break", "after_switch_invoke");
+    graph.assert_reachable("fallback_normal", "after_switch_invoke");
+
+    graph.assert_reachable("forward_goto", "live_invoke");
+    graph.assert_unreachable("forward_goto", "dead_jump_invoke");
+    graph.assert_reachable("live_invoke", "backward_goto");
+    graph.assert_reachable("backward_goto", "live_invoke");
+    graph.assert_reachable("backward_goto", "jump_done_invoke");
+    for transfer in ["forward_goto", "backward_goto"] {
+        graph.assert_point_gap(
+            transfer,
+            SemanticCapability::NonLocalControl,
+            SemanticGapKind::Unknown,
+        );
+        for capability in [
+            SemanticCapability::CleanupControlFlow,
+            SemanticCapability::ResourceManagement,
+            SemanticCapability::Calls,
+            SemanticCapability::ExceptionalControlFlow,
+        ] {
+            graph.assert_point_gap(transfer, capability, SemanticGapKind::Unknown);
+        }
+    }
+
+    graph.assert_successors(
+        "throw",
+        &[cfg_edge("catch_dispatch", ControlEdgeKind::Exceptional)],
+    );
+    graph.assert_predecessors(
+        "catch_dispatch",
+        &[
+            cfg_edge("throw", ControlEdgeKind::Exceptional),
+            cfg_edge("normal_exceptional", ControlEdgeKind::Exceptional),
+        ],
+    );
+    graph.assert_reachable("catch_dispatch", "handled_invoke");
+    graph.assert_reachable("catch_dispatch", "try_exceptional_exit");
+    graph.assert_reachable("try_entry", "normal_invoke");
+    graph.assert_unreachable("try_entry", "dead_throw_invoke");
+    graph.assert_reachable("handled_invoke", "after_try_invoke");
+    graph.assert_point_gap(
+        "catch_dispatch",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    for capability in [
+        SemanticCapability::Calls,
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticCapability::ResourceManagement,
+    ] {
+        graph.assert_point_gap("catch_entry", capability, SemanticGapKind::Unknown);
+    }
+    graph.assert_point_gap(
+        "catch_entry",
+        SemanticCapability::Values,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn cpp_callables_lifetimes_dispatch_and_unevaluated_operands_have_exact_gaps() {
+    let source = r#"void cpp_cleanup(int value);
+int cpp_hidden();
+int cpp_combine(int left, int right);
+
+struct Box {
+    Box(int seed) : value(seed) {}
+    ~Box() { cpp_cleanup(value); }
+    int operator+(int rhs) const { return value + rhs; }
+    virtual int run(int input) { return input; }
+    int value;
+};
+
+int cpp_use(Box* pointer, int (*callback)(int), int left, int right) {
+    Box local(left);
+    int virtual_value = pointer->run(left);
+    int indirect_value = (*callback)(right);
+    std::thread worker{cpp_cleanup, left};
+    int ordered_value = cpp_combine(left, right);
+    int unevaluated_value = noexcept(cpp_hidden());
+    Box* heap = new Box(right);
+    int overloaded_value = local + left;
+    return virtual_value + indirect_value + ordered_value + unevaluated_value
+        + overloaded_value + heap->value;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("cpp/callable_gaps.cpp", source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "cpp/callable_gaps.cpp");
+    graph
+        .bind(
+            "constructor_entry",
+            PointSelector::new("Box(int seed)")
+                .procedure("Box")
+                .effect("entry"),
+        )
+        .bind(
+            "destructor_entry",
+            PointSelector::new("~Box()")
+                .procedure("~Box")
+                .effect("entry"),
+        )
+        .bind(
+            "local_initialization",
+            PointSelector::new("Box local(left);")
+                .procedure("cpp_use")
+                .effect("gap"),
+        )
+        .bind(
+            "thread_spawn",
+            PointSelector::new("std::thread worker{cpp_cleanup, left};")
+                .procedure("cpp_use")
+                .effect("gap"),
+        )
+        .bind(
+            "virtual_invoke",
+            PointSelector::new("pointer->run(left)")
+                .procedure("cpp_use")
+                .effect("invoke"),
+        )
+        .bind(
+            "new_invoke",
+            PointSelector::new("new Box(right)")
+                .procedure("cpp_use")
+                .effect("invoke"),
+        )
+        .bind(
+            "unevaluated",
+            PointSelector::new("noexcept(cpp_hidden())")
+                .procedure("cpp_use")
+                .effect("gap"),
+        )
+        .bind(
+            "overloaded_operator",
+            PointSelector::new("local + left")
+                .procedure("cpp_use")
+                .effect("gap"),
+        )
+        .bind(
+            "use_normal_exit",
+            PointSelector::new(
+                "int cpp_use(Box* pointer, int (*callback)(int), int left, int right)",
+            )
+            .procedure("cpp_use")
+            .effect("normal_exit"),
+        )
+        .bind(
+            "use_exceptional_exit",
+            PointSelector::new(
+                "int cpp_use(Box* pointer, int (*callback)(int), int left, int right)",
+            )
+            .procedure("cpp_use")
+            .effect("exceptional_exit"),
+        );
+
+    let constructor = procedure_named(&graph, "Box", ProcedureKind::Constructor);
+    let destructor = procedure_named(&graph, "~Box", ProcedureKind::Method);
+    let operator = procedure_named(&graph, "operator+", ProcedureKind::Operator);
+    let method = procedure_named(&graph, "run", ProcedureKind::Method);
+    let use_procedure = procedure_named(&graph, "cpp_use", ProcedureKind::Function);
+    for procedure in [constructor, destructor, operator, method, use_procedure] {
+        assert_eq!(
+            procedure.properties().invocation,
+            ProcedureInvocationKind::Immediate
+        );
+    }
+
+    for boundary in ["constructor_entry", "destructor_entry"] {
+        for capability in [
+            SemanticCapability::Calls,
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticCapability::ResourceManagement,
+        ] {
+            graph.assert_point_gap(boundary, capability, SemanticGapKind::Unknown);
+        }
+    }
+    for capability in [
+        SemanticCapability::Calls,
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticCapability::ResourceManagement,
+    ] {
+        graph.assert_point_gap("local_initialization", capability, SemanticGapKind::Unknown);
+        graph.assert_point_gap("new_invoke", capability, SemanticGapKind::Unknown);
+    }
+    for boundary in ["use_normal_exit", "use_exceptional_exit"] {
+        for capability in [
+            SemanticCapability::CleanupControlFlow,
+            SemanticCapability::ResourceManagement,
+            SemanticCapability::Calls,
+            SemanticCapability::ExceptionalControlFlow,
+        ] {
+            graph.assert_point_gap(boundary, capability, SemanticGapKind::Unknown);
+        }
+    }
+
+    graph.assert_point_gap(
+        "virtual_invoke",
+        SemanticCapability::DynamicDispatch,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_point_gap(
+        "thread_spawn",
+        SemanticCapability::ConcurrentSpawn,
+        SemanticGapKind::Unknown,
+    );
+    assert_call_site_gap(
+        use_procedure,
+        source,
+        "(*callback)(right)",
+        SemanticCapability::CallableReferences,
+        SemanticGapKind::Unsupported,
+    );
+    assert_call_site_gap(
+        use_procedure,
+        source,
+        "(*callback)(right)",
+        SemanticCapability::Calls,
+        SemanticGapKind::Unsupported,
+    );
+    assert_call_site_gap(
+        use_procedure,
+        source,
+        "cpp_combine(left, right)",
+        SemanticCapability::NormalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    assert_call_site_gap(
+        use_procedure,
+        source,
+        "new Box(right)",
+        SemanticCapability::Allocations,
+        SemanticGapKind::Unknown,
+    );
+    assert_no_exact_call_site(use_procedure, source, "cpp_hidden()");
+    graph.assert_point_gap(
+        "unevaluated",
+        SemanticCapability::Values,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_point_gap(
+        "unevaluated",
+        SemanticCapability::Calls,
+        SemanticGapKind::Unsupported,
+    );
+    for capability in [
+        SemanticCapability::Calls,
+        SemanticCapability::ExceptionalControlFlow,
+    ] {
+        graph.assert_point_gap("overloaded_operator", capability, SemanticGapKind::Unknown);
+    }
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn cpp_preprocessing_publishes_exact_configuration_gaps() {
+    let preprocessor_source = r#"#if CPP_FEATURE
+    return cpp_feature(value);
+#else
+    return value;
+#endif"#;
+    let configured_source = format!(
+        r#"int cpp_feature(int value);
+
+int cpp_configured(int value) {{
+{preprocessor_source}
+}}
+"#
+    );
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("cpp/configured.cpp", &configured_source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut configured_graph =
+        SemanticGraph::materialize(&project, &analyzer, "cpp/configured.cpp");
+    configured_graph.bind(
+        "configuration_dispatch",
+        PointSelector::new(preprocessor_source)
+            .procedure("cpp_configured")
+            .outgoing_kind(ControlEdgeKind::SwitchCase),
+    );
+    let configured = procedure_named(&configured_graph, "cpp_configured", ProcedureKind::Function);
+    for capability in [
+        SemanticCapability::NormalControlFlow,
+        SemanticCapability::Calls,
+        SemanticCapability::CallableReferences,
+    ] {
+        assert_procedure_gap(configured, capability, SemanticGapKind::Unsupported);
+    }
+    for capability in [
+        SemanticCapability::NormalControlFlow,
+        SemanticCapability::Calls,
+        SemanticCapability::NonLocalControl,
+    ] {
+        configured_graph.assert_point_gap(
+            "configuration_dispatch",
+            capability,
+            SemanticGapKind::Unsupported,
+        );
+    }
+    configured_graph.assert_adjacency_symmetric();
+    let configured_render = configured_graph.render_topology();
+    assert_eq!(configured_render, configured_graph.render_topology());
+    assert!(!configured_render.contains("ProgramPointId"));
+    assert!(!configured_render.contains("ControlEdgeId"));
+}
+
+#[test]
+fn cpp_coroutines_publish_exact_suspension_gaps() {
+    let coroutine_source = r#"int cpp_awaitable();
+
+void cpp_coroutine() {
+    co_await cpp_awaitable();
+    co_yield 1;
+    co_return;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("cpp/coroutine.cpp", coroutine_source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut coroutine_graph = SemanticGraph::materialize(&project, &analyzer, "cpp/coroutine.cpp");
+    coroutine_graph
+        .bind(
+            "await_invoke",
+            PointSelector::new("cpp_awaitable()")
+                .procedure("cpp_coroutine")
+                .effect("invoke"),
+        )
+        .bind(
+            "await_normal",
+            PointSelector::new("cpp_awaitable()")
+                .procedure("cpp_coroutine")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "await_exceptional",
+            PointSelector::new("cpp_awaitable()")
+                .procedure("cpp_coroutine")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        );
+    let coroutine = procedure_named(&coroutine_graph, "cpp_coroutine", ProcedureKind::Function);
+    assert!(coroutine.properties().is_async);
+    assert!(coroutine.properties().is_generator);
+    assert_eq!(
+        coroutine.properties().invocation,
+        ProcedureInvocationKind::Deferred
+    );
+    for capability in [
+        SemanticCapability::DeferredExecution,
+        SemanticCapability::AsyncSuspendResume,
+        SemanticCapability::GeneratorSuspension,
+    ] {
+        assert_procedure_gap(coroutine, capability, SemanticGapKind::Unsupported);
+    }
+    for point_source in ["co_await cpp_awaitable()", "co_yield 1;", "co_return;"] {
+        for capability in [
+            SemanticCapability::AsyncSuspendResume,
+            SemanticCapability::DeferredExecution,
+        ] {
+            assert_source_point_gap(
+                coroutine,
+                coroutine_source,
+                point_source,
+                capability,
+                SemanticGapKind::Unsupported,
+            );
+        }
+    }
+    coroutine_graph.assert_successors(
+        "await_invoke",
+        &[
+            cfg_edge("await_normal", ControlEdgeKind::Normal),
+            cfg_edge("await_exceptional", ControlEdgeKind::Exceptional),
+        ],
+    );
+    coroutine_graph.assert_predecessors(
+        "await_normal",
+        &[cfg_edge("await_invoke", ControlEdgeKind::Normal)],
+    );
+    coroutine_graph.assert_adjacency_symmetric();
+    let coroutine_render = coroutine_graph.render_topology();
+    assert_eq!(coroutine_render, coroutine_graph.render_topology());
+    assert!(!coroutine_render.contains("ProgramPointId"));
+    assert!(!coroutine_render.contains("ControlEdgeId"));
+}
+
+#[test]
+fn cpp_order_scope_cleanup_and_local_static_uncertainty_are_point_scoped() {
+    let inner_block = r#"{
+        Guard local(sum);
+        cpp_left();
+    }"#;
+    let source = format!(
+        r#"int cpp_left();
+int cpp_right();
+
+struct Guard {{
+    Guard(int value);
+    ~Guard();
+}};
+
+struct Pair {{
+    int first;
+    int second;
+    Pair() : second(cpp_right()), first(cpp_left()) {{}}
+}};
+
+int cpp_boundaries() {{
+    int sum = cpp_left() + cpp_right();
+    {inner_block}
+    static Guard shared(cpp_right());
+    return sum;
+}}
+"#
+    );
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("cpp/order_and_lifetime.cpp", &source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "cpp/order_and_lifetime.cpp");
+    graph
+        .bind(
+            "binary_order",
+            PointSelector::new("cpp_left() + cpp_right()")
+                .procedure("cpp_boundaries")
+                .effect("gap"),
+        )
+        .bind(
+            "constructor_order",
+            PointSelector::new(": second(cpp_right()), first(cpp_left())")
+                .procedure("Pair")
+                .effect("gap"),
+        )
+        .bind(
+            "inner_scope_exit",
+            PointSelector::new(inner_block)
+                .procedure("cpp_boundaries")
+                .effect("gap"),
+        )
+        .bind(
+            "static_guard",
+            PointSelector::new("static Guard shared(cpp_right());")
+                .procedure("cpp_boundaries")
+                .effect("gap")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        );
+
+    for boundary in ["binary_order", "constructor_order", "static_guard"] {
+        graph.assert_point_gap(
+            boundary,
+            SemanticCapability::NormalControlFlow,
+            SemanticGapKind::Unknown,
+        );
+    }
+    for capability in [
+        SemanticCapability::CleanupControlFlow,
+        SemanticCapability::ResourceManagement,
+    ] {
+        graph.assert_point_gap("inner_scope_exit", capability, SemanticGapKind::Unknown);
+    }
+    graph.assert_point_gap(
+        "static_guard",
+        SemanticCapability::DeferredExecution,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn c_vla_bound_calls_are_retained_in_declaration_flow() {
+    let source = r#"int c_next_size(void) { return 4; }
+
+void c_vla(void) {
+    int values[c_next_size()];
+    values[0] = 1;
+    {
+        int nested[c_next_size()];
+        if (values[0]) return;
+        nested[0] = values[0];
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("c/vla.c", source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "c/vla.c");
+    graph
+        .bind(
+            "vla_invoke",
+            PointSelector::new("c_next_size()")
+                .occurrence(1)
+                .procedure("c_vla")
+                .effect("invoke"),
+        )
+        .bind(
+            "vla_normal",
+            PointSelector::new("c_next_size()")
+                .occurrence(1)
+                .procedure("c_vla")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "vla_exceptional",
+            PointSelector::new("c_next_size()")
+                .occurrence(1)
+                .procedure("c_vla")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "vla_normal_exit",
+            PointSelector::new("void c_vla(void)")
+                .procedure("c_vla")
+                .effect("normal_exit"),
+        )
+        .bind(
+            "vla_exceptional_exit",
+            PointSelector::new("void c_vla(void)")
+                .procedure("c_vla")
+                .effect("exceptional_exit"),
+        );
+    let procedure = procedure_named(&graph, "c_vla", ProcedureKind::Function);
+    assert_eq!(
+        call_site_source(
+            procedure,
+            source,
+            exact_call_site(procedure, source, "c_next_size()")
+        ),
+        "c_next_size()"
+    );
+    graph.assert_successors(
+        "vla_invoke",
+        &[
+            cfg_edge("vla_normal", ControlEdgeKind::Normal),
+            cfg_edge("vla_exceptional", ControlEdgeKind::Exceptional),
+        ],
+    );
+    for capability in [
+        SemanticCapability::CleanupControlFlow,
+        SemanticCapability::ResourceManagement,
+        SemanticCapability::Allocations,
+    ] {
+        assert_procedure_gap(procedure, capability, SemanticGapKind::Unknown);
+        graph.assert_point_gap("vla_normal_exit", capability, SemanticGapKind::Unknown);
+        graph.assert_point_gap("vla_exceptional_exit", capability, SemanticGapKind::Unknown);
+        assert_source_point_gap(
+            procedure,
+            source,
+            "return;",
+            capability,
+            SemanticGapKind::Unknown,
+        );
+    }
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn cpp_nested_cases_and_seh_bodies_are_retained_without_false_fallthrough() {
+    let outer_switch = r#"switch (value) {
+        if (flag) {
+            case 1:
+                cpp_nested();
+                break;
+        }
+        case 2:
+            switch (value) {
+                case 3:
+                    cpp_inner();
+                    break;
+            }
+            break;
+        default:
+            cpp_fallback();
+    }"#;
+    let seh_except = r#"__try {
+        cpp_try_body();
+    } __except(cpp_filter()) {
+        cpp_handler();
+    }"#;
+    let source = format!(
+        r#"int cpp_filter();
+void cpp_nested();
+void cpp_inner();
+void cpp_fallback();
+void cpp_try_body();
+void cpp_handler();
+void cpp_finally_body();
+void cpp_cleanup();
+void cpp_after_leave();
+
+void cpp_control(int value, bool flag) {{
+    {outer_switch}
+    {seh_except}
+    __try {{
+        cpp_finally_body();
+    }} __finally {{
+        cpp_cleanup();
+    }}
+    __try {{
+        __leave;
+        cpp_after_leave();
+    }} __finally {{
+        cpp_cleanup();
+    }}
+}}
+"#
+    );
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("cpp/switch_seh.cpp", &source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "cpp/switch_seh.cpp");
+    graph
+        .bind(
+            "outer_dispatch",
+            PointSelector::new(outer_switch)
+                .procedure("cpp_control")
+                .outgoing_kind(ControlEdgeKind::SwitchCase),
+        )
+        .bind(
+            "outer_case_one",
+            PointSelector::new("case 1:\n                cpp_nested();\n                break;")
+                .procedure("cpp_control")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "outer_case_two",
+            PointSelector::new(
+                r#"case 2:
+            switch (value) {
+                case 3:
+                    cpp_inner();
+                    break;
+            }
+            break;"#,
+            )
+            .procedure("cpp_control")
+            .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "outer_default",
+            PointSelector::new("default:\n            cpp_fallback();")
+                .procedure("cpp_control")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "inner_dispatch",
+            PointSelector::new(
+                r#"switch (value) {
+                case 3:
+                    cpp_inner();
+                    break;
+            }"#,
+            )
+            .procedure("cpp_control")
+            .outgoing_kind(ControlEdgeKind::SwitchCase),
+        )
+        .bind(
+            "inner_case",
+            PointSelector::new(
+                "case 3:\n                    cpp_inner();\n                    break;",
+            )
+            .procedure("cpp_control")
+            .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "seh_boundary",
+            PointSelector::new(seh_except)
+                .procedure("cpp_control")
+                .effect("gap"),
+        )
+        .bind(
+            "seh_leave",
+            PointSelector::new("__leave;")
+                .procedure("cpp_control")
+                .effect("gap"),
+        )
+        .bind(
+            "after_leave",
+            PointSelector::new("cpp_after_leave()")
+                .procedure("cpp_control")
+                .effect("invoke"),
+        );
+
+    graph.assert_successors(
+        "outer_dispatch",
+        &[
+            cfg_edge("outer_case_one", ControlEdgeKind::SwitchCase),
+            cfg_edge("outer_case_two", ControlEdgeKind::SwitchCase),
+            cfg_edge("outer_default", ControlEdgeKind::SwitchCase),
+        ],
+    );
+    graph.assert_predecessors(
+        "outer_case_one",
+        &[cfg_edge("outer_dispatch", ControlEdgeKind::SwitchCase)],
+    );
+    graph.assert_predecessors(
+        "inner_case",
+        &[cfg_edge("inner_dispatch", ControlEdgeKind::SwitchCase)],
+    );
+    for capability in [
+        SemanticCapability::NormalControlFlow,
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticCapability::CleanupControlFlow,
+        SemanticCapability::Calls,
+        SemanticCapability::NonLocalControl,
+        SemanticCapability::ResourceManagement,
+    ] {
+        graph.assert_point_gap("seh_boundary", capability, SemanticGapKind::Unsupported);
+    }
+    for capability in [
+        SemanticCapability::NormalControlFlow,
+        SemanticCapability::CleanupControlFlow,
+        SemanticCapability::NonLocalControl,
+    ] {
+        graph.assert_point_gap("seh_leave", capability, SemanticGapKind::Unsupported);
+    }
+    let procedure = procedure_named(&graph, "cpp_control", ProcedureKind::Function);
+    assert_eq!(
+        procedure
+            .call_sites()
+            .iter()
+            .filter(|call| call_site_source(procedure, &source, call) == "cpp_nested()")
+            .count(),
+        1,
+        "nested case body must be lowered exactly once"
+    );
+    for call in [
+        "cpp_try_body()",
+        "cpp_filter()",
+        "cpp_handler()",
+        "cpp_finally_body()",
+        "cpp_cleanup()",
+        "cpp_after_leave()",
+    ] {
+        let _ = exact_call_site(procedure, &source, call);
+    }
+    graph.assert_unreachable("seh_leave", "after_leave");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn cpp_enumeration_budget_counts_non_callable_syntax() {
+    let source = (0..64)
+        .map(|index| format!("struct Budget{index} {{ int value; }};\n"))
+        .collect::<String>();
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("cpp/enumeration_budget.cpp", &source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let file = project.file("cpp/enumeration_budget.cpp");
+    let cancellation = CancellationToken::default();
+
+    let mut limits = SemanticBudget::default().limits();
+    limits.nested_entries = 12;
+    let mut budget = SemanticBudget::new(limits).expect("positive semantic budget");
+    let outcome = analyzer
+        .materialize_program_semantics(&file, &mut SemanticRequest::new(&mut budget, &cancellation))
+        .expect("enumeration exhaustion is a semantic outcome");
+    assert!(matches!(
+        outcome,
+        SemanticOutcome::ExceededBudget { exceeded, work, .. }
+            if exceeded.dimension() == SemanticBudgetDimension::NestedEntries
+                && work.nested_entries > 12
+    ));
+
+    let mut budget = SemanticBudget::default();
+    let outcome = analyzer
+        .materialize_program_semantics(&file, &mut SemanticRequest::new(&mut budget, &cancellation))
+        .expect("sufficient enumeration budget");
+    assert!(matches!(
+        outcome,
+        SemanticOutcome::Complete { work, .. } if work.nested_entries > 64
+    ));
+}
+
+#[test]
+fn cpp_deep_parenthesized_member_receiver_is_stack_safe() {
+    const DEPTH: usize = 2_048;
+    let mut callee = "receiver->direct".to_string();
+    for _ in 0..DEPTH {
+        callee = format!("({callee})");
+    }
+    let source = format!(
+        r#"struct Receiver {{
+    int direct() {{ return 1; }}
+}};
+
+int cpp_deep_receiver(Receiver* receiver) {{
+    return {callee}();
+}}
+"#
+    );
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("cpp/deep_receiver.cpp", &source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "cpp/deep_receiver.cpp");
+    let procedure = procedure_named(&graph, "cpp_deep_receiver", ProcedureKind::Function);
+    let call = procedure
+        .call_sites()
+        .first()
+        .expect("deep parenthesized member call");
+    assert!(call.receiver.is_some());
+    assert!(procedure.gaps().iter().any(|gap| {
+        gap.point == call.point && gap.capability == SemanticCapability::DynamicDispatch
+    }));
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn c_assignment_call_operand_order_and_gnu_asm_publish_exact_gaps() {
+    let asm = r#"asm goto("test %0; jnz %l1" : : "r"(value) : "cc" : target);"#;
+    let source = format!(
+        r#"int c_bump(int *value);
+int c_argument(void);
+int (*c_next_callback(void))(int);
+void c_after(void);
+void c_done(void);
+
+int c_order(int *pointer, int value) {{
+    *pointer = c_bump(pointer);
+    int result = c_next_callback()(c_argument());
+    {asm}
+    c_after();
+target:
+    c_done();
+    return result;
+}}
+"#
+    );
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("c/order_and_asm.c", &source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "c/order_and_asm.c");
+    let procedure = procedure_named(&graph, "c_order", ProcedureKind::Function);
+    assert_source_point_gap(
+        procedure,
+        &source,
+        "*pointer = c_bump(pointer)",
+        SemanticCapability::NormalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    assert_call_site_gap(
+        procedure,
+        &source,
+        "c_next_callback()(c_argument())",
+        SemanticCapability::NormalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    for capability in [
+        SemanticCapability::NormalControlFlow,
+        SemanticCapability::NonLocalControl,
+        SemanticCapability::Calls,
+        SemanticCapability::Values,
+        SemanticCapability::Assignments,
+    ] {
+        assert_source_point_gap(
+            procedure,
+            &source,
+            asm,
+            capability,
+            SemanticGapKind::Unsupported,
+        );
+    }
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn cpp_cross_file_member_call_requires_dynamic_dispatch_refinement() {
+    let header = r#"struct Base {
+    virtual int run();
+};
+"#;
+    let caller_source = r#"#include "base.h"
+int cpp_cross_file_dispatch(Base* receiver) {
+    return receiver->run();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("cpp/base.h", header)
+        .file("cpp/caller.cpp", caller_source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "cpp/caller.cpp");
+    let procedure = procedure_named(&graph, "cpp_cross_file_dispatch", ProcedureKind::Function);
+    let call = exact_call_site(procedure, caller_source, "receiver->run()");
+    assert!(procedure.gaps().iter().any(|gap| {
+        gap.point == call.point
+            && gap.subject == SemanticGapSubject::Point
+            && gap.capability == SemanticCapability::DynamicDispatch
+            && gap.kind == SemanticGapKind::Unknown
+    }));
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn cpp_statement_condition_and_range_cleanup_boundaries_are_exact() {
+    let if_condition = "(Guard if_guard{make_if_guard()}; flag)";
+    let for_initializer = "Guard for_guard{make_for_guard()};";
+    let switch_condition = "(Guard switch_guard{make_switch_guard()}; tag)";
+    let range_loop = r#"for (Guard item : make_range()) {
+        if (flag) continue;
+        break;
+    }"#;
+    let source = format!(
+        r#"struct Guard {{
+    Guard();
+    ~Guard();
+}};
+struct Range {{}};
+
+Guard make_if_guard();
+Guard make_for_guard();
+Guard make_switch_guard();
+Range make_range();
+void touch();
+void step();
+void after();
+
+void cpp_cleanup_boundaries(bool flag, int tag) {{
+    if {if_condition} touch();
+    for ({for_initializer} flag; step()) {{
+        if (flag) continue;
+        break;
+    }}
+    switch {switch_condition} {{
+        default: break;
+    }}
+    {range_loop}
+    after();
+}}
+"#
+    );
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("cpp/statement_cleanup.cpp", &source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "cpp/statement_cleanup.cpp");
+    let procedure = procedure_named(&graph, "cpp_cleanup_boundaries", ProcedureKind::Function);
+    for call in [
+        "make_if_guard()",
+        "make_for_guard()",
+        "make_switch_guard()",
+        "make_range()",
+    ] {
+        let _ = exact_call_site(procedure, &source, call);
+    }
+    for boundary in [if_condition, for_initializer, switch_condition, range_loop] {
+        for capability in [
+            SemanticCapability::CleanupControlFlow,
+            SemanticCapability::ResourceManagement,
+        ] {
+            assert_source_point_gap(
+                procedure,
+                &source,
+                boundary,
+                capability,
+                SemanticGapKind::Unknown,
+            );
+        }
+    }
+    let range_cleanup_points = procedure
+        .points()
+        .iter()
+        .filter(|point| {
+            let Some(mapping) = procedure.source_mapping(point.source) else {
+                return false;
+            };
+            let span = mapping.locator.anchor().span();
+            source.get(span.start_byte() as usize..span.end_byte() as usize) == Some(range_loop)
+                && point.events.iter().any(|event| {
+                    let SemanticEffect::Gap { gap } = &event.effect else {
+                        return false;
+                    };
+                    procedure.gap(*gap).is_some_and(|gap| {
+                        gap.subject == SemanticGapSubject::Point
+                            && gap.capability == SemanticCapability::CleanupControlFlow
+                    })
+                })
+        })
+        .count();
+    assert_eq!(
+        range_cleanup_points, 3,
+        "range lifetime, normal/continue binding cleanup, and break binding cleanup must remain distinct"
+    );
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn cpp_noexcept_specs_route_or_downgrade_exceptional_completion() {
+    let unconditional = r#"void cpp_noexcept() noexcept {
+    cpp_risky();
+    throw 1;
+}"#;
+    let conditional = r#"void cpp_conditional_noexcept() noexcept(sizeof(int) == 4) {
+    throw 2;
+}"#;
+    let source = format!(
+        r#"void cpp_risky();
+
+{unconditional}
+
+{conditional}
+
+void cpp_may_throw() noexcept(false) {{
+    throw 3;
+}}
+"#
+    );
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("cpp/noexcept.cpp", &source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "cpp/noexcept.cpp");
+    graph
+        .bind(
+            "noexcept_throw",
+            PointSelector::new("throw 1;")
+                .procedure("cpp_noexcept")
+                .effect("throw"),
+        )
+        .bind(
+            "noexcept_call_exceptional",
+            PointSelector::new("cpp_risky()")
+                .procedure("cpp_noexcept")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "noexcept_exceptional_exit",
+            PointSelector::new("void cpp_noexcept()")
+                .procedure("cpp_noexcept")
+                .effect("exceptional_exit"),
+        )
+        .bind(
+            "conditional_exceptional_exit",
+            PointSelector::new("void cpp_conditional_noexcept()")
+                .procedure("cpp_conditional_noexcept")
+                .effect("exceptional_exit"),
+        );
+
+    let noexcept = procedure_named(&graph, "cpp_noexcept", ProcedureKind::Function);
+    let conditional_noexcept =
+        procedure_named(&graph, "cpp_conditional_noexcept", ProcedureKind::Function);
+    for capability in [
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticCapability::NonLocalControl,
+        SemanticCapability::Calls,
+    ] {
+        assert_procedure_gap(noexcept, capability, SemanticGapKind::Unknown);
+        assert_source_point_gap(
+            noexcept,
+            &source,
+            unconditional,
+            capability,
+            SemanticGapKind::Unknown,
+        );
+        assert_procedure_gap(conditional_noexcept, capability, SemanticGapKind::Unknown);
+        graph.assert_point_gap(
+            "conditional_exceptional_exit",
+            capability,
+            SemanticGapKind::Unknown,
+        );
+    }
+    graph.assert_unreachable("noexcept_throw", "noexcept_exceptional_exit");
+    graph.assert_unreachable("noexcept_call_exceptional", "noexcept_exceptional_exit");
     graph.assert_adjacency_symmetric();
 }
 
@@ -4328,13 +6235,18 @@ def make_deferred():
             root(),
         );
 
-    graph.assert_outcome(IcfgOutcomeKind::Complete);
+    graph.assert_outcome(IcfgOutcomeKind::Unproven);
     graph.assert_boundary(
         "async_invoke",
         ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchDeferred(
             DeferredInvocationKind::Async,
         ))
         .originating_call("async_call"),
+    );
+    graph.assert_boundary(
+        "async_invoke",
+        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
+            .originating_call("async_call"),
     );
     graph.assert_successors(
         "async_invoke",
@@ -4361,6 +6273,11 @@ def make_deferred():
             DeferredInvocationKind::Generator,
         ))
         .originating_call("generator_call"),
+    );
+    graph.assert_boundary(
+        "generator_invoke",
+        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
+            .originating_call("generator_call"),
     );
     graph.assert_successors(
         "generator_invoke",
@@ -13030,7 +14947,7 @@ fn scala_constructor_initializer_given_and_partial_function_procedures_are_disti
 
 #[test]
 fn scala_constructor_direct_call_conformance() {
-    assert_direct_call_conformance(DirectCallFixture {
+    assert_return_partial_direct_call_conformance(DirectCallFixture {
         language: Language::Scala,
         dialect: SemanticLanguage::Standard(Language::Scala),
         callee_path: "scala/ConstructedBox.scala",
@@ -13787,7 +15704,12 @@ fn ruby_same_class_bare_call_uses_the_shared_icfg() {
             root(),
         );
 
-    graph.assert_outcome(IcfgOutcomeKind::Complete);
+    graph.assert_outcome(IcfgOutcomeKind::Unproven);
+    graph.assert_boundary(
+        "invoke",
+        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
+            .originating_call("bare_call"),
+    );
     graph.assert_successors(
         "invoke",
         &[icfg_edge("callee_entry", IcfgEdgeKind::Call).originating_call("bare_call")],

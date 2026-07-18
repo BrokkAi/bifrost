@@ -156,6 +156,7 @@ fn php_capabilities() -> SemanticCapabilities {
         SemanticCapability::ExceptionalControlFlow,
         SemanticCapability::CleanupControlFlow,
         SemanticCapability::Calls,
+        SemanticCapability::DynamicDispatch,
         SemanticCapability::CallableReferences,
         SemanticCapability::Values,
         SemanticCapability::GeneratorSuspension,
@@ -2797,6 +2798,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             stack,
         )?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+        let uses_runtime_class_dispatch = runtime_class_dispatch_scope(self.source, node);
+        if receiver.is_some() || uses_runtime_class_dispatch {
+            self.add_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::DynamicDispatch,
+                SemanticGapKind::Unknown,
+                "member, late-static, or runtime-class dispatch may select an override, constructor, or magic method; receiver/runtime class and complete target coverage require class-hierarchy refinement",
+            )?;
+        }
         if node.kind() == "object_creation_expression" {
             self.add_gap(
                 builder,
@@ -3722,7 +3734,10 @@ fn callable_reference_evaluations(node: Node<'_>) -> Vec<Node<'_>> {
         }
         "scoped_call_expression" => {
             let mut values = Vec::new();
-            if let Some(scope) = node.child_by_field_name("scope") {
+            if let Some(scope) = node
+                .child_by_field_name("scope")
+                .filter(|scope| class_scope_requires_runtime_evaluation(*scope))
+            {
                 values.push(scope);
             }
             if let Some(name) = node.child_by_field_name("name")
@@ -3738,10 +3753,41 @@ fn callable_reference_evaluations(node: Node<'_>) -> Vec<Node<'_>> {
                 child.kind() != "arguments"
                     && child.kind() != "anonymous_class"
                     && !is_modifier_or_type_syntax(child.kind())
+                    && class_scope_requires_runtime_evaluation(*child)
             })
             .collect(),
         _ => Vec::new(),
     }
+}
+
+fn runtime_class_dispatch_scope(source: &str, node: Node<'_>) -> bool {
+    let scope = match node.kind() {
+        "scoped_call_expression" => node.child_by_field_name("scope"),
+        "object_creation_expression" => node.child_by_field_name("class").or_else(|| {
+            named_children(node).into_iter().find(|child| {
+                child.kind() == "relative_scope"
+                    || (!matches!(child.kind(), "arguments" | "anonymous_class")
+                        && !is_modifier_or_type_syntax(child.kind()))
+            })
+        }),
+        _ => None,
+    };
+    let Some(scope) = scope else {
+        return false;
+    };
+    let text = node_text(source, scope);
+    if text.is_some_and(|text| text.eq_ignore_ascii_case("static")) {
+        return true;
+    }
+    match scope.kind() {
+        "name" | "qualified_name" => false,
+        "relative_scope" => false, // `self` and `parent`; `static` was handled above.
+        _ => true,
+    }
+}
+
+fn class_scope_requires_runtime_evaluation(scope: Node<'_>) -> bool {
+    !matches!(scope.kind(), "name" | "qualified_name" | "relative_scope")
 }
 
 fn nullsafe_call_tail(node: Node<'_>) -> Vec<Node<'_>> {

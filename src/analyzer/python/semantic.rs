@@ -156,6 +156,7 @@ fn python_capabilities() -> SemanticCapabilities {
         SemanticCapability::ExceptionalControlFlow,
         SemanticCapability::CleanupControlFlow,
         SemanticCapability::Calls,
+        SemanticCapability::DynamicDispatch,
         SemanticCapability::CallableReferences,
         SemanticCapability::Values,
         SemanticCapability::ResourceManagement,
@@ -2389,6 +2390,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             stack,
         )?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
+
+        self.add_gap(
+            builder,
+            invoke,
+            SemanticGapSubject::CallSite(call_site),
+            SemanticCapability::DynamicDispatch,
+            SemanticGapKind::Unknown,
+            if receiver.is_some() {
+                "attribute dispatch may use descriptors, dynamic attribute lookup, or runtime mutation; complete target coverage requires value and type refinement"
+            } else {
+                "callable names may be rebound through globals, closures, or local assignment; complete target coverage requires lexical and value-flow refinement"
+            },
+        )?;
 
         let mut evaluations = Vec::with_capacity(arguments.len() + 1);
         if call_function_requires_evaluation(function) {

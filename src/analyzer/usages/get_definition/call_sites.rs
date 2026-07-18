@@ -141,6 +141,42 @@ pub(crate) fn is_call_reference_range_in_tree(
     is_call_reference_candidate(node, language)
 }
 
+/// Some C++ callable names are composite grammar nodes beginning with the
+/// identifier token `operator`. The general definition-location contract
+/// rejects a byte range extending beyond that first token, so dispatch uses a
+/// point request while retaining the full structured callee range as its call
+/// identity.
+pub(crate) fn call_reference_requires_point_lookup(
+    tree: &Tree,
+    language: Language,
+    range: &Range,
+) -> bool {
+    if language != Language::Cpp {
+        return false;
+    }
+    let Some(mut node) = tree
+        .root_node()
+        .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+    else {
+        return false;
+    };
+    loop {
+        if matches!(
+            node.kind(),
+            "operator_name" | "operator_cast" | "literal_operator_name"
+        ) {
+            return true;
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        if parent.start_byte() != range.start_byte || parent.end_byte() != range.end_byte {
+            return false;
+        }
+        node = parent;
+    }
+}
+
 pub(crate) fn call_site_syntax_for_reference(
     facts: &FileFacts,
     start_byte: usize,
@@ -369,6 +405,15 @@ fn callee_node_for_call<'tree>(node: Node<'tree>, language: Language) -> Option<
         Language::CSharp => node
             .child_by_field_name("function")
             .or_else(|| node.child_by_field_name("type")),
+        Language::Cpp => match node.kind() {
+            "call_expression" => {
+                cpp_explicit_operator_name(node).or_else(|| node.child_by_field_name("function"))
+            }
+            "new_expression" => node
+                .child_by_field_name("type")
+                .or_else(|| first_named_child_not_arguments(node, language)),
+            _ => None,
+        },
         Language::Scala => scala_callee_node_for_call(node),
         Language::Ruby => node.child_by_field_name("method"),
         _ => node
@@ -469,6 +514,9 @@ fn scala_terminal_callee_leaf(mut node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn call_reference_leaf(node: Node<'_>, language: Language) -> Option<Node<'_>> {
+    if language == Language::Cpp {
+        return cpp_terminal_callee_leaf(node);
+    }
     if node.named_child_count() == 0 {
         return is_call_reference_candidate(node, language).then_some(node);
     }
@@ -487,6 +535,51 @@ fn call_reference_leaf(node: Node<'_>, language: Language) -> Option<Node<'_>> {
         }
     }
     best
+}
+
+/// Follow only the structured C/C++ callee spine. In particular, do not walk
+/// every descendant of qualified or templated callables: doing so can select a
+/// namespace qualifier, receiver, or template argument instead of the name
+/// that dispatches.
+fn cpp_terminal_callee_leaf(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        node = match node.kind() {
+            "identifier"
+            | "field_identifier"
+            | "type_identifier"
+            | "operator_name"
+            | "operator_cast"
+            | "destructor_name"
+            | "literal_operator_name"
+            | "primitive_type" => return Some(node),
+            "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier" => {
+                last_named_child_by_field(node, "name")?
+            }
+            "dependent_name" | "template_function" | "template_method" | "template_type" => {
+                node.child_by_field_name("name")?
+            }
+            "field_expression" => node.child_by_field_name("field")?,
+            "parenthesized_expression" => only_named_child(node)?,
+            "pointer_expression" => node
+                .child_by_field_name("argument")
+                .or_else(|| only_named_child(node))?,
+            _ => return None,
+        };
+    }
+}
+
+fn last_named_child_by_field<'tree>(node: Node<'tree>, field: &str) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.children_by_field_name(field, &mut cursor)
+        .filter(|child| child.is_named())
+        .last()
+}
+
+fn only_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    let mut children = node.named_children(&mut cursor);
+    let child = children.next()?;
+    children.next().is_none().then_some(child)
 }
 
 fn contains_call_expression_node(node: Node<'_>, language: Language) -> bool {
@@ -553,6 +646,16 @@ fn collect_call_reference_ranges(
             continue;
         }
         if is_nested_callable_node(node, language, search_range) {
+            continue;
+        }
+        if language == Language::Cpp
+            && cpp_composite_call_name(node)
+            && is_call_reference_candidate(node, language)
+            && node.start_byte() >= search_range.start_byte
+            && node.end_byte() <= search_range.end_byte
+            && node.start_byte() < node.end_byte()
+        {
+            out.push(node_range(node));
             continue;
         }
         if node.named_child_count() == 0 {
@@ -652,7 +755,9 @@ fn ruby_nested_callable_node(node: Node<'_>) -> bool {
 }
 
 fn is_call_reference_candidate(node: Node<'_>, language: Language) -> bool {
-    if !is_reference_candidate_kind(node.kind()) {
+    let php_relative_constructor_scope =
+        language == Language::Php && node.kind() == "relative_scope";
+    if !is_reference_candidate_kind(node.kind()) && !php_relative_constructor_scope {
         return false;
     }
     match language {
@@ -688,7 +793,44 @@ fn is_reference_candidate_kind(kind: &str) -> bool {
             | "identifier_token"
             | "operator_identifier"
             | "operator"
+            | "operator_name"
+            | "operator_cast"
+            | "destructor_name"
+            | "literal_operator_name"
     )
+}
+
+fn cpp_composite_call_name(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "operator_name" | "operator_cast" | "destructor_name" | "literal_operator_name"
+    )
+}
+
+/// The C++ grammar currently recovers an explicitly named operator call such
+/// as `value.operator+(1)` as a normal call whose `function` field is the
+/// receiver plus an adjacent `ERROR(operator_name)` node. Retain the parser's
+/// structured operator node instead of treating the receiver as the callee.
+fn cpp_explicit_operator_name(call: Node<'_>) -> Option<Node<'_>> {
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let arguments = call.child_by_field_name("arguments");
+    let mut cursor = call.walk();
+    let errors = call
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "ERROR" && Some(*child) != arguments);
+    for error in errors {
+        let mut stack = vec![error];
+        while let Some(node) = stack.pop() {
+            if cpp_composite_call_name(node) {
+                return Some(node);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+    }
+    None
 }
 
 fn java_call_reference_candidate(node: Node<'_>) -> bool {
@@ -730,16 +872,13 @@ fn go_call_reference_candidate(node: Node<'_>) -> bool {
 }
 
 fn cpp_call_reference_candidate(node: Node<'_>) -> bool {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        match parent.kind() {
-            "call_expression" if parent.child_by_field_name("function") == Some(current) => {
-                return true;
-            }
-            "new_expression" if parent.start_byte() <= node.start_byte() => return true,
-            "qualified_identifier" | "field_expression" => current = parent,
-            _ => return false,
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if is_call_expression_node(current, Language::Cpp) {
+            return callee_node_for_call(current, Language::Cpp).and_then(cpp_terminal_callee_leaf)
+                == Some(node);
         }
+        ancestor = current.parent();
     }
     false
 }
@@ -997,6 +1136,82 @@ mod tests {
 
         assert_eq!(&source[leaf.start_byte..leaf.end_byte], "leaf");
         assert_eq!(&source[make.start_byte..make.end_byte], "make");
+    }
+
+    #[test]
+    fn exact_cpp_call_spans_follow_only_the_terminal_callable_spine() {
+        let source = r#"
+namespace ns {
+template <typename T> void make(T) {}
+template <typename T> struct Box {};
+struct Widget {
+  template <typename T> void run(T) {}
+  Widget& operator+(int) { return *this; }
+  ~Widget() {}
+};
+}
+void caller(ns::Widget& receiver) {
+  ns::make<int>(1);
+  receiver.run<int>(1);
+  new ns::Box<int>();
+  receiver.operator+(1);
+  receiver.~Widget();
+}
+"#;
+        let file = file("calls.cpp");
+        let tree = parse_tree_for_language(&file, Language::Cpp, source).expect("C++ syntax tree");
+        for (call, callee) in [
+            ("ns::make<int>(1)", "make"),
+            ("receiver.run<int>(1)", "run"),
+            ("new ns::Box<int>()", "Box"),
+            ("receiver.operator+(1)", "operator+"),
+            ("receiver.~Widget()", "~Widget"),
+        ] {
+            let reference =
+                call_reference_range_for_call(&tree, Language::Cpp, &byte_range(source, call))
+                    .unwrap_or_else(|| panic!("missing exact C++ call reference for `{call}`"));
+            assert_eq!(
+                &source[reference.start_byte..reference.end_byte],
+                callee,
+                "wrong exact C++ callee for `{call}`"
+            );
+        }
+    }
+
+    #[test]
+    fn cpp_call_candidates_exclude_receivers_qualifiers_and_template_arguments() {
+        let source = r#"
+namespace ns {
+template <typename T> void make(T) {}
+template <typename T> struct Box {};
+struct Widget {
+  template <typename T> void run(T) {}
+  Widget& operator+(int) { return *this; }
+  ~Widget() {}
+};
+}
+void caller(ns::Widget& receiver) {
+  ns::make<int>(1);
+  receiver.run<int>(1);
+  new ns::Box<int>();
+  receiver.operator+(1);
+  receiver.~Widget();
+}
+"#;
+        let file = file("calls.cpp");
+        let tree = parse_tree_for_language(&file, Language::Cpp, source).expect("C++ syntax tree");
+        let body = byte_range(
+            source,
+            "void caller(ns::Widget& receiver) {\n  ns::make<int>(1);\n  receiver.run<int>(1);\n  new ns::Box<int>();\n  receiver.operator+(1);\n  receiver.~Widget();\n}",
+        );
+
+        let references = call_reference_ranges_in_tree(&tree, Language::Cpp, &body, 20);
+        let names = references
+            .iter()
+            .map(|range| &source[range.start_byte..range.end_byte])
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["make", "run", "Box", "operator+", "~Widget"]);
     }
 
     #[test]

@@ -2192,6 +2192,15 @@ fn typescript_using_initializers_run_before_terminal_cleanup_gaps() {
     graph.assert_reachable("async_acquire_invoke", "await_using_gap");
     graph.assert_successors("await_using_gap", &[]);
     graph.assert_unreachable("await_using_gap", "async_after");
+    for alias in ["using_gap", "await_using_gap"] {
+        for capability in [
+            SemanticCapability::ResourceManagement,
+            SemanticCapability::CleanupControlFlow,
+            SemanticCapability::ExceptionalControlFlow,
+        ] {
+            graph.assert_point_gap(alias, capability, SemanticGapKind::Unsupported);
+        }
+    }
 
     let async_resource = graph
         .artifact()

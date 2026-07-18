@@ -1,9 +1,9 @@
 use super::*;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{
-    CallableArity, CppTemplateAliasTargetMetadata, CppTemplateExpression, CppTemplateMetadata,
-    CppTemplateParameterKind, CppTemplateParameterMetadata, CppTemplateTerm, ParameterMetadata,
-    Range, SignatureMetadata,
+    CallableArity, CallableLinkage, CppTemplateAliasTargetMetadata, CppTemplateExpression,
+    CppTemplateMetadata, CppTemplateParameterKind, CppTemplateParameterMetadata, CppTemplateTerm,
+    ParameterMetadata, Range, SignatureMetadata,
 };
 use regex::Regex;
 use tree_sitter::Node;
@@ -1113,7 +1113,8 @@ impl<'a> CppVisitor<'a> {
         );
         self.parsed.add_signature_with_metadata(
             code_unit.clone(),
-            cpp_signature_metadata(signature, function_declarator, self.source),
+            cpp_signature_metadata(signature, function_declarator, self.source)
+                .with_callable_linkage(cpp_callable_linkage(node, self.source)),
         );
         if let Some(parent) = &scope.class_unit {
             self.parsed.add_child(parent.clone(), code_unit);
@@ -1279,7 +1280,8 @@ impl<'a> CppVisitor<'a> {
         );
         self.parsed.add_signature_with_metadata(
             code_unit.clone(),
-            cpp_signature_metadata(signature, declarator, self.source),
+            cpp_signature_metadata(signature, declarator, self.source)
+                .with_callable_linkage(cpp_callable_linkage(declaration_node, self.source)),
         );
         if let Some(parent) = &scope.class_unit {
             self.parsed.add_child(parent.clone(), code_unit);
@@ -2802,6 +2804,50 @@ fn cpp_signature_metadata(
         .with_return_type_text(return_type_text)
 }
 
+fn cpp_callable_linkage(declaration: Node<'_>, source: &str) -> CallableLinkage {
+    let mut enclosed_by_class = false;
+    let mut current = declaration.parent();
+    while let Some(node) = current {
+        if node.kind() == "namespace_definition"
+            && node
+                .child_by_field_name("name")
+                .is_none_or(|name| normalize_cpp_whitespace(node_text(name, source)).is_empty())
+        {
+            return CallableLinkage::Internal;
+        }
+        if matches!(
+            node.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        ) {
+            if node
+                .child_by_field_name("name")
+                .is_none_or(|name| normalize_cpp_whitespace(node_text(name, source)).is_empty())
+            {
+                return CallableLinkage::Internal;
+            }
+            enclosed_by_class = true;
+        }
+        if matches!(node.kind(), "function_definition" | "lambda_expression") {
+            return CallableLinkage::Internal;
+        }
+        current = node.parent();
+    }
+
+    if enclosed_by_class {
+        return CallableLinkage::External;
+    }
+
+    let mut cursor = declaration.walk();
+    if declaration.named_children(&mut cursor).any(|child| {
+        child.kind() == "storage_class_specifier"
+            && normalize_cpp_whitespace(node_text(child, source)) == "static"
+    }) {
+        CallableLinkage::Internal
+    } else {
+        CallableLinkage::External
+    }
+}
+
 fn cpp_callable_return_type_text(function_declarator: Node<'_>, source: &str) -> Option<String> {
     let mut cursor = function_declarator.walk();
     if let Some(trailing) = function_declarator
@@ -3162,6 +3208,50 @@ mod tests {
         finish_declaration_identity_comparison_probe, start_declaration_identity_comparison_probe,
     };
     use std::fmt::Write;
+
+    fn member_function_linkage(source: &str) -> CallableLinkage {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "function_definition" {
+                let mut current = node.parent();
+                while let Some(parent) = current {
+                    if matches!(
+                        parent.kind(),
+                        "class_specifier" | "struct_specifier" | "union_specifier"
+                    ) {
+                        return cpp_callable_linkage(node, source);
+                    }
+                    current = parent.parent();
+                }
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        panic!("fixture has no member function definition");
+    }
+
+    #[test]
+    fn cpp_member_linkage_source_scopes_local_and_unnamed_types() {
+        assert_eq!(
+            member_function_linkage("struct Named { int method() { return 1; } };"),
+            CallableLinkage::External
+        );
+        assert_eq!(
+            member_function_linkage(
+                "int outer() { struct Local { int method() { return 1; } }; return 0; }"
+            ),
+            CallableLinkage::Internal
+        );
+        assert_eq!(
+            member_function_linkage("struct { int method() { return 1; } } instance;"),
+            CallableLinkage::Internal
+        );
+    }
 
     #[test]
     fn exported_single_base_recovery_uses_displaced_class_name() {

@@ -14,11 +14,12 @@ use std::sync::Arc;
 use brokk_bifrost::WorkspaceAnalyzer;
 use brokk_bifrost::analyzer::semantic::{
     CallContinuationKind, CallSiteHandle, CancellationToken, ControlContinuation, ControlEdgeKind,
-    DeferredInvocationKind, DispatchBoundaryKind, IcfgBoundaryKind, IcfgEdgeKind, IcfgLimitKind,
-    IcfgNodeId, IcfgProvider, IcfgSnapshot, IcfgSnapshotLimits, ProcedureHandle, ProcedureId,
-    ProcedureSemantics, ProgramPoint, ProgramPointId, SemanticArtifact, SemanticBudget,
-    SemanticCapability, SemanticEffect, SemanticGapKind, SemanticGapSubject, SemanticOutcome,
-    SemanticRequest, SourceAnchor, SourceMappingId, SourceSpan, WorkspaceRelativePath,
+    DeferredInvocationKind, DispatchBoundaryKind, EvidenceCompleteness, IcfgBoundaryKind,
+    IcfgEdgeKind, IcfgLimitKind, IcfgNodeId, IcfgProvider, IcfgSnapshot, IcfgSnapshotLimits,
+    ProcedureHandle, ProcedureId, ProcedureSemantics, ProgramPoint, ProgramPointId, ProofStatus,
+    SemanticArtifact, SemanticBudget, SemanticCapability, SemanticEffect, SemanticGapKind,
+    SemanticGapSubject, SemanticOutcome, SemanticRequest, SourceAnchor, SourceMappingId,
+    SourceSpan, WorkspaceRelativePath,
 };
 
 use super::BuiltInlineTestProject;
@@ -1344,6 +1345,18 @@ impl IcfgGraph {
         self.assert_edges(alias, expected_edges, EdgeDirection::Predecessors);
     }
 
+    pub fn assert_edge_unproven_partial(&self, source_alias: &str, expected: ExpectedIcfgEdge<'_>) {
+        self.assert_edge_evidence(source_alias, expected, false, false);
+    }
+
+    pub fn assert_edge_proven_complete(&self, source_alias: &str, expected: ExpectedIcfgEdge<'_>) {
+        self.assert_edge_evidence(source_alias, expected, true, true);
+    }
+
+    pub fn assert_edge_proven_partial(&self, source_alias: &str, expected: ExpectedIcfgEdge<'_>) {
+        self.assert_edge_evidence(source_alias, expected, true, false);
+    }
+
     pub fn assert_adjacency_symmetric(&self) {
         for node in self.snapshot.node_ids() {
             for (edge_id, edge) in self.snapshot.successor_edges(node) {
@@ -1610,6 +1623,56 @@ impl IcfgGraph {
                 self.node_name(node),
                 self.format_icfg_edges(&expected),
                 self.format_icfg_edges(&actual),
+                self.render_topology_excerpt(MAX_ERROR_TOPOLOGY_LINES)
+            );
+        }
+    }
+
+    fn assert_edge_evidence(
+        &self,
+        source_alias: &str,
+        expected: ExpectedIcfgEdge<'_>,
+        expect_proven: bool,
+        expect_complete: bool,
+    ) {
+        let source = self.bound_node(source_alias);
+        let target = self.bound_node(expected.endpoint);
+        let origin = expected
+            .originating_call
+            .map(|call| self.bound_call(call).clone());
+        let matching = self
+            .snapshot
+            .successor_edges(source)
+            .filter(|(_, edge)| {
+                edge.target == target && edge.kind == expected.kind && edge.origin == origin
+            })
+            .map(|(_, edge)| edge)
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            panic!(
+                "expected exactly one {:?} edge from {source_alias:?} to {:?}, found {}\n\n{}",
+                expected.kind,
+                expected.endpoint,
+                matching.len(),
+                self.render_topology_excerpt(MAX_ERROR_TOPOLOGY_LINES)
+            );
+        }
+        let edge = matching[0];
+        let evidence_matches = matches!(edge.proof, ProofStatus::Proven) == expect_proven
+            && matches!(edge.completeness, EvidenceCompleteness::Complete) == expect_complete;
+        if !evidence_matches {
+            let expected_label = match (expect_proven, expect_complete) {
+                (true, true) => "proven/complete",
+                (true, false) => "proven/partial",
+                (false, true) => "unproven/complete",
+                (false, false) => "unproven/partial",
+            };
+            panic!(
+                "expected {:?} edge from {source_alias:?} to {:?} to be {expected_label}, got {}/{}\n\n{}",
+                expected.kind,
+                expected.endpoint,
+                edge.proof.label(),
+                edge.completeness.label(),
                 self.render_topology_excerpt(MAX_ERROR_TOPOLOGY_LINES)
             );
         }

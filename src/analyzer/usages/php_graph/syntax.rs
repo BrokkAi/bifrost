@@ -67,7 +67,7 @@ pub(in crate::analyzer::usages) fn assignment_parts(
 pub(in crate::analyzer::usages) fn object_creation_type(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
-        .find(|child| matches!(child.kind(), "name" | "qualified_name"))
+        .find(|child| matches!(child.kind(), "name" | "qualified_name" | "relative_scope"))
 }
 
 pub(in crate::analyzer::usages) fn static_member_parts(

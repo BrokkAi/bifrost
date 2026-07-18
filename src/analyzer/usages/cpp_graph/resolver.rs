@@ -1733,7 +1733,11 @@ impl VisibilityIndex {
         )
     }
 
-    pub(super) fn is_physically_visible(&self, file: &ProjectFile, target: &CodeUnit) -> bool {
+    pub(in crate::analyzer::usages) fn is_physically_visible(
+        &self,
+        file: &ProjectFile,
+        target: &CodeUnit,
+    ) -> bool {
         file == target.source()
             || self
                 .visible_by_file

@@ -4,6 +4,7 @@ mod clones;
 mod declarations;
 mod hierarchy;
 mod imports;
+mod semantic;
 pub(crate) mod structural;
 mod tests;
 
@@ -59,7 +60,6 @@ pub struct CppAnalyzer {
 }
 
 crate::analyzer::impl_forward_query_provider!(CppAnalyzer);
-crate::analyzer::semantic::impl_forward_program_semantics_provider!(CppAnalyzer);
 
 impl CppAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
