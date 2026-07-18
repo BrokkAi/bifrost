@@ -3,6 +3,7 @@ mod clones;
 mod declarations;
 mod hierarchy;
 pub(crate) mod imports;
+mod semantic;
 pub(crate) mod structural;
 mod supertypes;
 mod tests;
@@ -144,7 +145,6 @@ pub struct ScalaAnalyzer {
 }
 
 crate::analyzer::impl_forward_query_provider!(ScalaAnalyzer);
-crate::analyzer::semantic::impl_forward_program_semantics_provider!(ScalaAnalyzer);
 
 impl ScalaAnalyzer {
     pub(crate) fn forward_owner_facts(

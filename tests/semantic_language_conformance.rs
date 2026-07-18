@@ -1,9 +1,10 @@
 mod common;
 
 use brokk_bifrost::analyzer::semantic::{
-    CallableTargetResolution, ControlEdgeKind, DeclarationSegmentKind, DeferredInvocationKind,
-    IcfgEdgeKind, ProcedureInvocationKind, ProcedureKind, SemanticCapability, SemanticEffect,
-    SemanticGapKind, SemanticGapSubject, SemanticLanguage,
+    CallableReferenceKind, CallableTargetResolution, ControlEdgeKind, DeclarationSegmentKind,
+    DeferredInvocationKind, IcfgEdgeKind, ProcedureInvocationKind, ProcedureKind,
+    ProcedureSemantics, SemanticCapability, SemanticEffect, SemanticGapKind, SemanticGapSubject,
+    SemanticLanguage,
 };
 use brokk_bifrost::{AnalyzerConfig, Language};
 
@@ -215,6 +216,35 @@ fn java_direct_call_conformance() {
         caller_declaration: "static int javaRoot()",
         caller_name: "javaRoot",
         call: "JavaLibrary.javaLeaf()",
+    });
+}
+
+#[test]
+fn scala_direct_call_conformance() {
+    assert_direct_call_conformance(DirectCallFixture {
+        language: Language::Scala,
+        dialect: SemanticLanguage::Standard(Language::Scala),
+        callee_path: "scala/conformance/ScalaLibrary.scala",
+        callee_source: r#"
+            package conformance
+
+            object ScalaLibrary {
+              def scalaLeaf(): Int = 7
+            }
+        "#,
+        callee_declaration: "def scalaLeaf(): Int",
+        callee_name: "scalaLeaf",
+        caller_path: "scala/conformance/ScalaCaller.scala",
+        caller_source: r#"
+            package conformance
+
+            object ScalaCaller {
+              def scalaRoot(): Int = ScalaLibrary.scalaLeaf()
+            }
+        "#,
+        caller_declaration: "def scalaRoot(): Int",
+        caller_name: "scalaRoot",
+        call: "ScalaLibrary.scalaLeaf()",
     });
 }
 
@@ -11030,4 +11060,2523 @@ fn php_match_without_default_has_an_explicit_exceptional_completion() {
     );
     graph.assert_unreachable("unmatched_throw", "normal_exit");
     graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn scala_functions_methods_locals_and_lambdas_are_separate_immediate_procedures() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "scala/Callables.scala",
+            r#"
+                package conformance
+
+                def topLevel(): Int = {
+                  topBody()
+                  1
+                }
+
+                object Worker {
+                  def method(): Int = {
+                    methodBody()
+                    2
+                  }
+                }
+
+                def outer(): Int = {
+                  def local(): Int = {
+                    localBody()
+                    3
+                  }
+
+                  val lambda = (value: Int) => { lambdaBody(value); value }
+                  outerBody()
+                  4
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "scala/Callables.scala");
+    graph
+        .bind(
+            "top_entry",
+            PointSelector::new("def topLevel(): Int")
+                .procedure("topLevel")
+                .effect("entry"),
+        )
+        .bind(
+            "top_invoke",
+            PointSelector::new("topBody()")
+                .procedure("topLevel")
+                .effect("invoke"),
+        )
+        .bind(
+            "method_entry",
+            PointSelector::new("def method(): Int")
+                .procedure("method")
+                .effect("entry"),
+        )
+        .bind(
+            "method_invoke",
+            PointSelector::new("methodBody()")
+                .procedure("method")
+                .effect("invoke"),
+        )
+        .bind(
+            "outer_entry",
+            PointSelector::new("def outer(): Int")
+                .procedure("outer")
+                .effect("entry"),
+        )
+        .bind(
+            "outer_invoke",
+            PointSelector::new("outerBody()")
+                .procedure("outer")
+                .effect("invoke"),
+        )
+        .bind(
+            "local_entry",
+            PointSelector::new("def local(): Int")
+                .procedure("local")
+                .effect("entry"),
+        )
+        .bind(
+            "local_invoke",
+            PointSelector::new("localBody()")
+                .procedure("local")
+                .effect("invoke"),
+        )
+        .bind(
+            "lambda_entry",
+            PointSelector::new("(value: Int) => { lambdaBody(value); value }").effect("entry"),
+        )
+        .bind(
+            "lambda_invoke",
+            PointSelector::new("lambdaBody(value)").effect("invoke"),
+        );
+
+    for (entry, invoke) in [
+        ("top_entry", "top_invoke"),
+        ("method_entry", "method_invoke"),
+        ("outer_entry", "outer_invoke"),
+        ("local_entry", "local_invoke"),
+        ("lambda_entry", "lambda_invoke"),
+    ] {
+        graph.assert_reachable(entry, invoke);
+    }
+    for (body_call, procedure) in [("localBody()", "outer"), ("lambdaBody(value)", "outer")] {
+        let error = graph
+            .try_bind(
+                format!("{procedure}_must_not_own_{body_call}"),
+                PointSelector::new(body_call)
+                    .procedure(procedure)
+                    .effect("invoke"),
+            )
+            .expect_err("nested callable execution must stay outside the enclosing CFG");
+        assert!(
+            error.to_string().contains("matched no semantic"),
+            "unexpected Scala nested callable selector for {body_call}: {error}"
+        );
+    }
+
+    let procedures = graph.artifact().procedures();
+    let named = |name: &str, kind: ProcedureKind| {
+        procedures
+            .iter()
+            .find(|procedure| {
+                procedure.kind() == kind
+                    && procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+            })
+            .unwrap_or_else(|| panic!("missing Scala {kind:?} procedure {name}"))
+    };
+    let top = named("topLevel", ProcedureKind::Function);
+    let method = named("method", ProcedureKind::Method);
+    let outer = named("outer", ProcedureKind::Function);
+    let local = named("local", ProcedureKind::LocalFunction);
+    let lambda = procedures
+        .iter()
+        .find(|procedure| procedure.kind() == ProcedureKind::Lambda)
+        .expect("missing Scala lambda procedure");
+
+    for procedure in [top, method, outer] {
+        assert!(procedure.lexical_parent().is_none());
+    }
+    assert_eq!(local.lexical_parent(), Some(outer.id()));
+    assert_eq!(lambda.lexical_parent(), Some(outer.id()));
+    for procedure in [top, method, outer, local, lambda] {
+        assert!(!procedure.properties().is_async);
+        assert!(!procedure.properties().is_generator);
+        assert_eq!(
+            procedure.properties().invocation,
+            ProcedureInvocationKind::Immediate
+        );
+        assert!(procedure.points().iter().any(|point| {
+            point.events.iter().any(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::ProcedureReturn { value: Some(_) }
+                )
+            })
+        }));
+    }
+
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn scala_local_class_members_are_methods_and_nested_defs_remain_local_functions() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "scala/LocalClass.scala",
+            r#"
+                package conformance
+
+                def outer(): Int = {
+                  class LocalClass {
+                    def member(): Int = {
+                      def nested(): Int = nestedBody()
+                      memberBody()
+                    }
+                  }
+                  outerBody()
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "scala/LocalClass.scala");
+    graph
+        .bind(
+            "outer_entry",
+            PointSelector::new("def outer(): Int")
+                .procedure("outer")
+                .effect("entry"),
+        )
+        .bind(
+            "outer_invoke",
+            PointSelector::new("outerBody()")
+                .procedure("outer")
+                .effect("invoke"),
+        )
+        .bind(
+            "member_entry",
+            PointSelector::new("def member(): Int")
+                .procedure("member")
+                .effect("entry"),
+        )
+        .bind(
+            "member_invoke",
+            PointSelector::new("memberBody()")
+                .procedure("member")
+                .effect("invoke"),
+        )
+        .bind(
+            "nested_entry",
+            PointSelector::new("def nested(): Int")
+                .procedure("nested")
+                .effect("entry"),
+        )
+        .bind(
+            "nested_invoke",
+            PointSelector::new("nestedBody()")
+                .procedure("nested")
+                .effect("invoke"),
+        );
+    for (entry, invoke) in [
+        ("outer_entry", "outer_invoke"),
+        ("member_entry", "member_invoke"),
+        ("nested_entry", "nested_invoke"),
+    ] {
+        graph.assert_reachable(entry, invoke);
+    }
+
+    let procedures = graph.artifact().procedures();
+    let named = |name: &str, kind: ProcedureKind| {
+        procedures
+            .iter()
+            .find(|procedure| {
+                procedure.kind() == kind
+                    && procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+            })
+            .unwrap_or_else(|| panic!("missing Scala {kind:?} procedure {name}"))
+    };
+    let outer = named("outer", ProcedureKind::Function);
+    let constructor = named("LocalClass", ProcedureKind::Constructor);
+    let member = named("member", ProcedureKind::Method);
+    let nested = named("nested", ProcedureKind::LocalFunction);
+    assert_eq!(constructor.lexical_parent(), Some(outer.id()));
+    assert_eq!(member.lexical_parent(), Some(outer.id()));
+    assert_ne!(member.lexical_parent(), Some(constructor.id()));
+    assert_eq!(nested.lexical_parent(), Some(member.id()));
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn scala_if_loops_early_return_and_dead_syntax_have_exact_topology() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "scala/Control.scala",
+            r#"
+                package conformance
+
+                def choose(flag: Boolean): Int =
+                  if flag then left() else right()
+
+                def flow(whileKeep: Boolean, doKeep: Boolean, stop: Boolean): Int = {
+                  while (whileKeep) { whileBody() }
+                  do { doBody() } while (doKeep)
+                  if stop then {
+                    return early()
+                    deadAfterReturn()
+                  }
+                  after()
+                  9
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "scala/Control.scala");
+    graph
+        .bind(
+            "choose_entry",
+            PointSelector::new("def choose(flag: Boolean)")
+                .procedure("choose")
+                .effect("entry"),
+        )
+        .bind(
+            "choose_decision",
+            PointSelector::new("flag")
+                .occurrence(1)
+                .procedure("choose")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "left_entry",
+            PointSelector::new("left()")
+                .procedure("choose")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "right_entry",
+            PointSelector::new("right()")
+                .procedure("choose")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "left_normal",
+            PointSelector::new("left()")
+                .procedure("choose")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "right_normal",
+            PointSelector::new("right()")
+                .procedure("choose")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "choose_return",
+            PointSelector::new("if flag then left() else right()")
+                .procedure("choose")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "choose_normal_exit",
+            PointSelector::new("def choose(flag: Boolean)")
+                .procedure("choose")
+                .effect("normal_exit"),
+        )
+        .bind(
+            "flow_entry",
+            PointSelector::new("def flow(whileKeep")
+                .procedure("flow")
+                .effect("entry"),
+        )
+        .bind(
+            "while_entry",
+            PointSelector::new("while (whileKeep) { whileBody() }")
+                .procedure("flow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "while_decision",
+            PointSelector::new("whileKeep")
+                .occurrence(1)
+                .procedure("flow")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "while_body_block",
+            PointSelector::new("{ whileBody() }")
+                .procedure("flow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "while_body_entry",
+            PointSelector::new("whileBody()")
+                .procedure("flow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "while_body_normal",
+            PointSelector::new("whileBody()")
+                .procedure("flow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::LoopBack),
+        )
+        .bind(
+            "do_entry",
+            PointSelector::new("do { doBody() } while (doKeep)")
+                .procedure("flow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "do_body_block",
+            PointSelector::new("{ doBody() }")
+                .procedure("flow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "do_body_entry",
+            PointSelector::new("doBody()")
+                .procedure("flow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "do_body_normal",
+            PointSelector::new("doBody()")
+                .procedure("flow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "do_decision",
+            PointSelector::new("doKeep")
+                .occurrence(1)
+                .procedure("flow")
+                .outgoing_kind(ControlEdgeKind::LoopBack),
+        )
+        .bind(
+            "stop_if",
+            PointSelector::new(
+                r#"if stop then {
+                    return early()
+                    deadAfterReturn()
+                  }"#,
+            )
+            .procedure("flow")
+            .anchor_occurrence(0),
+        )
+        .bind(
+            "return_transfer",
+            PointSelector::new("return early()")
+                .procedure("flow")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "flow_normal_exit",
+            PointSelector::new("def flow(whileKeep")
+                .procedure("flow")
+                .effect("normal_exit"),
+        )
+        .bind(
+            "dead_invoke",
+            PointSelector::new("deadAfterReturn()")
+                .procedure("flow")
+                .effect("invoke"),
+        )
+        .bind(
+            "after_invoke",
+            PointSelector::new("after()")
+                .procedure("flow")
+                .effect("invoke"),
+        );
+
+    graph.assert_successors(
+        "choose_decision",
+        &[
+            cfg_edge("left_entry", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("right_entry", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_predecessors(
+        "choose_return",
+        &[
+            cfg_edge("left_normal", ControlEdgeKind::Normal),
+            cfg_edge("right_normal", ControlEdgeKind::Normal),
+        ],
+    );
+    graph.assert_successors(
+        "choose_return",
+        &[cfg_edge("choose_normal_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("choose_entry", "choose_return");
+
+    graph.assert_successors(
+        "while_entry",
+        &[cfg_edge("while_decision", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "while_decision",
+        &[
+            cfg_edge("while_body_block", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("do_entry", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "while_body_block",
+        &[cfg_edge("while_body_entry", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "while_body_normal",
+        &[cfg_edge("while_decision", ControlEdgeKind::LoopBack)],
+    );
+    graph.assert_successors(
+        "do_entry",
+        &[cfg_edge("do_body_block", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "do_body_block",
+        &[cfg_edge("do_body_entry", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "do_body_normal",
+        &[cfg_edge("do_decision", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "do_decision",
+        &[
+            cfg_edge("do_body_block", ControlEdgeKind::LoopBack),
+            cfg_edge("stop_if", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "return_transfer",
+        &[cfg_edge("flow_normal_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("flow_entry", "after_invoke");
+    graph.assert_unreachable("return_transfer", "after_invoke");
+    graph.assert_unreachable("flow_entry", "dead_invoke");
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn scala_match_guards_are_ordered_and_unmatched_flow_is_exceptional() {
+    let match_source = r#"value match {
+                    case firstCandidate if firstGuard(firstCandidate) => first(firstCandidate)
+                    case secondCandidate if secondGuard(secondCandidate) => second(secondCandidate)
+                  }"#;
+    let first_case_source = concat!(
+        "case firstCandidate if firstGuard(firstCandidate) => first(firstCandidate)",
+        "\n                    ",
+    );
+    let second_case_source = concat!(
+        "case secondCandidate if secondGuard(secondCandidate) => second(secondCandidate)",
+        "\n                  ",
+    );
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "scala/GuardedMatch.scala",
+            r#"
+                package conformance
+
+                def guarded(value: Int): Int =
+                  value match {
+                    case firstCandidate if firstGuard(firstCandidate) => first(firstCandidate)
+                    case secondCandidate if secondGuard(secondCandidate) => second(secondCandidate)
+                  }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "scala/GuardedMatch.scala");
+    graph
+        .bind(
+            "subject_entry",
+            PointSelector::new(match_source)
+                .procedure("guarded")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "match_return",
+            PointSelector::new(match_source)
+                .procedure("guarded")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "dispatch",
+            PointSelector::new(match_source)
+                .procedure("guarded")
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "unmatched",
+            PointSelector::new(match_source)
+                .procedure("guarded")
+                .effect("throw"),
+        )
+        .bind(
+            "first_pattern",
+            PointSelector::new("firstCandidate")
+                .occurrence(0)
+                .procedure("guarded")
+                .outgoing_kind(ControlEdgeKind::SwitchCase),
+        )
+        .bind(
+            "second_pattern",
+            PointSelector::new("secondCandidate")
+                .occurrence(0)
+                .procedure("guarded")
+                .outgoing_kind(ControlEdgeKind::SwitchCase),
+        )
+        .bind(
+            "first_guard_entry",
+            PointSelector::new("firstGuard(firstCandidate)")
+                .procedure("guarded")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "first_guard_decision",
+            PointSelector::new("firstGuard(firstCandidate)")
+                .procedure("guarded")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "second_guard_entry",
+            PointSelector::new("secondGuard(secondCandidate)")
+                .procedure("guarded")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "second_guard_decision",
+            PointSelector::new("secondGuard(secondCandidate)")
+                .procedure("guarded")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "first_body",
+            PointSelector::new(first_case_source)
+                .procedure("guarded")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "second_body",
+            PointSelector::new(second_case_source)
+                .procedure("guarded")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "first_normal",
+            PointSelector::new("first(firstCandidate)")
+                .procedure("guarded")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "second_normal",
+            PointSelector::new("second(secondCandidate)")
+                .procedure("guarded")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "exceptional_exit",
+            PointSelector::new("def guarded(value: Int)")
+                .procedure("guarded")
+                .effect("exceptional_exit"),
+        );
+
+    graph.assert_successors(
+        "subject_entry",
+        &[cfg_edge("dispatch", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "dispatch",
+        &[cfg_edge("first_pattern", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "first_pattern",
+        &[
+            cfg_edge("first_guard_entry", ControlEdgeKind::SwitchCase),
+            cfg_edge("second_pattern", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "first_guard_decision",
+        &[
+            cfg_edge("first_body", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("second_pattern", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_predecessors(
+        "second_pattern",
+        &[
+            cfg_edge("first_pattern", ControlEdgeKind::ConditionalFalse),
+            cfg_edge("first_guard_decision", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "second_pattern",
+        &[
+            cfg_edge("second_guard_entry", ControlEdgeKind::SwitchCase),
+            cfg_edge("unmatched", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "second_guard_decision",
+        &[
+            cfg_edge("second_body", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("unmatched", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_predecessors(
+        "unmatched",
+        &[
+            cfg_edge("second_pattern", ControlEdgeKind::ConditionalFalse),
+            cfg_edge("second_guard_decision", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "first_normal",
+        &[cfg_edge("match_return", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "second_normal",
+        &[cfg_edge("match_return", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "unmatched",
+        &[cfg_edge("exceptional_exit", ControlEdgeKind::Exceptional)],
+    );
+    for pattern in ["first_pattern", "second_pattern"] {
+        graph.assert_point_gap(pattern, SemanticCapability::Calls, SemanticGapKind::Unknown);
+        graph.assert_point_gap(
+            pattern,
+            SemanticCapability::Values,
+            SemanticGapKind::Unknown,
+        );
+        graph.assert_point_gap(
+            pattern,
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapKind::Unknown,
+        );
+    }
+    graph.assert_point_gap(
+        "unmatched",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_unreachable("first_normal", "second_body");
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn scala_braced_try_catch_finally_specializes_normal_and_exceptional_cleanup() {
+    let try_source = r#"try { work() }
+                  catch { case error: Exception => recover(error) }
+                  finally { cleanup() }"#;
+    let catch_source = "catch { case error: Exception => recover(error) }";
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "scala/BracedTry.scala",
+            r#"
+                package conformance
+
+                def braced(): Int =
+                  try { work() }
+                  catch { case error: Exception => recover(error) }
+                  finally { cleanup() }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "scala/BracedTry.scala");
+    graph
+        .bind(
+            "work_normal",
+            PointSelector::new("work()")
+                .procedure("braced")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "work_exceptional",
+            PointSelector::new("work()")
+                .procedure("braced")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "try_body_exit",
+            PointSelector::new("{ work() }")
+                .procedure("braced")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "catch_dispatch",
+            PointSelector::new(catch_source)
+                .procedure("braced")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "catch_pattern",
+            PointSelector::new("error: Exception")
+                .occurrence(0)
+                .procedure("braced")
+                .outgoing_kind(ControlEdgeKind::SwitchCase),
+        )
+        .bind(
+            "catch_body",
+            PointSelector::new("case error: Exception => recover(error)")
+                .procedure("braced")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "recover_normal",
+            PointSelector::new("recover(error)")
+                .procedure("braced")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "recover_exceptional",
+            PointSelector::new("recover(error)")
+                .procedure("braced")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Cleanup),
+        )
+        .bind(
+            "catch_exit",
+            PointSelector::new(catch_source)
+                .procedure("braced")
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "unmatched_catch",
+            PointSelector::new(catch_source)
+                .procedure("braced")
+                .effect("throw"),
+        )
+        .bind(
+            "normal_cleanup",
+            PointSelector::new("{ cleanup() }")
+                .procedure("braced")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "exceptional_cleanup",
+            PointSelector::new("{ cleanup() }")
+                .procedure("braced")
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "exceptional_cleanup_relay",
+            PointSelector::new("{ cleanup() }")
+                .procedure("braced")
+                .anchor_occurrence(2),
+        )
+        .bind(
+            "exceptional_cleanup_call",
+            PointSelector::new("cleanup()")
+                .procedure("braced")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "normal_cleanup_call",
+            PointSelector::new("cleanup()")
+                .procedure("braced")
+                .anchor_occurrence(4),
+        )
+        .bind(
+            "exceptional_cleanup_normal",
+            PointSelector::new("cleanup()")
+                .procedure("braced")
+                .effect("call_continuation")
+                .anchor_occurrence(2),
+        )
+        .bind(
+            "normal_cleanup_normal",
+            PointSelector::new("cleanup()")
+                .procedure("braced")
+                .effect("call_continuation")
+                .anchor_occurrence(6),
+        )
+        .bind(
+            "normal_cleanup_exceptional",
+            PointSelector::new("cleanup()")
+                .procedure("braced")
+                .effect("call_continuation")
+                .anchor_occurrence(7),
+        )
+        .bind(
+            "try_return",
+            PointSelector::new(try_source)
+                .procedure("braced")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "exceptional_exit",
+            PointSelector::new("def braced(): Int")
+                .procedure("braced")
+                .effect("exceptional_exit"),
+        );
+
+    graph.assert_successors(
+        "work_normal",
+        &[cfg_edge("try_body_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "work_exceptional",
+        &[cfg_edge("catch_dispatch", ControlEdgeKind::Exceptional)],
+    );
+    graph.assert_successors(
+        "catch_dispatch",
+        &[cfg_edge("catch_pattern", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "catch_pattern",
+        &[
+            cfg_edge("catch_body", ControlEdgeKind::SwitchCase),
+            cfg_edge("unmatched_catch", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "recover_normal",
+        &[cfg_edge("catch_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "normal_cleanup",
+        &[
+            cfg_edge("try_body_exit", ControlEdgeKind::Cleanup),
+            cfg_edge("catch_exit", ControlEdgeKind::Cleanup),
+        ],
+    );
+    graph.assert_predecessors(
+        "exceptional_cleanup",
+        &[
+            cfg_edge("recover_exceptional", ControlEdgeKind::Cleanup),
+            cfg_edge("unmatched_catch", ControlEdgeKind::Cleanup),
+        ],
+    );
+    graph.assert_successors(
+        "normal_cleanup",
+        &[cfg_edge("normal_cleanup_call", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "exceptional_cleanup",
+        &[cfg_edge(
+            "exceptional_cleanup_call",
+            ControlEdgeKind::Normal,
+        )],
+    );
+    graph.assert_successors(
+        "normal_cleanup_normal",
+        &[cfg_edge("try_return", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "normal_cleanup_exceptional",
+        &[cfg_edge("exceptional_exit", ControlEdgeKind::Exceptional)],
+    );
+    graph.assert_successors(
+        "exceptional_cleanup_normal",
+        &[cfg_edge(
+            "exceptional_cleanup_relay",
+            ControlEdgeKind::Normal,
+        )],
+    );
+    graph.assert_successors(
+        "exceptional_cleanup_relay",
+        &[cfg_edge("exceptional_exit", ControlEdgeKind::Exceptional)],
+    );
+    graph.assert_point_gap(
+        "catch_dispatch",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_point_gap(
+        "catch_pattern",
+        SemanticCapability::Calls,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_point_gap(
+        "unmatched_catch",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn scala3_indented_try_catch_finally_specializes_both_cleanup_routes() {
+    let catch_source = r#"catch
+                    case error: Exception => indentedRecover(error)"#;
+    let try_body_source = concat!("indentedWork()", "\n                  ");
+    let finalizer_source = concat!(
+        "cleanupStart\n                    indentedCleanup()",
+        "\n            ",
+    );
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "scala/IndentedTry.scala",
+            r#"
+                package conformance
+
+                def indented(): Int =
+                  try
+                    indentedWork()
+                  catch
+                    case error: Exception => indentedRecover(error)
+                  finally
+                    cleanupStart
+                    indentedCleanup()
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "scala/IndentedTry.scala");
+    graph
+        .bind(
+            "work_normal",
+            PointSelector::new("indentedWork()")
+                .procedure("indented")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "work_exceptional",
+            PointSelector::new("indentedWork()")
+                .procedure("indented")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "try_body_exit",
+            PointSelector::new(try_body_source)
+                .procedure("indented")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "catch_dispatch",
+            PointSelector::new(catch_source)
+                .procedure("indented")
+                .effect("gap")
+                .outgoing_kind(ControlEdgeKind::Normal)
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "catch_pattern",
+            PointSelector::new("error: Exception")
+                .occurrence(0)
+                .procedure("indented")
+                .outgoing_kind(ControlEdgeKind::SwitchCase),
+        )
+        .bind(
+            "catch_body",
+            PointSelector::new("case error: Exception => indentedRecover(error)")
+                .procedure("indented")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "recover_normal",
+            PointSelector::new("indentedRecover(error)")
+                .procedure("indented")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "recover_exceptional",
+            PointSelector::new("indentedRecover(error)")
+                .procedure("indented")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Cleanup),
+        )
+        .bind(
+            "catch_exit",
+            PointSelector::new(catch_source)
+                .procedure("indented")
+                .outgoing_kind(ControlEdgeKind::Cleanup)
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "unmatched_catch",
+            PointSelector::new(catch_source)
+                .procedure("indented")
+                .effect("throw"),
+        )
+        .bind(
+            "normal_cleanup",
+            PointSelector::new(finalizer_source)
+                .procedure("indented")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "exceptional_cleanup",
+            PointSelector::new(finalizer_source)
+                .procedure("indented")
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "try_return",
+            PointSelector::new("try\n                    indentedWork()")
+                .procedure("indented")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "exceptional_exit",
+            PointSelector::new("def indented(): Int")
+                .procedure("indented")
+                .effect("exceptional_exit"),
+        );
+
+    graph.assert_successors(
+        "work_normal",
+        &[cfg_edge("try_body_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "work_exceptional",
+        &[cfg_edge("catch_dispatch", ControlEdgeKind::Exceptional)],
+    );
+    graph.assert_successors(
+        "catch_dispatch",
+        &[cfg_edge("catch_pattern", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "catch_pattern",
+        &[
+            cfg_edge("catch_body", ControlEdgeKind::SwitchCase),
+            cfg_edge("unmatched_catch", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "recover_normal",
+        &[cfg_edge("catch_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "normal_cleanup",
+        &[
+            cfg_edge("try_body_exit", ControlEdgeKind::Cleanup),
+            cfg_edge("catch_exit", ControlEdgeKind::Cleanup),
+        ],
+    );
+    graph.assert_predecessors(
+        "exceptional_cleanup",
+        &[
+            cfg_edge("recover_exceptional", ControlEdgeKind::Cleanup),
+            cfg_edge("unmatched_catch", ControlEdgeKind::Cleanup),
+        ],
+    );
+    graph.assert_reachable("normal_cleanup", "try_return");
+    graph.assert_reachable("exceptional_cleanup", "exceptional_exit");
+    graph.assert_point_gap(
+        "catch_dispatch",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_point_gap(
+        "unmatched_catch",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn scala_for_enumerator_flow_retains_protocol_and_deferred_execution_gaps() {
+    let for_source = "for value <- values yield transform(value)";
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "scala/ForFlow.scala",
+            r#"
+                package conformance
+
+                def enumerated(values: List[Int]): List[Int] =
+                  for value <- values yield transform(value)
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "scala/ForFlow.scala");
+    graph
+        .bind(
+            "for_entry",
+            PointSelector::new(for_source)
+                .procedure("enumerated")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "enumerator_decision",
+            PointSelector::new("value <- values")
+                .procedure("enumerated")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "body_entry",
+            PointSelector::new("transform(value)")
+                .procedure("enumerated")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "body_normal",
+            PointSelector::new("transform(value)")
+                .procedure("enumerated")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::LoopBack),
+        )
+        .bind(
+            "for_return",
+            PointSelector::new(for_source)
+                .procedure("enumerated")
+                .effect("procedure_return"),
+        );
+
+    graph.assert_successors(
+        "for_entry",
+        &[cfg_edge("enumerator_decision", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "enumerator_decision",
+        &[
+            cfg_edge("body_entry", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("for_return", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "body_normal",
+        &[cfg_edge("enumerator_decision", ControlEdgeKind::LoopBack)],
+    );
+    graph.assert_predecessors(
+        "enumerator_decision",
+        &[
+            cfg_edge("for_entry", ControlEdgeKind::Normal),
+            cfg_edge("body_normal", ControlEdgeKind::LoopBack),
+        ],
+    );
+    for (capability, kind) in [
+        (SemanticCapability::Calls, SemanticGapKind::Unsupported),
+        (
+            SemanticCapability::DeferredExecution,
+            SemanticGapKind::Unsupported,
+        ),
+        (
+            SemanticCapability::NormalControlFlow,
+            SemanticGapKind::Unsupported,
+        ),
+        (
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapKind::Unknown,
+        ),
+        (SemanticCapability::Values, SemanticGapKind::Unsupported),
+    ] {
+        graph.assert_point_gap("enumerator_decision", capability, kind);
+    }
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn scala_by_name_and_future_calls_report_callsite_scoped_execution_gaps() {
+    let deferred_source = r#"
+                package conformance
+
+                def consume(value: => Int): Int = value
+
+                def limitations(): Int = {
+                  consume(delayed())
+                  consume { firstDeferred(); secondDeferred() }
+                  Future { spawned() }
+                  done()
+                  1
+                }
+            "#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("scala/Deferred.scala", deferred_source)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "scala/Deferred.scala");
+    graph
+        .bind(
+            "consume_entry",
+            PointSelector::new("def consume(value: => Int)")
+                .procedure("consume")
+                .effect("entry"),
+        )
+        .bind(
+            "delayed_normal",
+            PointSelector::new("delayed()")
+                .procedure("limitations")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "strictness_invoke",
+            PointSelector::new("consume(delayed())")
+                .procedure("limitations")
+                .effect("invoke"),
+        )
+        .bind(
+            "strictness_normal",
+            PointSelector::new("consume(delayed())")
+                .procedure("limitations")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "structured_entry",
+            PointSelector::new("consume { firstDeferred(); secondDeferred() }")
+                .procedure("limitations")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "by_name_invoke",
+            PointSelector::new("consume { firstDeferred(); secondDeferred() }")
+                .procedure("limitations")
+                .effect("invoke"),
+        )
+        .bind(
+            "by_name_normal",
+            PointSelector::new("consume { firstDeferred(); secondDeferred() }")
+                .procedure("limitations")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "future_entry",
+            PointSelector::new("Future { spawned() }")
+                .procedure("limitations")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "future_invoke",
+            PointSelector::new("Future { spawned() }")
+                .procedure("limitations")
+                .effect("invoke"),
+        )
+        .bind(
+            "future_normal",
+            PointSelector::new("Future { spawned() }")
+                .procedure("limitations")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "done_entry",
+            PointSelector::new("done()")
+                .procedure("limitations")
+                .anchor_occurrence(0),
+        );
+
+    graph.assert_point_gap(
+        "consume_entry",
+        SemanticCapability::DeferredExecution,
+        SemanticGapKind::Unsupported,
+    );
+    let limitations = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("limitations")
+        })
+        .expect("missing Scala limitations procedure");
+    for (call_source, expected_capabilities) in [
+        (
+            "consume(delayed())",
+            &[SemanticCapability::DeferredExecution][..],
+        ),
+        (
+            "consume { firstDeferred(); secondDeferred() }",
+            &[SemanticCapability::DeferredExecution][..],
+        ),
+        (
+            "Future { spawned() }",
+            &[
+                SemanticCapability::DeferredExecution,
+                SemanticCapability::ConcurrentSpawn,
+            ][..],
+        ),
+    ] {
+        let call = limitations
+            .call_sites()
+            .iter()
+            .find(|call| {
+                let span = limitations
+                    .source_mapping(call.source)
+                    .expect("Scala call site must retain source mapping")
+                    .locator
+                    .anchor()
+                    .span();
+                deferred_source.get(span.start_byte() as usize..span.end_byte() as usize)
+                    == Some(call_source)
+            })
+            .unwrap_or_else(|| panic!("missing Scala call site for {call_source}"));
+        assert_eq!(
+            call.arguments.len(),
+            1,
+            "each Scala source argument must remain one semantic actual for {call_source}"
+        );
+        for capability in expected_capabilities {
+            assert!(
+                limitations.gaps().iter().any(|gap| {
+                    gap.point == call.point
+                        && gap.subject == SemanticGapSubject::CallSite(call.id)
+                        && gap.capability == *capability
+                        && gap.kind == SemanticGapKind::Unknown
+                }),
+                "missing CallSite-scoped {capability:?} gap for {call_source}"
+            );
+        }
+    }
+    assert!(limitations.call_sites().iter().any(|call| {
+        let span = limitations
+            .source_mapping(call.source)
+            .expect("Scala call site must retain source mapping")
+            .locator
+            .anchor()
+            .span();
+        deferred_source.get(span.start_byte() as usize..span.end_byte() as usize)
+            == Some("delayed()")
+    }));
+    for nested in ["firstDeferred()", "secondDeferred()", "spawned()"] {
+        assert!(
+            limitations.call_sites().iter().all(|call| {
+                let span = limitations
+                    .source_mapping(call.source)
+                    .expect("Scala call site must retain source mapping")
+                    .locator
+                    .anchor()
+                    .span();
+                deferred_source.get(span.start_byte() as usize..span.end_byte() as usize)
+                    != Some(nested)
+            }),
+            "deferred Scala body {nested} was lowered as a synchronous call"
+        );
+    }
+    graph.assert_successors(
+        "delayed_normal",
+        &[cfg_edge("strictness_invoke", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "strictness_normal",
+        &[cfg_edge("structured_entry", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "by_name_normal",
+        &[cfg_edge("future_entry", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "future_normal",
+        &[cfg_edge("done_entry", ControlEdgeKind::Normal)],
+    );
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn scala_generic_method_direct_call_conformance() {
+    const CALLEE: &str = r#"
+        package conformance
+
+        final class GenericWorker {
+          def identity[A](value: A): A = value
+        }
+    "#;
+    const CALLER: &str = r#"
+        package conformance
+
+        object GenericCaller {
+          def root(worker: GenericWorker): Int = worker.identity[Int](7)
+        }
+    "#;
+    assert_direct_call_conformance(DirectCallFixture {
+        language: Language::Scala,
+        dialect: SemanticLanguage::Standard(Language::Scala),
+        callee_path: "scala/GenericWorker.scala",
+        callee_source: CALLEE,
+        callee_declaration: "def identity[A](value: A)",
+        callee_name: "identity",
+        caller_path: "scala/GenericCaller.scala",
+        caller_source: CALLER,
+        caller_declaration: "def root(worker: GenericWorker)",
+        caller_name: "root",
+        call: "worker.identity[Int](7)",
+    });
+
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("scala/GenericWorker.scala", CALLEE)
+        .file("scala/GenericCaller.scala", CALLER)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "scala/GenericCaller.scala");
+    graph.bind(
+        "generic_selection",
+        PointSelector::new("worker.identity[Int]")
+            .procedure("root")
+            .effect("gap"),
+    );
+    graph.assert_point_gap(
+        "generic_selection",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+
+    let caller = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("root")
+        })
+        .expect("missing Scala generic-method caller");
+    assert_eq!(caller.call_sites().len(), 1);
+    let call = &caller.call_sites()[0];
+    assert!(
+        call.receiver.is_some(),
+        "generic method application must retain its bound receiver"
+    );
+    let point = caller
+        .point(call.point)
+        .expect("generic method call point must remain available");
+    assert!(point.events.iter().any(|event| {
+        matches!(
+            &event.effect,
+            SemanticEffect::CallableReference { callable, .. }
+                if callable.kind == CallableReferenceKind::BoundMethod
+                    && callable.bound_receiver == call.receiver
+        )
+    }));
+}
+
+#[test]
+fn scala_unqualified_identifier_reports_auto_application_uncertainty_without_a_callsite() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "scala/Parameterless.scala",
+            r#"
+                package conformance
+
+                def ping: Int = 7
+                def root: Int = ping
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "scala/Parameterless.scala");
+    graph
+        .bind(
+            "root_entry",
+            PointSelector::new("def root: Int")
+                .procedure("root")
+                .effect("entry"),
+        )
+        .bind(
+            "identifier",
+            PointSelector::new("ping")
+                .occurrence(1)
+                .procedure("root")
+                .effect("gap"),
+        )
+        .bind(
+            "root_exit",
+            PointSelector::new("def root: Int")
+                .procedure("root")
+                .effect("normal_exit"),
+        );
+    for capability in [
+        SemanticCapability::Calls,
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticCapability::CallableReferences,
+    ] {
+        graph.assert_point_gap("identifier", capability, SemanticGapKind::Unknown);
+    }
+    let root = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("root")
+        })
+        .expect("missing Scala parameterless root procedure");
+    assert!(root.call_sites().is_empty());
+    graph.assert_reachable("root_entry", "identifier");
+    graph.assert_reachable("identifier", "root_exit");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn scala_interpolated_string_reports_interpolator_and_conversion_uncertainty() {
+    const INTERPOLATION: &str = "s\"value=$value\"";
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "scala/Interpolation.scala",
+            r#"
+                package conformance
+
+                def render(value: Int): String = s"value=$value"
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "scala/Interpolation.scala");
+    graph
+        .bind(
+            "render_entry",
+            PointSelector::new("def render(value: Int)")
+                .procedure("render")
+                .effect("entry"),
+        )
+        .bind(
+            "interpolation",
+            PointSelector::new(INTERPOLATION)
+                .procedure("render")
+                .effect("gap"),
+        )
+        .bind(
+            "render_exit",
+            PointSelector::new("def render(value: Int)")
+                .procedure("render")
+                .effect("normal_exit"),
+        );
+    for capability in [
+        SemanticCapability::Calls,
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticCapability::Values,
+    ] {
+        graph.assert_point_gap("interpolation", capability, SemanticGapKind::Unknown);
+    }
+    let render = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("render")
+        })
+        .expect("missing Scala interpolation procedure");
+    assert!(
+        render.call_sites().is_empty(),
+        "interpolation uncertainty must not fabricate a resolved call site"
+    );
+    graph.assert_reachable("render_entry", "interpolation");
+    graph.assert_reachable("interpolation", "render_exit");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn scala_constructor_initializer_given_and_partial_function_procedures_are_distinct() {
+    const SOURCE: &str = r#"
+        package conformance
+
+        class Box(value: Int) {
+          constructorBody()
+          val classLambda = () => classLambdaBody()
+          def member(): Int = memberBody()
+        }
+
+        object Registry {
+          initializerBody()
+          val objectLambda = () => objectLambdaBody()
+          val objectPartial: PartialFunction[Int, Int] = {
+            case value => objectPartialBody(value)
+          }
+        }
+
+        given label: String = "ready"
+        given contextual(using value: Int): String = value.toString
+
+        def partial(): PartialFunction[Int, Int] = {
+          case value => closureBody(value)
+        }
+    "#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("scala/ProcedureKinds.scala", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "scala/ProcedureKinds.scala");
+    graph
+        .bind(
+            "constructor_entry",
+            PointSelector::new("class Box(value: Int)")
+                .procedure("Box")
+                .effect("entry"),
+        )
+        .bind(
+            "constructor_exit",
+            PointSelector::new("class Box(value: Int)")
+                .procedure("Box")
+                .effect("normal_exit"),
+        )
+        .bind(
+            "initializer_entry",
+            PointSelector::new("object Registry")
+                .procedure("Registry")
+                .effect("entry"),
+        )
+        .bind(
+            "initializer_exit",
+            PointSelector::new("object Registry")
+                .procedure("Registry")
+                .effect("normal_exit"),
+        )
+        .bind(
+            "given_initializer_entry",
+            PointSelector::new("given label: String")
+                .procedure("label")
+                .effect("entry"),
+        )
+        .bind(
+            "given_initializer_exit",
+            PointSelector::new("given label: String")
+                .procedure("label")
+                .effect("normal_exit"),
+        )
+        .bind(
+            "given_function_entry",
+            PointSelector::new("given contextual(using value: Int)")
+                .procedure("contextual")
+                .effect("entry"),
+        )
+        .bind(
+            "given_function_exit",
+            PointSelector::new("given contextual(using value: Int)")
+                .procedure("contextual")
+                .effect("normal_exit"),
+        )
+        .bind(
+            "partial_entry",
+            PointSelector::new("def partial(): PartialFunction")
+                .procedure("partial")
+                .effect("entry"),
+        )
+        .bind(
+            "partial_exit",
+            PointSelector::new("def partial(): PartialFunction")
+                .procedure("partial")
+                .effect("normal_exit"),
+        )
+        .bind(
+            "closure_pattern",
+            PointSelector::new("case value => closureBody(value)")
+                .outgoing_kind(ControlEdgeKind::SwitchCase),
+        )
+        .bind(
+            "closure_invoke",
+            PointSelector::new("closureBody(value)").effect("invoke"),
+        );
+
+    for (entry, exit) in [
+        ("constructor_entry", "constructor_exit"),
+        ("initializer_entry", "initializer_exit"),
+        ("given_initializer_entry", "given_initializer_exit"),
+        ("given_function_entry", "given_function_exit"),
+        ("partial_entry", "partial_exit"),
+        ("closure_pattern", "closure_invoke"),
+    ] {
+        graph.assert_reachable(entry, exit);
+    }
+
+    let procedures = graph.artifact().procedures();
+    let named = |name: &str, kind: ProcedureKind| {
+        procedures
+            .iter()
+            .find(|procedure| {
+                procedure.kind() == kind
+                    && procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+            })
+            .unwrap_or_else(|| panic!("missing Scala {kind:?} procedure {name}"))
+    };
+    let constructor = named("Box", ProcedureKind::Constructor);
+    let initializer = named("Registry", ProcedureKind::Initializer);
+    let given_initializer = named("label", ProcedureKind::Initializer);
+    let given_function = named("contextual", ProcedureKind::Function);
+    let partial = named("partial", ProcedureKind::Function);
+    let member = named("member", ProcedureKind::Method);
+    let procedure_source = |procedure: &ProcedureSemantics| {
+        let span = procedure.locator().anchor().span();
+        SOURCE
+            .get(span.start_byte() as usize..span.end_byte() as usize)
+            .expect("Scala procedure locator must remain in the fixture")
+    };
+    let closure = procedures
+        .iter()
+        .find(|procedure| {
+            procedure.kind() == ProcedureKind::Closure
+                && procedure_source(procedure).contains("closureBody(value)")
+        })
+        .expect("missing Scala partial-function closure");
+    let class_lambda = procedures
+        .iter()
+        .find(|procedure| {
+            procedure.kind() == ProcedureKind::Lambda
+                && procedure_source(procedure).contains("classLambdaBody()")
+        })
+        .expect("missing class-field lambda");
+    let object_lambda = procedures
+        .iter()
+        .find(|procedure| {
+            procedure.kind() == ProcedureKind::Lambda
+                && procedure_source(procedure).contains("objectLambdaBody()")
+        })
+        .expect("missing object-field lambda");
+    let object_partial = procedures
+        .iter()
+        .find(|procedure| {
+            procedure.kind() == ProcedureKind::Closure
+                && procedure_source(procedure).contains("objectPartialBody(value)")
+        })
+        .expect("missing object-field partial function");
+
+    assert!(constructor.properties().is_synthetic);
+    assert_eq!(
+        constructor.properties().invocation,
+        ProcedureInvocationKind::Immediate
+    );
+    assert!(initializer.properties().is_synthetic);
+    assert_eq!(
+        initializer.properties().invocation,
+        ProcedureInvocationKind::Deferred
+    );
+    assert!(!given_initializer.properties().is_synthetic);
+    assert_eq!(
+        given_initializer.properties().invocation,
+        ProcedureInvocationKind::Deferred
+    );
+    assert!(!given_function.properties().is_synthetic);
+    assert_eq!(
+        given_function.properties().invocation,
+        ProcedureInvocationKind::Immediate
+    );
+    assert_eq!(closure.lexical_parent(), Some(partial.id()));
+    assert_eq!(
+        closure.properties().invocation,
+        ProcedureInvocationKind::Immediate
+    );
+    assert_eq!(class_lambda.lexical_parent(), Some(constructor.id()));
+    assert_eq!(object_lambda.lexical_parent(), Some(initializer.id()));
+    assert_eq!(object_partial.lexical_parent(), Some(initializer.id()));
+    assert_eq!(member.lexical_parent(), constructor.lexical_parent());
+    assert_ne!(member.lexical_parent(), Some(constructor.id()));
+    assert!(
+        partial.call_sites().is_empty(),
+        "the enclosing partial-function factory must not execute the case body"
+    );
+    assert_eq!(closure.call_sites().len(), 1);
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn scala_constructor_direct_call_conformance() {
+    assert_direct_call_conformance(DirectCallFixture {
+        language: Language::Scala,
+        dialect: SemanticLanguage::Standard(Language::Scala),
+        callee_path: "scala/ConstructedBox.scala",
+        callee_source: r#"
+            package conformance
+
+            final class ConstructedBox(value: Int)
+        "#,
+        callee_declaration: "final class ConstructedBox(value: Int)",
+        callee_name: "ConstructedBox",
+        caller_path: "scala/ConstructorCaller.scala",
+        caller_source: r#"
+            package conformance
+
+            object ConstructorCaller {
+              def root(): ConstructedBox = new ConstructedBox(7)
+            }
+        "#,
+        caller_declaration: "def root(): ConstructedBox",
+        caller_name: "root",
+        call: "new ConstructedBox(7)",
+    });
+}
+
+#[test]
+fn scala_lambda_return_is_a_terminal_non_local_control_boundary() {
+    let lambda_source = r#"(value: Int) => {
+                    return escape(value)
+                    deadInsideLambda()
+                  }"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "scala/LambdaReturn.scala",
+            r#"
+                package conformance
+
+                def outer(): Int = {
+                  val lambda = (value: Int) => {
+                    return escape(value)
+                    deadInsideLambda()
+                  }
+                  afterLambdaCreation()
+                  1
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "scala/LambdaReturn.scala");
+    graph
+        .bind(
+            "lambda_entry",
+            PointSelector::new(lambda_source).effect("entry"),
+        )
+        .bind(
+            "escape_normal",
+            PointSelector::new("escape(value)")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "non_local_return",
+            PointSelector::new("return escape(value)").effect("gap"),
+        )
+        .bind(
+            "lambda_normal_exit",
+            PointSelector::new(lambda_source).effect("normal_exit"),
+        )
+        .bind(
+            "lambda_exceptional_exit",
+            PointSelector::new(lambda_source).effect("exceptional_exit"),
+        )
+        .bind(
+            "dead_invoke",
+            PointSelector::new("deadInsideLambda()").effect("invoke"),
+        );
+
+    graph.assert_successors(
+        "escape_normal",
+        &[cfg_edge("non_local_return", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "non_local_return",
+        &[cfg_edge("escape_normal", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors("non_local_return", &[]);
+    graph.assert_point_gap(
+        "non_local_return",
+        SemanticCapability::NonLocalControl,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_point_gap(
+        "non_local_return",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_reachable("lambda_entry", "non_local_return");
+    graph.assert_unreachable("lambda_entry", "dead_invoke");
+    graph.assert_unreachable("non_local_return", "lambda_normal_exit");
+    graph.assert_unreachable("non_local_return", "lambda_exceptional_exit");
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn scala_partial_function_return_is_a_terminal_non_local_control_boundary() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "scala/PartialFunctionReturn.scala",
+            r#"
+                package conformance
+
+                def partial(): PartialFunction[Int, Int] = {
+                  case value =>
+                    return escape(value)
+                    deadInsideClosure()
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph =
+        SemanticGraph::materialize(&project, &analyzer, "scala/PartialFunctionReturn.scala");
+    graph
+        .bind(
+            "closure_pattern",
+            PointSelector::new("case value =>\n                    return escape(value)")
+                .outgoing_kind(ControlEdgeKind::SwitchCase),
+        )
+        .bind(
+            "escape_normal",
+            PointSelector::new("escape(value)")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "non_local_return",
+            PointSelector::new("return escape(value)").effect("gap"),
+        )
+        .bind(
+            "dead_invoke",
+            PointSelector::new("deadInsideClosure()").effect("invoke"),
+        );
+
+    graph.assert_successors(
+        "escape_normal",
+        &[cfg_edge("non_local_return", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "non_local_return",
+        &[cfg_edge("escape_normal", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors("non_local_return", &[]);
+    graph.assert_point_gap(
+        "non_local_return",
+        SemanticCapability::NonLocalControl,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_point_gap(
+        "non_local_return",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_reachable("closure_pattern", "non_local_return");
+    graph.assert_unreachable("closure_pattern", "dead_invoke");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn scala_nested_partial_functions_keep_the_inner_body_out_of_the_outer_closure() {
+    const SOURCE: &str = r#"
+        package conformance
+
+        def nested(): PartialFunction[Int, Int] = {
+          case outer =>
+            val inner: PartialFunction[Int, Int] = {
+              case inner => innerBody(inner)
+            }
+            outerBody(outer)
+        }
+    "#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("scala/NestedPartial.scala", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "scala/NestedPartial.scala");
+    graph
+        .bind(
+            "outer_pattern",
+            PointSelector::new("case outer =>").outgoing_kind(ControlEdgeKind::SwitchCase),
+        )
+        .bind(
+            "outer_invoke",
+            PointSelector::new("outerBody(outer)").effect("invoke"),
+        )
+        .bind(
+            "inner_pattern",
+            PointSelector::new("case inner => innerBody(inner)")
+                .outgoing_kind(ControlEdgeKind::SwitchCase),
+        )
+        .bind(
+            "inner_invoke",
+            PointSelector::new("innerBody(inner)").effect("invoke"),
+        );
+    graph.assert_reachable("outer_pattern", "outer_invoke");
+    graph.assert_reachable("inner_pattern", "inner_invoke");
+
+    let closures = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .filter(|procedure| procedure.kind() == ProcedureKind::Closure)
+        .collect::<Vec<_>>();
+    assert_eq!(closures.len(), 2);
+    let procedure_source = |procedure: &ProcedureSemantics| {
+        let span = procedure.locator().anchor().span();
+        SOURCE
+            .get(span.start_byte() as usize..span.end_byte() as usize)
+            .expect("nested partial-function locator must remain in the fixture")
+    };
+    let outer = closures
+        .iter()
+        .copied()
+        .find(|procedure| procedure_source(procedure).contains("case outer"))
+        .expect("missing outer partial-function closure");
+    let inner = closures
+        .iter()
+        .copied()
+        .find(|procedure| {
+            let source = procedure_source(procedure);
+            source.contains("case inner") && !source.contains("case outer")
+        })
+        .expect("missing inner partial-function closure");
+    assert_eq!(inner.lexical_parent(), Some(outer.id()));
+    assert_eq!(outer.call_sites().len(), 1);
+    assert_eq!(inner.call_sites().len(), 1);
+    let call_source = |procedure: &ProcedureSemantics| {
+        let call = &procedure.call_sites()[0];
+        let span = procedure
+            .source_mapping(call.source)
+            .expect("nested partial-function call must retain source mapping")
+            .locator
+            .anchor()
+            .span();
+        SOURCE
+            .get(span.start_byte() as usize..span.end_byte() as usize)
+            .expect("nested partial-function call must remain in the fixture")
+    };
+    assert_eq!(call_source(outer), "outerBody(outer)");
+    assert_eq!(call_source(inner), "innerBody(inner)");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn scala_curried_call_is_one_dispatch_matched_invoke() {
+    const CALLEE: &str = r#"
+        package conformance
+
+        final class CurriedWorker {
+          def combine(value: Int)(label: String): Int = value
+        }
+    "#;
+    const CALLER: &str = r#"
+        package conformance
+
+        object CurriedCaller {
+          def root(worker: CurriedWorker): Int = worker.combine(7)("seven")
+        }
+    "#;
+    const CALL: &str = "worker.combine(7)(\"seven\")";
+
+    assert_direct_call_conformance(DirectCallFixture {
+        language: Language::Scala,
+        dialect: SemanticLanguage::Standard(Language::Scala),
+        callee_path: "scala/CurriedWorker.scala",
+        callee_source: CALLEE,
+        callee_declaration: "def combine(value: Int)(label: String)",
+        callee_name: "combine",
+        caller_path: "scala/CurriedCaller.scala",
+        caller_source: CALLER,
+        caller_declaration: "def root(worker: CurriedWorker)",
+        caller_name: "root",
+        call: CALL,
+    });
+
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("scala/CurriedWorker.scala", CALLEE)
+        .file("scala/CurriedCaller.scala", CALLER)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "scala/CurriedCaller.scala");
+    let caller = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("root")
+        })
+        .expect("missing Scala curried caller procedure");
+    assert_eq!(caller.call_sites().len(), 1);
+    let call = &caller.call_sites()[0];
+    let span = caller
+        .source_mapping(call.source)
+        .expect("curried call site must retain source mapping")
+        .locator
+        .anchor()
+        .span();
+    assert_eq!(
+        CALLER.get(span.start_byte() as usize..span.end_byte() as usize),
+        Some(CALL)
+    );
+}
+
+#[test]
+fn scala_curried_constructor_is_one_call_and_evaluates_every_argument_list() {
+    const CALL: &str = "new CurriedBox(firstArgument())(secondArgument())";
+    const SOURCE: &str = r#"
+        package conformance
+
+        final class CurriedBox(value: Int)(label: String)
+
+        def firstArgument(): Int = 7
+        def secondArgument(): String = "seven"
+
+        def root(): CurriedBox =
+          new CurriedBox(firstArgument())(secondArgument())
+    "#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("scala/CurriedConstructor.scala", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph =
+        SemanticGraph::materialize(&project, &analyzer, "scala/CurriedConstructor.scala");
+    graph
+        .bind(
+            "first_normal",
+            PointSelector::new("firstArgument()")
+                .procedure("root")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "second_entry",
+            PointSelector::new("secondArgument()")
+                .occurrence(1)
+                .procedure("root")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "second_normal",
+            PointSelector::new("secondArgument()")
+                .procedure("root")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "constructor_invoke",
+            PointSelector::new(CALL).procedure("root").effect("invoke"),
+        );
+    graph.assert_successors(
+        "first_normal",
+        &[cfg_edge("second_entry", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("second_entry", "second_normal");
+    graph.assert_successors(
+        "second_normal",
+        &[cfg_edge("constructor_invoke", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "constructor_invoke",
+        &[cfg_edge("second_normal", ControlEdgeKind::Normal)],
+    );
+
+    let caller = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("root")
+        })
+        .expect("missing Scala curried-constructor caller");
+    assert_eq!(
+        caller.call_sites().len(),
+        3,
+        "two argument calls and one constructor call must be emitted"
+    );
+    let constructor_calls = caller
+        .call_sites()
+        .iter()
+        .filter(|call| {
+            let span = caller
+                .source_mapping(call.source)
+                .expect("Scala call site must retain source mapping")
+                .locator
+                .anchor()
+                .span();
+            SOURCE.get(span.start_byte() as usize..span.end_byte() as usize) == Some(CALL)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(constructor_calls.len(), 1);
+    let constructor = constructor_calls[0];
+    assert_eq!(constructor.arguments.len(), 2);
+    let point = caller
+        .point(constructor.point)
+        .expect("constructor call point must remain available");
+    assert!(point.events.iter().any(|event| {
+        matches!(
+            &event.effect,
+            SemanticEffect::CallableReference { callable, .. }
+                if callable.kind == CallableReferenceKind::Constructor
+        )
+    }));
+    assert!(caller.call_sites().iter().all(|call| {
+        let span = caller
+            .source_mapping(call.source)
+            .expect("Scala call site must retain source mapping")
+            .locator
+            .anchor()
+            .span();
+        SOURCE.get(span.start_byte() as usize..span.end_byte() as usize)
+            != Some("new CurriedBox(firstArgument())")
+    }));
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn scala_infix_right_associative_and_postfix_calls_have_icfg_and_source_order() {
+    assert_direct_call_conformance(DirectCallFixture {
+        language: Language::Scala,
+        dialect: SemanticLanguage::Standard(Language::Scala),
+        callee_path: "scala/InfixTypes.scala",
+        callee_source: r#"
+            package conformance
+            final class Right
+            final class Left { def combine(right: Right): Int = 1 }
+        "#,
+        callee_declaration: "def combine(right: Right)",
+        callee_name: "combine",
+        caller_path: "scala/InfixCaller.scala",
+        caller_source: r#"
+            package conformance
+            object InfixCaller {
+              def root(left: Left, right: Right): Int = left combine right
+            }
+        "#,
+        caller_declaration: "def root(left: Left, right: Right)",
+        caller_name: "root",
+        call: "left combine right",
+    });
+    assert_direct_call_conformance(DirectCallFixture {
+        language: Language::Scala,
+        dialect: SemanticLanguage::Standard(Language::Scala),
+        callee_path: "scala/ColonTypes.scala",
+        callee_source: r#"
+            package conformance
+            final class Head
+            final class Tail { def ::(head: Head): Int = 2 }
+        "#,
+        callee_declaration: "def ::(head: Head)",
+        callee_name: "::",
+        caller_path: "scala/ColonCaller.scala",
+        caller_source: r#"
+            package conformance
+            object ColonCaller {
+              def root(head: Head, tail: Tail): Int = head :: tail
+            }
+        "#,
+        caller_declaration: "def root(head: Head, tail: Tail)",
+        caller_name: "root",
+        call: "head :: tail",
+    });
+    assert_direct_call_conformance(DirectCallFixture {
+        language: Language::Scala,
+        dialect: SemanticLanguage::Standard(Language::Scala),
+        callee_path: "scala/PostfixBox.scala",
+        callee_source: r#"
+            package conformance
+            final class PostfixBox { def ! : Boolean = true }
+        "#,
+        callee_declaration: "def ! : Boolean",
+        callee_name: "!",
+        caller_path: "scala/PostfixCaller.scala",
+        caller_source: r#"
+            package conformance
+            object PostfixCaller {
+              def root(box: PostfixBox): Boolean = box !
+            }
+        "#,
+        caller_declaration: "def root(box: PostfixBox)",
+        caller_name: "root",
+        call: "box !",
+    });
+
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "scala/OperatorOrder.scala",
+            r#"
+                package conformance
+
+                final class Right
+                final class Left { def combine(right: Right): Int = 1 }
+                final class Head
+                final class Tail { def ::(head: Head): Int = 2 }
+                final class PostfixBox { def ! : Boolean = true }
+
+                object OperatorOrder {
+                  def infix(leftOperand: Left, rightOperand: Right): Int =
+                    leftOperand combine rightOperand
+
+                  def colon(headOperand: Head, tailOperand: Tail): Int =
+                    headOperand :: tailOperand
+
+                  def postfix(boxOperand: PostfixBox): Boolean = boxOperand !
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "scala/OperatorOrder.scala");
+    graph
+        .bind(
+            "infix_entry",
+            PointSelector::new("leftOperand combine rightOperand")
+                .procedure("infix")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "infix_left",
+            PointSelector::new("leftOperand")
+                .occurrence(1)
+                .procedure("infix"),
+        )
+        .bind(
+            "infix_right",
+            PointSelector::new("rightOperand")
+                .occurrence(1)
+                .procedure("infix"),
+        )
+        .bind(
+            "infix_invoke",
+            PointSelector::new("leftOperand combine rightOperand")
+                .procedure("infix")
+                .effect("invoke"),
+        )
+        .bind(
+            "colon_entry",
+            PointSelector::new("headOperand :: tailOperand")
+                .procedure("colon")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "colon_left",
+            PointSelector::new("headOperand")
+                .occurrence(1)
+                .procedure("colon"),
+        )
+        .bind(
+            "colon_right",
+            PointSelector::new("tailOperand")
+                .occurrence(1)
+                .procedure("colon"),
+        )
+        .bind(
+            "colon_invoke",
+            PointSelector::new("headOperand :: tailOperand")
+                .procedure("colon")
+                .effect("invoke"),
+        )
+        .bind(
+            "postfix_entry",
+            PointSelector::new("boxOperand !")
+                .procedure("postfix")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "postfix_receiver",
+            PointSelector::new("boxOperand")
+                .occurrence(1)
+                .procedure("postfix"),
+        )
+        .bind(
+            "postfix_invoke",
+            PointSelector::new("boxOperand !")
+                .procedure("postfix")
+                .effect("invoke"),
+        );
+
+    graph.assert_successors(
+        "infix_entry",
+        &[cfg_edge("infix_left", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "infix_left",
+        &[cfg_edge("infix_right", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "infix_right",
+        &[cfg_edge("infix_invoke", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "colon_entry",
+        &[cfg_edge("colon_left", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "colon_left",
+        &[cfg_edge("colon_right", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "colon_right",
+        &[cfg_edge("colon_invoke", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "postfix_entry",
+        &[cfg_edge("postfix_receiver", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "postfix_receiver",
+        &[cfg_edge("postfix_invoke", ControlEdgeKind::Normal)],
+    );
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
 }

@@ -18153,6 +18153,361 @@ fn scala_postfix_operator_method_resolves_to_definition() {
 }
 
 #[test]
+fn scala_generic_and_curried_member_calls_resolve_to_definitions() {
+    let source = r#"
+package app
+
+class Service {
+  def generic[A](value: Int): Int = value
+  def curried(value: Int)(label: String): Int = value
+}
+
+object Controller {
+  def run(service: Service): Int =
+    service.generic[String](1) + service.curried(2)("two")
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Calls.scala", source)
+        .build();
+
+    for (needle, expected) in [
+        ("generic[String]", "app.Service.generic"),
+        ("curried(2)", "app.Service.curried"),
+    ] {
+        let start = source.find(needle).expect("Scala call");
+        let value = lookup(
+            project.root(),
+            &location_reference("app/Calls.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn scala_unapplied_generic_function_resolves_to_definition() {
+    let source = r#"
+package app
+
+object GenericRefs {
+  def generic[A](value: A): A = value
+  val reference = generic[Int]
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/GenericRefs.scala", source)
+        .build();
+    let start = source.rfind("generic[Int]").expect("generic reference");
+    let value = lookup(
+        project.root(),
+        &location_reference("app/GenericRefs.scala", source, start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.GenericRefs$.generic",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_wrapped_type_references_resolve_structured_targets() {
+    let source = r#"
+package app
+
+class Target
+class Parent(value: Int)
+class Child extends Parent(1)
+class Outer { class Inner }
+class Uses {
+  val annotated: Target @unchecked = ???
+  val projected: Outer#Inner = ???
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/WrappedTypes.scala", source)
+        .build();
+
+    for (start, expected) in [
+        (
+            source.find("Target @unchecked").expect("annotated type"),
+            "app.Target",
+        ),
+        (
+            source.find("Parent(1)").expect("applied constructor type"),
+            "app.Parent",
+        ),
+        (
+            source.find("Outer#Inner").expect("projected type") + "Outer#".len(),
+            "app.Outer.Inner",
+        ),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference("app/WrappedTypes.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn scala_trailing_block_argument_forms_have_one_top_level_argument() {
+    let source = r#"
+package app
+
+class Service {
+  def braced(value: => Int): Int = value
+  def partial(value: PartialFunction[Int, Int]): Int = 1
+  def colon(value: => Int): Int = value
+  def first(): Int = 1
+  def second(): Int = 2
+
+  def run(): Int = {
+    val a = braced { first(); second() }
+    val b = partial { case 0 => 0; case other => other }
+    val c = colon:
+      first()
+      second()
+    a + b + c
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/BlockArguments.scala", source)
+        .build();
+
+    for (needle, expected) in [
+        ("braced {", "app.Service.braced"),
+        ("partial {", "app.Service.partial"),
+        ("colon:", "app.Service.colon"),
+    ] {
+        let start = source.rfind(needle).expect("block argument call");
+        let value = lookup(
+            project.root(),
+            &location_reference("app/BlockArguments.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn scala_direct_application_chain_rejects_more_lists_than_the_declaration() {
+    let source = r#"
+package app
+
+class Service {
+  def single(value: Int): Int = value
+}
+
+object Controller {
+  def run(service: Service): Int = service.single(1)("extra")
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Calls.scala", source)
+        .build();
+    let start = source.find("single(1)").expect("Scala call");
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Calls.scala", source, start),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn scala_generic_and_curried_new_calls_resolve_to_primary_constructors() {
+    let source = r#"
+package app
+
+class Box[A](value: Int)
+class Curried(value: Int)(label: String)
+
+object Controller {
+  val box = new Box[String](1)
+  val curried = new Curried(2)("two")
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Constructors.scala", source)
+        .build();
+
+    for (needle, expected) in [
+        ("Box[String]", "app.Box.Box"),
+        ("Curried(2)", "app.Curried.Curried"),
+    ] {
+        let start = source.find(needle).expect("Scala constructor");
+        let value = lookup(
+            project.root(),
+            &location_reference("app/Constructors.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn scala_constructor_application_chain_rejects_extra_argument_lists() {
+    let source = r#"
+package app
+
+class Single(value: Int)
+
+object Controller {
+  val invalid = new Single(1)("extra")
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/InvalidConstructor.scala", source)
+        .build();
+    let start = source.find("Single(1)").expect("Scala constructor call");
+    let value = lookup(
+        project.root(),
+        &location_reference("app/InvalidConstructor.scala", source, start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "scala_constructor_arity_mismatch",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_parameterless_primary_and_secondary_constructors_share_valid_shapes() {
+    let source = r#"
+package app
+
+class Multi {
+  def this(value: Int) = this()
+}
+
+object Controller {
+  val zero = new Multi
+  val one = new Multi(1)
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/ConstructorAlternatives.scala", source)
+        .build();
+
+    for needle in ["new Multi\n", "new Multi(1)"] {
+        let start = source.find(needle).expect("constructor call") + "new ".len();
+        let value = lookup(
+            project.root(),
+            &location_reference("app/ConstructorAlternatives.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], "app.Multi.Multi",
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn scala_infix_dispatch_uses_left_receiver_for_ordinary_operators() {
+    let source = r#"
+package app
+
+class Right
+class Left {
+  def combine(right: Right): Int = 1
+}
+
+object Controller {
+  def run(left: Left, right: Right): Int = left combine right
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Infix.scala", source)
+        .build();
+    let start = source.rfind("combine").expect("infix call");
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Infix.scala", source, start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Left.combine",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_colon_infix_dispatch_uses_the_right_receiver() {
+    let source = r#"
+package app
+
+class Head {
+  def ::(tail: Tail): Int = 1
+}
+class Tail {
+  def ::(head: Head): Int = 2
+}
+
+object Controller {
+  def run(head: Head, tail: Tail): Int = head :: tail
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Colon.scala", source)
+        .build();
+    let start = source.rfind("::").expect("right-associative infix call");
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Colon.scala", source, start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Tail.::", "{value}");
+}
+
+#[test]
+fn scala_compound_infix_dispatch_fails_closed_without_precedence_reconstruction() {
+    let source = r#"
+package app
+
+class A { def +(right: B): A = this }
+class B { def *(right: C): B = this }
+class C
+
+object Controller {
+  def run(a: A, b: B, c: C) = a + b * c
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Compound.scala", source)
+        .build();
+    let start = source.rfind('*').expect("compound infix call");
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Compound.scala", source, start),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert!(
+        value["results"][0]["diagnostics"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("precedence-aware receiver reconstruction")),
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_service_execute_receiver_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

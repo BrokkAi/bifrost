@@ -271,7 +271,10 @@ fn is_call_expression_node(node: Node<'_>, language: Language) -> bool {
                 | "scoped_call_expression"
                 | "object_creation_expression"
         ),
-        Language::Scala => node.kind() == "call_expression",
+        Language::Scala => matches!(
+            node.kind(),
+            "call_expression" | "instance_expression" | "infix_expression" | "postfix_expression"
+        ),
         Language::CSharp => matches!(
             node.kind(),
             "invocation_expression" | "object_creation_expression"
@@ -322,6 +325,7 @@ fn callee_node_for_call<'tree>(node: Node<'tree>, language: Language) -> Option<
         Language::CSharp => node
             .child_by_field_name("function")
             .or_else(|| node.child_by_field_name("type")),
+        Language::Scala => scala_callee_node_for_call(node),
         Language::Ruby => node.child_by_field_name("method"),
         _ => node
             .child_by_field_name("function")
@@ -367,6 +371,57 @@ fn first_named_child_not_arguments(node: Node<'_>, language: Language) -> Option
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| Some(*child) != arguments)
+}
+
+fn scala_callee_node_for_call(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "call_expression" => node.child_by_field_name("function"),
+        "instance_expression" => scala_constructor_type_node(node),
+        "infix_expression" => node.child_by_field_name("operator"),
+        "postfix_expression" => scala_postfix_method_node(node),
+        _ => None,
+    }
+}
+
+fn scala_constructor_type_node(node: Node<'_>) -> Option<Node<'_>> {
+    let arguments = node.child_by_field_name("arguments");
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).find(|child| {
+        Some(*child) != arguments && !matches!(child.kind(), "arguments" | "template_body")
+    })
+}
+
+fn scala_terminal_callee_leaf(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        node = match node.kind() {
+            "identifier" | "operator_identifier" | "type_identifier" => return Some(node),
+            "call_expression" | "infix_expression" | "postfix_expression" => {
+                scala_callee_node_for_call(node)?
+            }
+            "instance_expression" => scala_constructor_type_node(node)?,
+            "generic_function" | "generic_type" => node
+                .child_by_field_name("function")
+                .or_else(|| node.child_by_field_name("type"))?,
+            "field_expression" => node.child_by_field_name("field")?,
+            "projected_type" => node.child_by_field_name("selector")?,
+            "stable_identifier" | "stable_type_identifier" => {
+                let mut cursor = node.walk();
+                node.named_children(&mut cursor).last()?
+            }
+            "annotated_type" | "applied_constructor_type" | "parenthesized_expression" => {
+                let mut cursor = node.walk();
+                let mut children = node
+                    .named_children(&mut cursor)
+                    .filter(|child| child.kind() != "arguments");
+                let child = children.next()?;
+                if children.next().is_some() {
+                    return None;
+                }
+                child
+            }
+            _ => return None,
+        };
+    }
 }
 
 fn call_reference_leaf(node: Node<'_>, language: Language) -> Option<Node<'_>> {
@@ -453,7 +508,7 @@ fn collect_call_reference_ranges(
         {
             continue;
         }
-        if is_nested_callable_node(node, search_range) {
+        if is_nested_callable_node(node, language, search_range) {
             continue;
         }
         if node.child_count() == 0 {
@@ -483,35 +538,51 @@ fn collect_call_reference_ranges(
     out
 }
 
-fn is_nested_callable_node(node: Node<'_>, search_range: &Range) -> bool {
-    node.start_byte() > search_range.start_byte
-        && node.end_byte() < search_range.end_byte
-        && matches!(
-            node.kind(),
-            "function_declaration"
-                | "function_definition"
-                | "method_declaration"
-                | "constructor_declaration"
-                | "method_definition"
-                | "function_expression"
-                | "arrow_function"
-                | "lambda_expression"
-                | "lambda"
-                | "func_literal"
-                | "class_declaration"
-                | "interface_declaration"
-                | "enum_declaration"
-                | "record_declaration"
-                | "class_definition"
-                | "method"
-                | "singleton_method"
-                | "module"
-                | "struct_declaration"
-                | "union_declaration"
-                | "trait_item"
-                | "impl_item"
-                | "object_definition"
+fn is_nested_callable_node(node: Node<'_>, language: Language, search_range: &Range) -> bool {
+    if node.start_byte() <= search_range.start_byte || node.end_byte() >= search_range.end_byte {
+        return false;
+    }
+    if language == Language::Scala
+        && (node.kind() == "given_definition"
+            || (node.kind() == "case_block" && scala_case_block_is_partial_function(node)))
+    {
+        return true;
+    }
+    matches!(
+        node.kind(),
+        "function_declaration"
+            | "function_definition"
+            | "method_declaration"
+            | "constructor_declaration"
+            | "method_definition"
+            | "function_expression"
+            | "arrow_function"
+            | "lambda_expression"
+            | "lambda"
+            | "func_literal"
+            | "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "class_definition"
+            | "method"
+            | "singleton_method"
+            | "module"
+            | "struct_declaration"
+            | "union_declaration"
+            | "trait_item"
+            | "impl_item"
+            | "object_definition"
+    )
+}
+
+fn scala_case_block_is_partial_function(node: Node<'_>) -> bool {
+    !node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "match_expression" | "catch_clause" | "try_expression"
         )
+    })
 }
 
 fn is_call_reference_candidate(node: Node<'_>, language: Language) -> bool {
@@ -549,6 +620,7 @@ fn is_reference_candidate_kind(kind: &str) -> bool {
             | "name"
             | "simple_name"
             | "identifier_token"
+            | "operator_identifier"
     )
 }
 
@@ -693,13 +765,12 @@ fn php_call_reference_candidate(node: Node<'_>) -> bool {
 fn scala_call_reference_candidate(node: Node<'_>) -> bool {
     let mut current = node;
     while let Some(parent) = current.parent() {
-        match parent.kind() {
-            "call_expression" if parent.child_by_field_name("function") == Some(current) => {
-                return true;
-            }
-            "field_expression" | "stable_identifier" | "stable_type_identifier" => current = parent,
-            _ => return false,
+        if is_call_expression_node(parent, Language::Scala)
+            && scala_callee_node_for_call(parent).and_then(scala_terminal_callee_leaf) == Some(node)
+        {
+            return true;
         }
+        current = parent;
     }
     false
 }
@@ -843,6 +914,127 @@ mod tests {
 
         assert_eq!(&source[leaf.start_byte..leaf.end_byte], "leaf");
         assert_eq!(&source[make.start_byte..make.end_byte], "make");
+    }
+
+    #[test]
+    fn exact_scala_call_spans_use_the_terminal_direct_callee() {
+        let source = r#"
+object Calls {
+  class Box[A](value: Int)
+  class Curried(value: Int)(label: String)
+  class Service {
+    def curried[A](value: Int)(label: String): Int = value
+    def combine(other: Service): Service = this
+    def ping: Int = 1
+  }
+  def ordinary(value: Int): Int = value
+  def caller(service: Service, other: Service, head: Int, tail: List[Int]): Unit = {
+    ordinary(1)
+    ordinary[Int](1)
+    service.curried[Int](1)("label")
+    new Box[Int](1)
+    new Curried(1)("label")
+    service combine other
+    service ping
+    head :: tail
+  }
+}
+"#;
+        let file = file("Calls.scala");
+        let tree =
+            parse_tree_for_language(&file, Language::Scala, source).expect("Scala syntax tree");
+
+        for (call, callee) in [
+            ("ordinary(1)", "ordinary"),
+            ("ordinary[Int](1)", "ordinary"),
+            ("service.curried[Int](1)(\"label\")", "curried"),
+            ("new Box[Int](1)", "Box"),
+            ("new Curried(1)(\"label\")", "Curried"),
+            ("service combine other", "combine"),
+            ("service ping", "ping"),
+            ("head :: tail", "::"),
+        ] {
+            let reference =
+                call_reference_range_for_call(&tree, Language::Scala, &byte_range(source, call))
+                    .unwrap_or_else(|| panic!("missing exact Scala call reference for `{call}`"));
+            assert_eq!(
+                &source[reference.start_byte..reference.end_byte],
+                callee,
+                "wrong exact Scala callee for `{call}`"
+            );
+        }
+    }
+
+    #[test]
+    fn scala_call_candidates_exclude_receivers_arguments_and_type_arguments() {
+        let source = "object Calls { def caller(service: Service, value: Int, label: String) = service.curried[String](value)(label) }";
+        let file = file("Calls.scala");
+        let tree =
+            parse_tree_for_language(&file, Language::Scala, source).expect("Scala syntax tree");
+        let call = byte_range(source, "service.curried[String](value)(label)");
+
+        let references = call_reference_ranges_in_tree(&tree, Language::Scala, &call, 20);
+        let names = references
+            .iter()
+            .map(|range| &source[range.start_byte..range.end_byte])
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["curried"]);
+    }
+
+    #[test]
+    fn scala_parameterless_selection_is_not_an_immediate_call_candidate() {
+        let source = "object Calls { def caller(service: Service) = service.value }";
+        let file = file("Calls.scala");
+        let tree =
+            parse_tree_for_language(&file, Language::Scala, source).expect("Scala syntax tree");
+        let selection = byte_range(source, "service.value");
+
+        let references = call_reference_ranges_in_tree(&tree, Language::Scala, &selection, 20);
+
+        assert!(references.is_empty(), "{references:#?}");
+    }
+
+    #[test]
+    fn scala_constructor_candidates_exclude_qualifiers_arguments_and_type_arguments() {
+        let source = "object Calls { def caller(value: Int) = new pkg.Box[String](value) }";
+        let file = file("Calls.scala");
+        let tree =
+            parse_tree_for_language(&file, Language::Scala, source).expect("Scala syntax tree");
+        let call = byte_range(source, "new pkg.Box[String](value)");
+
+        let references = call_reference_ranges_in_tree(&tree, Language::Scala, &call, 20);
+        let names = references
+            .iter()
+            .map(|range| &source[range.start_byte..range.end_byte])
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["Box"]);
+    }
+
+    #[test]
+    fn scala_call_candidates_prune_partial_functions_and_givens_but_not_match_cases() {
+        let outer = r#"def outer(value: Int): Int = {
+    val partial: PartialFunction[Int, Int] = { case _ => nestedCall() }
+    given generated: Int = nestedCall()
+    val matched = value match { case _ => matchCall() }
+    directCall()
+  }"#;
+        let source = format!(
+            "object Calls {{ def nestedCall(): Int = 1; def matchCall(): Int = 2; def directCall(): Int = 3; {outer} }}"
+        );
+        let file = file("Calls.scala");
+        let tree =
+            parse_tree_for_language(&file, Language::Scala, &source).expect("Scala syntax tree");
+        let search_range = byte_range(&source, outer);
+
+        let references = call_reference_ranges_in_tree(&tree, Language::Scala, &search_range, 20);
+        let names = references
+            .iter()
+            .map(|range| &source[range.start_byte..range.end_byte])
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["matchCall", "directCall"]);
     }
 
     #[test]

@@ -1031,6 +1031,50 @@ mod tests {
     }
 
     #[test]
+    fn scala_outgoing_relations_keep_nested_partial_function_and_given_calls_separate() {
+        let source = r#"
+package example
+
+object Calls {
+  def nestedCall(): Int = 1
+  def matchCall(): Int = 2
+  def directCall(): Int = 3
+
+  def outer(value: Int): Int = {
+    val partial: PartialFunction[Int, Int] = { case _ => nestedCall() }
+    given generated: Int = nestedCall()
+    val matched = value match { case _ => matchCall() }
+    directCall()
+  }
+}
+"#;
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::Scala, &[("Calls.scala", source)]);
+        let analyzer = fixture.analyzer.analyzer();
+        let caller = analyzer
+            .definitions("example.Calls$.outer")
+            .next()
+            .expect("Scala caller");
+
+        let relation =
+            CallRelationService::outgoing_bounded(analyzer, &caller, generous_limits(), None);
+        let callees = relation
+            .sites
+            .iter()
+            .map(|site| site.callee.fq_name())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            callees,
+            vec![
+                "example.Calls$.matchCall".to_string(),
+                "example.Calls$.directCall".to_string(),
+            ],
+            "{relation:#?}"
+        );
+    }
+
+    #[test]
     fn exact_dispatch_keeps_cancellation_budget_and_truncation_independent() {
         let source = Arc::new("function target() {}\ntarget();\n".to_string());
         let fixture = AnalyzerFixture::new_for_language(
