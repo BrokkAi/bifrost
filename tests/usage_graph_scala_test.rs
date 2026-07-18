@@ -573,6 +573,91 @@ fn scala_inverted_applies_compilation_unit_import_precedence() {
 }
 
 #[test]
+fn scala_inverted_resolves_generic_lexical_constructors_and_stable_paths() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Flags.scala",
+            r#"package model
+object Flags {
+  val Enabled: Int = 1
+  case object Nested
+}
+"#,
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+
+import model.Flags
+
+object Use {
+  class Generic[A](value: A)
+
+  def validGeneric = new Generic[Int](1)
+  def wrongGenericArity = new Generic[Int]()
+  def localConstructorRoot(Generic: LocalFactory) = new Generic[Int](1)
+  def directField: Int = Flags.Enabled
+  def stableField(value: Any): Int = value match {
+    case Flags.Enabled => 1
+    case model.Flags.Enabled => 2
+    case _ => 0
+  }
+  def stableObject(value: Any): Int = value match {
+    case Flags.Nested => 1
+    case model.Flags.Nested => 2
+    case _ => 0
+  }
+  def localRootIsNotImported(Flags: LocalFlags): Int = Flags.Enabled
+  def decoyObject(value: Any): Int = value match {
+    case decoy.Flags.Nested => 1
+    case _ => 0
+  }
+}
+
+class LocalFlags { val Enabled: Int = 2 }
+class LocalFactory
+"#,
+        )
+        .file(
+            "decoy/Flags.scala",
+            r#"package decoy
+object Flags {
+  val Enabled: Int = 2
+  case object Nested
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "app.Use$.validGeneric", "app.Use$.Generic"),
+        "{}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$.wrongGenericArity", "app.Use$.Generic"),
+        "{}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$.localConstructorRoot", "app.Use$.Generic"),
+        "{}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "app.Use$.stableObject", "model.Flags$.Nested$"),
+        "{}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$.decoyObject", "model.Flags$.Nested$"),
+        "{}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn scala_inverted_matches_all_same_file_overloads_and_curried_constructor_lists() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

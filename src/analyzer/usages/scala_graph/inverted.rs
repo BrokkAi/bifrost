@@ -32,7 +32,7 @@ use super::syntax::{
     is_constructor_like_reference, is_scala_class_reference, is_scala_object_reference,
     is_terminal_stable_field_reference, node_text, parenthesized_arity,
     qualified_stable_type_reference, resolve_stable_object_expression,
-    scala_import_is_visible_at_byte, scala_source_facts,
+    scala_import_is_visible_at_byte, scala_source_facts, stable_identifier_reference,
 };
 use crate::analyzer::scala::{
     ScalaAdapter, ScalaSupertypeLookupPath, ScalaWildcardOwnerFacts,
@@ -715,6 +715,17 @@ impl ProjectTypes {
             .iter()
             .find(|unit| unit.is_class() && self.type_accepts_object_roles(scala, unit))
             .map(CodeUnit::fq_name)
+    }
+
+    pub(super) fn exact_nested_type(&self, owner_fqn: &str, member: &str) -> Option<String> {
+        let candidate = format!("{owner_fqn}.{member}");
+        preferred_scala_type(
+            self.index
+                .by_fqn(&candidate)
+                .iter()
+                .filter(|unit| unit.is_class()),
+        )
+        .map(CodeUnit::fq_name)
     }
 
     fn resolve_type_text(&self, resolver: &NameResolver, type_text: &str) -> Option<String> {
@@ -2248,6 +2259,12 @@ impl ScalaScan<'_, '_> {
         self.class_ranges.enclosing(byte)
     }
 
+    fn lexically_visible_type(&self, byte: usize, name: &str) -> Option<String> {
+        self.class_ranges.find_in_enclosing_units(byte, |owner| {
+            self.types.exact_nested_type(&owner.fq_name(), name)
+        })
+    }
+
     fn record(&mut self, callee: String, node: Node<'_>) {
         self.collector.record_kind(
             callee,
@@ -2334,7 +2351,11 @@ fn record_reference(
             let resolved = if object_reference {
                 ctx.resolver.resolve_object(text)
             } else if is_scala_class_reference(node, ctx.source) {
-                ctx.resolver.resolve(text)
+                ctx.resolver.resolve(text).or_else(|| {
+                    (bindings.resolve_symbol(text).is_unknown() && !bindings.is_shadowed(text))
+                        .then(|| ctx.lexically_visible_type(node.start_byte(), text))
+                        .flatten()
+                })
             } else {
                 None
             };
@@ -2474,12 +2495,49 @@ fn record_reference(
             if bindings.is_shadowed(name) {
                 return;
             }
-            if is_terminal_stable_field_reference(node) {
-                if let Some(fqn) = node
-                    .parent()
-                    .and_then(|expression| stable_object_expression_fqn(expression, ctx, bindings))
+            if let Some(reference) = stable_identifier_reference(node, ctx.source) {
+                if reference.segments.first().is_some_and(|root| {
+                    !bindings.resolve_symbol(root).is_unknown() || bindings.is_shadowed(root)
+                }) {
+                    return;
+                }
+                let (member, owner_segments) =
+                    reference.segments.split_last().expect("stable path");
+                if let Some(owner) = ctx.types.resolve_qualified_stable_type(
+                    ctx.scala,
+                    &ctx.resolver,
+                    owner_segments,
+                    true,
+                ) && let Some(field) = ctx.types.exact_field(&owner, member)
                 {
-                    ctx.record(fqn, node);
+                    ctx.record(field, node);
+                    return;
+                }
+                if let Some(object) = ctx.types.resolve_qualified_stable_type(
+                    ctx.scala,
+                    &ctx.resolver,
+                    &reference.segments,
+                    true,
+                ) {
+                    ctx.record(object, node);
+                }
+                return;
+            }
+            if is_terminal_stable_field_reference(node) {
+                if let Some(qualifier) = node
+                    .parent()
+                    .and_then(|expression| expression.child_by_field_name("value"))
+                    && let Some(owner) = stable_object_expression_fqn(qualifier, ctx, bindings)
+                    && let Some(field) = ctx.types.exact_field(&owner, name)
+                {
+                    ctx.record(field, node);
+                } else if let Some(qualifier) = node
+                    .parent()
+                    .and_then(|expression| expression.child_by_field_name("value"))
+                    && let Some(owner) = stable_object_expression_fqn(qualifier, ctx, bindings)
+                    && let Some(object) = ctx.types.exact_nested_object(ctx.scala, &owner, name)
+                {
+                    ctx.record(object, node);
                 }
                 return;
             }
@@ -2896,6 +2954,7 @@ fn pattern_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
                     out.push(name);
                 }
             }
+            "stable_identifier" => {}
             _ => {
                 for index in (0..node.named_child_count()).rev() {
                     if let Some(child) = node.named_child(index) {

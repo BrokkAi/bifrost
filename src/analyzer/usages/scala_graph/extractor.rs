@@ -20,7 +20,8 @@ use crate::analyzer::usages::scala_graph::syntax::{
     is_scala_object_reference, is_terminal_stable_field_reference, member_qualifier,
     member_qualifier_node, named_argument_invocation_owner, node_text, parenthesized_arity,
     qualified_stable_type_reference, resolve_stable_object_expression,
-    scala_union_type_alternative_paths, terminal_invocation_owner_name,
+    scala_union_type_alternative_paths, stable_identifier_reference,
+    terminal_invocation_owner_name,
 };
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile, Range, ScalaAnalyzer,
@@ -871,6 +872,7 @@ fn pattern_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
             }
             names
         }
+        "stable_identifier" => Vec::new(),
         "identifiers" | "tuple_pattern" | "pattern" => {
             let mut names = Vec::new();
             let mut cursor = node.walk();
@@ -977,11 +979,21 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     .parent()
                     .and_then(|expression| stable_object_expression_fqn(expression, ctx))
                     .is_some_and(|fqn| fqn == ctx.spec.target.fq_name());
-            let lexical_type_matches = nested_target_type_is_lexically_visible(node, ctx);
+            let stable_identifier_object_matches = stable_identifier_object_fqn(node, ctx)
+                .is_some_and(|fqn| fqn == ctx.spec.target.fq_name());
+            let lexical_type_matches =
+                ctx.spec.member_name == text && nested_target_type_is_lexically_visible(node, ctx);
+            let class_call_shape_matches = !is_constructor_like_reference(node, ctx.source)
+                || ctx.types.constructor_call_shape_matches(
+                    ctx.scala,
+                    &ctx.spec.target.fq_name(),
+                    call_arities_for_reference(node).as_deref(),
+                );
             let class_reference = qualified.is_none()
                 && is_scala_class_reference(node, ctx.source)
                 && !ctx.spec.is_object_type
-                && (ctx.visibility.class_type_name_matches(text) || lexical_type_matches);
+                && (ctx.visibility.class_type_name_matches(text) || lexical_type_matches)
+                && class_call_shape_matches;
             let object_reference = qualified.is_none()
                 && object_syntax
                 && (ctx.visibility.object_type_name_matches(text) || lexical_type_matches)
@@ -1000,8 +1012,11 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             (qualified_role_matches
                 || class_reference
                 || object_reference
-                || terminal_object_matches)
-                && (qualified.is_some() || !type_reference_is_locally_bound(text, ctx))
+                || terminal_object_matches
+                || stable_identifier_object_matches)
+                && (qualified.is_some()
+                    || stable_identifier_object_matches
+                    || !type_reference_is_locally_bound(text, ctx))
         }
         TargetKind::Constructor => {
             let qualified = qualified_stable_type_reference(node, ctx.source).filter(|reference| {
@@ -1027,8 +1042,11 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                         ctx,
                     )
             });
+            let lexical_owner_matches = ctx.spec.owner_name.as_deref() == Some(text)
+                && nested_target_owner_is_lexically_visible(node, ctx);
             qualified_owner_matches
-                || ctx.visibility.class_type_name_matches(text)
+                || (ctx.visibility.class_type_name_matches(text) || lexical_owner_matches)
+                    && !type_reference_is_locally_bound(text, ctx)
                     && is_constructor_like_reference(node, ctx.source)
                     && member_call_arity_matches(node, ctx)
         }
@@ -1159,6 +1177,10 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
         return false;
     }
 
+    if let Some(owner_fq_name) = stable_identifier_field_owner_fqn(node, ctx) {
+        return ctx.spec.owner_fq_matches(&owner_fq_name);
+    }
+
     if ctx.spec.owner.is_none() {
         return member_qualifier(node, ctx.source)
             .is_some_and(|qualifier| qualifier == ctx.spec.target.package_name());
@@ -1173,9 +1195,7 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
                 && member_call_arity_matches(node, ctx)
         };
     };
-    if qualifier_node.kind() == "field_expression"
-        && let Some(owner_fq_name) = stable_object_expression_fqn(qualifier_node, ctx)
-    {
+    if let Some(owner_fq_name) = stable_object_expression_fqn(qualifier_node, ctx) {
         return ctx.spec.owner_fq_matches(&owner_fq_name) && member_call_arity_matches(node, ctx);
     }
     if qualifier_node.kind() == "call_expression"
@@ -1336,6 +1356,34 @@ fn stable_object_expression_fqn(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Str
         },
         |owner, member| ctx.types.exact_nested_object(ctx.scala, owner, member),
     )
+}
+
+fn stable_identifier_object_fqn(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
+    let reference = stable_identifier_reference(node, ctx.source)?;
+    let root = reference.segments.first()?;
+    if !ctx.bindings.resolve_symbol(root).is_unknown() || ctx.bindings.is_shadowed(root) {
+        return None;
+    }
+    ctx.types.resolve_qualified_stable_type(
+        ctx.scala,
+        &ctx.name_resolver,
+        &reference.segments,
+        true,
+    )
+}
+
+fn stable_identifier_field_owner_fqn(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
+    let reference = stable_identifier_reference(node, ctx.source)?;
+    let (member, owner_segments) = reference.segments.split_last()?;
+    if member != &ctx.spec.member_name {
+        return None;
+    }
+    let root = owner_segments.first()?;
+    if !ctx.bindings.resolve_symbol(root).is_unknown() || ctx.bindings.is_shadowed(root) {
+        return None;
+    }
+    ctx.types
+        .resolve_qualified_stable_type(ctx.scala, &ctx.name_resolver, owner_segments, true)
 }
 
 fn owner_qualified_this_matches(qualifier_node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {

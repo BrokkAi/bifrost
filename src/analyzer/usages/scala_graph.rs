@@ -232,6 +232,28 @@ class ScopeLeak {
   { val Service: Int = 0 }
   def call: Int = Service.run()
 }
+object Stable {
+  val Enabled: Int = 1
+}
+object Decoy {
+  val Enabled: Int = 2
+}
+class StableHolder {
+  val Enabled: Int = 3
+}
+object StableUse {
+  def direct: Int = Stable.Enabled
+  def stable(value: Any): Int = value match {
+    case Stable.Enabled => 1
+    case _ => 0
+  }
+  def packageStable(value: Any): Int = value match {
+    case app.Stable.Enabled => 1
+    case _ => 0
+  }
+  def localRoot(Stable: StableHolder): Int = Stable.Enabled
+  def decoy: Int = Decoy.Enabled
+}
 "#,
         )
         .unwrap();
@@ -264,6 +286,14 @@ class ScopeLeak {
         assert!(has_edge("app.Params.read", "app.Params.second"));
         assert!(!has_edge("app.Params.shadow", "app.Params.first"));
         assert!(has_edge("app.ScopeLeak.call", "svc.Service$.run"));
+        assert!(has_edge("app.StableUse$.direct", "app.Stable$.Enabled"));
+        assert!(has_edge("app.StableUse$.stable", "app.Stable$.Enabled"));
+        assert!(has_edge(
+            "app.StableUse$.packageStable",
+            "app.Stable$.Enabled"
+        ));
+        assert!(!has_edge("app.StableUse$.localRoot", "app.Stable$.Enabled"));
+        assert!(!has_edge("app.StableUse$.decoy", "app.Stable$.Enabled"));
     }
 
     #[test]

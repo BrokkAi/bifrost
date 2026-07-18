@@ -386,6 +386,168 @@ object Use {
 }
 
 #[test]
+fn scan_usages_resolves_scala_generic_lexical_constructors_and_stable_paths() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Flags.scala",
+            r#"package model
+object Flags {
+  val Enabled: Int = 1
+  case object Nested
+}
+"#,
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+
+import model.Flags
+
+object Use {
+  class Generic[A](value: A)
+
+  def validGeneric = new Generic[Int](1)
+  def wrongGenericArity = new Generic[Int]()
+  def localConstructorRoot(Generic: LocalFactory) = new Generic[Int](1)
+  def directField: Int = Flags.Enabled
+  def stableField(value: Any): Int = value match {
+    case Flags.Enabled => 1
+    case model.Flags.Enabled => 2
+    case _ => 0
+  }
+  def stableObject(value: Any): Int = value match {
+    case Flags.Nested => 1
+    case model.Flags.Nested => 2
+    case _ => 0
+  }
+  def localRootIsNotImported(Flags: LocalFlags): Int = Flags.Enabled
+  def decoyField(value: Any): Int = value match {
+    case decoy.Flags.Enabled => 1
+    case _ => 0
+  }
+  def decoyObject(value: Any): Int = value match {
+    case decoy.Flags.Nested => 1
+    case _ => 0
+  }
+}
+
+class LocalFlags { val Enabled: Int = 2 }
+class LocalFactory
+"#,
+        )
+        .file(
+            "decoy/Flags.scala",
+            r#"package decoy
+object Flags {
+  val Enabled: Int = 2
+  case object Nested
+}
+"#,
+        )
+        .build();
+    let analyzer = ScalaAnalyzer::from_project(project.project().clone());
+
+    let result = scan_usages_by_reference(
+        &analyzer,
+        ScanUsagesByReferenceParams {
+            symbols: vec![
+                "app/Use.scala#app.Use.Generic".to_string(),
+                "model/Flags.scala#model.Flags.Enabled".to_string(),
+                "model/Flags.scala#model.Flags.Nested".to_string(),
+            ],
+            include_tests: true,
+            paths: Some(vec!["app/Use.scala".to_string()]),
+        },
+    );
+    assert_eq!(3, result.results.len(), "{result:#?}");
+    assert!(
+        result
+            .results
+            .iter()
+            .all(|entry| entry.status == ScanUsagesStatus::Found),
+        "{result:#?}"
+    );
+
+    let snippets_for = |symbol_suffix: &str| {
+        result
+            .results
+            .iter()
+            .find(|entry| {
+                entry
+                    .symbol
+                    .as_deref()
+                    .is_some_and(|symbol| symbol.ends_with(symbol_suffix))
+            })
+            .unwrap_or_else(|| panic!("missing {symbol_suffix} result: {result:#?}"))
+            .files
+            .iter()
+            .flat_map(|file| file.hits.iter().filter_map(|hit| hit.snippet.as_deref()))
+            .collect::<Vec<_>>()
+    };
+
+    let generic = snippets_for("Use.Generic");
+    assert!(
+        generic
+            .iter()
+            .any(|snippet| snippet.contains("new Generic[Int](1)")),
+        "{result:#?}"
+    );
+    assert!(
+        generic
+            .iter()
+            .all(|snippet| !snippet.contains("new Generic[Int]()")),
+        "{result:#?}"
+    );
+    assert!(
+        generic
+            .iter()
+            .all(|snippet| !snippet.contains("Generic: LocalFactory")),
+        "{result:#?}"
+    );
+
+    let enabled = snippets_for("Flags.Enabled");
+    for expected in [
+        "Flags.Enabled",
+        "case Flags.Enabled",
+        "case model.Flags.Enabled",
+    ] {
+        assert!(
+            enabled.iter().any(|snippet| snippet.contains(expected)),
+            "missing {expected:?}: {result:#?}"
+        );
+    }
+    assert!(
+        enabled
+            .iter()
+            .all(|snippet| !snippet.contains("Flags: LocalFlags")),
+        "{result:#?}"
+    );
+    assert!(
+        enabled
+            .iter()
+            .all(|snippet| !snippet.contains("decoy.Flags.Enabled")),
+        "{result:#?}"
+    );
+
+    let nested = snippets_for("Flags.Nested");
+    assert!(
+        nested
+            .iter()
+            .any(|snippet| snippet.contains("case Flags.Nested"))
+            && nested
+                .iter()
+                .any(|snippet| snippet.contains("case model.Flags.Nested")),
+        "{result:#?}"
+    );
+    assert!(
+        nested
+            .iter()
+            .all(|snippet| !snippet.contains("decoy.Flags.Nested")),
+        "{result:#?}"
+    );
+}
+
+#[test]
 fn java_annotated_method_search_symbol_uses_name_line() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

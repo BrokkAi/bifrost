@@ -849,6 +849,92 @@ object Use {
 }
 
 #[test]
+fn scala_usage_finder_resolves_generic_lexical_constructors_and_stable_paths() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Flags.scala",
+            r#"package model
+object Flags {
+  val Enabled: Int = 1
+  case object Nested
+}
+"#,
+        ),
+        (
+            "decoy/Flags.scala",
+            r#"package decoy
+object Flags {
+  val Enabled: Int = 2
+  case object Nested
+}
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+
+import model.Flags
+
+object Use {
+  class Generic[A](value: A)
+
+  def validGeneric = new Generic[Int](1)
+  def wrongGenericArity = new Generic[Int]()
+  def localConstructorRoot(Generic: LocalFactory) = new Generic[Int](1)
+  def directField: Int = Flags.Enabled
+  def stableField(value: Any): Int = value match {
+    case Flags.Enabled => 1
+    case model.Flags.Enabled => 2
+    case _ => 0
+  }
+  def stableObject(value: Any): Int = value match {
+    case Flags.Nested => 1
+    case model.Flags.Nested => 2
+    case _ => 0
+  }
+  def localRootIsNotImported(Flags: LocalFlags): Int = Flags.Enabled
+  def decoyField(value: Any): Int = value match {
+    case decoy.Flags.Enabled => 1
+    case _ => 0
+  }
+  def decoyObject(value: Any): Int = value match {
+    case decoy.Flags.Nested => 1
+    case _ => 0
+  }
+}
+
+class LocalFlags { val Enabled: Int = 2 }
+class LocalFactory
+"#,
+        ),
+    ]);
+
+    let constructor = definition(&analyzer, "app.Use$.Generic.Generic");
+    let constructor_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &[constructor]));
+    assert_hit_contains(&constructor_hits, "new Generic[Int](1)");
+    assert_no_hit_contains(&constructor_hits, "new Generic[Int]()");
+    assert_no_hit_contains(&constructor_hits, "Generic: LocalFactory");
+
+    let enabled = definition(&analyzer, "model.Flags$.Enabled");
+    let enabled_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &[enabled]));
+    for expected in [
+        "def directField: Int = Flags.Enabled",
+        "case Flags.Enabled => 1",
+        "case model.Flags.Enabled => 2",
+    ] {
+        assert_hit_contains(&enabled_hits, expected);
+    }
+    assert_no_hit_contains(&enabled_hits, "Flags: LocalFlags");
+    assert_no_hit_contains(&enabled_hits, "case decoy.Flags.Enabled");
+
+    let nested = definition(&analyzer, "model.Flags$.Nested$");
+    let nested_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &[nested]));
+    assert_hit_contains(&nested_hits, "case Flags.Nested => 1");
+    assert_hit_contains(&nested_hits, "case model.Flags.Nested => 2");
+    assert_no_hit_contains(&nested_hits, "case decoy.Flags.Nested");
+}
+
+#[test]
 fn scala_usage_finder_matches_all_same_file_overloads_and_curried_constructor_lists() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "app/Calls.scala",

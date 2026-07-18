@@ -596,6 +596,55 @@ pub(crate) fn resolve_stable_object_expression<T>(
     Some(resolved)
 }
 
+pub(crate) struct ScalaStableIdentifierReference {
+    pub(crate) segments: Vec<String>,
+}
+
+/// Return the ordered identifier leaves of the outermost `stable_identifier`
+/// containing `node`, but only when `node` is that path's terminal leaf. Scala
+/// represents these paths recursively, so walking named children preserves the
+/// grammar's structure without reparsing the source spelling.
+pub(crate) fn stable_identifier_reference<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<ScalaStableIdentifierReference> {
+    let mut expression = node
+        .parent()
+        .filter(|parent| parent.kind() == "stable_identifier")?;
+    while let Some(parent) = expression
+        .parent()
+        .filter(|parent| parent.kind() == "stable_identifier")
+    {
+        expression = parent;
+    }
+
+    let mut leaves = Vec::new();
+    let mut stack = vec![expression];
+    while let Some(current) = stack.pop() {
+        if matches!(current.kind(), "identifier" | "operator_identifier") {
+            leaves.push(current);
+            continue;
+        }
+        if current.kind() != "stable_identifier" {
+            return None;
+        }
+        for index in (0..current.named_child_count()).rev() {
+            stack.push(current.named_child(index)?);
+        }
+    }
+    if leaves.last().copied() != Some(node) {
+        return None;
+    }
+    let segments = leaves
+        .into_iter()
+        .map(|leaf| node_text(leaf, source).trim().to_string())
+        .collect::<Vec<_>>();
+    if segments.len() < 2 || segments.iter().any(String::is_empty) {
+        return None;
+    }
+    Some(ScalaStableIdentifierReference { segments })
+}
+
 fn is_bare_term_reference(node: Node<'_>) -> bool {
     if node.kind() != "identifier" {
         return false;
@@ -709,11 +758,13 @@ pub(crate) fn call_arities_for_reference(node: Node<'_>) -> Option<Vec<usize>> {
         return Some(vec![1]);
     }
     let mut expression = field_expression_for_member(node).unwrap_or(node);
-    if expression.parent().is_some_and(|generic| {
-        generic.kind() == "generic_function"
-            && generic.child_by_field_name("function") == Some(expression)
+    if let Some(generic) = expression.parent().filter(|generic| {
+        (generic.kind() == "generic_function"
+            && generic.child_by_field_name("function") == Some(expression))
+            || (generic.kind() == "generic_type"
+                && generic.child_by_field_name("type") == Some(expression))
     }) {
-        expression = expression.parent()?;
+        expression = generic;
     }
     let mut arities = Vec::new();
     if let Some(instance) = expression

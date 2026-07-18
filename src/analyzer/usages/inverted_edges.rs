@@ -109,6 +109,25 @@ impl ClassRangeIndex {
             .min_by_key(|(start, end, _, _)| end - start)
             .map(|(_, _, unit, _)| unit)
     }
+
+    /// Apply `resolve` to class/object declarations containing `byte`, choosing
+    /// the successful result from the innermost owner. This preserves exact
+    /// analyzer identities without allocating or reconstructing lexical parents
+    /// from rendered fqns.
+    pub(crate) fn find_in_enclosing_units<T>(
+        &self,
+        byte: usize,
+        mut resolve: impl FnMut(&CodeUnit) -> Option<T>,
+    ) -> Option<T> {
+        self.ranges
+            .iter()
+            .filter(|(start, end, _, _)| *start <= byte && byte < *end)
+            .filter_map(|(start, end, unit, _)| {
+                resolve(unit).map(|resolved| (end - start, resolved))
+            })
+            .min_by_key(|(length, _)| *length)
+            .map(|(_, resolved)| resolved)
+    }
 }
 
 /// The single precise binding for `name`, if the engine resolved it to exactly
