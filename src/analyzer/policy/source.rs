@@ -173,6 +173,15 @@ pub struct PolicySourceHelp {
     pub description: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PolicySourceCompletion {
+    pub(crate) range: Range<usize>,
+    pub(crate) label: &'static str,
+    pub(crate) new_text: String,
+    pub(crate) signature: &'static str,
+    pub(crate) description: String,
+}
+
 pub fn parse_rqlp_source(
     source: &str,
     identity: PolicySourceIdentity,
@@ -250,6 +259,25 @@ pub fn rqlp_source_help_at(source: &str, byte_offset: usize) -> Option<PolicySou
     .ok()?;
     let expr = parsed.expr?;
     help_in_expr(&expr, byte_offset)
+}
+
+pub(crate) fn rqlp_source_completion_at(
+    source: &str,
+    byte_offset: usize,
+) -> Option<PolicySourceCompletion> {
+    if source.len() > MAX_RQLP_SOURCE_BYTES
+        || byte_offset > source.len()
+        || !source.is_char_boundary(byte_offset)
+    {
+        return None;
+    }
+    let parsed = parse_sexp_with_limits(
+        source,
+        SexpParseLimits::new(MAX_RQLP_SEXP_DEPTH, MAX_RQLP_SEXP_NODES),
+    )
+    .ok()?;
+    let expr = parsed.expr?;
+    completion_in_expr(&expr, byte_offset)
 }
 
 fn source_error(
@@ -435,38 +463,229 @@ fn help_in_expr(expr: &Expr, byte_offset: usize) -> Option<PolicySourceHelp> {
         return Some(PolicySourceHelp {
             range: items[0].range.clone(),
             signature: record.signature().to_string(),
-            description: record.description().to_string(),
+            description: help_description(record.description(), record, items),
         });
     }
-    for pair in items[1..].chunks(2) {
-        let Some(keyword) = pair.first() else {
-            continue;
-        };
-        let Some(label) = keyword
-            .as_symbol()
-            .and_then(|symbol| symbol.strip_prefix(':'))
-        else {
-            continue;
-        };
-        if keyword.range.contains(&byte_offset) {
-            let descriptor = records
-                .iter()
-                .find_map(|record| lookup_field(*record, label));
-            if let Some(descriptor) = descriptor {
-                return Some(PolicySourceHelp {
-                    range: keyword.range.clone(),
-                    signature: descriptor.signature.to_string(),
-                    description: descriptor.description.to_string(),
-                });
+    let mut index = 1;
+    while index < items.len() {
+        let item = &items[index];
+        let label = item.as_symbol().and_then(|symbol| symbol.strip_prefix(':'));
+        if let Some(label) = label {
+            if item.range.contains(&byte_offset) {
+                let descriptor = records
+                    .iter()
+                    .find_map(|record| lookup_field(*record, label));
+                if let Some(descriptor) = descriptor {
+                    let description = if label == "schema-version" && records.len() == 1 {
+                        help_description(descriptor.description, records[0], items)
+                    } else {
+                        descriptor.description.to_string()
+                    };
+                    return Some(PolicySourceHelp {
+                        range: item.range.clone(),
+                        signature: descriptor.signature.to_string(),
+                        description,
+                    });
+                }
             }
-        }
-        if let Some(value) = pair.get(1)
-            && let Some(help) = help_in_expr(value, byte_offset)
-        {
-            return Some(help);
+            if let Some(value) = items.get(index + 1)
+                && let Some(help) = help_in_expr(value, byte_offset)
+            {
+                return Some(help);
+            }
+            index += 2;
+        } else {
+            if let Some(help) = help_in_expr(item, byte_offset) {
+                return Some(help);
+            }
+            index += 1;
         }
     }
     None
+}
+
+fn help_description(base_description: &str, record: PolicyRecord, items: &[Expr]) -> String {
+    let Some(status) = schema_status(record, items) else {
+        return base_description.to_string();
+    };
+    format!("{base_description}\n\n{status}")
+}
+
+fn schema_status(record: PolicyRecord, items: &[Expr]) -> Option<String> {
+    let authored = authored_schema_version(items);
+    match record {
+        PolicyRecord::Policy | PolicyRecord::Endpoint => {
+            let kind = if record == PolicyRecord::Policy {
+                "policy"
+            } else {
+                "endpoint"
+            };
+            Some(match authored {
+                AuthoredSchemaVersion::Omitted => {
+                    let resolution = resolve_policy_schema_version(None).ok()?;
+                    format!(
+                        "Policy schema: `:schema-version` is omitted, so this {kind} document resolves to the latest compatible policy schema version (currently `{}`). Add `:schema-version {}` to pin it exactly.",
+                        resolution.version, resolution.version
+                    )
+                }
+                AuthoredSchemaVersion::Explicit(Some(version)) => {
+                    if resolve_policy_schema_version(Some(version)).is_ok() {
+                        format!(
+                            "Policy schema: this {kind} document explicitly pins policy schema version `{version}`."
+                        )
+                    } else {
+                        format!(
+                            "Policy schema: this {kind} document explicitly requests unsupported policy schema version `{version}`."
+                        )
+                    }
+                }
+                AuthoredSchemaVersion::Explicit(None) => format!(
+                    "Policy schema: this {kind} document has an incomplete or invalid explicit schema-version pin."
+                ),
+            })
+        }
+        PolicyRecord::Rql => Some(match authored {
+            AuthoredSchemaVersion::Omitted => {
+                let resolution = resolve_rql_schema_version(None).ok()?;
+                format!(
+                    "Selector schema: this inline RQL selector omits `:schema-version`, so it resolves to the latest compatible RQL schema version (currently `{}`). Add `:schema-version {}` to pin it exactly.",
+                    resolution.version, resolution.version
+                )
+            }
+            AuthoredSchemaVersion::Explicit(Some(version)) => {
+                if resolve_rql_schema_version(Some(version)).is_ok() {
+                    format!(
+                        "Selector schema: this inline RQL selector explicitly pins RQL schema version `{version}`."
+                    )
+                } else {
+                    format!(
+                        "Selector schema: this inline RQL selector explicitly requests unsupported RQL schema version `{version}`."
+                    )
+                }
+            }
+            AuthoredSchemaVersion::Explicit(None) => {
+                "Selector schema: this inline RQL selector has an incomplete or invalid explicit schema-version pin."
+                    .to_string()
+            }
+        }),
+        PolicyRecord::RqlFile => Some(match authored {
+            AuthoredSchemaVersion::Omitted => {
+                let resolution = resolve_rql_schema_version(None).ok()?;
+                format!(
+                    "Selector schema: this `rql-file` reference is resolved by the workspace loader, not by source-only validation. With no wrapper pin, an explicit version in the referenced `.rql` document wins; otherwise the latest compatible RQL schema version (currently `{}`) is used.",
+                    resolution.version
+                )
+            }
+            AuthoredSchemaVersion::Explicit(Some(version)) => {
+                let support = if resolve_rql_schema_version(Some(version)).is_ok() {
+                    ""
+                } else {
+                    " unsupported"
+                };
+                format!(
+                    "Selector schema: this `rql-file` wrapper explicitly constrains deferred resolution to{support} RQL schema version `{version}`; a referenced document pin must agree. The source-only editor does not read the referenced file."
+                )
+            }
+            AuthoredSchemaVersion::Explicit(None) => {
+                "Selector schema: this `rql-file` wrapper has an incomplete or invalid explicit schema-version constraint. The source-only editor does not read the referenced file."
+                    .to_string()
+            }
+        }),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthoredSchemaVersion {
+    Omitted,
+    Explicit(Option<u32>),
+}
+
+fn authored_schema_version(items: &[Expr]) -> AuthoredSchemaVersion {
+    let mut index = 1;
+    while index < items.len() {
+        if items[index].as_symbol() == Some(":schema-version") {
+            let version = items
+                .get(index + 1)
+                .and_then(Expr::as_number)
+                .and_then(|value| u32::try_from(value).ok());
+            return AuthoredSchemaVersion::Explicit(version);
+        }
+        index += if items[index]
+            .as_symbol()
+            .is_some_and(|symbol| symbol.starts_with(':'))
+        {
+            2
+        } else {
+            1
+        };
+    }
+    AuthoredSchemaVersion::Omitted
+}
+
+fn completion_in_expr(expr: &Expr, byte_offset: usize) -> Option<PolicySourceCompletion> {
+    if byte_offset < expr.range.start || byte_offset > expr.range.end {
+        return None;
+    }
+    match &expr.kind {
+        ExprKind::Vector(items) => items
+            .iter()
+            .find(|item| item.range.start <= byte_offset && byte_offset <= item.range.end)
+            .and_then(|item| completion_in_expr(item, byte_offset)),
+        ExprKind::List(items) => {
+            let head = items.first()?;
+            if head.range.start <= byte_offset && byte_offset <= head.range.end {
+                return None;
+            }
+            for item in &items[1..] {
+                if item.range.start <= byte_offset && byte_offset <= item.range.end {
+                    if matches!(item.kind, ExprKind::List(_) | ExprKind::Vector(_)) {
+                        return completion_in_expr(item, byte_offset);
+                    }
+                    let partial = item.as_symbol()?;
+                    if !partial.starts_with(':') || !":schema-version".starts_with(partial) {
+                        return None;
+                    }
+                    let record = single_record_for_head(head)?;
+                    return schema_version_completion(record, items, item.range.clone());
+                }
+            }
+            let record = single_record_for_head(head)?;
+            schema_version_completion(record, items, byte_offset..byte_offset)
+        }
+        ExprKind::String(_) | ExprKind::Symbol(_) | ExprKind::Number(_) => None,
+    }
+}
+
+fn single_record_for_head(head: &Expr) -> Option<PolicyRecord> {
+    let mut records = records_from_label(head.as_symbol()?);
+    let record = records.next()?;
+    records.next().is_none().then_some(record)
+}
+
+fn schema_version_completion(
+    record: PolicyRecord,
+    items: &[Expr],
+    range: Range<usize>,
+) -> Option<PolicySourceCompletion> {
+    if authored_schema_version(items) != AuthoredSchemaVersion::Omitted {
+        return None;
+    }
+    let descriptor = lookup_field(record, "schema-version")?;
+    let version = match record {
+        PolicyRecord::Policy | PolicyRecord::Endpoint => {
+            resolve_policy_schema_version(None).ok()?.version
+        }
+        PolicyRecord::Rql | PolicyRecord::RqlFile => resolve_rql_schema_version(None).ok()?.version,
+        _ => return None,
+    };
+    Some(PolicySourceCompletion {
+        range,
+        label: ":schema-version",
+        new_text: format!(":schema-version {version}"),
+        signature: descriptor.signature,
+        description: help_description(descriptor.description, record, items),
+    })
 }
 
 struct Decoder {
@@ -4486,5 +4705,80 @@ mod tests {
                 .iter()
                 .all(|diagnostic| diagnostic.code == "unknown-field")
         );
+    }
+
+    #[test]
+    fn schema_help_distinguishes_inferred_pinned_inline_and_deferred_versions() {
+        let omitted_policy = r#"(policy :id "p")"#;
+        let help = rqlp_source_help_at(omitted_policy, omitted_policy.find("policy").unwrap())
+            .expect("policy head help");
+        assert!(help.description.contains(":schema-version` is omitted"));
+        assert!(help.description.contains("currently `1`"));
+        assert!(help.description.contains("`:schema-version 1`"));
+
+        let pinned_endpoint = r#"(endpoint :schema-version 1 :id "e")"#;
+        let help = rqlp_source_help_at(
+            pinned_endpoint,
+            pinned_endpoint.find(":schema-version").unwrap(),
+        )
+        .expect("endpoint schema field help");
+        assert!(
+            help.description
+                .contains("explicitly pins policy schema version `1`")
+        );
+
+        let inline = r#"(policy :analysis (analysis :selector (rql (call))))"#;
+        let rql_offset = inline.find("(rql").unwrap() + 1;
+        let help = rqlp_source_help_at(inline, rql_offset).expect("inline RQL help");
+        assert!(help.description.contains("inline RQL selector"));
+        assert!(help.description.contains("currently `2`"));
+
+        let deferred =
+            r#"(policy :analysis (analysis :selector (rql-file :path "queries/q.rql")))"#;
+        let rql_file_offset = deferred.find("rql-file").unwrap();
+        let help = rqlp_source_help_at(deferred, rql_file_offset).expect("deferred RQL help");
+        assert!(
+            help.description
+                .contains("resolved by the workspace loader")
+        );
+        assert!(help.description.contains("source-only validation"));
+
+        let pinned_inline =
+            r#"(policy :analysis (analysis :selector (rql :schema-version 2 (call))))"#;
+        let rql_offset = pinned_inline.find("(rql").unwrap() + 1;
+        let help = rqlp_source_help_at(pinned_inline, rql_offset).expect("pinned RQL help");
+        assert!(
+            help.description
+                .contains("explicitly pins RQL schema version `2`")
+        );
+    }
+
+    #[test]
+    fn schema_version_completion_uses_registry_versions_and_exact_partial_range() {
+        let policy = r#"(policy :id "😀" :sch"#;
+        let completion = rqlp_source_completion_at(policy, policy.len())
+            .expect("policy schema-version completion");
+        assert_eq!(&policy[completion.range], ":sch");
+        assert_eq!(completion.label, ":schema-version");
+        assert_eq!(completion.new_text, ":schema-version 1");
+
+        let mid_token = "(policy :schema)";
+        let cursor = mid_token.find(":schema").unwrap() + ":sch".len();
+        let completion = rqlp_source_completion_at(mid_token, cursor)
+            .expect("mid-token policy schema-version completion");
+        assert_eq!(&mid_token[completion.range], ":schema");
+        assert_eq!(completion.new_text, ":schema-version 1");
+
+        let inline = "(policy :analysis (analysis :selector (rql ";
+        let completion = rqlp_source_completion_at(inline, inline.len())
+            .expect("nested RQL schema-version completion");
+        assert_eq!(completion.range, inline.len()..inline.len());
+        assert_eq!(completion.new_text, ":schema-version 2");
+
+        let explicit = "(policy :schema-version 1 ";
+        assert!(rqlp_source_completion_at(explicit, explicit.len()).is_none());
+
+        let inside_query = "(policy :analysis (analysis :selector (rql (call ";
+        assert!(rqlp_source_completion_at(inside_query, inside_query.len()).is_none());
     }
 }

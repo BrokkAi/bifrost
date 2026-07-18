@@ -26,6 +26,82 @@ For example, a saved hierarchy query can use `(members (subtypes :transitive tru
 
 `--query-file` accepts `.rql` and `.json` files only. The default workspace root is the current directory; query-file paths must stay inside that workspace, including after symlinks are resolved. The file contains the complete query, so it cannot be combined with `--tool`, `--args`, or `--sources`.
 
+## Static-Analysis Policies
+
+Run one or more workspace-relative `.rqlp` policy roots and emit one combined
+canonical report:
+
+```bash
+bifrost --root /path/to/project \
+  --policy-file policies/security.rqlp \
+  --policy-file policies/correctness.rqlp \
+  --format sarif \
+  --fail-on warning \
+  --output reports/bifrost.sarif
+```
+
+`--policy-file` is repeatable. Every root must be a `(policy ...)` document;
+passing a diagnostic-neutral `(endpoint ...)` as a root is a status-2 report.
+Policies may still load endpoints and saved `.rql` selectors as explicit
+dependencies. The one-shot CLI starts with empty catalog and endpoint
+registries. A catalog-backed policy requires a library embedding which
+explicitly populated `TaintCatalogRegistry`. A policy that uses only
+`(match-endpoints :ids [...])` also requires an embedding to pre-register those
+endpoint IDs; in a normal CLI run, the same policy can discover endpoints
+through a `match-directory` closure before selecting exact IDs. The CLI does
+not scan for policies, endpoints, or catalogs on its own.
+
+Policy mode cannot be combined with `--query-file`, `--tool`, `--args`,
+`--sources`, server/REPL modes, skill installation, `--no-line-numbers`, or
+`--force-semantic-cpu`.
+
+### Policy output and thresholds
+
+`--format` accepts `human` (the default), `json`, or `sarif`. All three are
+rendered from the same canonical report and preserve the same rule/finding
+IDs, resolved schema and dependency manifests, locations, severity, certainty,
+completion, classifications, evidence, witnesses, and CVSS variants. SARIF
+uses Unicode-code-point columns and strong finding IDs as stable partial
+fingerprints; weak IDs are labeled inconclusive and are not emitted as stable
+fingerprints.
+
+`--output PATH` writes the bounded report to a temporary file beside the
+destination, synchronizes it, and atomically replaces the destination. A
+serialization, write, or replacement failure leaves an existing destination
+untouched and exits 2. Without `--output`, the complete bounded encoding is
+prepared before stdout is written.
+
+`--fail-on` accepts:
+
+| Value | A complete batch exits 1 for |
+| --- | --- |
+| `never` | No finding threshold. |
+| `finding` | Any finding, including `unrated`. |
+| `note` | `note`, `warning`, or `error`. |
+| `warning` | `warning` or `error` (default). |
+| `error` | `error` only. |
+
+The process status is:
+
+| Status | Meaning |
+| --- | --- |
+| `0` | Every requested policy completed and no finding met the threshold. |
+| `1` | Every requested policy completed and at least one finding met the threshold. |
+| `2` | A load, schema, composition, evaluation, completeness, serialization, or output failure made the batch unreliable. Status 2 takes precedence over status 1. |
+
+`--fail-on never` disables only the finding threshold; it cannot turn an
+invalid, cancelled, incomplete, failed, or unsupported policy into a clean
+run. `--require-explicit-schema-versions` rejects compatible inference for the
+root and every loaded endpoint or RQL dependency. Omitted versions otherwise
+select only the newest compiled-in compatible lineage.
+
+Only `match` evaluation is available now. `taint` and `typestate` policies
+parse, validate, and compose, but running them emits an `unsupported` policy
+completion and exits 2 until [#824](https://github.com/BrokkAi/bifrost/issues/824)
+provides the semantic compiler/adapter. See [Static-Analysis
+Policies](/static-analysis-policies/) for syntax, endpoint composition,
+completeness, finding identity, and CVSS rules.
+
 For the available tool families and tool names, see [MCP Server](../mcp/). For a single tool's description and parameters, ask the CLI directly:
 
 ```bash

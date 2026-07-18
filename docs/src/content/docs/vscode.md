@@ -49,6 +49,22 @@ more specific `.rql` icon.
 
 The Play action runs through the extension's language-server connection, including unsaved editor text. It is separate from agent MCP: installing the extension does not expose `query_code` to an agent, and an MCP agent can execute saved RQL only through a query-capable toolset and `query_file`. See [MCP query and RQL availability](/mcp/#query-and-rql-availability).
 
+## Static-Analysis Policies
+
+The extension associates `.rqlp` files with the separate **Bifrost RQL
+Policy** language and policy file icon. It validates unsaved `(policy ...)` and
+`(endpoint ...)` source, provides schema-resolution hover and optional-version
+completion, formats complete documents at 100 columns, and highlights nested
+RQL only inside `(rql ...)`. Source-only editor validation does not read
+referenced `.rql` files, endpoint directories, or catalogs; those are resolved
+during a real workspace-backed policy load.
+
+Policy files deliberately do not satisfy the RQL Play command's language
+condition and do not reuse the RQL results tree. Run a saved policy from the
+CLI with `--policy-file`; loading a diagnostic-neutral endpoint as an execution
+root is an error. See [RQL in VS Code](/rql-vscode/#rql-policy-documents) and
+[Static-Analysis Policies](/static-analysis-policies/).
+
 ## Extension Settings
 
 | Setting | Default | Description |

@@ -1,6 +1,9 @@
 mod common;
 
 use brokk_bifrost::Language;
+use brokk_bifrost::analyzer::policy::{
+    PolicyFormatOptions, format_rqlp_source, format_rqlp_source_with_options,
+};
 use brokk_bifrost::analyzer::structural::{
     RuneIrLanguage, RuneIrLimits, RuneIrSelection, render_source_rune_ir,
 };
@@ -1021,6 +1024,201 @@ fn bifrost_lsp_server_validates_and_hovers_unsaved_rql_source() {
             .is_some_and(|value| value.contains("normalized node kinds")),
         "{partial_hover}"
     );
+}
+
+#[test]
+fn bifrost_lsp_server_validates_and_hovers_unsaved_rqlp_source() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let mut server = LspServer::start(&root);
+
+    let source = r#"(policy :id "😀" :unknown true)"#;
+    let response = server.request("bifrost/validatePolicy", json!({"source": source}));
+    let diagnostics = response["result"]["diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected policy diagnostics: {response}"));
+    let unknown = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "unknown-field")
+        .unwrap_or_else(|| panic!("missing unknown-field diagnostic: {response}"));
+    let unknown_byte = source.find(":unknown").unwrap();
+    let unknown_utf16 = source[..unknown_byte].encode_utf16().count() as u64;
+    assert_eq!(unknown["range"]["start"]["line"], 0, "{response}");
+    assert_eq!(
+        unknown["range"]["start"]["character"], unknown_utf16,
+        "the policy diagnostic must convert byte ranges after emoji to UTF-16: {response}"
+    );
+    assert_eq!(
+        unknown["range"]["end"]["character"],
+        unknown_utf16 + ":unknown".encode_utf16().count() as u64,
+        "{response}"
+    );
+    assert_eq!(unknown["source"], "Bifrost RQL Policy", "{response}");
+
+    let omitted = r#"(policy :id "p")"#;
+    let hover = server.request(
+        "bifrost/policyHover",
+        json!({"source": omitted, "position": {"line": 0, "character": 2}}),
+    );
+    assert_eq!(hover["result"]["range"]["start"]["character"], 1);
+    assert_eq!(hover["result"]["range"]["end"]["character"], 7);
+    assert!(
+        hover["result"]["contents"]["value"]
+            .as_str()
+            .is_some_and(
+                |value| value.contains("latest compatible policy schema version")
+                    && value.contains("currently `1`")
+                    && value.contains(":schema-version 1")
+            ),
+        "{hover}"
+    );
+
+    let pinned = r#"(endpoint :schema-version 1 :id "e")"#;
+    let hover = server.request(
+        "bifrost/policyHover",
+        json!({
+            "source": pinned,
+            "position": {"line": 0, "character": pinned.find(":schema-version").unwrap() + 2}
+        }),
+    );
+    assert!(
+        hover["result"]["contents"]["value"]
+            .as_str()
+            .is_some_and(|value| value.contains("explicitly pins policy schema version `1`")),
+        "{hover}"
+    );
+
+    for (selector, expected) in [
+        (
+            r#"(rql (call :callee (name "run")))"#,
+            "inline RQL selector omits",
+        ),
+        (
+            r#"(rql :schema-version 2 (call :callee (name "run")))"#,
+            "explicitly pins RQL schema version `2`",
+        ),
+        (
+            r#"(rql-file :path "queries/run.rql")"#,
+            "resolved by the workspace loader",
+        ),
+    ] {
+        let source = format!("(policy :analysis (analysis :selector {selector}))");
+        let selector_character = source.find(selector).unwrap() + 2;
+        let hover = server.request(
+            "bifrost/policyHover",
+            json!({
+                "source": source,
+                "position": {"line": 0, "character": selector_character}
+            }),
+        );
+        assert!(
+            hover["result"]["contents"]["value"]
+                .as_str()
+                .is_some_and(|value| value.contains(expected)),
+            "expected `{expected}` in {hover}"
+        );
+    }
+}
+
+#[test]
+fn bifrost_lsp_server_completes_optional_schema_versions_from_unsaved_rqlp_source() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let policy_path = root.join("authoring.rqlp");
+    fs::write(&policy_path, "").expect("write disk placeholder");
+    let policy_uri = uri_for(&policy_path);
+    let mut server =
+        LspServer::start_with_params(&root, completion_initialize_params(uri_for(&root)));
+
+    let partial = r#"(policy :id "😀" :schema)"#;
+    let completion_cursor = partial.find(":schema").unwrap() + ":sch".len();
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": policy_uri,
+                "languageId": "bifrost-rql-policy",
+                "version": 1,
+                "text": partial,
+            }
+        }),
+    );
+    let response = server.request(
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri_for(&policy_path)},
+            "position": {
+                "line": 0,
+                "character": partial[..completion_cursor].encode_utf16().count()
+            }
+        }),
+    );
+    let items = response["result"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected policy completions: {response}"));
+    assert_eq!(items.len(), 1, "{response}");
+    let completion = &items[0];
+    assert_eq!(completion["label"], ":schema-version", "{response}");
+    assert_eq!(completion["kind"], 14, "{response}");
+    assert_eq!(
+        completion["textEdit"]["newText"], ":schema-version 1",
+        "{response}"
+    );
+    let partial_byte = partial.find(":schema").unwrap();
+    let partial_utf16 = partial[..partial_byte].encode_utf16().count() as u64;
+    assert_eq!(
+        completion["textEdit"]["range"]["start"]["character"], partial_utf16,
+        "{response}"
+    );
+    assert_eq!(
+        completion["textEdit"]["range"]["end"]["character"],
+        partial[..partial_byte + ":schema".len()]
+            .encode_utf16()
+            .count() as u64,
+        "mid-token completion must replace the entire existing symbol: {response}"
+    );
+
+    let inline = r#"(policy :id "😀" :analysis (analysis :selector (rql "#;
+    server.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri_for(&policy_path), "version": 2},
+            "contentChanges": [{"text": inline}],
+        }),
+    );
+    let response = server.request(
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri_for(&policy_path)},
+            "position": {"line": 0, "character": inline.encode_utf16().count()}
+        }),
+    );
+    let completion = &response["result"]["items"][0];
+    assert_eq!(
+        completion["textEdit"]["newText"], ":schema-version 2",
+        "{response}"
+    );
+    assert_eq!(
+        completion["textEdit"]["range"]["start"], completion["textEdit"]["range"]["end"],
+        "blank-context completion must insert at the UTF-16 cursor: {response}"
+    );
+
+    let explicit = "(policy :schema-version 1 ";
+    server.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri_for(&policy_path), "version": 3},
+            "contentChanges": [{"text": explicit}],
+        }),
+    );
+    let response = server.request(
+        "textDocument/completion",
+        json!({
+            "textDocument": {"uri": uri_for(&policy_path)},
+            "position": {"line": 0, "character": explicit.len()}
+        }),
+    );
+    assert!(response["result"].is_null(), "{response}");
 }
 
 #[test]
@@ -8451,6 +8649,107 @@ fn bifrost_lsp_server_formats_rql_and_rune_documents_at_120_columns() {
         }),
     );
     assert_eq!(response["result"], json!([]), "{response}");
+}
+
+#[test]
+fn bifrost_lsp_server_formats_unsaved_rqlp_at_policy_width_and_preserves_omission() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let policy_path = root.join("formatting.rqlp");
+    fs::write(&policy_path, "").expect("write disk placeholder");
+    let policy_uri = uri_for(&policy_path);
+    let mut server = LspServer::start(&root);
+
+    let long_callee = "evaluate_".to_string() + &"a".repeat(60);
+    let source = format!(
+        "; retained 😀 comment\n(policy :id \"test.formatting\" :name \"Formatting policy\" :message \"Dynamic evaluation is forbidden\" :severity warning :analysis (analysis :type match :selector (rql (call :callee (name \"{long_callee}\")))))\n"
+    );
+    let expected = format_rqlp_source(&source).expect("complete RQLP source formats");
+    let width_120 = format_rqlp_source_with_options(
+        &source,
+        &PolicyFormatOptions::new(120).expect("valid width"),
+    )
+    .expect("complete RQLP source formats at 120 columns");
+    assert_ne!(expected, source, "fixture must exercise policy formatting");
+    assert_ne!(
+        expected, width_120,
+        "the LSP gold must distinguish the policy default of 100 columns from generic 120-column S-expression formatting"
+    );
+    assert!(
+        expected.lines().all(|line| line.chars().count() <= 100),
+        "100-column policy output contains an overlong line: {expected}"
+    );
+    assert!(
+        width_120.lines().any(|line| line.chars().count() > 100),
+        "the 120-column comparison fixture did not exercise the width boundary: {width_120}"
+    );
+    assert!(expected.contains("; retained 😀 comment"));
+    assert!(
+        !expected.contains(":schema-version"),
+        "formatting must preserve version omission: {expected}"
+    );
+
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": policy_uri,
+                "languageId": "bifrost-rql-policy",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+    let response = server.request(
+        "textDocument/formatting",
+        json!({
+            "textDocument": {"uri": uri_for(&policy_path)},
+            "options": {"tabSize": 4, "insertSpaces": true}
+        }),
+    );
+    let edits = response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected policy formatting edits: {response}"));
+    assert_eq!(edits.len(), 1, "{response}");
+    assert_eq!(edits[0]["newText"], expected, "{response}");
+    assert_eq!(
+        edits[0]["range"]["start"],
+        json!({"line": 0, "character": 0})
+    );
+    assert_eq!(
+        edits[0]["range"]["end"],
+        json!({"line": 2, "character": 0}),
+        "the full-document edit range must use the unsaved UTF-16 buffer: {response}"
+    );
+
+    for (version, invalid_source, kind) in [
+        (
+            2,
+            "; retained 😀 comment\n(policy :id \"unfinished\"",
+            "incomplete",
+        ),
+        (3, "(policy :id ]", "malformed"),
+    ] {
+        server.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": {"uri": uri_for(&policy_path), "version": version},
+                "contentChanges": [{"text": invalid_source}],
+            }),
+        );
+        let response = server.request(
+            "textDocument/formatting",
+            json!({
+                "textDocument": {"uri": uri_for(&policy_path)},
+                "options": {"tabSize": 4, "insertSpaces": true}
+            }),
+        );
+        assert_eq!(
+            response["result"],
+            json!([]),
+            "{kind} RQLP buffers must receive no replacement edit: {response}"
+        );
+    }
 }
 
 #[cfg(unix)]

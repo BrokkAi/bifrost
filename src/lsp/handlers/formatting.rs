@@ -7,6 +7,7 @@ use lsp_types::{DocumentFormattingParams, TextEdit};
 use serde::Deserialize;
 
 use crate::analyzer::common::language_for_file;
+use crate::analyzer::policy::format_rqlp_source;
 use crate::analyzer::{Language, Project, ProjectFile, Range as ByteRange};
 use crate::cancellation::CancellationToken;
 use crate::lsp::conversion::byte_range_to_lsp_range;
@@ -22,6 +23,7 @@ const MAX_FORMATTER_STDERR_BYTES: usize = 64 * 1024;
 const MAX_FORMATTER_STDOUT_BYTES: usize = 32 * 1024 * 1024;
 const FORMATTER_TIMEOUT: Duration = Duration::from_secs(30);
 const RQL_LANGUAGE_ID: &str = "bifrost-rql";
+const RQL_POLICY_LANGUAGE_ID: &str = "bifrost-rql-policy";
 const RUNE_IR_LANGUAGE_ID: &str = "bifrost-rune-ir";
 #[cfg(all(test, unix))]
 const TEST_HUNG_FORMATTER_TIMEOUT: Duration = Duration::from_secs(2);
@@ -76,6 +78,7 @@ pub(crate) struct PreparedFormatting {
 enum FormattingOperation {
     Command(FormatterCommand),
     BuiltInSexp,
+    BuiltInPolicy,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -138,9 +141,21 @@ pub(crate) fn is_bifrost_sexp_language(language_id: &str) -> bool {
     matches!(language_id, RQL_LANGUAGE_ID | RUNE_IR_LANGUAGE_ID)
 }
 
+pub(crate) fn is_bifrost_policy_language(language_id: &str) -> bool {
+    language_id == RQL_POLICY_LANGUAGE_ID
+}
+
 pub(crate) fn prepare_bifrost_sexp(content: &str) -> PreparedFormatting {
     PreparedFormatting {
         operation: FormattingOperation::BuiltInSexp,
+        content: content.to_string(),
+        line_starts: compute_line_starts(content),
+    }
+}
+
+pub(crate) fn prepare_bifrost_policy(content: &str) -> PreparedFormatting {
+    PreparedFormatting {
+        operation: FormattingOperation::BuiltInPolicy,
         content: content.to_string(),
         line_starts: compute_line_starts(content),
     }
@@ -174,6 +189,15 @@ pub(crate) fn run_prepared_with_cancellation(
                 return Err("S-expression formatting was cancelled".to_string());
             }
             format_bifrost_sexp(&content).unwrap_or_else(|| content.clone())
+        }
+        FormattingOperation::BuiltInPolicy => {
+            if cancellation.is_cancelled() {
+                return Err("RQLP formatting was cancelled".to_string());
+            }
+            // Source errors here mean that the editor buffer is incomplete or
+            // syntactically invalid. Preserve it byte-for-byte and return no
+            // edits while the author is still typing.
+            format_rqlp_source(&content).unwrap_or_else(|_| content.clone())
         }
     };
     if formatted == content {

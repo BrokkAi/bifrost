@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Bifrost RQL policy">
+  <path
+    d="M11 4h29l13 13v43H11z"
+    fill="#f83b32"
+    stroke="#111"
+    stroke-linejoin="round"
+    stroke-width="4"
+  />
+  <path d="M40 4v14h13" fill="#fff" stroke="#111" stroke-linejoin="round" stroke-width="4" />
+  <path
+    d="M32 23l14 6v10c0 9-5.6 15.8-14 19-8.4-3.2-14-10-14-19V29z"
+    fill="#111"
+    stroke="#fff"
+    stroke-linejoin="round"
+    stroke-width="2.5"
+  />
+  <path
+    d="M24.5 39.5l5 5 10-11"
+    fill="none"
+    stroke="#fff"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    stroke-width="4"
+  />
+</svg>

@@ -10,9 +10,15 @@ export interface GrammarToken {
 
 let onigLib: Promise<IOnigLib> | undefined;
 
+export interface TextMateGrammarDependency {
+  scopeName: string;
+  grammarPath: string;
+}
+
 export async function loadTextMateGrammar(
   grammarPath: string,
-  scopeName: string
+  scopeName: string,
+  dependencies: readonly TextMateGrammarDependency[] = []
 ): Promise<IGrammar> {
   if (!onigLib) {
     const wasm = fs.readFileSync(require.resolve("vscode-oniguruma/release/onig.wasm"));
@@ -23,14 +29,20 @@ export async function loadTextMateGrammar(
     });
   }
 
+  const grammarPaths = new Map<string, string>([
+    [scopeName, grammarPath],
+    ...dependencies.map((dependency) => [dependency.scopeName, dependency.grammarPath] as const)
+  ]);
   const registry = new Registry({
     onigLib,
-    loadGrammar: (requestedScope) =>
-      Promise.resolve(
-        requestedScope === scopeName
-          ? parseRawGrammar(fs.readFileSync(grammarPath, "utf8"), grammarPath)
+    loadGrammar: (requestedScope) => {
+      const requestedPath = grammarPaths.get(requestedScope);
+      return Promise.resolve(
+        requestedPath
+          ? parseRawGrammar(fs.readFileSync(requestedPath, "utf8"), requestedPath)
           : null
-      )
+      );
+    }
   });
   const grammar = await registry.loadGrammar(scopeName);
   assert.ok(grammar, `failed to load TextMate grammar ${scopeName}`);
@@ -54,4 +66,17 @@ export function assertScoped(tokens: readonly GrammarToken[], text: string, scop
     (candidate) => candidate.text === text && candidate.scopes.includes(scope)
   );
   assert.ok(token, `expected ${JSON.stringify(text)} to have ${scope}`);
+}
+
+export function assertNotScoped(
+  tokens: readonly GrammarToken[],
+  text: string,
+  scope: string
+): void {
+  const matching = tokens.filter((candidate) => candidate.text === text);
+  assert.ok(matching.length > 0, `expected to find ${JSON.stringify(text)}`);
+  assert.ok(
+    matching.every((candidate) => !candidate.scopes.includes(scope)),
+    `expected ${JSON.stringify(text)} not to have ${scope}`
+  );
 }

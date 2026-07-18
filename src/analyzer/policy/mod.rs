@@ -48,4 +48,5 @@ pub use render::*;
 pub use report::*;
 pub use resolved::*;
 pub use retained::*;
+pub(crate) use source::rqlp_source_completion_at;
 pub use source::*;

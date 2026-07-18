@@ -1,0 +1,25 @@
+; Policy forms use their own grammar while inline selectors embed native RQL.
+(policy
+  :schema-version 1
+  :id "bifrost.security.dynamic-eval"
+  :name "No dynamic evaluation"
+  :message "Dynamic evaluation is forbidden"
+  :severity warning
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql
+          (language python
+            (call :callee (name/regex "eval\\("))))))
+
+; Deferred selectors are policy syntax, not embedded RQL source.
+(endpoint
+  :id "bifrost.sources.deferred"
+  :name "Deferred source"
+  :display-name "Deferred source"
+  :role source
+  :categories [input.external]
+  :selector (rql-file :path "queries/deferred.rql")
+  :binding return-value
+  :supersedes [])
