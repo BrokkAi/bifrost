@@ -64,6 +64,52 @@ class Worker extends Base with Runnable
 }
 
 #[test]
+fn scala_sequential_package_clauses_resolve_constructor_applied_generic_parent() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "impl/Base.scala",
+            r#"
+package scala.collection.convert
+package impl
+abstract class IndexedStepperBase[Sub, Semi <: Sub](protected var i0: Int)
+"#,
+        ),
+        (
+            "impl/Child.scala",
+            r#"
+package scala.collection.convert
+package impl
+trait AnyStepper[A]
+class ObjectArrayStepper[A](start: Int)
+  extends IndexedStepperBase[AnyStepper[A], ObjectArrayStepper[A]](start)
+    with AnyStepper[A]
+"#,
+        ),
+    ]);
+
+    let child = definition(
+        &analyzer,
+        "scala.collection.convert.impl.ObjectArrayStepper",
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&child)),
+        BTreeSet::from([
+            "scala.collection.convert.impl.AnyStepper".to_string(),
+            "scala.collection.convert.impl.IndexedStepperBase".to_string(),
+        ])
+    );
+
+    let base = definition(
+        &analyzer,
+        "scala.collection.convert.impl.IndexedStepperBase",
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&base)),
+        BTreeSet::from(["scala.collection.convert.impl.ObjectArrayStepper".to_string()])
+    );
+}
+
+#[test]
 fn scala_trait_extends_trait_parent() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "Types.scala",

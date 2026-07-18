@@ -22,8 +22,8 @@
 //! are an unhandled recall gap, not a wrong edge.
 
 use super::resolver::{
-    package_name_of, preferred_scala_type, scala_builtin_type_name,
-    scala_extension_receiver_matches_resolved, scala_literal_type_name, scala_normalized_fq_name,
+    preferred_scala_type, scala_builtin_type_name, scala_extension_receiver_matches_resolved,
+    scala_literal_type_name, scala_normalized_fq_name,
 };
 use super::shared::ScalaEdgeGraph;
 use super::syntax::{
@@ -230,18 +230,30 @@ impl ProjectTypes {
                     Some((owner.clone(), paths))
                 })
                 .collect::<HashMap<_, _>>();
-            let required_names = lookup_paths_by_owner
-                .values()
-                .flatten()
-                .filter_map(|path| path.segments().first().cloned())
-                .collect();
-            let resolver = NameResolver::for_type_hierarchy_file(
-                Some(file),
-                Some(&state.package_name),
-                &state.imports,
-                self,
-                &required_names,
-            );
+            let mut required_names_by_package = HashMap::<String, HashSet<String>>::default();
+            for (owner, paths) in &lookup_paths_by_owner {
+                required_names_by_package
+                    .entry(owner.package_name().to_string())
+                    .or_default()
+                    .extend(
+                        paths
+                            .iter()
+                            .filter_map(|path| path.segments().first().cloned()),
+                    );
+            }
+            let resolvers_by_package = required_names_by_package
+                .into_iter()
+                .map(|(package, required_names)| {
+                    let resolver = NameResolver::for_type_hierarchy_file(
+                        Some(file),
+                        Some(&package),
+                        &state.imports,
+                        self,
+                        &required_names,
+                    );
+                    (package, resolver)
+                })
+                .collect::<HashMap<_, _>>();
             let parent_by_child = state
                 .children
                 .iter()
@@ -251,11 +263,14 @@ impl ProjectTypes {
                 if !owner.is_class() {
                     continue;
                 }
+                let Some(resolver) = resolvers_by_package.get(owner.package_name()) else {
+                    continue;
+                };
                 let mut ancestors = Vec::new();
                 let mut seen = HashSet::default();
                 for path in lookup_paths {
                     let Some(fqn) = self.resolve_type_in_owner_context(
-                        &resolver,
+                        resolver,
                         path.segments(),
                         &owner,
                         state,
@@ -817,13 +832,13 @@ impl ProjectTypes {
 
     pub(super) fn exact_nested_type(&self, owner_fqn: &str, member: &str) -> Option<String> {
         let candidate = format!("{owner_fqn}.{member}");
-        preferred_scala_type(
-            self.index
-                .by_fqn(&candidate)
-                .iter()
-                .filter(|unit| unit.is_class()),
-        )
-        .map(CodeUnit::fq_name)
+        let mut matches = self
+            .index
+            .by_fqn(&candidate)
+            .iter()
+            .filter(|unit| unit.is_class());
+        let resolved = matches.next()?.fq_name();
+        matches.next().is_none().then_some(resolved)
     }
 
     fn resolve_type_text(&self, resolver: &NameResolver, type_text: &str) -> Option<String> {
@@ -836,7 +851,7 @@ impl ProjectTypes {
             .or_else(|| scala_builtin_type_name(type_text).map(str::to_string))
     }
 
-    pub(super) fn resolve_type_in_declaration_context(
+    pub(crate) fn resolve_type_in_declaration_context(
         &self,
         resolver: &NameResolver,
         segments: &[String],
@@ -1774,32 +1789,6 @@ fn add_hierarchy_package_object_bindings<F>(
 }
 
 impl NameResolver {
-    pub(crate) fn for_file(
-        scala: &ScalaAnalyzer,
-        file: &ProjectFile,
-        types: &ProjectTypes,
-    ) -> Self {
-        match &types.bulk_file_states {
-            Some(states) => match states.get(file) {
-                Some(state) => Self::for_file_with_facts(
-                    scala,
-                    Some(file),
-                    Some(&state.package_name),
-                    &state.imports,
-                    types,
-                ),
-                None => Self::for_file_with_facts(scala, Some(file), None, &[], types),
-            },
-            None => Self::for_file_with_facts(
-                scala,
-                Some(file),
-                package_name_of(scala, file).as_deref(),
-                &scala.import_info_of(file),
-                types,
-            ),
-        }
-    }
-
     pub(crate) fn for_file_with_facts(
         scala: &ScalaAnalyzer,
         source_file: Option<&ProjectFile>,
@@ -1891,7 +1880,11 @@ impl NameResolver {
         }
     }
 
-    fn for_file_types(scala: &ScalaAnalyzer, target: &CodeUnit, types: &ProjectTypes) -> Self {
+    pub(crate) fn for_file_types(
+        scala: &ScalaAnalyzer,
+        target: &CodeUnit,
+        types: &ProjectTypes,
+    ) -> Self {
         let file = target.source();
         match &types.bulk_file_states {
             Some(states) => match states.get(file) {
@@ -1907,7 +1900,7 @@ impl NameResolver {
                     Self::for_file_with_facts_impl(
                         scala,
                         Some(file),
-                        Some(&state.package_name),
+                        Some(target.package_name()),
                         &imports,
                         types,
                         false,
@@ -1926,7 +1919,7 @@ impl NameResolver {
                 Self::for_file_with_facts_impl(
                     scala,
                     Some(file),
-                    package_name_of(scala, file).as_deref(),
+                    Some(target.package_name()),
                     &imports,
                     types,
                     false,
@@ -2363,6 +2356,13 @@ impl ScalaScan<'_, '_> {
         self.class_ranges.find_in_enclosing_units(byte, |owner| {
             self.types.exact_nested_type(&owner.fq_name(), name)
         })
+    }
+
+    fn lexically_visible_type_path(&self, byte: usize, path: &[String]) -> Option<String> {
+        let [name] = path else {
+            return None;
+        };
+        self.lexically_visible_type(byte, name)
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
@@ -3136,8 +3136,11 @@ fn resolve_receiver_type_node(type_node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> O
     if path.is_empty() {
         return None;
     }
-    ctx.types
-        .resolve_type_in_declaration_context(&ctx.resolver, &path)
+    ctx.lexically_visible_type_path(type_node.start_byte(), &path)
+        .or_else(|| {
+            ctx.types
+                .resolve_type_in_declaration_context(&ctx.resolver, &path)
+        })
         .or_else(|| {
             (path.len() == 1)
                 .then(|| scala_builtin_type_name(&path[0]).map(str::to_string))

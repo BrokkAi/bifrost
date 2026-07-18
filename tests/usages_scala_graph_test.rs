@@ -691,6 +691,84 @@ class Middle(val leaf: Leaf)
 }
 
 #[test]
+fn scala_usage_finder_resolves_lexical_nested_state_field_in_local_function() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "app/ClusterReceptionist.scala",
+            r#"package app
+class Registry { def read: Int = 1 }
+class State(val registry: other.Registry)
+object ClusterReceptionist {
+  final case class State(registry: Registry)
+  def behavior(state: State): Int = {
+    def onCommand(): Int = state.registry.read // positive-nested-state-field
+    onCommand()
+  }
+  def decoy(state: app.State): Int = state.registry.read // negative-package-state
+}
+"#,
+        ),
+        (
+            "other/Registry.scala",
+            "package other\nclass Registry { def read: Int = 2 }\n",
+        ),
+    ]);
+
+    let registry = definition(&analyzer, "app.ClusterReceptionist$.State.registry");
+    assert_eq!(
+        analyzer.parent_of(&registry).map(|owner| owner.fq_name()),
+        Some("app.ClusterReceptionist$.State".to_string())
+    );
+    let registry_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&registry)));
+    assert_hit_contains(&registry_hits, "positive-nested-state-field");
+    assert_no_hit_contains(&registry_hits, "negative-package-state");
+}
+
+#[test]
+fn scala_usage_finder_resolves_inherited_field_through_sequential_package_parent() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "impl/IndexedStepperBase.scala",
+            r#"package scala.collection.convert
+package impl
+abstract class IndexedStepperBase[Sub, Semi <: Sub](protected var i0: Int)
+"#,
+        ),
+        (
+            "impl/ArrayStepper.scala",
+            r#"package scala.collection.convert
+package impl
+trait AnyStepper[A]
+class ObjectArrayStepper[A](start: Int)
+  extends IndexedStepperBase[AnyStepper[A], ObjectArrayStepper[A]](start)
+    with AnyStepper[A] {
+  def nextStep(): Int = { val j = i0; i0 += 1; j } // positive-inherited-i0
+  def shadow(i0: Int): Int = i0 // negative-local-i0
+}
+class Unrelated(protected var i0: Int) {
+  def read: Int = i0 // negative-unrelated-i0
+}
+"#,
+        ),
+    ]);
+
+    let i0 = definition(
+        &analyzer,
+        "scala.collection.convert.impl.IndexedStepperBase.i0",
+    );
+    assert_eq!(
+        analyzer.parent_of(&i0).map(|owner| owner.fq_name()),
+        Some("scala.collection.convert.impl.IndexedStepperBase".to_string())
+    );
+    let i0_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&i0)));
+    assert_hit_contains(&i0_hits, "positive-inherited-i0");
+    assert_no_hit_contains(&i0_hits, "negative-local-i0");
+    assert_no_hit_contains(&i0_hits, "negative-unrelated-i0");
+}
+
+#[test]
 fn scala_usage_finder_resolves_infix_extractor_object_identity() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (

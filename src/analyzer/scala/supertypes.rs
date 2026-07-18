@@ -176,6 +176,20 @@ mod tests {
     }
 
     #[test]
+    fn constructor_applied_generic_supertype_keeps_parent_before_mixin() {
+        assert_eq!(
+            facts_for(
+                "class Child[A](start: Int) extends Base[Child[A], A](start, 1) with Mixin[A]",
+                "Child",
+            ),
+            vec![
+                ("Base[Child[A], A]".to_string(), "Base".to_string()),
+                ("Mixin[A]".to_string(), "Mixin".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn compound_supertypes_preserve_source_order() {
         assert_eq!(
             facts_for("class Child extends Base with ImportedTrait", "Child"),

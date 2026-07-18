@@ -87,11 +87,15 @@ impl ScalaAnalyzer {
             return Vec::new();
         }
 
-        let resolver = ScalaNameResolver::for_file(self, code_unit.source(), types);
+        let Some(facts) = self.forward_owner_facts(code_unit) else {
+            return Vec::new();
+        };
+        let resolver = ScalaNameResolver::for_file_types(self, code_unit, types);
         let mut ancestors = Vec::new();
         let mut seen = HashSet::default();
-        for raw in self.inner.raw_supertypes_of(code_unit) {
-            let Some(fqn) = resolver.resolve(&raw) else {
+        for path in facts.supertype_lookup_paths {
+            let Some(fqn) = types.resolve_type_in_declaration_context(&resolver, path.segments())
+            else {
                 continue;
             };
             if !seen.insert(fqn.clone()) {

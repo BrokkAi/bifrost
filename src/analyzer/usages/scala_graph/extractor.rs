@@ -693,13 +693,42 @@ fn resolve_type_node(type_node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
     if path.is_empty() {
         return None;
     }
-    ctx.types
-        .resolve_type_in_declaration_context(&ctx.name_resolver, &path)
+    lexically_nested_type(type_node, &path, ctx)
+        .or_else(|| {
+            ctx.types
+                .resolve_type_in_declaration_context(&ctx.name_resolver, &path)
+        })
         .or_else(|| {
             (path.len() == 1)
                 .then(|| scala_builtin_type_name(&path[0]).map(str::to_string))
                 .flatten()
         })
+}
+
+fn lexically_nested_type(
+    type_node: Node<'_>,
+    path: &[String],
+    ctx: &ScanCtx<'_>,
+) -> Option<String> {
+    let [name] = path else {
+        return None;
+    };
+    let range = Range {
+        start_byte: type_node.start_byte(),
+        end_byte: type_node.end_byte(),
+        start_line: type_node.start_position().row,
+        end_line: type_node.end_position().row,
+    };
+    let mut current = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
+    while let Some(unit) = current {
+        if unit.is_class()
+            && let Some(nested) = ctx.types.exact_nested_type(&unit.fq_name(), name)
+        {
+            return Some(nested);
+        }
+        current = ctx.analyzer.parent_of(&unit);
+    }
+    None
 }
 
 fn refresh_assignment_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
