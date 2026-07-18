@@ -18413,6 +18413,116 @@ fn scala_stable_identifier_object_val_resolves_in_case_pattern() {
 }
 
 #[test]
+fn scala_stable_identifier_pattern_prefers_nested_object_term_over_same_named_type() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "lib/Maybe.scala",
+            "package lib\nsealed trait Maybe\nobject Maybe { sealed abstract class Absent; case object Absent extends Absent }\n",
+        )
+        .file(
+            "app/Consumer.scala",
+            "package app\nimport lib.Maybe\nobject Consumer { def empty(value: Maybe): Boolean = value match { case Maybe.Absent => true; case _ => false } }\nobject QualifiedConsumer { def empty(value: Maybe): Boolean = value match { case lib.Maybe.Absent => true; case _ => false } }\nobject TypeConsumer { val absent: Maybe.Absent = ??? }\n",
+        )
+        .file(
+            "app/Decoy.scala",
+            "package app\nobject Maybe { sealed abstract class Absent; case object Absent extends Absent }\n",
+        )
+        .build();
+
+    let line = "object Consumer { def empty(value: Maybe): Boolean = value match { case Maybe.Absent => true; case _ => false } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Consumer.scala","line":3,"column":{}}}]}}"#,
+            column_of(line, "Absent")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["fqn"], "lib.Maybe$.Absent$",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "lib/Maybe.scala",
+        "{value}"
+    );
+
+    let qualified_line = "object QualifiedConsumer { def empty(value: Maybe): Boolean = value match { case lib.Maybe.Absent => true; case _ => false } }";
+    let qualified_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Consumer.scala","line":4,"column":{}}}]}}"#,
+            column_of(qualified_line, "Absent")
+        ),
+    );
+    assert_eq!(
+        qualified_value["results"][0]["definitions"][0]["fqn"], "lib.Maybe$.Absent$",
+        "{qualified_value}"
+    );
+
+    let type_line = "object TypeConsumer { val absent: Maybe.Absent = ??? }";
+    let type_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Consumer.scala","line":5,"column":{}}}]}}"#,
+            column_of(type_line, "Absent")
+        ),
+    );
+    assert_eq!(
+        type_value["results"][0]["status"], "resolved",
+        "{type_value}"
+    );
+    assert_eq!(
+        type_value["results"][0]["definitions"][0]["fqn"], "lib.Maybe$.Absent",
+        "{type_value}"
+    );
+}
+
+#[test]
+fn scala_stable_identifier_pattern_honors_package_and_local_term_owners() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Definitions.scala",
+            "package app\nsealed trait State\nobject State { sealed abstract class Empty; case object Empty extends Empty }\nclass LocalMaybe { val Absent: Int = 1 }\nobject Maybe { case object Absent }\n",
+        )
+        .file(
+            "app/Consumer.scala",
+            "package app\nobject Consumer {\n  def packageTerm(value: State): Boolean = value match { case State.Empty => true; case _ => false }\n  def localTerm(Maybe: LocalMaybe, value: Int): Boolean = value match { case Maybe.Absent => true; case _ => false }\n}\n",
+        )
+        .build();
+
+    let package_line = "  def packageTerm(value: State): Boolean = value match { case State.Empty => true; case _ => false }";
+    let local_line = "  def localTerm(Maybe: LocalMaybe, value: Int): Boolean = value match { case Maybe.Absent => true; case _ => false }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Consumer.scala","line":3,"column":{}}},{{"path":"app/Consumer.scala","line":4,"column":{}}}]}}"#,
+            column_of(package_line, "Empty"),
+            column_of(local_line, "Absent")
+        ),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[0]["definitions"][0]["fqn"], "app.State$.Empty$",
+        "{value}"
+    );
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[1]["definitions"][0]["fqn"], "app.LocalMaybe.Absent",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_external_import_reports_boundary() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

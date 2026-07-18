@@ -1444,28 +1444,60 @@ fn resolve_scala_stable_identifier(
     root: Node<'_>,
     identifier: Node<'_>,
 ) -> DefinitionLookupOutcome {
-    let text = scala_node_text(identifier, ctx.source).trim();
-    let Some((owner_text, member)) = text.rsplit_once('.') else {
+    let segments = scala_type_lookup_segments(identifier, ctx.source);
+    let Some((member, owner_segments)) = segments.split_last() else {
         return resolve_scala_type(ctx, resolver, root, identifier);
     };
-    if owner_text.is_empty() || member.is_empty() {
+    if owner_segments.is_empty() {
+        return resolve_scala_type(ctx, resolver, root, identifier);
+    }
+    if member.is_empty() || owner_segments.iter().any(String::is_empty) {
         return no_definition("no_reference_text", "Scala stable identifier is blank");
     }
+    let text = scala_node_text(identifier, ctx.source).trim();
+    let root_name = owner_segments.first().expect("non-empty stable owner path");
     let bindings = scala_bindings_before(ctx, resolver, root, identifier.start_byte());
-    let bound_owner = first_precise(&bindings, owner_text);
-    let parameter_owner =
-        scala_enclosing_class_parameter_type(ctx, identifier, owner_text, resolver);
-    let owner = bound_owner.clone().or(parameter_owner.clone()).or_else(|| {
-        (!bindings.is_shadowed(owner_text))
-            .then(|| scala_resolve_visible_term_owner(ctx, resolver, root, identifier, owner_text))
-            .flatten()
-    });
+    let bound_owner = first_precise(&bindings, root_name)
+        .or_else(|| scala_enclosing_class_parameter_type(ctx, identifier, root_name, resolver));
+    let owner = bound_owner
+        .and_then(|owner| scala_resolve_stable_owner_tail(ctx.support, owner, &owner_segments[1..]))
+        .or_else(|| {
+            if bindings.is_shadowed(root_name) {
+                return None;
+            }
+            if owner_segments.len() == 1 {
+                return scala_resolve_visible_term_owner(
+                    ctx, resolver, root, identifier, root_name,
+                );
+            }
+            scala_resolve_enclosing_qualified_type(
+                ctx,
+                resolver,
+                identifier,
+                owner_segments,
+                ScalaOwnerKind::SingletonObject,
+            )
+            .or_else(|| {
+                match resolver
+                    .resolve_owner_segments(owner_segments, ScalaOwnerKind::SingletonObject)
+                {
+                    ScalaNameResolution::Resolved(owner) => Some(owner.fqn),
+                    ScalaNameResolution::MissingExplicitImport
+                    | ScalaNameResolution::Ambiguous
+                    | ScalaNameResolution::Unresolved => None,
+                }
+            })
+        });
     if let Some(owner) = owner {
-        return scala_member_candidates(ctx, &owner, member, false);
+        let candidates = scala_stable_term_member_candidate_units(ctx, &owner, member);
+        if !candidates.is_empty() {
+            return candidates_outcome(candidates);
+        }
+        return scala_member_not_found(ctx, &owner, member);
     }
-    if scala_import_boundary_for_name(ctx.scala, ctx.support, ctx.file, owner_text) {
+    if scala_import_boundary_for_name(ctx.scala, ctx.support, ctx.file, root_name) {
         return boundary(format!(
-            "`{owner_text}` appears to cross a Scala import boundary not indexed in this workspace"
+            "`{root_name}` appears to cross a Scala import boundary not indexed in this workspace"
         ));
     }
     no_definition(
@@ -1474,18 +1506,83 @@ fn resolve_scala_stable_identifier(
     )
 }
 
-fn scala_member_candidates(
+fn scala_resolve_stable_owner_tail(
+    support: &dyn BoundedDefinitionLookup,
+    mut owner: String,
+    tail: &[String],
+) -> Option<String> {
+    for segment in tail {
+        let nested = format!("{owner}.{segment}$");
+        if !support
+            .fqn(&nested)
+            .into_iter()
+            .any(|unit| unit.is_class() && unit.fq_name() == nested)
+        {
+            return None;
+        }
+        owner = nested;
+    }
+    Some(owner)
+}
+
+fn scala_stable_term_member_candidate_units(
     ctx: ScalaLookupCtx<'_>,
     owner_fqn: &str,
     member: &str,
-    include_companion: bool,
-) -> DefinitionLookupOutcome {
-    let candidates = scala_member_candidate_units(ctx, owner_fqn, member, include_companion);
+) -> Vec<CodeUnit> {
+    let mut candidates =
+        scala_stable_term_member_candidate_units_without_ancestors(ctx.support, owner_fqn, member);
     if !candidates.is_empty() {
-        return candidates_outcome(candidates);
+        return candidates;
     }
 
-    scala_member_not_found(ctx, owner_fqn, member)
+    let mut matching_depth = None;
+    for owner in ctx
+        .support
+        .fqn(owner_fqn)
+        .into_iter()
+        .filter(|unit| unit.is_class() && unit.fq_name() == owner_fqn)
+    {
+        for (ancestor, depth) in scala_ancestor_owners(ctx.scala, ctx.support, owner) {
+            if matching_depth.is_some_and(|found| depth > found) {
+                break;
+            }
+            let direct = scala_stable_term_member_candidate_units_without_ancestors(
+                ctx.support,
+                &ancestor.fq_name(),
+                member,
+            );
+            if !direct.is_empty() {
+                matching_depth = Some(depth);
+                candidates.extend(direct);
+            }
+        }
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
+fn scala_stable_term_member_candidate_units_without_ancestors(
+    support: &dyn BoundedDefinitionLookup,
+    owner_fqn: &str,
+    member: &str,
+) -> Vec<CodeUnit> {
+    let singleton_fqn = format!("{owner_fqn}.{member}$");
+    let mut candidates = support
+        .fqn(&singleton_fqn)
+        .into_iter()
+        .filter(|unit| unit.is_class() && unit.fq_name() == singleton_fqn)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        candidates = scala_direct_member_candidate_units(support, owner_fqn, member)
+            .into_iter()
+            .filter(|unit| unit.is_field() || unit.is_function())
+            .collect();
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
 }
 
 fn scala_member_candidate_units(
