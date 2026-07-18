@@ -632,6 +632,10 @@ fn seed_declaration(
     ctx: &mut CppScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
+    if crate::analyzer::cpp::is_direct_recovered_exported_class_field_declaration(node, ctx.source)
+    {
+        return;
+    }
     match node.kind() {
         "parameter_declaration" | "optional_parameter_declaration" => {
             seed_typed_binding(node, ctx, bindings)

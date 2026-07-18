@@ -10,6 +10,7 @@ struct ScopeInfo {
     module: Option<CodeUnit>,
     class_unit: Option<CodeUnit>,
     template_signature: Option<String>,
+    declarations_are_fields: bool,
 }
 
 struct CppContainer<'tree> {
@@ -382,6 +383,48 @@ fn recover_exported_class_function_definition<'tree>(
     class_identifier_before_body(node, source).map(|name| (node, name))
 }
 
+pub(crate) fn is_recovered_exported_class_container(node: Node<'_>, source: &str) -> bool {
+    recover_exported_class_function_definition(node, source).is_some()
+}
+
+fn preserves_declaration_scope_through_wrapper(kind: &str, in_class_scope: bool) -> bool {
+    matches!(
+        kind,
+        "ERROR"
+            | "preproc_if"
+            | "preproc_ifdef"
+            | "preproc_ifndef"
+            | "preproc_else"
+            | "preproc_elif"
+    ) || (kind == "labeled_statement" && in_class_scope)
+}
+
+pub(crate) fn is_direct_recovered_exported_class_field_declaration(
+    node: Node<'_>,
+    source: &str,
+) -> bool {
+    if node.kind() != "declaration" {
+        return false;
+    }
+    let mut ancestor = node.parent();
+    while let Some(container) = ancestor {
+        match container.kind() {
+            "compound_statement" => {
+                return container.parent().is_some_and(|class_container| {
+                    is_recovered_exported_class_container(class_container, source)
+                });
+            }
+            // These containers preserve ScopeInfo in visit_node. declaration_list is
+            // the body container selected for a linkage specification.
+            "template_declaration" | "linkage_specification" | "declaration_list" => {}
+            kind if preserves_declaration_scope_through_wrapper(kind, true) => {}
+            _ => return false,
+        }
+        ancestor = container.parent();
+    }
+    false
+}
+
 pub(crate) fn recovered_exported_class_has_body(
     node: Node<'_>,
     source: &str,
@@ -557,6 +600,7 @@ impl<'a> CppVisitor<'a> {
                 module,
                 class_unit,
                 template_signature,
+                declarations_are_fields: false,
             },
         })];
         while let Some(work) = stack.pop() {
@@ -623,24 +667,20 @@ impl<'a> CppVisitor<'a> {
                 self.visit_class_like(node, scope, stack)
             }
             "function_definition" => self.visit_function_definition(node, scope, stack),
-            "declaration" => self.visit_declaration(node, scope, false, stack),
+            "declaration" => {
+                self.visit_declaration(node, scope, scope.declarations_are_fields, stack)
+            }
             "field_declaration" => self.visit_declaration(node, scope, true, stack),
             "type_definition" | "alias_declaration" => {
                 self.visit_type_declaration(node, scope, stack)
             }
-            "ERROR" => stack.push(CppWork::Container(CppContainer {
-                node,
-                scope: scope.clone(),
-            })),
             "preproc_def" | "preproc_function_def" => self.visit_macro(node),
             "preproc_include" => self.visit_include(node),
-            "labeled_statement" if scope.class_unit.is_some() => {
-                stack.push(CppWork::Container(CppContainer {
-                    node,
-                    scope: scope.clone(),
-                }))
-            }
-            "preproc_if" | "preproc_ifdef" | "preproc_ifndef" | "preproc_else" | "preproc_elif" => {
+            kind if preserves_declaration_scope_through_wrapper(
+                kind,
+                scope.class_unit.is_some(),
+            ) =>
+            {
                 stack.push(CppWork::Container(CppContainer {
                     node,
                     scope: scope.clone(),
@@ -691,6 +731,7 @@ impl<'a> CppVisitor<'a> {
             module: Some(module),
             class_unit: scope.class_unit.clone(),
             template_signature: scope.template_signature.clone(),
+            declarations_are_fields: false,
         };
         let container = cpp_body_node(node).unwrap_or(node);
         stack.push(CppWork::Container(CppContainer {
@@ -784,6 +825,10 @@ impl<'a> CppVisitor<'a> {
             let mut nested_scope = scope.clone();
             nested_scope.class_unit = Some(code_unit.clone());
             nested_scope.template_signature = scope.template_signature.clone();
+            // Export-macro class bodies recovered from a function_definition use
+            // compound_statement children, whose direct fields are declarations.
+            nested_scope.declarations_are_fields =
+                is_recovered_exported_class_container(declaration_node, self.source);
             stack.push(CppWork::Container(CppContainer {
                 node: body,
                 scope: nested_scope,

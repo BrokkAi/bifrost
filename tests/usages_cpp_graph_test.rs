@@ -10535,3 +10535,286 @@ void ::demo::Owner<T>::GlobalCheck() {
         );
     }
 }
+
+#[test]
+fn authoritative_cpp_macro_exported_class_declarations_keep_recovered_field_owner() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "metrics.cc",
+            r#"#define API_EXPORT
+#define ENABLE_METRICS 1
+namespace demo {
+struct Decoder {};
+class API_EXPORT Metrics {
+public:
+    int decoder_bypass_block_count = 0;
+    int initialized_count = 1;
+    Decoder* decoder;
+#if ENABLE_METRICS
+    int guarded_count = 2;
+#endif
+    int Read(bool shadow) const {
+        if (shadow) {
+            int decoder_bypass_block_count = 7; // negative-local-shadow-declaration
+            return decoder_bypass_block_count; // negative-local-shadow-use
+        }
+        return decoder_bypass_block_count; // positive-implicit-self
+    }
+    int Guarded() const {
+        return guarded_count; // positive-guarded-implicit-self
+    }
+};
+struct Ordinary {
+    int decoder_bypass_block_count;
+    int Read() const {
+        return decoder_bypass_block_count; // negative-ordinary-implicit-self
+    }
+};
+}
+namespace controls {
+int decoder_bypass_block_count = 0;
+}
+namespace wrong {
+struct Metrics {
+    int decoder_bypass_block_count;
+};
+}
+void exercise(demo::Metrics& metrics, demo::Ordinary& ordinary, wrong::Metrics& wrong) {
+    int explicit_owner = metrics.decoder_bypass_block_count; // positive-explicit-receiver
+    int ordinary_owner = ordinary.decoder_bypass_block_count; // negative-ordinary-receiver
+    int wrong_owner = wrong.decoder_bypass_block_count; // negative-wrong-owner-receiver
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let file = project.file("metrics.cc");
+    let source = file.read_to_string().expect("metrics fixture source");
+    let declarations = analyzer.get_all_declarations();
+
+    let matching_fields = declarations
+        .iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Field
+                && unit.fq_name() == "demo.Metrics.decoder_bypass_block_count"
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching_fields.len(),
+        1,
+        "the recovered Metrics member must have one canonical identity: {declarations:#?}"
+    );
+    let target = matching_fields[0].clone();
+    let metrics = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "demo.Metrics"
+    });
+    assert_eq!(analyzer.parent_of(&target), Some(metrics.clone()));
+    assert!(
+        declarations.iter().all(|unit| {
+            unit.kind() != CodeUnitType::Field
+                || unit.fq_name() != "demo.decoder_bypass_block_count"
+        }),
+        "the recovered member must not leave a flattened namespace phantom: {declarations:#?}"
+    );
+
+    for member in ["initialized_count", "decoder", "guarded_count"] {
+        let field = definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Field && unit.fq_name() == format!("demo.Metrics.{member}")
+        });
+        assert_eq!(
+            analyzer.parent_of(&field),
+            Some(metrics.clone()),
+            "recovered plain, initialized, and pointer declarations must share the Metrics owner"
+        );
+    }
+    let read = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.fq_name() == "demo.Metrics.Read"
+    });
+    assert_eq!(
+        analyzer.parent_of(&read),
+        Some(metrics.clone()),
+        "inline method ownership must remain intact"
+    );
+    let guarded = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field && unit.fq_name() == "demo.Metrics.guarded_count"
+    });
+    assert_eq!(analyzer.parent_of(&guarded), Some(metrics.clone()));
+    assert!(declarations.iter().any(|unit| {
+        unit.kind() == CodeUnitType::Field
+            && unit.fq_name() == "demo.Ordinary.decoder_bypass_block_count"
+    }));
+    assert!(declarations.iter().any(|unit| {
+        unit.kind() == CodeUnitType::Field
+            && unit.fq_name() == "controls.decoder_bypass_block_count"
+    }));
+    assert!(declarations.iter().any(|unit| {
+        unit.kind() == CodeUnitType::Field
+            && unit.fq_name() == "wrong.Metrics.decoder_bypass_block_count"
+    }));
+
+    let implicit = fixture_token_range(
+        &source,
+        "        return decoder_bypass_block_count; // positive-implicit-self",
+        "decoder_bypass_block_count",
+    );
+    let explicit = fixture_token_range(
+        &source,
+        "    int explicit_owner = metrics.decoder_bypass_block_count; // positive-explicit-receiver",
+        "decoder_bypass_block_count",
+    );
+    let expected = BTreeSet::from([implicit, explicit]);
+    let guarded_implicit = fixture_token_range(
+        &source,
+        "        return guarded_count; // positive-guarded-implicit-self",
+        "guarded_count",
+    );
+    let negatives = [
+        "            int decoder_bypass_block_count = 7; // negative-local-shadow-declaration",
+        "            return decoder_bypass_block_count; // negative-local-shadow-use",
+        "        return decoder_bypass_block_count; // negative-ordinary-implicit-self",
+        "    int ordinary_owner = ordinary.decoder_bypass_block_count; // negative-ordinary-receiver",
+        "    int wrong_owner = wrong.decoder_bypass_block_count; // negative-wrong-owner-receiver",
+        "int decoder_bypass_block_count = 0;",
+    ]
+    .map(|line| fixture_token_range(&source, line, "decoder_bypass_block_count"));
+
+    let forward_at = |start: usize| {
+        let line_start = source[..start].rfind('\n').map_or(0, |newline| newline + 1);
+        let line = source[..start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let column = source[line_start..start].chars().count() + 1;
+        brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "metrics.cc".to_string(),
+                    line: Some(line),
+                    column: Some(column),
+                }],
+            },
+        )
+        .results
+        .into_iter()
+        .next()
+        .expect("one forward result")
+    };
+    for reference in [implicit, explicit] {
+        let forward = forward_at(reference.0);
+        assert_eq!("resolved", forward.status, "{forward:#?}");
+        assert!(
+            !forward.definitions.is_empty()
+                && forward.definitions.iter().all(|definition| {
+                    definition.fqn.as_deref() == Some("demo.Metrics.decoder_bypass_block_count")
+                }),
+            "forward lookup must select only the recovered Metrics field: {forward:#?}"
+        );
+    }
+    let guarded_forward = forward_at(guarded_implicit.0);
+    assert_eq!("resolved", guarded_forward.status, "{guarded_forward:#?}");
+    assert!(
+        !guarded_forward.definitions.is_empty()
+            && guarded_forward.definitions.iter().all(|definition| {
+                definition.fqn.as_deref() == Some("demo.Metrics.guarded_count")
+            }),
+        "the preprocessor-contained member must not shadow its implicit-self use: {guarded_forward:#?}"
+    );
+    let local_shadow = fixture_token_range(
+        &source,
+        "            return decoder_bypass_block_count; // negative-local-shadow-use",
+        "decoder_bypass_block_count",
+    );
+    let shadow_forward = forward_at(local_shadow.0);
+    assert!(
+        shadow_forward.definitions.iter().all(|definition| {
+            definition.fqn.as_deref() != Some("demo.Metrics.decoder_bypass_block_count")
+        }),
+        "a genuine method-local declaration must shadow the recovered field: {shadow_forward:#?}"
+    );
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(file.clone()).collect()));
+    let targeted_query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = targeted_query.result
+    else {
+        panic!("expected authoritative recovered-field success");
+    };
+    let targeted = hits_by_overload
+        .values()
+        .flatten()
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(targeted, expected, "{hits_by_overload:#?}");
+    assert!(
+        unproven_total_by_overload.values().all(|count| *count == 0),
+        "wrong-owner controls must be proven exclusions: {unproven_total_by_overload:#?}"
+    );
+
+    let whole = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let whole_ranges = whole
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == file)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(whole_ranges, expected);
+    assert!(
+        negatives
+            .into_iter()
+            .all(|negative| { !targeted.contains(&negative) && !whole_ranges.contains(&negative) })
+    );
+
+    let guarded_provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(file.clone()).collect()));
+    let guarded_query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&guarded),
+            Some(&guarded_provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = guarded_query.result
+    else {
+        panic!("expected authoritative recovered guarded-field success");
+    };
+    let guarded_targeted = hits_by_overload
+        .values()
+        .flatten()
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(guarded_targeted, BTreeSet::from([guarded_implicit]));
+    assert!(
+        unproven_total_by_overload.values().all(|count| *count == 0),
+        "the guarded implicit-self use must be fully proven: {unproven_total_by_overload:#?}"
+    );
+    let guarded_whole =
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&guarded));
+    let guarded_whole_ranges = guarded_whole
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == file)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(guarded_whole_ranges, BTreeSet::from([guarded_implicit]));
+}

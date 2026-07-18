@@ -265,6 +265,10 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn seed_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if crate::analyzer::cpp::is_direct_recovered_exported_class_field_declaration(node, ctx.source)
+    {
+        return;
+    }
     match node.kind() {
         "parameter_declaration" | "optional_parameter_declaration" => seed_typed_binding(node, ctx),
         "declaration" | "field_declaration" => seed_variable_declaration(node, ctx),

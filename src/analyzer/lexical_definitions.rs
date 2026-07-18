@@ -495,6 +495,17 @@ fn scope_has_matching_local(
             if language == Language::Rust && node.end_byte() > focus_start {
                 continue;
             }
+            if language == Language::Cpp
+                && node.kind() == "init_declarator"
+                && node.parent().is_some_and(|declaration| {
+                    super::cpp::is_direct_recovered_exported_class_field_declaration(
+                        declaration,
+                        source,
+                    )
+                })
+            {
+                continue;
+            }
             if language == Language::Scala
                 && matches!(node.kind(), "val_definition" | "var_definition")
                 && (!scala_has_value_definition_keyword(node)
