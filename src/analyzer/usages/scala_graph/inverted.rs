@@ -70,6 +70,12 @@ pub(super) enum MemberReturnResolution {
     Resolved(String),
 }
 
+pub(super) enum BareMemberResolution {
+    NoMatch,
+    Unresolved,
+    Resolved(Vec<CodeUnit>),
+}
+
 /// Every class/object/trait/enum the project declares, indexed for the per-file
 /// name->fqn rebuild. Built once and shared across all files' scans.
 pub(crate) struct ProjectTypes {
@@ -259,7 +265,11 @@ impl ProjectTypes {
         ancestors_by_owner
     }
 
-    fn direct_ancestors_for_owner(&self, scala: &ScalaAnalyzer, owner_fqn: &str) -> Vec<CodeUnit> {
+    pub(super) fn direct_ancestors_for_owner(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner_fqn: &str,
+    ) -> Vec<CodeUnit> {
         if let Some(ancestors_by_owner) = &self.direct_ancestors_by_owner {
             return ancestors_by_owner
                 .get(owner_fqn)
@@ -287,6 +297,19 @@ impl ProjectTypes {
         member: &str,
         call_arities: Option<&[usize]>,
     ) -> Vec<String> {
+        self.method_declarations_for_owner_member(scala, owner_fqn, member, call_arities)
+            .into_iter()
+            .map(|method| method.fq_name())
+            .collect()
+    }
+
+    fn method_declarations_for_owner_member(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner_fqn: &str,
+        member: &str,
+        call_arities: Option<&[usize]>,
+    ) -> Vec<CodeUnit> {
         let members = self.members_for_exact_owner_name(owner_fqn, member);
         let candidates = members
             .iter()
@@ -311,8 +334,84 @@ impl ProjectTypes {
             .filter(|(_, facts, alternatives)| {
                 method_call_shape_matches(facts, alternatives, call_arities, unique_callable)
             })
-            .map(|(method, _, _)| method.fq_name())
+            .map(|(method, _, _)| (*method).clone())
             .collect()
+    }
+
+    pub(super) fn bare_member_declarations(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner_fqn: &str,
+        member: &str,
+        call_arities: Option<&[usize]>,
+    ) -> BareMemberResolution {
+        let mut owners = scala
+            .definitions(owner_fqn)
+            .filter(CodeUnit::is_class)
+            .collect::<Vec<_>>();
+        if owners.is_empty() {
+            return BareMemberResolution::NoMatch;
+        }
+        if owners.len() > 1 {
+            return BareMemberResolution::Unresolved;
+        }
+
+        let mut seen = HashSet::default();
+        while !owners.is_empty() {
+            let mut matched = Vec::new();
+            let mut next = Vec::new();
+            for owner in owners {
+                if !seen.insert(owner.clone()) {
+                    continue;
+                }
+                let owner_fqn = owner.fq_name();
+                let members = self.members_for_exact_owner_name(&owner_fqn, member);
+                if members.iter().any(|member| member.is_field()) {
+                    return BareMemberResolution::Unresolved;
+                }
+                matched.extend(self.method_declarations_for_owner_member(
+                    scala,
+                    &owner_fqn,
+                    member,
+                    call_arities,
+                ));
+                next.extend(self.direct_ancestors_for_owner(scala, &owner_fqn));
+            }
+            if !matched.is_empty() {
+                let mut unique = HashSet::default();
+                matched.retain(|method| unique.insert(method.clone()));
+                return BareMemberResolution::Resolved(matched);
+            }
+            owners = next;
+        }
+        BareMemberResolution::NoMatch
+    }
+
+    pub(super) fn callable_parameter_function_arity(
+        &self,
+        scala: &ScalaAnalyzer,
+        method: &CodeUnit,
+        call_arities: &[usize],
+        parameter_list: usize,
+        parameter_index: usize,
+    ) -> Option<usize> {
+        let alternatives = self.callable_alternatives_for(scala, method);
+        let mut resolved = None;
+        for alternative in alternatives.iter().filter(|alternative| {
+            callable_shape_matches(&alternative.shape, Some(call_arities), true)
+        }) {
+            let arity = alternative
+                .parameter_function_arities
+                .get(parameter_list)
+                .and_then(|parameters| parameters.get(parameter_index))
+                .copied()
+                .flatten()?;
+            if resolved.is_some_and(|resolved| resolved != arity) {
+                return None;
+            }
+            resolved = Some(arity);
+        }
+        resolved
     }
 
     fn inherited_method_targets_for_owner_member(
@@ -993,6 +1092,7 @@ impl ProjectTypes {
                         .get(&(range.start_byte, range.end_byte))
                         .map(|facts| CallableAlternative {
                             shape: facts.shape.clone(),
+                            parameter_function_arities: facts.parameter_function_arities.clone(),
                             extension_receiver_type: facts
                                 .extension_receiver_type_path
                                 .as_deref()
@@ -1020,6 +1120,7 @@ impl ProjectTypes {
                 .filter_map(|metadata| {
                     metadata.callable_arity().map(|arity| CallableAlternative {
                         shape: vec![arity],
+                        parameter_function_arities: Vec::new(),
                         extension_receiver_type: None,
                         return_type: None,
                     })
@@ -1034,6 +1135,7 @@ impl ProjectTypes {
             {
                 fallback.push(CallableAlternative {
                     shape: vec![arity],
+                    parameter_function_arities: Vec::new(),
                     extension_receiver_type: None,
                     return_type: self
                         .facts
@@ -1351,6 +1453,7 @@ impl ProjectTypes {
 #[derive(Clone)]
 pub(crate) struct CallableAlternative {
     pub(crate) shape: Vec<CallableArity>,
+    pub(crate) parameter_function_arities: Vec<Vec<Option<usize>>>,
     pub(crate) extension_receiver_type: Option<String>,
     pub(crate) return_type: Option<String>,
 }
@@ -2525,13 +2628,16 @@ fn call_result_type(
             {
                 return Some(return_type);
             }
-            ctx.types.member_return_type_for_owner_member(
+            match ctx.types.unqualified_member_return_type(
                 ctx.scala,
                 ctx.resolver,
                 owner,
                 method,
                 call_arities.as_deref(),
-            )
+            ) {
+                MemberReturnResolution::Resolved(return_type) => Some(return_type),
+                MemberReturnResolution::NoMatch | MemberReturnResolution::Unresolved => None,
+            }
         }
         _ => None,
     }

@@ -14,6 +14,7 @@ pub(crate) struct ScalaSourceFacts {
 #[derive(Clone)]
 pub(crate) struct ScalaCallableSourceAlternative {
     pub(crate) shape: Vec<CallableArity>,
+    pub(crate) parameter_function_arities: Vec<Vec<Option<usize>>>,
     pub(crate) extension_receiver_type_path: Option<Vec<String>>,
     pub(crate) return_type_path: Option<Vec<String>>,
 }
@@ -30,15 +31,25 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
         match node.kind() {
             "function_definition" | "function_declaration" => {
                 let mut cursor = node.walk();
-                let shape = node
+                let parameter_lists = node
                     .named_children(&mut cursor)
                     .filter(|child| child.kind() == "parameters")
+                    .collect::<Vec<_>>();
+                let shape = parameter_lists
+                    .iter()
+                    .copied()
                     .map(callable_arity_for_parameters)
+                    .collect();
+                let parameter_function_arities = parameter_lists
+                    .iter()
+                    .copied()
+                    .map(parameter_function_arities)
                     .collect();
                 facts.callable_alternatives_by_range.insert(
                     (node.start_byte(), node.end_byte()),
                     ScalaCallableSourceAlternative {
                         shape,
+                        parameter_function_arities,
                         extension_receiver_type_path: enclosing_extension_receiver_type_path(
                             node, source,
                         ),
@@ -61,6 +72,7 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                         (node.start_byte(), node.end_byte()),
                         ScalaCallableSourceAlternative {
                             shape: lists,
+                            parameter_function_arities: Vec::new(),
                             extension_receiver_type_path: None,
                             return_type_path: None,
                         },
@@ -168,6 +180,28 @@ fn callable_arity_for_parameters(parameters: Node<'_>) -> CallableArity {
         }
     }
     CallableArity::new(required, total, repeated)
+}
+
+fn parameter_function_arities(parameters: Node<'_>) -> Vec<Option<usize>> {
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter(|parameter| matches!(parameter.kind(), "parameter" | "class_parameter"))
+        .map(|parameter| {
+            parameter
+                .child_by_field_name("type")
+                .and_then(function_type_arity)
+        })
+        .collect()
+}
+
+fn function_type_arity(type_node: Node<'_>) -> Option<usize> {
+    if type_node.kind() != "function_type" {
+        return None;
+    }
+    let parameter_types = type_node.child_by_field_name("parameter_types")?;
+    let mut cursor = parameter_types.walk();
+    Some(parameter_types.named_children(&mut cursor).count())
 }
 
 fn contains_repeated_parameter_type(node: Node<'_>) -> bool {
@@ -532,12 +566,6 @@ pub(crate) fn terminal_invocation_owner_name(node: Node<'_>) -> Option<Node<'_>>
         }
         _ => None,
     }
-}
-
-pub(crate) fn is_assignment_lhs(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        parent.kind() == "assignment_expression" && parent.child_by_field_name("left") == Some(node)
-    })
 }
 
 pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {

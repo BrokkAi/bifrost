@@ -1,5 +1,5 @@
-use super::inverted::{MemberReturnResolution, NameResolver, ProjectTypes};
-use crate::analyzer::scala::imports::parse_scala_import_infos;
+use super::inverted::{BareMemberResolution, MemberReturnResolution, NameResolver, ProjectTypes};
+use crate::analyzer::scala::imports::scala_import_infos_from_node;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
@@ -13,12 +13,11 @@ use crate::analyzer::usages::scala_graph::resolver::{
 };
 use crate::analyzer::usages::scala_graph::syntax::{
     call_arities_for_reference, has_ancestor_kind, has_member_qualifier,
-    infix_receiver_for_operator, is_assignment_lhs, is_call_function_reference,
-    is_constructor_like_reference, is_extractor_reference, is_identifier_node,
-    is_infix_pattern_operator, is_owner_qualified_this, is_scala_class_reference,
-    is_scala_object_reference, is_terminal_stable_field_reference, member_qualifier,
-    member_qualifier_node, named_argument_invocation_owner, node_text, parenthesized_arity,
-    resolve_stable_object_expression, scala_union_type_alternative_paths,
+    infix_receiver_for_operator, is_call_function_reference, is_constructor_like_reference,
+    is_extractor_reference, is_identifier_node, is_infix_pattern_operator, is_owner_qualified_this,
+    is_scala_class_reference, is_scala_object_reference, is_terminal_stable_field_reference,
+    member_qualifier, member_qualifier_node, named_argument_invocation_owner, node_text,
+    parenthesized_arity, resolve_stable_object_expression, scala_union_type_alternative_paths,
     terminal_invocation_owner_name,
 };
 use crate::analyzer::{
@@ -81,7 +80,7 @@ pub(super) fn scan_file(
         limit_exceeded,
         enclosing_cache: HashMap::default(),
     };
-    scan_node(tree.root_node(), &mut ctx);
+    scan_tree(tree.root_node(), &mut ctx);
 }
 
 pub(super) struct ScanCtx<'a> {
@@ -102,43 +101,63 @@ pub(super) struct ScanCtx<'a> {
     pub(super) enclosing_cache: HashMap<(usize, usize), Option<CodeUnit>>,
 }
 
-fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if *ctx.limit_exceeded {
-        return;
-    }
-    seed_parent_scope_declarations(node, ctx);
-    let enters_scope = enters_local_scope(node);
-    if enters_scope {
-        ctx.bindings.enter_scope();
-        seed_scope_declarations(node, ctx);
-    } else {
-        seed_inline_declarations(node, ctx);
-    }
+enum ScanEvent<'tree> {
+    Enter(Node<'tree>),
+    Exit {
+        node: Node<'tree>,
+        exits_scope: bool,
+    },
+}
 
-    if node.kind() == "call_expression" {
-        scan_call_expression(node, ctx);
-    }
-    if node.kind() == "infix_expression" {
-        scan_infix_expression(node, ctx);
-    }
-    if matches!(node.kind(), "function_definition" | "function_declaration") {
-        scan_method_declaration(node, ctx);
-    }
-    if node.kind() == "import_declaration" {
-        scan_import_declaration(node, ctx);
-    } else if is_identifier_node(node) {
-        scan_identifier(node, ctx);
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        scan_node(child, ctx);
-        if *ctx.limit_exceeded {
-            break;
+fn scan_tree(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let mut stack = vec![ScanEvent::Enter(root)];
+    while let Some(event) = stack.pop() {
+        match event {
+            ScanEvent::Enter(node) => {
+                if *ctx.limit_exceeded {
+                    continue;
+                }
+                seed_parent_scope_declarations(node, ctx);
+                let enters_scope = enters_local_scope(node);
+                if enters_scope {
+                    ctx.bindings.enter_scope();
+                    seed_scope_declarations(node, ctx);
+                } else {
+                    seed_inline_declarations(node, ctx);
+                }
+
+                if node.kind() == "call_expression" {
+                    scan_call_expression(node, ctx);
+                }
+                if node.kind() == "infix_expression" {
+                    scan_infix_expression(node, ctx);
+                }
+                if matches!(node.kind(), "function_definition" | "function_declaration") {
+                    scan_method_declaration(node, ctx);
+                }
+                if node.kind() == "import_declaration" {
+                    scan_import_declaration(node, ctx);
+                } else if is_identifier_node(node) {
+                    scan_identifier(node, ctx);
+                }
+
+                stack.push(ScanEvent::Exit {
+                    node,
+                    exits_scope: enters_scope,
+                });
+                let mut cursor = node.walk();
+                let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+                stack.extend(children.into_iter().rev().map(ScanEvent::Enter));
+            }
+            ScanEvent::Exit { node, exits_scope } => {
+                if node.kind() == "assignment_expression" {
+                    refresh_assignment_binding(node, ctx);
+                }
+                if exits_scope {
+                    ctx.bindings.exit_scope();
+                }
+            }
         }
-    }
-
-    if enters_scope {
-        ctx.bindings.exit_scope();
     }
 }
 
@@ -175,9 +194,8 @@ fn scan_import_declaration_identifier(
 }
 
 fn matching_names_for_import_declaration(node: Node<'_>, ctx: &ScanCtx<'_>) -> HashSet<String> {
-    let import_text = node_text(node, ctx.source);
     let mut names = HashSet::default();
-    for import in parse_scala_import_infos(import_text) {
+    for import in scala_import_infos_from_node(node, ctx.source) {
         let matched = Visibility::matching_import_names(&import, ctx.spec, ctx.file_package);
         names.extend(matched.type_names);
         names.extend(matched.owner_names.into_keys());
@@ -201,10 +219,7 @@ fn scan_call_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if text != ctx.spec.member_name || has_member_qualifier(function) {
         return;
     }
-    if !is_locally_shadowed(ctx, text)
-        && enclosing_matches_owner(function, ctx)
-        && member_call_arity_matches(function, ctx)
-    {
+    if bare_member_reference_is_proven(function, text, ctx) {
         add_hit(function, ctx);
     }
 }
@@ -574,6 +589,54 @@ fn seed_value_definition(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+fn refresh_assignment_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let (Some(left), Some(right)) = (
+        node.child_by_field_name("left"),
+        node.child_by_field_name("right"),
+    ) else {
+        return;
+    };
+    if !matches!(left.kind(), "identifier" | "operator_identifier") {
+        return;
+    }
+    let name = node_text(left, ctx.source).trim();
+    if name.is_empty()
+        || !ctx.bindings.is_shadowed(name)
+        || assignment_updates_target_owner_field(name, ctx)
+    {
+        return;
+    }
+
+    if let Some(owner) = call_initializer_return_owner(right, ctx) {
+        ctx.bindings.seed_symbol(name.to_string(), owner);
+        return;
+    }
+    if matches!(right.kind(), "identifier" | "operator_identifier") {
+        let source_name = node_text(right, ctx.source).trim();
+        if !source_name.is_empty()
+            && let Some(targets) = ctx
+                .bindings
+                .resolve_symbol(source_name)
+                .as_precise()
+                .cloned()
+        {
+            ctx.bindings.seed_symbol_many(name.to_string(), targets);
+            return;
+        }
+    }
+    ctx.bindings.declare_shadow(name.to_string());
+}
+
+fn assignment_updates_target_owner_field(name: &str, ctx: &ScanCtx<'_>) -> bool {
+    ctx.spec.kind == TargetKind::Field
+        && name == ctx.spec.member_name
+        && ctx
+            .bindings
+            .resolve_symbol(name)
+            .as_precise()
+            .is_some_and(|owners| owners.iter().any(|owner| ctx.spec.owner_fq_matches(owner)))
+}
+
 fn call_initializer_return_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
     if node.kind() != "call_expression" {
         return None;
@@ -591,8 +654,11 @@ fn call_initializer_return_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<St
                 stable_object_expression_fqn(owner_node, ctx)
             } else if matches!(owner_node.kind(), "identifier" | "type_identifier") {
                 let owner_name = node_text(owner_node, ctx.source).trim();
-                ctx.name_resolver
-                    .resolve_object(owner_name)
+                ctx.bindings
+                    .resolve_symbol(owner_name)
+                    .as_precise()
+                    .and_then(single_precise_target)
+                    .or_else(|| ctx.name_resolver.resolve_object(owner_name))
                     .or_else(|| ctx.name_resolver.resolve(owner_name))
             } else {
                 None
@@ -807,12 +873,6 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if proven {
         add_hit(node, ctx);
     }
-    if is_assignment_lhs(node)
-        && !ctx.bindings.resolve_symbol(text).is_unknown()
-        && !assignment_lhs_is_target_member_write(proven, text, ctx)
-    {
-        ctx.bindings.declare_shadow(text.to_string());
-    }
 }
 
 fn nested_target_type_is_lexically_visible(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -851,10 +911,6 @@ fn named_argument_field_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>)
             .owner_fq_name_for(owner_name)
             .or_else(|| ctx.visibility.receiver_type_fq_name_for(owner_name))
             .is_some_and(|owner| ctx.spec.receiver_owner_fq_matches(owner))
-}
-
-fn assignment_lhs_is_target_member_write(proven: bool, text: &str, ctx: &ScanCtx<'_>) -> bool {
-    proven && ctx.spec.kind == TargetKind::Field && text == ctx.spec.member_name
 }
 
 fn type_reference_is_locally_bound(text: &str, ctx: &ScanCtx<'_>) -> bool {
@@ -941,9 +997,13 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
     }
 
     let Some(qualifier_node) = member_qualifier_node(node) else {
-        return !is_locally_shadowed(ctx, text)
-            && enclosing_matches_owner(node, ctx)
-            && member_call_arity_matches(node, ctx);
+        return if ctx.spec.kind == TargetKind::Method {
+            bare_member_reference_is_proven(node, text, ctx)
+        } else {
+            !is_locally_shadowed(ctx, text)
+                && enclosing_matches_owner(node, ctx)
+                && member_call_arity_matches(node, ctx)
+        };
     };
     if qualifier_node.kind() == "field_expression"
         && let Some(owner_fq_name) = stable_object_expression_fqn(qualifier_node, ctx)
@@ -976,6 +1036,125 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
             .is_some_and(|owner_fq_name| ctx.spec.owner_fq_matches(owner_fq_name));
     }
     receiver_binding_matches(node, qualifier, ctx)
+}
+
+fn bare_member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
+    if text != ctx.spec.member_name || is_locally_shadowed(ctx, text) {
+        return false;
+    }
+    let call_arities = call_arities_for_reference(node)
+        .or_else(|| contextual_method_value_call_arities(node, ctx));
+    if !member_call_arities_match(call_arities.as_deref(), ctx) {
+        return false;
+    }
+    let Some(owner) = enclosing_owner_fq_name(node, ctx) else {
+        return false;
+    };
+    let BareMemberResolution::Resolved(methods) =
+        ctx.types
+            .bare_member_declarations(ctx.scala, &owner, text, call_arities.as_deref())
+    else {
+        return false;
+    };
+    !methods.is_empty()
+        && methods.iter().all(|method| {
+            ctx.scala
+                .structural_parent_of(method)
+                .or_else(|| ctx.scala.parent_of(method))
+                .is_some_and(|owner| ctx.spec.owner_fq_matches(&owner.fq_name()))
+        })
+}
+
+fn contextual_method_value_call_arities(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Vec<usize>> {
+    explicitly_declared_function_arity(node)
+        .or_else(|| call_parameter_function_arity(node, ctx))
+        .map(|arity| vec![arity])
+}
+
+fn explicitly_declared_function_arity(node: Node<'_>) -> Option<usize> {
+    let definition = node.parent()?;
+    if !matches!(definition.kind(), "val_definition" | "var_definition")
+        || definition.child_by_field_name("value") != Some(node)
+    {
+        return None;
+    }
+    function_type_arity(definition.child_by_field_name("type")?)
+}
+
+fn function_type_arity(type_node: Node<'_>) -> Option<usize> {
+    if type_node.kind() != "function_type" {
+        return None;
+    }
+    let parameter_types = type_node.child_by_field_name("parameter_types")?;
+    let mut cursor = parameter_types.walk();
+    Some(parameter_types.named_children(&mut cursor).count())
+}
+
+fn call_parameter_function_arity(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<usize> {
+    let arguments = node.parent()?;
+    if arguments.kind() != "arguments" {
+        return None;
+    }
+    let mut arguments_cursor = arguments.walk();
+    let parameter_index = arguments
+        .named_children(&mut arguments_cursor)
+        .position(|argument| argument == node)?;
+    let call = arguments.parent()?;
+    if call.kind() != "call_expression" || call.child_by_field_name("arguments") != Some(arguments)
+    {
+        return None;
+    }
+
+    let mut parameter_list = 0usize;
+    let mut function = call.child_by_field_name("function")?;
+    while function.kind() == "call_expression" {
+        parameter_list += 1;
+        function = function.child_by_field_name("function")?;
+    }
+    if function.kind() == "generic_function" {
+        function = function.child_by_field_name("function")?;
+    }
+    if !matches!(function.kind(), "identifier" | "operator_identifier") {
+        return None;
+    }
+    let function_name = node_text(function, ctx.source).trim();
+    if function_name.is_empty() || ctx.bindings.is_shadowed(function_name) {
+        return None;
+    }
+    let call_arities = call_arities_for_reference(function)?;
+    let owner = enclosing_owner_fq_name(function, ctx)?;
+    let methods = match ctx.types.bare_member_declarations(
+        ctx.scala,
+        &owner,
+        function_name,
+        Some(&call_arities),
+    ) {
+        BareMemberResolution::Resolved(methods) => methods,
+        BareMemberResolution::NoMatch => {
+            let imported = ctx.name_resolver.resolve_member(function_name)?;
+            ctx.scala
+                .definitions(&imported)
+                .filter(CodeUnit::is_function)
+                .collect()
+        }
+        BareMemberResolution::Unresolved => return None,
+    };
+
+    let mut resolved = None;
+    for method in methods {
+        let arity = ctx.types.callable_parameter_function_arity(
+            ctx.scala,
+            &method,
+            &call_arities,
+            parameter_list,
+            parameter_index,
+        )?;
+        if resolved.is_some_and(|resolved| resolved != arity) {
+            return None;
+        }
+        resolved = Some(arity);
+    }
+    resolved
 }
 
 fn stable_object_expression_fqn(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
@@ -1319,6 +1498,10 @@ fn enclosing_owner_fq_name(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> 
 }
 
 fn member_call_arity_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    member_call_arities_match(call_arities_for_reference(node).as_deref(), ctx)
+}
+
+fn member_call_arities_match(call_arities: Option<&[usize]>, ctx: &ScanCtx<'_>) -> bool {
     if !matches!(ctx.spec.kind, TargetKind::Method | TargetKind::Constructor) {
         return true;
     }
@@ -1336,16 +1519,15 @@ fn member_call_arity_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         return ctx.spec.callable_alternatives.iter().any(|alternative| {
             callable_shape_matches(
                 &alternative.shape,
-                call_arities_for_reference(node).as_deref(),
+                call_arities,
                 ctx.spec.unapplied_reference_is_unambiguous,
             )
         });
     };
-    let call_arities = call_arities_for_reference(node);
     shapes.iter().any(|declared| {
         callable_shape_matches(
             declared,
-            call_arities.as_deref(),
+            call_arities,
             ctx.spec.unapplied_reference_is_unambiguous,
         )
     })

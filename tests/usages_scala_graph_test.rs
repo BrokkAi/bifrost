@@ -1002,6 +1002,161 @@ class BinaryChild extends BinaryBase {
 }
 
 #[test]
+fn scala_inherited_bare_members_use_exact_hierarchy_and_contextual_callable_shape() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "app/Bases.scala",
+            r#"package app
+
+trait ActorBase {
+  def sender(): String = "base"
+}
+
+trait CallbackBase {
+  def transform(value: Int): String = value.toString
+  def transform(value: Int, suffix: String): String = value.toString + suffix
+}
+
+trait ConflictingActor {
+  def sender(): String = "conflict"
+}
+
+trait ConflictingCallbacks {
+  def transform(value: Int): String = "conflict"
+}
+
+trait OtherCallbacks {
+  def transform(value: Int): String = "other"
+}
+"#,
+        ),
+        (
+            "app/Consumers.scala",
+            r#"package app
+
+class GoodConsumer extends ActorBase with CallbackBase {
+  def consume(seed: Int)(callback: Int => String): String = callback(seed)
+
+  val inheritedCall = sender() // positive-inherited-call
+  val inheritedMethodValue = consume(1)(transform) // positive-method-value
+  val inheritedBinaryCall = transform(1, "!") // positive-binary-call
+}
+
+class TraitConflict extends ActorBase with ConflictingActor {
+  val conflicted = sender() // negative-trait-conflict
+}
+
+class CallbackConflict extends CallbackBase with ConflictingCallbacks {
+  def consume(callback: Int => String): String = callback(1)
+  val conflicted = consume(transform) // negative-callback-conflict
+}
+
+class LocalShadow extends ActorBase with CallbackBase {
+  def run(): String = {
+    def sender(): String = "local"
+    sender() // negative-local-shadow
+  }
+
+  def consume(callback: Int => String): String = callback(1)
+  def callback(): String = {
+    def transform(value: Int): String = "local"
+    consume(transform) // negative-method-value-shadow
+  }
+}
+
+class UnrelatedActor {
+  def sender(): String = "unrelated"
+  val value = sender() // negative-unrelated
+}
+
+class OtherOverride extends OtherCallbacks {
+  override def transform(value: Int): String = "override"
+  def consume(callback: Int => String): String = callback(1)
+  val value = consume(transform) // negative-unrelated-override
+}
+
+class SenderOverride extends ActorBase {
+  override def sender(): String = "override"
+  val value = sender() // positive-related-override
+}
+"#,
+        ),
+    ]);
+
+    let sender = definition(&analyzer, "app.ActorBase.sender");
+    let sender_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&sender)));
+    assert_hit_contains(&sender_hits, "sender() // positive-inherited-call");
+    assert_hit_contains(&sender_hits, "sender() // positive-related-override");
+    assert_no_hit_contains(&sender_hits, "negative-trait-conflict");
+    assert_no_hit_contains(&sender_hits, "negative-local-shadow");
+    assert_no_hit_contains(&sender_hits, "negative-unrelated");
+
+    let sender_override = definition(&analyzer, "app.SenderOverride.sender");
+    let override_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&sender_override)),
+    );
+    assert_hit_contains(&override_hits, "sender() // positive-related-override");
+    assert_no_hit_contains(&override_hits, "positive-inherited-call");
+
+    let transform = definition(&analyzer, "app.CallbackBase.transform");
+    let transform_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&transform)));
+    assert_hit_contains(
+        &transform_hits,
+        "consume(1)(transform) // positive-method-value",
+    );
+    assert_hit_contains(
+        &transform_hits,
+        "transform(1, \"!\") // positive-binary-call",
+    );
+    assert_no_hit_contains(&transform_hits, "negative-callback-conflict");
+    assert_no_hit_contains(&transform_hits, "negative-method-value-shadow");
+    assert_no_hit_contains(&transform_hits, "negative-unrelated-override");
+
+    let limited = UsageFinder::new().query(&analyzer, &[transform], 100, 1);
+    assert!(
+        matches!(
+            limited.result,
+            FuzzyResult::TooManyCallsites { limit: 1, .. }
+        ),
+        "inherited bare-member overloads must preserve the query-wide cap"
+    );
+}
+
+#[test]
+fn scala_usage_scan_is_stack_safe_for_deep_lexical_scopes() {
+    std::thread::Builder::new()
+        .name("scala-deep-usage-scan".to_string())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let depth = 1_024;
+            let mut source = String::from(
+                "package app\n\nclass Deep {\n  def ping(): Unit = ()\n  def run(): Unit = ",
+            );
+            for _ in 0..depth {
+                source.push_str("{\n");
+            }
+            source.push_str("ping() // positive-deep-scope\n");
+            for _ in 0..depth {
+                source.push_str("}\n");
+            }
+            source.push_str("}\n");
+
+            let (_project, analyzer) =
+                scala_analyzer_with_files(&[("app/Deep.scala", source.as_str())]);
+            let target = definition(&analyzer, "app.Deep.ping");
+            let hits = hits(
+                UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+            );
+            assert_hit_contains(&hits, "ping() // positive-deep-scope");
+        })
+        .expect("spawn deep Scala usage scan")
+        .join()
+        .expect("deep Scala usage scan must not overflow its small stack");
+}
+
+#[test]
 fn scala_callable_arity_accepts_defaults_and_repeated_parameters() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (
@@ -1674,6 +1829,65 @@ class UnrelatedFactory {
     assert_no_hit_contains(&hits, "negative-return");
     assert_no_hit_contains(&hits, "negative-local-shadow");
     assert_no_hit_contains(&hits, "negative-unrelated");
+}
+
+#[test]
+fn scala_nested_mixin_factory_receiver_survives_while_reassignment() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "queue/Messages.scala",
+            r#"package queue
+
+class LatestMessages
+class Messages {
+  def nonEmpty: Boolean = true
+  def tail: Messages = new Messages
+}
+
+trait SystemQueue { self: Mailbox =>
+  def systemDrain(seed: LatestMessages): Messages = new Messages
+}
+
+class Mailbox
+"#,
+        ),
+        (
+            "app/Dispatcher.scala",
+            r#"package app
+
+import queue.{LatestMessages, Mailbox, SystemQueue}
+
+class Dispatcher {
+  private class SharingMailbox extends Mailbox with SystemQueue {
+    def cleanUp(): Unit = {
+      var messages = systemDrain(new LatestMessages)
+      while (messages.nonEmpty) {
+        messages = messages.tail // positive-nested-mixin-reassignment
+      }
+    }
+  }
+}
+"#,
+        ),
+    ]);
+
+    let tail = definition(&analyzer, "queue.Messages.tail");
+    let tail_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&tail)));
+    assert_hit_contains(
+        &tail_hits,
+        "messages = messages.tail // positive-nested-mixin-reassignment",
+    );
+
+    let drain = definition(&analyzer, "queue.SystemQueue.systemDrain");
+    let drain_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&drain)));
+    assert_hit_contains(&drain_hits, "systemDrain(new LatestMessages)");
+
+    let non_empty = definition(&analyzer, "queue.Messages.nonEmpty");
+    let non_empty_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&non_empty)));
+    assert_hit_contains(&non_empty_hits, "while (messages.nonEmpty)");
 }
 
 #[test]
