@@ -342,6 +342,22 @@ fn javascript_scoped_gaps_and_class_field_arrow_name_are_source_backed() {
                     using resource = acquire();
                 }
 
+                function resourceItems() {
+                    return [];
+                }
+
+                function useEach() {
+                    for (using resource of resourceItems()) {
+                        consume(resource);
+                    }
+                }
+
+                async function useEachAsync() {
+                    for await (using resource of resourceItems()) {
+                        consume(resource);
+                    }
+                }
+
                 function* values() {
                     yield 1;
                 }
@@ -368,6 +384,41 @@ fn javascript_scoped_gaps_and_class_field_arrow_name_are_source_backed() {
                 .effect("gap"),
         )
         .bind(
+            "acquire_continuation",
+            PointSelector::new("acquire()")
+                .procedure("resources")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "for_using_items_continuation",
+            PointSelector::new("resourceItems()")
+                .procedure("useEach")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "for_using_gap",
+            PointSelector::new("for (using resource of resourceItems())")
+                .procedure("useEach")
+                .effect("gap")
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "for_await_using_items_continuation",
+            PointSelector::new("resourceItems()")
+                .procedure("useEachAsync")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "for_await_using_gap",
+            PointSelector::new("for await (using resource of resourceItems())")
+                .procedure("useEachAsync")
+                .effect("gap")
+                .anchor_occurrence(1),
+        )
+        .bind(
             "yield_gap",
             PointSelector::new("yield 1")
                 .procedure("values")
@@ -389,6 +440,33 @@ fn javascript_scoped_gaps_and_class_field_arrow_name_are_source_backed() {
         SemanticCapability::ResourceManagement,
         SemanticGapKind::Unsupported,
     );
+    graph.assert_successors(
+        "acquire_continuation",
+        &[cfg_edge("using_gap", ControlEdgeKind::Normal)],
+    );
+    graph.assert_point_gap(
+        "for_using_gap",
+        SemanticCapability::ResourceManagement,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_successors(
+        "for_using_items_continuation",
+        &[cfg_edge("for_using_gap", ControlEdgeKind::Normal)],
+    );
+    graph.assert_point_gap(
+        "for_await_using_gap",
+        SemanticCapability::ResourceManagement,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_point_gap(
+        "for_await_using_gap",
+        SemanticCapability::AsyncSuspendResume,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_successors(
+        "for_await_using_items_continuation",
+        &[cfg_edge("for_await_using_gap", ControlEdgeKind::Normal)],
+    );
     graph.assert_point_gap(
         "yield_gap",
         SemanticCapability::GeneratorSuspension,
@@ -400,6 +478,8 @@ fn javascript_scoped_gaps_and_class_field_arrow_name_are_source_backed() {
         SemanticGapKind::Unsupported,
     );
     graph.assert_successors("using_gap", &[]);
+    graph.assert_successors("for_using_gap", &[]);
+    graph.assert_successors("for_await_using_gap", &[]);
     graph.assert_successors("yield_gap", &[]);
     graph.assert_adjacency_symmetric();
 
