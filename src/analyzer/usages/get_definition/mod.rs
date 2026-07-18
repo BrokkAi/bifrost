@@ -4,12 +4,12 @@ use crate::analyzer::lexical_definitions::{
 };
 use crate::analyzer::usages::cpp_graph::{
     CppDesignatedInitializerOwner, CppLexicalScopeResolution, CppLexicalTypeResolution,
-    CppTargetKind, CppVisibilityIndex, cpp_call_arity, cpp_constructor_type_node,
-    cpp_designated_initializer_owner, cpp_enclosing_lexical_scope_components,
-    cpp_field_declared_type_text, cpp_first_type_child, cpp_function_return_type_text,
-    cpp_is_declaration_name, cpp_is_declarator_node, cpp_name_for, cpp_reference_fqn_candidates,
-    cpp_signature_arity, cpp_split_top_level_commas, extract_variable_name,
-    normalize_cpp_type_text,
+    CppTargetKind, CppVisibilityIndex, cpp_argument_children, cpp_call_arity,
+    cpp_constructor_type_node, cpp_designated_initializer_owner,
+    cpp_enclosing_lexical_scope_components, cpp_field_declared_type_text, cpp_first_type_child,
+    cpp_function_return_type_text, cpp_is_declaration_name, cpp_is_declarator_node, cpp_name_for,
+    cpp_reference_fqn_candidates, cpp_signature_arity, cpp_split_top_level_commas,
+    extract_variable_name, normalize_cpp_type_text,
 };
 use crate::analyzer::usages::csharp_graph::{
     csharp_argument_count, csharp_first_type_child, csharp_is_declaration_name,

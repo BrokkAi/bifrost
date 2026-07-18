@@ -2174,8 +2174,16 @@ pub(in crate::analyzer::usages) fn call_arity(node: Node<'_>) -> usize {
         .or_else(|| node.child_by_field_name("value"))
         .or_else(|| first_named_child_of_kind(node, "argument_list"))
         .or_else(|| first_named_child_of_kind(node, "initializer_list"))
-        .map(|args| args.named_child_count())
+        .map(|args| argument_children(args).count())
         .unwrap_or(0)
+}
+
+pub(in crate::analyzer::usages) fn argument_children<'tree>(
+    node: Node<'tree>,
+) -> impl Iterator<Item = Node<'tree>> {
+    (0..node.child_count())
+        .filter_map(move |index| node.child(index))
+        .filter(|child| child.is_named() && !child.is_extra())
 }
 
 pub(in crate::analyzer::usages) fn constructor_type_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -2586,7 +2594,7 @@ pub(super) fn declaration_constructor_arity(node: Node<'_>, _ctx: &ScanCtx<'_>) 
 
 fn declaration_init_value_arity(value: Node<'_>) -> usize {
     match value.kind() {
-        "argument_list" | "initializer_list" => count_non_comment_named_children(value),
+        "argument_list" | "initializer_list" => argument_children(value).count(),
         "compound_literal_expression" => call_arity(value),
         _ => 1,
     }
@@ -2594,18 +2602,11 @@ fn declaration_init_value_arity(value: Node<'_>) -> usize {
 
 fn declaration_declarator_arity(node: Node<'_>) -> usize {
     if let Some(parameters) = node.child_by_field_name("parameters") {
-        return count_non_comment_named_children(parameters);
+        return argument_children(parameters).count();
     }
     node.child_by_field_name("declarator")
         .map(declaration_declarator_arity)
         .unwrap_or(0)
-}
-
-fn count_non_comment_named_children(node: Node<'_>) -> usize {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .filter(|child| child.kind() != "comment")
-        .count()
 }
 
 fn first_named_child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {

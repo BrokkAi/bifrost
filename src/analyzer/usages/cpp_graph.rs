@@ -25,9 +25,9 @@ pub(in crate::analyzer::usages) use extractor::{
 pub(in crate::analyzer::usages) use resolver::{
     DesignatedInitializerOwner as CppDesignatedInitializerOwner,
     LexicalTypeResolution as CppLexicalTypeResolution, TargetKind as CppTargetKind,
-    VisibilityIndex as CppVisibilityIndex, call_arity as cpp_call_arity,
-    constructor_type_node as cpp_constructor_type_node, cpp_function_return_type_text,
-    cpp_name_for, cpp_reference_fqn_candidates,
+    VisibilityIndex as CppVisibilityIndex, argument_children as cpp_argument_children,
+    call_arity as cpp_call_arity, constructor_type_node as cpp_constructor_type_node,
+    cpp_function_return_type_text, cpp_name_for, cpp_reference_fqn_candidates,
     designated_initializer_owner as cpp_designated_initializer_owner, extract_variable_name,
     field_declared_type_text as cpp_field_declared_type_text,
     first_type_child as cpp_first_type_child, is_declaration_name as cpp_is_declaration_name,

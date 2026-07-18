@@ -1507,9 +1507,8 @@ fn cpp_call_argument_types(
         .child_by_field_name("arguments")
         .or_else(|| call.child_by_field_name("parameters"))
         .or_else(|| call.child_by_field_name("value"))?;
-    let mut cursor = args.walk();
     Some(
-        args.named_children(&mut cursor)
+        cpp_argument_children(args)
             .map(|arg| cpp_expression_type(analyzer, support, visibility, file, source, root, arg))
             .collect(),
     )

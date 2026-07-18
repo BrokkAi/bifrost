@@ -10133,3 +10133,224 @@ void consume() {
         "a directly queried mutually cyclic right alias must fail closed"
     );
 }
+
+#[test]
+fn authoritative_cpp_call_arguments_ignore_named_comment_extras() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "histogram_tester.h",
+            r#"#pragma once
+namespace base {
+class HistogramTester {
+public:
+    void ExpectUniqueSample(const char* name, int sample, int count, int flags = 0);
+    template <typename Sample>
+    void ExpectUniqueSample(const char* name, Sample sample, int count, int flags = 0);
+    void RecordVariadic(const char* name, int sample, ...);
+    void Select(int value);
+    void Select(double value);
+};
+class WrongOwner {
+public:
+    void ExpectUniqueSample(const char* name, int sample, int count, int flags = 0);
+};
+}
+"#,
+        )
+        .file(
+            "histogram_tester.cc",
+            r#"#include "histogram_tester.h"
+namespace base {
+void HistogramTester::ExpectUniqueSample(const char* name, int sample, int count, int flags) {}
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "histogram_tester.h"
+namespace demo {
+void exercise(base::HistogramTester& tester, base::WrongOwner& wrong) {
+    tester.ExpectUniqueSample("default-zero", 1, 1); // positive-default-zero-comments
+    tester.ExpectUniqueSample("default-one", /* sample */ 2, 1); // positive-default-one-comment
+    tester.ExpectUniqueSample("default-two", /* sample */ 3, /* count */ 1); // positive-default-two-comments
+    tester.ExpectUniqueSample("explicit-zero", 4, 1, 0); // positive-explicit-zero-comments
+    tester.ExpectUniqueSample("explicit-one", /* sample */ 5, 1, 0); // positive-explicit-one-comment
+    tester.ExpectUniqueSample("explicit-two", /* sample */ 6, /* count */ 1, 0); // positive-explicit-two-comments
+    tester.ExpectUniqueSample("too-many", 7, 1, 0, 9); // negative-genuine-over-arity
+    wrong.ExpectUniqueSample("wrong-owner", 8, 1); // negative-wrong-owner
+
+    tester.RecordVariadic("fixed", /* sample */ 9); // positive-variadic-fixed
+    tester.RecordVariadic("extra", /* sample */ 10, /* extra */ 11, 12); // positive-variadic-extra
+    tester.RecordVariadic(/* name only */ "missing"); // negative-variadic-under-arity
+
+    tester.Select(/* integer */ 13); // positive-known-int-overload
+    tester.Select(/* floating */ 13.5); // negative-known-double-overload
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("commented call source");
+
+    let expect_targets = analyzer
+        .get_all_declarations()
+        .iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Function
+                && unit.fq_name() == "base.HistogramTester.ExpectUniqueSample"
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        3,
+        expect_targets.len(),
+        "fixture must retain the concrete header declaration, template declaration, and out-of-line definition: {expect_targets:#?}"
+    );
+    let expected_expect = [
+        "    tester.ExpectUniqueSample(\"default-zero\", 1, 1); // positive-default-zero-comments",
+        "    tester.ExpectUniqueSample(\"default-one\", /* sample */ 2, 1); // positive-default-one-comment",
+        "    tester.ExpectUniqueSample(\"default-two\", /* sample */ 3, /* count */ 1); // positive-default-two-comments",
+        "    tester.ExpectUniqueSample(\"explicit-zero\", 4, 1, 0); // positive-explicit-zero-comments",
+        "    tester.ExpectUniqueSample(\"explicit-one\", /* sample */ 5, 1, 0); // positive-explicit-one-comment",
+        "    tester.ExpectUniqueSample(\"explicit-two\", /* sample */ 6, /* count */ 1, 0); // positive-explicit-two-comments",
+    ]
+    .map(|line| fixture_token_range(&source, line, "ExpectUniqueSample"))
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+
+    let forward_at = |start: usize| {
+        let line_start = source[..start].rfind('\n').map_or(0, |newline| newline + 1);
+        let line = source[..start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let column = source[line_start..start].chars().count() + 1;
+        brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "consumer.cc".to_string(),
+                    line: Some(line),
+                    column: Some(column),
+                }],
+            },
+        )
+        .results
+        .into_iter()
+        .next()
+        .expect("one forward lookup result")
+    };
+    let production_like = fixture_token_range(
+        &source,
+        "    tester.ExpectUniqueSample(\"default-two\", /* sample */ 3, /* count */ 1); // positive-default-two-comments",
+        "ExpectUniqueSample",
+    );
+    let forward = forward_at(production_like.0);
+    assert_eq!("resolved", forward.status, "{forward:#?}");
+    let matching_forward = forward
+        .definitions
+        .iter()
+        .filter(|definition| {
+            definition.fqn.as_deref() == Some("base.HistogramTester.ExpectUniqueSample")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        3,
+        matching_forward.len(),
+        "forward lookup must retain both header declarations and the out-of-line definition: {forward:#?}"
+    );
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let expect_query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(&analyzer, &expect_targets, Some(&provider), 1, 1000);
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = expect_query.result
+    else {
+        panic!("expected authoritative commented-argument success");
+    };
+    let targeted_expect = hits_by_overload
+        .values()
+        .flatten()
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(targeted_expect, expected_expect, "{hits_by_overload:#?}");
+    assert!(
+        unproven_total_by_overload.values().all(|count| *count == 0),
+        "over-arity and wrong-owner controls must be proven exclusions: {unproven_total_by_overload:#?}"
+    );
+
+    let whole_expect = UsageFinder::new().find_usages_default(&analyzer, &expect_targets);
+    let whole_expect_ranges = whole_expect
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == consumer)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(whole_expect_ranges, expected_expect);
+
+    let variadic = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "base.HistogramTester.RecordVariadic"
+    });
+    let expected_variadic = [
+        "    tester.RecordVariadic(\"fixed\", /* sample */ 9); // positive-variadic-fixed",
+        "    tester.RecordVariadic(\"extra\", /* sample */ 10, /* extra */ 11, 12); // positive-variadic-extra",
+    ]
+    .map(|line| fixture_token_range(&source, line, "RecordVariadic"))
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&variadic), &consumer),
+        expected_variadic
+    );
+    let whole_variadic = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&variadic))
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == consumer)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(whole_variadic, expected_variadic);
+
+    let select_int = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "base.HistogramTester.Select"
+            && unit
+                .signature()
+                .is_some_and(|signature| signature.contains("int"))
+    });
+    let int_range = fixture_token_range(
+        &source,
+        "    tester.Select(/* integer */ 13); // positive-known-int-overload",
+        "Select",
+    );
+    let select_forward = forward_at(int_range.0);
+    assert_eq!("resolved", select_forward.status, "{select_forward:#?}");
+    assert_eq!(
+        1,
+        select_forward.definitions.len(),
+        "the commented int call must select exactly one overload: {select_forward:#?}"
+    );
+    assert!(
+        select_forward.definitions.iter().all(|definition| {
+            definition.fqn.as_deref() == Some("base.HistogramTester.Select")
+                && definition
+                    .signature
+                    .as_deref()
+                    .is_some_and(|signature| signature.contains("int"))
+        }),
+        "comment extras must not shift known argument types during forward overload selection: {select_forward:#?}"
+    );
+    assert_eq!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&select_int), &consumer),
+        BTreeSet::from([int_range])
+    );
+}

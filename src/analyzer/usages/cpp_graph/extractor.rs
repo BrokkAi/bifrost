@@ -848,8 +848,7 @@ fn call_argument_types(call: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Option<CppArgTy
     else {
         return Vec::new();
     };
-    let mut cursor = args.walk();
-    args.named_children(&mut cursor)
+    argument_children(args)
         .map(|arg| expression_arg_type(arg, ctx))
         .collect()
 }
