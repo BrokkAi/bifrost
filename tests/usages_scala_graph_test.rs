@@ -2496,6 +2496,13 @@ object Plain {
 object LexicalCollision {
   def apply(value: Int): Other = new Other
 }
+object NestedFactory {
+  final class Settings private (val value: Int)
+  object Settings {
+    def apply(value: Int): Settings = new Settings(value)
+  }
+  val nested = Settings(8) // positive-nested-apply
+}
 trait Growable {
   def +=(value: Int): Unit
 }
@@ -2539,6 +2546,11 @@ class NestedWins {
         ("model.Zero", "positive-zero-arity"),
         ("model.Growable.+=", "positive-infix"),
         ("model.Plain$.apply", "positive-other-return-apply"),
+        ("model.NestedFactory$.Settings", "positive-nested-apply"),
+        (
+            "model.NestedFactory$.Settings$.apply",
+            "positive-nested-apply",
+        ),
         (
             "app.NestedWins.LexicalCollision",
             "positive-lexical-collision",
@@ -2551,7 +2563,10 @@ class NestedWins {
         let target = definition(&analyzer, target);
         let target_hits =
             hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
-        assert_hit_contains(&target_hits, expected);
+        assert!(
+            target_hits.iter().any(|hit| hit.snippet.contains(expected)),
+            "{target:?} missing {expected:?}: {target_hits:#?}"
+        );
         assert_no_hit_contains(&target_hits, "negative-same-name-member");
     }
 

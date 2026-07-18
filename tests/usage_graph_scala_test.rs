@@ -824,6 +824,11 @@ class Other
 class Plain(val value: Int)
 object Plain { def apply(value: Int): Other = new Other }
 object LexicalCollision { def apply(value: Int): Other = new Other }
+object NestedFactory {
+  final class Settings private (val value: Int)
+  object Settings { def apply(value: Int): Settings = new Settings(value) }
+  def nested = Settings(8)
+}
 trait Growable { def +=(value: Int): Unit }
 "#,
         )
@@ -865,6 +870,14 @@ class NestedWins {
         ("app.Use$.grow", "model.Growable.+="),
         ("app.LocalWins.value", "app.LocalWins.Projected"),
         ("app.NestedWins.value", "app.NestedWins.LexicalCollision"),
+        (
+            "model.NestedFactory$.nested",
+            "model.NestedFactory$.Settings",
+        ),
+        (
+            "model.NestedFactory$.nested",
+            "model.NestedFactory$.Settings$.apply",
+        ),
     ] {
         assert!(
             has_edge(&value, caller, callee),

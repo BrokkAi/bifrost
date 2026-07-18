@@ -958,6 +958,55 @@ impl ProjectTypes {
             .map(CodeUnit::fq_name)
     }
 
+    fn resolve_type_in_callable_declaration_context(
+        &self,
+        scala: &ScalaAnalyzer,
+        resolver: &NameResolver,
+        declaration: &CodeUnit,
+        segments: &[String],
+    ) -> Option<String> {
+        let (first, rest) = segments.split_first()?;
+        let mut scope = scala
+            .structural_parent_of(declaration)
+            .or_else(|| scala.parent_of(declaration));
+        let mut seen = HashSet::default();
+        while let Some(owner) = scope {
+            if !seen.insert(owner.clone()) {
+                break;
+            }
+            let lexical_root = (owner.is_class() && scala_simple_type_name(&owner) == *first)
+                .then(|| {
+                    self.type_by_normalized_fqn(&scala_normalized_fq_name(&owner.fq_name()))
+                        .map(CodeUnit::fq_name)
+                })
+                .flatten()
+                .or_else(|| self.exact_nested_type(&owner.fq_name(), first));
+            if let Some(mut resolved) = lexical_root {
+                let mut complete = true;
+                for segment in rest {
+                    let candidate = format!("{resolved}.{segment}");
+                    let Some(nested) = preferred_scala_type(
+                        self.index
+                            .by_fqn(&candidate)
+                            .iter()
+                            .filter(|unit| unit.is_class()),
+                    ) else {
+                        complete = false;
+                        break;
+                    };
+                    resolved = nested.fq_name();
+                }
+                if complete {
+                    return Some(resolved);
+                }
+            }
+            scope = scala
+                .structural_parent_of(&owner)
+                .or_else(|| scala.parent_of(&owner));
+        }
+        self.resolve_type_in_declaration_context(resolver, segments)
+    }
+
     fn resolve_type_in_owner_context(
         &self,
         resolver: &NameResolver,
@@ -1276,14 +1325,18 @@ impl ProjectTypes {
                                 .extension_receiver_type_path
                                 .as_deref()
                                 .and_then(|segments| {
-                                    self.resolve_type_in_declaration_context(
+                                    self.resolve_type_in_callable_declaration_context(
+                                        scala,
                                         &declaration_resolver,
+                                        target,
                                         segments,
                                     )
                                 }),
                             return_type: facts.return_type_path.as_deref().and_then(|segments| {
-                                self.resolve_type_in_declaration_context(
+                                self.resolve_type_in_callable_declaration_context(
+                                    scala,
                                     &declaration_resolver,
+                                    target,
                                     segments,
                                 )
                             }),

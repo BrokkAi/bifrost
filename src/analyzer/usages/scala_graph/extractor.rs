@@ -334,7 +334,13 @@ fn companion_apply_call_is_proven(function: Node<'_>, text: &str, ctx: &ScanCtx<
                     .is_some_and(|owner| ctx.spec.owner_fq_matches(owner))
                     || nested_target_owner_is_lexically_visible(function, ctx)
             },
-            |lexical_type| ctx.spec.owner_fq_matches(&lexical_type),
+            |lexical_type| {
+                ctx.spec.owner_fq_matches(&lexical_type)
+                    || ctx.spec.owner.as_ref().is_some_and(|owner| {
+                        scala_normalized_fq_name(&owner.fq_name())
+                            == scala_normalized_fq_name(&lexical_type)
+                    })
+            },
         )
 }
 
@@ -1277,15 +1283,18 @@ fn bare_call_is_claimed_by_enclosing_member(node: Node<'_>, text: &str, ctx: &Sc
     let Some(owner) = enclosing_owner_fq_name(node, ctx) else {
         return false;
     };
-    !matches!(
-        ctx.types.bare_member_declarations(
-            ctx.scala,
-            &owner,
-            text,
-            call_arities_for_reference(node).as_deref(),
-        ),
-        BareMemberResolution::NoMatch
-    )
+    match ctx.types.bare_member_declarations(
+        ctx.scala,
+        &owner,
+        text,
+        call_arities_for_reference(node).as_deref(),
+    ) {
+        BareMemberResolution::Resolved(methods) => {
+            methods.iter().any(|method| !method.is_synthetic())
+        }
+        BareMemberResolution::Unresolved => true,
+        BareMemberResolution::NoMatch => false,
+    }
 }
 
 fn seed_value_binding_identifier(node: Node<'_>, text: &str, ctx: &mut ScanCtx<'_>) -> bool {
