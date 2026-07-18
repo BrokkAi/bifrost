@@ -123,16 +123,23 @@ Selections are stored in separate canonical-workspace files under
 `<Pi agent directory>/bifrost/workspaces/` (normally
 `~/.pi/agent/bifrost/workspaces/`), so they survive new sessions without
 adding configuration to the repository or making concurrent workspaces rewrite
-the same settings document.
+the same settings document. If a settings file is malformed, interactive Pi
+reports the problem and starts with Bifrost disabled so `/bifrost` can repair
+the selection. Pi modes without a UI context report the failure through the
+extension error path and leave Bifrost unstarted instead of silently enabling
+defaults; Pi itself can continue without Bifrost.
 
 Changing a capability may restart the Bifrost child when it requires another
 existing MCP server toolset. Tools discovered earlier remain registered with Pi
-but are removed from Pi's active tool set when disabled. A failed change leaves
-the prior connection and saved selection active. In interactive Pi, startup,
-reconnect, and background connection failures use Pi's error notifications; in
-noninteractive modes, startup failures use Pi's extension error path. The
-extension does not write directly into the TUI with `console.log` or
-`console.error`.
+but are removed from Pi's active tool set when disabled or rejected by Pi's
+command-line tool filters. The namespace note is omitted when Pi accepts no
+Bifrost tools. A failed change before connection retirement leaves the prior
+connection and saved selection active. If retiring that connection fails, the
+saved selection remains but Bifrost tools are disabled because cleanup could
+not be confirmed. In interactive Pi, startup, reconnect, and background
+connection failures use Pi's error notifications; in modes without a UI
+context, startup failures use Pi's extension error path. The extension does not
+write directly into the TUI with `console.log` or `console.error`.
 
 Tool calls time out after 300 seconds; startup times out after 60 seconds.
 Cancellation stops the Pi request promptly, though the current Bifrost stdio

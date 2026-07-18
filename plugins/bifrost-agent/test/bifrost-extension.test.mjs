@@ -38,11 +38,23 @@ function fakeSession(overrides = {}) {
     applied,
     async start(workspace, capabilities) {
       starts.push({ workspace, capabilities: [...capabilities] });
+      status = {
+        ...status,
+        state: capabilities.length > 0 ? "connected" : "disconnected",
+        workspace,
+        toolCount: capabilities.length > 0 ? status.toolCount : 0,
+        capabilities: [...capabilities],
+      };
       return true;
     },
     async applySelection(capabilities) {
       applied.push([...capabilities]);
-      status = { ...status, capabilities: [...capabilities] };
+      status = {
+        ...status,
+        state: capabilities.length > 0 ? "connected" : "disconnected",
+        toolCount: capabilities.length > 0 ? status.toolCount : 0,
+        capabilities: [...capabilities],
+      };
       return true;
     },
     async shutdown() {},
@@ -96,6 +108,63 @@ test("restores workspace settings and injects only the short Pi namespace note",
 
   session.setStatus({ state: "disconnected", workspace: "/workspace", toolCount: 0, capabilities: [] });
   assert.equal(await pi.handlers.get("before_agent_start")({ systemPrompt: "base" }), undefined);
+  session.setStatus({ state: "connected", workspace: "/workspace", toolCount: 0, capabilities: ["symbols"] });
+  assert.equal(await pi.handlers.get("before_agent_start")({ systemPrompt: "base" }), undefined);
+});
+
+test("malformed settings fail closed with a TUI diagnostic", async () => {
+  const pi = fakePi();
+  const session = fakeSession();
+  const settingsError = new Error("settings JSON is malformed");
+  configureBifrostExtension(pi, {
+    createSession: () => session,
+    settingsStore: {
+      async load() { throw settingsError; },
+      async save() {},
+    },
+  });
+  const notifications = [];
+
+  await pi.handlers.get("session_start")({}, {
+    cwd: "/workspace",
+    hasUI: true,
+    ui: { notify: (...args) => notifications.push(args) },
+  });
+
+  assert.deepEqual(session.starts, [{ workspace: "/workspace", capabilities: [] }]);
+  assert.equal(session.status().state, "disconnected");
+  assert.equal(
+    await pi.handlers.get("before_agent_start")({ systemPrompt: "base" }),
+    undefined,
+  );
+  assert.deepEqual(notifications, [[
+    "Could not load Bifrost settings. Bifrost tools are disabled until the settings are updated.",
+    "error",
+  ]]);
+});
+
+test("malformed settings throw before Bifrost starts in headless mode", async () => {
+  const pi = fakePi();
+  const session = fakeSession();
+  const settingsError = new Error("settings JSON is malformed");
+  configureBifrostExtension(pi, {
+    createSession: () => session,
+    settingsStore: {
+      async load() { throw settingsError; },
+      async save() {},
+    },
+  });
+
+  await assert.rejects(
+    pi.handlers.get("session_start")({}, {
+      cwd: "/workspace",
+      hasUI: false,
+      ui: { notify() {} },
+    }),
+    (error) => error.message === "Could not load Bifrost settings. Bifrost tools are disabled until the settings are updated."
+      && error.cause === settingsError,
+  );
+  assert.deepEqual(session.starts, []);
 });
 
 test("routes background session failures through Pi UI notifications", async () => {
@@ -114,6 +183,41 @@ test("routes background session failures through Pi UI notifications", async () 
   assert.deepEqual(notifications, [["Bifrost connection failed.", "error"]]);
 });
 
+test("session_shutdown reports cleanup failure through Pi UI when interactive", async () => {
+  const pi = fakePi();
+  const cleanupError = new Error("Bifrost MCP cleanup failed.", { cause: new Error("close failed") });
+  const session = fakeSession({
+    async shutdown() { throw cleanupError; },
+  });
+  configureBifrostExtension(pi, dependencies(session));
+  const notifications = [];
+  await pi.handlers.get("session_start")({}, {
+    cwd: "/workspace",
+    hasUI: true,
+    ui: { notify: (...args) => notifications.push(args) },
+  });
+
+  await pi.handlers.get("session_shutdown")();
+
+  assert.deepEqual(notifications, [["Bifrost MCP cleanup failed.", "error"]]);
+});
+
+test("session_shutdown throws cleanup failure in noninteractive mode", async () => {
+  const pi = fakePi();
+  const cleanupError = new Error("Bifrost MCP cleanup failed.", { cause: new Error("close failed") });
+  const session = fakeSession({
+    async shutdown() { throw cleanupError; },
+  });
+  configureBifrostExtension(pi, dependencies(session));
+  await pi.handlers.get("session_start")({}, {
+    cwd: "/workspace",
+    hasUI: false,
+    ui: { notify() {} },
+  });
+
+  await assert.rejects(pi.handlers.get("session_shutdown")(), (error) => error === cleanupError);
+});
+
 test("session_start reports a startup failure through Pi UI when interactive", async () => {
   const pi = fakePi();
   const startupError = new Error("Bifrost MCP configuration failed.", { cause: new Error("handshake failed") });
@@ -124,7 +228,7 @@ test("session_start reports a startup failure through Pi UI when interactive", a
         workspace: "/workspace",
         toolCount: 0,
         capabilities: [],
-        error: startupError,
+        lastOperationError: startupError,
       });
       return false;
     },
@@ -152,7 +256,7 @@ test("session_start throws the structured startup error in noninteractive mode",
         workspace: "/workspace",
         toolCount: 0,
         capabilities: [],
-        error: startupError,
+        lastOperationError: startupError,
       });
       return false;
     },
@@ -215,6 +319,205 @@ test("/bifrost applies and persists a TUI toggle", async () => {
 
   assert.deepEqual(session.applied, [["query", "files"]]);
   assert.deepEqual(saves, [{ workspace: "/workspace", capabilities: ["query", "files"] }]);
+});
+
+test("/bifrost builds a retry from desired capabilities retained after startup failure", async () => {
+  initTheme("dark", false);
+  const pi = fakePi();
+  const session = fakeSession();
+  session.setStatus({
+    state: "error",
+    workspace: "/workspace",
+    toolCount: 0,
+    capabilities: ["symbols", "query", "files"],
+    lastOperationError: new Error("startup failed"),
+  });
+  const saves = [];
+  configureBifrostExtension(pi, dependencies(session, undefined, saves));
+
+  await pi.commands.get("bifrost").handler("", {
+    mode: "tui",
+    ui: {
+      notify() {},
+      async custom(factory) {
+        const component = factory(
+          { requestRender() {} },
+          theme,
+          {},
+          () => {},
+        );
+        component.handleInput(" ");
+      },
+    },
+  });
+
+  assert.deepEqual(session.applied, [["query", "files"]]);
+  assert.deepEqual(saves, [{ workspace: "/workspace", capabilities: ["query", "files"] }]);
+});
+
+test("/bifrost refreshes its header after disconnect and recovery", async () => {
+  initTheme("dark", false);
+  const pi = fakePi();
+  const session = fakeSession();
+  session.setStatus({
+    state: "connected",
+    workspace: "/workspace",
+    toolCount: 1,
+    capabilities: ["symbols"],
+  });
+  configureBifrostExtension(pi, dependencies(session));
+  let lastRender = "";
+
+  const invoke = async () => {
+    await pi.commands.get("bifrost").handler("", {
+      mode: "tui",
+      ui: {
+        notify() {},
+        async custom(factory) {
+          let component;
+          const tui = {
+            requestRender() {
+              if (component) {
+                lastRender = component.render(100).join("\n");
+              }
+            },
+          };
+          component = factory(tui, theme, {}, () => {});
+          component.handleInput(" ");
+        },
+      },
+    });
+  };
+
+  await invoke();
+  assert.match(lastRender, /disconnected · \/workspace/);
+
+  session.setStatus({
+    state: "error",
+    workspace: "/workspace",
+    toolCount: 0,
+    capabilities: [],
+    lastOperationError: new Error("connection failed"),
+  });
+  await invoke();
+  assert.match(lastRender, /connected · \/workspace/);
+});
+
+test("/bifrost reads live session status on every render", async () => {
+  initTheme("dark", false);
+  const pi = fakePi();
+  const session = fakeSession();
+  configureBifrostExtension(pi, dependencies(session));
+  let rerendered = "";
+
+  await pi.commands.get("bifrost").handler("", {
+    mode: "tui",
+    ui: {
+      notify() {},
+      async custom(factory) {
+        const component = factory({ requestRender() {} }, theme, {}, () => {});
+        assert.match(component.render(100).join("\n"), /connected · \/workspace/);
+        session.setStatus({
+          state: "error",
+          workspace: "/workspace",
+          toolCount: 0,
+          capabilities: ["symbols", "query", "files"],
+          lastOperationError: new Error("connection closed"),
+        });
+        rerendered = component.render(100).join("\n");
+      },
+    },
+  });
+
+  assert.match(rerendered, /error · \/workspace/);
+});
+
+test("/bifrost refreshes its header after a failed apply", async () => {
+  initTheme("dark", false);
+  const pi = fakePi();
+  const session = fakeSession();
+  session.setStatus({
+    state: "connecting",
+    workspace: "/workspace",
+    toolCount: 0,
+    capabilities: ["symbols"],
+  });
+  session.applySelection = async () => {
+    session.setStatus({
+      state: "error",
+      workspace: "/workspace",
+      toolCount: 0,
+      capabilities: ["symbols"],
+      lastOperationError: new Error("apply failed"),
+    });
+    return false;
+  };
+  configureBifrostExtension(pi, dependencies(session));
+  let lastRender = "";
+
+  await pi.commands.get("bifrost").handler("", {
+    mode: "tui",
+    ui: {
+      notify() {},
+      async custom(factory) {
+        let component;
+        const tui = {
+          requestRender() {
+            if (component) {
+              lastRender = component.render(100).join("\n");
+            }
+          },
+        };
+        component = factory(tui, theme, {}, () => {});
+        component.handleInput(" ");
+      },
+    },
+  });
+
+  assert.match(lastRender, /error · \/workspace/);
+});
+
+test("/bifrost refreshes its header after persistence rollback", async () => {
+  initTheme("dark", false);
+  const pi = fakePi();
+  const session = fakeSession();
+  session.setStatus({
+    state: "error",
+    workspace: "/workspace",
+    toolCount: 0,
+    capabilities: [],
+    lastOperationError: new Error("startup failed"),
+  });
+  configureBifrostExtension(pi, {
+    createSession: () => session,
+    settingsStore: {
+      async load() { return undefined; },
+      async save() { throw new Error("disk is read-only"); },
+    },
+  });
+  let lastRender = "";
+
+  await pi.commands.get("bifrost").handler("", {
+    mode: "tui",
+    ui: {
+      notify() {},
+      async custom(factory) {
+        let component;
+        const tui = {
+          requestRender() {
+            if (component) {
+              lastRender = component.render(100).join("\n");
+            }
+          },
+        };
+        component = factory(tui, theme, {}, () => {});
+        component.handleInput(" ");
+      },
+    },
+  });
+
+  assert.deepEqual(session.applied, [["symbols"], []]);
+  assert.match(lastRender, /disconnected · \/workspace/);
 });
 
 test("/bifrost applies queued toggles from committed state after an earlier failure", async () => {

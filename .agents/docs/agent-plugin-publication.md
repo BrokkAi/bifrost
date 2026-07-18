@@ -120,11 +120,14 @@ release binaries do not include the `nlp` feature. Per-workspace
 selections live in independent hashed files under the Pi agent directory at
 `bifrost/workspaces/`, not in the analyzed repository. Separate files prevent
 concurrent Pi sessions for different workspaces from losing each other's
-settings. Route interactive extension failures through the current `ExtensionContext`
-with `ctx.ui.notify(..., "error")`, and throw startup errors through Pi's
-extension runner in noninteractive modes. Never use `console.log` or
-`console.error` from the Pi extension because direct terminal writes corrupt or
-displace TUI output.
+settings. Malformed settings fail closed: notify and start disabled when Pi supplies a UI
+context, but throw before Bifrost starts in modes without one. Pi's post-filter
+active tool set, not the requested names, determines the Bifrost tool count and whether
+the namespace prompt note appears. Route interactive extension failures through
+the current `ExtensionContext` with `ctx.ui.notify(..., "error")`, and throw
+startup errors through Pi's extension runner in modes without a UI context. Never use
+`console.log` or `console.error` from the Pi extension because direct terminal
+writes corrupt or displace TUI output.
 
 Release CI runs `npm ci`, `npm test`, `npm run check`, and the packed-install
 smoke in `plugins/bifrost-agent`, then places the npm tarball in the GitHub
@@ -255,8 +258,9 @@ claude plugin validate .
 - The macOS release smoke downloads the published agent-plugin archive, starts
   from an empty launcher cache, runs `prepare --json`, and requires the
   packaged MCP server to advertise `search_symbols` through `tools/list`.
-- Confirm the release workflow uploads `bifrost-agent-<tag>.tar.gz` after
-  preparing `plugins/bifrost-agent/bifrost-release.json`.
+- Confirm the release workflow uploads `bifrost-agent-<tag>.tar.gz` after one
+  checksum preparation writes both `editors/vscode/package.json` and
+  `plugins/bifrost-agent/bifrost-release.json` from the same release sidecars.
 - Package the Codex Agent Plugin from `plugins/bifrost-agent` with
   `.codex-plugin/plugin.json`, `.mcp.json`, `bifrost-release.json`, `bin/`,
   `skills/`, `agents/`, and `assets/icon.png`.
