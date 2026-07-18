@@ -235,6 +235,59 @@ object Consumer {
 }
 
 #[test]
+fn scala_for_generator_binding_shadows_import_only_after_its_source_expression() {
+    let source = r#"package app
+
+import lib.Factory.typeText
+
+object Consumer {
+  def run: String =
+    for
+      typeText <- typeText("source")
+      preserved = typeText
+    yield typeText
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "lib/Factory.scala",
+            "package lib\nobject Factory { def typeText(value: String): String = value }\n",
+        )
+        .file("app/App.scala", source)
+        .build();
+    let rhs = source
+        .find("typeText(\"source\")")
+        .expect("generator source call");
+    let subsequent = source
+        .find("preserved = typeText")
+        .expect("subsequent enumerator")
+        + "preserved = ".len();
+    let yielded = source.rfind("typeText").expect("yielded generator binding");
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({
+            "references": [
+                location_at(source, rhs),
+                location_at(source, subsequent),
+                location_at(source, yielded)
+            ]
+        })
+        .to_string(),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "lib.Factory$.typeText",
+        "{value}"
+    );
+    for result in &value["results"].as_array().expect("definition results")[1..] {
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert_eq!(result["diagnostics"][0]["kind"], "local_binding", "{value}");
+    }
+}
+
+#[test]
 fn scala_qualified_owner_paths_preserve_nested_and_namespace_identity() {
     let source = r#"package app
 

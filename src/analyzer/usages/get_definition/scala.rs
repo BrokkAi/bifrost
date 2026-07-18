@@ -2054,6 +2054,12 @@ fn scala_node_declares_name_before(
                     && scala_pattern_names(pattern, source).contains(&name)
             })
         }
+        "enumerator" => {
+            scala_enumerator_visible_pattern(node, target_byte).is_some_and(|pattern| {
+                lower_bound <= pattern.start_byte()
+                    && scala_pattern_names(pattern, source).contains(&name)
+            })
+        }
         "function_definition" => node.child_by_field_name("name").is_some_and(|name_node| {
             lower_bound <= name_node.start_byte()
                 && name_node.start_byte() < target_byte
@@ -2061,6 +2067,20 @@ fn scala_node_declares_name_before(
         }),
         _ => false,
     }
+}
+
+fn scala_enumerator_visible_pattern(
+    enumerator: Node<'_>,
+    reference_byte: usize,
+) -> Option<Node<'_>> {
+    let pattern = enumerator
+        .named_child(0)
+        .filter(|child| child.kind() != "guard")?;
+    enumerator
+        .named_children(&mut enumerator.walk())
+        .find(|child| child.start_byte() >= pattern.end_byte() && child.kind() != "guard")
+        .filter(|expression| expression.end_byte() <= reference_byte)
+        .map(|_| pattern)
 }
 
 fn scala_existing_package_type_fqn(
@@ -2530,6 +2550,13 @@ fn scala_seed_active_path(
                     .child_by_field_name("pattern")
                     .filter(|pattern| pattern.end_byte() <= cutoff_start)
                 {
+                    for name in scala_pattern_names(pattern, ctx.source) {
+                        bindings.declare_shadow(name.to_string());
+                    }
+                }
+            }
+            "enumerator" => {
+                if let Some(pattern) = scala_enumerator_visible_pattern(node, cutoff_start) {
                     for name in scala_pattern_names(pattern, ctx.source) {
                         bindings.declare_shadow(name.to_string());
                     }
