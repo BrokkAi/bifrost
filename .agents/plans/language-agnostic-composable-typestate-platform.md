@@ -36,6 +36,7 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [x] (2026-07-17 16:05+02:00) Completed the TypeScript/TSX and Java reference callable-CFG checkpoints under #815, including the shared inline topology harness, typed advanced-feature gaps, differential cases, representation benchmark, strict repository gates, and post-milestone reviews. The all-language #815 rollout remains open behind the reference ICFG contract.
 - [x] (2026-07-17 16:54+02:00) Completed the #816 dispatch prerequisite and #818 TypeScript/Java vertical slice: exact whole-call resolution, one bounded context-bearing ICFG, matched normal/exceptional returns, typed incomplete boundaries, source-generation validation, shared inline assertions, and post-milestone review are complete. The shared adapter contract is frozen for the remaining #815 languages.
 - [x] (2026-07-17 17:00+02:00) Created and natively attached the nine remaining #815 rollout children: #887 JavaScript/JSX, #886 C#, #888 Python, #889 Go, #891 Rust, #890 PHP, #892 Scala, #893 Ruby, and #894 C/C++, each cross-linked to #816 and #818.
+- [x] (2026-07-18 10:45+02:00) Completed #815 Milestone 4a: JavaScript and JSX now share the structured TypeScript lowering core behind exact flavor identities and pass the common direct-call CFG/ICFG conformance contract with point-scoped advanced-feature gaps.
 - [ ] Complete #816 in parallel: expose reusable dispatch, value, heap, and bounded access-path oracles for the reference languages.
 - [x] Complete #818's internal TypeScript/Java control-topology slice: stitch CFG fragments through existing call relations into a demand-materialized ICFG. Public query exposure and value/heap transfers remain in their owning issues.
 - [ ] Complete #819 as needed: add iterative reachability, reverse postorder, SCC, and loop utilities; add dominators only after a named client justifies them.
@@ -46,7 +47,7 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [ ] Complete #824: expose typed, bounded CFG/data-flow/taint/typestate domains through `CodeQuery` and RQL, then adapt diagnostic-neutral findings to #709's policy boundary.
 - [ ] Complete #825: deliver and benchmark one TypeScript/Java resource-lifecycle protocol through internal, query, `.rqlp`, human, and SARIF paths.
 - [ ] Complete #826 only after #825: decide, with evidence, whether WPDS weights or synchronized call/field pushdown precision should be implemented.
-- [ ] Open per-language rollout children under #815 and #816 only after the reference adapters stabilize the neutral contracts.
+- [x] Opened and natively attached per-language rollout children under #815 after the reference CFG/ICFG contract stabilized; their ordered implementation remains tracked in the focused rollout plan.
 
 ## Surprises & Discoveries
 
@@ -101,6 +102,9 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - Observation: the TypeScript/Java ICFG slice requires context-bearing snapshot nodes even though callable CFG nodes remain context-free.
   Evidence: two call sites entering one callee share the immutable procedure artifact, but their callee exits must return to different continuations. Interning `(program point, exact bounded call stack)` in the ephemeral snapshot preserves that distinction without cloning or persisting the base CFG.
 
+- Observation: the first post-reference rollout did not require a second adapter engine or ICFG implementation.
+  Evidence: JavaScript/JSX reuse the TypeScript structured lowerer with explicit grammar-flavor branches and unchanged TypeScript fingerprints, while the existing location-first dispatch facade and context-bearing `WorkspaceIcfgProvider` materialize their cross-file calls without language-specific stitching.
+
 ## Decision Log
 
 - Decision: target meet-over-valid-interprocedural-paths analysis rather than SMT-backed path feasibility.
@@ -154,6 +158,10 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - Decision: freeze one exact-location dispatch facade and one context-bearing demand-materialized ICFG as the cross-language control boundary.
   Rationale: existing query and LSP resolution remains authoritative for candidate discovery, while the ICFG provider alone owns invoke-scaffold suppression, bounded call contexts, matched returns, typed incomplete boundaries, and dense traversal snapshots. This prevents each language adapter from inventing a second resolver or ICFG.
   Date: 2026-07-17.
+
+- Decision: reuse the JavaScript/TypeScript structured lowering core through flavor-specific semantic providers while preserving separate durable adapter/configuration fingerprints.
+  Rationale: shared control mechanics eliminate drift, but exact prepared-language validation and JavaScript-specific fields, resource declarations, and JSX gaps keep each grammar honest. JSX remains a JavaScript source flavor rather than a new persisted semantic dialect.
+  Date: 2026-07-18.
 
 - Decision: keep language-semantic summaries separate from rule-specific protocol summaries.
   Rationale: adapter/call/value effects can be reused by several clients, while a protocol summary must include its rule hash and map incoming client state to outgoing client state and effects.
@@ -1461,3 +1469,5 @@ Plan revision note (2026-07-17): Recorded completion of #815 Milestones 1b and 1
 Plan revision note (2026-07-17): Recorded completion of #815 Milestone 2. The Java reference adapter now passes the common and extended differential CFG contract, including cleanup-safe switch yield and executable initializer fragments with exact gaps. The measured hot representation remains one canonical edge table with outgoing offsets and incoming edge-ID rows; outgoing-only memory savings did not justify multi-second reverse traversal. Location-first dispatch and the matched TypeScript/Java ICFG are now the next focused checkpoint.
 
 Plan revision note (2026-07-17): Recorded completion of the #816 dispatch prerequisite and #818 TypeScript/Java internal control slice. Exact call expressions reuse the existing resolver, while one bounded context-bearing provider owns generation validation, invoke expansion, matched returns, typed boundaries, and dense predecessor/successor snapshots. The reviewed cross-language adapter boundary is frozen; value/heap transfer, public query exposure, and solver work remain outside the focused rollout.
+
+Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4a. JavaScript and JSX now pass the same source-backed callable CFG and matched-return ICFG contract as the reference pair through a flavor-aware shared JS/TS lowerer. JavaScript resource management, generator suspension, and JSX uncertainty remain exact point-scoped gaps; the remaining adapters continue in the focused rollout plan.

@@ -47,6 +47,8 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser, Tree};
 
+mod semantic;
+
 #[derive(Debug, Clone, Default)]
 pub struct JavascriptAdapter;
 
@@ -233,7 +235,6 @@ impl JsMemoCaches {
 }
 
 crate::analyzer::impl_forward_query_provider!(JavascriptAnalyzer);
-crate::analyzer::semantic::impl_forward_program_semantics_provider!(JavascriptAnalyzer);
 
 impl JavascriptAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {

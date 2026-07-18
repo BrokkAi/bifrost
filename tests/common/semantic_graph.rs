@@ -16,9 +16,9 @@ use brokk_bifrost::analyzer::semantic::{
     CallContinuationKind, CallSiteHandle, CancellationToken, ControlContinuation, ControlEdgeKind,
     DispatchBoundaryKind, IcfgBoundaryKind, IcfgEdgeKind, IcfgLimitKind, IcfgNodeId, IcfgProvider,
     IcfgSnapshot, IcfgSnapshotLimits, ProcedureHandle, ProcedureId, ProcedureSemantics,
-    ProgramPoint, ProgramPointId, SemanticArtifact, SemanticBudget, SemanticEffect,
-    SemanticOutcome, SemanticRequest, SourceAnchor, SourceMappingId, SourceSpan,
-    WorkspaceRelativePath,
+    ProgramPoint, ProgramPointId, SemanticArtifact, SemanticBudget, SemanticCapability,
+    SemanticEffect, SemanticGapKind, SemanticGapSubject, SemanticOutcome, SemanticRequest,
+    SourceAnchor, SourceMappingId, SourceSpan, WorkspaceRelativePath,
 };
 
 use super::BuiltInlineTestProject;
@@ -468,6 +468,62 @@ impl SemanticGraph {
 
     pub fn assert_predecessors(&self, alias: &str, expected_edges: &[ExpectedEdge<'_>]) {
         self.assert_edges(alias, expected_edges, EdgeDirection::Predecessors);
+    }
+
+    /// Assert that an aliased point owns an exact point-scoped semantic gap.
+    ///
+    /// This follows the point's [`SemanticEffect::Gap`] reference instead of
+    /// searching the procedure-wide gap table. It therefore cannot pass when
+    /// the requested capability is reported only at some unrelated construct
+    /// in the same callable.
+    pub fn assert_point_gap(
+        &self,
+        alias: &str,
+        capability: SemanticCapability,
+        kind: SemanticGapKind,
+    ) {
+        let bound = self.bound(alias);
+        let procedure = self.procedure(bound.procedure);
+        let point = procedure
+            .point(bound.point)
+            .expect("bound semantic point must remain in its procedure");
+        let mut observed = Vec::new();
+
+        for event in &point.events {
+            let SemanticEffect::Gap { gap: gap_id } = &event.effect else {
+                continue;
+            };
+            let gap = procedure
+                .gap(*gap_id)
+                .expect("a gap effect must reference a published procedure gap");
+            observed.push(format!(
+                "{}:{}:{}",
+                gap.subject.label(),
+                gap.capability.label(),
+                gap.kind.label()
+            ));
+            if gap.point == point.id
+                && gap.subject == SemanticGapSubject::Point
+                && gap.capability == capability
+                && gap.kind == kind
+            {
+                return;
+            }
+        }
+
+        observed.sort_unstable();
+        panic!(
+            "missing exact point-scoped {}:{} gap at alias {alias:?} ({})\nobserved gap effects: {}\n\n{}",
+            capability.label(),
+            kind.label(),
+            self.point_descriptor(procedure, bound.point),
+            if observed.is_empty() {
+                "(none)".to_string()
+            } else {
+                observed.join(", ")
+            },
+            self.render_topology_excerpt(MAX_ERROR_TOPOLOGY_LINES)
+        );
     }
 
     /// Verify that each canonical edge occurs in both directional adjacency
