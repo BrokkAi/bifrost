@@ -12239,3 +12239,141 @@ int ambiguous_cross(composite::cross<int*, int> value) {
         .collect::<BTreeSet<_>>();
     assert_eq!(whole, BTreeSet::from([positive_ranges[0]]));
 }
+
+#[test]
+fn cpp_member_targets_inside_other_field_declarations() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"namespace demo {
+enum class Mode { Ready, Done };
+struct Base { static constexpr int BaseValue = 7; };
+struct Derived : Base { static constexpr int Inherited = BaseValue + 1; };
+struct Other {
+    static constexpr int A = 9;
+    static constexpr int B = A + 2;
+};
+struct Owner {
+    Mode mode = Mode::Ready;
+    explicit Owner(Mode value = Mode::Done);
+    int method(Mode value = Mode::Ready);
+    static constexpr int A = 1;
+    static constexpr int B = A + 1;
+    static constexpr int C = Other::A + 1;
+    static constexpr int D = [] { int A = 0; return A; }();
+};
+}"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let file = project.file("types.h");
+    let source = file.read_to_string().expect("source");
+    let target = |fq_name: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Field && unit.fq_name() == fq_name
+        })
+    };
+    let range = |line: &str, token: &str| fixture_token_range(&source, line, token);
+    let cases = [
+        (
+            target("demo.Mode.Ready"),
+            BTreeSet::from([
+                range("    Mode mode = Mode::Ready;", "Mode::Ready"),
+                range("    int method(Mode value = Mode::Ready);", "Mode::Ready"),
+            ]),
+        ),
+        (
+            target("demo.Mode.Done"),
+            BTreeSet::from([range(
+                "    explicit Owner(Mode value = Mode::Done);",
+                "Mode::Done",
+            )]),
+        ),
+        (
+            target("demo.Base.BaseValue"),
+            BTreeSet::from([range(
+                "struct Derived : Base { static constexpr int Inherited = BaseValue + 1; };",
+                "BaseValue",
+            )]),
+        ),
+        (
+            target("demo.Owner.A"),
+            BTreeSet::from([range("    static constexpr int B = A + 1;", "A")]),
+        ),
+    ];
+
+    for (target, expected) in &cases {
+        let target_fq_name = target.fq_name();
+        for &(start, end) in expected {
+            let terminal_start = source[start..end]
+                .find("::")
+                .map_or(start, |scope| start + scope + 2);
+            let line_start = source[..terminal_start]
+                .rfind('\n')
+                .map_or(0, |newline| newline + 1);
+            let line = source[..terminal_start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1;
+            let column = source[line_start..terminal_start].chars().count() + 1;
+            let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+                &analyzer,
+                brokk_bifrost::searchtools::GetDefinitionParams {
+                    references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                        path: "types.h".to_string(),
+                        line: Some(line),
+                        column: Some(column),
+                    }],
+                },
+            );
+            let result = &forward.results[0];
+            assert_eq!("resolved", result.status, "{target:#?}: {result:#?}");
+            assert!(
+                result
+                    .definitions
+                    .iter()
+                    .any(|definition| definition.fqn.as_deref() == Some(target_fq_name.as_str())),
+                "forward lookup should resolve {start} to {}: {result:#?}",
+                target_fq_name
+            );
+        }
+
+        let provider =
+            ExplicitCandidateProvider::new(Arc::new(std::iter::once(file.clone()).collect()));
+        let targeted_query = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(target),
+                Some(&provider),
+                1,
+                1000,
+            );
+        let FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } = targeted_query.result
+        else {
+            panic!("expected authoritative C++ success");
+        };
+        assert!(
+            unproven_total_by_overload.values().all(|count| *count == 0),
+            "wrong-owner and shadow references must be proven non-targets: {target:#?}"
+        );
+        let targeted = hits_by_overload
+            .values()
+            .flatten()
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect::<BTreeSet<_>>();
+        let whole = UsageFinder::new()
+            .find_usages_default(&analyzer, std::slice::from_ref(target))
+            .all_hits_including_imports()
+            .into_iter()
+            .filter(|hit| hit.file == file)
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect::<BTreeSet<_>>();
+        assert_eq!((&targeted, &whole), (expected, expected), "{target:#?}");
+    }
+}

@@ -25,7 +25,7 @@ pub(super) fn push_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 pub(super) fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if is_inside_target_declaration(node, ctx) || is_member_field_declaration_context(node, ctx) {
+    if is_inside_target_declaration(node, ctx) || is_member_field_own_declarator(node, ctx) {
         return;
     }
     let start = node.start_byte();
@@ -66,7 +66,7 @@ fn push_hit_with_options(
     let start = node.start_byte();
     let end = node.end_byte();
     if (!allow_inside_target_declaration && is_inside_target_declaration(node, ctx))
-        || is_member_field_declaration_context(node, ctx)
+        || is_member_field_own_declarator(node, ctx)
     {
         return;
     }
@@ -144,14 +144,28 @@ fn is_inside_target_declaration(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         .any(|range| node.start_byte() >= range.start_byte && node.end_byte() <= range.end_byte)
 }
 
-pub(super) fn is_member_field_declaration_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+/// Returns whether `node` is on the declared-name path of a class field.
+///
+/// A `field_declaration` also owns default member initializers and, for method
+/// declarations, parameter default values. Those subtrees contain genuine
+/// references and must not be discarded with the declaration's own name.
+pub(super) fn is_member_field_own_declarator(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     if !matches!(ctx.spec.kind, TargetKind::MemberField) {
         return false;
     }
     let mut current = node.parent();
     while let Some(parent) = current {
         if parent.kind() == "field_declaration" {
-            return true;
+            let mut cursor = parent.walk();
+            return parent
+                .children_by_field_name("declarator", &mut cursor)
+                .any(|mut declarator| {
+                    while let Some(inner) = declarator.child_by_field_name("declarator") {
+                        declarator = inner;
+                    }
+                    node.start_byte() >= declarator.start_byte()
+                        && node.end_byte() <= declarator.end_byte()
+                });
         }
         if matches!(parent.kind(), "compound_statement" | "function_definition") {
             return false;

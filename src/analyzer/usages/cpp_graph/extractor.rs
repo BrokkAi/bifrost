@@ -4,7 +4,7 @@ use crate::analyzer::usages::cpp_call_match::{
     cpp_type_text_pointer_depth, normalize_cpp_type_name,
 };
 use crate::analyzer::usages::cpp_graph::hits::{
-    enclosing_context, is_member_field_declaration_context, push_definition_hit, push_hit,
+    enclosing_context, is_member_field_own_declarator, push_definition_hit, push_hit,
     push_self_receiver_hit, push_type_hit, push_unproven_hit,
 };
 use crate::analyzer::usages::cpp_graph::resolver::*;
@@ -1385,7 +1385,7 @@ fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         "identifier" | "field_identifier" | "qualified_identifier"
     ) || !name_matches_terminal(node_text(node, ctx.source), &ctx.spec.member_name)
         || is_declaration_name(node)
-        || is_member_field_declaration_context(node, ctx)
+        || is_member_field_own_declarator(node, ctx)
         || is_selected_field_expression_member_descendant(node)
         || is_nested_in_qualified_identifier(node)
     {
@@ -1558,7 +1558,7 @@ fn maybe_record_member_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         "identifier" | "field_identifier" | "qualified_identifier" | "scoped_identifier"
     ) || !name_matches_terminal(node_text(node, ctx.source), &ctx.spec.member_name)
         || is_declaration_name(node)
-        || is_member_field_declaration_context(node, ctx)
+        || is_member_field_own_declarator(node, ctx)
         || is_selected_field_expression_member_descendant(node)
         || is_nested_in_qualified_identifier(node)
     {
