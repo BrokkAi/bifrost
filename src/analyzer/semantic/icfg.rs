@@ -865,7 +865,10 @@ impl DispatchOracle for WorkspaceIcfgProvider<'_> {
         }
 
         debug_assert!(lookup.work.scanned_files <= 1);
-        debug_assert!(lookup.callee_range.is_some() || lookup.status.is_none());
+        debug_assert!(
+            lookup.status.is_none() || !lookup.targets.is_empty() || !lookup.boundaries.is_empty(),
+            "every completed dispatch status must retain a target or typed boundary"
+        );
         let dispatch_work = SemanticWork {
             source_bytes: lookup.work.scanned_source_bytes,
             call_sites: 1,

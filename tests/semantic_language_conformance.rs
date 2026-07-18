@@ -8527,3 +8527,2507 @@ async def iterate(items):
     assert!(!rendered.contains("ProgramPointId"));
     assert!(!rendered.contains("ControlEdgeId"));
 }
+
+#[test]
+fn php_direct_free_call_conformance() {
+    assert_direct_call_conformance(DirectCallFixture {
+        language: Language::Php,
+        dialect: SemanticLanguage::Standard(Language::Php),
+        callee_path: "src/Leaf.php",
+        callee_source: r#"<?php
+            namespace App;
+
+            function php_leaf(): int {
+                return 7;
+            }
+        "#,
+        callee_declaration: "function php_leaf(): int",
+        callee_name: "php_leaf",
+        caller_path: "src/Caller.php",
+        caller_source: r#"<?php
+            namespace App;
+
+            function php_root(): int {
+                return php_leaf();
+            }
+        "#,
+        caller_declaration: "function php_root(): int",
+        caller_name: "php_root",
+        call: "php_leaf()",
+    });
+}
+
+#[test]
+fn php_typed_instance_method_call_uses_the_shared_dispatch_oracle() {
+    assert_direct_call_conformance(DirectCallFixture {
+        language: Language::Php,
+        dialect: SemanticLanguage::Standard(Language::Php),
+        callee_path: "src/Service.php",
+        callee_source: r#"<?php
+            namespace App;
+
+            final class Service {
+                public function run(): int {
+                    return 7;
+                }
+            }
+        "#,
+        callee_declaration: "public function run(): int",
+        callee_name: "run",
+        caller_path: "src/Controller.php",
+        caller_source: r#"<?php
+            namespace App;
+
+            final class Controller {
+                public function handle(Service $service): int {
+                    return $service->run();
+                }
+            }
+        "#,
+        caller_declaration: "public function handle(Service $service): int",
+        caller_name: "handle",
+        call: "$service->run()",
+    });
+}
+
+#[test]
+fn php_typed_nullsafe_method_call_has_matched_icfg_returns() {
+    assert_direct_call_conformance(DirectCallFixture {
+        language: Language::Php,
+        dialect: SemanticLanguage::Standard(Language::Php),
+        callee_path: "src/NullableService.php",
+        callee_source: r#"<?php
+            namespace App;
+
+            final class NullableService {
+                public function run(): int {
+                    return 7;
+                }
+            }
+        "#,
+        callee_declaration: "public function run(): int",
+        callee_name: "run",
+        caller_path: "src/NullableController.php",
+        caller_source: r#"<?php
+            namespace App;
+
+            function maybe_run(?NullableService $service): ?int {
+                return $service?->run();
+            }
+        "#,
+        caller_declaration: "function maybe_run(?NullableService $service): ?int",
+        caller_name: "maybe_run",
+        call: "$service?->run()",
+    });
+}
+
+#[test]
+fn php_named_nested_and_anonymous_callables_are_separate() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Callables.php",
+            r#"<?php
+                namespace App;
+
+                function top_level(): void {
+                    top_body();
+                }
+
+                final class Worker {
+                    public function __construct() {
+                        constructor_body();
+                    }
+
+                    public function step(): void {
+                        method_body();
+                    }
+
+                    public static function create(): void {
+                        static_body();
+                    }
+
+                    public string $value {
+                        #[Hook]
+                        final get => getter_body();
+                    }
+                }
+
+                function outer(): void {
+                    function local(): void {
+                        local_body();
+                    }
+
+                    $closure = function (): void {
+                        closure_body();
+                    };
+                    $arrow = fn(): int => arrow_body();
+                    outer_body();
+                }
+
+                function values(): iterable {
+                    yield yielded_value();
+                    after_yield();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/Callables.php");
+
+    for (alias, declaration, procedure, body_call) in [
+        (
+            "top",
+            "function top_level(): void",
+            "top_level",
+            "top_body()",
+        ),
+        (
+            "constructor",
+            "public function __construct()",
+            "__construct",
+            "constructor_body()",
+        ),
+        (
+            "method",
+            "public function step(): void",
+            "step",
+            "method_body()",
+        ),
+        (
+            "static_method",
+            "public static function create(): void",
+            "create",
+            "static_body()",
+        ),
+        (
+            "accessor",
+            "final get => getter_body()",
+            "$value.get",
+            "getter_body()",
+        ),
+        ("local", "function local(): void", "local", "local_body()"),
+        ("closure", "function (): void", "$closure", "closure_body()"),
+        ("arrow", "fn(): int", "$arrow", "arrow_body()"),
+        ("outer", "function outer(): void", "outer", "outer_body()"),
+        (
+            "generator",
+            "function values(): iterable",
+            "values",
+            "yielded_value()",
+        ),
+    ] {
+        graph
+            .bind(
+                format!("{alias}_entry"),
+                PointSelector::new(declaration)
+                    .procedure(procedure)
+                    .effect("entry"),
+            )
+            .bind(
+                format!("{alias}_invoke"),
+                PointSelector::new(body_call)
+                    .procedure(procedure)
+                    .effect("invoke"),
+            );
+        graph.assert_reachable(&format!("{alias}_entry"), &format!("{alias}_invoke"));
+    }
+
+    for body_call in [
+        "local_body()",
+        "closure_body()",
+        "arrow_body()",
+        "yielded_value()",
+    ] {
+        let error = graph
+            .try_bind(
+                format!("outer_must_not_own_{body_call}"),
+                PointSelector::new(body_call)
+                    .procedure("outer")
+                    .effect("invoke"),
+            )
+            .expect_err("nested callable execution must stay outside the enclosing CFG");
+        assert!(
+            error.to_string().contains("matched no semantic"),
+            "unexpected PHP nested callable selector for {body_call}: {error}"
+        );
+    }
+
+    let procedures = graph.artifact().procedures();
+    let named = |name: &str, kind: ProcedureKind| {
+        procedures
+            .iter()
+            .find(|procedure| {
+                procedure.kind() == kind
+                    && procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+            })
+            .unwrap_or_else(|| panic!("missing PHP {kind:?} procedure {name}"))
+    };
+    let top = named("top_level", ProcedureKind::Function);
+    let constructor = named("__construct", ProcedureKind::Constructor);
+    let method = named("step", ProcedureKind::Method);
+    let static_method = named("create", ProcedureKind::Method);
+    let accessor = named("$value.get", ProcedureKind::Accessor);
+    let outer = named("outer", ProcedureKind::Function);
+    let local = named("local", ProcedureKind::LocalFunction);
+    let closure = named("$closure", ProcedureKind::Closure);
+    let arrow = named("$arrow", ProcedureKind::Lambda);
+    let generator = named("values", ProcedureKind::Function);
+
+    for procedure in [top, constructor, method, static_method, accessor, outer] {
+        assert!(procedure.lexical_parent().is_none());
+    }
+    for procedure in [local, closure, arrow] {
+        assert_eq!(procedure.lexical_parent(), Some(outer.id()));
+    }
+    assert!(!constructor.properties().is_static);
+    assert!(!method.properties().is_static);
+    assert!(static_method.properties().is_static);
+    for procedure in [
+        top,
+        constructor,
+        method,
+        static_method,
+        accessor,
+        outer,
+        local,
+        closure,
+        arrow,
+    ] {
+        assert!(!procedure.properties().is_generator);
+        assert_eq!(
+            procedure.properties().invocation,
+            ProcedureInvocationKind::Immediate
+        );
+    }
+    assert!(generator.properties().is_generator);
+    assert_eq!(
+        generator.properties().invocation,
+        ProcedureInvocationKind::Deferred
+    );
+    assert!(
+        arrow
+            .points()
+            .iter()
+            .any(|point| point.events.iter().any(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::ProcedureReturn { value: Some(_) }
+                )
+            })),
+        "PHP arrow expressions must publish an implicit value return"
+    );
+    assert!(
+        accessor
+            .points()
+            .iter()
+            .any(|point| point.events.iter().any(|event| {
+                matches!(
+                    event.effect,
+                    SemanticEffect::ProcedureReturn { value: Some(_) }
+                )
+            })),
+        "attributed/final expression-bodied PHP getters must retain their hook identity and implicit value return"
+    );
+
+    graph
+        .bind(
+            "yield_boundary",
+            PointSelector::new("yield yielded_value()")
+                .procedure("values")
+                .effect("gap"),
+        )
+        .bind(
+            "after_yield",
+            PointSelector::new("after_yield()")
+                .procedure("values")
+                .effect("invoke"),
+        );
+    graph.assert_point_gap(
+        "yield_boundary",
+        SemanticCapability::GeneratorSuspension,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_successors("yield_boundary", &[]);
+    graph.assert_unreachable("generator_entry", "after_yield");
+
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn php_branches_loops_and_numeric_abrupt_completions_have_exact_topology() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Control.php",
+            r#"<?php
+                function branch(bool $flag): void {
+                    before();
+                    if ($flag) {
+                        yes();
+                        return;
+                        dead_after_return();
+                    } else {
+                        no();
+                    }
+                    after();
+                }
+
+                function nested_levels(bool $outer, bool $inner, bool $repeat): void {
+                    while ($outer) {
+                        while ($inner) {
+                            if ($repeat) {
+                                continue 2;
+                            }
+                            break 2;
+                        }
+                        dead_after_transfer();
+                    }
+                    after_nested();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/Control.php");
+    graph
+        .bind(
+            "branch_entry",
+            PointSelector::new("function branch(bool $flag)")
+                .procedure("branch")
+                .effect("entry"),
+        )
+        .bind(
+            "condition",
+            PointSelector::new("$flag")
+                .occurrence(1)
+                .procedure("branch")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "yes_block",
+            PointSelector::new(
+                r#"{
+                        yes();
+                        return;
+                        dead_after_return();
+                    }"#,
+            )
+            .procedure("branch")
+            .anchor_occurrence(0),
+        )
+        .bind(
+            "yes_statement",
+            PointSelector::new("yes()")
+                .procedure("branch")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "no_block",
+            PointSelector::new(
+                r#"{
+                        no();
+                    }"#,
+            )
+            .procedure("branch")
+            .anchor_occurrence(0),
+        )
+        .bind(
+            "no_statement",
+            PointSelector::new("no()")
+                .procedure("branch")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "no_normal",
+            PointSelector::new("no()")
+                .procedure("branch")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "return",
+            PointSelector::new("return;")
+                .procedure("branch")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "branch_normal_exit",
+            PointSelector::new("function branch(bool $flag)")
+                .procedure("branch")
+                .effect("normal_exit"),
+        )
+        .bind(
+            "yes_full_statement",
+            PointSelector::new("yes();")
+                .procedure("branch")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "no_full_statement",
+            PointSelector::new("no();")
+                .procedure("branch")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_full_statement",
+            PointSelector::new("after();")
+                .procedure("branch")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_statement",
+            PointSelector::new("after()")
+                .procedure("branch")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_invoke",
+            PointSelector::new("after()")
+                .procedure("branch")
+                .effect("invoke"),
+        )
+        .bind(
+            "dead_after_return",
+            PointSelector::new("dead_after_return()")
+                .procedure("branch")
+                .effect("invoke"),
+        )
+        .bind(
+            "outer_condition",
+            PointSelector::new("$outer")
+                .occurrence(1)
+                .procedure("nested_levels")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "outer_condition_entry",
+            PointSelector::new("($outer)")
+                .procedure("nested_levels")
+                .outgoing_kind(ControlEdgeKind::Normal)
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "outer_body",
+            PointSelector::new(
+                r#"{
+                        while ($inner) {
+                            if ($repeat) {
+                                continue 2;
+                            }
+                            break 2;
+                        }
+                        dead_after_transfer();
+                    }"#,
+            )
+            .procedure("nested_levels")
+            .anchor_occurrence(0),
+        )
+        .bind(
+            "continue_two",
+            PointSelector::new("continue 2;")
+                .procedure("nested_levels")
+                .outgoing_kind(ControlEdgeKind::LoopBack),
+        )
+        .bind(
+            "break_two",
+            PointSelector::new("break 2;")
+                .procedure("nested_levels")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "dead_after_transfer",
+            PointSelector::new("dead_after_transfer()")
+                .procedure("nested_levels")
+                .effect("invoke"),
+        )
+        .bind(
+            "after_nested_statement",
+            PointSelector::new("after_nested()")
+                .procedure("nested_levels")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_nested_full_statement",
+            PointSelector::new("after_nested();")
+                .procedure("nested_levels")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_nested_invoke",
+            PointSelector::new("after_nested()")
+                .procedure("nested_levels")
+                .effect("invoke"),
+        );
+
+    graph.assert_successors(
+        "condition",
+        &[
+            cfg_edge("yes_block", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("no_block", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "yes_block",
+        &[cfg_edge("yes_full_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "yes_full_statement",
+        &[cfg_edge("yes_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "no_block",
+        &[cfg_edge("no_full_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "no_full_statement",
+        &[cfg_edge("no_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "after_full_statement",
+        &[cfg_edge("no_normal", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "after_full_statement",
+        &[cfg_edge("after_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "return",
+        &[cfg_edge("branch_normal_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("branch_entry", "after_invoke");
+    graph.assert_unreachable("return", "after_invoke");
+    graph.assert_unreachable("branch_entry", "dead_after_return");
+
+    graph.assert_successors(
+        "outer_condition",
+        &[
+            cfg_edge("outer_body", ControlEdgeKind::ConditionalTrue),
+            cfg_edge(
+                "after_nested_full_statement",
+                ControlEdgeKind::ConditionalFalse,
+            ),
+        ],
+    );
+    graph.assert_successors(
+        "continue_two",
+        &[cfg_edge("outer_condition_entry", ControlEdgeKind::LoopBack)],
+    );
+    graph.assert_successors(
+        "outer_condition_entry",
+        &[cfg_edge("outer_condition", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "break_two",
+        &[cfg_edge(
+            "after_nested_full_statement",
+            ControlEdgeKind::Normal,
+        )],
+    );
+    graph.assert_successors(
+        "after_nested_full_statement",
+        &[cfg_edge("after_nested_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_unreachable("break_two", "dead_after_transfer");
+    graph.assert_reachable("break_two", "after_nested_invoke");
+
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn php_first_class_callable_is_not_invoked_but_dynamic_calls_remain_boundaries() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/InvocationForms.php",
+            r#"<?php
+                function target(): void {}
+
+                function nested(): int {
+                    return 1;
+                }
+
+                function invocation_forms(callable $dynamic): void {
+                    $reference = target(...);
+                    $dynamic(nested());
+                    after_dynamic();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/InvocationForms.php");
+    graph
+        .bind(
+            "entry",
+            PointSelector::new("function invocation_forms(callable $dynamic)")
+                .procedure("invocation_forms")
+                .effect("entry"),
+        )
+        .bind(
+            "callable_reference",
+            PointSelector::new("target(...)")
+                .procedure("invocation_forms")
+                .effect("callable_reference"),
+        )
+        .bind(
+            "nested_invoke",
+            PointSelector::new("nested()")
+                .procedure("invocation_forms")
+                .effect("invoke"),
+        )
+        .bind(
+            "nested_normal",
+            PointSelector::new("nested()")
+                .procedure("invocation_forms")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "dynamic_invoke",
+            PointSelector::new("$dynamic(nested())")
+                .procedure("invocation_forms")
+                .effect("invoke"),
+        )
+        .bind(
+            "dynamic_normal",
+            PointSelector::new("$dynamic(nested())")
+                .procedure("invocation_forms")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "dynamic_exceptional",
+            PointSelector::new("$dynamic(nested())")
+                .procedure("invocation_forms")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "after_dynamic_statement",
+            PointSelector::new("after_dynamic()")
+                .procedure("invocation_forms")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_dynamic_full_statement",
+            PointSelector::new("after_dynamic();")
+                .procedure("invocation_forms")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_dynamic_invoke",
+            PointSelector::new("after_dynamic()")
+                .procedure("invocation_forms")
+                .effect("invoke"),
+        );
+
+    let error = graph
+        .try_bind(
+            "fabricated_reference_invoke",
+            PointSelector::new("target(...)")
+                .procedure("invocation_forms")
+                .effect("invoke"),
+        )
+        .expect_err("PHP first-class callable syntax must not be an invocation");
+    assert!(
+        error.to_string().contains("matched no semantic"),
+        "unexpected first-class callable selector: {error}"
+    );
+    graph.assert_reachable("entry", "callable_reference");
+    graph.assert_successors(
+        "nested_normal",
+        &[cfg_edge("dynamic_invoke", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "dynamic_invoke",
+        &[cfg_edge("nested_normal", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "dynamic_invoke",
+        &[
+            cfg_edge("dynamic_normal", ControlEdgeKind::Normal),
+            cfg_edge("dynamic_exceptional", ControlEdgeKind::Exceptional),
+        ],
+    );
+    graph.assert_successors(
+        "dynamic_normal",
+        &[cfg_edge(
+            "after_dynamic_full_statement",
+            ControlEdgeKind::Normal,
+        )],
+    );
+    graph.assert_successors(
+        "after_dynamic_full_statement",
+        &[cfg_edge("after_dynamic_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("nested_invoke", "after_dynamic_invoke");
+    graph.assert_adjacency_symmetric();
+
+    let mut icfg = IcfgGraph::materialize(
+        &project,
+        &analyzer,
+        "src/InvocationForms.php",
+        PointSelector::new("function invocation_forms(callable $dynamic)")
+            .procedure("invocation_forms")
+            .effect("entry"),
+    );
+    icfg.bind_call(
+        "dynamic_call",
+        "src/InvocationForms.php",
+        PointSelector::new("$dynamic(nested())")
+            .procedure("invocation_forms")
+            .effect("invoke"),
+    )
+    .bind_node(
+        "icfg_dynamic_invoke",
+        "src/InvocationForms.php",
+        PointSelector::new("$dynamic(nested())")
+            .procedure("invocation_forms")
+            .effect("invoke"),
+        root(),
+    );
+    icfg.assert_outcome(IcfgOutcomeKind::Unknown);
+    icfg.assert_boundary(
+        "icfg_dynamic_invoke",
+        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
+            .originating_call("dynamic_call"),
+    );
+    icfg.assert_successors("icfg_dynamic_invoke", &[]);
+    icfg.assert_adjacency_symmetric();
+}
+
+#[test]
+fn php_first_class_callable_requires_a_sole_placeholder_argument() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/RecoveredPlaceholder.php",
+            r#"<?php
+                function target(): void {}
+
+                function recovered_placeholder(): void {
+                    target(..., recovered_argument());
+                    after_recovered_call();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/RecoveredPlaceholder.php");
+    graph
+        .bind(
+            "recovered_outer_invoke",
+            PointSelector::new("target(..., recovered_argument())")
+                .procedure("recovered_placeholder")
+                .effect("invoke"),
+        )
+        .bind(
+            "after_recovered_invoke",
+            PointSelector::new("after_recovered_call()")
+                .procedure("recovered_placeholder")
+                .effect("invoke"),
+        );
+
+    graph.assert_reachable("recovered_outer_invoke", "after_recovered_invoke");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn php_nullsafe_calls_skip_arguments_and_short_circuit_calls_preserve_order() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/ConditionalCalls.php",
+            r#"<?php
+                final class Service {
+                    public function run(int $value): void {}
+                }
+
+                function maybe_run(?Service $service): void {
+                    $service?->run(argument());
+                    after_nullsafe();
+                }
+
+                function guarded(bool $flag): void {
+                    if ($flag && first(second())) {
+                        selected();
+                    }
+                    after_condition();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/ConditionalCalls.php");
+    graph
+        .bind(
+            "nullsafe_decision",
+            PointSelector::new("$service?->run(argument())")
+                .procedure("maybe_run")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "argument_expression",
+            PointSelector::new("argument()")
+                .procedure("maybe_run")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "argument_normal",
+            PointSelector::new("argument()")
+                .procedure("maybe_run")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "nullsafe_invoke",
+            PointSelector::new("$service?->run(argument())")
+                .procedure("maybe_run")
+                .effect("invoke"),
+        )
+        .bind(
+            "nullsafe_normal",
+            PointSelector::new("$service?->run(argument())")
+                .procedure("maybe_run")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "nullsafe_exceptional",
+            PointSelector::new("$service?->run(argument())")
+                .procedure("maybe_run")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "after_nullsafe_statement",
+            PointSelector::new("after_nullsafe()")
+                .procedure("maybe_run")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_nullsafe_full_statement",
+            PointSelector::new("after_nullsafe();")
+                .procedure("maybe_run")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "flag_decision",
+            PointSelector::new("$flag")
+                .occurrence(1)
+                .procedure("guarded")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "right_expression",
+            PointSelector::new("first(second())")
+                .procedure("guarded")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "first_callee",
+            PointSelector::new("first")
+                .procedure("guarded")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "second_expression",
+            PointSelector::new("second()")
+                .procedure("guarded")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "second_normal",
+            PointSelector::new("second()")
+                .procedure("guarded")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "first_invoke",
+            PointSelector::new("first(second())")
+                .procedure("guarded")
+                .effect("invoke"),
+        )
+        .bind(
+            "first_decision",
+            PointSelector::new("first(second())")
+                .procedure("guarded")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue)
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "first_normal",
+            PointSelector::new("first(second())")
+                .procedure("guarded")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "selected_block",
+            PointSelector::new(
+                r#"{
+                        selected();
+                    }"#,
+            )
+            .procedure("guarded")
+            .anchor_occurrence(0),
+        )
+        .bind(
+            "after_condition_statement",
+            PointSelector::new("after_condition()")
+                .procedure("guarded")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_condition_full_statement",
+            PointSelector::new("after_condition();")
+                .procedure("guarded")
+                .anchor_occurrence(0),
+        );
+
+    graph.assert_successors(
+        "nullsafe_decision",
+        &[
+            cfg_edge("argument_expression", ControlEdgeKind::ConditionalTrue),
+            cfg_edge(
+                "after_nullsafe_full_statement",
+                ControlEdgeKind::ConditionalFalse,
+            ),
+        ],
+    );
+    graph.assert_successors(
+        "argument_normal",
+        &[cfg_edge("nullsafe_invoke", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "nullsafe_invoke",
+        &[
+            cfg_edge("nullsafe_normal", ControlEdgeKind::Normal),
+            cfg_edge("nullsafe_exceptional", ControlEdgeKind::Exceptional),
+        ],
+    );
+    graph.assert_successors(
+        "nullsafe_normal",
+        &[cfg_edge(
+            "after_nullsafe_full_statement",
+            ControlEdgeKind::Normal,
+        )],
+    );
+    graph.assert_predecessors(
+        "after_nullsafe_full_statement",
+        &[
+            cfg_edge("nullsafe_decision", ControlEdgeKind::ConditionalFalse),
+            cfg_edge("nullsafe_normal", ControlEdgeKind::Normal),
+        ],
+    );
+    graph.assert_successors(
+        "after_nullsafe_full_statement",
+        &[cfg_edge(
+            "after_nullsafe_statement",
+            ControlEdgeKind::Normal,
+        )],
+    );
+
+    graph.assert_successors(
+        "flag_decision",
+        &[
+            cfg_edge("right_expression", ControlEdgeKind::ConditionalTrue),
+            cfg_edge(
+                "after_condition_full_statement",
+                ControlEdgeKind::ConditionalFalse,
+            ),
+        ],
+    );
+    graph.assert_successors(
+        "right_expression",
+        &[cfg_edge("first_callee", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "first_callee",
+        &[cfg_edge("second_expression", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "second_normal",
+        &[cfg_edge("first_invoke", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "first_normal",
+        &[cfg_edge("first_decision", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "first_decision",
+        &[
+            cfg_edge("selected_block", ControlEdgeKind::ConditionalTrue),
+            cfg_edge(
+                "after_condition_full_statement",
+                ControlEdgeKind::ConditionalFalse,
+            ),
+        ],
+    );
+    graph.assert_successors(
+        "after_condition_full_statement",
+        &[cfg_edge(
+            "after_condition_statement",
+            ControlEdgeKind::Normal,
+        )],
+    );
+    graph.assert_unreachable("first_invoke", "second_expression");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn php_nullsafe_dereference_chains_short_circuit_at_the_whole_chain_boundary() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/NullsafeChains.php",
+            r#"<?php
+                final class ChainService {
+                    public function first(): ChainService { return $this; }
+                    public function second(int $value): ChainService { return $this; }
+                }
+
+                function full_chain(?ChainService $service): void {
+                    $service?->first()->second(argument())->{property_name()}[index_value()];
+                    after_chain();
+                }
+
+                function nested_chain(?ChainService $service): void {
+                    $service?->first()?->second(argument());
+                    after_nested();
+                }
+
+                function property_chain(?ChainService $service): void {
+                    $service?->{property_name()};
+                    after_property();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/NullsafeChains.php");
+    graph
+        .bind(
+            "full_inner_decision",
+            PointSelector::new("$service?->first()")
+                .procedure("full_chain")
+                .outgoing_kind(ControlEdgeKind::ConditionalFalse),
+        )
+        .bind(
+            "full_inner_invoke",
+            PointSelector::new("$service?->first()")
+                .procedure("full_chain")
+                .effect("invoke"),
+        )
+        .bind(
+            "argument_invoke",
+            PointSelector::new("argument()")
+                .procedure("full_chain")
+                .effect("invoke"),
+        )
+        .bind(
+            "property_name_invoke",
+            PointSelector::new("property_name()")
+                .procedure("full_chain")
+                .effect("invoke"),
+        )
+        .bind(
+            "index_invoke",
+            PointSelector::new("index_value()")
+                .procedure("full_chain")
+                .effect("invoke"),
+        )
+        .bind(
+            "after_chain_statement",
+            PointSelector::new("after_chain();")
+                .procedure("full_chain")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "nested_inner_decision",
+            PointSelector::new("$service?->first()")
+                .procedure("nested_chain")
+                .outgoing_kind(ControlEdgeKind::ConditionalFalse),
+        )
+        .bind(
+            "nested_inner_invoke",
+            PointSelector::new("$service?->first()")
+                .procedure("nested_chain")
+                .effect("invoke"),
+        )
+        .bind(
+            "nested_outer_decision",
+            PointSelector::new("$service?->first()?->second(argument())")
+                .procedure("nested_chain")
+                .outgoing_kind(ControlEdgeKind::ConditionalFalse),
+        )
+        .bind(
+            "after_nested_statement",
+            PointSelector::new("after_nested();")
+                .procedure("nested_chain")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "property_decision",
+            PointSelector::new("$service?->{property_name()}")
+                .procedure("property_chain")
+                .outgoing_kind(ControlEdgeKind::ConditionalFalse),
+        )
+        .bind(
+            "property_name_expression",
+            PointSelector::new("property_name()")
+                .procedure("property_chain")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_property_statement",
+            PointSelector::new("after_property();")
+                .procedure("property_chain")
+                .anchor_occurrence(0),
+        );
+
+    graph.assert_successors(
+        "full_inner_decision",
+        &[
+            cfg_edge("full_inner_invoke", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("after_chain_statement", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    for skipped_on_null in ["argument_invoke", "property_name_invoke", "index_invoke"] {
+        graph.assert_reachable("full_inner_invoke", skipped_on_null);
+        graph.assert_unreachable("after_chain_statement", skipped_on_null);
+    }
+    graph.assert_successors(
+        "nested_inner_decision",
+        &[
+            cfg_edge("nested_inner_invoke", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("after_nested_statement", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_unreachable("after_nested_statement", "nested_outer_decision");
+    graph.assert_successors(
+        "property_decision",
+        &[
+            cfg_edge("property_name_expression", ControlEdgeKind::ConditionalTrue),
+            cfg_edge(
+                "after_property_statement",
+                ControlEdgeKind::ConditionalFalse,
+            ),
+        ],
+    );
+    graph.assert_unreachable("after_property_statement", "property_name_expression");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn php_null_coalescing_tests_nullness_after_evaluating_its_left_expression() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Coalesce.php",
+            r#"<?php
+                function coalesce(bool $flag): void {
+                    ($flag && left_value()) ?? fallback_value();
+                    after_coalesce();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/Coalesce.php");
+    graph
+        .bind(
+            "flag_decision",
+            PointSelector::new("$flag")
+                .occurrence(1)
+                .procedure("coalesce")
+                .outgoing_kind(ControlEdgeKind::ConditionalFalse),
+        )
+        .bind(
+            "left_call_expression",
+            PointSelector::new("left_value()")
+                .procedure("coalesce")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "and_merge",
+            PointSelector::new("$flag && left_value()")
+                .procedure("coalesce")
+                .outgoing_kind(ControlEdgeKind::Normal)
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "nullish_decision",
+            PointSelector::new("($flag && left_value())")
+                .procedure("coalesce")
+                .outgoing_kind(ControlEdgeKind::ConditionalFalse)
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "nonnull_truthiness",
+            PointSelector::new("($flag && left_value())")
+                .procedure("coalesce")
+                .outgoing_kind(ControlEdgeKind::ConditionalFalse)
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "fallback_expression",
+            PointSelector::new("fallback_value()")
+                .procedure("coalesce")
+                .anchor_occurrence(0),
+        );
+
+    graph.assert_successors(
+        "flag_decision",
+        &[
+            cfg_edge("left_call_expression", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("and_merge", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "and_merge",
+        &[cfg_edge("nullish_decision", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "nullish_decision",
+        &[
+            cfg_edge("fallback_expression", ControlEdgeKind::ConditionalFalse),
+            cfg_edge("nonnull_truthiness", ControlEdgeKind::ConditionalTrue),
+        ],
+    );
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn php_alternative_and_empty_loop_bodies_and_switch_continue_follow_php_control_levels() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/GrammarLoops.php",
+            r#"<?php
+                function grammar_loops(bool $go, array $items): void {
+                    for (; $go;):
+                        first_body();
+                        second_body();
+                        break;
+                    endfor;
+                    for (; $go;);
+                    foreach ($items as $item);
+                    after_loops();
+                }
+
+                function continue_switch(bool $go): void {
+                    while ($go) {
+                        switch (1) {
+                            default:
+                                continue;
+                        }
+                        after_switch();
+                        break;
+                    }
+                    after_loop();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/GrammarLoops.php");
+    graph
+        .bind(
+            "first_body_normal",
+            PointSelector::new("first_body()")
+                .procedure("grammar_loops")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "second_body_statement",
+            PointSelector::new("second_body();")
+                .procedure("grammar_loops")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "second_body_invoke",
+            PointSelector::new("second_body()")
+                .procedure("grammar_loops")
+                .effect("invoke"),
+        )
+        .bind(
+            "alternative_break",
+            PointSelector::new("break;")
+                .occurrence(0)
+                .procedure("grammar_loops")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "empty_for_body",
+            PointSelector::new("for (; $go;);")
+                .procedure("grammar_loops")
+                .outgoing_kind(ControlEdgeKind::LoopBack),
+        )
+        .bind(
+            "empty_for_condition_entry",
+            PointSelector::new("$go")
+                .occurrence(2)
+                .procedure("grammar_loops")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "empty_foreach_body",
+            PointSelector::new("foreach ($items as $item);")
+                .procedure("grammar_loops")
+                .outgoing_kind(ControlEdgeKind::LoopBack),
+        )
+        .bind(
+            "empty_foreach_test",
+            PointSelector::new("foreach ($items as $item);")
+                .procedure("grammar_loops")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "switch_continue",
+            PointSelector::new("continue;")
+                .procedure("continue_switch")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "after_switch_statement",
+            PointSelector::new("after_switch();")
+                .procedure("continue_switch")
+                .anchor_occurrence(0),
+        );
+
+    graph.assert_successors(
+        "first_body_normal",
+        &[cfg_edge("second_body_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("second_body_statement", "second_body_invoke");
+    graph.assert_reachable("second_body_invoke", "alternative_break");
+    graph.assert_successors(
+        "switch_continue",
+        &[cfg_edge("after_switch_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "empty_for_body",
+        &[cfg_edge(
+            "empty_for_condition_entry",
+            ControlEdgeKind::LoopBack,
+        )],
+    );
+    graph.assert_successors(
+        "empty_foreach_body",
+        &[cfg_edge("empty_foreach_test", ControlEdgeKind::LoopBack)],
+    );
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn php_static_declare_and_dynamic_class_constant_syntax_retains_runtime_calls_and_gaps() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/DeclarationForms.php",
+            r#"<?php
+                final class DynamicConstants {
+                    public const VALUE = 1;
+                }
+
+                function declaration_forms(): void {
+                    static $cached = static_initializer();
+                    declare(ticks=1):
+                        declared_call();
+                    enddeclare;
+                    (class_name())::VALUE;
+                    after_declarations();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/DeclarationForms.php");
+    graph
+        .bind(
+            "static_dispatch",
+            PointSelector::new("static $cached = static_initializer();")
+                .procedure("declaration_forms")
+                .effect("gap")
+                .outgoing_kind(ControlEdgeKind::ConditionalFalse),
+        )
+        .bind(
+            "static_initializer_expression",
+            PointSelector::new("static_initializer()")
+                .procedure("declaration_forms")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "declare_entry",
+            PointSelector::new("declare(ticks=1):")
+                .procedure("declaration_forms")
+                .effect("gap"),
+        )
+        .bind(
+            "declared_invoke",
+            PointSelector::new("declared_call()")
+                .procedure("declaration_forms")
+                .effect("invoke"),
+        )
+        .bind(
+            "dynamic_class_invoke",
+            PointSelector::new("class_name()")
+                .procedure("declaration_forms")
+                .effect("invoke"),
+        )
+        .bind(
+            "after_declarations_invoke",
+            PointSelector::new("after_declarations()")
+                .procedure("declaration_forms")
+                .effect("invoke"),
+        );
+
+    graph.assert_successors(
+        "static_dispatch",
+        &[
+            cfg_edge(
+                "static_initializer_expression",
+                ControlEdgeKind::ConditionalTrue,
+            ),
+            cfg_edge("declare_entry", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_point_gap(
+        "static_dispatch",
+        SemanticCapability::NormalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_point_gap(
+        "declare_entry",
+        SemanticCapability::Calls,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_reachable("static_initializer_expression", "declared_invoke");
+    graph.assert_reachable("declare_entry", "declared_invoke");
+    graph.assert_reachable("declared_invoke", "dynamic_class_invoke");
+    graph.assert_reachable("dynamic_class_invoke", "after_declarations_invoke");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn php_include_continues_with_typed_gaps_while_goto_is_terminal() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Boundaries.php",
+            r#"<?php
+                function load_file(string $name): void {
+                    include path_for($name);
+                    after_include();
+                }
+
+                function jump(): void {
+                    before_goto();
+                    goto Target;
+                    dead_after_goto();
+                Target:
+                    target_body();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/Boundaries.php");
+    graph
+        .bind(
+            "path_normal",
+            PointSelector::new("path_for($name)")
+                .procedure("load_file")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "include_boundary",
+            PointSelector::new("include path_for($name)")
+                .procedure("load_file")
+                .effect("gap"),
+        )
+        .bind(
+            "after_include_statement",
+            PointSelector::new("after_include()")
+                .procedure("load_file")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_include_full_statement",
+            PointSelector::new("after_include();")
+                .procedure("load_file")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_include_invoke",
+            PointSelector::new("after_include()")
+                .procedure("load_file")
+                .effect("invoke"),
+        )
+        .bind(
+            "jump_entry",
+            PointSelector::new("function jump(): void")
+                .procedure("jump")
+                .effect("entry"),
+        )
+        .bind(
+            "before_goto_normal",
+            PointSelector::new("before_goto()")
+                .procedure("jump")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "goto_boundary",
+            PointSelector::new("goto Target;")
+                .procedure("jump")
+                .effect("gap"),
+        )
+        .bind(
+            "dead_after_goto",
+            PointSelector::new("dead_after_goto()")
+                .procedure("jump")
+                .effect("invoke"),
+        )
+        .bind(
+            "target_body",
+            PointSelector::new("target_body()")
+                .procedure("jump")
+                .effect("invoke"),
+        );
+
+    graph.assert_successors(
+        "path_normal",
+        &[cfg_edge("include_boundary", ControlEdgeKind::Normal)],
+    );
+    for (capability, kind) in [
+        (SemanticCapability::Calls, SemanticGapKind::Unsupported),
+        (
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapKind::Unsupported,
+        ),
+        (
+            SemanticCapability::NormalControlFlow,
+            SemanticGapKind::Unknown,
+        ),
+    ] {
+        graph.assert_point_gap("include_boundary", capability, kind);
+    }
+    graph.assert_successors(
+        "include_boundary",
+        &[cfg_edge(
+            "after_include_full_statement",
+            ControlEdgeKind::Normal,
+        )],
+    );
+    graph.assert_successors(
+        "after_include_full_statement",
+        &[cfg_edge("after_include_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("path_normal", "after_include_invoke");
+
+    graph.assert_successors(
+        "before_goto_normal",
+        &[cfg_edge("goto_boundary", ControlEdgeKind::Normal)],
+    );
+    graph.assert_point_gap(
+        "goto_boundary",
+        SemanticCapability::NonLocalControl,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_successors("goto_boundary", &[]);
+    graph.assert_reachable("jump_entry", "goto_boundary");
+    graph.assert_unreachable("jump_entry", "dead_after_goto");
+    graph.assert_unreachable("jump_entry", "target_body");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn php_switch_evaluates_predicates_in_order_and_preserves_fallthrough() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/SwitchFlow.php",
+            r#"<?php
+                function switch_flow(): void {
+                    switch (subject()) {
+                        case first_case():
+                            first_body();
+                        default:
+                            fallback_body();
+                        case second_case():
+                            second_body();
+                            break;
+                    }
+                    after_switch();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/SwitchFlow.php");
+    let switch_source = r#"switch (subject()) {
+                        case first_case():
+                            first_body();
+                        default:
+                            fallback_body();
+                        case second_case():
+                            second_body();
+                            break;
+                    }"#;
+    let first_case_source = r#"case first_case():
+                            first_body();"#;
+    let second_case_source = r#"case second_case():
+                            second_body();
+                            break;"#;
+    let default_source = r#"default:
+                            fallback_body();"#;
+    graph
+        .bind(
+            "subject_normal",
+            PointSelector::new("subject()")
+                .procedure("switch_flow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "dispatch",
+            PointSelector::new(switch_source)
+                .procedure("switch_flow")
+                .outgoing_kind(ControlEdgeKind::Normal)
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "first_predicate_expression",
+            PointSelector::new("first_case()")
+                .procedure("switch_flow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "first_predicate_normal",
+            PointSelector::new("first_case()")
+                .procedure("switch_flow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "first_comparison",
+            PointSelector::new(first_case_source)
+                .procedure("switch_flow")
+                .effect("gap")
+                .outgoing_kind(ControlEdgeKind::SwitchCase),
+        )
+        .bind(
+            "first_case_entry",
+            PointSelector::new(first_case_source)
+                .procedure("switch_flow")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "second_predicate_expression",
+            PointSelector::new("second_case()")
+                .procedure("switch_flow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "second_predicate_normal",
+            PointSelector::new("second_case()")
+                .procedure("switch_flow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "second_comparison",
+            PointSelector::new(second_case_source)
+                .procedure("switch_flow")
+                .effect("gap")
+                .outgoing_kind(ControlEdgeKind::SwitchCase),
+        )
+        .bind(
+            "second_case_entry",
+            PointSelector::new(second_case_source)
+                .procedure("switch_flow")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "default_entry",
+            PointSelector::new(default_source)
+                .procedure("switch_flow")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "first_body_normal",
+            PointSelector::new("first_body()")
+                .procedure("switch_flow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "fallback_body_normal",
+            PointSelector::new("fallback_body()")
+                .procedure("switch_flow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "break_transfer",
+            PointSelector::new("break;")
+                .procedure("switch_flow")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "after_switch_statement",
+            PointSelector::new("after_switch()")
+                .procedure("switch_flow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_switch_full_statement",
+            PointSelector::new("after_switch();")
+                .procedure("switch_flow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_switch_invoke",
+            PointSelector::new("after_switch()")
+                .procedure("switch_flow")
+                .effect("invoke"),
+        );
+
+    graph.assert_successors(
+        "subject_normal",
+        &[cfg_edge("dispatch", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "dispatch",
+        &[cfg_edge(
+            "first_predicate_expression",
+            ControlEdgeKind::Normal,
+        )],
+    );
+    graph.assert_successors(
+        "first_predicate_normal",
+        &[cfg_edge("first_comparison", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "first_comparison",
+        &[
+            cfg_edge("first_case_entry", ControlEdgeKind::SwitchCase),
+            cfg_edge(
+                "second_predicate_expression",
+                ControlEdgeKind::ConditionalFalse,
+            ),
+        ],
+    );
+    graph.assert_successors(
+        "second_predicate_normal",
+        &[cfg_edge("second_comparison", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "second_comparison",
+        &[
+            cfg_edge("second_case_entry", ControlEdgeKind::SwitchCase),
+            cfg_edge("default_entry", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "first_body_normal",
+        &[cfg_edge("default_entry", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "fallback_body_normal",
+        &[cfg_edge("second_case_entry", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "break_transfer",
+        &[cfg_edge(
+            "after_switch_full_statement",
+            ControlEdgeKind::Normal,
+        )],
+    );
+    graph.assert_successors(
+        "after_switch_full_statement",
+        &[cfg_edge("after_switch_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_point_gap(
+        "first_comparison",
+        SemanticCapability::Calls,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_point_gap(
+        "first_comparison",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_reachable("default_entry", "after_switch_invoke");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn php_explicit_throw_evaluates_its_value_and_terminates_normal_flow() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/ExplicitThrow.php",
+            r#"<?php
+                function explicit_throw(): void {
+                    before_throw();
+                    throw exception_value();
+                    dead_after_throw();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/ExplicitThrow.php");
+    graph
+        .bind(
+            "before_throw_normal",
+            PointSelector::new("before_throw()")
+                .procedure("explicit_throw")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "throw_statement",
+            PointSelector::new("throw exception_value();")
+                .procedure("explicit_throw")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "exception_value_invoke",
+            PointSelector::new("exception_value()")
+                .procedure("explicit_throw")
+                .effect("invoke"),
+        )
+        .bind(
+            "exception_value_normal",
+            PointSelector::new("exception_value()")
+                .procedure("explicit_throw")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "throw_transfer",
+            PointSelector::new("throw exception_value()")
+                .procedure("explicit_throw")
+                .effect("throw"),
+        )
+        .bind(
+            "dead_after_throw",
+            PointSelector::new("dead_after_throw()")
+                .procedure("explicit_throw")
+                .effect("invoke"),
+        )
+        .bind(
+            "exceptional_exit",
+            PointSelector::new("function explicit_throw(): void")
+                .procedure("explicit_throw")
+                .effect("exceptional_exit"),
+        )
+        .bind(
+            "normal_exit",
+            PointSelector::new("function explicit_throw(): void")
+                .procedure("explicit_throw")
+                .effect("normal_exit"),
+        );
+
+    graph.assert_successors(
+        "before_throw_normal",
+        &[cfg_edge("throw_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("throw_statement", "exception_value_invoke");
+    graph.assert_successors(
+        "exception_value_normal",
+        &[cfg_edge("throw_transfer", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "throw_transfer",
+        &[cfg_edge("exceptional_exit", ControlEdgeKind::Exceptional)],
+    );
+    graph.assert_unreachable("throw_transfer", "normal_exit");
+    graph.assert_unreachable("throw_statement", "dead_after_throw");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn php_try_catch_finally_routes_normal_handled_and_unmatched_completion() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/FinallyFlow.php",
+            r#"<?php
+                function guarded(): void {
+                    try {
+                        work();
+                    } catch (Problem $problem) {
+                        handled();
+                    } finally {
+                        cleanup();
+                    }
+                    after_try();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/FinallyFlow.php");
+    graph
+        .bind(
+            "work_normal",
+            PointSelector::new("work()")
+                .procedure("guarded")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "work_exceptional",
+            PointSelector::new("work()")
+                .procedure("guarded")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "try_body_exit",
+            PointSelector::new(
+                r#"{
+                        work();
+                    }"#,
+            )
+            .procedure("guarded")
+            .outgoing_kind(ControlEdgeKind::Cleanup),
+        )
+        .bind(
+            "handler_dispatch",
+            PointSelector::new("try {")
+                .procedure("guarded")
+                .effect("gap")
+                .outgoing_kind(ControlEdgeKind::SwitchCase),
+        )
+        .bind(
+            "catch_entry",
+            PointSelector::new(
+                r#"catch (Problem $problem) {
+                        handled();
+                    }"#,
+            )
+            .procedure("guarded")
+            .outgoing_kind(ControlEdgeKind::Normal)
+            .anchor_occurrence(0),
+        )
+        .bind(
+            "unmatched_exception",
+            PointSelector::new("try {")
+                .procedure("guarded")
+                .outgoing_kind(ControlEdgeKind::Cleanup),
+        )
+        .bind(
+            "handled_invoke",
+            PointSelector::new("handled()")
+                .procedure("guarded")
+                .effect("invoke"),
+        )
+        .bind(
+            "handled_normal",
+            PointSelector::new("handled()")
+                .procedure("guarded")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "catch_body_exit",
+            PointSelector::new(
+                r#"{
+                        handled();
+                    }"#,
+            )
+            .procedure("guarded")
+            .outgoing_kind(ControlEdgeKind::Cleanup),
+        )
+        .bind(
+            "normal_cleanup_entry",
+            PointSelector::new(
+                r#"{
+                        cleanup();
+                    }"#,
+            )
+            .procedure("guarded")
+            .outgoing_kind(ControlEdgeKind::Normal)
+            .anchor_occurrence(2),
+        )
+        .bind(
+            "exceptional_cleanup_entry",
+            PointSelector::new(
+                r#"{
+                        cleanup();
+                    }"#,
+            )
+            .procedure("guarded")
+            .outgoing_kind(ControlEdgeKind::Normal)
+            .anchor_occurrence(0),
+        )
+        .bind(
+            "normal_cleanup_invoke",
+            PointSelector::new("cleanup()")
+                .procedure("guarded")
+                .effect("invoke")
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "normal_cleanup_continuation",
+            PointSelector::new("cleanup()")
+                .procedure("guarded")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal)
+                .anchor_occurrence(2),
+        )
+        .bind(
+            "exceptional_cleanup_invoke",
+            PointSelector::new("cleanup()")
+                .procedure("guarded")
+                .effect("invoke")
+                .anchor_occurrence(5),
+        )
+        .bind(
+            "exceptional_cleanup_continuation",
+            PointSelector::new("cleanup()")
+                .procedure("guarded")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal)
+                .anchor_occurrence(6),
+        )
+        .bind(
+            "exceptional_cleanup_relay",
+            PointSelector::new(
+                r#"{
+                        cleanup();
+                    }"#,
+            )
+            .procedure("guarded")
+            .outgoing_kind(ControlEdgeKind::Exceptional)
+            .anchor_occurrence(1),
+        )
+        .bind(
+            "after_try_statement",
+            PointSelector::new("after_try();")
+                .procedure("guarded")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_try_invoke",
+            PointSelector::new("after_try()")
+                .procedure("guarded")
+                .effect("invoke"),
+        )
+        .bind(
+            "exceptional_exit",
+            PointSelector::new("function guarded(): void")
+                .procedure("guarded")
+                .effect("exceptional_exit"),
+        );
+
+    graph.assert_successors(
+        "work_normal",
+        &[cfg_edge("try_body_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "work_exceptional",
+        &[cfg_edge("handler_dispatch", ControlEdgeKind::Exceptional)],
+    );
+    graph.assert_point_gap(
+        "handler_dispatch",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_successors(
+        "handler_dispatch",
+        &[
+            cfg_edge("catch_entry", ControlEdgeKind::SwitchCase),
+            cfg_edge("unmatched_exception", ControlEdgeKind::Exceptional),
+        ],
+    );
+    graph.assert_reachable("catch_entry", "handled_invoke");
+    graph.assert_successors(
+        "handled_normal",
+        &[cfg_edge("catch_body_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "try_body_exit",
+        &[cfg_edge("normal_cleanup_entry", ControlEdgeKind::Cleanup)],
+    );
+    graph.assert_successors(
+        "catch_body_exit",
+        &[cfg_edge("normal_cleanup_entry", ControlEdgeKind::Cleanup)],
+    );
+    graph.assert_predecessors(
+        "normal_cleanup_entry",
+        &[
+            cfg_edge("try_body_exit", ControlEdgeKind::Cleanup),
+            cfg_edge("catch_body_exit", ControlEdgeKind::Cleanup),
+        ],
+    );
+    graph.assert_successors(
+        "unmatched_exception",
+        &[cfg_edge(
+            "exceptional_cleanup_entry",
+            ControlEdgeKind::Cleanup,
+        )],
+    );
+    graph.assert_reachable("normal_cleanup_entry", "normal_cleanup_invoke");
+    graph.assert_successors(
+        "normal_cleanup_continuation",
+        &[cfg_edge("after_try_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("exceptional_cleanup_entry", "exceptional_cleanup_invoke");
+    graph.assert_successors(
+        "exceptional_cleanup_continuation",
+        &[cfg_edge(
+            "exceptional_cleanup_relay",
+            ControlEdgeKind::Normal,
+        )],
+    );
+    graph.assert_successors(
+        "exceptional_cleanup_relay",
+        &[cfg_edge("exceptional_exit", ControlEdgeKind::Exceptional)],
+    );
+    graph.assert_reachable("normal_cleanup_entry", "after_try_statement");
+    graph.assert_reachable("normal_cleanup_entry", "after_try_invoke");
+    graph.assert_unreachable("unmatched_exception", "after_try_invoke");
+    graph.assert_reachable("unmatched_exception", "exceptional_exit");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn php_match_selected_values_merge_after_ordered_predicates() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/MatchFlow.php",
+            r#"<?php
+                function match_flow(): void {
+                    $chosen = match (match_subject()) {
+                        first_key() => first_value(),
+                        second_key() => second_value(),
+                        default => fallback_value(),
+                    };
+                    after_match($chosen);
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/MatchFlow.php");
+    let match_source = r#"match (match_subject()) {
+                        first_key() => first_value(),
+                        second_key() => second_value(),
+                        default => fallback_value(),
+                    }"#;
+    graph
+        .bind(
+            "subject_normal",
+            PointSelector::new("match_subject()")
+                .procedure("match_flow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "first_predicate_expression",
+            PointSelector::new("first_key()")
+                .procedure("match_flow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "first_predicate_normal",
+            PointSelector::new("first_key()")
+                .procedure("match_flow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "first_comparison",
+            PointSelector::new("first_key()")
+                .procedure("match_flow")
+                .outgoing_kind(ControlEdgeKind::SwitchCase)
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "second_predicate_expression",
+            PointSelector::new("second_key()")
+                .procedure("match_flow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "second_predicate_normal",
+            PointSelector::new("second_key()")
+                .procedure("match_flow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "second_comparison",
+            PointSelector::new("second_key()")
+                .procedure("match_flow")
+                .outgoing_kind(ControlEdgeKind::SwitchCase)
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "first_value_entry",
+            PointSelector::new("first_value()")
+                .procedure("match_flow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "first_value_normal",
+            PointSelector::new("first_value()")
+                .procedure("match_flow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "second_value_entry",
+            PointSelector::new("second_value()")
+                .procedure("match_flow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "second_value_normal",
+            PointSelector::new("second_value()")
+                .procedure("match_flow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "fallback_value_entry",
+            PointSelector::new("fallback_value()")
+                .procedure("match_flow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "fallback_value_normal",
+            PointSelector::new("fallback_value()")
+                .procedure("match_flow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "match_merge",
+            PointSelector::new(match_source)
+                .procedure("match_flow")
+                .outgoing_kind(ControlEdgeKind::Normal)
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "assignment_boundary",
+            PointSelector::new("$chosen = match")
+                .procedure("match_flow")
+                .effect("gap")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "after_match_statement",
+            PointSelector::new("after_match($chosen)")
+                .procedure("match_flow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_match_full_statement",
+            PointSelector::new("after_match($chosen);")
+                .procedure("match_flow")
+                .anchor_occurrence(0),
+        );
+
+    graph.assert_successors(
+        "subject_normal",
+        &[cfg_edge(
+            "first_predicate_expression",
+            ControlEdgeKind::Normal,
+        )],
+    );
+    graph.assert_successors(
+        "first_predicate_normal",
+        &[cfg_edge("first_comparison", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "first_comparison",
+        &[
+            cfg_edge("first_value_entry", ControlEdgeKind::SwitchCase),
+            cfg_edge(
+                "second_predicate_expression",
+                ControlEdgeKind::ConditionalFalse,
+            ),
+        ],
+    );
+    graph.assert_successors(
+        "second_predicate_normal",
+        &[cfg_edge("second_comparison", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "second_comparison",
+        &[
+            cfg_edge("second_value_entry", ControlEdgeKind::SwitchCase),
+            cfg_edge("fallback_value_entry", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    for result in [
+        "first_value_normal",
+        "second_value_normal",
+        "fallback_value_normal",
+    ] {
+        graph.assert_successors(result, &[cfg_edge("match_merge", ControlEdgeKind::Normal)]);
+    }
+    graph.assert_predecessors(
+        "match_merge",
+        &[
+            cfg_edge("first_value_normal", ControlEdgeKind::Normal),
+            cfg_edge("second_value_normal", ControlEdgeKind::Normal),
+            cfg_edge("fallback_value_normal", ControlEdgeKind::Normal),
+        ],
+    );
+    graph.assert_unreachable("first_value_normal", "second_value_entry");
+    graph.assert_unreachable("second_value_normal", "first_value_entry");
+    graph.assert_successors(
+        "match_merge",
+        &[cfg_edge("assignment_boundary", ControlEdgeKind::Normal)],
+    );
+    for capability in [
+        SemanticCapability::NormalControlFlow,
+        SemanticCapability::Calls,
+        SemanticCapability::ExceptionalControlFlow,
+    ] {
+        graph.assert_point_gap("assignment_boundary", capability, SemanticGapKind::Unknown);
+    }
+    graph.assert_successors(
+        "assignment_boundary",
+        &[cfg_edge(
+            "after_match_full_statement",
+            ControlEdgeKind::Normal,
+        )],
+    );
+    graph.assert_successors(
+        "after_match_full_statement",
+        &[cfg_edge("after_match_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn php_match_without_default_has_an_explicit_exceptional_completion() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/IncompleteMatch.php",
+            r#"<?php
+                function incomplete_match(): int {
+                    return match (missing_subject()) {
+                        1 => chosen_value(),
+                    };
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/IncompleteMatch.php");
+    let match_source = r#"match (missing_subject()) {
+                        1 => chosen_value(),
+                    }"#;
+    graph
+        .bind(
+            "subject_normal",
+            PointSelector::new("missing_subject()")
+                .procedure("incomplete_match")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "predicate_entry",
+            PointSelector::new("1")
+                .procedure("incomplete_match")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "comparison",
+            PointSelector::new("1")
+                .procedure("incomplete_match")
+                .outgoing_kind(ControlEdgeKind::SwitchCase)
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "chosen_entry",
+            PointSelector::new("chosen_value()")
+                .procedure("incomplete_match")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "chosen_normal",
+            PointSelector::new("chosen_value()")
+                .procedure("incomplete_match")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "match_merge",
+            PointSelector::new(match_source)
+                .procedure("incomplete_match")
+                .outgoing_kind(ControlEdgeKind::Normal)
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "unmatched_throw",
+            PointSelector::new(match_source)
+                .procedure("incomplete_match")
+                .effect("throw"),
+        )
+        .bind(
+            "return",
+            PointSelector::new("return match")
+                .procedure("incomplete_match")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "normal_exit",
+            PointSelector::new("function incomplete_match(): int")
+                .procedure("incomplete_match")
+                .effect("normal_exit"),
+        )
+        .bind(
+            "exceptional_exit",
+            PointSelector::new("function incomplete_match(): int")
+                .procedure("incomplete_match")
+                .effect("exceptional_exit"),
+        );
+
+    graph.assert_successors(
+        "subject_normal",
+        &[cfg_edge("predicate_entry", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "comparison",
+        &[
+            cfg_edge("chosen_entry", ControlEdgeKind::SwitchCase),
+            cfg_edge("unmatched_throw", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "chosen_normal",
+        &[cfg_edge("match_merge", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "match_merge",
+        &[cfg_edge("return", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "return",
+        &[cfg_edge("normal_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_point_gap(
+        "unmatched_throw",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_successors(
+        "unmatched_throw",
+        &[cfg_edge("exceptional_exit", ControlEdgeKind::Exceptional)],
+    );
+    graph.assert_unreachable("unmatched_throw", "normal_exit");
+    graph.assert_adjacency_symmetric();
+}

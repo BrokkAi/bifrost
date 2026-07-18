@@ -194,7 +194,10 @@ fn php_reference_node<'tree>(node: Node<'tree>) -> Option<PhpReferenceNode<'tree
             let (scope, name) = php_static_member_parts(node)?;
             Some(PhpReferenceNode::StaticMember { scope, name })
         }
-        "member_call_expression" | "member_access_expression" => {
+        "member_call_expression"
+        | "nullsafe_member_call_expression"
+        | "member_access_expression"
+        | "nullsafe_member_access_expression" => {
             let object = node.child_by_field_name("object")?;
             let name = node.child_by_field_name("name")?;
             Some(PhpReferenceNode::InstanceMember { object, name })
@@ -211,7 +214,10 @@ fn php_reference_node<'tree>(node: Node<'tree>) -> Option<PhpReferenceNode<'tree
                 "scoped_call_expression"
                 | "class_constant_access_expression"
                 | "scoped_property_access_expression" => php_static_access_reference(parent, node),
-                "member_call_expression" | "member_access_expression"
+                "member_call_expression"
+                | "nullsafe_member_call_expression"
+                | "member_access_expression"
+                | "nullsafe_member_access_expression"
                     if parent.child_by_field_name("name") == Some(node) =>
                 {
                     let object = parent.child_by_field_name("object")?;
@@ -487,18 +493,72 @@ fn php_instance_receiver_fqn(
                 ctx,
             )
         }),
-        "member_access_expression" => php_member_access_receiver_fqn(
-            php,
-            analyzer,
-            support,
-            object,
-            source,
-            class_ranges,
-            bindings,
-            ctx,
-        ),
+        "member_call_expression" | "nullsafe_member_call_expression" => {
+            php_member_call_return_type_fqn(
+                php,
+                analyzer,
+                support,
+                object,
+                source,
+                class_ranges,
+                bindings,
+                ctx,
+            )
+        }
+        "member_access_expression" | "nullsafe_member_access_expression" => {
+            php_member_access_receiver_fqn(
+                php,
+                analyzer,
+                support,
+                object,
+                source,
+                class_ranges,
+                bindings,
+                ctx,
+            )
+        }
         _ => None,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn php_member_call_return_type_fqn(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    call: Node<'_>,
+    source: &str,
+    class_ranges: &ClassRangeIndex,
+    bindings: &LocalInferenceEngine<String>,
+    ctx: &FileContext,
+) -> Option<String> {
+    let object = call.child_by_field_name("object")?;
+    let name = call.child_by_field_name("name")?;
+    let owner = php_instance_receiver_fqn(
+        php,
+        analyzer,
+        support,
+        object,
+        source,
+        class_ranges,
+        bindings,
+        ctx,
+    )?;
+    let member = php_node_text(name, source).trim_start_matches('$');
+    if member.is_empty() {
+        return None;
+    }
+    let mut candidates = php_fqn_candidates(support, &format!("{owner}.{member}"));
+    if candidates.is_empty() {
+        candidates = php_inherited_member_candidates(php, support, &owner, member);
+    }
+    candidates.retain(CodeUnit::is_function);
+    sort_units(&mut candidates);
+    candidates.dedup();
+    let [callable] = candidates.as_slice() else {
+        return None;
+    };
+    declared_callable_return_type_fq_name(php, analyzer, callable)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -696,7 +756,9 @@ fn php_is_bare_constant_reference(node: Node<'_>) -> bool {
         parent.kind(),
         "function_call_expression"
             | "member_access_expression"
+            | "nullsafe_member_access_expression"
             | "member_call_expression"
+            | "nullsafe_member_call_expression"
             | "scoped_call_expression"
             | "class_constant_access_expression"
             | "named_type"

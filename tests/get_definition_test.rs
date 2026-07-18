@@ -11333,6 +11333,131 @@ fn php_typed_receiver_method_resolves_to_definition() {
 }
 
 #[test]
+fn php_typed_nullsafe_receiver_method_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Service.php",
+            "<?php\nnamespace App;\nclass Service {\n    public function run(): void {}\n}\n",
+        )
+        .file(
+            "src/Controller.php",
+            "<?php\nnamespace App;\nclass Controller {\n    public function handle(Service $service): void {\n        $service?->run();\n    }\n}\n",
+        )
+        .build();
+
+    let line = "        $service?->run();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Controller.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "run")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "App.Service.run",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "src/Service.php",
+        "{value}"
+    );
+}
+
+#[test]
+fn php_nullsafe_property_access_and_chained_call_resolve_to_definitions() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Service.php",
+            "<?php\nnamespace App;\nclass Service {\n    public function run(): void {}\n}\n",
+        )
+        .file(
+            "src/Holder.php",
+            "<?php\nnamespace App;\nclass Holder {\n    public Service $service;\n}\n",
+        )
+        .file(
+            "src/Controller.php",
+            "<?php\nnamespace App;\nclass Controller {\n    public function handle(Holder $holder): void {\n        $holder?->service?->run();\n    }\n}\n",
+        )
+        .build();
+
+    let line = "        $holder?->service?->run();";
+    let property_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Controller.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "service")
+        ),
+    );
+    let property_result = &property_value["results"][0];
+    assert_eq!(property_result["status"], "resolved", "{property_value}");
+    assert_eq!(
+        property_result["definitions"][0]["fqn"], "App.Holder.service",
+        "{property_value}"
+    );
+    assert_eq!(
+        property_result["definitions"][0]["path"], "src/Holder.php",
+        "{property_value}"
+    );
+
+    let method_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Controller.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "run")
+        ),
+    );
+    let method_result = &method_value["results"][0];
+    assert_eq!(method_result["status"], "resolved", "{method_value}");
+    assert_eq!(
+        method_result["definitions"][0]["fqn"], "App.Service.run",
+        "{method_value}"
+    );
+    assert_eq!(
+        method_result["definitions"][0]["path"], "src/Service.php",
+        "{method_value}"
+    );
+}
+
+#[test]
+fn php_nullsafe_method_return_chain_resolves_to_definitions() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Service.php",
+            "<?php\nnamespace App;\nclass Service {\n    public function run(): void {}\n}\n",
+        )
+        .file(
+            "src/Holder.php",
+            "<?php\nnamespace App;\nclass Holder {\n    public function service(): ?Service { return new Service(); }\n}\n",
+        )
+        .file(
+            "src/Controller.php",
+            "<?php\nnamespace App;\nclass Controller {\n    public function handle(Holder $holder): void {\n        $holder?->service()?->run();\n    }\n}\n",
+        )
+        .build();
+
+    let line = "        $holder?->service()?->run();";
+    for (name, expected_fqn, expected_path) in [
+        ("service", "App.Holder.service", "src/Holder.php"),
+        ("run", "App.Service.run", "src/Service.php"),
+    ] {
+        let value = lookup(
+            project.root(),
+            &format!(
+                r#"{{"references":[{{"path":"src/Controller.php","line":5,"column":{}}}]}}"#,
+                column_of(line, name)
+            ),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected_fqn, "{value}");
+        assert_eq!(result["definitions"][0]["path"], expected_path, "{value}");
+    }
+}
+
+#[test]
 fn php_trait_method_resolves_through_using_class() {
     let project = InlineTestProject::with_language(Language::Php)
         .file(

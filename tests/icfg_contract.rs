@@ -817,6 +817,67 @@ fn unresolved_and_external_calls_remain_typed_boundaries() {
 }
 
 #[test]
+fn ambiguous_go_promoted_call_without_retained_targets_remains_a_boundary() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "main.go",
+            r#"
+                package main
+
+                type Left struct{}
+                func (Left) Run() {}
+
+                type Right struct{}
+                func (Right) Run() {}
+
+                type Model struct {
+                    Left
+                    Right
+                }
+
+                func caller(model Model) {
+                    model.Run()
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = IcfgGraph::materialize(
+        &project,
+        &analyzer,
+        "main.go",
+        PointSelector::new("func caller(model Model)")
+            .procedure("caller")
+            .effect("entry"),
+    );
+    graph
+        .bind_call(
+            "ambiguous_call",
+            "main.go",
+            PointSelector::new("model.Run()")
+                .procedure("caller")
+                .effect("invoke"),
+        )
+        .bind_node(
+            "ambiguous_invoke",
+            "main.go",
+            PointSelector::new("model.Run()")
+                .procedure("caller")
+                .effect("invoke"),
+            root(),
+        );
+
+    graph.assert_outcome(IcfgOutcomeKind::Ambiguous);
+    graph.assert_boundary(
+        "ambiguous_invoke",
+        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
+            .originating_call("ambiguous_call"),
+    );
+    graph.assert_successors("ambiguous_invoke", &[]);
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
 fn limits_cancellation_and_bounded_rendering_are_explicit() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(

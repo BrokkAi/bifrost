@@ -267,6 +267,7 @@ fn is_call_expression_node(node: Node<'_>, language: Language) -> bool {
             node.kind(),
             "function_call_expression"
                 | "member_call_expression"
+                | "nullsafe_member_call_expression"
                 | "scoped_call_expression"
                 | "object_creation_expression"
         ),
@@ -666,9 +667,20 @@ fn php_call_reference_candidate(node: Node<'_>) -> bool {
         match parent.kind() {
             "function_call_expression"
             | "member_call_expression"
+            | "nullsafe_member_call_expression"
             | "scoped_call_expression"
-            | "object_creation_expression" => return true,
+            | "object_creation_expression"
+                if callee_node_for_call(parent, Language::Php) == Some(current) =>
+            {
+                return true;
+            }
+            "function_call_expression"
+            | "member_call_expression"
+            | "nullsafe_member_call_expression"
+            | "scoped_call_expression"
+            | "object_creation_expression" => return false,
             "member_access_expression"
+            | "nullsafe_member_access_expression"
             | "scoped_property_access_expression"
             | "qualified_name"
             | "namespace_name" => current = parent,
@@ -738,7 +750,8 @@ mod tests {
     use std::env;
 
     use super::{
-        call_reference_range_for_call, call_signature_context, call_site_syntax_for_reference,
+        call_reference_range_for_call, call_reference_ranges_in_tree, call_signature_context,
+        call_site_syntax_for_reference,
     };
     use crate::analyzer::ruby::structural::RUBY_STRUCTURAL_SPEC;
     use crate::analyzer::structural::extract::extract_file_facts;
@@ -830,6 +843,39 @@ mod tests {
 
         assert_eq!(&source[leaf.start_byte..leaf.end_byte], "leaf");
         assert_eq!(&source[make.start_byte..make.end_byte], "make");
+    }
+
+    #[test]
+    fn exact_php_nullsafe_call_span_uses_the_named_method_field() {
+        let source = "<?php\nclass Service { public function run(): void {} }\nfunction caller(Service $service): void { $service?->run(); }\n";
+        let file = file("nested.php");
+        let tree = parse_tree_for_language(&file, Language::Php, source).expect("PHP syntax tree");
+
+        let run = call_reference_range_for_call(
+            &tree,
+            Language::Php,
+            &byte_range(source, "$service?->run()"),
+        )
+        .expect("nullsafe method reference");
+
+        assert_eq!(&source[run.start_byte..run.end_byte], "run");
+    }
+
+    #[test]
+    fn php_nullsafe_receiver_properties_are_not_outgoing_call_candidates() {
+        let source =
+            "<?php\nfunction caller(Holder $holder): void { $holder?->service?->run(); }\n";
+        let file = file("nested.php");
+        let tree = parse_tree_for_language(&file, Language::Php, source).expect("PHP syntax tree");
+        let call = byte_range(source, "$holder?->service?->run()");
+
+        let references = call_reference_ranges_in_tree(&tree, Language::Php, &call, 10);
+        let names = references
+            .iter()
+            .map(|range| &source[range.start_byte..range.end_byte])
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["run"]);
     }
 
     #[test]

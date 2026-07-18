@@ -4,6 +4,7 @@ mod clones;
 mod composer;
 mod declarations;
 mod diagnostics;
+mod semantic;
 pub(crate) mod structural;
 mod tests;
 
@@ -46,7 +47,6 @@ pub struct PhpAnalyzer {
 }
 
 crate::analyzer::impl_forward_query_provider!(PhpAnalyzer);
-crate::analyzer::semantic::impl_forward_program_semantics_provider!(PhpAnalyzer);
 
 impl PhpAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {

@@ -80,7 +80,6 @@ pub(crate) enum CallDispatchBoundaryKind {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CallDispatchLookup {
     pub(crate) status: Option<DefinitionLookupStatus>,
-    pub(crate) callee_range: Option<Range>,
     pub(crate) targets: Vec<CallDispatchTarget>,
     pub(crate) boundaries: Vec<CallDispatchBoundaryKind>,
     pub(crate) truncated: bool,
@@ -237,7 +236,6 @@ impl CallRelationService {
             cancellation,
         );
         let mut lookup = CallDispatchLookup {
-            callee_range: Some(callee_range),
             cancelled: batch.cancelled,
             work,
             ..CallDispatchLookup::default()
@@ -614,9 +612,13 @@ fn apply_dispatch_outcome(
     );
 
     match status {
-        DefinitionLookupStatus::Resolved if lookup.targets.is_empty() => lookup
-            .boundaries
-            .push(CallDispatchBoundaryKind::Unresolved(status)),
+        DefinitionLookupStatus::Resolved | DefinitionLookupStatus::Ambiguous
+            if lookup.targets.is_empty() =>
+        {
+            lookup
+                .boundaries
+                .push(CallDispatchBoundaryKind::Unresolved(status));
+        }
         DefinitionLookupStatus::Resolved | DefinitionLookupStatus::Ambiguous => {}
         DefinitionLookupStatus::UnresolvableImportBoundary => {
             lookup.boundaries.push(CallDispatchBoundaryKind::External)
@@ -1098,6 +1100,28 @@ mod tests {
             ambiguous
                 .boundaries
                 .contains(&CallDispatchBoundaryKind::Truncated)
+        );
+
+        let mut empty_ambiguous = CallDispatchLookup::default();
+        apply_dispatch_outcome(
+            &mut empty_ambiguous,
+            DefinitionLookupOutcome {
+                status: DefinitionLookupStatus::Ambiguous,
+                reference: None,
+                definitions: Vec::new(),
+                lexical_definition: None,
+                diagnostics: vec![DefinitionLookupDiagnostic {
+                    kind: "ambiguous_definition".to_string(),
+                    message: "ambiguous without retainable candidates".to_string(),
+                }],
+            },
+            1,
+        );
+        assert_eq!(
+            empty_ambiguous.boundaries,
+            vec![CallDispatchBoundaryKind::Unresolved(
+                DefinitionLookupStatus::Ambiguous
+            )]
         );
 
         let mut external = CallDispatchLookup::default();
