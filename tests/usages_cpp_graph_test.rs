@@ -10818,3 +10818,681 @@ void exercise(demo::Metrics& metrics, demo::Ordinary& ordinary, wrong::Metrics& 
         .collect::<BTreeSet<_>>();
     assert_eq!(guarded_whole_ranges, BTreeSet::from([guarded_implicit]));
 }
+
+#[test]
+fn authoritative_cpp_partial_specialization_owner_and_receiver_dispatch_are_structural() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "fragmented.h",
+            r#"#pragma once
+#define GSL_POINTER
+#define UNSAFE_BUFFER_USAGE
+#define DCHECK(condition)
+namespace base {
+using size_t = unsigned long;
+inline constexpr size_t dynamic_extent = static_cast<size_t>(-1);
+template <typename ElementType,
+          size_t Extent = dynamic_extent,
+          typename InternalPtrType = ElementType*>
+class GSL_POINTER span {
+ public:
+  constexpr int first(size_t count) const;
+};
+template <typename T> class complete {};
+template <typename T> class GSL_POINTER complete<T*> {
+ public:
+  constexpr int member() const { return 1; }
+};
+constexpr int after_complete() { return 9; }
+template <typename ElementType, typename InternalPtrType>
+class GSL_POINTER span<ElementType, dynamic_extent, InternalPtrType> {
+ public:
+  using element_type = ElementType;
+  static constexpr size_t extent = dynamic_extent;
+  template <typename It>
+    requires(true)
+  UNSAFE_BUFFER_USAGE constexpr span(It first, size_t count)
+      : data_(first), size_(count) {
+    DCHECK(count == 0 || !!data_);
+  }
+  constexpr long first(size_t count) const {
+    return count + size_;
+  }
+ private:
+  InternalPtrType data_ = nullptr;
+  size_t size_ = 0;
+};
+constexpr int after_span() { return 7; }
+}  // namespace base
+"#,
+        )
+        .file(
+            "control.h",
+            r#"#pragma once
+namespace control {
+using size_t = unsigned long;
+inline constexpr size_t dynamic_extent = static_cast<size_t>(-1);
+template <typename ElementType,
+          size_t Extent = dynamic_extent,
+          typename InternalPtrType = ElementType*>
+class span {
+ public:
+  constexpr int first(size_t count) const;
+};
+template <typename ElementType, typename InternalPtrType>
+class span<ElementType, dynamic_extent, InternalPtrType> {
+ public:
+  constexpr long first(size_t count) const;
+};
+}  // namespace control
+"#,
+        )
+        .file(
+            "site.cc",
+            r#"#include "fragmented.h"
+#include "control.h"
+long fragmented_dynamic(base::span<int> value, unsigned long count) {
+  return value.first(count); // positive-fragmented-dynamic
+}
+
+int fragmented_fixed(base::span<int, 4> value, unsigned long count) {
+  return value.first(count); // positive-fragmented-fixed
+}
+long control_dynamic(control::span<int> value, unsigned long count) {
+  return value.first(count); // positive-control-dynamic
+}
+int control_fixed(control::span<int, 4> value, unsigned long count) {
+  return value.first(count); // positive-control-fixed
+}
+struct Holder {
+  base::span<int> value;
+  long run(unsigned long count) {
+    return value.first(count); // positive-field-dynamic
+  }
+};
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_all_declarations();
+    let specialized_name = "base.span<ElementType, dynamic_extent, InternalPtrType>";
+    let specialized = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == specialized_name
+    });
+    let dynamic_first = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == format!("{specialized_name}.first")
+    });
+    assert_eq!(
+        analyzer.parent_of(&dynamic_first),
+        Some(specialized.clone())
+    );
+    for prefix_member in ["element_type", "extent"] {
+        let member = definition_by(&analyzer, |unit| {
+            unit.identifier() == prefix_member
+                && analyzer.parent_of(unit).as_ref() == Some(&specialized)
+        });
+        assert_eq!(
+            analyzer.parent_of(&member),
+            Some(specialized.clone()),
+            "valid declarations before the chopped constructor must remain class-owned"
+        );
+    }
+    assert!(
+        declarations
+            .iter()
+            .all(|unit| unit.fq_name() != "base.first"),
+        "the fragmented specialization member must not remain flattened: {declarations:#?}"
+    );
+    for field_name in ["data_", "size_"] {
+        let field = definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Field
+                && unit.fq_name() == format!("{specialized_name}.{field_name}")
+        });
+        assert_eq!(analyzer.parent_of(&field), Some(specialized.clone()));
+    }
+    assert!(
+        declarations.iter().all(|unit| {
+            unit.fq_name() != format!("{specialized_name}.requires")
+                && !(unit.kind() == CodeUnitType::Function
+                    && matches!(unit.identifier(), "data_" | "size_"))
+        }),
+        "the chopped constructor body must not emit phantom members: {declarations:#?}"
+    );
+    let primary_first = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.fq_name() == "base.span.first"
+    });
+    let control_specialized = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "control.span<ElementType, dynamic_extent, InternalPtrType>"
+    });
+    let control_dynamic_first = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "control.span<ElementType, dynamic_extent, InternalPtrType>.first"
+    });
+    assert_eq!(
+        analyzer.parent_of(&control_dynamic_first),
+        Some(control_specialized)
+    );
+    let after_span = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.identifier() == "after_span"
+    });
+    assert_ne!(analyzer.parent_of(&after_span), Some(specialized.clone()));
+    assert_eq!(after_span.fq_name(), "base.after_span");
+    let specialized_range = analyzer
+        .ranges(&specialized)
+        .into_iter()
+        .next()
+        .expect("recovered fragmented specialization range");
+    let dynamic_first_range = analyzer
+        .ranges(&dynamic_first)
+        .into_iter()
+        .next()
+        .expect("late recovered member range");
+    let after_span_range = analyzer
+        .ranges(&after_span)
+        .into_iter()
+        .next()
+        .expect("following namespace declaration range");
+    assert!(
+        specialized_range.start_byte <= dynamic_first_range.start_byte
+            && dynamic_first_range.end_byte <= specialized_range.end_byte
+    );
+    assert!(after_span_range.start_byte >= specialized_range.end_byte);
+    let complete_specialization = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "base.complete<T*>"
+    });
+    let complete_member = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.fq_name() == "base.complete<T*>.member"
+    });
+    assert_eq!(
+        analyzer.parent_of(&complete_member),
+        Some(complete_specialization.clone())
+    );
+    let after_complete = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.identifier() == "after_complete"
+    });
+    assert_ne!(
+        analyzer.parent_of(&after_complete),
+        Some(complete_specialization.clone())
+    );
+    assert_eq!(after_complete.fq_name(), "base.after_complete");
+    let complete_range = analyzer
+        .ranges(&complete_specialization)
+        .into_iter()
+        .next()
+        .expect("recovered complete specialization range");
+    let after_complete_range = analyzer
+        .ranges(&after_complete)
+        .into_iter()
+        .next()
+        .expect("following complete namespace declaration range");
+    assert!(after_complete_range.start_byte >= complete_range.end_byte);
+
+    let site = project.file("site.cc");
+    let source = site.read_to_string().expect("site source");
+    let dynamic_call = fixture_token_range(
+        &source,
+        "  return value.first(count); // positive-fragmented-dynamic",
+        "first",
+    );
+    let fixed_call = fixture_token_range(
+        &source,
+        "  return value.first(count); // positive-fragmented-fixed",
+        "first",
+    );
+    let control_dynamic_call = fixture_token_range(
+        &source,
+        "  return value.first(count); // positive-control-dynamic",
+        "first",
+    );
+    let control_fixed_call = fixture_token_range(
+        &source,
+        "  return value.first(count); // positive-control-fixed",
+        "first",
+    );
+    let field_dynamic_call = fixture_token_range(
+        &source,
+        "    return value.first(count); // positive-field-dynamic",
+        "first",
+    );
+    let forward_at = |start: usize| {
+        let line_start = source[..start].rfind('\n').map_or(0, |newline| newline + 1);
+        let line = source[..start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let column = source[line_start..start].chars().count() + 1;
+        brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "site.cc".to_string(),
+                    line: Some(line),
+                    column: Some(column),
+                }],
+            },
+        )
+        .results
+        .into_iter()
+        .next()
+        .expect("one forward result")
+    };
+    for (reference, expected_fqn) in [
+        (dynamic_call, dynamic_first.fq_name()),
+        (fixed_call, primary_first.fq_name()),
+        (control_dynamic_call, control_dynamic_first.fq_name()),
+        (control_fixed_call, "control.span.first".to_string()),
+        (field_dynamic_call, dynamic_first.fq_name()),
+    ] {
+        let forward = forward_at(reference.0);
+        assert_eq!("resolved", forward.status, "{forward:#?}");
+        assert!(
+            !forward.definitions.is_empty()
+                && forward
+                    .definitions
+                    .iter()
+                    .all(|definition| definition.fqn.as_deref() == Some(expected_fqn.as_str())),
+            "receiver template arguments must select {expected_fqn}: {forward:#?}"
+        );
+    }
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(site.clone()).collect()));
+    let targeted_query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&dynamic_first),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = targeted_query.result
+    else {
+        panic!("expected authoritative specialization success");
+    };
+    let targeted = hits_by_overload
+        .values()
+        .flatten()
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(targeted, BTreeSet::from([dynamic_call, field_dynamic_call]));
+    assert!(unproven_total_by_overload.values().all(|count| *count == 0));
+    let whole = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&dynamic_first))
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == site)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(whole, BTreeSet::from([dynamic_call, field_dynamic_call]));
+    assert!(
+        [fixed_call, control_dynamic_call, control_fixed_call]
+            .into_iter()
+            .all(|range| !targeted.contains(&range) && !whole.contains(&range))
+    );
+}
+#[test]
+fn authoritative_cpp_composite_partial_specializations_are_ranked_structurally() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "composite.h",
+            r#"#pragma once
+namespace composite {
+template <typename T> class box {};
+
+template <typename T, typename U> class chooser {
+ public: int pick() const;
+};
+template <typename T, typename U> class chooser<T*, U> {
+ public: long pick() const;
+};
+template <typename T> class chooser<T*, T> {
+ public: short pick() const;
+};
+template <typename T, typename U> class chooser<box<T>, U> {
+ public: unsigned pick() const;
+};
+template <typename T> class chooser<box<T>, T> {
+ public: unsigned long pick() const;
+};
+
+template <typename T, typename U = T*> class defaulted {
+ public: int pick() const;
+};
+template <typename T> class defaulted<T, T*> {
+ public: long pick() const;
+};
+
+template <typename T, typename U = T*> class forward_defaulted;
+template <typename T, typename U> class forward_defaulted {
+ public: int pick() const;
+};
+template <typename T> class forward_defaulted<T, T*>;
+template <typename T> class forward_defaulted<T, T*> {
+ public: long pick() const;
+};
+
+template <typename T, typename U> class definition_defaulted;
+template <typename T, typename U = T*> class definition_defaulted {
+ public: int pick() const;
+};
+template <typename T> class definition_defaulted<T, T*> {
+ public: short pick() const;
+};
+
+template <typename T, typename U> class ambiguous {
+ public: int pick() const;
+};
+template <typename T> class ambiguous<T, int> {
+ public: long pick() const;
+};
+template <typename U> class ambiguous<int, U> {
+ public: short pick() const;
+};
+
+template <typename T, typename U> class cross {
+ public: int pick() const;
+};
+template <typename T, typename U> class cross<T*, U> {
+ public: long pick() const;
+};
+template <typename T> class cross<T, int> {
+ public: short pick() const;
+};
+
+template <typename T> class envelope {
+ public:
+  class nested {
+   public: int pick() const;
+  };
+};
+
+class OuterA {
+ public:
+  template <typename T, typename U = T*> class slot {
+   public: int pick() const;
+  };
+  template <typename T> class slot<T, T*> {
+   public: long pick() const;
+  };
+};
+class OuterB {
+ public:
+  template <typename T, typename U = T*> class slot {
+   public: short pick() const;
+  };
+  template <typename T> class slot<T, T*> {
+   public: unsigned pick() const;
+  };
+};
+
+}  // namespace composite
+"#,
+        )
+        .file(
+            "site.cc",
+            r#"#include "composite.h"
+using composite::box;
+short pointer_repeated(composite::chooser<int* /* structural comment */, int> value) {
+  return value.pick(); // positive-pointer-repeated
+}
+long pointer_broad(composite::chooser<int*, double> value) {
+  return value.pick(); // positive-pointer-broad
+}
+unsigned long nested_repeated(composite::chooser<box<int>, int> value) {
+  return value.pick(); // positive-nested-repeated
+}
+unsigned nested_broad(composite::chooser<box<int>, double> value) {
+  return value.pick(); // positive-nested-broad
+}
+long defaulted_pointer(composite::defaulted<int> value) {
+  return value.pick(); // positive-defaulted-pointer
+}
+long forward_defaulted_pointer(composite::forward_defaulted<int> value) {
+  return value.pick(); // positive-forward-defaulted-pointer
+}
+short definition_defaulted_pointer(composite::definition_defaulted<int> value) {
+  return value.pick(); // positive-definition-defaulted-pointer
+}
+long nested_owner_a(composite::OuterA::slot<int> value) {
+  return value.pick(); // positive-owner-a
+}
+unsigned nested_owner_b(composite::OuterB::slot<int> value) {
+  return value.pick(); // positive-owner-b
+}
+int ordinary_nested(composite::envelope<int>::nested value) {
+  return value.pick(); // positive-ordinary-nested
+}
+"#,
+        )
+        .file(
+            "ambiguous.cc",
+            r#"#include "composite.h"
+int ambiguous_equal(composite::ambiguous<int, int> value) {
+  return value.pick(); // conservative-equal-specificity
+}
+int ambiguous_cross(composite::cross<int*, int> value) {
+  return value.pick(); // conservative-incomparable-shapes
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let pointer_repeated = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.fq_name() == "composite.chooser<T*, T>.pick"
+    });
+    let pointer_broad = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.fq_name() == "composite.chooser<T*, U>.pick"
+    });
+    let nested_repeated = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "composite.chooser<box<T>, T>.pick"
+    });
+    let nested_broad = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "composite.chooser<box<T>, U>.pick"
+    });
+    let defaulted_pointer = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.fq_name() == "composite.defaulted<T, T*>.pick"
+    });
+    let forward_defaulted_pointer = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "composite.forward_defaulted<T, T*>.pick"
+    });
+    let definition_defaulted_pointer = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "composite.definition_defaulted<T, T*>.pick"
+    });
+    let outer_a_slot = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name().contains("OuterA")
+            && unit.identifier() == "slot<T, T*>"
+    });
+    let outer_b_slot = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name().contains("OuterB")
+            && unit.identifier() == "slot<T, T*>"
+    });
+    let outer_a_pick = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.identifier() == "pick"
+            && analyzer.parent_of(unit).as_ref() == Some(&outer_a_slot)
+    });
+    let outer_b_pick = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.identifier() == "pick"
+            && analyzer.parent_of(unit).as_ref() == Some(&outer_b_slot)
+    });
+    let envelope = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "composite.envelope"
+    });
+    let ordinary_nested = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.identifier() == "nested"
+            && analyzer.parent_of(unit).as_ref() == Some(&envelope)
+    });
+    let ordinary_nested_pick = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.identifier() == "pick"
+            && analyzer.parent_of(unit).as_ref() == Some(&ordinary_nested)
+    });
+
+    let site = project.file("site.cc");
+    let source = site.read_to_string().expect("site source");
+    let cases = [
+        (
+            "  return value.pick(); // positive-pointer-repeated",
+            &pointer_repeated,
+        ),
+        (
+            "  return value.pick(); // positive-pointer-broad",
+            &pointer_broad,
+        ),
+        (
+            "  return value.pick(); // positive-nested-repeated",
+            &nested_repeated,
+        ),
+        (
+            "  return value.pick(); // positive-nested-broad",
+            &nested_broad,
+        ),
+        (
+            "  return value.pick(); // positive-defaulted-pointer",
+            &defaulted_pointer,
+        ),
+        (
+            "  return value.pick(); // positive-forward-defaulted-pointer",
+            &forward_defaulted_pointer,
+        ),
+        (
+            "  return value.pick(); // positive-definition-defaulted-pointer",
+            &definition_defaulted_pointer,
+        ),
+        ("  return value.pick(); // positive-owner-a", &outer_a_pick),
+        ("  return value.pick(); // positive-owner-b", &outer_b_pick),
+        (
+            "  return value.pick(); // positive-ordinary-nested",
+            &ordinary_nested_pick,
+        ),
+    ];
+    let forward_at = |start: usize| {
+        let line_start = source[..start].rfind('\n').map_or(0, |newline| newline + 1);
+        let line = source[..start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let column = source[line_start..start].chars().count() + 1;
+        brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "site.cc".to_string(),
+                    line: Some(line),
+                    column: Some(column),
+                }],
+            },
+        )
+        .results
+        .into_iter()
+        .next()
+        .expect("one forward result")
+    };
+    let mut positive_ranges = Vec::new();
+    for (line, expected) in cases {
+        let range = fixture_token_range(&source, line, "pick");
+        positive_ranges.push(range);
+        let forward = forward_at(range.0);
+        assert_eq!("resolved", forward.status, "{forward:#?}");
+        assert!(
+            !forward.definitions.is_empty()
+                && forward.definitions.iter().all(|definition| {
+                    definition.fqn.as_deref() == Some(expected.fq_name().as_str())
+                }),
+            "composite specialization must select {}: {forward:#?}",
+            expected.fq_name()
+        );
+    }
+    let ambiguous_file = project.file("ambiguous.cc");
+    let ambiguous_source = ambiguous_file.read_to_string().expect("ambiguous source");
+    for marker in [
+        "  return value.pick(); // conservative-equal-specificity",
+        "  return value.pick(); // conservative-incomparable-shapes",
+    ] {
+        let ambiguous_range = fixture_token_range(&ambiguous_source, marker, "pick");
+        let ambiguous_line_start = ambiguous_source[..ambiguous_range.0]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let ambiguous = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "ambiguous.cc".to_string(),
+                    line: Some(
+                        ambiguous_source[..ambiguous_range.0]
+                            .bytes()
+                            .filter(|byte| *byte == b'\n')
+                            .count()
+                            + 1,
+                    ),
+                    column: Some(
+                        ambiguous_source[ambiguous_line_start..ambiguous_range.0]
+                            .chars()
+                            .count()
+                            + 1,
+                    ),
+                }],
+            },
+        )
+        .results
+        .into_iter()
+        .next()
+        .expect("one ambiguous forward result");
+        assert!(
+            ambiguous.status != "resolved" || ambiguous.definitions.is_empty(),
+            "incomparable partial specializations must fail closed for {marker}: {ambiguous:#?}"
+        );
+    }
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(site.clone()).collect()));
+    let targeted_query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&pointer_repeated),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = targeted_query.result
+    else {
+        panic!("expected authoritative composite specialization success");
+    };
+    let targeted = hits_by_overload
+        .values()
+        .flatten()
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(targeted, BTreeSet::from([positive_ranges[0]]));
+    assert!(unproven_total_by_overload.values().all(|count| *count == 0));
+    let whole = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&pointer_repeated))
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == site)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(whole, BTreeSet::from([positive_ranges[0]]));
+}

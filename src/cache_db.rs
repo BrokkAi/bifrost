@@ -16,7 +16,7 @@ pub const LEGACY_SEMANTIC_DB_FILE_NAME: &str = "semantic_cache.db";
 pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 
 const BASELINE_MIGRATION_VERSION: i64 = 1;
-const CURRENT_MIGRATION_VERSION: i64 = 7;
+const CURRENT_MIGRATION_VERSION: i64 = 8;
 const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
 const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
 const PATH_SYMBOL_UNITS_SQL: &str = include_str!("../migrations/cache/0002-path-symbol-units.sql");
@@ -29,6 +29,8 @@ const ANALYZER_BLOB_PAYLOAD_COSTS_SQL: &str =
     include_str!("../migrations/cache/0006-analyzer-blob-payload-costs.sql");
 const STRUCTURAL_FACTS_SNAPSHOTS_SQL: &str =
     include_str!("../migrations/cache/0007-structural-facts-snapshots.sql");
+const CPP_TEMPLATE_METADATA_SQL: &str =
+    include_str!("../migrations/cache/0008-cpp-template-metadata.sql");
 const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     CURRENT_BASELINE_SQL,
     PATH_SYMBOL_UNITS_SQL,
@@ -37,6 +39,7 @@ const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     ANALYZER_BLOB_CASCADE_COSTS_SQL,
     ANALYZER_BLOB_PAYLOAD_COSTS_SQL,
     STRUCTURAL_FACTS_SNAPSHOTS_SQL,
+    CPP_TEMPLATE_METADATA_SQL,
 ];
 #[cfg(test)]
 static CACHE_MIGRATIONS: Lazy<Migrations<'static>> =
@@ -64,6 +67,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
         .expect("apply analyzer blob payload costs migration");
     conn.execute_batch(STRUCTURAL_FACTS_SNAPSHOTS_SQL)
         .expect("apply structural facts snapshots migration");
+    conn.execute_batch(CPP_TEMPLATE_METADATA_SQL)
+        .expect("apply C++ template metadata migration");
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
@@ -1209,7 +1214,10 @@ mod tests {
         let analyzer_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(cache_migration_version(&conn).unwrap(), 8);
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION + 1
+        );
         assert_eq!(analyzer_count, 1);
         assert!(table_exists(&conn, "migration_probe").unwrap());
     }
@@ -1295,7 +1303,10 @@ mod tests {
         writer.rollback().unwrap();
         migrate_with_sql(&mut conn, &migrations).unwrap();
 
-        assert_eq!(cache_migration_version(&conn).unwrap(), 8);
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION + 1
+        );
         assert!(table_exists(&conn, "migration_probe").unwrap());
     }
 
@@ -1307,7 +1318,8 @@ mod tests {
             ["2222222222222222222222222222222222222222"],
         )
         .unwrap();
-        conn.execute_batch("PRAGMA user_version = 8;").unwrap();
+        conn.pragma_update(None, "user_version", CURRENT_MIGRATION_VERSION + 1)
+            .unwrap();
 
         let err = migrate(&mut conn).unwrap_err();
 
@@ -1318,7 +1330,10 @@ mod tests {
             err.contains("DatabaseTooFarAhead"),
             "unexpected error: {err}"
         );
-        assert_eq!(cache_migration_version(&conn).unwrap(), 8);
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION + 1
+        );
         assert_eq!(analyzer_count, 1);
     }
 

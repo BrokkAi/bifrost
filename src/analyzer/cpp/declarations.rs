@@ -1,16 +1,21 @@
 use super::*;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
-use crate::analyzer::{CallableArity, ParameterMetadata, SignatureMetadata};
+use crate::analyzer::{
+    CallableArity, CppTemplateExpression, CppTemplateMetadata, CppTemplateParameterKind,
+    CppTemplateParameterMetadata, CppTemplateTerm, ParameterMetadata, Range, SignatureMetadata,
+};
 use regex::Regex;
 use tree_sitter::Node;
 
 #[derive(Clone)]
-struct ScopeInfo {
+pub(super) struct ScopeInfo {
     package_name: String,
     module: Option<CodeUnit>,
     class_unit: Option<CodeUnit>,
     template_signature: Option<String>,
+    template_metadata: Option<CppTemplateMetadata>,
     declarations_are_fields: bool,
+    recovered_specialization_member_scope: bool,
 }
 
 struct CppContainer<'tree> {
@@ -582,6 +587,7 @@ pub(super) struct CppVisitor<'a> {
     pub(super) file: &'a ProjectFile,
     pub(super) source: &'a str,
     pub(super) parsed: &'a mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    pub(super) recovered_class_sibling_scopes: HashMap<usize, ScopeInfo>,
 }
 
 impl<'a> CppVisitor<'a> {
@@ -600,7 +606,9 @@ impl<'a> CppVisitor<'a> {
                 module,
                 class_unit,
                 template_signature,
+                template_metadata: None,
                 declarations_are_fields: false,
+                recovered_specialization_member_scope: false,
             },
         })];
         while let Some(work) = stack.pop() {
@@ -621,6 +629,10 @@ impl<'a> CppVisitor<'a> {
         scope: &ScopeInfo,
         stack: &mut Vec<CppWork<'tree>>,
     ) {
+        if let Some(recovered_scope) = self.recovered_class_sibling_scopes.remove(&node.id()) {
+            self.visit_node(node, &recovered_scope, stack);
+            return;
+        }
         match node.kind() {
             "template_declaration" => {
                 for index in (0..node.named_child_count()).rev() {
@@ -642,6 +654,43 @@ impl<'a> CppVisitor<'a> {
                         let mut template_scope = scope.clone();
                         template_scope.template_signature =
                             cpp_template_signature(node, child, self.source);
+                        template_scope.template_metadata =
+                            cpp_template_metadata(node, child, self.source);
+                        if let Some(recovered) =
+                            recover_fragmented_partial_specialization(node, child, self.source)
+                        {
+                            let code_unit = self.visit_named_class_like_shape(
+                                recovered.declaration_node,
+                                recovered.name,
+                                None,
+                                true,
+                                Some(recovered.range),
+                                None,
+                                &template_scope,
+                                stack,
+                            );
+                            let mut member_scope = template_scope.clone();
+                            member_scope.class_unit = Some(code_unit);
+                            member_scope.declarations_are_fields = true;
+                            member_scope.recovered_specialization_member_scope = true;
+                            for prefix_member in recovered.prefix_members.into_iter().rev() {
+                                stack.push(CppWork::Node(CppNodeWork {
+                                    node: prefix_member,
+                                    scope: member_scope.clone(),
+                                }));
+                            }
+                            for sibling in recovered.member_siblings {
+                                self.recovered_class_sibling_scopes
+                                    .insert(sibling.id(), member_scope.clone());
+                            }
+                            for following in recovered.following_declarations.into_iter().rev() {
+                                stack.push(CppWork::Node(CppNodeWork {
+                                    node: following,
+                                    scope: scope.clone(),
+                                }));
+                            }
+                            return;
+                        }
                         stack.push(CppWork::Node(CppNodeWork {
                             node: child,
                             scope: template_scope,
@@ -668,7 +717,16 @@ impl<'a> CppVisitor<'a> {
             }
             "function_definition" => self.visit_function_definition(node, scope, stack),
             "declaration" => {
-                self.visit_declaration(node, scope, scope.declarations_are_fields, stack)
+                if scope.class_unit.is_some()
+                    && scope.declarations_are_fields
+                    && scope.recovered_specialization_member_scope
+                    && let Some(alias_name) =
+                        recovered_using_declaration_alias_name(node, self.source)
+                {
+                    self.add_type_aliases(node, scope, vec![alias_name]);
+                } else {
+                    self.visit_declaration(node, scope, scope.declarations_are_fields, stack)
+                }
             }
             "field_declaration" => self.visit_declaration(node, scope, true, stack),
             "type_definition" | "alias_declaration" => {
@@ -731,7 +789,9 @@ impl<'a> CppVisitor<'a> {
             module: Some(module),
             class_unit: scope.class_unit.clone(),
             template_signature: scope.template_signature.clone(),
+            template_metadata: scope.template_metadata.clone(),
             declarations_are_fields: false,
+            recovered_specialization_member_scope: false,
         };
         let container = cpp_body_node(node).unwrap_or(node);
         stack.push(CppWork::Container(CppContainer {
@@ -760,20 +820,33 @@ impl<'a> CppVisitor<'a> {
         stack: &mut Vec<CppWork<'tree>>,
     ) {
         let body = cpp_body_node(node);
+        let definition_body_present = body.is_some();
         let raw_supertypes = matches!(node.kind(), "class_specifier" | "struct_specifier")
             .then(|| extract_cpp_supertypes(node, self.source));
-        self.visit_named_class_like_shape(node, name, body, raw_supertypes, scope, stack);
+        self.visit_named_class_like_shape(
+            node,
+            name,
+            body,
+            definition_body_present,
+            None,
+            raw_supertypes,
+            scope,
+            stack,
+        );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn visit_named_class_like_shape<'tree>(
         &mut self,
         declaration_node: Node<'tree>,
         name: String,
         body: Option<Node<'tree>>,
+        definition_body_present: bool,
+        explicit_range: Option<Range>,
         raw_supertypes: Option<Vec<String>>,
         scope: &ScopeInfo,
         stack: &mut Vec<CppWork<'tree>>,
-    ) {
+    ) -> CodeUnit {
         let short_name = if let Some(parent) = &scope.class_unit {
             format!("{}${name}", parent.short_name())
         } else {
@@ -787,18 +860,23 @@ impl<'a> CppVisitor<'a> {
             scope.template_signature.clone(),
             false,
         );
-        let has_body = body.is_some();
+        let has_body = definition_body_present;
         if !has_body && self.parsed.contains_declaration(&code_unit) {
-            return;
+            return code_unit;
         }
         if has_body {
-            self.parsed.replace_code_unit(
-                code_unit.clone(),
-                declaration_node,
-                self.source,
-                None,
-                None,
-            );
+            if let Some(range) = explicit_range {
+                self.parsed
+                    .replace_code_unit_with_range(code_unit.clone(), range, None, None);
+            } else {
+                self.parsed.replace_code_unit(
+                    code_unit.clone(),
+                    declaration_node,
+                    self.source,
+                    None,
+                    None,
+                );
+            }
         } else {
             self.parsed
                 .add_code_unit(code_unit.clone(), declaration_node, self.source, None, None);
@@ -815,6 +893,24 @@ impl<'a> CppVisitor<'a> {
                 scope.template_signature.as_deref(),
             ),
         );
+        if let Some(metadata) = &scope.template_metadata {
+            let primary_short_name = if let Some(parent) = &scope.class_unit {
+                format!("{}${}", parent.short_name(), metadata.primary_name)
+            } else {
+                metadata.primary_name.clone()
+            };
+            let primary_fq_name = CodeUnit::new(
+                self.file.clone(),
+                CodeUnitType::Class,
+                scope.package_name.clone(),
+                primary_short_name,
+            )
+            .fq_name();
+            let mut metadata = metadata.clone();
+            metadata.primary_fq_name = primary_fq_name;
+            self.parsed
+                .set_cpp_template_metadata(code_unit.clone(), metadata);
+        }
         if let Some(parent) = &scope.class_unit {
             self.parsed.add_child(parent.clone(), code_unit.clone());
         } else if let Some(module) = &scope.module {
@@ -825,10 +921,21 @@ impl<'a> CppVisitor<'a> {
             let mut nested_scope = scope.clone();
             nested_scope.class_unit = Some(code_unit.clone());
             nested_scope.template_signature = scope.template_signature.clone();
+            // Template metadata describes the class just created. It must not
+            // leak into ordinary nested declarations in that class's body.
+            // Recovered export-macro specializations carry a separate scope bit
+            // for their declaration-shaped body members.
+            nested_scope.template_metadata = None;
             // Export-macro class bodies recovered from a function_definition use
             // compound_statement children, whose direct fields are declarations.
+            nested_scope.recovered_specialization_member_scope =
+                scope.template_metadata.as_ref().is_some_and(|metadata| {
+                    declaration_node.kind() == "function_definition"
+                        && !metadata.specialization_arguments.is_empty()
+                });
             nested_scope.declarations_are_fields =
-                is_recovered_exported_class_container(declaration_node, self.source);
+                is_recovered_exported_class_container(declaration_node, self.source)
+                    || nested_scope.recovered_specialization_member_scope;
             stack.push(CppWork::Container(CppContainer {
                 node: body,
                 scope: nested_scope,
@@ -840,6 +947,7 @@ impl<'a> CppVisitor<'a> {
                 self.visit_enum_enumerators_from_text(declaration_node, scope, &code_unit);
             }
         }
+        code_unit
     }
 
     fn has_enum_enumerator_units(&self, parent: &CodeUnit) -> bool {
@@ -1012,10 +1120,13 @@ impl<'a> CppVisitor<'a> {
 
         if let Some(recovered) = recover_exported_class_declaration(node, self.source) {
             let uses_initializer_body = recovered.uses_initializer_body;
+            let definition_body_present = recovered.body.is_some();
             self.visit_named_class_like_shape(
                 recovered.declaration_node,
                 recovered.name,
                 recovered.body,
+                definition_body_present,
+                None,
                 recovered.raw_supertypes,
                 scope,
                 stack,
@@ -2084,6 +2195,420 @@ fn cpp_template_signature(
         return None;
     }
     Some(text[start..=end].to_string())
+}
+
+struct RecoveredFragmentedPartialSpecialization<'tree> {
+    declaration_node: Node<'tree>,
+    name: String,
+    range: Range,
+    prefix_members: Vec<Node<'tree>>,
+    member_siblings: Vec<Node<'tree>>,
+    following_declarations: Vec<Node<'tree>>,
+}
+
+fn recover_fragmented_partial_specialization<'tree>(
+    template_node: Node<'tree>,
+    declaration_child: Node<'tree>,
+    source: &str,
+) -> Option<RecoveredFragmentedPartialSpecialization<'tree>> {
+    if declaration_child.kind() != "function_definition" {
+        return None;
+    }
+    let class_node = declaration_child.child_by_field_name("type")?;
+    if !matches!(
+        class_node.kind(),
+        "class_specifier" | "struct_specifier" | "union_specifier"
+    ) || !class_node
+        .child_by_field_name("name")
+        .and_then(|name| direct_identifier_name(name, source))
+        .is_some_and(|name| cpp_export_macro_token(&name))
+    {
+        return None;
+    }
+    let declarator = declaration_child.child_by_field_name("declarator")?;
+    if declarator.kind() != "template_function" {
+        return None;
+    }
+    let metadata = cpp_template_metadata(template_node, declaration_child, source)?;
+    if metadata.specialization_arguments.is_empty() {
+        return None;
+    }
+    let body = declaration_child.child_by_field_name("body")?;
+    if body.kind() != "compound_statement" {
+        return None;
+    }
+    let complete_prefix = body.named_child(0).filter(|first| {
+        first.kind() == "labeled_statement"
+            && first.has_error()
+            && first
+                .named_child(first.named_child_count().saturating_sub(1))
+                .is_some_and(recovered_declaration_has_class_terminator)
+    });
+    let complete_body = complete_prefix.is_some();
+    let mut prefix_members = Vec::new();
+    if let Some(prefix) = complete_prefix {
+        prefix_members.push(prefix);
+    } else {
+        let mut body_cursor = body.walk();
+        for child in body.named_children(&mut body_cursor) {
+            if !is_structurally_valid_fragmented_class_prefix_member(child) {
+                break;
+            }
+            prefix_members.push(child);
+        }
+    }
+    let containing_declarations = template_node.parent()?;
+    if !matches!(
+        containing_declarations.kind(),
+        "declaration_list" | "compound_statement"
+    ) {
+        return None;
+    }
+    let mut member_siblings = Vec::new();
+    let mut following_declarations = Vec::new();
+    let terminator;
+    if complete_body {
+        terminator = complete_prefix?;
+        let mut cursor = body.walk();
+        let mut after_prefix = false;
+        for child in body.named_children(&mut cursor) {
+            if complete_prefix.is_some_and(|prefix| same_node(child, prefix)) {
+                after_prefix = true;
+            } else if after_prefix {
+                following_declarations.push(child);
+            }
+        }
+    } else {
+        let mut found_template = false;
+        let mut cursor = containing_declarations.walk();
+        let mut class_terminator = None;
+        for child in containing_declarations.children(&mut cursor) {
+            if same_node(child, template_node) {
+                found_template = true;
+                continue;
+            }
+            if found_template && child.kind() == "}" {
+                class_terminator = Some(child);
+                break;
+            }
+            if found_template && child.is_named() {
+                member_siblings.push(child);
+            }
+        }
+        terminator = class_terminator?;
+    }
+    let name = format!(
+        "{}<{}>",
+        metadata.primary_name,
+        metadata
+            .specialization_arguments
+            .iter()
+            .map(|argument| argument.text.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Some(RecoveredFragmentedPartialSpecialization {
+        declaration_node: declaration_child,
+        name,
+        range: Range {
+            start_byte: declaration_child.start_byte(),
+            end_byte: terminator.end_byte(),
+            start_line: declaration_child.start_position().row + 1,
+            end_line: terminator.end_position().row + 1,
+        },
+        prefix_members,
+        member_siblings,
+        following_declarations,
+    })
+}
+
+fn recovered_declaration_has_class_terminator(declaration: Node<'_>) -> bool {
+    if declaration.kind() != "declaration" {
+        return false;
+    }
+    // With an export macro between `class` and its name, tree-sitter folds a
+    // complete class body into a function-shaped declaration. The class's own
+    // `};` remains structurally identifiable as a direct ERROR child holding
+    // `}`, immediately followed by the declaration's direct `;` child.
+    (0..declaration.child_count().saturating_sub(1)).any(|index| {
+        let Some(error) = declaration.child(index) else {
+            return false;
+        };
+        error.kind() == "ERROR"
+            && error.child_count() == 1
+            && error.child(0).is_some_and(|child| child.kind() == "}")
+            && declaration
+                .child(index + 1)
+                .is_some_and(|child| child.kind() == ";")
+    })
+}
+
+fn is_structurally_valid_fragmented_class_prefix_member(node: Node<'_>) -> bool {
+    if node.has_error() {
+        return false;
+    }
+    match node.kind() {
+        "declaration"
+        | "field_declaration"
+        | "alias_declaration"
+        | "type_definition"
+        | "static_assert_declaration" => true,
+        "labeled_statement" => node
+            .named_child(node.named_child_count().saturating_sub(1))
+            .is_some_and(is_structurally_valid_fragmented_class_prefix_member),
+        "template_declaration" => node.named_children(&mut node.walk()).any(|child| {
+            matches!(
+                child.kind(),
+                "declaration"
+                    | "field_declaration"
+                    | "alias_declaration"
+                    | "type_definition"
+                    | "function_definition"
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn recovered_using_declaration_alias_name(node: Node<'_>, source: &str) -> Option<String> {
+    (node.kind() == "declaration" && node.child(0)?.kind() == "using")
+        .then(|| node.child_by_field_name("declarator"))
+        .flatten()
+        .and_then(|declarator| extract_variable_name(declarator, source))
+}
+
+fn cpp_template_metadata(
+    template_node: Node<'_>,
+    declaration_child: Node<'_>,
+    source: &str,
+) -> Option<CppTemplateMetadata> {
+    let parameters_node = template_node.child_by_field_name("parameters")?;
+    let name_node = cpp_templated_class_name_node(declaration_child)?;
+    let primary_node = match name_node.kind() {
+        "template_type" | "template_function" => name_node.child_by_field_name("name")?,
+        _ => name_node,
+    };
+    let primary_name = normalize_cpp_whitespace(node_text(primary_node, source));
+    if primary_name.is_empty() || cpp_export_macro_token(&primary_name) {
+        return None;
+    }
+
+    let mut parameter_nodes = Vec::new();
+    let mut parameter_names = Vec::new();
+    let mut cursor = parameters_node.walk();
+    for parameter in parameters_node.named_children(&mut cursor) {
+        let Some(name) = cpp_template_parameter_name(parameter, source) else {
+            continue;
+        };
+        parameter_names.push(name);
+        parameter_nodes.push(parameter);
+    }
+    let parameters = parameter_nodes
+        .into_iter()
+        .zip(parameter_names.iter().cloned())
+        .map(|(parameter, name)| CppTemplateParameterMetadata {
+            name,
+            kind: cpp_template_parameter_kind(parameter),
+            default: cpp_template_parameter_default_expression(parameter, source, &parameter_names),
+        })
+        .collect();
+    let specialization_arguments = name_node
+        .child_by_field_name("arguments")
+        .map(|arguments| {
+            let mut cursor = arguments.walk();
+            arguments
+                .named_children(&mut cursor)
+                .filter(|argument| !argument.is_extra() && argument.kind() != "comment")
+                .map(|argument| cpp_template_expression(argument, source, &parameter_names))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(CppTemplateMetadata {
+        primary_name,
+        primary_fq_name: String::new(),
+        parameters,
+        specialization_arguments,
+    })
+}
+
+fn cpp_templated_class_name_node(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "class_specifier" | "struct_specifier" | "union_specifier" => {
+            node.child_by_field_name("name")
+        }
+        "function_definition" => {
+            let declarator = node.child_by_field_name("declarator")?;
+            if matches!(declarator.kind(), "identifier" | "template_function") {
+                Some(declarator)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn cpp_template_parameter_name(node: Node<'_>, source: &str) -> Option<String> {
+    let candidate = node
+        .child_by_field_name("name")
+        .or_else(|| node.child_by_field_name("declarator"))
+        .or_else(|| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor).find(|child| {
+                matches!(
+                    child.kind(),
+                    "identifier" | "type_identifier" | "field_identifier"
+                )
+            })
+        })?;
+    let name = normalize_cpp_whitespace(&extract_declarator_name(candidate, source));
+    (!name.is_empty()).then_some(name)
+}
+
+fn cpp_template_parameter_kind(node: Node<'_>) -> CppTemplateParameterKind {
+    match node.kind() {
+        "type_parameter_declaration"
+        | "optional_type_parameter_declaration"
+        | "variadic_type_parameter_declaration" => CppTemplateParameterKind::Type,
+        "template_template_parameter_declaration" => CppTemplateParameterKind::Template,
+        _ => CppTemplateParameterKind::Value,
+    }
+}
+
+fn cpp_template_parameter_default(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("default_type")
+        .or_else(|| node.child_by_field_name("default_value"))
+}
+
+fn cpp_template_parameter_default_expression(
+    parameter: Node<'_>,
+    source: &str,
+    parameter_names: &[String],
+) -> Option<CppTemplateExpression> {
+    let default = cpp_template_parameter_default(parameter)?;
+    let base = cpp_template_expression(default, source, parameter_names);
+    let Some(pointer_error) = parameter.next_named_sibling() else {
+        return Some(base);
+    };
+    let Some(pointer_declarator) =
+        recovered_abstract_pointer_declarator_term(pointer_error, source)
+    else {
+        return Some(base);
+    };
+    Some(CppTemplateExpression {
+        text: format!(
+            "{}{}",
+            base.text,
+            normalize_cpp_whitespace(node_text(pointer_error, source))
+        ),
+        term: CppTemplateTerm::Node {
+            kind: "type_descriptor".to_string(),
+            children: vec![base.term, pointer_declarator],
+        },
+    })
+}
+
+fn recovered_abstract_pointer_declarator_term(
+    node: Node<'_>,
+    source: &str,
+) -> Option<CppTemplateTerm> {
+    if node.kind() != "ERROR" || node.child_count() == 0 {
+        return None;
+    }
+    let mut children = Vec::new();
+    for index in 0..node.child_count() {
+        let child = node.child(index)?;
+        if child.kind() != "*" {
+            return None;
+        }
+        children.push(CppTemplateTerm::Atom {
+            kind: "*".to_string(),
+            text: normalize_cpp_whitespace(node_text(child, source)),
+        });
+    }
+    Some(CppTemplateTerm::Node {
+        kind: "abstract_pointer_declarator".to_string(),
+        children,
+    })
+}
+
+fn cpp_template_expression(
+    node: Node<'_>,
+    source: &str,
+    parameter_names: &[String],
+) -> CppTemplateExpression {
+    let text = normalize_cpp_whitespace(node_text(node, source));
+    CppTemplateExpression {
+        text,
+        term: cpp_template_term(node, source, parameter_names),
+    }
+}
+
+pub(crate) fn cpp_template_term(
+    node: Node<'_>,
+    source: &str,
+    parameter_names: &[String],
+) -> CppTemplateTerm {
+    enum Work<'tree> {
+        Visit(Node<'tree>),
+        Build { kind: String, child_count: usize },
+    }
+
+    let mut work = vec![Work::Visit(node)];
+    let mut terms = Vec::new();
+    while let Some(next) = work.pop() {
+        match next {
+            Work::Visit(current) => {
+                let text = normalize_cpp_whitespace(node_text(current, source));
+                if parameter_names.contains(&text) {
+                    terms.push(CppTemplateTerm::Parameter(text));
+                    continue;
+                }
+                if matches!(current.kind(), "type_descriptor" | "dependent_type") {
+                    let mut cursor = current.walk();
+                    let named = current
+                        .named_children(&mut cursor)
+                        .filter(|child| !child.is_extra() && child.kind() != "comment")
+                        .collect::<Vec<_>>();
+                    if let [child] = named.as_slice() {
+                        work.push(Work::Visit(*child));
+                        continue;
+                    }
+                }
+                if current.child_count() == 0 {
+                    terms.push(CppTemplateTerm::Atom {
+                        kind: if matches!(
+                            current.kind(),
+                            "identifier"
+                                | "type_identifier"
+                                | "field_identifier"
+                                | "namespace_identifier"
+                        ) {
+                            "identifier".to_string()
+                        } else {
+                            current.kind().to_string()
+                        },
+                        text,
+                    });
+                    continue;
+                }
+                let children = (0..current.child_count())
+                    .filter_map(|index| current.child(index))
+                    .filter(|child| !child.is_extra() && child.kind() != "comment")
+                    .collect::<Vec<_>>();
+                work.push(Work::Build {
+                    kind: current.kind().to_string(),
+                    child_count: children.len(),
+                });
+                work.extend(children.into_iter().rev().map(Work::Visit));
+            }
+            Work::Build { kind, child_count } => {
+                let children = terms.split_off(terms.len() - child_count);
+                terms.push(CppTemplateTerm::Node { kind, children });
+            }
+        }
+    }
+    terms.pop().expect("template term traversal emits one root")
 }
 
 fn enclosing_cpp_declaration_node(mut node: Node<'_>) -> Option<Node<'_>> {

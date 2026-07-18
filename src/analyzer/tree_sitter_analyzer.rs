@@ -6,7 +6,7 @@ use crate::analyzer::store::{
     PersistBatchStats, PreparedParsedBlob, StoreError,
 };
 use crate::analyzer::{
-    AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, DeclarationInfo,
+    AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, CppTemplateMetadata, DeclarationInfo,
     GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language, Project, ProjectFile, Range,
     RubyMethodDispatchMode, SearchSymbolCandidate, SignatureMetadata, SummaryFileProjection,
     UsageFactsIndex,
@@ -357,6 +357,7 @@ pub struct FileState {
     pub(crate) type_identifiers: HashSet<String>,
     pub(crate) signatures: HashMap<CodeUnit, Vec<String>>,
     pub(crate) signature_metadata: HashMap<CodeUnit, Vec<SignatureMetadata>>,
+    pub(crate) cpp_template_metadata: HashMap<CodeUnit, CppTemplateMetadata>,
     pub(crate) ruby_method_dispatch_modes: HashMap<CodeUnit, RubyMethodDispatchMode>,
     pub(crate) ranges: HashMap<CodeUnit, Vec<Range>>,
     pub(crate) children: HashMap<CodeUnit, Vec<CodeUnit>>,
@@ -710,6 +711,7 @@ pub struct ParsedFile {
     pub type_identifiers: HashSet<String>,
     pub signatures: HashMap<CodeUnit, Vec<String>>,
     pub signature_metadata: HashMap<CodeUnit, Vec<SignatureMetadata>>,
+    pub(crate) cpp_template_metadata: HashMap<CodeUnit, CppTemplateMetadata>,
     pub ruby_method_dispatch_modes: HashMap<CodeUnit, RubyMethodDispatchMode>,
     pub scala_traits: HashSet<CodeUnit>,
     pub type_aliases: HashSet<CodeUnit>,
@@ -783,6 +785,7 @@ impl ParsedFile {
             type_identifiers: HashSet::default(),
             signatures: HashMap::default(),
             signature_metadata: HashMap::default(),
+            cpp_template_metadata: HashMap::default(),
             ruby_method_dispatch_modes: HashMap::default(),
             scala_traits: HashSet::default(),
             type_aliases: HashSet::default(),
@@ -904,6 +907,17 @@ impl ParsedFile {
         self.add_code_unit(code_unit, node, source, parent, top_level);
     }
 
+    pub fn replace_code_unit_with_range(
+        &mut self,
+        code_unit: CodeUnit,
+        range: Range,
+        parent: Option<CodeUnit>,
+        top_level: Option<CodeUnit>,
+    ) {
+        self.remove_code_unit(&code_unit);
+        self.add_code_unit_with_range(code_unit, range, parent, top_level);
+    }
+
     pub(crate) fn declarations(&self) -> &HashSet<CodeUnit> {
         &self.declarations
     }
@@ -961,6 +975,14 @@ impl ParsedFile {
         self.ruby_method_dispatch_modes.insert(code_unit, mode);
     }
 
+    pub(crate) fn set_cpp_template_metadata(
+        &mut self,
+        code_unit: CodeUnit,
+        metadata: CppTemplateMetadata,
+    ) {
+        self.cpp_template_metadata.insert(code_unit, metadata);
+    }
+
     pub fn set_scala_trait(&mut self, code_unit: CodeUnit) {
         self.scala_traits.insert(code_unit);
     }
@@ -1002,6 +1024,7 @@ impl ParsedFile {
         self.supertype_lookup_paths.remove(code_unit);
         self.signatures.remove(code_unit);
         self.signature_metadata.remove(code_unit);
+        self.cpp_template_metadata.remove(code_unit);
         self.ruby_method_dispatch_modes.remove(code_unit);
         self.scala_traits.remove(code_unit);
         self.type_aliases.remove(code_unit);
@@ -1451,6 +1474,7 @@ where
             type_identifiers: parsed.type_identifiers,
             signatures: parsed.signatures,
             signature_metadata: parsed.signature_metadata,
+            cpp_template_metadata: parsed.cpp_template_metadata,
             ruby_method_dispatch_modes: parsed.ruby_method_dispatch_modes,
             ranges: parsed.ranges,
             children: parsed.children,
@@ -4496,6 +4520,14 @@ where
             .unwrap_or_default()
     }
 
+    pub(crate) fn cpp_template_metadata_of(
+        &self,
+        code_unit: &CodeUnit,
+    ) -> Option<CppTemplateMetadata> {
+        self.fetch_file_state(code_unit.source())
+            .and_then(|state| state.cpp_template_metadata.get(code_unit).cloned())
+    }
+
     fn source_slice(
         &self,
         code_unit: &CodeUnit,
@@ -6065,6 +6097,7 @@ mod tests {
             type_identifiers: HashSet::default(),
             signatures: HashMap::default(),
             signature_metadata: HashMap::default(),
+            cpp_template_metadata: HashMap::default(),
             ruby_method_dispatch_modes: HashMap::default(),
             ranges: HashMap::default(),
             children: HashMap::default(),

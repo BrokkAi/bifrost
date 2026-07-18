@@ -105,6 +105,14 @@ impl CppScan<'_, '_> {
         self.visibility.resolve_type(self.file, text)
     }
 
+    fn resolve_type_node_result(
+        &self,
+        node: Node<'_>,
+    ) -> std::result::Result<Option<CodeUnit>, ()> {
+        self.visibility
+            .resolve_type_node_result(self.file, node, self.source)
+    }
+
     /// The fqn of the smallest class declaration containing `byte`.
     fn enclosing_class(&self, byte: usize) -> Option<&str> {
         self.class_ranges.enclosing(byte)
@@ -656,11 +664,10 @@ fn seed_typed_binding(
     let Some(name) = extract_variable_name(declarator, ctx.source) else {
         return;
     };
-    let type_text = node
+    let type_node = node
         .child_by_field_name("type")
-        .or_else(|| first_type_child(node))
-        .map(|type_node| normalize_type_text(node_text(type_node, ctx.source)));
-    seed_binding(&name, type_text.as_deref(), None, ctx, bindings);
+        .or_else(|| first_type_child(node));
+    seed_binding(&name, type_node, None, ctx, bindings);
 }
 
 fn seed_variable_declaration(
@@ -668,10 +675,11 @@ fn seed_variable_declaration(
     ctx: &CppScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
-    let type_text = node
+    let type_node = node
         .child_by_field_name("type")
-        .or_else(|| first_type_child(node))
-        .map(|type_node| normalize_type_text(node_text(type_node, ctx.source)));
+        .or_else(|| first_type_child(node));
+    let type_text =
+        type_node.map(|type_node| normalize_type_text(node_text(type_node, ctx.source)));
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         let declarator = if child.kind() == "init_declarator" {
@@ -700,13 +708,13 @@ fn seed_variable_declaration(
             continue;
         };
         let value = child.child_by_field_name("value");
-        seed_binding(&name, type_text.as_deref(), value, ctx, bindings);
+        seed_binding(&name, type_node, value, ctx, bindings);
     }
 }
 
 fn seed_binding(
     name: &str,
-    type_text: Option<&str>,
+    type_node: Option<Node<'_>>,
     value: Option<Node<'_>>,
     ctx: &CppScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
@@ -717,10 +725,16 @@ fn seed_binding(
     // A declared type resolves directly; `auto x = new Foo()` infers from the
     // initializer. A declared-but-unresolved local is shadowed so a later
     // member access never falls back to static type resolution on its name.
-    let resolved = type_text
-        .filter(|text| *text != "auto")
-        .and_then(|text| ctx.resolve_type(text))
-        .or_else(|| value.and_then(|value| infer_type_from_value(value, ctx)));
+    let declared_type =
+        type_node.filter(|node| normalize_type_text(node_text(*node, ctx.source)) != "auto");
+    let resolved = match declared_type {
+        Some(node) => match ctx.resolve_type_node_result(node) {
+            Ok(Some(unit)) => Some(unit),
+            Ok(None) => ctx.resolve_type(node_text(node, ctx.source)),
+            Err(()) => None,
+        },
+        None => value.and_then(|value| infer_type_from_value(value, ctx)),
+    };
     match resolved {
         Some(unit) => bindings.seed_symbol(name.to_string(), unit),
         None => bindings.declare_shadow(name.to_string()),

@@ -1616,14 +1616,14 @@ fn cpp_field_declared_type(
     file: &ProjectFile,
     field: &CodeUnit,
 ) -> Option<CppType> {
-    let (type_text, indirection) = cpp_field_declared_type_text(analyzer, visibility, field)?;
-    Some(CppType::from_text(
-        analyzer,
-        visibility,
-        file,
-        &type_text,
+    let (name, unit, indirection) =
+        cpp_field_declared_type_binding(analyzer, visibility, file, field)?;
+    Some(CppType {
+        alias_unit: cpp_resolve_type_alias_unit(analyzer, visibility, file, &name),
+        name,
+        unit,
         indirection,
-    ))
+    })
 }
 
 fn cpp_receiver_type_units(
@@ -2023,6 +2023,9 @@ fn cpp_seed_typed_binding(
     let type_text =
         cpp_declaration_type_text_for_declarator(visibility, file, node, declarator, source)
             .or_else(|| cpp_declaration_type_text(visibility, file, node, source));
+    let type_node = node
+        .child_by_field_name("type")
+        .or_else(|| cpp_first_type_child(node));
     cpp_seed_binding(
         analyzer,
         support,
@@ -2032,6 +2035,7 @@ fn cpp_seed_typed_binding(
         cpp_lexical_namespace(node, source).as_deref(),
         &name,
         type_text.as_deref(),
+        type_node,
         cpp_declarator_pointer_depth(declarator),
         None,
         None,
@@ -2061,6 +2065,9 @@ fn cpp_seed_for_range_binding(
         .child_by_field_name("type")
         .or_else(|| cpp_first_type_child(node))
         .map(|type_node| cpp_normalize_declared_type_text(cpp_node_text(type_node, ctx.source)));
+    let type_node = node
+        .child_by_field_name("type")
+        .or_else(|| cpp_first_type_child(node));
     cpp_seed_binding(
         ctx.analyzer,
         ctx.support,
@@ -2070,6 +2077,7 @@ fn cpp_seed_for_range_binding(
         cpp_lexical_namespace(node, ctx.source).as_deref(),
         &name,
         type_text.as_deref(),
+        type_node,
         cpp_declarator_pointer_depth(declarator),
         None,
         None,
@@ -2085,6 +2093,10 @@ fn cpp_seed_variable_declaration(
 ) {
     let declaration_type_text =
         cpp_declaration_type_text(ctx.visibility, ctx.file, node, ctx.source);
+    let declaration_type_node = node
+        .child_by_field_name("type")
+        .or_else(|| cpp_first_type_child(node));
+    let mut seeded_structured_declarator = false;
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         let declarator = if child.kind() == "init_declarator" {
@@ -2121,6 +2133,7 @@ fn cpp_seed_variable_declaration(
             continue;
         }
         if let Some(name) = extract_variable_name(declarator, ctx.source) {
+            seeded_structured_declarator = true;
             let value = child
                 .child_by_field_name("value")
                 .filter(|value| value.end_byte() <= cutoff_start);
@@ -2133,6 +2146,7 @@ fn cpp_seed_variable_declaration(
                 cpp_lexical_namespace(node, ctx.source).as_deref(),
                 &name,
                 type_text.as_deref(),
+                declaration_type_node,
                 cpp_declarator_pointer_depth(declarator),
                 Some(ctx.root),
                 value,
@@ -2140,7 +2154,18 @@ fn cpp_seed_variable_declaration(
             );
         }
     }
-    if node.end_byte() <= cutoff_start {
+    // An object-like annotation macro is parsed as the declaration's type,
+    // the real type as a structured declarator, and the actual variable tail
+    // as a direct ERROR child. Preserve recovery for that explicit AST gap,
+    // while ordinary fully structured declarations must not be reseeded by
+    // the less precise statement recovery path.
+    let has_direct_declarator_error = (0..node.named_child_count()).any(|index| {
+        node.named_child(index)
+            .is_some_and(|child| child.kind() == "ERROR")
+    });
+    if (!seeded_structured_declarator || has_direct_declarator_error)
+        && node.end_byte() <= cutoff_start
+    {
         cpp_seed_recovered_statement_declaration(
             ctx.analyzer,
             ctx.support,
@@ -2174,6 +2199,7 @@ fn cpp_seed_recovered_statement_declaration(
             cpp_lexical_namespace(node, source).as_deref(),
             &name,
             Some(&type_text),
+            None,
             pointer_depth,
             None,
             None,
@@ -2514,6 +2540,7 @@ fn cpp_seed_binding(
     lexical_namespace: Option<&str>,
     name: &str,
     type_text: Option<&str>,
+    type_node: Option<Node<'_>>,
     declarator_depth: i32,
     root: Option<Node<'_>>,
     value: Option<Node<'_>>,
@@ -2526,15 +2553,23 @@ fn cpp_seed_binding(
         .filter(|text| *text != "auto")
         .map(|text| {
             let name = normalize_cpp_type_name(text);
-            CppType {
-                name: name.clone(),
-                unit: cpp_resolve_type_unit_in_namespace(
+            let structured_template_node = type_node.filter(|node| cpp_contains_template_id(*node));
+            let unit = match structured_template_node
+                .map(|node| visibility.resolve_type_node_result(file, node, source))
+            {
+                Some(Ok(Some(unit))) => Some(unit),
+                Some(Err(())) => None,
+                Some(Ok(None)) | None => cpp_resolve_type_unit_in_namespace(
                     analyzer,
                     visibility,
                     file,
                     &name,
                     lexical_namespace,
                 ),
+            };
+            CppType {
+                name: name.clone(),
+                unit,
                 indirection: 0,
                 alias_unit: cpp_resolve_type_alias_unit(analyzer, visibility, file, &name),
             }
@@ -2553,6 +2588,18 @@ fn cpp_seed_binding(
         }
         None => bindings.declare_shadow(name.to_string()),
     }
+}
+
+fn cpp_contains_template_id(node: Node<'_>) -> bool {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "template_type" {
+            return true;
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    false
 }
 
 fn cpp_resolve_type_unit(

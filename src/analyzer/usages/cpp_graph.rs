@@ -29,7 +29,7 @@ pub(in crate::analyzer::usages) use resolver::{
     call_arity as cpp_call_arity, constructor_type_node as cpp_constructor_type_node,
     cpp_function_return_type_text, cpp_name_for, cpp_reference_fqn_candidates,
     designated_initializer_owner as cpp_designated_initializer_owner, extract_variable_name,
-    field_declared_type_text as cpp_field_declared_type_text,
+    field_declared_type_binding as cpp_field_declared_type_binding,
     first_type_child as cpp_first_type_child, is_declaration_name as cpp_is_declaration_name,
     is_declarator_node as cpp_is_declarator_node, normalize_type_text as normalize_cpp_type_text,
     signature_arity as cpp_signature_arity,

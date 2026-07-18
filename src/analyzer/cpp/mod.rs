@@ -23,14 +23,14 @@ use regex::Regex;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
-use adapter::CppAdapter;
+pub(crate) use adapter::CppAdapter;
 use cache::{weight_code_unit_set_by_file, weight_code_unit_vec_by_file, weight_project_file_set};
 use clones::{build_clone_candidate_data, refine_cpp_clone_similarity};
 use tests::detect_cpp_test_assertion_smells;
 
 pub(crate) use declarations::{
-    is_direct_recovered_exported_class_field_declaration, node_text, normalize_cpp_whitespace,
-    recovered_exported_class_has_body,
+    cpp_template_term, is_direct_recovered_exported_class_field_declaration, node_text,
+    normalize_cpp_whitespace, recovered_exported_class_has_body,
 };
 pub(crate) use imports::{
     IncludeTargetIndex, include_paths, resolve_include_targets, resolve_include_targets_with_index,
@@ -173,6 +173,13 @@ impl CppAnalyzer {
 
     pub(crate) fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         self.inner.structural_parent_of(code_unit)
+    }
+
+    pub(crate) fn template_metadata(
+        &self,
+        code_unit: &CodeUnit,
+    ) -> Option<crate::analyzer::CppTemplateMetadata> {
+        self.inner.cpp_template_metadata_of(code_unit)
     }
 
     #[cfg(test)]

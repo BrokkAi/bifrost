@@ -5,8 +5,9 @@ use crate::analyzer::usages::cpp_call_match::{
 use crate::analyzer::usages::cpp_graph::extractor::ScanCtx;
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::{
-    CallableArity, CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, IncludeTargetIndex, ProjectFile,
-    cpp_include_paths, cpp_node_text as node_text, normalize_cpp_whitespace,
+    CallableArity, CodeUnit, CodeUnitType, CppAnalyzer, CppTemplateExpression, CppTemplateMetadata,
+    CppTemplateParameterMetadata, CppTemplateTerm, IAnalyzer, IncludeTargetIndex, ProjectFile,
+    cpp_include_paths, cpp_node_text as node_text, cpp_template_term, normalize_cpp_whitespace,
     recovered_exported_class_has_body, resolve_analyzer, resolve_include_targets_with_index,
 };
 use crate::cancellation::CancellationToken;
@@ -554,6 +555,8 @@ pub(in crate::analyzer::usages) struct VisibilityIndex {
     alias_source_parse_counts: Mutex<HashMap<ProjectFile, usize>>,
     field_type_facts: Mutex<HashMap<CodeUnit, Option<DeclaredFieldTypeFact>>>,
     structured_alias_targets: Mutex<HashMap<CodeUnit, Option<StructuredAliasTarget>>>,
+    cpp_template_metadata: HashMap<CodeUnit, CppTemplateMetadata>,
+    cpp_template_families: HashMap<String, Vec<CodeUnit>>,
     #[cfg(test)]
     qualified_candidate_inspections: AtomicUsize,
 }
@@ -562,6 +565,7 @@ pub(in crate::analyzer::usages) struct VisibilityIndex {
 struct DeclaredFieldTypeFact {
     type_text: String,
     indirection: i32,
+    template_arguments: Option<Vec<CppTemplateExpression>>,
 }
 
 #[derive(Clone)]
@@ -615,6 +619,26 @@ impl VisibilityIndex {
             |file| analyzer.declarations(file),
         );
         let visible_by_identifier = build_visible_identifier_index(&visible_by_file);
+        let mut cpp_template_metadata = HashMap::default();
+        for unit in visible_by_file
+            .values()
+            .flatten()
+            .filter(|unit| unit.is_class())
+        {
+            if cpp_template_metadata.contains_key(unit) {
+                continue;
+            }
+            if let Some(metadata) = cpp.template_metadata(unit) {
+                cpp_template_metadata.insert(unit.clone(), metadata);
+            }
+        }
+        let mut cpp_template_families: HashMap<String, Vec<CodeUnit>> = HashMap::default();
+        for (unit, metadata) in &cpp_template_metadata {
+            cpp_template_families
+                .entry(metadata.primary_fq_name.clone())
+                .or_default()
+                .push(unit.clone());
+        }
         Self {
             visible_by_file,
             visible_by_identifier,
@@ -625,6 +649,8 @@ impl VisibilityIndex {
             alias_source_parse_counts: Mutex::new(HashMap::default()),
             field_type_facts: Mutex::new(HashMap::default()),
             structured_alias_targets: Mutex::new(HashMap::default()),
+            cpp_template_metadata,
+            cpp_template_families,
             #[cfg(test)]
             qualified_candidate_inspections: AtomicUsize::new(0),
         }
@@ -669,6 +695,142 @@ impl VisibilityIndex {
             .into_iter()
             .next()
             .cloned()
+    }
+
+    pub(in crate::analyzer::usages) fn resolve_type_node_result(
+        &self,
+        file: &ProjectFile,
+        node: Node<'_>,
+        source: &str,
+    ) -> std::result::Result<Option<CodeUnit>, ()> {
+        let mut components = Vec::new();
+        if append_cpp_name_components(node, source, &mut components).is_none() {
+            return Ok(None);
+        }
+        let Some(primary) = self.resolve_type(file, &components.join("::")) else {
+            return Ok(None);
+        };
+        let Some(arguments) = cpp_template_reference_arguments(node, source) else {
+            return Ok(Some(primary));
+        };
+        self.resolve_template_arguments(file, primary, &arguments)
+            .map(Some)
+    }
+
+    fn resolve_template_arguments(
+        &self,
+        file: &ProjectFile,
+        primary: CodeUnit,
+        arguments: &[CppTemplateExpression],
+    ) -> std::result::Result<CodeUnit, ()> {
+        let primary_fq_name = self
+            .cpp_template_metadata
+            .get(&primary)
+            .map(|metadata| metadata.primary_fq_name.clone())
+            .unwrap_or_else(|| primary.fq_name());
+        let has_specialization_metadata = self
+            .cpp_template_families
+            .get(&primary_fq_name)
+            .is_some_and(|family| family.iter().any(|unit| self.is_visible(file, unit)));
+        if !has_specialization_metadata {
+            return Ok(primary);
+        }
+        self.select_template_specialization(file, &primary, arguments)
+            .ok_or(())
+    }
+
+    fn select_template_specialization(
+        &self,
+        file: &ProjectFile,
+        resolved: &CodeUnit,
+        explicit_arguments: &[CppTemplateExpression],
+    ) -> Option<CodeUnit> {
+        let primary_fq_name = self
+            .cpp_template_metadata
+            .get(resolved)
+            .map(|metadata| metadata.primary_fq_name.clone())
+            .unwrap_or_else(|| resolved.fq_name());
+        let family = self.cpp_template_families.get(&primary_fq_name)?;
+        let primary_candidates = family
+            .iter()
+            .filter_map(|unit| {
+                let metadata = self.cpp_template_metadata.get(unit)?;
+                (metadata.specialization_arguments.is_empty() && self.is_visible(file, unit))
+                    .then_some((unit, metadata))
+            })
+            .collect::<Vec<_>>();
+        let primary_unit = primary_candidates
+            .iter()
+            .find_map(|(unit, _)| (*unit == resolved).then_some(*unit))
+            .or_else(|| {
+                primary_candidates
+                    .iter()
+                    .map(|(unit, _)| *unit)
+                    .min_by_key(|unit| {
+                        (
+                            unit.source().to_string(),
+                            unit.signature().unwrap_or_default(),
+                        )
+                    })
+            })?;
+        let primary_parameters =
+            cpp_reconcile_primary_template_parameters(&primary_candidates, primary_unit)?;
+        if explicit_arguments.len() > primary_parameters.len() {
+            return None;
+        }
+        let mut expanded = explicit_arguments
+            .iter()
+            .map(cpp_clone_template_expression_iterative)
+            .collect::<Vec<_>>();
+        let mut primary_bindings = HashMap::default();
+        for (parameter, argument) in primary_parameters.iter().zip(&expanded) {
+            primary_bindings.insert(
+                parameter.name.clone(),
+                cpp_clone_template_term_iterative(&argument.term),
+            );
+        }
+        for parameter in primary_parameters.iter().skip(expanded.len()) {
+            let default = parameter.default.as_ref()?;
+            let term = cpp_substitute_template_term(&default.term, &primary_bindings)?;
+            primary_bindings.insert(parameter.name.clone(), term.clone());
+            expanded.push(CppTemplateExpression {
+                text: default.text.clone(),
+                term,
+            });
+        }
+
+        let mut applicable = Vec::new();
+        for unit in family {
+            let Some(metadata) = self.cpp_template_metadata.get(unit) else {
+                continue;
+            };
+            if metadata.specialization_arguments.is_empty() || !self.is_visible(file, unit) {
+                continue;
+            }
+            if !cpp_specialization_matches(metadata, &expanded) {
+                continue;
+            }
+            applicable.push((unit, metadata));
+        }
+        if applicable.is_empty() {
+            return Some(primary_unit.clone());
+        }
+
+        // A scalar constraint count cannot represent C++ partial ordering:
+        // e.g. `<T*, U>` and `<T, int>` are incomparable for `<int*, int>`.
+        // Select only a logical candidate whose structural pattern is strictly
+        // more specialized than every other distinct applicable candidate.
+        let mut winners = applicable.iter().filter(|(candidate, candidate_metadata)| {
+            applicable.iter().all(|(other, other_metadata)| {
+                same_visible_symbol(candidate, other)
+                    || cpp_specialization_more_specialized(candidate_metadata, other_metadata)
+            })
+        });
+        let selected = winners.next()?.0;
+        if winners.any(|(unit, _)| !same_visible_symbol(unit, selected)) {
+            return None;
+        }
+        Some(selected.clone())
     }
 
     pub(super) fn resolve_type_components_lexically(
@@ -2241,6 +2403,13 @@ pub(super) fn field_declared_binding(
         field,
         &normalized,
     );
+    let resolved = match (resolved, fact.template_arguments.as_deref()) {
+        (Some(primary), Some(arguments)) => visibility
+            .resolve_template_arguments(visible_from, primary, arguments)
+            .ok(),
+        (resolved, None) => resolved,
+        (None, Some(_)) => None,
+    };
     Some(CppScanBinding::from_type_name(
         normalized,
         resolved,
@@ -2301,13 +2470,28 @@ fn declared_type_alias(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
             .is_some_and(|provider| provider.is_type_alias(unit))
 }
 
-pub(in crate::analyzer::usages) fn field_declared_type_text(
+pub(in crate::analyzer::usages) fn field_declared_type_binding(
     analyzer: &dyn IAnalyzer,
     visibility: &VisibilityIndex,
+    visible_from: &ProjectFile,
     field: &CodeUnit,
-) -> Option<(String, i32)> {
+) -> Option<(String, Option<CodeUnit>, i32)> {
     let fact = visibility.field_declared_type_fact(analyzer, field)?;
-    Some((fact.type_text, fact.indirection))
+    let normalized = normalize_field_type_text(&fact.type_text);
+    let primary = visibility.resolve_unique_canonical_type_for_declaration(
+        analyzer,
+        visible_from,
+        field,
+        &normalized,
+    );
+    let resolved = match (primary, fact.template_arguments.as_deref()) {
+        (Some(primary), Some(arguments)) => visibility
+            .resolve_template_arguments(visible_from, primary, arguments)
+            .ok(),
+        (resolved, None) => resolved,
+        (None, Some(_)) => None,
+    };
+    Some((normalized, resolved, fact.indirection))
 }
 
 fn decode_field_declared_type_fact(
@@ -2332,6 +2516,7 @@ fn decode_field_declared_type_fact(
             return Some(DeclaredFieldTypeFact {
                 type_text: node_text(type_node, &declaration).to_string(),
                 indirection,
+                template_arguments: cpp_template_reference_arguments(type_node, &declaration),
             });
         }
         let mut cursor = node.walk();
@@ -3131,6 +3316,333 @@ pub(super) fn append_cpp_name_components(
             .map(|component| node_text(component, source).to_string()),
     );
     Some(())
+}
+
+fn cpp_template_reference_arguments(
+    mut node: Node<'_>,
+    source: &str,
+) -> Option<Vec<CppTemplateExpression>> {
+    loop {
+        match node.kind() {
+            "template_type" => {
+                let arguments = node.child_by_field_name("arguments")?;
+                let mut cursor = arguments.walk();
+                return Some(
+                    arguments
+                        .named_children(&mut cursor)
+                        .filter(|argument| !argument.is_extra() && argument.kind() != "comment")
+                        .map(|argument| CppTemplateExpression {
+                            text: normalize_cpp_whitespace(node_text(argument, source)),
+                            term: cpp_template_term(argument, source, &[]),
+                        })
+                        .collect(),
+                );
+            }
+            "qualified_identifier" | "scoped_type_identifier" | "type_descriptor" => {
+                node = node
+                    .child_by_field_name("name")
+                    .or_else(|| node.child_by_field_name("type"))?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn cpp_reconcile_primary_template_parameters(
+    candidates: &[(&CodeUnit, &CppTemplateMetadata)],
+    preferred: &CodeUnit,
+) -> Option<Vec<CppTemplateParameterMetadata>> {
+    let canonical = candidates
+        .iter()
+        .find_map(|(unit, metadata)| (*unit == preferred).then_some(*metadata))?;
+    let mut merged = canonical
+        .parameters
+        .iter()
+        .map(|parameter| CppTemplateParameterMetadata {
+            name: parameter.name.clone(),
+            kind: parameter.kind,
+            default: None,
+        })
+        .collect::<Vec<_>>();
+
+    for (_, metadata) in candidates {
+        if metadata.parameters.len() != merged.len() {
+            return None;
+        }
+        let rename_bindings = metadata
+            .parameters
+            .iter()
+            .zip(&merged)
+            .map(|(parameter, canonical)| {
+                (
+                    parameter.name.clone(),
+                    CppTemplateTerm::Parameter(canonical.name.clone()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for ((parameter, canonical), merged_parameter) in metadata
+            .parameters
+            .iter()
+            .zip(&canonical.parameters)
+            .zip(&mut merged)
+        {
+            if parameter.kind != canonical.kind {
+                return None;
+            }
+            let Some(default) = &parameter.default else {
+                continue;
+            };
+            let normalized_term = cpp_substitute_template_term(&default.term, &rename_bindings)?;
+            if let Some(existing) = &merged_parameter.default {
+                if !cpp_template_terms_equal(&existing.term, &normalized_term) {
+                    return None;
+                }
+            } else {
+                merged_parameter.default = Some(CppTemplateExpression {
+                    text: default.text.clone(),
+                    term: normalized_term,
+                });
+            }
+        }
+    }
+    Some(merged)
+}
+
+fn cpp_specialization_matches(
+    metadata: &CppTemplateMetadata,
+    arguments: &[CppTemplateExpression],
+) -> bool {
+    if metadata.specialization_arguments.len() != arguments.len() {
+        return false;
+    }
+    let parameter_names = metadata
+        .parameters
+        .iter()
+        .map(|parameter| parameter.name.as_str())
+        .collect::<HashSet<_>>();
+    let mut bindings: HashMap<String, CppTemplateTerm> = HashMap::default();
+    for (pattern, argument) in metadata.specialization_arguments.iter().zip(arguments) {
+        if !cpp_unify_template_term(
+            &pattern.term,
+            &argument.term,
+            &parameter_names,
+            &mut bindings,
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+fn cpp_specialization_more_specialized(
+    candidate: &CppTemplateMetadata,
+    other: &CppTemplateMetadata,
+) -> bool {
+    cpp_specialization_pattern_accepts(other, candidate)
+        && !cpp_specialization_pattern_accepts(candidate, other)
+}
+
+fn cpp_specialization_pattern_accepts(
+    broader: &CppTemplateMetadata,
+    narrower: &CppTemplateMetadata,
+) -> bool {
+    if broader.specialization_arguments.len() != narrower.specialization_arguments.len() {
+        return false;
+    }
+    let parameter_names = broader
+        .parameters
+        .iter()
+        .map(|parameter| parameter.name.as_str())
+        .collect::<HashSet<_>>();
+    let mut bindings: HashMap<String, CppTemplateTerm> = HashMap::default();
+    broader
+        .specialization_arguments
+        .iter()
+        .zip(&narrower.specialization_arguments)
+        .all(|(pattern, argument)| {
+            cpp_unify_template_term(
+                &pattern.term,
+                &argument.term,
+                &parameter_names,
+                &mut bindings,
+            )
+        })
+}
+
+fn cpp_substitute_template_term(
+    term: &CppTemplateTerm,
+    bindings: &HashMap<String, CppTemplateTerm>,
+) -> Option<CppTemplateTerm> {
+    enum Work<'a> {
+        Visit(&'a CppTemplateTerm),
+        Build { kind: String, child_count: usize },
+    }
+
+    let mut work = vec![Work::Visit(term)];
+    let mut substituted = Vec::new();
+    while let Some(next) = work.pop() {
+        match next {
+            Work::Visit(CppTemplateTerm::Parameter(name)) => {
+                substituted.push(cpp_clone_template_term_iterative(bindings.get(name)?));
+            }
+            Work::Visit(CppTemplateTerm::Atom { kind, text }) => {
+                substituted.push(CppTemplateTerm::Atom {
+                    kind: kind.clone(),
+                    text: text.clone(),
+                });
+            }
+            Work::Visit(CppTemplateTerm::Node { kind, children }) => {
+                work.push(Work::Build {
+                    kind: kind.clone(),
+                    child_count: children.len(),
+                });
+                work.extend(children.iter().rev().map(Work::Visit));
+            }
+            Work::Build { kind, child_count } => {
+                let children = substituted.split_off(substituted.len() - child_count);
+                substituted.push(CppTemplateTerm::Node { kind, children });
+            }
+        }
+    }
+    substituted.pop()
+}
+
+fn cpp_clone_template_term_iterative(term: &CppTemplateTerm) -> CppTemplateTerm {
+    enum Work<'a> {
+        Visit(&'a CppTemplateTerm),
+        Build { kind: String, child_count: usize },
+    }
+
+    let mut work = vec![Work::Visit(term)];
+    let mut cloned = Vec::new();
+    while let Some(next) = work.pop() {
+        match next {
+            Work::Visit(CppTemplateTerm::Parameter(name)) => {
+                cloned.push(CppTemplateTerm::Parameter(name.clone()));
+            }
+            Work::Visit(CppTemplateTerm::Atom { kind, text }) => {
+                cloned.push(CppTemplateTerm::Atom {
+                    kind: kind.clone(),
+                    text: text.clone(),
+                });
+            }
+            Work::Visit(CppTemplateTerm::Node { kind, children }) => {
+                work.push(Work::Build {
+                    kind: kind.clone(),
+                    child_count: children.len(),
+                });
+                work.extend(children.iter().rev().map(Work::Visit));
+            }
+            Work::Build { kind, child_count } => {
+                let children = cloned.split_off(cloned.len() - child_count);
+                cloned.push(CppTemplateTerm::Node { kind, children });
+            }
+        }
+    }
+    cloned
+        .pop()
+        .expect("template term traversal emits one root")
+}
+
+fn cpp_clone_template_expression_iterative(
+    expression: &CppTemplateExpression,
+) -> CppTemplateExpression {
+    CppTemplateExpression {
+        text: expression.text.clone(),
+        term: cpp_clone_template_term_iterative(&expression.term),
+    }
+}
+
+fn cpp_unify_template_term(
+    pattern: &CppTemplateTerm,
+    argument: &CppTemplateTerm,
+    parameters: &HashSet<&str>,
+    bindings: &mut HashMap<String, CppTemplateTerm>,
+) -> bool {
+    let mut work = vec![(pattern, argument)];
+    while let Some((pattern, argument)) = work.pop() {
+        match pattern {
+            CppTemplateTerm::Parameter(name) if parameters.contains(name.as_str()) => {
+                if let Some(bound) = bindings.get(name) {
+                    if !cpp_template_terms_equal(bound, argument) {
+                        return false;
+                    }
+                } else {
+                    bindings.insert(name.clone(), cpp_clone_template_term_iterative(argument));
+                }
+            }
+            CppTemplateTerm::Atom {
+                kind: pattern_kind,
+                text: pattern_text,
+            } => {
+                if !matches!(
+                    argument,
+                    CppTemplateTerm::Atom { kind, text }
+                        if kind == pattern_kind && text == pattern_text
+                ) {
+                    return false;
+                }
+            }
+            CppTemplateTerm::Node {
+                kind: pattern_kind,
+                children: pattern_children,
+            } => {
+                let CppTemplateTerm::Node { kind, children } = argument else {
+                    return false;
+                };
+                if kind != pattern_kind || children.len() != pattern_children.len() {
+                    return false;
+                }
+                work.extend(pattern_children.iter().zip(children).rev());
+            }
+            CppTemplateTerm::Parameter(_) => return false,
+        }
+    }
+    true
+}
+
+fn cpp_template_terms_equal(left: &CppTemplateTerm, right: &CppTemplateTerm) -> bool {
+    let mut work = vec![(left, right)];
+    while let Some((left, right)) = work.pop() {
+        match (left, right) {
+            (CppTemplateTerm::Parameter(left), CppTemplateTerm::Parameter(right)) => {
+                if left != right {
+                    return false;
+                }
+            }
+            (
+                CppTemplateTerm::Atom {
+                    kind: left_kind,
+                    text: left_text,
+                },
+                CppTemplateTerm::Atom {
+                    kind: right_kind,
+                    text: right_text,
+                },
+            ) => {
+                if left_kind != right_kind || left_text != right_text {
+                    return false;
+                }
+            }
+            (
+                CppTemplateTerm::Node {
+                    kind: left_kind,
+                    children: left_children,
+                },
+                CppTemplateTerm::Node {
+                    kind: right_kind,
+                    children: right_children,
+                },
+            ) => {
+                if left_kind != right_kind || left_children.len() != right_children.len() {
+                    return false;
+                }
+                work.extend(left_children.iter().zip(right_children).rev());
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn cpp_name_component_nodes(node: Node<'_>) -> Option<Vec<Node<'_>>> {
@@ -4079,8 +4591,87 @@ mod tests {
             alias_source_parse_counts: Mutex::new(HashMap::default()),
             field_type_facts: Mutex::new(HashMap::default()),
             structured_alias_targets: Mutex::new(HashMap::default()),
+            cpp_template_metadata: HashMap::default(),
+            cpp_template_families: HashMap::default(),
             qualified_candidate_inspections: AtomicUsize::new(0),
         }
+    }
+
+    #[test]
+    fn template_id_without_specialization_metadata_keeps_resolved_primary() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
+        let legacy = CodeUnit::new(
+            ProjectFile::new(root, "legacy.h"),
+            CodeUnitType::Class,
+            "",
+            "legacy",
+        );
+        let visibility = visibility_index(HashMap::from_iter([(
+            consumer.clone(),
+            HashSet::from_iter([legacy.clone()]),
+        )]));
+        let source = "legacy<int> value;";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("set C++ grammar");
+        let tree = parser.parse(source, None).expect("parse template-id");
+        let mut stack = vec![tree.root_node()];
+        let mut type_node = None;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "template_type" {
+                type_node = Some(node);
+                break;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        assert_eq!(
+            visibility.resolve_type_node_result(
+                &consumer,
+                type_node.expect("template type node"),
+                source,
+            ),
+            Ok(Some(legacy))
+        );
+    }
+
+    #[test]
+    fn deeply_nested_cpp_template_terms_use_stack_safe_matching_and_substitution() {
+        let mut pattern = CppTemplateTerm::Parameter("T".to_string());
+        let mut argument = CppTemplateTerm::Atom {
+            kind: "primitive_type".to_string(),
+            text: "int".to_string(),
+        };
+        for _ in 0..512 {
+            pattern = CppTemplateTerm::Node {
+                kind: "template_argument".to_string(),
+                children: vec![pattern],
+            };
+            argument = CppTemplateTerm::Node {
+                kind: "template_argument".to_string(),
+                children: vec![argument],
+            };
+        }
+
+        let parameters = std::iter::once("T").collect::<HashSet<_>>();
+        let mut bindings = HashMap::default();
+        assert!(cpp_unify_template_term(
+            &pattern,
+            &argument,
+            &parameters,
+            &mut bindings,
+        ));
+        let substituted =
+            cpp_substitute_template_term(&pattern, &bindings).expect("bound deep template term");
+        assert!(cpp_unify_template_term(
+            &substituted,
+            &argument,
+            &HashSet::default(),
+            &mut HashMap::default(),
+        ));
     }
 
     #[test]

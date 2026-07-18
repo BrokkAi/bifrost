@@ -21,8 +21,8 @@ use tree_sitter::Language as TsLanguage;
 
 use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter};
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, ImportInfo, Language, ProjectFile, Range, RubyMethodDispatchMode,
-    SignatureMetadata, SummaryFileProjection,
+    CodeUnit, CodeUnitType, CppTemplateMetadata, ImportInfo, Language, ProjectFile, Range,
+    RubyMethodDispatchMode, SignatureMetadata, SummaryFileProjection,
 };
 use crate::gitblob;
 use crate::hash::{HashMap, HashSet, set_with_capacity};
@@ -145,6 +145,10 @@ AND meta.signature_count = (
 )
 AND meta.signature_metadata_count = (
   SELECT COUNT(*) FROM unit_signature_metadata AS metadata
+  WHERE metadata.blob_oid = meta.blob_oid AND metadata.lang = meta.lang
+)
+AND meta.cpp_template_metadata_count = (
+  SELECT COUNT(*) FROM unit_cpp_template_metadata AS metadata
   WHERE metadata.blob_oid = meta.blob_oid AND metadata.lang = meta.lang
 )
 AND meta.supertype_count = (
@@ -2113,6 +2117,7 @@ impl AnalyzerStore {
             "unit_ranges",
             "unit_signatures",
             "unit_signature_metadata",
+            "unit_cpp_template_metadata",
             "unit_supertypes",
             "unit_children",
             "import_statements",
@@ -2369,6 +2374,7 @@ pub(crate) struct PreparedParsedBlob {
     ranges: Vec<(i64, i64, i64, i64, i64, i64)>,
     signatures: Vec<(i64, i64, String)>,
     signature_metadata: Vec<(i64, i64, Vec<u8>)>,
+    cpp_template_metadata: Vec<(i64, Vec<u8>)>,
     supertypes: Vec<(i64, i64, String, String)>,
     children: Vec<(i64, i64, i64)>,
     import_statements: Vec<(i64, String)>,
@@ -2505,6 +2511,7 @@ struct PersistedSideTableCounts {
     range_count: usize,
     signature_count: usize,
     signature_metadata_count: usize,
+    cpp_template_metadata_count: usize,
     supertype_count: usize,
     child_count: usize,
     import_statement_count: usize,
@@ -2594,6 +2601,13 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
             signature_metadata.push((unit_key, usize_to_i64(ordinal)?, serialize_blob(metadata)?));
         }
     }
+    let mut cpp_template_metadata = Vec::new();
+    for (unit, metadata) in &state.cpp_template_metadata {
+        let Some(&unit_key) = unit_keys.get(unit) else {
+            continue;
+        };
+        cpp_template_metadata.push((unit_key, serialize_blob(metadata)?));
+    }
     let mut supertypes = Vec::new();
     for (unit, entries) in &state.raw_supertypes {
         let Some(&unit_key) = unit_keys.get(unit) else {
@@ -2658,6 +2672,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
         ranges.len(),
         signatures.len(),
         signature_metadata.len(),
+        cpp_template_metadata.len(),
         supertypes.len(),
         children.len(),
         import_statements.len(),
@@ -2694,6 +2709,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
     ]);
     let binary_bytes = saturating_sum([
         saturating_sum(signature_metadata.iter().map(|(_, _, bytes)| bytes.len())),
+        saturating_sum(cpp_template_metadata.iter().map(|(_, bytes)| bytes.len())),
         saturating_sum(imports.iter().map(|(_, bytes)| bytes.len())),
     ]);
     let content_package = adapter.storage_file_content_qualifier(&state.content_qualifier);
@@ -2715,6 +2731,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
         ranges,
         signatures,
         signature_metadata,
+        cpp_template_metadata,
         supertypes,
         children,
         import_statements,
@@ -2802,6 +2819,13 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
         }
     );
     insert_rows!(
+        "INSERT OR IGNORE INTO unit_cpp_template_metadata(blob_oid, lang, unit_key, metadata) VALUES(?1, ?2, ?3, ?4)",
+        &blob.cpp_template_metadata,
+        |stmt, row| {
+            stmt.execute(params![oid, lang, row.0, row.1])?;
+        }
+    );
+    insert_rows!(
         "INSERT OR IGNORE INTO unit_supertypes(blob_oid, lang, unit_key, ordinal, raw, lookup_path) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
         &blob.supertypes,
         |stmt, row| {
@@ -2855,8 +2879,8 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
            blob_oid, lang, contains_tests, content_package, stored_unit_count,
            range_count, signature_count, signature_metadata_count, supertype_count,
            child_count, import_statement_count, import_count, type_identifier_count,
-           ruby_dispatch_count, scala_trait_count, is_complete
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 1)",
+           ruby_dispatch_count, scala_trait_count, cpp_template_metadata_count, is_complete
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 1)",
         params![
             oid,
             lang,
@@ -2873,6 +2897,7 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
             usize_to_i64(blob.type_identifiers.len())?,
             usize_to_i64(blob.ruby_dispatch_modes.len())?,
             usize_to_i64(blob.scala_traits.len())?,
+            usize_to_i64(blob.cpp_template_metadata.len())?,
         ],
     )?;
     let integrity_sql = format!(
@@ -2959,6 +2984,8 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
     let signature_count = insert_unit_signatures(tx, &oid, lang, &unit_keys, &state.signatures)?;
     let signature_metadata_count =
         insert_unit_signature_metadata(tx, &oid, lang, &unit_keys, &state.signature_metadata)?;
+    let cpp_template_metadata_count =
+        insert_cpp_template_metadata(tx, &oid, lang, &unit_keys, &state.cpp_template_metadata)?;
     let supertype_count = insert_unit_supertypes(
         tx,
         &oid,
@@ -2981,6 +3008,7 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
         range_count,
         signature_count,
         signature_metadata_count,
+        cpp_template_metadata_count,
         supertype_count,
         child_count,
         import_statement_count,
@@ -3002,6 +3030,7 @@ fn collect_stored_units<A: LanguageAdapter>(adapter: &A, state: &FileState) -> V
     candidates.extend(state.raw_supertypes.keys().cloned());
     candidates.extend(state.signatures.keys().cloned());
     candidates.extend(state.signature_metadata.keys().cloned());
+    candidates.extend(state.cpp_template_metadata.keys().cloned());
     candidates.extend(state.ranges.keys().cloned());
     candidates.extend(state.children.keys().cloned());
     candidates.extend(state.children.values().flatten().cloned());
@@ -3153,6 +3182,29 @@ fn insert_unit_signature_metadata(
             ])?;
             count += 1;
         }
+    }
+    Ok(count)
+}
+
+fn insert_cpp_template_metadata(
+    tx: &Transaction<'_>,
+    oid: &str,
+    lang: &str,
+    unit_keys: &HashMap<CodeUnit, i64>,
+    metadata: &HashMap<CodeUnit, CppTemplateMetadata>,
+) -> Result<usize> {
+    let mut stmt = tx.prepare(
+        "INSERT OR IGNORE INTO unit_cpp_template_metadata(
+           blob_oid, lang, unit_key, metadata
+         ) VALUES(?1, ?2, ?3, ?4)",
+    )?;
+    let mut count = 0;
+    for (unit, entry) in metadata {
+        let Some(unit_key) = unit_keys.get(unit) else {
+            continue;
+        };
+        stmt.execute(params![oid, lang, unit_key, serialize_blob(entry)?])?;
+        count += 1;
     }
     Ok(count)
 }
@@ -3329,8 +3381,8 @@ fn insert_blob_meta<A: LanguageAdapter>(
            blob_oid, lang, contains_tests, content_package, stored_unit_count,
            range_count, signature_count, signature_metadata_count, supertype_count,
            child_count, import_statement_count, import_count, type_identifier_count,
-           ruby_dispatch_count, scala_trait_count, is_complete
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+           ruby_dispatch_count, scala_trait_count, cpp_template_metadata_count, is_complete
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             oid,
             lang,
@@ -3347,6 +3399,7 @@ fn insert_blob_meta<A: LanguageAdapter>(
             usize_to_i64(side_counts.type_identifier_count)?,
             usize_to_i64(side_counts.ruby_dispatch_count)?,
             usize_to_i64(side_counts.scala_trait_count)?,
+            usize_to_i64(side_counts.cpp_template_metadata_count)?,
             1,
         ],
     )?;
@@ -3417,11 +3470,13 @@ struct RawSideTableCounts {
     type_identifier_count: i64,
     ruby_dispatch_count: i64,
     scala_trait_count: i64,
+    cpp_template_metadata_count: i64,
 }
 
 type BlobMetaRows = HashMap<String, BlobMetaRow>;
 type SignatureMetadataRow = (i64, Vec<u8>);
 type SignatureMetadataRows = HashMap<String, Vec<SignatureMetadataRow>>;
+type CppTemplateMetadataRows = HashMap<String, Vec<SignatureMetadataRow>>;
 type RangeRow = (i64, i64, i64, i64, i64);
 type RangeRows = HashMap<String, Vec<RangeRow>>;
 type RubyDispatchRows = HashMap<String, Vec<(i64, i64)>>;
@@ -3484,12 +3539,14 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
     let imports = read_import_infos(conn, &oid, lang)?;
     let signatures = read_unit_string_vec(conn, &oid, lang, "unit_signatures", "text", &by_key)?;
     let signature_metadata = read_signature_metadata(conn, &oid, lang, &by_key)?;
+    let cpp_template_metadata = read_cpp_template_metadata(conn, &oid, lang, &by_key)?;
     let ranges = read_ranges(conn, &oid, lang, &by_key)?;
 
     let actual_counts = side_table_counts_from_hydrated_parts(HydratedSideTableParts {
         ranges: &ranges,
         signatures: &signatures,
         signature_metadata: &signature_metadata,
+        cpp_template_metadata: &cpp_template_metadata,
         raw_supertypes: &raw_supertypes,
         children: &children,
         import_statement_count: import_statements.len(),
@@ -3516,6 +3573,7 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
         type_identifiers: meta.type_identifiers,
         signatures,
         signature_metadata,
+        cpp_template_metadata,
         ranges,
         children,
         type_aliases,
@@ -3599,6 +3657,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
     let signatures_by_oid =
         read_unit_string_vec_bulk(conn, lang, "unit_signatures", "text", &oids)?;
     let signature_metadata_by_oid = read_signature_metadata_bulk(conn, lang, &oids)?;
+    let cpp_template_metadata_by_oid = read_cpp_template_metadata_bulk(conn, lang, &oids)?;
     let ranges_by_oid = read_ranges_bulk(conn, lang, &oids)?;
     let ruby_dispatch_by_oid = read_ruby_method_dispatch_modes_bulk(conn, lang, &oids)?;
     let scala_traits_by_oid = read_scala_traits_bulk(conn, lang, &oids)?;
@@ -3682,6 +3741,10 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
         let signatures = unit_string_map_for_file(signatures_by_oid.get(&oid_text), &by_key);
         let signature_metadata =
             signature_metadata_map_for_file(signature_metadata_by_oid.get(&oid_text), &by_key)?;
+        let cpp_template_metadata = cpp_template_metadata_map_for_file(
+            cpp_template_metadata_by_oid.get(&oid_text),
+            &by_key,
+        )?;
         let ranges = ranges_map_for_file(ranges_by_oid.get(&oid_text), &by_key)?;
         let children = children_map_for_file(children_by_oid.get(&oid_text), &by_key);
 
@@ -3689,6 +3752,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             ranges: &ranges,
             signatures: &signatures,
             signature_metadata: &signature_metadata,
+            cpp_template_metadata: &cpp_template_metadata,
             raw_supertypes: &raw_supertypes,
             children: &children,
             import_statement_count: import_statements.len(),
@@ -3715,6 +3779,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             type_identifiers: meta.type_identifiers.clone(),
             signatures,
             signature_metadata,
+            cpp_template_metadata,
             ranges,
             children,
             type_aliases,
@@ -3748,7 +3813,7 @@ fn read_blob_meta<A: LanguageAdapter>(
                 "SELECT contains_tests, content_package, stored_unit_count,
                     range_count, signature_count, signature_metadata_count, supertype_count,
                     child_count, import_statement_count, import_count, type_identifier_count,
-                    ruby_dispatch_count, scala_trait_count
+                    ruby_dispatch_count, scala_trait_count, cpp_template_metadata_count
              FROM blob_meta AS meta
              WHERE blob_oid = ?1 AND lang = ?2
                AND {PARSED_BLOB_COMPLETE_CONDITION}"
@@ -3835,6 +3900,7 @@ fn raw_side_table_counts_from_row(
         type_identifier_count: row.get(offset + 7)?,
         ruby_dispatch_count: row.get(offset + 8)?,
         scala_trait_count: row.get(offset + 9)?,
+        cpp_template_metadata_count: row.get(offset + 10)?,
     })
 }
 
@@ -3850,6 +3916,7 @@ fn side_table_counts_from_raw(raw: RawSideTableCounts) -> Result<PersistedSideTa
         type_identifier_count: i64_to_usize(raw.type_identifier_count)?,
         ruby_dispatch_count: i64_to_usize(raw.ruby_dispatch_count)?,
         scala_trait_count: i64_to_usize(raw.scala_trait_count)?,
+        cpp_template_metadata_count: i64_to_usize(raw.cpp_template_metadata_count)?,
     })
 }
 
@@ -3889,7 +3956,7 @@ fn read_blob_meta_bulk(conn: &Connection, lang: &str, oids: &[String]) -> Result
             "SELECT meta.blob_oid, contains_tests, content_package, stored_unit_count,
                     range_count, signature_count, signature_metadata_count, supertype_count,
                     child_count, import_statement_count, import_count, type_identifier_count,
-                    ruby_dispatch_count, scala_trait_count
+                    ruby_dispatch_count, scala_trait_count, cpp_template_metadata_count
              FROM blob_meta AS meta
              WHERE meta.lang = ? AND meta.blob_oid IN ({placeholders})
                AND {PARSED_BLOB_COMPLETE_CONDITION}
@@ -4164,6 +4231,39 @@ fn read_signature_metadata_bulk(
     Ok(out)
 }
 
+fn read_cpp_template_metadata_bulk(
+    conn: &Connection,
+    lang: &str,
+    oids: &[String],
+) -> Result<CppTemplateMetadataRows> {
+    let mut out = HashMap::default();
+    for chunk in oids.chunks(900) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = chunk_placeholders(chunk);
+        let sql = format!(
+            "SELECT blob_oid, unit_key, metadata FROM unit_cpp_template_metadata
+             WHERE lang = ? AND blob_oid IN ({placeholders})
+             ORDER BY blob_oid, unit_key"
+        );
+        let params = chunk_params(lang, chunk);
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (oid, key, value) = row?;
+            out.entry(oid).or_insert_with(Vec::new).push((key, value));
+        }
+    }
+    Ok(out)
+}
+
 fn read_ranges_bulk(conn: &Connection, lang: &str, oids: &[String]) -> Result<RangeRows> {
     let mut out: RangeRows = HashMap::default();
     for chunk in oids.chunks(900) {
@@ -4324,6 +4424,19 @@ fn signature_metadata_map_for_file(
     Ok(out)
 }
 
+fn cpp_template_metadata_map_for_file(
+    rows: Option<&Vec<(i64, Vec<u8>)>>,
+    by_key: &HashMap<i64, UnitRow>,
+) -> Result<HashMap<CodeUnit, CppTemplateMetadata>> {
+    let mut out = HashMap::default();
+    for (key, value) in rows.into_iter().flatten() {
+        if let Some(unit) = by_key.get(key) {
+            out.insert(unit.unit.clone(), deserialize_blob(value)?);
+        }
+    }
+    Ok(out)
+}
+
 fn ranges_map_for_file(
     rows: Option<&Vec<RangeRow>>,
     by_key: &HashMap<i64, UnitRow>,
@@ -4388,6 +4501,7 @@ struct HydratedSideTableParts<'a> {
     ranges: &'a HashMap<CodeUnit, Vec<Range>>,
     signatures: &'a HashMap<CodeUnit, Vec<String>>,
     signature_metadata: &'a HashMap<CodeUnit, Vec<SignatureMetadata>>,
+    cpp_template_metadata: &'a HashMap<CodeUnit, CppTemplateMetadata>,
     raw_supertypes: &'a HashMap<CodeUnit, Vec<String>>,
     children: &'a HashMap<CodeUnit, Vec<CodeUnit>>,
     import_statement_count: usize,
@@ -4404,6 +4518,7 @@ fn side_table_counts_from_hydrated_parts(
         range_count: count_vec_entries(parts.ranges),
         signature_count: count_vec_entries(parts.signatures),
         signature_metadata_count: count_vec_entries(parts.signature_metadata),
+        cpp_template_metadata_count: parts.cpp_template_metadata.len(),
         supertype_count: count_vec_entries(parts.raw_supertypes),
         child_count: count_vec_entries(parts.children),
         import_statement_count: parts.import_statement_count,
@@ -4922,6 +5037,30 @@ fn read_signature_metadata(
     Ok(out)
 }
 
+fn read_cpp_template_metadata(
+    conn: &Connection,
+    oid: &str,
+    lang: &str,
+    by_key: &HashMap<i64, UnitRow>,
+) -> Result<HashMap<CodeUnit, CppTemplateMetadata>> {
+    let mut stmt = conn.prepare(
+        "SELECT unit_key, metadata FROM unit_cpp_template_metadata
+         WHERE blob_oid = ?1 AND lang = ?2
+         ORDER BY unit_key",
+    )?;
+    let rows = stmt.query_map(params![oid, lang], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+    let mut out = HashMap::default();
+    for row in rows {
+        let (key, metadata) = row?;
+        if let Some(unit) = by_key.get(&key) {
+            out.insert(unit.unit.clone(), deserialize_blob(&metadata)?);
+        }
+    }
+    Ok(out)
+}
+
 fn read_ranges(
     conn: &Connection,
     oid: &str,
@@ -5223,7 +5362,8 @@ fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
            CASE WHEN blob.blob_oid IS NULL THEN 0
              WHEN meta.blob_oid IS NULL THEN 1
              ELSE 2 + meta.stored_unit_count + meta.range_count + meta.signature_count
-               + meta.signature_metadata_count + meta.supertype_count + meta.child_count
+               + meta.signature_metadata_count + meta.cpp_template_metadata_count
+               + meta.supertype_count + meta.child_count
                + meta.import_statement_count + meta.import_count + meta.type_identifier_count
                + meta.ruby_dispatch_count + meta.scala_trait_count
                + (SELECT COUNT(*) FROM structural_facts_snapshots AS snapshots
@@ -5259,7 +5399,8 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
     "SELECT
        1 + CASE WHEN meta.blob_oid IS NULL THEN 0 ELSE
          1 + meta.stored_unit_count + meta.range_count + meta.signature_count
-           + meta.signature_metadata_count + meta.supertype_count + meta.child_count
+           + meta.signature_metadata_count + meta.cpp_template_metadata_count
+           + meta.supertype_count + meta.child_count
            + meta.import_statement_count + meta.import_count + meta.type_identifier_count
            + meta.ruby_dispatch_count + meta.scala_trait_count
            + (SELECT COUNT(*) FROM structural_facts_snapshots AS snapshots
@@ -5277,6 +5418,8 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
            + COALESCE((SELECT SUM(length(CAST(text AS BLOB))) FROM unit_signatures
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
            + COALESCE((SELECT SUM(length(metadata)) FROM unit_signature_metadata
+               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
+           + COALESCE((SELECT SUM(length(metadata)) FROM unit_cpp_template_metadata
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
            + COALESCE((SELECT SUM(length(CAST(raw AS BLOB))
                + length(CAST(lookup_path AS BLOB))) FROM unit_supertypes
@@ -5370,7 +5513,8 @@ fn reclaim_stale_generations_conn(conn: &mut Connection, max_logical_rows: usize
             "SELECT blobs.blob_oid, blobs.lang,
                     1 + CASE WHEN meta.blob_oid IS NULL THEN 0 ELSE
                       1 + meta.stored_unit_count + meta.range_count + meta.signature_count
-                        + meta.signature_metadata_count + meta.supertype_count + meta.child_count
+                        + meta.signature_metadata_count + meta.cpp_template_metadata_count
+                        + meta.supertype_count + meta.child_count
                         + meta.import_statement_count + meta.import_count
                         + meta.type_identifier_count + meta.ruby_dispatch_count
                         + meta.scala_trait_count
@@ -5531,6 +5675,7 @@ fn ruby_dispatch_mode_from_i64(value: i64) -> Result<RubyMethodDispatchMode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::cpp::CppAdapter;
     use crate::analyzer::go::GoAdapter;
     use crate::analyzer::java::JavaAdapter;
     use crate::analyzer::python::PythonAdapter;
@@ -6287,6 +6432,11 @@ mod tests {
             "src/main/scala/app/Corrupt.scala",
             "package app\ntrait Runnable\nclass Worker extends Runnable\n",
         );
+        let cpp_file = write_file(
+            root,
+            "include/corrupt.h",
+            "template <typename T, typename U = T*> class Corrupt {};\ntemplate <typename T> class Corrupt<T, T*> {};\n",
+        );
 
         for table in [
             "unit_ranges",
@@ -6313,6 +6463,12 @@ mod tests {
             "scala",
             &scala_file,
             "scala_traits",
+        );
+        assert_deleting_side_table_marks_incomplete(
+            &CppAdapter,
+            "cpp",
+            &cpp_file,
+            "unit_cpp_template_metadata",
         );
     }
 
@@ -7890,6 +8046,7 @@ mod tests {
             type_identifiers: parsed.type_identifiers,
             signatures: parsed.signatures,
             signature_metadata: parsed.signature_metadata,
+            cpp_template_metadata: parsed.cpp_template_metadata,
             ranges: parsed.ranges,
             children: parsed.children,
             type_aliases: parsed.type_aliases,
@@ -7924,6 +8081,7 @@ mod tests {
         assert_eq!(actual.type_identifiers, expected.type_identifiers);
         assert_eq!(actual.signatures, expected.signatures);
         assert_eq!(actual.signature_metadata, expected.signature_metadata);
+        assert_eq!(actual.cpp_template_metadata, expected.cpp_template_metadata);
         assert_eq!(actual.ranges, expected.ranges);
         assert_eq!(
             non_empty_code_unit_vec_entries(&actual.children),

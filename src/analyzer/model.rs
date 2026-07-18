@@ -259,6 +259,47 @@ pub struct SignatureMetadata {
     bare_return_type_parameter: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) enum CppTemplateParameterKind {
+    Type,
+    Value,
+    Template,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CppTemplateExpression {
+    pub(crate) text: String,
+    pub(crate) term: CppTemplateTerm,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum CppTemplateTerm {
+    Parameter(String),
+    Atom {
+        kind: String,
+        text: String,
+    },
+    Node {
+        kind: String,
+        children: Vec<CppTemplateTerm>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CppTemplateParameterMetadata {
+    pub(crate) name: String,
+    pub(crate) kind: CppTemplateParameterKind,
+    pub(crate) default: Option<CppTemplateExpression>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CppTemplateMetadata {
+    pub(crate) primary_name: String,
+    pub(crate) primary_fq_name: String,
+    pub(crate) parameters: Vec<CppTemplateParameterMetadata>,
+    pub(crate) specialization_arguments: Vec<CppTemplateExpression>,
+}
+
 impl SignatureMetadata {
     pub fn new(label: impl Into<String>, parameters: Vec<ParameterMetadata>) -> Self {
         Self {

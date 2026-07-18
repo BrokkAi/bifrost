@@ -297,10 +297,10 @@ fn seed_using_enum(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn seed_variable_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    let type_text = node
+    let type_node = node
         .child_by_field_name("type")
-        .or_else(|| first_type_child(node))
-        .map(|node| node_text(node, ctx.source).to_string());
+        .or_else(|| first_type_child(node));
+    let type_text = type_node.map(|node| node_text(node, ctx.source).to_string());
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         let declarator = if child.kind() == "init_declarator" {
@@ -332,7 +332,7 @@ fn seed_variable_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             ctx.local_shadows.declare_shadow(name.clone());
         }
         let value = child.child_by_field_name("value");
-        seed_binding_from_type_or_value(&name, type_text.as_deref(), value, ctx);
+        seed_binding_from_type_or_value(&name, type_node, value, ctx);
     }
 }
 
@@ -346,11 +346,10 @@ fn seed_typed_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if has_function_scope_ancestor(node) {
         ctx.local_shadows.declare_shadow(name.clone());
     }
-    let type_text = node
+    let type_node = node
         .child_by_field_name("type")
-        .or_else(|| first_type_child(node))
-        .map(|node| node_text(node, ctx.source).to_string());
-    seed_binding_from_type_or_value(&name, type_text.as_deref(), None, ctx);
+        .or_else(|| first_type_child(node));
+    seed_binding_from_type_or_value(&name, type_node, None, ctx);
 }
 
 fn has_function_scope_ancestor(node: Node<'_>) -> bool {
@@ -366,24 +365,30 @@ fn has_function_scope_ancestor(node: Node<'_>) -> bool {
 
 fn seed_binding_from_type_or_value(
     name: &str,
-    type_text: Option<&str>,
+    type_node: Option<Node<'_>>,
     value: Option<Node<'_>>,
     ctx: &mut ScanCtx<'_>,
 ) {
     if name.is_empty() {
         return;
     }
-    let resolved = type_text
-        .filter(|text| normalize_type_text(text) != "auto")
-        .map(|text| {
+    let resolved = type_node
+        .filter(|node| normalize_type_text(node_text(*node, ctx.source)) != "auto")
+        .map(|node| {
+            let text = node_text(node, ctx.source);
             let name = normalize_cpp_type_name(text);
-            CppScanBinding::from_type_name(
-                name.clone(),
-                ctx.visibility
+            let unit = match ctx
+                .visibility
+                .resolve_type_node_result(ctx.file, node, ctx.source)
+            {
+                Ok(Some(unit)) => Some(unit),
+                Ok(None) => ctx
+                    .visibility
                     .canonical_type_for_reference(ctx.file, &name)
                     .or_else(|| ctx.visibility.resolve_type(ctx.file, &name)),
-                cpp_type_text_pointer_depth(text),
-            )
+                Err(()) => None,
+            };
+            CppScanBinding::from_type_name(name.clone(), unit, cpp_type_text_pointer_depth(text))
         })
         .or_else(|| value.and_then(|value| infer_type_from_value(value, ctx)));
 

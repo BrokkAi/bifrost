@@ -25,6 +25,42 @@ static CPP_ASSERT_EQUALITY_RE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid regex")
 });
 
+#[test]
+fn class_template_metadata_does_not_leak_into_ordinary_nested_classes() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical temp dir");
+    let file = ProjectFile::new(root.clone(), "nested.h");
+    file.write(
+        r#"namespace metadata_scope {
+template <typename T> class envelope {
+ public:
+  class nested { public: int pick() const; };
+};
+}
+"#,
+    )
+    .expect("write nested template fixture");
+    let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
+    let declarations = analyzer.get_all_declarations();
+    let envelope = declarations
+        .iter()
+        .find(|unit| {
+            unit.kind() == CodeUnitType::Class && unit.fq_name() == "metadata_scope.envelope"
+        })
+        .expect("outer class template");
+    let nested = declarations
+        .iter()
+        .find(|unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.identifier() == "nested"
+                && analyzer.parent_of(unit).as_ref() == Some(envelope)
+        })
+        .expect("ordinary nested class");
+
+    assert!(analyzer.template_metadata(envelope).is_some());
+    assert!(analyzer.template_metadata(nested).is_none());
+}
+
 #[derive(Clone)]
 struct CppAssertionSignal {
     kind: String,
