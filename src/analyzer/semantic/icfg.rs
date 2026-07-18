@@ -22,10 +22,11 @@ use crate::hash::{HashMap, HashSet};
 use super::{
     CallContinuationKind, CallSiteHandle, CallSiteId, ContentIdentity, ControlContinuation,
     ControlEdgeKind, DeclarationLocator, DeclarationSegment, DeclarationSegmentKind,
-    EvidenceCompleteness, OverlaySnapshotId, ProcedureHandle, ProcedureKind, ProgramPointHandle,
-    ProofStatus, SemanticBudgetExceeded, SemanticCapability, SemanticLocator, SemanticOutcome,
-    SemanticProviderError, SemanticRequest, SemanticRole, SemanticWork, SourceAnchor,
-    SourcePosition, SourceRevision, SourceSpan, WorkspaceMountId, WorkspaceRelativePath,
+    EvidenceCompleteness, OverlaySnapshotId, ProcedureHandle, ProcedureInvocationKind,
+    ProcedureKind, ProgramPointHandle, ProofStatus, SemanticBudgetExceeded, SemanticCapability,
+    SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticRole,
+    SemanticWork, SourceAnchor, SourcePosition, SourceRevision, SourceSpan, WorkspaceMountId,
+    WorkspaceRelativePath,
 };
 
 const MAX_DISPATCH_TARGETS: usize = 1_024;
@@ -47,8 +48,34 @@ pub enum DispatchBoundaryKind {
     /// A declaration was resolved, but no callable body was published by the
     /// language adapter for this generation.
     Unmaterialized(SemanticLocator),
+    /// Dispatch resolved a callable body, but invoking it only creates a
+    /// suspended object. Entering that body requires a later language-level
+    /// resume operation that this control-only ICFG does not yet model.
+    Deferred {
+        target: SemanticLocator,
+        kind: DeferredInvocationKind,
+    },
     Unresolved,
     Truncated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeferredInvocationKind {
+    Async,
+    Generator,
+    AsyncGenerator,
+    LanguageDefined,
+}
+
+impl DeferredInvocationKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Async => "async",
+            Self::Generator => "generator",
+            Self::AsyncGenerator => "async_generator",
+            Self::LanguageDefined => "language_defined",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -84,7 +111,7 @@ pub struct CallTransfer {
     pub completeness: EvidenceCompleteness,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CallToReturnModel {
     Normal,
     Exceptional,
@@ -1098,27 +1125,8 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
             .call_site_handle(call)
             .ok_or_else(|| SemanticProviderError::internal("failed to scope semantic call site"))?;
         Ok(self.resolve_call(&origin, request)?.map(|dispatch| {
-            let transfers = dispatch
-                .candidates
-                .into_vec()
-                .into_iter()
-                .filter_map(|candidate| {
-                    let entry = candidate
-                        .target
-                        .point_handle(candidate.target.semantics().entry_point())?;
-                    Some(CallTransfer {
-                        origin: origin.clone(),
-                        callee: candidate.target,
-                        callee_entry: entry,
-                        normal_continuation: semantic_call.normal_continuation,
-                        exceptional_continuation: semantic_call.exceptional_continuation,
-                        proof: candidate.proof,
-                        completeness: candidate.completeness,
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-            let boundaries = dispatch
+            let mut transfers = Vec::new();
+            let mut boundaries = dispatch
                 .boundaries
                 .into_vec()
                 .into_iter()
@@ -1127,11 +1135,48 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                     dispatch,
                     model: None,
                 })
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
+                .collect::<Vec<_>>();
+            for candidate in dispatch.candidates.into_vec() {
+                let properties = candidate.target.semantics().properties();
+                if properties.invocation == ProcedureInvocationKind::Deferred {
+                    boundaries.push(CallBoundary {
+                        origin: origin.clone(),
+                        dispatch: DispatchBoundary {
+                            kind: DispatchBoundaryKind::Deferred {
+                                target: candidate.target.semantics().locator().clone(),
+                                kind: deferred_invocation_kind(properties),
+                            },
+                            proof: candidate.proof,
+                            completeness: EvidenceCompleteness::Partial(
+                                "callee body execution requires a later resume transfer".into(),
+                            ),
+                        },
+                        // Creating the suspended object normally returns to the
+                        // caller, while argument binding or language call
+                        // mechanics can still fail synchronously.
+                        model: Some(CallToReturnModel::NormalAndExceptional),
+                    });
+                    continue;
+                }
+                let Some(entry) = candidate
+                    .target
+                    .point_handle(candidate.target.semantics().entry_point())
+                else {
+                    continue;
+                };
+                transfers.push(CallTransfer {
+                    origin: origin.clone(),
+                    callee: candidate.target,
+                    callee_entry: entry,
+                    normal_continuation: semantic_call.normal_continuation,
+                    exceptional_continuation: semantic_call.exceptional_continuation,
+                    proof: candidate.proof,
+                    completeness: candidate.completeness,
+                });
+            }
             CallTransferSet {
-                transfers,
-                boundaries,
+                transfers: transfers.into_boxed_slice(),
+                boundaries: boundaries.into_boxed_slice(),
             }
         }))
     }
@@ -1265,6 +1310,16 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                     }
                     if let Some(transfers) = outcome.available_value().cloned() {
                         builder.record_dispatch_boundaries(node, &transfers.boundaries);
+                        for boundary in &transfers.boundaries {
+                            link_boundary_continuations(
+                                &mut builder,
+                                node,
+                                &key,
+                                &semantic_call,
+                                boundary,
+                                &mut staged_request,
+                            )?;
+                        }
                         for transfer in transfers.transfers.into_vec() {
                             let mut frames = key.frames.to_vec();
                             frames.push(CallFrame {
@@ -1649,9 +1704,89 @@ fn dispatch_boundary_sort_key(boundary: &DispatchBoundary) -> (u8, String) {
             locator.as_ref().map_or_else(String::new, locator_sort_key),
         ),
         DispatchBoundaryKind::Unmaterialized(locator) => (1, locator_sort_key(locator)),
-        DispatchBoundaryKind::Unresolved => (2, String::new()),
-        DispatchBoundaryKind::Truncated => (3, String::new()),
+        DispatchBoundaryKind::Deferred { target, kind } => {
+            (2, format!("{}:{}", kind.label(), locator_sort_key(target)))
+        }
+        DispatchBoundaryKind::Unresolved => (3, String::new()),
+        DispatchBoundaryKind::Truncated => (4, String::new()),
     }
+}
+
+fn deferred_invocation_kind(properties: super::ProcedureProperties) -> DeferredInvocationKind {
+    match (properties.is_async, properties.is_generator) {
+        (true, true) => DeferredInvocationKind::AsyncGenerator,
+        (true, false) => DeferredInvocationKind::Async,
+        (false, true) => DeferredInvocationKind::Generator,
+        (false, false) => DeferredInvocationKind::LanguageDefined,
+    }
+}
+
+fn link_boundary_continuations(
+    builder: &mut SnapshotBuilder,
+    source: IcfgNodeId,
+    key: &TraversalKey,
+    semantic_call: &super::SemanticCallSite,
+    boundary: &CallBoundary,
+    request: &mut SemanticRequest<'_>,
+) -> Result<(), SemanticProviderError> {
+    let Some(model) = boundary.model else {
+        return Ok(());
+    };
+    let mut link = |kind: CallContinuationKind,
+                    continuation: ControlContinuation,
+                    edge_kind: IcfgEdgeKind|
+     -> Result<(), SemanticProviderError> {
+        match continuation {
+            ControlContinuation::Target(point) => {
+                let point = key.point.procedure().point_handle(point).ok_or_else(|| {
+                    SemanticProviderError::internal("call boundary continuation is stale")
+                })?;
+                builder.link(
+                    source,
+                    TraversalKey {
+                        point,
+                        frames: key.frames.clone(),
+                    },
+                    edge_kind,
+                    Some(boundary.origin.clone()),
+                    boundary.dispatch.proof.clone(),
+                    boundary.dispatch.completeness.clone(),
+                    request,
+                )?;
+            }
+            ControlContinuation::Absent => {}
+            state => {
+                builder.boundaries.push(IcfgBoundary {
+                    at: source,
+                    origin: Some(boundary.origin.clone()),
+                    kind: IcfgBoundaryKind::Continuation { kind, state },
+                });
+                builder.quality = merge_quality(builder.quality, SnapshotQuality::Unknown);
+            }
+        }
+        Ok(())
+    };
+    if matches!(
+        model,
+        CallToReturnModel::Normal | CallToReturnModel::NormalAndExceptional
+    ) {
+        link(
+            CallContinuationKind::Normal,
+            semantic_call.normal_continuation,
+            IcfgEdgeKind::CallToNormalContinuation,
+        )?;
+    }
+    if matches!(
+        model,
+        CallToReturnModel::Exceptional | CallToReturnModel::NormalAndExceptional
+    ) {
+        link(
+            CallContinuationKind::Exceptional,
+            semantic_call.exceptional_continuation,
+            IcfgEdgeKind::CallToExceptionalContinuation,
+        )?;
+    }
+    Ok(())
 }
 
 fn locator_sort_key(locator: &SemanticLocator) -> String {

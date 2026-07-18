@@ -313,7 +313,7 @@ fn render_procedure(state: &mut RenderState, procedure: &ProcedureSemantics) -> 
     if !state.writer.open_with(2, |writer| {
         write!(
             writer,
-            "(procedure :id {} :kind {} :parent {} :source {} :evidence {} :entry {} :normal-exit {} :exceptional-exit {} :async {} :generator {} :static {} :synthetic {}",
+            "(procedure :id {} :kind {} :parent {} :source {} :evidence {} :entry {} :normal-exit {} :exceptional-exit {} :async {} :generator {} :static {} :synthetic {} :invocation {}",
             procedure.id(),
             quoted(procedure.kind().label()),
             optional_id(procedure.lexical_parent()),
@@ -326,6 +326,7 @@ fn render_procedure(state: &mut RenderState, procedure: &ProcedureSemantics) -> 
             properties.is_generator,
             properties.is_static,
             properties.is_synthetic,
+            quoted(properties.invocation.label()),
         )
     }) {
         return false;
@@ -1078,7 +1079,10 @@ fn write_icfg_boundary(
     }
     if let IcfgBoundaryKind::Dispatch(
         DispatchBoundaryKind::External(Some(locator))
-        | DispatchBoundaryKind::Unmaterialized(locator),
+        | DispatchBoundaryKind::Unmaterialized(locator)
+        | DispatchBoundaryKind::Deferred {
+            target: locator, ..
+        },
     ) = &boundary.kind
     {
         writer.write_str(" :target (locator ")?;
@@ -1108,6 +1112,12 @@ fn dispatch_boundary_label(boundary: &DispatchBoundaryKind) -> &'static str {
     match boundary {
         DispatchBoundaryKind::External(_) => "external",
         DispatchBoundaryKind::Unmaterialized(_) => "unmaterialized",
+        DispatchBoundaryKind::Deferred { kind, .. } => match kind {
+            super::DeferredInvocationKind::Async => "deferred_async",
+            super::DeferredInvocationKind::Generator => "deferred_generator",
+            super::DeferredInvocationKind::AsyncGenerator => "deferred_async_generator",
+            super::DeferredInvocationKind::LanguageDefined => "deferred_language_defined",
+        },
         DispatchBoundaryKind::Unresolved => "unresolved",
         DispatchBoundaryKind::Truncated => "truncated",
     }

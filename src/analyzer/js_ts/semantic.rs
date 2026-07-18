@@ -624,6 +624,11 @@ fn callable_shape<'tree>(
                 || (node.kind() == "method_definition"
                     && (has_child_kind(node, "static") || has_child_kind(node, "static get"))),
             is_synthetic: false,
+            invocation: if generator {
+                ProcedureInvocationKind::Deferred
+            } else {
+                ProcedureInvocationKind::Immediate
+            },
         },
     ))
 }

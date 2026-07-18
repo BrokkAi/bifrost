@@ -14,11 +14,11 @@ use std::sync::Arc;
 use brokk_bifrost::WorkspaceAnalyzer;
 use brokk_bifrost::analyzer::semantic::{
     CallContinuationKind, CallSiteHandle, CancellationToken, ControlContinuation, ControlEdgeKind,
-    DispatchBoundaryKind, IcfgBoundaryKind, IcfgEdgeKind, IcfgLimitKind, IcfgNodeId, IcfgProvider,
-    IcfgSnapshot, IcfgSnapshotLimits, ProcedureHandle, ProcedureId, ProcedureSemantics,
-    ProgramPoint, ProgramPointId, SemanticArtifact, SemanticBudget, SemanticCapability,
-    SemanticEffect, SemanticGapKind, SemanticGapSubject, SemanticOutcome, SemanticRequest,
-    SourceAnchor, SourceMappingId, SourceSpan, WorkspaceRelativePath,
+    DeferredInvocationKind, DispatchBoundaryKind, IcfgBoundaryKind, IcfgEdgeKind, IcfgLimitKind,
+    IcfgNodeId, IcfgProvider, IcfgSnapshot, IcfgSnapshotLimits, ProcedureHandle, ProcedureId,
+    ProcedureSemantics, ProgramPoint, ProgramPointId, SemanticArtifact, SemanticBudget,
+    SemanticCapability, SemanticEffect, SemanticGapKind, SemanticGapSubject, SemanticOutcome,
+    SemanticRequest, SourceAnchor, SourceMappingId, SourceSpan, WorkspaceRelativePath,
 };
 
 use super::BuiltInlineTestProject;
@@ -210,6 +210,7 @@ pub enum IcfgOutcomeKind {
 pub enum ExpectedIcfgBoundaryKind {
     DispatchExternal,
     DispatchUnmaterialized,
+    DispatchDeferred(DeferredInvocationKind),
     DispatchUnresolved,
     DispatchTruncated,
     Limit(IcfgLimitKind),
@@ -1903,6 +1904,10 @@ fn boundary_kind_matches(actual: &IcfgBoundaryKind, expected: ExpectedIcfgBounda
             IcfgBoundaryKind::Dispatch(DispatchBoundaryKind::Truncated),
             ExpectedIcfgBoundaryKind::DispatchTruncated,
         ) => true,
+        (
+            IcfgBoundaryKind::Dispatch(DispatchBoundaryKind::Deferred { kind: actual, .. }),
+            ExpectedIcfgBoundaryKind::DispatchDeferred(expected),
+        ) => *actual == expected,
         (IcfgBoundaryKind::Limit(actual), ExpectedIcfgBoundaryKind::Limit(expected)) => {
             *actual == expected
         }
@@ -1927,6 +1932,13 @@ fn boundary_kind_label(boundary: &IcfgBoundaryKind) -> String {
         }
         IcfgBoundaryKind::Dispatch(DispatchBoundaryKind::Unmaterialized(locator)) => {
             format!("dispatch_unmaterialized({})", locator.path().as_str())
+        }
+        IcfgBoundaryKind::Dispatch(DispatchBoundaryKind::Deferred { target, kind }) => {
+            format!(
+                "dispatch_deferred_{}({})",
+                kind.label(),
+                target.path().as_str()
+            )
         }
         IcfgBoundaryKind::Dispatch(DispatchBoundaryKind::Unresolved) => {
             "dispatch_unresolved".to_string()

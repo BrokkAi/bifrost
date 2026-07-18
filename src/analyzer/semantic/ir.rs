@@ -224,6 +224,30 @@ impl ProcedureKind {
     }
 }
 
+/// Whether invoking a callable begins executing its body immediately.
+///
+/// Some languages publish callable bodies whose invocation only creates a
+/// suspended object. Python coroutine and generator functions, JavaScript
+/// generators, and Rust async functions are examples. Keeping this separate
+/// from `is_async` and `is_generator` avoids incorrectly applying one
+/// language's call semantics to another language with the same surface
+/// property.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProcedureInvocationKind {
+    #[default]
+    Immediate,
+    Deferred,
+}
+
+impl ProcedureInvocationKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Immediate => "immediate",
+            Self::Deferred => "deferred",
+        }
+    }
+}
+
 /// Orthogonal properties that should not be encoded in [`ProcedureKind`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcedureProperties {
@@ -231,6 +255,7 @@ pub struct ProcedureProperties {
     pub is_generator: bool,
     pub is_static: bool,
     pub is_synthetic: bool,
+    pub invocation: ProcedureInvocationKind,
 }
 
 /// The semantic role of a value row.

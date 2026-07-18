@@ -600,15 +600,21 @@ fn callable_shape<'tree>(
         ),
         _ => return None,
     };
+    let is_generator = body_contains_yield(body);
     Some((
         kind,
         segment_kind,
         body,
         ProcedureProperties {
             is_async: has_modifier(source, node, "async"),
-            is_generator: body_contains_yield(body),
+            is_generator,
             is_static,
             is_synthetic: false,
+            invocation: if is_generator {
+                ProcedureInvocationKind::Deferred
+            } else {
+                ProcedureInvocationKind::Immediate
+            },
         },
     ))
 }
