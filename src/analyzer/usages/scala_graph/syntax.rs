@@ -362,10 +362,146 @@ pub(crate) fn is_type_like_reference(node: Node<'_>, source: &str) -> bool {
 pub(crate) fn is_scala_object_reference(node: Node<'_>) -> bool {
     is_singleton_type_reference(node)
         || is_stable_type_qualifier(node)
+        || qualified_stable_type_expression_role(node).is_some_and(|(_, _, role)| {
+            matches!(
+                role,
+                ScalaQualifiedStableTypeRole::Apply | ScalaQualifiedStableTypeRole::Extractor
+            )
+        })
         || is_extractor_reference(node)
         || is_infix_pattern_operator(node)
         || is_field_expression_value(node)
         || is_bare_term_reference(node)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ScalaQualifiedStableTypeRole {
+    Type,
+    Apply,
+    Extractor,
+    Constructor,
+}
+
+pub(crate) struct ScalaQualifiedStableTypeReference<'tree> {
+    pub(crate) segments: Vec<String>,
+    pub(crate) expression: Node<'tree>,
+    pub(crate) role: ScalaQualifiedStableTypeRole,
+}
+
+pub(crate) fn qualified_stable_type_reference<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<ScalaQualifiedStableTypeReference<'tree>> {
+    let (expression, role, segments) =
+        if let Some((stable, expression, role)) = qualified_stable_type_expression_role(node) {
+            (expression, role, scala_type_lookup_segments(stable, source))
+        } else {
+            qualified_stable_term_application(node, source)?
+        };
+    if segments.len() <= 1 {
+        return None;
+    }
+
+    Some(ScalaQualifiedStableTypeReference {
+        segments,
+        expression,
+        role,
+    })
+}
+
+fn qualified_stable_term_application<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, ScalaQualifiedStableTypeRole, Vec<String>)> {
+    let mut expression = node.parent()?;
+    if expression.kind() != "field_expression"
+        || expression.child_by_field_name("field") != Some(node)
+    {
+        return None;
+    }
+
+    let mut fields = Vec::new();
+    let mut path = expression;
+    while path.kind() == "field_expression" {
+        fields.push(path.child_by_field_name("field")?);
+        path = path.child_by_field_name("value")?;
+    }
+    if !matches!(path.kind(), "identifier" | "type_identifier") {
+        return None;
+    }
+    fields.push(path);
+    fields.reverse();
+    let segments = fields
+        .into_iter()
+        .map(|segment| node_text(segment, source).trim().to_string())
+        .collect::<Vec<_>>();
+    if segments.iter().any(String::is_empty) {
+        return None;
+    }
+
+    if expression.parent().is_some_and(|parent| {
+        parent.kind() == "generic_function"
+            && parent.child_by_field_name("function") == Some(expression)
+    }) {
+        expression = expression.parent()?;
+    }
+    let call = expression.parent()?;
+    if call.kind() != "call_expression" || call.child_by_field_name("function") != Some(expression)
+    {
+        return None;
+    }
+    Some((expression, ScalaQualifiedStableTypeRole::Apply, segments))
+}
+
+fn qualified_stable_type_expression_role(
+    node: Node<'_>,
+) -> Option<(Node<'_>, Node<'_>, ScalaQualifiedStableTypeRole)> {
+    let mut stable = node.parent()?;
+    if stable.kind() != "stable_type_identifier" {
+        return None;
+    }
+    let mut cursor = stable.walk();
+    if stable.named_children(&mut cursor).last() != Some(node) {
+        return None;
+    }
+    while let Some(parent) = stable
+        .parent()
+        .filter(|parent| parent.kind() == "stable_type_identifier")
+    {
+        let mut cursor = parent.walk();
+        if parent.named_children(&mut cursor).last() != Some(stable) {
+            break;
+        }
+        stable = parent;
+    }
+    let mut expression = stable;
+    while let Some(parent) = expression.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "generic_type" | "applied_constructor_type" | "annotated_type" | "type"
+        )
+    }) {
+        expression = parent;
+    }
+    let role = expression
+        .parent()
+        .map(|parent| {
+            if parent.kind() == "call_expression"
+                && parent.child_by_field_name("function") == Some(expression)
+            {
+                ScalaQualifiedStableTypeRole::Apply
+            } else if parent.kind() == "case_class_pattern"
+                && parent.child_by_field_name("type") == Some(expression)
+            {
+                ScalaQualifiedStableTypeRole::Extractor
+            } else if parent.kind() == "instance_expression" {
+                ScalaQualifiedStableTypeRole::Constructor
+            } else {
+                ScalaQualifiedStableTypeRole::Type
+            }
+        })
+        .unwrap_or(ScalaQualifiedStableTypeRole::Type);
+    Some((stable, expression, role))
 }
 
 pub(crate) fn is_scala_class_reference(node: Node<'_>, source: &str) -> bool {
@@ -386,10 +522,14 @@ fn is_singleton_type_reference(node: Node<'_>) -> bool {
 }
 
 fn is_stable_type_qualifier(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        parent.kind() == "stable_type_identifier"
-            && parent.child_by_field_name("name") != Some(node)
-    })
+    let Some(parent) = node
+        .parent()
+        .filter(|parent| parent.kind() == "stable_type_identifier")
+    else {
+        return false;
+    };
+    let mut cursor = parent.walk();
+    parent.named_children(&mut cursor).last() != Some(node)
 }
 
 pub(crate) fn is_extractor_reference(node: Node<'_>) -> bool {
@@ -662,4 +802,68 @@ pub(crate) fn terminal_invocation_owner_name(node: Node<'_>) -> Option<Node<'_>>
 
 pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     &source[node.byte_range()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qualified_stable_type_roles_follow_parser_structure() {
+        let source = r#"object Use {
+  val applied = Structure.Value(1)
+  def extracted(value: Any): Any = value match { case Structure.Value(number) => number }
+  val created = new Structure.Value(1)
+  val generic = new Structure.Box[Int](1)
+  val typed: Structure.Value = ???
+  val packageTyped: model.Structure.Value = ???
+}
+"#;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_scala::LANGUAGE.into())
+            .expect("Scala grammar");
+        let tree = parser.parse(source, None).expect("Scala tree");
+        let mut value_roles = Vec::new();
+        let mut box_roles = Vec::new();
+        let mut package_paths = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if matches!(node.kind(), "identifier" | "type_identifier")
+                && let Some(reference) = qualified_stable_type_reference(node, source)
+            {
+                match node_text(node, source) {
+                    "Value" => {
+                        if reference
+                            .segments
+                            .first()
+                            .is_some_and(|root| root == "model")
+                        {
+                            package_paths.push(reference.segments.clone());
+                        }
+                        value_roles.push(reference.role);
+                    }
+                    "Box" => box_roles.push(reference.role),
+                    _ => {}
+                }
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        value_roles.sort();
+        assert_eq!(
+            value_roles,
+            vec![
+                ScalaQualifiedStableTypeRole::Type,
+                ScalaQualifiedStableTypeRole::Type,
+                ScalaQualifiedStableTypeRole::Apply,
+                ScalaQualifiedStableTypeRole::Extractor,
+                ScalaQualifiedStableTypeRole::Constructor,
+            ],
+            "{}",
+            tree.root_node().to_sexp(),
+        );
+        assert_eq!(package_paths, vec![vec!["model", "Structure", "Value"]]);
+        assert_eq!(box_roles, vec![ScalaQualifiedStableTypeRole::Constructor]);
+    }
 }

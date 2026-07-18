@@ -1066,3 +1066,119 @@ class Consumer {
         value["edges"]
     );
 }
+
+#[test]
+fn qualified_stable_type_paths_emit_exact_inverse_edges() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Structure.scala",
+            r#"package model
+
+object Structure {
+  case class Value(value: Int)
+  object Deep { class Leaf }
+}
+"#,
+        )
+        .file(
+            "decoy/Structure.scala",
+            r#"package decoy
+
+object Structure {
+  case class Value(value: Int)
+  object Deep { class Leaf }
+}
+"#,
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+
+import model.Structure
+
+object Use {
+  def typed: Option[Structure.Value] = None
+  def created = new Structure.Value(1)
+  def wrongConstructor = new Structure.Value(1, 2)
+  def applied = Structure.Value(2)
+  def wrongApply = Structure.Value(2, 3)
+  def extracted(value: Structure.Value): Int = value match {
+    case Structure.Value(number) => number
+  }
+  def deep: Option[Structure.Deep.Leaf] = None
+}
+"#,
+        )
+        .file(
+            "app/Alias.scala",
+            r#"package app
+
+import model.{Structure as Schema}
+
+object Alias {
+  def typed: Option[Schema.Value] = None
+  def deep: Option[Schema.Deep.Leaf] = None
+}
+"#,
+        )
+        .file(
+            "app/PackageRoot.scala",
+            r#"package app
+
+object PackageRoot {
+  def typed: Option[model.Structure.Value] = None
+  def deep: Option[model.Structure.Deep.Leaf] = None
+}
+"#,
+        )
+        .file(
+            "decoy/Use.scala",
+            r#"package decoy
+
+object Use {
+  def typed: Option[Structure.Value] = None
+  def applied = Structure.Value(3)
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    let target = "model.Structure$.Value";
+    for caller in [
+        "app.Use$.typed",
+        "app.Use$.created",
+        "app.Use$.applied",
+        "app.Use$.extracted",
+        "app.Alias$.typed",
+        "app.PackageRoot$.typed",
+    ] {
+        assert!(
+            has_edge(&value, caller, target),
+            "expected {caller} -> {target}: {}",
+            value["edges"]
+        );
+    }
+    for caller in ["app.Use$.wrongConstructor", "app.Use$.wrongApply"] {
+        assert!(
+            !has_edge(&value, caller, target),
+            "wrong-arity {caller} must not edge to {target}: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        !has_edge(&value, "decoy.Use$.typed", target)
+            && !has_edge(&value, "decoy.Use$.applied", target),
+        "same-name decoy must not edge to {target}: {}",
+        value["edges"]
+    );
+
+    let leaf = "model.Structure$.Deep$.Leaf";
+    for caller in ["app.Use$.deep", "app.Alias$.deep", "app.PackageRoot$.deep"] {
+        assert!(
+            has_edge(&value, caller, leaf),
+            "expected {caller} -> {leaf}: {}",
+            value["edges"]
+        );
+    }
+}

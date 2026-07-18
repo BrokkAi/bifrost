@@ -222,6 +222,170 @@ object Service {
 }
 
 #[test]
+fn scan_usages_resolves_scala_qualified_stable_type_paths() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Structure.scala",
+            r#"package model
+object Structure {
+  case class Value(value: Int)
+  object Deep { class Leaf }
+}
+"#,
+        )
+        .file(
+            "app/Direct.scala",
+            r#"package app
+import model.Structure
+object Direct {
+  val typed = Option.empty[Structure.Value]
+  val created = new Structure.Value(1)
+  val wrongConstructor = new Structure.Value(1, 2)
+  val applied = Structure.Value(2)
+  val wrongApply = Structure.Value(2, 3)
+  def extract(value: Structure.Value): Int = value match {
+    case Structure.Value(number) => number
+  }
+  val deep = Option.empty[Structure.Deep.Leaf]
+}
+"#,
+        )
+        .file(
+            "app/Alias.scala",
+            r#"package app
+import model.{Structure as Schema}
+object Alias {
+  val typed = Option.empty[Schema.Value]
+  val deep = Option.empty[Schema.Deep.Leaf]
+}
+"#,
+        )
+        .file(
+            "app/PackageRoot.scala",
+            r#"package app
+object PackageRoot {
+  val typed = Option.empty[model.Structure.Value]
+  val deep = Option.empty[model.Structure.Deep.Leaf]
+}
+"#,
+        )
+        .file(
+            "app/Shadowed.scala",
+            r#"package app
+import model.Structure
+object Shadowed {
+  val Structure = decoy.Structure
+  val typed = Option.empty[Structure.Value]
+}
+"#,
+        )
+        .file(
+            "decoy/Structure.scala",
+            r#"package decoy
+object Structure {
+  case class Value(value: Int)
+  object Deep { class Leaf }
+}
+"#,
+        )
+        .file(
+            "decoy/Use.scala",
+            r#"package decoy
+object Use {
+  val typed = Option.empty[Structure.Value]
+  val deep = Option.empty[Structure.Deep.Leaf]
+}
+"#,
+        )
+        .build();
+    let analyzer = ScalaAnalyzer::from_project(project.project().clone());
+
+    let result = scan_usages_by_reference(
+        &analyzer,
+        ScanUsagesByReferenceParams {
+            symbols: vec![
+                "model/Structure.scala#model.Structure.Value".to_string(),
+                "model/Structure.scala#model.Structure.Deep.Leaf".to_string(),
+            ],
+            include_tests: true,
+            paths: Some(vec![
+                "app/Direct.scala".to_string(),
+                "app/Alias.scala".to_string(),
+                "app/PackageRoot.scala".to_string(),
+                "app/Shadowed.scala".to_string(),
+                "decoy/Use.scala".to_string(),
+            ]),
+        },
+    );
+    assert_eq!(2, result.results.len(), "{result:#?}");
+    assert!(
+        result
+            .results
+            .iter()
+            .all(|entry| entry.status == ScanUsagesStatus::Found),
+        "{result:#?}"
+    );
+
+    let snippets_for = |symbol_suffix: &str| {
+        result
+            .results
+            .iter()
+            .find(|entry| {
+                entry
+                    .symbol
+                    .as_deref()
+                    .is_some_and(|symbol| symbol.ends_with(symbol_suffix))
+            })
+            .unwrap_or_else(|| panic!("missing {symbol_suffix} result: {result:#?}"))
+            .files
+            .iter()
+            .flat_map(|file| file.hits.iter().filter_map(|hit| hit.snippet.as_deref()))
+            .collect::<Vec<_>>()
+    };
+
+    let value = snippets_for("Structure.Value");
+    for expected in [
+        "Option.empty[Structure.Value]",
+        "new Structure.Value(1)",
+        "Structure.Value(2)",
+        "case Structure.Value(number)",
+        "Option.empty[Schema.Value]",
+        "Option.empty[model.Structure.Value]",
+    ] {
+        assert!(
+            value.iter().any(|snippet| snippet.contains(expected)),
+            "missing {expected:?}: {result:#?}"
+        );
+    }
+    for rejected in ["new Structure.Value(1, 2)", "Structure.Value(2, 3)"] {
+        assert!(
+            value.iter().all(|snippet| !snippet.contains(rejected)),
+            "unexpected {rejected:?}: {result:#?}"
+        );
+    }
+
+    let leaf = snippets_for("Structure.Deep.Leaf");
+    for expected in [
+        "Option.empty[Structure.Deep.Leaf]",
+        "Option.empty[Schema.Deep.Leaf]",
+        "Option.empty[model.Structure.Deep.Leaf]",
+    ] {
+        assert!(
+            leaf.iter().any(|snippet| snippet.contains(expected)),
+            "missing {expected:?}: {result:#?}"
+        );
+    }
+    assert!(
+        result
+            .results
+            .iter()
+            .flat_map(|entry| &entry.files)
+            .all(|file| { file.path != "decoy/Use.scala" && file.path != "app/Shadowed.scala" }),
+        "same-name or shadowed qualified path leaked: {result:#?}"
+    );
+}
+
+#[test]
 fn java_annotated_method_search_symbol_uses_name_line() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

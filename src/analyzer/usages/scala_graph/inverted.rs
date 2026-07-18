@@ -27,10 +27,12 @@ use super::resolver::{
 };
 use super::shared::ScalaEdgeGraph;
 use super::syntax::{
-    ScalaCallableParameterList, ScalaImportContextIndex, ScalaParameterListKind, ScalaSourceFacts,
-    call_arities_for_reference, is_constructor_like_reference, is_scala_class_reference,
-    is_scala_object_reference, is_terminal_stable_field_reference, node_text, parenthesized_arity,
-    resolve_stable_object_expression, scala_import_is_visible_at_byte, scala_source_facts,
+    ScalaCallableParameterList, ScalaImportContextIndex, ScalaParameterListKind,
+    ScalaQualifiedStableTypeRole, ScalaSourceFacts, call_arities_for_reference,
+    is_constructor_like_reference, is_scala_class_reference, is_scala_object_reference,
+    is_terminal_stable_field_reference, node_text, parenthesized_arity,
+    qualified_stable_type_reference, resolve_stable_object_expression,
+    scala_import_is_visible_at_byte, scala_source_facts,
 };
 use crate::analyzer::scala::{
     ScalaAdapter, ScalaSupertypeLookupPath, ScalaWildcardOwnerFacts,
@@ -783,6 +785,53 @@ impl ProjectTypes {
             .map(CodeUnit::fq_name)
     }
 
+    pub(super) fn resolve_qualified_stable_type(
+        &self,
+        scala: &ScalaAnalyzer,
+        resolver: &NameResolver,
+        segments: &[String],
+        terminal_object: bool,
+    ) -> Option<String> {
+        let (first, rest) = segments.split_first()?;
+        if rest.is_empty() {
+            return if terminal_object {
+                resolver.resolve_object(first)
+            } else {
+                resolver.resolve(first)
+            };
+        }
+
+        if let Some(mut owner) = resolver.resolve_object(first) {
+            for segment in &rest[..rest.len() - 1] {
+                owner = self.exact_nested_object(scala, &owner, segment)?;
+            }
+            let terminal = rest.last()?;
+            if terminal_object {
+                return self.exact_nested_object(scala, &owner, terminal);
+            }
+            let candidate = format!("{owner}.{terminal}");
+            return preferred_scala_type(
+                self.index
+                    .by_fqn(&candidate)
+                    .iter()
+                    .filter(|unit| unit.is_class()),
+            )
+            .map(CodeUnit::fq_name);
+        }
+
+        if resolver.has_type_or_object_binding(first) || !self.has_package_prefix(segments) {
+            return None;
+        }
+        let normalized = scala_normalized_fq_name(&segments.join("."));
+        if terminal_object {
+            return self
+                .object_by_normalized_fqn(scala, &normalized)
+                .map(CodeUnit::fq_name);
+        }
+        self.type_by_normalized_fqn(&normalized)
+            .map(CodeUnit::fq_name)
+    }
+
     fn resolve_type_in_owner_context(
         &self,
         resolver: &NameResolver,
@@ -886,12 +935,7 @@ impl ProjectTypes {
     }
 
     fn has_package_prefix(&self, segments: &[String]) -> bool {
-        (1..segments.len()).any(|end| {
-            let prefix = segments[..end].join(".");
-            self.index
-                .package_types()
-                .any(|((package, _), _)| package == &prefix)
-        })
+        (1..segments.len()).any(|end| self.index.package_exists(&segments[..end].join(".")))
     }
 
     fn package_objects_in(&self, scala: &ScalaAnalyzer, package: &str) -> PackageTypeEntries {
@@ -1048,7 +1092,7 @@ impl ProjectTypes {
             .map(CodeUnit::fq_name)
     }
 
-    fn constructor_call_shape_matches(
+    pub(super) fn constructor_call_shape_matches(
         &self,
         scala: &ScalaAnalyzer,
         type_fqn: &str,
@@ -2280,8 +2324,12 @@ fn record_reference(
         // and the type child of `new Foo()`. Construction is covered here without
         // a separate `instance_expression` case (avoids double counting).
         "type_identifier" => {
+            if record_qualified_stable_reference(node, ctx, bindings) {
+                return;
+            }
             let text = node_text(node, ctx.source);
-            let resolved = if is_scala_object_reference(node) {
+            let object_reference = is_scala_object_reference(node);
+            let resolved = if object_reference {
                 ctx.resolver.resolve_object(text)
             } else if is_scala_class_reference(node, ctx.source) {
                 ctx.resolver.resolve(text)
@@ -2289,11 +2337,12 @@ fn record_reference(
                 None
             };
             if let Some(fqn) = resolved {
+                let call_arities = call_arities_for_reference(node);
                 if is_constructor_like_reference(node, ctx.source)
                     && !ctx.types.constructor_call_shape_matches(
                         ctx.scala,
                         &fqn,
-                        call_arities_for_reference(node).as_deref(),
+                        call_arities.as_deref(),
                     )
                 {
                     return;
@@ -2403,6 +2452,9 @@ fn record_reference(
             }
         }
         "identifier" | "operator_identifier" => {
+            if record_qualified_stable_reference(node, ctx, bindings) {
+                return;
+            }
             let name = node_text(node, ctx.source);
             if name.is_empty()
                 || has_ancestor_kind(node, "import_declaration")
@@ -2441,6 +2493,62 @@ fn record_reference(
         }
         _ => {}
     }
+}
+
+fn record_qualified_stable_reference(
+    node: Node<'_>,
+    ctx: &mut ScalaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<ScalaBinding>,
+) -> bool {
+    let Some(reference) = qualified_stable_type_reference(node, ctx.source) else {
+        return false;
+    };
+    if reference
+        .segments
+        .first()
+        .is_none_or(|root| bindings.is_shadowed(root))
+    {
+        return true;
+    }
+    let Some(fqn) = ctx.types.resolve_qualified_stable_type(
+        ctx.scala,
+        &ctx.resolver,
+        &reference.segments,
+        false,
+    ) else {
+        return true;
+    };
+    let call_arities = call_arities_for_reference(reference.expression);
+    let role_matches = match reference.role {
+        ScalaQualifiedStableTypeRole::Type => true,
+        ScalaQualifiedStableTypeRole::Constructor => {
+            ctx.types
+                .constructor_call_shape_matches(ctx.scala, &fqn, call_arities.as_deref())
+        }
+        ScalaQualifiedStableTypeRole::Apply | ScalaQualifiedStableTypeRole::Extractor => {
+            ctx.types
+                .type_by_normalized_fqn(&scala_normalized_fq_name(&fqn))
+                .is_some_and(|target| match reference.role {
+                    ScalaQualifiedStableTypeRole::Apply => {
+                        ctx.types.class_companion_apply_call_matches(
+                            ctx.scala,
+                            &ctx.resolver,
+                            &target,
+                            call_arities.as_deref(),
+                        )
+                    }
+                    ScalaQualifiedStableTypeRole::Extractor => {
+                        ctx.types.class_accepts_extractor_role(ctx.scala, &target)
+                    }
+                    ScalaQualifiedStableTypeRole::Type
+                    | ScalaQualifiedStableTypeRole::Constructor => unreachable!(),
+                })
+        }
+    };
+    if role_matches {
+        ctx.record(fqn, node);
+    }
+    true
 }
 
 /// The fqn of a receiver expression's type, for the shapes that resolve without

@@ -13,13 +13,14 @@ use crate::analyzer::usages::scala_graph::resolver::{
 };
 use crate::analyzer::usages::scala_graph::syntax::{
     ScalaCallableParameterList, ScalaImportContextIndex, ScalaParameterListKind,
-    call_arities_for_reference, has_ancestor_kind, has_member_qualifier,
-    infix_receiver_for_operator, is_call_function_reference, is_constructor_like_reference,
-    is_extractor_reference, is_identifier_node, is_infix_pattern_operator, is_owner_qualified_this,
-    is_scala_class_reference, is_scala_object_reference, is_terminal_stable_field_reference,
-    member_qualifier, member_qualifier_node, named_argument_invocation_owner, node_text,
-    parenthesized_arity, resolve_stable_object_expression, scala_union_type_alternative_paths,
-    terminal_invocation_owner_name,
+    ScalaQualifiedStableTypeRole, call_arities_for_reference, has_ancestor_kind,
+    has_member_qualifier, infix_receiver_for_operator, is_call_function_reference,
+    is_constructor_like_reference, is_extractor_reference, is_identifier_node,
+    is_infix_pattern_operator, is_owner_qualified_this, is_scala_class_reference,
+    is_scala_object_reference, is_terminal_stable_field_reference, member_qualifier,
+    member_qualifier_node, named_argument_invocation_owner, node_text, parenthesized_arity,
+    qualified_stable_type_reference, resolve_stable_object_expression,
+    scala_union_type_alternative_paths, terminal_invocation_owner_name,
 };
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile, Range, ScalaAnalyzer,
@@ -859,6 +860,17 @@ fn pattern_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
                 vec![name]
             }
         }
+        "case_class_pattern" => {
+            let type_node = node.child_by_field_name("type");
+            let mut names = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if Some(child) != type_node {
+                    names.extend(pattern_names(child, source));
+                }
+            }
+            names
+        }
         "identifiers" | "tuple_pattern" | "pattern" => {
             let mut names = Vec::new();
             let mut cursor = node.walk();
@@ -900,16 +912,78 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
     let proven = match ctx.spec.kind {
         TargetKind::Type => {
+            let qualified = qualified_stable_type_reference(node, ctx.source).filter(|reference| {
+                reference
+                    .segments
+                    .first()
+                    .is_some_and(|root| !ctx.bindings.is_shadowed(root))
+            });
+            let object_syntax = is_scala_object_reference(node);
+            let qualified_class_target = qualified.as_ref().and_then(|reference| {
+                ctx.types.resolve_qualified_stable_type(
+                    ctx.scala,
+                    &ctx.name_resolver,
+                    &reference.segments,
+                    false,
+                )
+            });
+            let qualified_object_target = qualified.as_ref().and_then(|reference| {
+                ctx.types.resolve_qualified_stable_type(
+                    ctx.scala,
+                    &ctx.name_resolver,
+                    &reference.segments,
+                    true,
+                )
+            });
+            let qualified_class_matches = qualified_class_target
+                .as_deref()
+                .is_some_and(|fqn| fqn == ctx.spec.target.fq_name());
+            let qualified_object_matches = qualified_object_target.as_deref().is_some_and(|fqn| {
+                fqn == ctx.spec.target.fq_name() || ctx.spec.object_role_fq_matches(fqn)
+            });
+            let qualified_role_matches = qualified.as_ref().is_some_and(|reference| {
+                let call_arities = call_arities_for_reference(reference.expression);
+                match reference.role {
+                    ScalaQualifiedStableTypeRole::Type => qualified_class_matches,
+                    ScalaQualifiedStableTypeRole::Constructor => {
+                        qualified_class_matches
+                            && qualified_class_target.as_deref().is_some_and(|fqn| {
+                                ctx.types.constructor_call_shape_matches(
+                                    ctx.scala,
+                                    fqn,
+                                    call_arities.as_deref(),
+                                )
+                            })
+                    }
+                    ScalaQualifiedStableTypeRole::Apply => {
+                        (qualified_class_matches
+                            && ctx.spec.accepts_apply_role
+                            && ctx.types.class_companion_apply_call_matches(
+                                ctx.scala,
+                                &ctx.name_resolver,
+                                &ctx.spec.target,
+                                call_arities.as_deref(),
+                            ))
+                            || (ctx.spec.is_object_type && qualified_object_matches)
+                    }
+                    ScalaQualifiedStableTypeRole::Extractor => {
+                        (qualified_class_matches && ctx.spec.accepts_extractor_role)
+                            || (ctx.spec.is_object_type && qualified_object_matches)
+                    }
+                }
+            });
             let terminal_object_matches = is_terminal_stable_field_reference(node)
                 && node
                     .parent()
                     .and_then(|expression| stable_object_expression_fqn(expression, ctx))
                     .is_some_and(|fqn| fqn == ctx.spec.target.fq_name());
             let lexical_type_matches = nested_target_type_is_lexically_visible(node, ctx);
-            let class_reference = is_scala_class_reference(node, ctx.source)
+            let class_reference = qualified.is_none()
+                && is_scala_class_reference(node, ctx.source)
                 && !ctx.spec.is_object_type
                 && (ctx.visibility.class_type_name_matches(text) || lexical_type_matches);
-            let object_reference = is_scala_object_reference(node)
+            let object_reference = qualified.is_none()
+                && object_syntax
                 && (ctx.visibility.object_type_name_matches(text) || lexical_type_matches)
                 && (ctx.spec.is_object_type
                     || ctx.spec.accepts_stable_object_role
@@ -923,13 +997,40 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                             &ctx.spec.target,
                             call_arities_for_reference(node).as_deref(),
                         ));
-            (class_reference || object_reference || terminal_object_matches)
-                && !type_reference_is_locally_bound(text, ctx)
+            (qualified_role_matches
+                || class_reference
+                || object_reference
+                || terminal_object_matches)
+                && (qualified.is_some() || !type_reference_is_locally_bound(text, ctx))
         }
         TargetKind::Constructor => {
-            ctx.visibility.class_type_name_matches(text)
-                && is_constructor_like_reference(node, ctx.source)
-                && member_call_arity_matches(node, ctx)
+            let qualified = qualified_stable_type_reference(node, ctx.source).filter(|reference| {
+                reference
+                    .segments
+                    .first()
+                    .is_some_and(|root| !ctx.bindings.is_shadowed(root))
+            });
+            let qualified_owner_matches = qualified.as_ref().is_some_and(|reference| {
+                reference.role == ScalaQualifiedStableTypeRole::Constructor
+                    && ctx
+                        .types
+                        .resolve_qualified_stable_type(
+                            ctx.scala,
+                            &ctx.name_resolver,
+                            &reference.segments,
+                            false,
+                        )
+                        .as_deref()
+                        == ctx.spec.owner.as_ref().map(CodeUnit::fq_name).as_deref()
+                    && member_call_arities_match(
+                        call_arities_for_reference(reference.expression).as_deref(),
+                        ctx,
+                    )
+            });
+            qualified_owner_matches
+                || ctx.visibility.class_type_name_matches(text)
+                    && is_constructor_like_reference(node, ctx.source)
+                    && member_call_arity_matches(node, ctx)
         }
         TargetKind::Method => member_reference_is_proven(node, text, ctx),
         TargetKind::Field => {

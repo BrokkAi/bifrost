@@ -280,6 +280,159 @@ object Use {
 }
 
 #[test]
+fn scala_usage_finder_resolves_qualified_stable_type_paths_exactly() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Structure.scala",
+            r#"package model
+object Structure {
+  case class Value(value: Int)
+  object Value
+  class Plain
+  object Plain { def apply(value: Int): Plain = new Plain }
+  class Box[T](value: T)
+  object Deep { class Leaf }
+}
+"#,
+        ),
+        (
+            "decoy/Structure.scala",
+            r#"package decoy
+object Structure {
+  case class Value(value: Int)
+  object Value
+  class Plain
+  object Plain { def apply(value: Int): Plain = new Plain }
+  class Box[T](value: T)
+  object Deep { class Leaf }
+}
+"#,
+        ),
+        (
+            "app/Direct.scala",
+            r#"package app
+import model.Structure
+object Direct {
+  val decoded = Option.empty[Structure.Value]
+  val created = new Structure.Value(1)
+  val wrongConstructor = new Structure.Value(1, 2)
+  val applied = Structure.Value(2)
+  val wrongApply = Structure.Value(2, 3)
+  def extracted(value: Structure.Value): Int = value match {
+    case Structure.Value(number) => number
+  }
+  def notExtractor(value: Structure.Plain): Int = value match {
+    case Structure.Plain() => 0
+    case _ => 1
+  }
+  val generic = new Structure.Box[Int](1)
+  val wrongGeneric = new Structure.Box[Int](1, 2)
+  val deep = Option.empty[Structure.Deep.Leaf]
+}
+"#,
+        ),
+        (
+            "app/Alias.scala",
+            r#"package app
+import model.{Structure as Schema}
+object Alias {
+  val decoded = Option.empty[Schema.Value]
+  val deep = Option.empty[Schema.Deep.Leaf]
+}
+"#,
+        ),
+        (
+            "model/PackageRoot.scala",
+            r#"package app
+object PackageRoot {
+  val decoded = Option.empty[model.Structure.Value]
+  val deep = Option.empty[model.Structure.Deep.Leaf]
+}
+"#,
+        ),
+        (
+            "app/Shadowed.scala",
+            r#"package app
+import model.Structure
+object Shadowed {
+  val Structure = decoy.Structure
+  val decoded = Option.empty[Structure.Value]
+}
+"#,
+        ),
+        (
+            "decoy/Use.scala",
+            r#"package decoy
+object Use {
+  val decoded = Option.empty[Structure.Value]
+  val created = new Structure.Value(3)
+  val applied = Structure.Value(4)
+}
+"#,
+        ),
+    ]);
+
+    let value = definition(&analyzer, "model.Structure$.Value");
+    let value_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&value)));
+    for expected in [
+        "Option.empty[Structure.Value]",
+        "new Structure.Value(1)",
+        "Structure.Value(2)",
+        "case Structure.Value(number)",
+        "Option.empty[Schema.Value]",
+        "Option.empty[model.Structure.Value]",
+    ] {
+        assert_hit_contains(&value_hits, expected);
+    }
+    assert!(
+        value_hits.iter().all(|hit| !matches!(
+            hit.file.rel_path().to_str(),
+            Some("decoy/Use.scala" | "app/Shadowed.scala")
+        )),
+        "same-name qualified type leaked: {value_hits:#?}"
+    );
+    assert_no_hit_contains(&value_hits, "new Structure.Value(1, 2)");
+    assert_no_hit_contains(&value_hits, "Structure.Value(2, 3)");
+
+    let companion = definition(&analyzer, "model.Structure$.Value$");
+    let companion_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&companion)));
+    assert_hit_contains(&companion_hits, "Structure.Value(2)");
+    assert_hit_contains(&companion_hits, "case Structure.Value(number)");
+    assert_no_hit_contains(&companion_hits, "Option.empty[Structure.Value]");
+
+    let plain = definition(&analyzer, "model.Structure$.Plain");
+    let plain_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&plain)));
+    assert_no_hit_contains(&plain_hits, "case Structure.Plain()");
+
+    let box_constructor = definition(&analyzer, "model.Structure$.Box.Box");
+    let box_constructor_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&box_constructor)),
+    );
+    assert_hit_contains(&box_constructor_hits, "new Structure.Box[Int](1)");
+    assert_no_hit_contains(&box_constructor_hits, "new Structure.Box[Int](1, 2)");
+
+    let leaf = definition(&analyzer, "model.Structure$.Deep$.Leaf");
+    let leaf_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&leaf)));
+    for expected in [
+        "Option.empty[Structure.Deep.Leaf]",
+        "Option.empty[Schema.Deep.Leaf]",
+        "Option.empty[model.Structure.Deep.Leaf]",
+    ] {
+        assert_hit_contains(&leaf_hits, expected);
+    }
+    assert!(
+        leaf_hits
+            .iter()
+            .all(|hit| hit.file.rel_path() != "decoy/Use.scala"),
+        "multi-level stable type leaked to decoy: {leaf_hits:#?}"
+    );
+}
+
+#[test]
 fn scala_usage_finder_applies_compilation_unit_import_precedence() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (
