@@ -5,6 +5,7 @@ use tree_sitter::{Node, Tree};
 
 use super::imports::scala_import_infos_from_node_with_prefixes;
 use super::supertypes::extract_scala_supertypes;
+use super::wildcard_imports::scala_package_prefixes_at;
 
 pub(super) fn parse_scala_file(
     file: &ProjectFile,
@@ -18,7 +19,36 @@ pub(super) fn parse_scala_file(
         parsed: &mut parsed,
     };
     visitor.visit_compilation_unit(tree.root_node(), "");
+    collect_scala_imports(tree.root_node(), source, &mut parsed);
     parsed
+}
+
+fn collect_scala_imports(
+    root: Node<'_>,
+    source: &str,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "import_declaration" {
+            let raw = scala_node_text(node, source).trim().to_string();
+            if !raw.is_empty() {
+                let package_prefixes = scala_package_prefixes_at(root, source, node.start_byte());
+                parsed
+                    .imports
+                    .extend(scala_import_infos_from_node_with_prefixes(
+                        node,
+                        source,
+                        &package_prefixes,
+                    ));
+                parsed.import_statements.push(raw);
+            }
+        }
+
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
 }
 
 struct ScalaVisitor<'a> {
@@ -131,19 +161,6 @@ impl<'a> ScalaVisitor<'a> {
                             recovery_parent: None,
                         });
                         return;
-                    }
-                }
-                "import_declaration" => {
-                    let raw = scala_node_text(child, self.source).trim().to_string();
-                    if !raw.is_empty() {
-                        self.parsed
-                            .imports
-                            .extend(scala_import_infos_from_node_with_prefixes(
-                                child,
-                                self.source,
-                                &package_prefixes,
-                            ));
-                        self.parsed.import_statements.push(raw);
                     }
                 }
                 "class_definition" | "object_definition" | "trait_definition"
@@ -335,19 +352,6 @@ impl<'a> ScalaVisitor<'a> {
         let children = body.named_children(&mut cursor).collect::<Vec<_>>();
         for child in children {
             match child.kind() {
-                "import_declaration" => {
-                    let raw = scala_node_text(child, self.source).trim().to_string();
-                    if !raw.is_empty() {
-                        self.parsed
-                            .imports
-                            .extend(scala_import_infos_from_node_with_prefixes(
-                                child,
-                                self.source,
-                                package_prefixes,
-                            ));
-                        self.parsed.import_statements.push(raw);
-                    }
-                }
                 "function_definition" | "function_declaration" => {
                     self.visit_function(child, package_name, Some(parent.clone()))
                 }

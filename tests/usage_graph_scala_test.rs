@@ -585,6 +585,92 @@ object Use {
 }
 
 #[test]
+fn scala_inverted_graph_honors_method_and_anonymous_local_import_contexts() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Owner.scala",
+            r#"package app
+object Owner {
+  private class RetryTick
+  private object RetryTick
+}
+"#,
+        )
+        .file("other/RetryTick.scala", "package other\nobject RetryTick\n")
+        .file(
+            "app/Consumer.scala",
+            r#"package app
+class Consumer {
+  def methodLocal: Any = {
+    import Owner._
+    accept(RetryTick)
+  }
+  def anonymousLocal: Any = new Runnable {
+    import Owner._
+    def run(): Unit = accept(RetryTick)
+  }
+  def aliasLocal: Any = {
+    import Owner.{RetryTick => AliasTick}
+    accept(AliasTick)
+  }
+  def beforeImport: Any = {
+    accept(RetryTick)
+    import Owner._
+  }
+  def siblingScope: Any = {
+    { import Owner._; accept(RetryTick) }
+    accept(RetryTick)
+  }
+  def shadowed: Any = {
+    import Owner._
+    val RetryTick = other.RetryTick
+    accept(RetryTick)
+  }
+  def ambiguous: Any = {
+    import Owner._
+    import other._
+    accept(RetryTick)
+  }
+  def absent: Any = accept(RetryTick)
+  private def accept(value: Any): Any = value
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+
+    for caller in [
+        "app.Consumer.methodLocal",
+        "app.Consumer.anonymousLocal",
+        "app.Consumer.aliasLocal",
+        "app.Consumer.siblingScope",
+    ] {
+        assert!(
+            has_edge(&value, caller, "app.Owner$.RetryTick$"),
+            "{caller} should edge to the exact imported object: {}",
+            value["edges"]
+        );
+        assert!(
+            !has_edge(&value, caller, "app.Owner$.RetryTick"),
+            "{caller} must not edge to the same-name class: {}",
+            value["edges"]
+        );
+    }
+    for caller in [
+        "app.Consumer.beforeImport",
+        "app.Consumer.shadowed",
+        "app.Consumer.ambiguous",
+        "app.Consumer.absent",
+    ] {
+        assert!(
+            !has_edge(&value, caller, "app.Owner$.RetryTick$"),
+            "{caller} must not see the target object: {}",
+            value["edges"]
+        );
+    }
+}
+
+#[test]
 fn scala_inverted_applies_compilation_unit_import_precedence() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

@@ -4,8 +4,11 @@ use brokk_bifrost::usages::{
     ExplicitCandidateProvider, FuzzyResult, ScalaUsageGraphStrategy, UsageAnalyzer, UsageFinder,
     UsageHit, UsageHitKind,
 };
-use brokk_bifrost::{CodeUnit, CodeUnitType, IAnalyzer, Language, ScalaAnalyzer};
-use common::{InlineTestProject, line_of};
+use brokk_bifrost::{
+    CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, Language, ScalaAnalyzer,
+};
+use common::{InlineTestProject, call_search_tool_json, line_of};
+use serde_json::json;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -2163,6 +2166,134 @@ object Ambiguous {
             .all(|hit| hit.file.rel_path() != "app/Ambiguous.scala"),
         "ambiguous sibling wildcard imports must not select a nested target: {inner_hits:#?}"
     );
+}
+
+#[test]
+fn scala_method_local_imports_preserve_scope_order_shadowing_and_object_identity() {
+    let consumer_source = r#"package app
+class Consumer {
+  def methodLocal: Any = {
+    import Owner._
+    accept(RetryTick) // positive-method
+  }
+  def anonymous: Any = new Runnable {
+    import Owner._
+    def run(): Unit = accept(RetryTick) // positive-anonymous
+  }
+  def aliased: Any = {
+    import Owner.{RetryTick => AliasTick}
+    accept(AliasTick) // positive-alias
+  }
+  def beforeImport: Any = {
+    accept(RetryTick) // negative-before
+    import Owner._
+  }
+  def siblingScope: Any = {
+    { import Owner._; accept(RetryTick) } // positive-sibling-inner
+    accept(RetryTick) // negative-sibling-outer
+  }
+  def shadowed: Any = {
+    import Owner._
+    val RetryTick = other.RetryTick
+    accept(RetryTick) // negative-shadow
+  }
+  def ambiguous: Any = {
+    import Owner._
+    import other._
+    accept(RetryTick) // negative-ambiguous
+  }
+  def absent: Any = accept(RetryTick) // negative-absent
+  private def accept(value: Any): Any = value
+}
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "app/Owner.scala",
+            r#"package app
+object Owner {
+  private class RetryTick
+  private object RetryTick
+}
+"#,
+        ),
+        ("other/RetryTick.scala", "package other\nobject RetryTick\n"),
+        ("app/Consumer.scala", consumer_source),
+    ]);
+
+    let target = definition(&analyzer, "app.Owner$.RetryTick$");
+    let target_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    for marker in [
+        "positive-method",
+        "positive-anonymous",
+        "positive-alias",
+        "positive-sibling-inner",
+    ] {
+        assert_hit_line(&target_hits, line_of(consumer_source, marker));
+    }
+    for marker in [
+        "negative-before",
+        "negative-sibling-outer",
+        "negative-shadow",
+        "negative-ambiguous",
+        "negative-absent",
+    ] {
+        assert_no_hit_line(&target_hits, line_of(consumer_source, marker));
+    }
+
+    let class = definition(&analyzer, "app.Owner$.RetryTick");
+    let class_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&class)));
+    for marker in [
+        "positive-method",
+        "positive-anonymous",
+        "positive-alias",
+        "positive-sibling-inner",
+    ] {
+        assert_no_hit_line(&class_hits, line_of(consumer_source, marker));
+    }
+
+    let imports = analyzer.import_info_of(&definition(&analyzer, "app.Consumer").source());
+    assert_eq!(
+        8,
+        imports.len(),
+        "each source import is collected exactly once"
+    );
+    assert!(imports.iter().all(|info| {
+        info.path
+            .as_ref()
+            .is_some_and(|path| path.declaration_start_byte > 0 && !path.lexical_scopes.is_empty())
+    }));
+
+    let mcp = call_search_tool_json(
+        project.root(),
+        "scan_usages_by_reference",
+        &json!({
+            "symbols": ["app.Owner$.RetryTick$"],
+            "include_tests": true,
+        })
+        .to_string(),
+    );
+    let result = &mcp["results"][0];
+    assert_eq!(result["status"], "found", "{mcp}");
+    let mcp_hits = result["files"]
+        .as_array()
+        .expect("MCP usage files")
+        .iter()
+        .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+        .filter_map(|hit| hit["line"].as_u64())
+        .collect::<BTreeSet<_>>();
+    for marker in [
+        "positive-method",
+        "positive-anonymous",
+        "positive-alias",
+        "positive-sibling-inner",
+    ] {
+        assert!(
+            mcp_hits.contains(&(line_of(consumer_source, marker) as u64)),
+            "MCP result omitted {marker}: {mcp}"
+        );
+    }
 }
 
 #[test]
