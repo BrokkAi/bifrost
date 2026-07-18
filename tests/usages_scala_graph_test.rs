@@ -748,6 +748,169 @@ object Use {
 }
 
 #[test]
+fn scala_usage_finder_omits_only_trailing_contextual_parameter_lists() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Calls.scala",
+        r#"package app
+trait Context
+object Scope {
+  def run[A](value: A)(using Context): A = value
+  def run[A](parallelism: Int)(value: A)(using Context): A = value
+}
+object Required {
+  def run(parallelism: Int)(value: Int)(using Context): Int = value
+}
+object Use {
+  given Context = new Context {}
+  val contextual = Scope.run { 1 }
+  val contextualAfterTwoExplicitLists = Scope.run(2) { 1 }
+  val ambiguousEta = Scope.run
+  val missingRequiredExplicitList = Required.run(2)
+  val completeRequiredExplicitList = Required.run(2)(1)
+}
+"#,
+    )]);
+
+    let scope_run = definition(&analyzer, "app.Scope$.run");
+    let scope_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&scope_run)));
+    assert_hit_contains(&scope_hits, "Scope.run { 1 }");
+    assert_hit_contains(&scope_hits, "Scope.run(2) { 1 }");
+    assert_no_hit_contains(&scope_hits, "val ambiguousEta = Scope.run");
+
+    let required_run = definition(&analyzer, "app.Required$.run");
+    let required_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&required_run)),
+    );
+    assert_no_hit_in_enclosing(&required_hits, "app.Use.missingRequiredExplicitList");
+    assert_hit_contains(&required_hits, "Required.run(2)(1)");
+}
+
+#[test]
+fn scala_usage_finder_routes_chained_wildcard_contextual_apply() {
+    let consumer_source = r#"package dotty.tools.dotc.typer
+import dotty.tools.dotc.core.*
+import Annotations.*
+
+object Typer {
+  given Context = new Context {}
+  val annotation = Annotation(1, 2, 3)
+  val wrongArity = Annotation(1, 2)
+}
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "dotty/tools/dotc/core/Annotations.scala",
+            r#"package dotty.tools.dotc.core
+trait Context
+object Annotations {
+  object Annotation {
+    def apply(cls: Int, arg: Int, span: Int)(using Context): Int = cls
+    def apply(cls: String, arg: Int, span: Int)(using Context): Int = arg
+  }
+}
+"#,
+        ),
+        ("dotty/tools/dotc/typer/Typer.scala", consumer_source),
+    ]);
+    let target = definition(
+        &analyzer,
+        "dotty.tools.dotc.core.Annotations$.Annotation$.apply",
+    );
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let hits = hits(result);
+
+    assert_hit_line(&hits, line_of(consumer_source, "Annotation(1, 2, 3)"));
+    assert_no_hit_line(&hits, line_of(consumer_source, "Annotation(1, 2)"));
+    assert!(
+        hits.iter()
+            .any(|hit| { hit.file == project.file("dotty/tools/dotc/typer/Typer.scala") }),
+        "default candidate discovery must route the chained wildcard consumer"
+    );
+}
+
+#[test]
+fn scala_usage_finder_keeps_sibling_wildcard_import_scopes_exact() {
+    let consumer_source = r#"package app
+
+object LeftConsumer {
+  import api.LeftFactories.*
+  val value = Factory(1)
+}
+
+object RightConsumer {
+  import api.RightFactories.*
+  val value = Factory(2)
+}
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "api/Factories.scala",
+            r#"package api
+object LeftFactories {
+  object Factory { def apply(value: Int): Int = value }
+}
+object RightFactories {
+  object Factory { def apply(value: Int): Int = value }
+}
+"#,
+        ),
+        ("app/Consumers.scala", consumer_source),
+    ]);
+    let consumer = project.file("app/Consumers.scala");
+
+    for (target_fqn, expected_line, rejected_line) in [
+        (
+            "api.LeftFactories$.Factory$.apply",
+            "val value = Factory(1)",
+            "val value = Factory(2)",
+        ),
+        (
+            "api.RightFactories$.Factory$.apply",
+            "val value = Factory(2)",
+            "val value = Factory(1)",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 100, 100);
+        assert!(
+            query.candidate_files.contains(&consumer),
+            "default candidate discovery must route {target_fqn} to the consumer"
+        );
+        let target_hits = hits(query.result);
+        assert_hit_line(&target_hits, line_of(consumer_source, expected_line));
+        assert_no_hit_line(&target_hits, line_of(consumer_source, rejected_line));
+    }
+}
+
+#[test]
+fn scala_usage_finder_merges_case_class_and_explicit_companion_apply_shapes() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "akka/util/Timeout.scala",
+        r#"package akka.util
+case class Timeout(duration: Long)
+object Timeout {
+  def apply(length: Long, unit: String): Timeout = new Timeout(length)
+}
+object Use {
+  val generated = Timeout(1)
+  val explicit = Timeout(1, "second")
+  val tooFew = Timeout()
+  val tooMany = Timeout(1, "second", "extra")
+}
+"#,
+    )]);
+    let target = definition(&analyzer, "akka.util.Timeout$.apply");
+    let target_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+
+    assert_hit_contains(&target_hits, "Timeout(1)");
+    assert_hit_contains(&target_hits, "Timeout(1, \"second\")");
+    assert_no_hit_contains(&target_hits, "Timeout()");
+    assert_no_hit_contains(&target_hits, "Timeout(1, \"second\", \"extra\")");
+}
+
+#[test]
 fn scala_usage_finder_keeps_overload_shape_receiver_and_return_facts_aligned() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "app/Aligned.scala",

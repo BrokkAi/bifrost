@@ -27,14 +27,15 @@ use super::resolver::{
 };
 use super::shared::ScalaEdgeGraph;
 use super::syntax::{
-    ScalaSourceFacts, call_arities_for_reference, is_constructor_like_reference,
-    is_scala_class_reference, is_scala_object_reference, is_terminal_stable_field_reference,
-    node_text, parenthesized_arity, resolve_stable_object_expression, scala_import_path,
-    scala_source_facts,
+    ScalaCallableParameterList, ScalaImportContextIndex, ScalaParameterListKind, ScalaSourceFacts,
+    call_arities_for_reference, is_constructor_like_reference, is_scala_class_reference,
+    is_scala_object_reference, is_terminal_stable_field_reference, node_text, parenthesized_arity,
+    resolve_stable_object_expression, scala_import_is_visible_at_byte, scala_source_facts,
 };
 use crate::analyzer::scala::{
-    ScalaAdapter, ScalaSupertypeLookupPath, scala_class_parameter_field_keyword,
-    scala_normalize_full_name, scala_simple_type_name,
+    ScalaAdapter, ScalaSupertypeLookupPath, ScalaWildcardOwnerFacts,
+    resolve_scala_wildcard_import_environment, scala_class_parameter_field_keyword,
+    scala_import_path, scala_normalize_full_name, scala_simple_type_name,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usage_facts::CallableFacts;
@@ -1061,7 +1062,13 @@ impl ProjectTypes {
         };
         let alternatives = self.callable_alternatives_for(scala, target);
         if alternatives.is_empty() {
-            return callable_shape_matches(&[CallableArity::exact(0)], Some(call_arities), false);
+            return callable_shape_matches(
+                &[ScalaCallableParameterList::explicit(CallableArity::exact(
+                    0,
+                ))],
+                Some(call_arities),
+                false,
+            );
         }
         alternatives.iter().any(|alternative| {
             callable_shape_matches(&alternative.shape, Some(call_arities), false)
@@ -1082,9 +1089,9 @@ impl ProjectTypes {
             .clone();
         cell.get_or_init(|| {
             let source_facts = self.source_facts_for_file(scala, target.source());
-            let declaration_resolver = NameResolver::for_file_types(scala, target.source(), self);
+            let declaration_resolver = NameResolver::for_file_types(scala, target, self);
             let ranges = self.declaration_ranges_for(scala, target);
-            let exact = ranges
+            let mut exact = ranges
                 .iter()
                 .filter_map(|range| {
                     source_facts
@@ -1111,6 +1118,20 @@ impl ProjectTypes {
                         })
                 })
                 .collect::<Vec<_>>();
+            if let Some(case_class) = self.exact_case_class_for_companion_apply(scala, target) {
+                for constructor in self.callable_alternatives_for(scala, &case_class).iter() {
+                    if exact
+                        .iter()
+                        .any(|alternative| alternative.shape == constructor.shape)
+                    {
+                        continue;
+                    }
+                    let mut synthetic = constructor.clone();
+                    synthetic.extension_receiver_type = None;
+                    synthetic.return_type = Some(case_class.fq_name());
+                    exact.push(synthetic);
+                }
+            }
             if !exact.is_empty() {
                 return Arc::new(exact);
             }
@@ -1119,7 +1140,7 @@ impl ProjectTypes {
                 .into_iter()
                 .filter_map(|metadata| {
                     metadata.callable_arity().map(|arity| CallableAlternative {
-                        shape: vec![arity],
+                        shape: vec![ScalaCallableParameterList::explicit(arity)],
                         parameter_function_arities: Vec::new(),
                         extension_receiver_type: None,
                         return_type: None,
@@ -1134,7 +1155,7 @@ impl ProjectTypes {
                 })
             {
                 fallback.push(CallableAlternative {
-                    shape: vec![arity],
+                    shape: vec![ScalaCallableParameterList::explicit(arity)],
                     parameter_function_arities: Vec::new(),
                     extension_receiver_type: None,
                     return_type: self
@@ -1146,6 +1167,34 @@ impl ProjectTypes {
             Arc::new(fallback)
         })
         .clone()
+    }
+
+    fn exact_case_class_for_companion_apply(
+        &self,
+        scala: &ScalaAnalyzer,
+        target: &CodeUnit,
+    ) -> Option<CodeUnit> {
+        if !target.is_function() || target.short_name().rsplit('.').next() != Some("apply") {
+            return None;
+        }
+        let companion = scala.structural_parent_of(target)?;
+        if !companion.is_class() || !companion.short_name().ends_with('$') {
+            return None;
+        }
+        let structural_parent = scala.structural_parent_of(&companion);
+        let mut candidates = self
+            .index
+            .by_normalized_fqn(&scala_normalized_fq_name(&companion.fq_name()))
+            .iter()
+            .filter(|candidate| {
+                candidate.is_class()
+                    && !candidate.short_name().ends_with('$')
+                    && candidate.source() == companion.source()
+                    && scala.structural_parent_of(candidate) == structural_parent
+                    && self.is_case_class(scala, candidate)
+            });
+        let candidate = candidates.next()?.clone();
+        candidates.next().is_none().then_some(candidate)
     }
 
     pub(super) fn type_accepts_object_roles(
@@ -1452,7 +1501,7 @@ impl ProjectTypes {
 
 #[derive(Clone)]
 pub(crate) struct CallableAlternative {
-    pub(crate) shape: Vec<CallableArity>,
+    pub(crate) shape: Vec<ScalaCallableParameterList>,
     pub(crate) parameter_function_arities: Vec<Vec<Option<usize>>>,
     pub(crate) extension_receiver_type: Option<String>,
     pub(crate) return_type: Option<String>,
@@ -1687,27 +1736,47 @@ impl NameResolver {
         }
     }
 
-    fn for_file_types(scala: &ScalaAnalyzer, file: &ProjectFile, types: &ProjectTypes) -> Self {
+    fn for_file_types(scala: &ScalaAnalyzer, target: &CodeUnit, types: &ProjectTypes) -> Self {
+        let file = target.source();
         match &types.bulk_file_states {
             Some(states) => match states.get(file) {
-                Some(state) => Self::for_file_with_facts_impl(
-                    scala,
-                    Some(file),
-                    Some(&state.package_name),
-                    &state.imports,
-                    types,
-                    false,
-                ),
+                Some(state) => {
+                    let reference_byte = state
+                        .ranges
+                        .get(target)
+                        .into_iter()
+                        .flatten()
+                        .map(|range| range.start_byte)
+                        .min();
+                    let imports = visible_imports_at_byte(&state.imports, reference_byte);
+                    Self::for_file_with_facts_impl(
+                        scala,
+                        Some(file),
+                        Some(&state.package_name),
+                        &imports,
+                        types,
+                        false,
+                    )
+                }
                 None => Self::for_file_with_facts_impl(scala, Some(file), None, &[], types, false),
             },
-            None => Self::for_file_with_facts_impl(
-                scala,
-                Some(file),
-                package_name_of(scala, file).as_deref(),
-                &scala.import_info_of(file),
-                types,
-                false,
-            ),
+            None => {
+                let imports = scala.import_info_of(file);
+                let reference_byte = scala
+                    .ranges(target)
+                    .into_iter()
+                    .map(|range| range.start_byte)
+                    .min();
+                let imports = visible_imports_at_byte(&imports, reference_byte);
+                Self::for_file_with_facts_impl(
+                    scala,
+                    Some(file),
+                    package_name_of(scala, file).as_deref(),
+                    &imports,
+                    types,
+                    false,
+                )
+            }
         }
     }
 
@@ -1738,33 +1807,49 @@ impl NameResolver {
             object_names.add(simple.clone(), decl.fq_name(), priority);
         }
 
+        let package_prefixes = scala_package_prefixes(file_package);
+        let wildcard_environment =
+            resolve_scala_wildcard_import_environment(imports, &package_prefixes, |candidate| {
+                ScalaWildcardOwnerFacts {
+                    package: !types.package_types_in(candidate).is_empty()
+                        || !types.package_objects_in(scala, candidate).is_empty(),
+                    stable_singleton: types
+                        .object_by_normalized_fqn(scala, &scala_normalized_fq_name(candidate))
+                        .is_some(),
+                }
+            });
+        if !wildcard_environment.ambiguous {
+            for owner in &wildcard_environment.owners {
+                if owner.is_singleton() {
+                    let normalized_owner = scala_normalized_fq_name(&owner.declaration_fqn());
+                    for (simple, decl) in types.nested_types_in(scala, &normalized_owner).iter() {
+                        names.add(simple.clone(), decl.fq_name(), 1);
+                    }
+                    for (simple, decl) in types.nested_objects_in(scala, &normalized_owner).iter() {
+                        object_names.add(simple.clone(), decl.fq_name(), 1);
+                    }
+                    if include_members {
+                        wildcard_extension_owners.push(normalized_owner);
+                    }
+                } else {
+                    for (simple, decl) in types.package_types_in(&owner.fqn).iter() {
+                        names.add(simple.clone(), decl.fq_name(), 1);
+                    }
+                    for (simple, decl) in types.package_objects_in(scala, &owner.fqn).iter() {
+                        object_names.add(simple.clone(), decl.fq_name(), 1);
+                    }
+                    if include_members {
+                        wildcard_extension_owners.push(owner.fqn.clone());
+                    }
+                }
+            }
+        }
+
         for import in imports {
             let Some(path) = scala_import_path(import) else {
                 continue;
             };
             if import.is_wildcard {
-                let package_candidates = import_candidate_paths(&path, file_package);
-                // `import pkg._` exposes every type in `pkg` by simple name.
-                for decl_package in &package_candidates {
-                    for (simple, decl) in types.package_types_in(decl_package).iter() {
-                        names.add(simple.clone(), decl.fq_name(), 1);
-                    }
-                    for (simple, decl) in types.package_objects_in(scala, decl_package).iter() {
-                        object_names.add(simple.clone(), decl.fq_name(), 1);
-                    }
-                }
-                for owner in import_candidate_normalized_paths(&path, file_package) {
-                    for (simple, decl) in types.nested_types_in(scala, &owner).iter() {
-                        names.add(simple.clone(), decl.fq_name(), 1);
-                    }
-                    for (simple, decl) in types.nested_objects_in(scala, &owner).iter() {
-                        object_names.add(simple.clone(), decl.fq_name(), 1);
-                    }
-                }
-                if include_members {
-                    wildcard_extension_owners
-                        .extend(import_candidate_normalized_paths(&path, file_package));
-                }
                 continue;
             }
             // `import pkg.Type [as Alias]` binds the (possibly renamed) local name.
@@ -1882,6 +1967,31 @@ impl NameResolver {
     }
 }
 
+fn visible_imports_at_byte(
+    imports: &[crate::analyzer::ImportInfo],
+    reference_byte: Option<usize>,
+) -> Vec<crate::analyzer::ImportInfo> {
+    let Some(reference_byte) = reference_byte else {
+        return imports.to_vec();
+    };
+    imports
+        .iter()
+        .filter(|import| scala_import_is_visible_at_byte(import, reference_byte))
+        .cloned()
+        .collect()
+}
+
+fn scala_package_prefixes(package_name: &str) -> Vec<String> {
+    let mut prefixes = package_name
+        .match_indices('.')
+        .map(|(index, _)| package_name[..index].to_string())
+        .collect::<Vec<_>>();
+    if !package_name.is_empty() {
+        prefixes.push(package_name.to_string());
+    }
+    prefixes
+}
+
 fn import_candidate_normalized_paths(path: &str, package_name: &str) -> HashSet<String> {
     import_candidate_paths(path, package_name)
         .into_iter()
@@ -1926,7 +2036,7 @@ fn method_call_shape_matches(
         fallback_shape = facts
             .callable_arity
             .or_else(|| facts.arity.map(crate::analyzer::CallableArity::exact))
-            .map(|arity| vec![arity])
+            .map(|arity| vec![ScalaCallableParameterList::explicit(arity)])
             .unwrap_or_default();
         fallback_shapes = vec![fallback_shape];
         fallback_shapes.as_slice()
@@ -1941,23 +2051,24 @@ fn method_call_shape_matches(
 }
 
 fn callable_shape_matches(
-    declared: &[CallableArity],
+    declared: &[ScalaCallableParameterList],
     call_arities: Option<&[usize]>,
     unique_callable: bool,
 ) -> bool {
     match call_arities {
         Some(call_arities) => {
-            if call_arities.len() > declared.len()
-                || (call_arities.len() < declared.len() && !unique_callable)
-            {
+            if call_arities.len() > declared.len() {
                 return false;
             }
             call_arities
                 .iter()
                 .zip(declared)
-                .all(|(call_arity, declared)| declared.accepts(*call_arity))
+                .all(|(call_arity, declared)| declared.arity.accepts(*call_arity))
+                && declared[call_arities.len()..]
+                    .iter()
+                    .all(|list| list.kind == ScalaParameterListKind::Contextual)
         }
-        None => declared.first().is_none_or(|arity| arity.total() == 0) || unique_callable,
+        None => declared.first().is_none_or(|list| list.arity.total() == 0) || unique_callable,
     }
 }
 
@@ -2002,24 +2113,28 @@ where
             &language,
             declarations,
             |parsed, collector| {
-                let resolver = NameResolver::for_file_with_facts(
+                let resolver = Arc::new(NameResolver::for_file_with_facts(
                     scala,
                     Some(file),
                     Some(&state.package_name),
-                    &state.imports,
+                    &[],
                     &graph.types,
-                );
-                let factory_returns = collect_factory_return_types(
-                    parsed.tree.root_node(),
-                    parsed.source.as_str(),
-                    &resolver,
-                );
+                ));
                 let mut ctx = ScalaScan {
                     scala,
                     source: parsed.source.as_str(),
-                    resolver: &resolver,
+                    source_file: file,
+                    package: &state.package_name,
+                    imports: &state.imports,
+                    import_contexts: ScalaImportContextIndex::new(
+                        &state.imports,
+                        parsed.tree.root_node().end_byte(),
+                    ),
+                    import_context_cursor: 0,
+                    resolver,
+                    active_import_key: Vec::new(),
+                    resolver_contexts: HashMap::default(),
                     types: &graph.types,
-                    factory_returns,
                     class_ranges,
                     collector,
                 };
@@ -2033,9 +2148,15 @@ where
 struct ScalaScan<'a, 'b> {
     scala: &'a ScalaAnalyzer,
     source: &'a str,
-    resolver: &'a NameResolver,
+    source_file: &'a ProjectFile,
+    package: &'a str,
+    imports: &'a [crate::analyzer::ImportInfo],
+    import_contexts: ScalaImportContextIndex,
+    import_context_cursor: usize,
+    resolver: Arc<NameResolver>,
+    active_import_key: Vec<usize>,
+    resolver_contexts: HashMap<Vec<usize>, Arc<NameResolver>>,
     types: &'a ProjectTypes,
-    factory_returns: HashMap<String, HashSet<String>>,
     class_ranges: ClassRangeIndex,
     collector: &'a mut EdgeCollector<'b>,
 }
@@ -2047,6 +2168,35 @@ struct ScalaBinding {
 }
 
 impl ScalaScan<'_, '_> {
+    fn activate_import_context(&mut self, node: Node<'_>) {
+        let visible = self
+            .import_contexts
+            .advance_to(node.start_byte(), &mut self.import_context_cursor);
+        if visible == self.active_import_key {
+            return;
+        }
+        let key = visible.to_vec();
+        if let Some(resolver) = self.resolver_contexts.get(&key) {
+            self.resolver = resolver.clone();
+            self.active_import_key = key;
+            return;
+        }
+        let visible_imports = key
+            .iter()
+            .filter_map(|index| self.imports.get(*index).cloned())
+            .collect::<Vec<_>>();
+        let resolver = Arc::new(NameResolver::for_file_with_facts(
+            self.scala,
+            Some(self.source_file),
+            Some(self.package),
+            &visible_imports,
+            self.types,
+        ));
+        self.resolver_contexts.insert(key.clone(), resolver.clone());
+        self.resolver = resolver;
+        self.active_import_key = key;
+    }
+
     /// The fqn of the smallest class/object declaration containing `byte`.
     fn enclosing_class(&self, byte: usize) -> Option<&str> {
         self.class_ranges.enclosing(byte)
@@ -2109,6 +2259,7 @@ fn walk_enter(
     ctx: &mut ScalaScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<ScalaBinding>,
 ) -> bool {
+    ctx.activate_import_context(node);
     let enters_scope = SCOPE_NODES.contains(&node.kind());
     if enters_scope {
         bindings.enter_scope();
@@ -2315,13 +2466,8 @@ fn receiver_type_fqn(
                 .or_else(|| {
                     (!bindings.is_shadowed(name)).then(|| {
                         ctx.resolver.resolve_member(name).and_then(|method| {
-                            ctx.factory_returns
-                                .get(&method)
-                                .and_then(single_factory_return)
-                                .or_else(|| {
-                                    ctx.types
-                                        .member_return_type(ctx.scala, ctx.resolver, &method)
-                                })
+                            ctx.types
+                                .member_return_type(ctx.scala, &ctx.resolver, &method)
                         })
                     })?
                 })
@@ -2464,7 +2610,7 @@ fn seed_parameter(
         return;
     }
     let resolved = parameter.child_by_field_name("type").and_then(|type_node| {
-        resolve_receiver_type(ctx.resolver, node_text(type_node, ctx.source))
+        resolve_receiver_type(&ctx.resolver, node_text(type_node, ctx.source))
     });
     seed_binding(binding_name, resolved, declaration_owner, bindings);
 }
@@ -2534,7 +2680,9 @@ fn seed_value_definition_with_owner(
     // or a call with a declared factory return.
     let resolved = node
         .child_by_field_name("type")
-        .and_then(|type_node| resolve_receiver_type(ctx.resolver, node_text(type_node, ctx.source)))
+        .and_then(|type_node| {
+            resolve_receiver_type(&ctx.resolver, node_text(type_node, ctx.source))
+        })
         .or_else(|| {
             node.child_by_field_name("value")
                 .and_then(|value| constructed_type(value, ctx))
@@ -2600,17 +2748,9 @@ fn call_result_type(
             let owner = receiver_type_fqn(receiver, ctx, bindings)?;
             let method = node_text(field, ctx.source);
             let call_arities = call_arities_for_reference(field);
-            let method_fqn = format!("{owner}.{method}");
-            if let Some(return_type) = ctx
-                .factory_returns
-                .get(&method_fqn)
-                .and_then(single_factory_return)
-            {
-                return Some(return_type);
-            }
             ctx.types.member_return_type_for_owner_member(
                 ctx.scala,
-                ctx.resolver,
+                &ctx.resolver,
                 &owner,
                 method,
                 call_arities.as_deref(),
@@ -2620,17 +2760,9 @@ fn call_result_type(
             let method = node_text(function, ctx.source);
             let owner = ctx.enclosing_class(function.start_byte())?;
             let call_arities = call_arities_for_reference(function);
-            let method_fqn = format!("{owner}.{method}");
-            if let Some(return_type) = ctx
-                .factory_returns
-                .get(&method_fqn)
-                .and_then(single_factory_return)
-            {
-                return Some(return_type);
-            }
             match ctx.types.unqualified_member_return_type(
                 ctx.scala,
-                ctx.resolver,
+                &ctx.resolver,
                 owner,
                 method,
                 call_arities.as_deref(),
@@ -2640,58 +2772,6 @@ fn call_result_type(
             }
         }
         _ => None,
-    }
-}
-
-fn single_factory_return(returns: &HashSet<String>) -> Option<String> {
-    let mut iter = returns.iter();
-    let first = iter.next()?;
-    iter.next().is_none().then(|| first.clone())
-}
-
-fn collect_factory_return_types(
-    root: Node<'_>,
-    source: &str,
-    resolver: &NameResolver,
-) -> HashMap<String, HashSet<String>> {
-    let mut returns: HashMap<String, HashSet<String>> = HashMap::default();
-    let mut stack = vec![(root, None::<String>)];
-    while let Some((node, owner)) = stack.pop() {
-        match node.kind() {
-            "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
-                let next_owner = node
-                    .child_by_field_name("name")
-                    .and_then(|name| resolver.resolve(node_text(name, source)));
-                push_children_with_owner(node, next_owner, &mut stack);
-            }
-            "function_definition" => {
-                if let Some(owner) = owner.as_ref()
-                    && let Some(name) = node.child_by_field_name("name")
-                    && let Some(return_type) = node.child_by_field_name("return_type")
-                    && let Some(return_fqn) =
-                        resolve_receiver_type(resolver, node_text(return_type, source))
-                {
-                    returns
-                        .entry(format!("{owner}.{}", node_text(name, source)))
-                        .or_default()
-                        .insert(return_fqn);
-                }
-            }
-            _ => push_children_with_owner(node, owner, &mut stack),
-        }
-    }
-    returns
-}
-
-fn push_children_with_owner<'tree>(
-    node: Node<'tree>,
-    owner: Option<String>,
-    stack: &mut Vec<(Node<'tree>, Option<String>)>,
-) {
-    for index in (0..node.named_child_count()).rev() {
-        if let Some(child) = node.named_child(index) {
-            stack.push((child, owner.clone()));
-        }
     }
 }
 
@@ -2762,7 +2842,7 @@ fn visible_extensions(
         .visible_extension_methods(ctx.scala, ctx.types, member)
     {
         if method.alternatives.iter().any(|alternative| {
-            extension_alternative_receiver_matches(ctx.resolver, alternative, receiver_owner)
+            extension_alternative_receiver_matches(&ctx.resolver, alternative, receiver_owner)
         }) {
             matches.push(method);
         }
@@ -2776,7 +2856,7 @@ fn visible_extensions(
     let unique_callable = callable_count == 1;
     matches.retain(|method| {
         method.alternatives.iter().any(|alternative| {
-            extension_alternative_receiver_matches(ctx.resolver, alternative, receiver_owner)
+            extension_alternative_receiver_matches(&ctx.resolver, alternative, receiver_owner)
                 && callable_shape_matches(&alternative.shape, call_arities, unique_callable)
         })
     });

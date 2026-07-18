@@ -13,10 +13,31 @@ pub(crate) struct ScalaSourceFacts {
 
 #[derive(Clone)]
 pub(crate) struct ScalaCallableSourceAlternative {
-    pub(crate) shape: Vec<CallableArity>,
+    pub(crate) shape: Vec<ScalaCallableParameterList>,
     pub(crate) parameter_function_arities: Vec<Vec<Option<usize>>>,
     pub(crate) extension_receiver_type_path: Option<Vec<String>>,
     pub(crate) return_type_path: Option<Vec<String>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScalaParameterListKind {
+    Explicit,
+    Contextual,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScalaCallableParameterList {
+    pub(crate) arity: CallableArity,
+    pub(crate) kind: ScalaParameterListKind,
+}
+
+impl ScalaCallableParameterList {
+    pub(crate) fn explicit(arity: CallableArity) -> Self {
+        Self {
+            arity,
+            kind: ScalaParameterListKind::Explicit,
+        }
+    }
 }
 
 pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
@@ -38,7 +59,7 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                 let shape = parameter_lists
                     .iter()
                     .copied()
-                    .map(callable_arity_for_parameters)
+                    .map(callable_parameter_list)
                     .collect();
                 let parameter_function_arities = parameter_lists
                     .iter()
@@ -65,7 +86,7 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                 let lists = node
                     .named_children(&mut cursor)
                     .filter(|child| child.kind() == "class_parameters")
-                    .map(callable_arity_for_parameters)
+                    .map(callable_parameter_list)
                     .collect::<Vec<_>>();
                 if !lists.is_empty() {
                     facts.callable_alternatives_by_range.insert(
@@ -182,6 +203,22 @@ fn callable_arity_for_parameters(parameters: Node<'_>) -> CallableArity {
     CallableArity::new(required, total, repeated)
 }
 
+fn callable_parameter_list(parameters: Node<'_>) -> ScalaCallableParameterList {
+    let mut cursor = parameters.walk();
+    let kind = if parameters
+        .children(&mut cursor)
+        .any(|child| matches!(child.kind(), "using" | "implicit"))
+    {
+        ScalaParameterListKind::Contextual
+    } else {
+        ScalaParameterListKind::Explicit
+    };
+    ScalaCallableParameterList {
+        arity: callable_arity_for_parameters(parameters),
+        kind,
+    }
+}
+
 fn parameter_function_arities(parameters: Node<'_>) -> Vec<Option<usize>> {
     let mut cursor = parameters.walk();
     parameters
@@ -221,32 +258,87 @@ pub(super) fn parenthesized_arity(source: &str) -> Option<usize> {
 }
 
 pub(crate) fn scala_import_path(info: &ImportInfo) -> Option<String> {
-    let trimmed = info
-        .raw_snippet
-        .trim()
-        .strip_prefix("import ")
-        .unwrap_or(info.raw_snippet.trim())
-        .trim();
-    if trimmed.is_empty() {
-        return None;
+    crate::analyzer::scala::scala_import_path(info)
+}
+
+pub(crate) struct ScalaImportContextIndex {
+    segments: Vec<ScalaImportContextSegment>,
+}
+
+pub(crate) fn scala_import_is_visible_at_byte(import: &ImportInfo, byte: usize) -> bool {
+    let Some(path) = import.path.as_ref() else {
+        return true;
+    };
+    let end_byte = path
+        .lexical_scopes
+        .last()
+        .map(|scope| scope.end_byte)
+        .unwrap_or(usize::MAX);
+    path.declaration_start_byte <= byte && byte < end_byte
+}
+
+struct ScalaImportContextSegment {
+    start_byte: usize,
+    import_indices: Vec<usize>,
+}
+
+impl ScalaImportContextIndex {
+    pub(crate) fn new(imports: &[ImportInfo], file_end_byte: usize) -> Self {
+        let mut events = Vec::with_capacity(imports.len() * 2);
+        for (index, import) in imports.iter().enumerate() {
+            let Some(path) = import.path.as_ref() else {
+                events.push((0, true, index));
+                events.push((file_end_byte, false, index));
+                continue;
+            };
+            let end_byte = path
+                .lexical_scopes
+                .last()
+                .map(|scope| scope.end_byte)
+                .unwrap_or(file_end_byte);
+            if path.declaration_start_byte < end_byte {
+                events.push((path.declaration_start_byte, true, index));
+                events.push((end_byte, false, index));
+            }
+        }
+        events.sort_by_key(|(byte, enters, index)| (*byte, *enters, *index));
+
+        let mut active = vec![false; imports.len()];
+        let mut segments = vec![ScalaImportContextSegment {
+            start_byte: 0,
+            import_indices: Vec::new(),
+        }];
+        let mut cursor = 0;
+        while cursor < events.len() {
+            let byte = events[cursor].0;
+            while cursor < events.len() && events[cursor].0 == byte {
+                let (_, enters, index) = events[cursor];
+                active[index] = enters;
+                cursor += 1;
+            }
+            let import_indices = active
+                .iter()
+                .enumerate()
+                .filter_map(|(index, active)| active.then_some(index))
+                .collect();
+            if let Some(last) = segments.last_mut().filter(|last| last.start_byte == byte) {
+                last.import_indices = import_indices;
+            } else {
+                segments.push(ScalaImportContextSegment {
+                    start_byte: byte,
+                    import_indices,
+                });
+            }
+        }
+        Self { segments }
     }
-    if info.is_wildcard {
-        return Some(
-            trimmed
-                .trim_end_matches(".*")
-                .trim_end_matches("._")
-                .to_string(),
-        );
+
+    pub(crate) fn advance_to(&self, byte: usize, cursor: &mut usize) -> &[usize] {
+        while *cursor + 1 < self.segments.len() && self.segments[*cursor + 1].start_byte <= byte {
+            *cursor += 1;
+        }
+        &self.segments[*cursor].import_indices
     }
-    Some(
-        trimmed
-            .split_once(" as ")
-            .map(|(path, _)| path)
-            .or_else(|| trimmed.split_once(" => ").map(|(path, _)| path))
-            .unwrap_or(trimmed)
-            .trim()
-            .to_string(),
-    )
 }
 
 pub(crate) fn is_identifier_node(node: Node<'_>) -> bool {

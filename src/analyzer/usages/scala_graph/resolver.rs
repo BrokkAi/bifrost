@@ -1,5 +1,6 @@
 use super::inverted::{CachedCallableAlternatives, NameResolver, is_package_level_type};
-use crate::analyzer::usages::scala_graph::syntax::{parenthesized_arity, scala_import_path};
+use crate::analyzer::scala::scala_import_path;
+use crate::analyzer::usages::scala_graph::syntax::parenthesized_arity;
 use crate::analyzer::{
     CallableArity, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile,
     ScalaAnalyzer, TypeHierarchyProvider,
@@ -744,11 +745,12 @@ pub(super) struct Visibility {
 }
 
 impl Visibility {
-    pub(super) fn for_file(
+    pub(super) fn for_file_with_imports(
         scala: &ScalaAnalyzer,
         file: &ProjectFile,
         spec: &TargetSpec,
         resolver: &NameResolver,
+        imports: &[ImportInfo],
     ) -> Self {
         let mut visibility = Self {
             type_names: HashSet::default(),
@@ -799,9 +801,27 @@ impl Visibility {
             }
         }
 
+        // NameResolver has already interpreted the file's wildcard imports as
+        // one ordered environment. Seed names exposed through chained imports
+        // (for example `core.*; Annotations.*`) from those exact bindings;
+        // retain_exact_visible_bindings below still rejects ambiguous names.
+        if let Some(owner_name) = spec.owner_name.as_ref()
+            && let Some(owner_fq_name) = resolver.resolve_object(owner_name)
+            && (spec.owner_fq_matches(&owner_fq_name)
+                || spec.object_role_fq_matches(&owner_fq_name))
+        {
+            visibility.add_owner_name(owner_name.clone(), owner_fq_name);
+        }
+        if resolver
+            .resolve_object(&spec.member_name)
+            .is_some_and(|resolved| spec.object_role_fq_matches(&resolved))
+        {
+            visibility.type_names.insert(spec.member_name.clone());
+        }
+
         let file_package = file_package.unwrap_or_default();
-        for import in scala.import_info_of(file) {
-            visibility.apply_import(scala, resolver, &import, spec, &file_package);
+        for import in imports {
+            visibility.apply_import(scala, resolver, import, spec, &file_package);
         }
 
         visibility.retain_exact_visible_bindings(resolver, spec);

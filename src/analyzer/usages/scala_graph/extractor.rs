@@ -12,6 +12,7 @@ use crate::analyzer::usages::scala_graph::resolver::{
     scala_literal_type_name, scala_normalized_fq_name, scala_resolve_declared_type,
 };
 use crate::analyzer::usages::scala_graph::syntax::{
+    ScalaCallableParameterList, ScalaImportContextIndex, ScalaParameterListKind,
     call_arities_for_reference, has_ancestor_kind, has_member_qualifier,
     infix_receiver_for_operator, is_call_function_reference, is_constructor_like_reference,
     is_extractor_reference, is_identifier_node, is_infix_pattern_operator, is_owner_qualified_this,
@@ -21,7 +22,8 @@ use crate::analyzer::usages::scala_graph::syntax::{
     terminal_invocation_owner_name,
 };
 use crate::analyzer::{
-    CodeUnit, IAnalyzer, ProjectFile, Range, ScalaAnalyzer, TypeHierarchyProvider,
+    CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile, Range, ScalaAnalyzer,
+    TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
@@ -59,9 +61,23 @@ pub(super) fn scan_file(
     };
     let line_starts = compute_line_starts(&source);
     let types = scala.project_types();
-    let name_resolver = NameResolver::for_file(scala, file, &types);
-    let visibility = Visibility::for_file(scala, file, spec, &name_resolver);
     let file_package = package_name_of(scala, file).unwrap_or_default();
+    let imports = scala.import_info_of(file);
+    let import_contexts = ScalaImportContextIndex::new(&imports, tree.root_node().end_byte());
+    let name_resolver = Arc::new(NameResolver::for_file_with_facts(
+        scala,
+        Some(file),
+        Some(&file_package),
+        &[],
+        &types,
+    ));
+    let visibility = Arc::new(Visibility::for_file_with_imports(
+        scala,
+        file,
+        spec,
+        &name_resolver,
+        &[],
+    ));
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     let mut ctx = ScanCtx {
         scala,
@@ -74,6 +90,11 @@ pub(super) fn scan_file(
         types,
         name_resolver,
         visibility,
+        imports,
+        import_contexts,
+        import_context_cursor: 0,
+        active_import_key: Vec::new(),
+        resolver_contexts: HashMap::default(),
         bindings: &mut bindings,
         hits,
         max_usages,
@@ -92,8 +113,13 @@ pub(super) struct ScanCtx<'a> {
     pub(super) line_starts: &'a [usize],
     pub(super) spec: &'a TargetSpec,
     pub(super) types: Arc<ProjectTypes>,
-    pub(super) name_resolver: NameResolver,
-    pub(super) visibility: Visibility,
+    pub(super) name_resolver: Arc<NameResolver>,
+    pub(super) visibility: Arc<Visibility>,
+    imports: Vec<ImportInfo>,
+    import_contexts: ScalaImportContextIndex,
+    import_context_cursor: usize,
+    active_import_key: Vec<usize>,
+    resolver_contexts: HashMap<Vec<usize>, (Arc<NameResolver>, Arc<Visibility>)>,
     pub(super) bindings: &'a mut LocalInferenceEngine<String>,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
     pub(super) max_usages: usize,
@@ -117,6 +143,7 @@ fn scan_tree(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 if *ctx.limit_exceeded {
                     continue;
                 }
+                activate_import_context(node, ctx);
                 seed_parent_scope_declarations(node, ctx);
                 let enters_scope = enters_local_scope(node);
                 if enters_scope {
@@ -159,6 +186,46 @@ fn scan_tree(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
             }
         }
     }
+}
+
+fn activate_import_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let visible = ctx
+        .import_contexts
+        .advance_to(node.start_byte(), &mut ctx.import_context_cursor);
+    if visible == ctx.active_import_key {
+        return;
+    }
+    let key = visible.to_vec();
+    if let Some((resolver, visibility)) = ctx.resolver_contexts.get(&key) {
+        ctx.name_resolver = resolver.clone();
+        ctx.visibility = visibility.clone();
+        ctx.active_import_key = key;
+        return;
+    }
+
+    let visible_imports = key
+        .iter()
+        .filter_map(|index| ctx.imports.get(*index).cloned())
+        .collect::<Vec<_>>();
+    let resolver = Arc::new(NameResolver::for_file_with_facts(
+        ctx.scala,
+        Some(ctx.file),
+        Some(ctx.file_package),
+        &visible_imports,
+        &ctx.types,
+    ));
+    let visibility = Arc::new(Visibility::for_file_with_imports(
+        ctx.scala,
+        ctx.file,
+        ctx.spec,
+        &resolver,
+        &visible_imports,
+    ));
+    ctx.resolver_contexts
+        .insert(key.clone(), (resolver.clone(), visibility.clone()));
+    ctx.name_resolver = resolver;
+    ctx.visibility = visibility;
+    ctx.active_import_key = key;
 }
 
 fn scan_import_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -1511,7 +1578,7 @@ fn member_call_arities_match(call_arities: Option<&[usize]>, ctx: &ScanCtx<'_>) 
         fallback_shape = ctx
             .spec
             .callable_arity
-            .map(|arity| vec![arity])
+            .map(|arity| vec![ScalaCallableParameterList::explicit(arity)])
             .unwrap_or_default();
         fallback_shapes = vec![fallback_shape];
         fallback_shapes.as_slice()
@@ -1534,20 +1601,22 @@ fn member_call_arities_match(call_arities: Option<&[usize]>, ctx: &ScanCtx<'_>) 
 }
 
 fn callable_shape_matches(
-    declared: &[crate::analyzer::CallableArity],
+    declared: &[ScalaCallableParameterList],
     call_arities: Option<&[usize]>,
     unique_callable: bool,
 ) -> bool {
     match call_arities {
         Some(actual) => {
             actual.len() <= declared.len()
-                && (actual.len() == declared.len() || unique_callable)
                 && actual
                     .iter()
                     .zip(declared)
-                    .all(|(actual, declared)| declared.accepts(*actual))
+                    .all(|(actual, declared)| declared.arity.accepts(*actual))
+                && declared[actual.len()..]
+                    .iter()
+                    .all(|list| list.kind == ScalaParameterListKind::Contextual)
         }
-        None => declared.first().is_none_or(|arity| arity.total() == 0) || unique_callable,
+        None => declared.first().is_none_or(|list| list.arity.total() == 0) || unique_callable,
     }
 }
 
