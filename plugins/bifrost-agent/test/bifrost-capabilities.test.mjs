@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  BIFROST_CAPABILITY_IDS,
   capabilityForTool,
   normalizeCapabilities,
   piToolName,
@@ -33,4 +34,10 @@ test("classifies broad extended tools into Pi capabilities", () => {
 test("uses one stable namespace for every Pi-visible tool", () => {
   assert.equal(piToolName("query_code"), "bifrost_query_code");
   assert.equal(piToolName("jq"), "bifrost_jq");
+});
+
+test("does not advertise Semantic Search as a Pi capability", () => {
+  assert.equal(BIFROST_CAPABILITY_IDS.includes("semantic"), false);
+  assert.equal(capabilityForTool("semantic_search"), undefined);
+  assert.equal(toolBelongsToSelection("semantic_search", BIFROST_CAPABILITY_IDS), false);
 });

@@ -109,9 +109,64 @@ test("routes background session failures through Pi UI notifications", async () 
     ui: { notify: (...args) => notifications.push(args) },
   });
 
-  session.reportError("Bifrost connection failed.");
+  session.reportError(new Error("Bifrost connection failed."));
 
   assert.deepEqual(notifications, [["Bifrost connection failed.", "error"]]);
+});
+
+test("session_start reports a startup failure through Pi UI when interactive", async () => {
+  const pi = fakePi();
+  const startupError = new Error("Bifrost MCP configuration failed.", { cause: new Error("handshake failed") });
+  const session = fakeSession({
+    async start() {
+      session.setStatus({
+        state: "error",
+        workspace: "/workspace",
+        toolCount: 0,
+        capabilities: [],
+        error: startupError,
+      });
+      return false;
+    },
+  });
+  configureBifrostExtension(pi, dependencies(session));
+  const notifications = [];
+
+  await pi.handlers.get("session_start")({}, {
+    cwd: "/workspace",
+    hasUI: true,
+    ui: { notify: (...args) => notifications.push(args) },
+  });
+
+  assert.deepEqual(notifications, [["Bifrost MCP configuration failed.", "error"]]);
+  assert.equal(session.status().state, "error");
+});
+
+test("session_start throws the structured startup error in noninteractive mode", async () => {
+  const pi = fakePi();
+  const startupError = new Error("Bifrost MCP configuration failed.", { cause: new Error("handshake failed") });
+  const session = fakeSession({
+    async start() {
+      session.setStatus({
+        state: "error",
+        workspace: "/workspace",
+        toolCount: 0,
+        capabilities: [],
+        error: startupError,
+      });
+      return false;
+    },
+  });
+  configureBifrostExtension(pi, dependencies(session));
+
+  await assert.rejects(
+    pi.handlers.get("session_start")({}, {
+      cwd: "/workspace",
+      hasUI: false,
+      ui: { notify() {} },
+    }),
+    (error) => error === startupError,
+  );
 });
 
 test("/bifrost requires TUI mode", async () => {
@@ -238,5 +293,8 @@ test("/bifrost rolls back the runtime selection when persistence fails", async (
     ["query", "files"],
     ["symbols", "query", "files"],
   ]);
-  assert.match(notifications[0][0], /disk is read-only/);
+  assert.equal(
+    notifications[0][0],
+    "Could not save Bifrost settings. The previous runtime selection was restored. Check the settings directory and try again.",
+  );
 });

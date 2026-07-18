@@ -65,3 +65,26 @@ test("rejects malformed, mismatched, and unknown persisted settings", () => {
     /version 1/,
   );
 });
+
+test("rejects a top-level array through the schema boundary", () => {
+  assert.throws(
+    () => parseSettingsDocument('["symbols"]'),
+    /version 1/,
+  );
+});
+
+test("rejects a top-level null through the schema boundary", () => {
+  assert.throws(
+    () => parseSettingsDocument("null"),
+    /version 1/,
+  );
+});
+
+test("rejects extra fields not defined by the settings schema", () => {
+  assert.throws(
+    () => parseSettingsDocument(
+      '{"version":1,"workspace":"/repo","capabilities":[],"extra":true}',
+    ),
+    /version 1/,
+  );
+});

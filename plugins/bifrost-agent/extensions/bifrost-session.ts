@@ -1,5 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { resolveBifrostLaunch, type BifrostLaunch } from "../bin/bifrost-launcher.mjs";
@@ -11,25 +12,19 @@ import {
   toolBelongsToSelection,
   type BifrostCapability,
 } from "./bifrost-capabilities.ts";
-import {
-  mapToolResult,
-  toolLabel,
-  toolParameters,
-  type McpToolDescription,
-  type McpToolResult,
-} from "./mcp-adapter.ts";
+import { mapToolResult, toolLabel, toolParameters } from "./mcp-adapter.ts";
 
 const CONNECT_TIMEOUT_MS = 60_000;
 const CALL_TIMEOUT_MS = 300_000;
 
 export interface BifrostSessionClient {
   connect(): Promise<void>;
-  listTools(): Promise<McpToolDescription[]>;
+  listTools(): Promise<Tool[]>;
   callTool(
     name: string,
     args: Record<string, unknown>,
     options: { signal: AbortSignal | undefined; timeout: number },
-  ): Promise<McpToolResult>;
+  ): Promise<CallToolResult>;
   onClose(handler: () => void): void;
   close(): Promise<void>;
 }
@@ -37,7 +32,7 @@ export interface BifrostSessionClient {
 export interface BifrostSessionDependencies {
   resolveLaunch(root: string, toolset: string): Promise<BifrostLaunch>;
   createClient(launch: BifrostLaunch): BifrostSessionClient;
-  reportError(message: string): void;
+  reportError(error: Error): void;
 }
 
 type ConnectionState = "disconnected" | "connecting" | "connected" | "error";
@@ -47,7 +42,7 @@ export interface BifrostSessionStatus {
   workspace?: string;
   toolCount: number;
   capabilities: BifrostCapability[];
-  error?: string;
+  error?: Error;
 }
 
 export interface BifrostSessionController {
@@ -55,25 +50,45 @@ export interface BifrostSessionController {
   applySelection(capabilities: readonly BifrostCapability[]): Promise<boolean>;
   shutdown(): Promise<void>;
   status(): BifrostSessionStatus;
-  setErrorHandler(handler: (message: string) => void): void;
+  setErrorHandler(handler: (error: Error) => void): void;
+}
+
+/** All lifecycle state for one Pi session's Bifrost connection, owned as a single record. */
+interface SessionLifecycle {
+  generation: number;
+  connection: ConnectionState;
+  workspace: string | undefined;
+  selectedCapabilities: BifrostCapability[];
+  currentToolset: string;
+  lastError: Error | undefined;
+  activeClient: BifrostSessionClient | undefined;
+  advertisedMcpToolNames: Set<string>;
+  activeMcpToolNames: Set<string>;
+}
+
+function createLifecycle(): SessionLifecycle {
+  return {
+    generation: 0,
+    connection: "disconnected",
+    workspace: undefined,
+    selectedCapabilities: [],
+    currentToolset: "",
+    lastError: undefined,
+    activeClient: undefined,
+    advertisedMcpToolNames: new Set(),
+    activeMcpToolNames: new Set(),
+  };
 }
 
 export function createBifrostSession(
   pi: ExtensionAPI,
   dependencies: BifrostSessionDependencies = defaultDependencies(),
 ): BifrostSessionController {
-  let generation = 0;
+  const lifecycle = createLifecycle();
   let reportError = dependencies.reportError;
-  let state: ConnectionState = "disconnected";
-  let workspace: string | undefined;
-  let selectedCapabilities: BifrostCapability[] = [];
-  let currentToolset = "";
-  let lastError: string | undefined;
-  let activeClient: BifrostSessionClient | undefined;
-  let advertisedMcpToolNames = new Set<string>();
-  let activeMcpToolNames = new Set<string>();
   const startingClients = new Set<BifrostSessionClient>();
   const closePromises = new WeakMap<BifrostSessionClient, Promise<void>>();
+  const closingClientPromises = new Set<Promise<void>>();
   const ownedPiToolNames = new Set<string>();
 
   const closeOnce = (client: BifrostSessionClient | undefined): Promise<void> => {
@@ -85,9 +100,11 @@ export function createBifrostSession(
       return existing;
     }
     const closing = client.close().catch((error: unknown) => {
-      reportError(`Bifrost MCP cleanup failed: ${formatError(error)}`);
+      reportError(new Error("Bifrost MCP cleanup failed.", { cause: error }));
     });
     closePromises.set(client, closing);
+    closingClientPromises.add(closing);
+    void closing.then(() => closingClientPromises.delete(closing));
     return closing;
   };
 
@@ -99,52 +116,46 @@ export function createBifrostSession(
     for (const ownedName of ownedPiToolNames) {
       activeNames.delete(ownedName);
     }
-    activeMcpToolNames = new Set();
+    lifecycle.activeMcpToolNames = new Set();
     for (const mcpName of advertisedNames) {
       if (toolBelongsToSelection(mcpName, capabilities)) {
-        activeMcpToolNames.add(mcpName);
+        lifecycle.activeMcpToolNames.add(mcpName);
         activeNames.add(piToolName(mcpName));
       }
     }
     pi.setActiveTools(Array.from(activeNames));
   };
 
-  const registerDiscoveredTools = (tools: McpToolDescription[]) => {
-    assertNoToolCollisions(tools, pi.getAllTools().map((tool) => tool.name), ownedPiToolNames);
+  const registerDiscoveredTools = (tools: Tool[]) => {
+    assertToolsHaveUniqueNames(tools);
     for (const tool of tools) {
       const registeredName = piToolName(tool.name);
-      if (ownedPiToolNames.has(registeredName)) {
-        continue;
-      }
       pi.registerTool({
         name: registeredName,
         label: `Bifrost: ${toolLabel(tool)}`,
-        description: `${tool.description ?? `Bifrost MCP tool ${tool.name}.`} This is the namespaced Pi form of ${tool.name}. Output is limited to 2,000 lines or 50 KB; the full MCP result remains in tool details.`,
-        promptSnippet: tool.description ?? `Use Bifrost ${tool.name}.`,
+        description: `${tool.description ?? `Bifrost MCP tool ${tool.name}.`} Output is limited to 2,000 lines or 50 KB.`,
         parameters: toolParameters(tool),
         async execute(_toolCallId, params, signal) {
-          const client = activeClient;
+          const client = lifecycle.activeClient;
           if (
             !client
-            || state !== "connected"
-            || !advertisedMcpToolNames.has(tool.name)
-            || !activeMcpToolNames.has(tool.name)
+            || lifecycle.connection !== "connected"
+            || !lifecycle.advertisedMcpToolNames.has(tool.name)
+            || !lifecycle.activeMcpToolNames.has(tool.name)
           ) {
             throw new Error(`Bifrost tool ${registeredName} is unavailable because its capability is not active.`);
           }
+          let result: CallToolResult;
           try {
-            const result = await client.callTool(tool.name, params, {
+            result = await client.callTool(tool.name, params, {
               signal,
               timeout: CALL_TIMEOUT_MS,
             });
-            return mapToolResult(tool.name, result);
-          } catch (error) {
-            const message = formatError(error);
-            if (message.startsWith(`Bifrost tool ${tool.name} failed:`)) {
-              throw error;
-            }
-            throw new Error(`Bifrost tool ${tool.name} failed: ${message}`, { cause: error });
+          } catch (cause) {
+            const reason = cause instanceof Error ? `: ${cause.message}` : ".";
+            throw new Error(`Bifrost tool ${tool.name} failed${reason}`, { cause });
           }
+          return mapToolResult(tool.name, result);
         },
       });
       ownedPiToolNames.add(registeredName);
@@ -152,74 +163,92 @@ export function createBifrostSession(
   };
 
   const connectSelection = async (capabilities: readonly BifrostCapability[]): Promise<boolean> => {
-    if (!workspace) {
+    if (!lifecycle.workspace) {
       throw new Error("Cannot configure Bifrost before a workspace is set.");
     }
+    const workspace = lifecycle.workspace;
     const normalized = normalizeCapabilities(capabilities);
     const desiredToolset = serverToolsetExpression(normalized);
+    const ticket = ++lifecycle.generation;
+    await Promise.all(
+      Array.from(startingClients)
+        .filter((client) => client !== lifecycle.activeClient)
+        .map((client) => closeOnce(client)),
+    );
+    if (ticket !== lifecycle.generation) {
+      return false;
+    }
     if (
-      sameCapabilities(normalized, selectedCapabilities)
-      && desiredToolset === currentToolset
-      && (!desiredToolset || activeClient)
+      sameCapabilities(normalized, lifecycle.selectedCapabilities)
+      && desiredToolset === lifecycle.currentToolset
+      && (!desiredToolset || lifecycle.activeClient)
     ) {
       if (!desiredToolset) {
-        state = "disconnected";
+        lifecycle.connection = "disconnected";
       }
-      reconcileActiveTools(normalized, advertisedMcpToolNames);
+      reconcileActiveTools(normalized, lifecycle.advertisedMcpToolNames);
+      if (lifecycle.activeClient) {
+        startingClients.delete(lifecycle.activeClient);
+      }
       return true;
     }
-    if (desiredToolset === currentToolset && activeClient) {
-      selectedCapabilities = normalized;
-      state = "connected";
-      lastError = undefined;
-      reconcileActiveTools(normalized, advertisedMcpToolNames);
+    if (desiredToolset === lifecycle.currentToolset && lifecycle.activeClient) {
+      lifecycle.selectedCapabilities = normalized;
+      lifecycle.connection = "connected";
+      lifecycle.lastError = undefined;
+      reconcileActiveTools(normalized, lifecycle.advertisedMcpToolNames);
+      startingClients.delete(lifecycle.activeClient);
       return true;
     }
 
-    const ticket = ++generation;
-    const previousState = state;
-    const previousClient = activeClient;
-    const previousAdvertised = advertisedMcpToolNames;
-    state = previousClient ? previousState : desiredToolset ? "connecting" : "disconnected";
-    lastError = undefined;
+    const previousConnection = lifecycle.connection;
+    const previousClient = lifecycle.activeClient;
+    const previousAdvertised = lifecycle.advertisedMcpToolNames;
+    lifecycle.connection = previousClient ? previousConnection : desiredToolset ? "connecting" : "disconnected";
+    lifecycle.lastError = undefined;
 
     if (!desiredToolset) {
-      state = "disconnected";
-      activeClient = undefined;
-      advertisedMcpToolNames = new Set();
-      selectedCapabilities = normalized;
-      currentToolset = "";
-      reconcileActiveTools(normalized, advertisedMcpToolNames);
+      lifecycle.connection = "disconnected";
+      lifecycle.activeClient = undefined;
+      lifecycle.advertisedMcpToolNames = new Set();
+      lifecycle.selectedCapabilities = normalized;
+      lifecycle.currentToolset = "";
+      reconcileActiveTools(normalized, lifecycle.advertisedMcpToolNames);
       await closeOnce(previousClient);
-      return true;
+      return ticket === lifecycle.generation
+        && lifecycle.connection === "disconnected"
+        && lifecycle.activeClient === undefined;
     }
 
     let client: BifrostSessionClient | undefined;
     try {
       const launch = await dependencies.resolveLaunch(workspace, desiredToolset);
-      if (ticket !== generation) {
+      if (ticket !== lifecycle.generation) {
         return false;
       }
       client = dependencies.createClient(launch);
-      startingClients.add(client);
-      client.onClose(() => {
-        if (activeClient !== client) {
+      const candidate = client;
+      startingClients.add(candidate);
+      candidate.onClose(() => {
+        if (lifecycle.activeClient !== candidate) {
           return;
         }
-        activeClient = undefined;
-        advertisedMcpToolNames = new Set();
-        reconcileActiveTools([], advertisedMcpToolNames);
-        state = "error";
-        lastError = "Bifrost MCP connection closed unexpectedly.";
-        reportError(lastError);
+        lifecycle.activeClient = undefined;
+        lifecycle.advertisedMcpToolNames = new Set();
+        reconcileActiveTools([], lifecycle.advertisedMcpToolNames);
+        lifecycle.connection = "error";
+        lifecycle.lastError = new Error("Bifrost MCP connection closed unexpectedly.");
+        if (!startingClients.has(candidate)) {
+          reportError(lifecycle.lastError);
+        }
       });
-      await client.connect();
-      if (ticket !== generation) {
+      await candidate.connect();
+      if (ticket !== lifecycle.generation) {
         await closeOnce(client);
         return false;
       }
       const tools = await client.listTools();
-      if (ticket !== generation) {
+      if (ticket !== lifecycle.generation) {
         await closeOnce(client);
         return false;
       }
@@ -227,30 +256,38 @@ export function createBifrostSession(
       assertCapabilitiesAvailable(normalized, discoveredNames);
       registerDiscoveredTools(tools);
 
-      activeClient = client;
-      advertisedMcpToolNames = discoveredNames;
-      selectedCapabilities = normalized;
-      currentToolset = desiredToolset;
-      state = "connected";
+      lifecycle.activeClient = client;
+      lifecycle.advertisedMcpToolNames = discoveredNames;
+      lifecycle.selectedCapabilities = normalized;
+      lifecycle.currentToolset = desiredToolset;
+      lifecycle.connection = "connected";
       reconcileActiveTools(normalized, discoveredNames);
       await closeOnce(previousClient);
+
+      if (
+        ticket !== lifecycle.generation
+        || lifecycle.activeClient !== client
+        || lifecycle.connection !== "connected"
+      ) {
+        return false;
+      }
       return true;
-    } catch (error) {
+    } catch (cause) {
       await closeOnce(client);
-      if (ticket === generation) {
-        const previousIsUsable = previousClient !== undefined && activeClient === previousClient;
-        activeClient = previousIsUsable ? previousClient : undefined;
-        advertisedMcpToolNames = previousIsUsable ? previousAdvertised : new Set();
-        state = previousIsUsable ? previousState : "error";
+      if (ticket === lifecycle.generation) {
+        const previousIsUsable = previousClient !== undefined && lifecycle.activeClient === previousClient;
+        lifecycle.activeClient = previousIsUsable ? previousClient : undefined;
+        lifecycle.advertisedMcpToolNames = previousIsUsable ? previousAdvertised : new Set();
+        lifecycle.connection = previousIsUsable ? previousConnection : "error";
         if (!previousIsUsable) {
-          currentToolset = "";
+          lifecycle.currentToolset = "";
         }
-        lastError = `Bifrost MCP configuration failed: ${formatError(error)}`;
+        const reason = cause instanceof Error ? `: ${cause.message}` : ".";
+        lifecycle.lastError = new Error(`Bifrost MCP configuration failed${reason}`, { cause });
         reconcileActiveTools(
-          previousIsUsable ? selectedCapabilities : [],
-          advertisedMcpToolNames,
+          previousIsUsable ? lifecycle.selectedCapabilities : [],
+          lifecycle.advertisedMcpToolNames,
         );
-        reportError(lastError);
       }
       return false;
     } finally {
@@ -261,38 +298,41 @@ export function createBifrostSession(
   };
 
   const start = async (nextWorkspace: string, capabilities: readonly BifrostCapability[]) => {
-    const startTicket = ++generation;
-    workspace = nextWorkspace;
-    selectedCapabilities = [];
-    currentToolset = "";
-    lastError = undefined;
-    advertisedMcpToolNames = new Set();
-    activeMcpToolNames = new Set();
-    const previous = activeClient;
-    activeClient = undefined;
+    const startTicket = ++lifecycle.generation;
+    lifecycle.workspace = nextWorkspace;
+    lifecycle.selectedCapabilities = [];
+    lifecycle.currentToolset = "";
+    lifecycle.lastError = undefined;
+    lifecycle.advertisedMcpToolNames = new Set();
+    lifecycle.activeMcpToolNames = new Set();
+    const previous = lifecycle.activeClient;
+    lifecycle.activeClient = undefined;
     await Promise.all([
       closeOnce(previous),
       ...Array.from(startingClients, (client) => closeOnce(client)),
+      ...closingClientPromises,
     ]);
-    if (startTicket !== generation) {
+    if (startTicket !== lifecycle.generation) {
       return false;
     }
     return await connectSelection(capabilities);
   };
 
   const shutdown = async () => {
-    ++generation;
-    state = "disconnected";
-    lastError = undefined;
-    selectedCapabilities = [];
-    currentToolset = "";
-    advertisedMcpToolNames = new Set();
-    reconcileActiveTools([], advertisedMcpToolNames);
-    const current = activeClient;
-    activeClient = undefined;
+    ++lifecycle.generation;
+    lifecycle.connection = "disconnected";
+    lifecycle.workspace = undefined;
+    lifecycle.lastError = undefined;
+    lifecycle.selectedCapabilities = [];
+    lifecycle.currentToolset = "";
+    lifecycle.advertisedMcpToolNames = new Set();
+    reconcileActiveTools([], lifecycle.advertisedMcpToolNames);
+    const current = lifecycle.activeClient;
+    lifecycle.activeClient = undefined;
     await Promise.all([
       closeOnce(current),
       ...Array.from(startingClients, (client) => closeOnce(client)),
+      ...closingClientPromises,
     ]);
   };
 
@@ -301,11 +341,11 @@ export function createBifrostSession(
     applySelection: connectSelection,
     shutdown,
     status: () => ({
-      state,
-      workspace,
-      toolCount: activeMcpToolNames.size,
-      capabilities: [...selectedCapabilities],
-      ...(lastError ? { error: lastError } : {}),
+      state: lifecycle.connection,
+      workspace: lifecycle.workspace,
+      toolCount: lifecycle.activeMcpToolNames.size,
+      capabilities: [...lifecycle.selectedCapabilities],
+      ...(lifecycle.lastError ? { error: lifecycle.lastError } : {}),
     }),
     setErrorHandler(handler) {
       reportError = handler;
@@ -313,11 +353,7 @@ export function createBifrostSession(
   };
 }
 
-export function assertNoToolCollisions(
-  tools: McpToolDescription[],
-  configuredNames: Iterable<string>,
-  ownedNames: ReadonlySet<string> = new Set(),
-): void {
+export function assertToolsHaveUniqueNames(tools: Tool[]): void {
   const discovered = new Set<string>();
   for (const tool of tools) {
     if (!tool.name.trim()) {
@@ -328,18 +364,19 @@ export function assertNoToolCollisions(
     }
     discovered.add(tool.name);
   }
+}
 
-  const configured = new Set(configuredNames);
-  const collisions = Array.from(discovered, piToolName)
-    .filter((name) => configured.has(name) && !ownedNames.has(name))
-    .sort();
-  if (collisions.length > 0) {
-    throw new Error(`Bifrost tool name collision: ${collisions.join(", ")}.`);
+class AwaitableCloseClient extends Client {
+  private closePromise: Promise<void> | undefined;
+
+  override close(): Promise<void> {
+    this.closePromise ??= super.close();
+    return this.closePromise;
   }
 }
 
 export function createSdkSessionClient(launch: BifrostLaunch): BifrostSessionClient {
-  const client = new Client({ name: "bifrost-pi", version: "1" });
+  const client = new AwaitableCloseClient({ name: "bifrost-pi", version: "1" });
   const transport = new StdioClientTransport({
     command: launch.command,
     args: launch.args,
@@ -352,14 +389,10 @@ export function createSdkSessionClient(launch: BifrostLaunch): BifrostSessionCli
     connect: () => client.connect(transport, { timeout: CONNECT_TIMEOUT_MS }),
     async listTools() {
       const response = await client.listTools(undefined, { timeout: CONNECT_TIMEOUT_MS });
-      return response.tools as McpToolDescription[];
+      return response.tools;
     },
     async callTool(name, args, options) {
-      return await client.callTool(
-        { name, arguments: args },
-        undefined,
-        options,
-      ) as McpToolResult;
+      return await client.callTool({ name, arguments: args }, undefined, options) as CallToolResult;
     },
     onClose(handler) {
       client.onclose = handler;
@@ -380,12 +413,28 @@ function assertCapabilitiesAvailable(
   capabilities: readonly BifrostCapability[],
   discoveredNames: ReadonlySet<string>,
 ): void {
-  const unavailable = capabilities.filter((id) => {
+  const missingRequirements: string[] = [];
+  for (const id of capabilities) {
     const definition = BIFROST_CAPABILITIES.find((capability) => capability.id === id);
-    return !definition?.toolNames.some((name) => discoveredNames.has(name));
-  });
-  if (unavailable.length > 0) {
-    throw new Error(`Selected Bifrost capabilities are unavailable: ${unavailable.join(", ")}.`);
+    for (const alternatives of definition?.toolRequirements ?? []) {
+      if (!alternatives.some((toolName) => discoveredNames.has(toolName))) {
+        missingRequirements.push(alternatives.join(" or "));
+      }
+    }
+    if (
+      definition
+      && "toolVariants" in definition
+      && !definition.toolVariants.some((variant) =>
+        variant.every((toolName) => discoveredNames.has(toolName))
+      )
+    ) {
+      missingRequirements.push(
+        definition.toolVariants.map((variant) => variant.join(" + ")).join(" or "),
+      );
+    }
+  }
+  if (missingRequirements.length > 0) {
+    throw new Error(`Bifrost did not advertise expected tools: ${missingRequirements.join(", ")}.`);
   }
 }
 
@@ -400,8 +449,4 @@ function stringEnvironment(env: NodeJS.ProcessEnv): Record<string, string> {
   return Object.fromEntries(
     Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined),
   );
-}
-
-function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

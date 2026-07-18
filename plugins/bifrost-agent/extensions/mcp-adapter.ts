@@ -4,45 +4,19 @@ import {
   truncateHead,
   type AgentToolResult,
 } from "@earendil-works/pi-coding-agent";
+import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import { Type, type TSchema } from "typebox";
 
-export interface McpToolDescription {
-  name: string;
-  description?: string;
-  inputSchema?: Record<string, unknown>;
-  annotations?: { title?: string };
-}
-
-export interface McpContent {
-  type: string;
-  text?: string;
-  data?: string;
-  mimeType?: string;
-  [key: string]: unknown;
-}
-
-export interface McpToolResult {
-  content?: McpContent[];
-  structuredContent?: Record<string, unknown>;
-  isError?: boolean;
-  [key: string]: unknown;
-}
-
 export interface BifrostToolDetails {
-  mcpResult: McpToolResult;
+  mcpResult: CallToolResult;
   truncated: boolean;
 }
 
-export function toolParameters(tool: McpToolDescription) {
-  const inputSchema = tool.inputSchema ?? {
-    type: "object",
-    properties: {},
-    additionalProperties: false,
-  };
-  return Type.Unsafe<Record<string, unknown>>(inputSchema as TSchema);
+export function toolParameters(tool: Tool) {
+  return Type.Unsafe<Record<string, unknown>>(tool.inputSchema as TSchema);
 }
 
-export function toolLabel(tool: McpToolDescription): string {
+export function toolLabel(tool: Tool): string {
   return tool.annotations?.title?.trim() || tool.name
     .split("_")
     .filter(Boolean)
@@ -50,7 +24,7 @@ export function toolLabel(tool: McpToolDescription): string {
     .join(" ");
 }
 
-export function mapToolResult(toolName: string, result: McpToolResult): AgentToolResult<BifrostToolDetails> {
+export function mapToolResult(toolName: string, result: CallToolResult): AgentToolResult<BifrostToolDetails> {
   if (result.isError) {
     throw new Error(`Bifrost tool ${toolName} failed: ${errorMessage(result)}`);
   }
@@ -95,17 +69,19 @@ function truncateModelText(text: string): { text: string; truncated: boolean } {
     maxBytes: DEFAULT_MAX_BYTES - 256,
     maxLines: DEFAULT_MAX_LINES - 2,
   });
-  const notice = `[Output truncated: showing ${reserved.outputLines} of ${reserved.totalLines} lines and ${reserved.outputBytes} of ${reserved.totalBytes} bytes. Full output is retained in tool details.]`;
+  const notice = `[Output truncated: showing ${reserved.outputLines} of ${reserved.totalLines} lines and ${reserved.outputBytes} of ${reserved.totalBytes} bytes.]`;
   const separator = reserved.content ? "\n\n" : "";
   return { text: `${reserved.content}${separator}${notice}`, truncated: true };
 }
 
-function errorMessage(result: McpToolResult): string {
-  const text = (result.content ?? [])
-    .filter((item) => item.type === "text" && typeof item.text === "string")
-    .map((item) => item.text)
-    .join("\n")
-    .trim();
+function errorMessage(result: CallToolResult): string {
+  const textParts: string[] = [];
+  for (const item of result.content ?? []) {
+    if (item.type === "text" && typeof item.text === "string") {
+      textParts.push(item.text);
+    }
+  }
+  const text = textParts.join("\n").trim();
   if (text) {
     return text;
   }

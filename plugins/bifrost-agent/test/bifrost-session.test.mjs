@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { BIFROST_CAPABILITIES } from "../extensions/bifrost-capabilities.ts";
 import {
-  assertNoToolCollisions,
+  assertToolsHaveUniqueNames,
   createBifrostSession,
 } from "../extensions/bifrost-session.ts";
 
@@ -14,18 +15,39 @@ const launch = {
   source: "explicit",
 };
 
+function toolNamesFor(capabilityId) {
+  const capability = BIFROST_CAPABILITIES.find((candidate) => candidate.id === capabilityId);
+  return [
+    ...capability.toolRequirements.map((alternatives) => alternatives[0]),
+    ...("toolVariants" in capability ? capability.toolVariants[0] : []),
+  ];
+}
+
+const SYMBOL_TOOL_NAMES = toolNamesFor("symbols");
+const QUALITY_TOOL_NAMES = toolNamesFor("quality");
+const QUERY_TOOL_NAMES = toolNamesFor("query");
+const TRANSFORMS_TOOL_NAMES = toolNamesFor("transforms");
+
+function piNames(toolNames) {
+  return toolNames.map((name) => `bifrost_${name}`);
+}
+
 function fakePi(existingNames = [], initiallyActive = existingNames) {
-  const registered = [];
+  const toolsByName = new Map();
+  const registrationLog = [];
   let activeNames = [...initiallyActive];
   return {
-    registered,
+    get registered() {
+      return Array.from(toolsByName.values());
+    },
+    registrationLog,
     get activeNames() {
       return activeNames;
     },
     getAllTools() {
       return [
         ...existingNames.map((name) => ({ name })),
-        ...registered.map((tool) => ({ name: tool.name })),
+        ...Array.from(toolsByName.keys(), (name) => ({ name })),
       ];
     },
     getActiveTools() {
@@ -35,9 +57,14 @@ function fakePi(existingNames = [], initiallyActive = existingNames) {
       activeNames = [...names];
     },
     registerTool(tool) {
-      registered.push(tool);
+      toolsByName.set(tool.name, tool);
+      registrationLog.push(tool.name);
     },
   };
+}
+
+function stubTool(name) {
+  return { name, inputSchema: { type: "object", properties: {} } };
 }
 
 function symbolTool() {
@@ -52,12 +79,37 @@ function symbolTool() {
   };
 }
 
+function symbolTools({ searchSymbolsDescription } = {}) {
+  return SYMBOL_TOOL_NAMES.map((name) => {
+    if (name !== "search_symbols") {
+      return stubTool(name);
+    }
+    const tool = symbolTool();
+    return searchSymbolsDescription ? { ...tool, description: searchSymbolsDescription } : tool;
+  });
+}
+
 function qualityTool() {
   return {
     name: "compute_cyclomatic_complexity",
     description: "Compute complexity.",
     inputSchema: { type: "object", properties: {} },
   };
+}
+
+function qualityTools({ includeAll = true } = {}) {
+  if (!includeAll) {
+    return [qualityTool()];
+  }
+  return QUALITY_TOOL_NAMES.map((name) => (name === "compute_cyclomatic_complexity" ? qualityTool() : stubTool(name)));
+}
+
+function queryTools() {
+  return QUERY_TOOL_NAMES.map((name) => stubTool(name));
+}
+
+function transformsTools() {
+  return TRANSFORMS_TOOL_NAMES.map((name) => stubTool(name));
 }
 
 function fakeClient(options = {}) {
@@ -70,7 +122,7 @@ function fakeClient(options = {}) {
       return closeCount;
     },
     connect: options.connect ?? (async () => {}),
-    listTools: options.listTools ?? (async () => [symbolTool()]),
+    listTools: options.listTools ?? (async () => symbolTools()),
     async callTool(name, args, requestOptions) {
       calls.push({ name, args, options: requestOptions });
       return options.result ?? { content: [{ type: "text", text: "found" }] };
@@ -96,7 +148,7 @@ function dependencies(clients, errors = [], resolved = []) {
       return { ...launch, cwd: root, args: ["--root", root, "--mcp", toolset] };
     },
     createClient: () => clients[index++],
-    reportError: (message) => errors.push(message),
+    reportError: (error) => errors.push(error),
   };
 }
 
@@ -110,7 +162,7 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function connectedStatus(workspace, capabilities, toolCount = 1) {
+function connectedStatus(workspace, capabilities, toolCount) {
   return { state: "connected", workspace, toolCount, capabilities };
 }
 
@@ -121,10 +173,10 @@ test("registers a namespaced tool and forwards the canonical MCP name", async ()
   const session = createBifrostSession(pi, dependencies([client], [], resolved));
   assert.equal(await session.start("/workspace", ["symbols"]), true);
 
-  assert.deepEqual(session.status(), connectedStatus("/workspace", ["symbols"]));
+  assert.deepEqual(session.status(), connectedStatus("/workspace", ["symbols"], SYMBOL_TOOL_NAMES.length));
   assert.deepEqual(resolved, [{ root: "/workspace", toolset: "symbol" }]);
   assert.equal(pi.registered[0].name, "bifrost_search_symbols");
-  assert.deepEqual(new Set(pi.activeNames), new Set(["read", "bifrost_search_symbols"]));
+  assert.deepEqual(new Set(pi.activeNames), new Set(["read", ...piNames(SYMBOL_TOOL_NAMES)]));
 
   const controller = new AbortController();
   const result = await pi.registered[0].execute("call-1", { query: "Widget" }, controller.signal);
@@ -135,9 +187,29 @@ test("registers a namespaced tool and forwards the canonical MCP name", async ()
   assert.equal(client.calls[0].options.timeout, 300_000);
 });
 
+test("accepts reference-rendered symbol tools as alternatives to location-rendered tools", async () => {
+  const referenceTools = symbolTools()
+    .filter((tool) => ![
+      "scan_usages_by_location",
+      "get_definitions_by_location",
+      "get_type_by_location",
+    ].includes(tool.name));
+  referenceTools.push(stubTool("scan_usages_by_reference"), stubTool("get_definitions_by_reference"));
+  const pi = fakePi();
+  const session = createBifrostSession(
+    pi,
+    dependencies([fakeClient({ listTools: async () => referenceTools })]),
+  );
+
+  assert.equal(await session.start("/workspace", ["symbols"]), true);
+  assert.equal(session.status().state, "connected");
+  assert.ok(pi.activeNames.includes("bifrost_scan_usages_by_reference"));
+  assert.ok(pi.activeNames.includes("bifrost_get_definitions_by_reference"));
+});
+
 test("registers newly advertised unclassified tools but keeps them inactive", async () => {
   const client = fakeClient({ listTools: async () => [
-    symbolTool(),
+    ...symbolTools(),
     { name: "future_symbol_tool", inputSchema: { type: "object" } },
   ] });
   const pi = fakePi(["read"]);
@@ -145,28 +217,15 @@ test("registers newly advertised unclassified tools but keeps them inactive", as
 
   assert.equal(await session.start("/workspace", ["symbols"]), true);
   assert.deepEqual(pi.registered.map((tool) => tool.name), [
-    "bifrost_search_symbols",
+    ...piNames(SYMBOL_TOOL_NAMES),
     "bifrost_future_symbol_tool",
   ]);
-  assert.deepEqual(new Set(pi.activeNames), new Set(["read", "bifrost_search_symbols"]));
-});
-
-test("rejects namespaced collisions atomically", async () => {
-  const pi = fakePi(["bifrost_search_symbols"]);
-  const client = fakeClient();
-  const errors = [];
-  const session = createBifrostSession(pi, dependencies([client], errors));
-
-  assert.equal(await session.start("/workspace", ["symbols"]), false);
-  assert.equal(pi.registered.length, 0);
-  assert.equal(client.closeCount, 1);
-  assert.equal(session.status().state, "error");
-  assert.match(errors[0], /tool name collision: bifrost_search_symbols/);
+  assert.deepEqual(new Set(pi.activeNames), new Set(["read", ...piNames(SYMBOL_TOOL_NAMES)]));
 });
 
 test("detects duplicate canonical names before registration", () => {
   assert.throws(
-    () => assertNoToolCollisions([{ name: "same" }, { name: "same" }], []),
+    () => assertToolsHaveUniqueNames([{ name: "same" }, { name: "same" }]),
     /duplicate tool name: same/,
   );
 });
@@ -174,7 +233,7 @@ test("detects duplicate canonical names before registration", () => {
 test("changing capabilities reconnects, registers new tools, and preserves unrelated active tools", async () => {
   const pi = fakePi(["read"]);
   const first = fakeClient();
-  const second = fakeClient({ listTools: async () => [symbolTool(), qualityTool()] });
+  const second = fakeClient({ listTools: async () => [...symbolTools(), ...qualityTools()] });
   const resolved = [];
   const session = createBifrostSession(pi, dependencies([first, second], [], resolved));
 
@@ -182,20 +241,44 @@ test("changing capabilities reconnects, registers new tools, and preserves unrel
   assert.equal(await session.applySelection(["symbols", "quality"]), true);
 
   assert.equal(first.closeCount, 1);
-  assert.equal(pi.registered.length, 2);
+  assert.equal(pi.registered.length, SYMBOL_TOOL_NAMES.length + QUALITY_TOOL_NAMES.length);
   assert.deepEqual(
     new Set(pi.activeNames),
-    new Set(["read", "bifrost_search_symbols", "bifrost_compute_cyclomatic_complexity"]),
+    new Set(["read", ...piNames(SYMBOL_TOOL_NAMES), ...piNames(QUALITY_TOOL_NAMES)]),
   );
   assert.deepEqual(resolved.map((item) => item.toolset), ["symbol", "symbol|slopcop"]);
-  assert.deepEqual(session.status(), connectedStatus("/workspace", ["symbols", "quality"], 2));
+  assert.deepEqual(
+    session.status(),
+    connectedStatus("/workspace", ["symbols", "quality"], SYMBOL_TOOL_NAMES.length + QUALITY_TOOL_NAMES.length),
+  );
+});
+
+test("reconnecting re-registers tools by name so schemas and descriptions refresh", async () => {
+  const pi = fakePi();
+  const first = fakeClient();
+  const second = fakeClient({ listTools: async () => [
+    ...symbolTools({ searchSymbolsDescription: "Updated search symbols description." }),
+    ...qualityTools(),
+  ] });
+  const session = createBifrostSession(pi, dependencies([first, second]));
+
+  await session.start("/workspace", ["symbols"]);
+  assert.match(pi.registered.find((tool) => tool.name === "bifrost_search_symbols").description, /Search symbols\./);
+
+  assert.equal(await session.applySelection(["symbols", "quality"]), true);
+
+  assert.match(
+    pi.registered.find((tool) => tool.name === "bifrost_search_symbols").description,
+    /Updated search symbols description\./,
+  );
+  assert.equal(
+    pi.registrationLog.filter((name) => name === "bifrost_search_symbols").length,
+    2,
+  );
 });
 
 test("disabling a capability without changing the server expression does not reconnect", async () => {
-  const client = fakeClient({ listTools: async () => [
-    { name: "query_code", inputSchema: { type: "object" } },
-    { name: "jq", inputSchema: { type: "object" } },
-  ] });
+  const client = fakeClient({ listTools: async () => [...queryTools(), ...transformsTools()] });
   const pi = fakePi(["read"]);
   const session = createBifrostSession(pi, dependencies([client]));
 
@@ -203,7 +286,7 @@ test("disabling a capability without changing the server expression does not rec
   await session.applySelection(["query"]);
 
   assert.equal(client.closeCount, 0);
-  assert.deepEqual(new Set(pi.activeNames), new Set(["read", "bifrost_query_code"]));
+  assert.deepEqual(new Set(pi.activeNames), new Set(["read", ...piNames(QUERY_TOOL_NAMES)]));
   await assert.rejects(
     pi.registered.find((tool) => tool.name === "bifrost_jq").execute("call", {}),
     /capability is not active/,
@@ -229,21 +312,44 @@ test("disabling every capability closes the child and reports disconnected", asy
   assert.equal(session.status().state, "disconnected");
 });
 
+test("shutdown waits for an in-flight disable cleanup and invalidates its success", async () => {
+  const closing = deferred();
+  const client = fakeClient({ onClose: () => closing.promise });
+  const pi = fakePi();
+  const session = createBifrostSession(pi, dependencies([client]));
+  await session.start("/workspace", ["symbols"]);
+
+  const disabling = session.applySelection([]);
+  await new Promise((resolve) => setImmediate(resolve));
+  let shutdownSettled = false;
+  const shuttingDown = session.shutdown().then(() => { shutdownSettled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(shutdownSettled, false);
+  closing.resolve();
+  assert.equal(await disabling, false);
+  await shuttingDown;
+  assert.equal(session.status().workspace, undefined);
+  assert.equal(client.closeCount, 1);
+});
+
 test("a failed capability change keeps the previous client and selection", async () => {
   const first = fakeClient();
-  const unavailable = fakeClient({ listTools: async () => [symbolTool()] });
+  const incomplete = fakeClient({ listTools: async () => [...symbolTools(), ...qualityTools({ includeAll: false })] });
   const pi = fakePi();
   const errors = [];
-  const session = createBifrostSession(pi, dependencies([first, unavailable], errors));
+  const session = createBifrostSession(pi, dependencies([first, incomplete], errors));
 
   await session.start("/workspace", ["symbols"]);
-  assert.equal(await session.applySelection(["symbols", "semantic"]), false);
+  assert.equal(await session.applySelection(["symbols", "quality"]), false);
 
   assert.equal(first.closeCount, 0);
-  assert.equal(unavailable.closeCount, 1);
+  assert.equal(incomplete.closeCount, 1);
   assert.deepEqual(session.status().capabilities, ["symbols"]);
   assert.equal(session.status().state, "connected");
-  assert.match(errors.at(-1), /semantic/);
+  assert.equal(errors.length, 0);
+  assert.match(session.status().error.message, /Bifrost MCP configuration failed:/);
+  assert.match(String(session.status().error.cause), /compute_cognitive_complexity/);
   assert.equal((await pi.registered[0].execute("still-live", { query: "x" })).content[0].text, "found");
 });
 
@@ -256,8 +362,31 @@ test("reapplying the same selection restores active Bifrost tools without reconn
   pi.setActiveTools(["read"]);
   assert.equal(await session.applySelection(["symbols"]), true);
 
-  assert.deepEqual(new Set(pi.activeNames), new Set(["read", "bifrost_search_symbols"]));
+  assert.deepEqual(new Set(pi.activeNames), new Set(["read", ...piNames(SYMBOL_TOOL_NAMES)]));
   assert.equal(client.closeCount, 0);
+});
+
+test("a newer no-op selection cancels an older reconnect in progress", async () => {
+  const replacementConnect = deferred();
+  const first = fakeClient();
+  const replacement = fakeClient({
+    connect: () => replacementConnect.promise,
+    listTools: async () => [...symbolTools(), ...qualityTools()],
+  });
+  const pi = fakePi();
+  const session = createBifrostSession(pi, dependencies([first, replacement]));
+  await session.start("/workspace", ["symbols"]);
+
+  const enablingQuality = session.applySelection(["symbols", "quality"]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(await session.applySelection(["symbols"]), true);
+  replacementConnect.resolve();
+
+  assert.equal(await enablingQuality, false);
+  assert.deepEqual(session.status().capabilities, ["symbols"]);
+  assert.equal(session.status().state, "connected");
+  assert.equal(first.closeCount, 0);
+  assert.equal(replacement.closeCount, 1);
 });
 
 test("a failed replacement does not resurrect a previous client that closed", async () => {
@@ -297,6 +426,66 @@ test("shutdown while start waits for old cleanup prevents a later reconnect", as
   assert.equal(session.status().state, "disconnected");
 });
 
+test("shutdown clears the workspace before awaiting cleanup so a pending applySelection cannot reconnect", async () => {
+  const closing = deferred();
+  const first = fakeClient({ onClose: () => closing.promise });
+  const pi = fakePi();
+  const session = createBifrostSession(pi, dependencies([first]));
+  await session.start("/workspace", ["symbols"]);
+
+  const shuttingDown = session.shutdown();
+  await assert.rejects(session.applySelection(["symbols"]), /workspace/);
+  assert.equal(session.status().workspace, undefined);
+  closing.resolve();
+  await shuttingDown;
+
+  assert.equal(session.status().state, "disconnected");
+  assert.equal(session.status().workspace, undefined);
+});
+
+test("returning true after closing the replaced client is revalidated against a concurrent shutdown", async () => {
+  const closingFirst = deferred();
+  const first = fakeClient({ onClose: () => closingFirst.promise });
+  const second = fakeClient({ listTools: async () => [...symbolTools(), ...qualityTools()] });
+  const pi = fakePi();
+  const session = createBifrostSession(pi, dependencies([first, second]));
+  await session.start("/workspace", ["symbols"]);
+
+  const applying = session.applySelection(["symbols", "quality"]);
+  await new Promise((resolve) => setImmediate(resolve));
+  // `second` is already connected and active; connectSelection is now awaiting closeOnce(first).
+  const shuttingDown = session.shutdown();
+  closingFirst.resolve();
+  const applied = await applying;
+  await shuttingDown;
+
+  assert.equal(applied, false);
+  assert.equal(session.status().state, "disconnected");
+  assert.equal(first.closeCount, 1);
+  assert.equal(second.closeCount, 1);
+});
+
+test("a replacement that closes during old-client cleanup fails without a duplicate background report", async () => {
+  const closingFirst = deferred();
+  const first = fakeClient({ onClose: () => closingFirst.promise });
+  const second = fakeClient({ listTools: async () => [...symbolTools(), ...qualityTools()] });
+  const pi = fakePi();
+  const errors = [];
+  const session = createBifrostSession(pi, dependencies([first, second], errors));
+  await session.start("/workspace", ["symbols"]);
+
+  const applying = session.applySelection(["symbols", "quality"]);
+  await new Promise((resolve) => setImmediate(resolve));
+  second.triggerUnexpectedClose();
+  closingFirst.resolve();
+
+  assert.equal(await applying, false);
+  assert.equal(session.status().state, "error");
+  assert.equal(session.status().toolCount, 0);
+  assert.equal(errors.length, 0);
+  assert.equal(first.closeCount, 1);
+});
+
 test("a stale startup client is closed and cannot replace the newer session", async () => {
   const connecting = deferred();
   const first = fakeClient({ connect: () => connecting.promise });
@@ -313,7 +502,7 @@ test("a stale startup client is closed and cannot replace the newer session", as
 
   assert.equal(first.closeCount, 1);
   assert.equal(second.closeCount, 0);
-  assert.deepEqual(session.status(), connectedStatus("/two", ["symbols"]));
+  assert.deepEqual(session.status(), connectedStatus("/two", ["symbols"], SYMBOL_TOOL_NAMES.length));
 });
 
 test("shutdown during startup and repeated shutdown close each client only once", async () => {
@@ -345,7 +534,7 @@ test("reapplying a selection after unexpected close reconnects", async () => {
   assert.equal(await session.applySelection(["symbols"]), true);
 
   assert.equal(session.status().state, "connected");
-  assert.deepEqual(pi.activeNames, ["bifrost_search_symbols"]);
+  assert.deepEqual(new Set(pi.activeNames), new Set(piNames(SYMBOL_TOOL_NAMES)));
   assert.equal(second.closeCount, 0);
 });
 
@@ -361,19 +550,22 @@ test("unexpected connection close marks namespaced tools inactive", async () => 
   assert.equal(session.status().state, "error");
   assert.equal(session.status().toolCount, 0);
   assert.deepEqual(pi.activeNames, ["read"]);
-  assert.match(errors[0], /connection closed unexpectedly/);
+  assert.ok(errors[0] instanceof Error);
+  assert.match(errors[0].message, /connection closed unexpectedly/);
   await assert.rejects(
     pi.registered[0].execute("after-close", { query: "Widget" }),
     /capability is not active/,
   );
 });
 
-test("startup failure reports a concise diagnostic", async () => {
+test("startup failure preserves a concise diagnostic and underlying cause in status", async () => {
   const client = fakeClient({ connect: async () => { throw new Error("protocol handshake failed"); } });
   const errors = [];
   const session = createBifrostSession(fakePi(), dependencies([client], errors));
 
   assert.equal(await session.start("/workspace", ["symbols"]), false);
   assert.equal(client.closeCount, 1);
-  assert.match(errors[0], /^Bifrost MCP configuration failed: protocol handshake failed$/);
+  assert.equal(errors.length, 0);
+  assert.equal(session.status().error.message, "Bifrost MCP configuration failed: protocol handshake failed");
+  assert.equal(session.status().error.cause.message, "protocol handshake failed");
 });

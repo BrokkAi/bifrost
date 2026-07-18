@@ -42,9 +42,9 @@ export function configureBifrostExtension(
     hasUI: boolean;
     ui: { notify(message: string, level: "error"): void };
   } | undefined;
-  session.setErrorHandler((message) => {
+  session.setErrorHandler((error) => {
     if (uiContext?.hasUI) {
-      uiContext.ui.notify(message, "error");
+      uiContext.ui.notify(error.message, "error");
     }
   });
 
@@ -53,10 +53,21 @@ export function configureBifrostExtension(
     let capabilities: readonly BifrostCapability[] = DEFAULT_BIFROST_CAPABILITIES;
     try {
       capabilities = await dependencies.settingsStore.load(ctx.cwd) ?? DEFAULT_BIFROST_CAPABILITIES;
-    } catch (error) {
-      reportUiError(ctx, `Could not load Bifrost settings; using defaults: ${formatError(error)}`);
+    } catch (cause) {
+      const error = new Error("Could not load Bifrost settings; using defaults.", { cause });
+      if (ctx.hasUI) {
+        ctx.ui.notify(error.message, "error");
+      }
     }
-    await session.start(ctx.cwd, capabilities);
+    const started = await session.start(ctx.cwd, capabilities);
+    if (!started) {
+      const error = session.status().error ?? new Error("Bifrost failed to start.");
+      if (ctx.hasUI) {
+        ctx.ui.notify(error.message, "error");
+      } else {
+        throw error;
+      }
+    }
   });
 
   pi.on("session_shutdown", async () => {
@@ -118,7 +129,7 @@ export function configureBifrostExtension(
               if (!applied) {
                 desired = new Set(session.status().capabilities);
                 updateSettingValues(settingsList, desired);
-                ctx.ui.notify(session.status().error ?? "Bifrost could not apply that selection.", "error");
+                ctx.ui.notify(session.status().error?.message ?? "Bifrost could not apply that selection.", "error");
                 tui.requestRender();
                 return;
               }
@@ -128,16 +139,21 @@ export function configureBifrostExtension(
                 desired = new Set(session.status().capabilities);
                 updateSettingValues(settingsList, desired);
                 tui.requestRender();
-              } catch (error) {
+              } catch (cause) {
                 const rolledBack = await session.applySelection(previous);
                 desired = new Set(session.status().capabilities);
                 updateSettingValues(settingsList, desired);
                 tui.requestRender();
-                const rollbackNote = rolledBack ? "" : " The previous runtime selection could not be restored.";
-                throw new Error(`Could not save Bifrost settings: ${formatError(error)}${rollbackNote}`);
+                const consequence = rolledBack
+                  ? "The previous runtime selection was restored. Check the settings directory and try again."
+                  : "The previous runtime selection could not be restored. Restart Pi before retrying.";
+                throw new Error(`Could not save Bifrost settings. ${consequence}`, { cause });
               }
             }).catch((error: unknown) => {
-              ctx.ui.notify(formatError(error), "error");
+              ctx.ui.notify(
+                error instanceof Error ? error.message : "Bifrost could not update its settings. Restart Pi and try again.",
+                "error",
+              );
             });
           },
           () => done(undefined),
@@ -188,17 +204,4 @@ function defaultDependencies(): BifrostExtensionDependencies {
     createSession: createBifrostSession,
     settingsStore: createBifrostSettingsStore(join(getAgentDir(), "bifrost", "workspaces")),
   };
-}
-
-function reportUiError(
-  ctx: { hasUI: boolean; ui: { notify(message: string, level: "error"): void } },
-  message: string,
-): void {
-  if (ctx.hasUI) {
-    ctx.ui.notify(message, "error");
-  }
-}
-
-function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

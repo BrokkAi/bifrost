@@ -179,12 +179,19 @@ jobs:
         run: npm ci
         working-directory: plugins/bifrost-agent
 
+      - name: Check release version projections
+        run: node scripts/sync-release-version.mjs --check
+
       - name: Check package
         run: npm run check
         working-directory: plugins/bifrost-agent
 
       - name: Test package
         run: npm test
+        working-directory: plugins/bifrost-agent
+
+      - name: Test packed package install
+        run: npm run test:packed
         working-directory: plugins/bifrost-agent
 
       - name: Validate shared plugin manifests

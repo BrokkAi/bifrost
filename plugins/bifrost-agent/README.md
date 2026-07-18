@@ -117,8 +117,8 @@ pi install npm:@brokk/bifrost-agent@0.8.4
 Run `/bifrost` in Pi's interactive TUI to configure Bifrost for the current
 workspace. The default enables symbol navigation, structural queries, and file
 discovery/ranking. The settings list can also enable code-quality reports, Git
-history, raw text search, JSON/XML transforms, or semantic search. It never
-offers Bifrost workspace-switching tools because Pi owns the session workspace.
+history, raw text search, or JSON/XML transforms. It never offers Bifrost
+workspace-switching tools because Pi owns the session workspace.
 Selections are stored in separate canonical-workspace files under
 `<Pi agent directory>/bifrost/workspaces/` (normally
 `~/.pi/agent/bifrost/workspaces/`), so they survive new sessions without
@@ -127,12 +127,12 @@ the same settings document.
 
 Changing a capability may restart the Bifrost child when it requires another
 existing MCP server toolset. Tools discovered earlier remain registered with Pi
-but are removed from Pi's active tool set when disabled. Semantic search can be
-enabled only when the selected Bifrost binary advertises it for the current Git
-workspace and accelerator environment. A failed change leaves the prior connection and saved selection active. In
-interactive Pi, startup, reconnect, and background connection failures use
-Pi's error notifications; the extension does not write directly into the TUI
-with `console.log` or `console.error`.
+but are removed from Pi's active tool set when disabled. A failed change leaves
+the prior connection and saved selection active. In interactive Pi, startup,
+reconnect, and background connection failures use Pi's error notifications; in
+noninteractive modes, startup failures use Pi's extension error path. The
+extension does not write directly into the TUI with `console.log` or
+`console.error`.
 
 Tool calls time out after 300 seconds; startup times out after 60 seconds.
 Cancellation stops the Pi request promptly, though the current Bifrost stdio
@@ -157,14 +157,15 @@ the installed package directory. Use Pi's JSON mode for protocol-level evidence
 when needed; Bifrost diagnostics remain on stderr and must not appear as JSON
 messages on stdout.
 
-Package maintainers should keep `package.json`, `bifrost-release.json`, and the
-Rust crate version aligned. Validate the package before publication:
+Package maintainers should keep `package.json`, `package-lock.json`,
+`bifrost-release.json`, and the Rust crate version aligned. Validate the package before publication:
 
 ```bash
 cd plugins/bifrost-agent
 npm ci
 npm run check
 npm test
+npm run test:packed
 npm pack --dry-run
 npm publish --dry-run
 ```

@@ -2,11 +2,25 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import { Type, type Static } from "typebox";
+import { Value } from "typebox/value";
+
 import {
   BIFROST_CAPABILITY_IDS,
   normalizeCapabilities,
   type BifrostCapability,
 } from "./bifrost-capabilities.ts";
+
+const BifrostSettingsEnvelope = Type.Object(
+  {
+    version: Type.Literal(1),
+    workspace: Type.String(),
+    capabilities: Type.Array(Type.String()),
+  },
+  { additionalProperties: false },
+);
+
+type BifrostSettingsEnvelope = Static<typeof BifrostSettingsEnvelope>;
 
 interface BifrostSettingsDocument {
   version: 1;
@@ -69,39 +83,38 @@ export function parseSettingsDocument(
   source: string,
   expectedWorkspace?: string,
 ): BifrostSettingsDocument {
-  let value: unknown;
+  let parsed: unknown;
   try {
-    value = JSON.parse(source);
+    parsed = JSON.parse(source);
   } catch (error) {
     throw new Error("Bifrost settings are not valid JSON.", { cause: error });
   }
-  if (
-    !isRecord(value)
-    || value.version !== 1
-    || typeof value.workspace !== "string"
-    || !Array.isArray(value.capabilities)
-    || value.capabilities.some((item) => typeof item !== "string")
-  ) {
-    throw new Error("Bifrost settings must contain version 1, a workspace, and a capabilities array.");
+
+  let envelope: BifrostSettingsEnvelope;
+  try {
+    envelope = Value.Parse(BifrostSettingsEnvelope, parsed);
+  } catch (error) {
+    throw new Error(
+      "Bifrost settings must contain version 1, a workspace, and a capabilities array.",
+      { cause: error },
+    );
   }
-  if (expectedWorkspace !== undefined && value.workspace !== expectedWorkspace) {
+
+  if (expectedWorkspace !== undefined && envelope.workspace !== expectedWorkspace) {
     throw new Error("Bifrost settings do not match the requested workspace.");
   }
 
   const knownCapabilities = new Set<string>(BIFROST_CAPABILITY_IDS);
-  const unknown = value.capabilities.filter((item) => !knownCapabilities.has(item));
+  const unknown = envelope.capabilities.filter((item) => !knownCapabilities.has(item));
   if (unknown.length > 0) {
     throw new Error(`Bifrost settings contain unknown capabilities: ${unknown.join(", ")}.`);
   }
+
   return {
     version: 1,
-    workspace: value.workspace,
-    capabilities: normalizeCapabilities(value.capabilities),
+    workspace: envelope.workspace,
+    capabilities: normalizeCapabilities(envelope.capabilities),
   };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isMissingFile(error: unknown): boolean {

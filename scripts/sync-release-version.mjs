@@ -36,6 +36,20 @@ const updates = [
   updateJson("plugins/bifrost-agent/bifrost-release.json", (json) => {
     json.binaryVersion = version;
   }),
+  updateJson("plugins/bifrost-agent/package.json", (json) => {
+    json.version = version;
+  }),
+  updateJson("plugins/bifrost-agent/package-lock.json", (json) => {
+    json.version = version;
+    json.packages ??= {};
+    json.packages[""] ??= {};
+    json.packages[""].version = version;
+  }),
+  updateText("plugins/bifrost-agent/README.md", (source) =>
+    source.replace(
+      /pi install npm:@brokk\/bifrost-agent@[^\s]+/,
+      `pi install npm:@brokk/bifrost-agent@${version}`,
+    )),
   updateJson("plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/bifrost-release.json", (json) => {
     json.binaryVersion = version;
   }),
@@ -106,8 +120,14 @@ function updateJson(relativePath, mutate) {
   const original = fs.readFileSync(absolutePath, "utf8");
   const json = JSON.parse(original);
   mutate(json);
-  const next = `${JSON.stringify(json, null, 2)}\n`;
-  if (next === original) {
+  return updateText(relativePath, () => `${JSON.stringify(json, null, 2)}\n`, original);
+}
+
+function updateText(relativePath, mutate, original = undefined) {
+  const absolutePath = path.join(repoRoot, relativePath);
+  const current = original ?? fs.readFileSync(absolutePath, "utf8");
+  const next = mutate(current);
+  if (next === current) {
     return null;
   }
   if (!checkOnly) {

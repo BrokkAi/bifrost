@@ -23,7 +23,9 @@ input.on("line", (line) => {
 
   if (message.method === "initialize") {
     respond(message.id, {
-      protocolVersion: message.params.protocolVersion,
+      protocolVersion: process.env.BIFROST_FAKE_MCP_FAIL_INIT === "1"
+        ? "unsupported-protocol-version"
+        : message.params.protocolVersion,
       capabilities: { tools: {} },
       serverInfo: { name: "fake-bifrost", version: "0.8.4" },
     });

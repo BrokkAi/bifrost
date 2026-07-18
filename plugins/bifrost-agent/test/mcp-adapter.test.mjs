@@ -34,13 +34,6 @@ test("preserves discovered JSON Schema without rebuilding it", () => {
   }
 });
 
-test("normalizes a missing input schema to a closed empty object", () => {
-  const parameters = toolParameters({ name: "status" });
-  assert.equal(parameters.type, "object");
-  assert.deepEqual(parameters.properties, {});
-  assert.equal(parameters.additionalProperties, false);
-});
-
 test("uses an advertised title or a readable tool name as the label", () => {
   assert.equal(toolLabel({ name: "search_symbols", annotations: { title: "Symbol Search" } }), "Symbol Search");
   assert.equal(toolLabel({ name: "search_symbols" }), "Search Symbols");
@@ -90,7 +83,8 @@ test("truncates combined model-visible output within Pi line and byte limits", (
   const text = result.content[0].text;
 
   assert.equal(result.details.truncated, true);
-  assert.match(text, /Full output is retained in tool details/);
+  assert.match(text, /Output truncated: showing/);
+  assert.doesNotMatch(text, /tool details/);
   assert.ok(Buffer.byteLength(text, "utf8") <= DEFAULT_MAX_BYTES);
   assert.ok(text.split("\n").length <= DEFAULT_MAX_LINES);
   assert.equal(result.details.mcpResult.content[0].text, oversized);

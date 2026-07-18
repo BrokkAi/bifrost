@@ -26,7 +26,10 @@
     "skills/bifrost-code-navigation/SKILL.md",
     "skills/bifrost-code-reading/SKILL.md",
     "skills/bifrost-codebase-search/SKILL.md",
-    "README.md"
+    "README.md",
+    "LICENSE.md",
+    "GPL-3.0.md",
+    "SOURCE.md"
   ],
   "pi": {
     "extensions": [
@@ -41,7 +44,8 @@
   "scripts": {
     "check": "tsc --noEmit && npm run check:package",
     "check:package": "node test/package-contents.mjs",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "test:packed": "node test/packed-install.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0"

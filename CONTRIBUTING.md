@@ -97,11 +97,16 @@ That script updates these committed version fields:
 - `.cursor-plugin/marketplace.json`
 - `editors/vscode/package.json`
 - `editors/vscode/package-lock.json`
+- `plugins/bifrost-agent/package.json`
+- `plugins/bifrost-agent/package-lock.json`
+- the pinned npm install command in `plugins/bifrost-agent/README.md`
 - `plugins/bifrost-agent/bifrost-release.json`
 - `plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/bifrost-release.json`
 - `docs/src/content/docs/rust-library.md`
 
-The Codex and Claude marketplace files are also part of the plugin surface, but
+The package and README entries keep the published Pi artifact and its install
+instructions on the Cargo version. The Codex and Claude marketplace files are
+also part of the plugin surface, but
 currently do not carry version fields:
 
 - `.agents/plugins/marketplace.json`
@@ -120,8 +125,10 @@ Those checksum-bearing files must match the actual release archives.
 when that release metadata is already on the same version as `Cargo.toml`. The
 `release.yml` workflow prepares checksum metadata from the built `.sha256`
 sidecars with `scripts/prepare-vscode-extension-manifest.mjs`, regenerates the
-Amp skill bundle, validates the plugin manifests, packages
-`bifrost-agent-<tag>.tar.gz`, and publishes the VSIX. If you perform those
+Amp skill bundle, validates the plugin manifests, and packages the VSIX,
+`bifrost-agent-<tag>.tar.gz`, and Pi npm tarball. Only after those package gates
+pass does it publish the GitHub Release; VS Code Marketplace publication follows
+the successful GitHub release. If you perform those
 packaging steps manually, run the same script against the release `dist/`
 directory instead of hand-editing checksums.
 
@@ -141,7 +148,7 @@ To cut a release:
    node --test plugins/bifrost-agent/test/*.test.mjs
    ```
 
-   `check-codex-plugin-manifest.mjs` checks the Codex, Claude, and Cursor plugin
+   `check-codex-plugin-manifest.mjs` checks the Codex, Claude, Cursor, and Pi
    manifests, the Cursor marketplace versions, the generated Codex and Amp
    bundles, and parseability of the Codex and Claude marketplace files. It also
    checks `plugins/bifrost-agent/bifrost-release.json`, so run it after that
@@ -155,9 +162,10 @@ To cut a release:
 
 A single `vX.Y.Z` tag fans out to three workflows:
 
-- `release.yml` — builds platform archives + SHA-256 checksums and publishes a
-  GitHub Release, then prepares and publishes the VS Code extension and bundled
-  agent plugin artifacts.
+- `release.yml` — builds platform archives + SHA-256 checksums, prepares and
+  validates the VS Code, shared-agent, and Pi package artifacts, publishes them
+  together in a GitHub Release, then publishes the validated VSIX to the VS Code
+  Marketplace.
 - `publish-crate.yml` — publishes the crate to crates.io.
 - `publish-wheels.yml` — builds all platform wheels + sdist and publishes to PyPI.
 

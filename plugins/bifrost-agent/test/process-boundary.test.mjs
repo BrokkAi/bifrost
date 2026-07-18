@@ -54,6 +54,33 @@ test("SDK process boundary initializes, discovers, calls, cancels, and cleans up
   await waitFor(() => !isProcessAlive(started.pid));
 });
 
+test("SDK initialization failure cleanup waits for the child process to exit", async () => {
+  const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost-pi-mcp-failed-init-test-"));
+  const recordPath = path.join(temp, "events.jsonl");
+  const client = createSdkSessionClient({
+    command: process.execPath,
+    args: [fixture, "--root", temp, "--mcp", "symbol"],
+    cwd: temp,
+    env: {
+      ...process.env,
+      BIFROST_FAKE_MCP_RECORD: recordPath,
+      BIFROST_FAKE_MCP_FAIL_INIT: "1",
+    },
+    source: "explicit",
+  });
+
+  try {
+    await assert.rejects(client.connect(), /not supported/);
+  } finally {
+    await client.close();
+  }
+
+  const events = await readRecords(recordPath);
+  const started = events.find((event) => event.type === "started");
+  assert.ok(started, "fake MCP child did not record startup");
+  assert.equal(isProcessAlive(started.pid), false);
+});
+
 async function readRecords(recordPath) {
   try {
     const text = await fsp.readFile(recordPath, "utf8");

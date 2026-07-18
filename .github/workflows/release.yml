@@ -198,9 +198,156 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
 
+  vscode-package:
+    name: vscode extension package
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.tag }}
+        run: scripts/resolve-release-tag.sh
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Install extension dependencies
+        run: npm ci
+        working-directory: editors/vscode
+
+      - name: Prepare extension manifest
+        run: >
+          node scripts/prepare-vscode-extension-manifest.mjs
+          --version "${{ steps.tag.outputs.version }}"
+          --manifest editors/vscode/package.json
+          --dist dist
+
+      - name: Test extension
+        run: npm test
+        working-directory: editors/vscode
+
+      - name: Package extension
+        run: npx --no-install vsce package --out "../../dist/bifrost-vscode-${{ steps.tag.outputs.name }}.vsix"
+        working-directory: editors/vscode
+
+      - name: Upload vscode extension artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: vscode-extension
+          path: dist/*.vsix
+          if-no-files-found: error
+
+  agent-package:
+    name: agent (Pi) package
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.tag }}
+        run: scripts/resolve-release-tag.sh
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: plugins/bifrost-agent/package-lock.json
+
+      - name: Install agent package dependencies
+        run: npm ci
+        working-directory: plugins/bifrost-agent
+
+      - name: Prepare plugin release metadata
+        run: >
+          node scripts/prepare-vscode-extension-manifest.mjs
+          --version "${{ steps.tag.outputs.version }}"
+          --plugin-release plugins/bifrost-agent/bifrost-release.json
+          --dist dist
+
+      - name: Check release version projections
+        run: node scripts/sync-release-version.mjs --check
+
+      - name: Generate Amp skill bundle
+        run: node scripts/generate-amp-skill-bundle.mjs
+
+      - name: Test agent plugin launcher
+        run: node --test plugins/bifrost-agent/test/launcher.test.mjs
+
+      - name: Validate agent plugin manifests
+        run: node scripts/check-codex-plugin-manifest.mjs
+
+      - name: Test Pi package
+        run: npm test
+        working-directory: plugins/bifrost-agent
+
+      - name: Check Pi package
+        run: npm run check
+        working-directory: plugins/bifrost-agent
+
+      - name: Test packed Pi package install
+        run: npm run test:packed
+        working-directory: plugins/bifrost-agent
+
+      - name: Package agent plugin
+        shell: bash
+        run: |
+          cp -R plugins/bifrost-agent "${RUNNER_TEMP}/bifrost-agent"
+          cp LICENSE.md licenses/GPL-3.0.md licenses/SOURCE.md "${RUNNER_TEMP}/bifrost-agent/"
+          tar --exclude='bifrost-agent/node_modules' -C "${RUNNER_TEMP}" -czf "dist/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz" bifrost-agent
+          if tar -tzf "dist/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz" | rg '/node_modules/'; then
+            echo "Agent plugin archive unexpectedly contains node_modules" >&2
+            exit 1
+          fi
+
+      - name: Package Pi package
+        run: npm pack --pack-destination ../../dist
+        working-directory: plugins/bifrost-agent
+
+      - name: Upload agent plugin artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: agent-plugin
+          path: |
+            dist/bifrost-agent-*.tar.gz
+            dist/brokk-bifrost-agent-*.tgz
+          if-no-files-found: error
+
   release:
     name: release
-    needs: build
+    needs: [build, vscode-package, agent-package]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -230,25 +377,17 @@ jobs:
           name: ${{ steps.tag.outputs.name }}
           generate_release_notes: true
           files: |
-            dist/*.tar.gz
+            dist/bifrost-v*.tar.gz
             dist/*.zip
             dist/*.sha256
+            dist/*.vsix
+            dist/bifrost-agent-*.tar.gz
+            dist/brokk-bifrost-agent-*.tgz
 
-      - name: Announce release on Discord
-        continue-on-error: true
-        env:
-          DISCORD_RELEASE_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.tag.outputs.name }}
-        shell: bash
-        run: bash scripts/announce-discord-release.sh
-
-  vscode:
-    name: vscode extension
+  vscode-publish:
+    name: vscode marketplace publish
     needs: release
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -262,85 +401,22 @@ jobs:
           RELEASE_TAG_INPUT: ${{ inputs.tag }}
         run: scripts/resolve-release-tag.sh
 
-      - name: Download release artifacts
+      - name: Download vscode extension artifact
         uses: actions/download-artifact@v7
         with:
+          name: vscode-extension
           path: dist
-          merge-multiple: true
 
       - name: Set up Node
         uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: |
-            editors/vscode/package-lock.json
-            plugins/bifrost-agent/package-lock.json
+          cache-dependency-path: editors/vscode/package-lock.json
 
       - name: Install extension dependencies
         run: npm ci
         working-directory: editors/vscode
-
-      - name: Install agent package dependencies
-        run: npm ci
-        working-directory: plugins/bifrost-agent
-
-      - name: Prepare extension manifest
-        run: >
-          node scripts/prepare-vscode-extension-manifest.mjs
-          --version "${{ steps.tag.outputs.version }}"
-          --manifest editors/vscode/package.json
-          --plugin-release plugins/bifrost-agent/bifrost-release.json
-          --dist dist
-
-      - name: Generate Amp skill bundle
-        run: node scripts/generate-amp-skill-bundle.mjs
-
-      - name: Test agent plugin launcher
-        run: node --test plugins/bifrost-agent/test/launcher.test.mjs
-
-      - name: Validate agent plugin manifests
-        run: node scripts/check-codex-plugin-manifest.mjs
-
-      - name: Test Pi package
-        run: npm test
-        working-directory: plugins/bifrost-agent
-
-      - name: Check Pi package
-        run: npm run check
-        working-directory: plugins/bifrost-agent
-
-      - name: Test extension
-        run: npm test
-        working-directory: editors/vscode
-
-      - name: Package extension
-        run: npx --no-install vsce package --out "../../dist/bifrost-vscode-${{ steps.tag.outputs.name }}.vsix"
-        working-directory: editors/vscode
-
-      - name: Package agent plugin
-        shell: bash
-        run: |
-          cp -R plugins/bifrost-agent "${RUNNER_TEMP}/bifrost-agent"
-          cp LICENSE.md licenses/GPL-3.0.md licenses/SOURCE.md "${RUNNER_TEMP}/bifrost-agent/"
-          tar --exclude='bifrost-agent/node_modules' -C "${RUNNER_TEMP}" -czf "dist/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz" bifrost-agent
-          if tar -tzf "dist/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz" | rg '/node_modules/'; then
-            echo "Agent plugin archive unexpectedly contains node_modules" >&2
-            exit 1
-          fi
-
-      - name: Package Pi package
-        run: npm pack --pack-destination ../../dist
-        working-directory: plugins/bifrost-agent
-
-      - name: Upload editor and agent plugin artifacts to GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ steps.tag.outputs.name }}
-          files: |
-            dist/*.vsix
-            dist/bifrost-agent-*.tar.gz
-            dist/brokk-bifrost-agent-*.tgz
 
       - name: Publish extension to Visual Studio Marketplace
         run: >

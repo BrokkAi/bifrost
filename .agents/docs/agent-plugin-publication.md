@@ -114,18 +114,22 @@ forwards the canonical name over MCP. Keep the short `before_agent_start`
 namespace clarification in the extension instead of forking the canonical
 skills. The `/bifrost` SettingsList controls a Pi-local capability model over
 Bifrost's existing server toolsets. Its default is symbols, structural queries,
-and file discovery; quality, Git, text, transforms, and semantic search are
-optional. Do not add workspace lifecycle tools to this UI. Per-workspace
+and file discovery; quality, Git, text, and transforms are optional. Do not add
+workspace lifecycle tools to this UI. Semantic search is absent because normal
+release binaries do not include the `nlp` feature. Per-workspace
 selections live in independent hashed files under the Pi agent directory at
 `bifrost/workspaces/`, not in the analyzed repository. Separate files prevent
 concurrent Pi sessions for different workspaces from losing each other's
-settings. Route extension failures through the current `ExtensionContext` with
-`ctx.ui.notify(..., "error")`; never use `console.log` or `console.error` from
-the Pi extension because direct terminal writes corrupt or displace TUI output.
+settings. Route interactive extension failures through the current `ExtensionContext`
+with `ctx.ui.notify(..., "error")`, and throw startup errors through Pi's
+extension runner in noninteractive modes. Never use `console.log` or
+`console.error` from the Pi extension because direct terminal writes corrupt or
+displace TUI output.
 
-Release CI runs `npm ci`, `npm test`, and `npm run check` in
-`plugins/bifrost-agent`, then places the npm tarball in the GitHub release next
-to the shared agent archive. Publishing `@brokk/bifrost-agent` to npm remains a
+Release CI runs `npm ci`, `npm test`, `npm run check`, and the packed-install
+smoke in `plugins/bifrost-agent`, then places the npm tarball in the GitHub
+release next to the shared agent archive. The GitHub release is published only
+after the Pi and VS Code artifacts pass their package gates. Publishing `@brokk/bifrost-agent` to npm remains a
 separate credentialed action until the repository has an approved npm trusted
 publisher or token. Do not document npm installation as available until that
 publication is configured and the matching version exists in the registry.
@@ -136,6 +140,7 @@ cd plugins/bifrost-agent
 npm ci
 npm test
 npm run check
+npm run test:packed
 npm pack --dry-run
 npm publish --dry-run
 ```
