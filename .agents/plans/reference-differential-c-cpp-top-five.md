@@ -16,10 +16,10 @@ The acceptance surface is the MCP `symbols` toolset and its associated Rust and 
 - [x] (2026-07-18 19:30Z) Read `.agents/PLANS.md`, the canonical N=1 campaign, and the completed Java/Go/Python top-five plan so this campaign preserves their evidence, recovery, and issue-ownership discipline.
 - [x] (2026-07-18 19:30Z) Used the canonical corpus metadata and a no-write runner dry-run to select the exact five C and five non-Chromium C++ repositories. Verified their clone heads and identified RMerl's unignored `.brokk/` as the only apparent dirtiness.
 - [x] (2026-07-18 19:30Z) Completed independent read-only runner and GitHub audits. The safe initial resource shape is one C and one C++ corpus process concurrently, each with one active repository and eight inner workers. Open issue #894 is assigned to another user and covers CFG/ICFG rather than symbols; it must not be absorbed into this campaign.
-- [ ] Publish this campaign-start plan on `origin/master`, locally ignore `.brokk/` in all ten clone metadata directories, build a fresh release runner from that exact clean head, and record the run manifest.
-- [ ] Run the complete five-repository C and five-repository C++ baselines, preserving head-scoped JSONL and logs, then verify ten successful records and integrity fields.
-- [ ] Exhaustively ledger every raw missing row, reproduce suspicious sites exactly, reduce legitimate defects, and search issue/assignee state before any implementation.
-- [ ] File or reuse issues assigned only to `jbellis`, delegate substantial implementations to Oldskool, root-review each change, and prove fixes with focused tests and exact production reruns.
+- [x] (2026-07-18 19:34Z) Published the campaign-start plan and run manifest on `origin/master` at `31853f8485f68fce41a99b3c4155a57f467d3e79`, locally excluded `.brokk/` from all selected clones, and built the frozen release runner (`sha256 709bd0f4a4e1c668c9891d78e6fb5002fe1e5588d1f943624150b0d0d0179fcb`).
+- [x] (2026-07-18 22:47Z) Completed and integrity-checked all five C and five C++ baseline records: 100,000 sampled sites, 12,279 consistent, 234 editor-only, 541 unproven, 86,147 inconclusive, and 799 raw missing. Both language JSONL files have five clean pinned-head records with one shared fingerprint.
+- [ ] Exhaustively ledger every raw missing row, reproduce suspicious sites exactly, reduce legitimate defects, and search issue/assignee state before any implementation. (Completed: all 12 C rows and all 619 WebKit/LLVM/QGIS/Node rows; reduced six assigned root causes and four additional C++ residual families. Remaining: exhaustive disposition of OceanBase's 168 rows.)
+- [ ] File or reuse issues assigned only to `jbellis`, delegate substantial implementations to Oldskool, root-review each change, and prove fixes with focused tests and exact production reruns. (Completed: filed and assigned #924 through #929; prepared reviewed source-only patches for #924, #925, #928, and #929, with #926 and #927 delegated. Remaining: post-freeze execution review, additional tickets that pass the reduction/ownership bar, implementation, and production proof.)
 - [ ] Pass formatting, all-target/all-feature Clippy, focused suites, and the complete feature-enabled Cargo suite; integrate and push directly to `origin/master` without waiting for CI.
 - [ ] Rebuild the runner and complete a fresh clean all-ten confirmation, audit every final residual, close assigned issues with evidence, publish compact checked-in reports, and verify a clean worktree equal to `origin/master`.
 
@@ -39,6 +39,18 @@ The acceptance surface is the MCP `symbols` toolset and its associated Rust and 
 
 - Observation: The canonical C++ top five would include Chromium if selected only by count.
   Evidence: Chromium is ranked first in the C++ dry-run. The campaign must use explicit repository filters for WebKit, Node.js, QGIS, LLVM, and OceanBase rather than `--repos-per-language 5`.
+
+- Observation: Chromium's fixes generalized strongly to large C corpora.
+  Evidence: Across 50,000 C sites, only 12 rows were raw missing; exhaustive review found eight genuine misses in three structured families and four artifacts. ASUSWRT and the WSL kernel had zero genuine misses.
+
+- Observation: Non-Chromium C++ misses are concentrated rather than a long tail of unrelated parser shapes.
+  Evidence: The first four C++ repositories produced 619 raw rows, of which exhaustive second-pass review classified 379 as genuine. Effective ordinary and namespace imports account for 262 of those 379 rows; the remaining rows cluster around lexical type, template alias, receiver/member, construction, field-declaration, and hierarchy seams.
+
+- Observation: The shared authoritative visibility batch has a large single-threaded setup cost on OceanBase.
+  Evidence: OceanBase completed its 746-file forward phase at 4,736.4 seconds, then spent about 30 minutes in `CppAuthoritativeUsageBatch::new` before the first inverse-target progress event. Host observation showed one active setup thread and about 12--15 GiB resident memory. The complete repository record took 7,701.9 seconds and 14,882,120 KiB peak RSS.
+
+- Observation: A single inverse target can dominate a large-repository run after the shared batch is built.
+  Evidence: QGIS had one target take about 1,560 seconds because the same large source was parsed once per 113 sibling candidates. OceanBase likewise paused at 971/1,000 while one worker consumed a full core, then released 24 queued targets. Issue #929 carries the exact 113-to-zero reparse reduction.
 
 ## Decision Log
 
@@ -70,13 +82,27 @@ The acceptance surface is the MCP `symbols` toolset and its associated Rust and 
   Rationale: C and C++ share analyzer and persistence machinery. A later C++ fix can affect earlier C evidence, and sampled target composition can change after a correction; subtracting exact-site deltas is not a closure proof.
   Date/Author: 2026-07-18 / Codex
 
+- Decision: Freeze every workspace file while a baseline runner is active, including planning documents.
+  Rationale: The release runner reads Bifrost HEAD and dirtiness dynamically for each repository record. Mutating even an agent-owned plan would make executable provenance and recorded provenance disagree. All research and patch preparation therefore stayed under `/tmp` until OceanBase's fifth record was durable.
+  Date/Author: 2026-07-18 / Codex
+
+- Decision: Accept resumed outer concurrency of two C repositories and three C++ repositories after measuring host headroom, while preserving eight inner workers and every semantic limit.
+  Rationale: The original one-repository launch was safely resumable but unnecessarily serialized independent repositories. The completed records retain the same head, fingerprint, per-repository limits, and inner parallelism; only orchestration concurrency changed. This launch history is recorded rather than retroactively claiming the original setting.
+  Date/Author: 2026-07-18 / Codex
+
+- Decision: Stop reopening isolated Chromium residuals unless a non-Chromium witness establishes recurrence.
+  Rationale: Chromium's final C++ tail contained no recurring unfixed family. The top-five campaign is the generalization test; importing one-off Chromium parser shapes without a new witness would turn the campaign into whack-a-mole.
+  Date/Author: 2026-07-18 / Codex
+
 - Decision: Do not wait for GitHub CI after the complete local gate passes.
   Rationale: The user explicitly made local `cargo test` the transition boundary. Formatting, Clippy, focused tests, and `cargo test --features nlp,python` remain mandatory.
   Date/Author: 2026-07-18 / Codex
 
 ## Outcomes & Retrospective
 
-The campaign is in preflight. Repository selection, resource limits, evidence rules, and issue exclusions are pinned, but no top-five C or C++ measurement has yet been accepted. Update this section with baseline/final per-repository counters, runtimes and RSS, exhaustive residual partitions, issue/fix evidence, final heads and checksums, and lessons about whether Chromium's fixes generalized.
+The clean `31853f84` baseline milestone is complete. All ten repositories contributed one accepted 10,000-site record. C produced 12 raw missing rows and eight genuine defects; WebKit, LLVM, QGIS, and Node produced 619 raw rows and 379 genuine defects after exhaustive review; OceanBase produced 168 raw rows whose row-by-row disposition is in progress. The aggregate baseline classifications are 12,279 consistent, 234 editor-only, 541 unproven, 86,147 inconclusive, and 799 raw missing.
+
+The strongest interim conclusion is that the Chromium work generalized: large C is nearly closed, and C++ misses concentrate in a small number of cross-repository resolver environments rather than recurring Chromium-only parser recovery. The baseline also exposed two concrete performance costs: the shared visibility batch's OceanBase setup and repeated per-candidate class-strength parsing (#929). This section remains incomplete until OceanBase triage, the fix stack, the clean all-ten confirmation, issue closure, reports, and final master synchronization are complete.
 
 ## Context and Orientation
 
@@ -108,7 +134,7 @@ The prior Chromium closure and its known false-forward, declaration-frontier, pa
 
 First publish this plan from a clean Bifrost checkpoint. Add `.brokk/` to each selected clone's local `.git/info/exclude` without modifying tracked clone content, then verify all ten clones report `repo_dirty=false` under the runner's rules and still match the pinned heads. Build a fresh release runner from the published Bifrost head and do not modify the Bifrost source tree while either baseline process runs.
 
-Start one explicit C `run-corpus` command and one explicit C++ command concurrently. Each process runs its five repositories serially with eight workers, persisted cache mode, the established 1,000-file/10,000-site/1,000-target budgets, and `--strict`. Store head-scoped JSONL and logs below `/mnt/optane/tmp/reference-differential`. A strict exit status of two is expected when raw missing sites exist; acceptance depends on five completed repository records, not the shell status alone. If interrupted, confirm no process still owns a selected clone and repeat the identical command without `--force` so completed semantic keys are skipped.
+Start one explicit C `run-corpus` command and one explicit C++ command concurrently. Each process begins with one active repository and eight inner workers, persisted cache mode, the established 1,000-file/10,000-site/1,000-target budgets, and `--strict`. After measuring host headroom, resumable recovery may increase only outer repository concurrency; the accepted run used two C repositories and three C++ repositories concurrently without changing any semantic limit. Store head-scoped JSONL and logs below `/mnt/optane/tmp/reference-differential`. A strict exit status of two is expected when raw missing sites exist; acceptance depends on five completed repository records, not the shell status alone. If interrupted, confirm no process still owns a selected clone and repeat the identical command without `--force` so completed semantic keys are skipped.
 
 After both baselines finish, verify JSON integrity, exact Bifrost and repository heads, clean flags, configuration fingerprints, record counts, and any file errors or explicit truncation. Extract every raw missing row into a stable ledger keyed by repository, path, start/end byte, and ordered declaration identities. Preserve the original `text`, source evidence, targets, note, and diagnostics. Partition read-only source review by repository among research agents and Oldskool; root checks source bytes and adjudicates every row.
 
@@ -221,3 +247,5 @@ No production interface change is planned in advance. Preserve the existing diff
 C and C++ both use the C++ parser/analyzer and persisted metadata. Any declaration-emission or identity correction may require a C++-local analysis epoch bump so warm caches cannot silently retain stale facts. Avoid new dependencies, persistence schemas, or public API shapes unless a reduced root cause requires them and this plan records the decision first.
 
 Revision note (2026-07-18 19:30Z): Created the self-contained C/C++ top-five plan after the Chromium closure, pinned the canonical ten-repository matrix and clone heads, completed independent runner and GitHub audits, selected bounded two-repository concurrency, and recorded the clean-head, issue-ownership, delegation, local-gate, no-CI-wait, exhaustive-ledger, and final-all-ten acceptance boundaries before any cache or analyzer mutation.
+
+Revision note (2026-07-18 22:47Z): Recorded the accepted ten-repository `31853f84` baseline, actual resumable outer concurrency, per-language triage progress, assigned issues #924--#929, frozen-workspace provenance rule, concentrated C++ families, and measured OceanBase/QGIS performance surprises before implementation began.
