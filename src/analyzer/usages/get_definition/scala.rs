@@ -25,6 +25,17 @@ struct ScalaOwnerIdentity {
     kind: ScalaOwnerKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ScalaWildcardImportOwner {
+    fqn: String,
+    singleton: bool,
+}
+
+enum ScalaWildcardImportOwnerResolution {
+    Resolved(Vec<ScalaWildcardImportOwner>),
+    Ambiguous,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ScalaNameResolution {
     Resolved(ScalaOwnerIdentity),
@@ -40,6 +51,7 @@ struct ForwardScalaNameResolver<'a> {
     scala: &'a ScalaAnalyzer,
     support: &'a dyn BoundedDefinitionLookup,
     package: Arc<str>,
+    package_prefixes: Arc<Vec<String>>,
     imports: Arc<Vec<ImportInfo>>,
 }
 
@@ -70,8 +82,16 @@ impl<'a> ForwardScalaNameResolver<'a> {
             scala,
             support,
             package: Arc::clone(&batch.package),
+            package_prefixes: Arc::new(vec![batch.package.to_string()]),
             imports: Arc::clone(&batch.imports),
         }
+    }
+
+    fn with_package_prefixes(mut self, package_prefixes: Vec<String>) -> Self {
+        if !package_prefixes.is_empty() {
+            self.package_prefixes = Arc::new(package_prefixes);
+        }
+        self
     }
 
     fn resolve(&self, raw: &str) -> Option<String> {
@@ -189,6 +209,116 @@ impl<'a> ForwardScalaNameResolver<'a> {
             ));
         }
         self.resolve_candidate_tier(local_candidates, kind)
+    }
+
+    fn resolve_wildcard_singleton(&self, name: &str) -> ScalaNameResolution {
+        let segments = [name.to_string()];
+        let mut owners = Vec::new();
+        let import_owners = match self.wildcard_import_owners() {
+            ScalaWildcardImportOwnerResolution::Resolved(owners) => owners,
+            ScalaWildcardImportOwnerResolution::Ambiguous => {
+                return ScalaNameResolution::Ambiguous;
+            }
+        };
+        for import_owner in import_owners {
+            let candidates =
+                scala_nested_type_candidates(import_owner.fqn, &segments, import_owner.singleton);
+            let outcome = self.resolve_candidate_tier(candidates, ScalaOwnerKind::SingletonObject);
+            match outcome {
+                ScalaNameResolution::Resolved(owner) => owners.push(owner),
+                ScalaNameResolution::Ambiguous => return ScalaNameResolution::Ambiguous,
+                ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Unresolved => {}
+            }
+        }
+        owners.sort();
+        owners.dedup();
+        match owners.as_slice() {
+            [] => ScalaNameResolution::Unresolved,
+            [owner] => ScalaNameResolution::Resolved(owner.clone()),
+            _ => ScalaNameResolution::Ambiguous,
+        }
+    }
+
+    fn wildcard_import_owners(&self) -> ScalaWildcardImportOwnerResolution {
+        let mut package_roots = Vec::new();
+        let mut singleton_roots = Vec::new();
+        let mut owners = Vec::new();
+        for path in self
+            .imports
+            .iter()
+            .filter(|import| import.is_wildcard)
+            .filter_map(scala_import_path)
+        {
+            let direct = self
+                .import_path_candidates(&path)
+                .into_iter()
+                .find_map(|candidate| self.existing_wildcard_import_owner(candidate));
+            let owner = if let Some(owner) = direct {
+                owner
+            } else {
+                let mut chained = package_roots
+                    .iter()
+                    .filter_map(|root: &String| {
+                        self.existing_wildcard_import_owner(format!("{root}.{path}"))
+                    })
+                    .chain(singleton_roots.iter().filter_map(|root: &String| {
+                        self.existing_wildcard_import_owner(format!("{root}$.{path}"))
+                    }))
+                    .collect::<Vec<_>>();
+                chained.sort();
+                chained.dedup();
+                match chained.as_slice() {
+                    [] => continue,
+                    [owner] => owner.clone(),
+                    _ => return ScalaWildcardImportOwnerResolution::Ambiguous,
+                }
+            };
+            if owner.singleton {
+                singleton_roots.push(owner.fqn.clone());
+            } else {
+                package_roots.push(owner.fqn.clone());
+            }
+            owners.push(owner);
+        }
+        owners.sort();
+        owners.dedup();
+        ScalaWildcardImportOwnerResolution::Resolved(owners)
+    }
+
+    fn existing_wildcard_import_owner(
+        &self,
+        candidate: String,
+    ) -> Option<ScalaWildcardImportOwner> {
+        if self.support.package_exists(&candidate) {
+            return Some(ScalaWildcardImportOwner {
+                fqn: candidate,
+                singleton: false,
+            });
+        }
+        let fqn = candidate.trim_end_matches('$');
+        let singleton_fqn = format!("{fqn}$");
+        self.support
+            .fqn(&singleton_fqn)
+            .into_iter()
+            .any(|unit| unit.is_class() && unit.fq_name() == singleton_fqn)
+            .then(|| ScalaWildcardImportOwner {
+                fqn: fqn.to_string(),
+                singleton: true,
+            })
+    }
+
+    fn import_path_candidates(&self, path: &str) -> Vec<String> {
+        let mut candidates = Vec::new();
+        for prefix in self.package_prefixes.iter().rev() {
+            if prefix.is_empty() || path.starts_with(&format!("{prefix}.")) {
+                continue;
+            }
+            candidates.push(format!("{prefix}.{path}"));
+        }
+        candidates.push(path.to_string());
+        let mut seen = HashSet::default();
+        candidates.retain(|candidate| seen.insert(candidate.clone()));
+        candidates
     }
 
     fn resolve_candidate_tier(
@@ -362,6 +492,44 @@ pub(crate) enum ScalaTypeLookupResolution {
     InappropriateSymbolContext,
 }
 
+fn scala_package_prefixes_at(root: Node<'_>, source: &str, reference_byte: usize) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    let mut segments = Vec::new();
+    let mut container = root;
+    loop {
+        let mut nested_body = None;
+        let mut cursor = container.walk();
+        for child in container.named_children(&mut cursor) {
+            if child.start_byte() > reference_byte {
+                break;
+            }
+            if child.kind() != "package_clause" {
+                continue;
+            }
+            let Some(name) = child.child_by_field_name("name") else {
+                continue;
+            };
+            let clause_segments = scala_type_lookup_segments(name, source);
+            if clause_segments.is_empty() {
+                continue;
+            }
+            segments.extend(clause_segments);
+            prefixes.push(segments.join("."));
+            if let Some(body) = child.child_by_field_name("body").filter(|body| {
+                body.start_byte() <= reference_byte && reference_byte < body.end_byte()
+            }) {
+                nested_body = Some(body);
+                break;
+            }
+        }
+        let Some(body) = nested_body else {
+            break;
+        };
+        container = body;
+    }
+    prefixes
+}
+
 pub(crate) fn scala_type_lookup_resolution(
     analyzer: &dyn IAnalyzer,
     support: &dyn BoundedDefinitionLookup,
@@ -371,7 +539,9 @@ pub(crate) fn scala_type_lookup_resolution(
     site: &ResolvedReferenceSite,
 ) -> Option<ScalaTypeLookupResolution> {
     let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer)?;
-    let resolver = ScalaNameResolver::for_file(scala, support, file);
+    let resolver = ScalaNameResolver::for_file(scala, support, file).with_package_prefixes(
+        scala_package_prefixes_at(root, source, site.focus_start_byte),
+    );
     let ctx = ScalaLookupCtx {
         scala,
         analyzer,
@@ -419,14 +589,21 @@ pub(super) fn resolve_scala(
             format!("`{}` is not a Scala reference site", site.text),
         );
     }
+    if scala_is_pattern_binding(node, source) {
+        return no_definition(
+            "local_variable_reference",
+            format!("`{}` is a local Scala pattern binding", site.text),
+        );
+    }
 
-    if let Some(outcome) =
-        resolve_scala_bare_apply_fast_path(scala, analyzer, support, file, source, root, node)
-    {
+    let resolver = ScalaNameResolver::for_batch(scala, support, &batch)
+        .with_package_prefixes(scala_package_prefixes_at(root, source, node.start_byte()));
+    if let Some(outcome) = resolve_scala_bare_apply_fast_path(
+        scala, analyzer, support, file, source, root, node, &resolver,
+    ) {
         return outcome;
     }
 
-    let resolver = ScalaNameResolver::for_batch(scala, support, &batch);
     let ctx = ScalaLookupCtx {
         scala,
         analyzer,
@@ -518,6 +695,7 @@ fn resolve_scala_bare_apply_fast_path(
     source: &str,
     root: Node<'_>,
     node: Node<'_>,
+    resolver: &ScalaNameResolver<'_>,
 ) -> Option<DefinitionLookupOutcome> {
     let Some(ScalaReferenceNode::Call(call)) = scala_reference_node(node) else {
         return None;
@@ -541,11 +719,25 @@ fn resolve_scala_bare_apply_fast_path(
             name,
         )
         || scala_imported_member_shadows_bare_call(scala, support, file, name, call_arity)
+        || resolver.resolve_wildcard_singleton(name) != ScalaNameResolution::Unresolved
     {
         return None;
     }
 
-    let resolver = ScalaNameResolver::for_file(scala, support, file);
+    let ctx = ScalaLookupCtx {
+        scala,
+        analyzer,
+        support,
+        file,
+        source,
+    };
+    let local_segments = [name.to_string()];
+    if !scala_type_annotation_has_explicit_import(ctx, name)
+        && let Some(owner_fqn) =
+            scala_same_file_type_fqn(ctx, &local_segments, ScalaOwnerKind::Class)
+    {
+        return Some(scala_apply_or_type_outcome(support, &owner_fqn, name));
+    }
     let owner_fqn = resolver
         .resolve_singleton(name)
         .or_else(|| resolver.resolve(name))?;
@@ -810,6 +1002,30 @@ fn scala_is_declaration_name(node: Node<'_>) -> bool {
         )
 }
 
+fn scala_is_pattern_binding(node: Node<'_>, source: &str) -> bool {
+    let name = scala_node_text(node, source).trim();
+    if name.is_empty() || !matches!(node.kind(), "identifier" | "operator_identifier") {
+        return false;
+    }
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "case_clause" {
+            return parent
+                .child_by_field_name("pattern")
+                .is_some_and(|pattern| {
+                    pattern.start_byte() <= node.start_byte()
+                        && node.end_byte() <= pattern.end_byte()
+                        && scala_pattern_names(pattern, source).contains(&name)
+                });
+        }
+        if SCALA_SCOPE_NODES.contains(&parent.kind()) {
+            return false;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
 fn scala_is_type_position(node: Node<'_>) -> bool {
     let mut current = node;
     while let Some(parent) = current.parent() {
@@ -966,6 +1182,18 @@ fn resolve_scala_call(
                 call_arity_for_reference(function),
             ) {
                 return imported_member;
+            }
+            match resolver.resolve_wildcard_singleton(name) {
+                ScalaNameResolution::Resolved(owner) => {
+                    return scala_apply_or_type_outcome(ctx.support, &owner.fqn, name);
+                }
+                ScalaNameResolution::Ambiguous => {
+                    return no_definition(
+                        "ambiguous_scala_wildcard_import",
+                        format!("Scala wildcard imports expose multiple `{name}` objects"),
+                    );
+                }
+                ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Unresolved => {}
             }
             if let Some(owner_fqn) = resolver.resolve_singleton(name).or_else(|| {
                 scala_resolve_visible_type_annotation(ctx, resolver, name, function.start_byte())
@@ -1982,6 +2210,12 @@ fn scala_resolve_visible_type_node(
         return None;
     }
     let kind = scala_type_node_owner_kind(node);
+    let type_text = scala_node_text(node, ctx.source);
+    if !scala_type_annotation_has_explicit_import(ctx, type_text)
+        && let Some(local) = scala_same_file_type_fqn(ctx, &segments, kind)
+    {
+        return Some(local);
+    }
     match resolver.resolve_type_node(node, ctx.source, kind) {
         ScalaNameResolution::Resolved(owner) => Some(owner.fqn),
         ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous => None,
@@ -1997,6 +2231,35 @@ fn scala_resolve_visible_type_node(
             node.start_byte(),
         ),
     }
+}
+
+fn scala_same_file_type_fqn(
+    ctx: ScalaLookupCtx<'_>,
+    segments: &[String],
+    kind: ScalaOwnerKind,
+) -> Option<String> {
+    let package = scala_package_name_of(ctx.scala, ctx.file).unwrap_or_default();
+    let candidates = scala_nested_type_candidates(package, segments, false);
+    let mut matches = Vec::new();
+    for candidate in candidates {
+        let fqn = match kind {
+            ScalaOwnerKind::Class => candidate.trim_end_matches('$').to_string(),
+            ScalaOwnerKind::SingletonObject if candidate.ends_with('$') => candidate,
+            ScalaOwnerKind::SingletonObject => format!("{candidate}$"),
+        };
+        matches.extend(
+            ctx.support
+                .fqn(&fqn)
+                .into_iter()
+                .filter(|unit| {
+                    unit.is_class() && unit.fq_name() == fqn && unit.source() == ctx.file
+                })
+                .map(|unit| unit.fq_name()),
+        );
+    }
+    matches.sort();
+    matches.dedup();
+    (matches.len() == 1).then(|| matches.remove(0))
 }
 
 fn scala_type_node_owner_kind(node: Node<'_>) -> ScalaOwnerKind {
