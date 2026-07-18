@@ -17026,6 +17026,79 @@ fn scala_object_apply_call_resolves_to_definition() {
 }
 
 #[test]
+fn scala_bare_calls_do_not_confuse_universal_construction_with_instance_apply_or_object() {
+    let source = r#"package app
+
+class FunType(prefix: String) {
+  def apply(index: Int): String = prefix
+}
+
+final class PcConvertToNamedLambdaParameters(driver: String, params: Int)
+object PcConvertToNamedLambdaParameters { val codeActionId = "convert" }
+
+sealed abstract class Chunk[+A] {
+  def apply(index: Int): A
+}
+object Chunk
+
+object Consumer {
+  val funType = FunType("Function")
+  val conversion = PcConvertToNamedLambdaParameters("driver", 1)
+  val header = Chunk("package", "app")
+  val options = Chunk("--driver", "local")
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Calls.scala", source)
+        .build();
+    let references = [
+        "FunType(\"Function\")",
+        "PcConvertToNamedLambdaParameters(\"driver\", 1)",
+        "Chunk(\"package\", \"app\")",
+        "Chunk(\"--driver\", \"local\")",
+    ]
+    .into_iter()
+    .map(|needle| {
+        let start = source.find(needle).expect("bare call");
+        let prefix = &source[..start];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let column = prefix
+            .rsplit_once('\n')
+            .map_or(prefix, |(_, current)| current)
+            .chars()
+            .count()
+            + 1;
+        format!(r#"{{"path":"app/Calls.scala","line":{line},"column":{column}}}"#)
+    })
+    .collect::<Vec<_>>()
+    .join(",");
+    let value = lookup(
+        project.root(),
+        &format!(r#"{{"references":[{references}]}}"#),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[0]["definitions"][0]["fqn"], "app.FunType.FunType",
+        "{value}"
+    );
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[1]["definitions"][0]["fqn"],
+        "app.PcConvertToNamedLambdaParameters.PcConvertToNamedLambdaParameters",
+        "{value}"
+    );
+    for result in &results[2..] {
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "no_applicable_scala_callable",
+            "{value}"
+        );
+    }
+}
+
+#[test]
 fn scala_uppercase_local_call_shadows_same_package_object_apply() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

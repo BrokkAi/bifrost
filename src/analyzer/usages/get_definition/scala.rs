@@ -681,28 +681,62 @@ fn resolve_scala_bare_apply_fast_path(
         && let Some(owner_fqn) =
             scala_same_file_type_fqn(ctx, &local_segments, ScalaOwnerKind::Class)
     {
-        return Some(scala_apply_or_type_outcome(support, &owner_fqn, name));
+        return Some(scala_apply_or_constructor_outcome(
+            scala, support, &owner_fqn, name, call_arity,
+        ));
     }
     let owner_fqn = resolver
         .resolve_singleton(name)
         .or_else(|| resolver.resolve(name))?;
-    Some(scala_apply_or_type_outcome(support, &owner_fqn, name))
+    Some(scala_apply_or_constructor_outcome(
+        scala, support, &owner_fqn, name, call_arity,
+    ))
 }
 
-fn scala_apply_or_type_outcome(
+fn scala_apply_or_constructor_outcome(
+    scala: &ScalaAnalyzer,
     support: &dyn BoundedDefinitionLookup,
     owner_fqn: &str,
     reference: &str,
+    call_arity: Option<usize>,
 ) -> DefinitionLookupOutcome {
-    let companion_base = owner_fqn.trim_end_matches('$');
-    let mut apply_candidates = support.fqn(&format!("{companion_base}$.apply"));
-    if apply_candidates.is_empty() {
-        apply_candidates = support.fqn(&format!("{owner_fqn}.apply"));
-    }
+    let class_fqn = owner_fqn.trim_end_matches('$');
+    let apply_fqn = format!("{class_fqn}$.apply");
+    let apply_candidates = support
+        .fqn(&apply_fqn)
+        .into_iter()
+        .filter(|unit| {
+            unit.is_function()
+                && unit.fq_name() == apply_fqn
+                && call_arity.is_none_or(|arity| method_call_arity_applies(scala, unit, arity))
+        })
+        .collect::<Vec<_>>();
     if !apply_candidates.is_empty() {
         return candidates_outcome(apply_candidates);
     }
-    scala_fqn_outcome(support, owner_fqn, reference)
+
+    let constructor_name = scala_constructor_member_name(class_fqn);
+    let constructor_fqn = format!("{class_fqn}.{constructor_name}");
+    let constructor_candidates = support
+        .fqn(&constructor_fqn)
+        .into_iter()
+        .filter(|unit| {
+            unit.is_function()
+                && unit.is_synthetic()
+                && unit.fq_name() == constructor_fqn
+                && call_arity.is_none_or(|arity| method_call_arity_applies(scala, unit, arity))
+        })
+        .collect::<Vec<_>>();
+    if !constructor_candidates.is_empty() {
+        return candidates_outcome(constructor_candidates);
+    }
+
+    no_definition(
+        "no_applicable_scala_callable",
+        format!(
+            "`{reference}` has no indexed companion `apply` or universal constructor matching this call"
+        ),
+    )
 }
 
 fn scala_type_lookup_node_fqn(
@@ -1193,7 +1227,13 @@ fn resolve_scala_call(
             }
             match resolver.resolve_wildcard_singleton(name) {
                 ScalaNameResolution::Resolved(owner) => {
-                    return scala_apply_or_type_outcome(ctx.support, &owner.fqn, name);
+                    return scala_apply_or_constructor_outcome(
+                        ctx.scala,
+                        ctx.support,
+                        &owner.fqn,
+                        name,
+                        call_arity_for_reference(function),
+                    );
                 }
                 ScalaNameResolution::Ambiguous => {
                     return no_definition(
@@ -1206,7 +1246,13 @@ fn resolve_scala_call(
             if let Some(owner_fqn) = resolver.resolve_singleton(name).or_else(|| {
                 scala_resolve_visible_type_annotation(ctx, resolver, name, function.start_byte())
             }) {
-                return scala_apply_or_type_outcome(ctx.support, &owner_fqn, name);
+                return scala_apply_or_constructor_outcome(
+                    ctx.scala,
+                    ctx.support,
+                    &owner_fqn,
+                    name,
+                    call_arity_for_reference(function),
+                );
             }
             if scala_import_boundary_for_name(ctx.scala, ctx.support, ctx.file, name) {
                 return boundary(format!(
