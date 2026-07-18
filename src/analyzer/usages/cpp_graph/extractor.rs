@@ -503,8 +503,9 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         return;
     }
-    let recovered_return_type = recovered_macro_function_return_type(node).is_some();
-    if !recovered_return_type
+    let recovered_type = recovered_macro_function_return_type(node).is_some()
+        || recovered_qualified_declarator_type(node);
+    if !recovered_type
         && !matches!(
             node.kind(),
             "type_identifier" | "qualified_identifier" | "scoped_type_identifier" | "template_type"
@@ -512,7 +513,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
-    if !recovered_return_type
+    if !recovered_type
         && matches!(node.kind(), "qualified_identifier" | "scoped_identifier")
         && let Some(owners) = out_of_line_member_definition_owner(
             ctx.analyzer,
@@ -530,10 +531,10 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         return;
     }
-    if !recovered_return_type && is_nested_type_node(node) {
+    if !recovered_type && is_nested_type_node(node) {
         return;
     }
-    if !recovered_return_type && is_declaration_name(node) {
+    if !recovered_type && is_declaration_name(node) {
         if let Some(owners) = out_of_line_member_definition_owner(
             ctx.analyzer,
             ctx.visibility,

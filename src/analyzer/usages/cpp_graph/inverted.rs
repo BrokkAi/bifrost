@@ -36,7 +36,8 @@ use super::resolver::{
     infer_cpp_initializer_binding, infer_cpp_initializer_type, is_declaration_name,
     is_declarator_node, is_nested_type_node, normalize_type_text,
     out_of_line_member_definition_owner, recovered_macro_function_return_type,
-    resolve_declaring_member_owner, same_visible_symbol, type_owner_of,
+    recovered_qualified_declarator_type, resolve_declaring_member_owner, same_visible_symbol,
+    type_owner_of,
 };
 use super::syntax::explicit_qualified_callable_value;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
@@ -244,7 +245,10 @@ fn record_reference(
         return;
     }
     match node.kind() {
-        "namespace_identifier" if recovered_macro_function_return_type(node).is_some() => {
+        "namespace_identifier"
+            if recovered_macro_function_return_type(node).is_some()
+                || recovered_qualified_declarator_type(node) =>
+        {
             record_type_reference(node, ctx);
         }
         // A type reference (`Foo x`, base class, `new Foo()`'s type child) resolves

@@ -2366,9 +2366,61 @@ pub(in crate::analyzer::usages) fn call_arity(node: Node<'_>) -> usize {
 pub(in crate::analyzer::usages) fn argument_children<'tree>(
     node: Node<'tree>,
 ) -> impl Iterator<Item = Node<'tree>> {
+    let recovered_block_arguments = recovered_block_literal_arguments(node);
     (0..node.child_count())
         .filter_map(move |index| node.child(index))
         .filter(|child| child.is_named() && !child.is_extra())
+        .flat_map(move |child| {
+            if let Some((raw, left, right)) = recovered_block_arguments
+                && child == raw
+            {
+                [Some(left), Some(right)]
+            } else {
+                [Some(child), None]
+            }
+        })
+        .flatten()
+}
+
+fn recovered_block_literal_arguments<'tree>(
+    arguments: Node<'tree>,
+) -> Option<(Node<'tree>, Node<'tree>, Node<'tree>)> {
+    if arguments.kind() != "argument_list" {
+        return None;
+    }
+    let mut raw_arguments = (0..arguments.child_count())
+        .filter_map(|index| arguments.child(index))
+        .filter(|child| child.is_named() && !child.is_extra());
+    let raw = raw_arguments.next()?;
+    if raw_arguments.next().is_some() || raw.kind() != "binary_expression" {
+        return None;
+    }
+
+    let left = raw.child_by_field_name("left")?;
+    if left.is_missing() || left.start_byte() == left.end_byte() {
+        return None;
+    }
+    let right = raw.child_by_field_name("right")?;
+    if right.kind() != "compound_literal_expression"
+        || right.is_missing()
+        || right
+            .child_by_field_name("type")
+            .is_none_or(|node| node.kind() != "type_descriptor" || node.is_missing())
+        || right
+            .child_by_field_name("value")
+            .is_none_or(|node| node.kind() != "initializer_list" || node.is_missing())
+    {
+        return None;
+    }
+    let has_intervening_error = (0..raw.child_count())
+        .filter_map(|index| raw.child(index))
+        .any(|child| {
+            child.kind() == "ERROR"
+                && !child.is_missing()
+                && child.start_byte() >= left.end_byte()
+                && child.end_byte() <= right.start_byte()
+        });
+    has_intervening_error.then_some((raw, left, right))
 }
 
 pub(in crate::analyzer::usages) fn constructor_type_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -2856,6 +2908,65 @@ pub(in crate::analyzer::usages) fn is_declarator_node(node: Node<'_>) -> bool {
             | "parenthesized_declarator"
             | "function_declarator"
     )
+}
+
+pub(super) fn recovered_qualified_declarator_type(node: Node<'_>) -> bool {
+    if node.kind() != "namespace_identifier" || node.is_missing() {
+        return false;
+    }
+    let Some(qualified) = node.parent() else {
+        return false;
+    };
+    if qualified.kind() != "qualified_identifier"
+        || qualified.child_by_field_name("scope") != Some(node)
+        || !(0..qualified.child_count())
+            .filter_map(|index| qualified.child(index))
+            .any(|child| child.kind() == "::" && child.is_missing())
+    {
+        return false;
+    }
+    let Some(pointer) = qualified.child_by_field_name("name") else {
+        return false;
+    };
+    if pointer.kind() != "pointer_type_declarator" {
+        return false;
+    }
+    let Some(terminal) = pointer.child_by_field_name("declarator") else {
+        return false;
+    };
+    if terminal.is_missing()
+        || terminal.start_byte() == terminal.end_byte()
+        || !matches!(
+            terminal.kind(),
+            "identifier" | "field_identifier" | "type_identifier"
+        )
+    {
+        return false;
+    }
+
+    let Some(parent) = qualified.parent() else {
+        return false;
+    };
+    let declaration = if parent.kind() == "init_declarator"
+        && parent.child_by_field_name("declarator") == Some(qualified)
+    {
+        parent
+            .parent()
+            .filter(|declaration| declaration.kind() == "declaration")
+    } else if parent.kind() == "declaration"
+        && parent.child_by_field_name("declarator") == Some(qualified)
+    {
+        Some(parent)
+    } else {
+        None
+    };
+    declaration
+        .and_then(|declaration| declaration.child_by_field_name("type"))
+        .is_some_and(|type_node| {
+            type_node != qualified
+                && !type_node.is_missing()
+                && type_node.start_byte() != type_node.end_byte()
+        })
 }
 
 /// Aggregate-owner proof for a structurally recognized designated initializer.

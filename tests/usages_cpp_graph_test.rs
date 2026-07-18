@@ -10676,6 +10676,7 @@ void exercise(base::HistogramTester& tester, base::WrongOwner& wrong) {
     tester.Select(/* integer */ 13); // positive-known-int-overload
     tester.Select(/* floating */ 13.5); // negative-known-double-overload
 }
+
 }
 "#,
         )
@@ -10843,6 +10844,258 @@ void exercise(base::HistogramTester& tester, base::WrongOwner& wrong) {
         authoritative_exact_ranges(&analyzer, std::slice::from_ref(&select_int), &consumer),
         BTreeSet::from([int_range])
     );
+}
+
+#[test]
+fn authoritative_c_usage_recovers_logical_arguments_for_blocks_calls() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "blocks.h",
+            r#"#pragma once
+typedef int Boolean;
+typedef struct Bucket { int value; } Bucket;
+typedef struct Context { int value; } Context;
+void ApplyTwo(Context* context, Boolean (^block)(Bucket));
+void ApplyThree(Context* first, Context* second, Boolean (^block)(Bucket));
+void ApplyComma(Context* context);
+"#,
+        )
+        .file(
+            "consumer.c",
+            r#"#include "blocks.h"
+void exercise(Context* first, Context* second) {
+    ApplyTwo(first, ^(Bucket bucket) { return bucket.value; }); // positive-two-argument-block
+    ApplyTwo(first); // negative-one-argument
+    ApplyTwo(first, second, ^(Bucket bucket) { return bucket.value; }); // negative-three-argument-block
+    ApplyThree(first, second, ^(Bucket bucket) { return bucket.value; }); // positive-three-argument-block
+    ApplyComma((first, second)); // positive-real-comma-expression
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.c");
+    let source = consumer.read_to_string().expect("Blocks consumer source");
+    let forward_at = |start: usize| {
+        let line_start = source[..start].rfind('\n').map_or(0, |newline| newline + 1);
+        let line = source[..start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let column = source[line_start..start].chars().count() + 1;
+        brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "consumer.c".to_string(),
+                    line: Some(line),
+                    column: Some(column),
+                }],
+            },
+        )
+        .results
+        .into_iter()
+        .next()
+        .expect("one forward Blocks lookup result")
+    };
+    let apply_two_mismatches = BTreeSet::from([
+        fixture_token_range(
+            &source,
+            "    ApplyTwo(first); // negative-one-argument",
+            "ApplyTwo",
+        ),
+        fixture_token_range(
+            &source,
+            "    ApplyTwo(first, second, ^(Bucket bucket) { return bucket.value; }); // negative-three-argument-block",
+            "ApplyTwo",
+        ),
+    ]);
+
+    let cases = [
+        (
+            "ApplyTwo",
+            "    ApplyTwo(first, ^(Bucket bucket) { return bucket.value; }); // positive-two-argument-block",
+        ),
+        (
+            "ApplyThree",
+            "    ApplyThree(first, second, ^(Bucket bucket) { return bucket.value; }); // positive-three-argument-block",
+        ),
+        (
+            "ApplyComma",
+            "    ApplyComma((first, second)); // positive-real-comma-expression",
+        ),
+    ];
+    for (name, line) in cases {
+        let target = definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Function && unit.fq_name() == name
+        });
+        let expected = BTreeSet::from([fixture_token_range(&source, line, name)]);
+        let positive_start = expected.iter().next().expect("one positive call range").0;
+        let forward = forward_at(positive_start);
+        assert_eq!("resolved", forward.status, "{forward:#?}");
+        assert!(
+            forward
+                .definitions
+                .iter()
+                .any(|definition| definition.fqn.as_deref() == Some(name)),
+            "public forward lookup must resolve the positive {name} call: {forward:#?}"
+        );
+
+        let targeted =
+            authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &consumer);
+        assert_eq!(
+            targeted, expected,
+            "targeted inverse lookup must preserve the recovered logical arity for {name}"
+        );
+        let whole = UsageFinder::new().find_usages_default(&analyzer, &[target.clone()]);
+        let whole_ranges = whole
+            .all_hits_including_imports()
+            .into_iter()
+            .filter(|hit| hit.file == consumer)
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            whole_ranges, expected,
+            "whole-workspace lookup must share the recovered logical arity for {name}"
+        );
+        if name == "ApplyTwo" {
+            assert!(
+                targeted.is_disjoint(&apply_two_mismatches)
+                    && whole_ranges.is_disjoint(&apply_two_mismatches),
+                "one- and three-argument ApplyTwo calls must remain excluded: targeted={targeted:#?}, whole={whole_ranges:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn authoritative_c_usage_recovers_block_qualified_declarator_type() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"#pragma once
+typedef const void * const_any_pointer_t;
+namespace other { using Alias = int; }
+"#,
+        )
+        .file(
+            "consumer.c",
+            r#"#include "types.h"
+void collect(void* keybuf) {
+    __block const_any_pointer_t *keys = keybuf; // positive-recovered-block-type
+    other::Alias *ordinary = 0; // positive-ordinary-qualified-type
+    (void)keys;
+    (void)ordinary;
+}
+void shadow_type_name(int const_any_pointer_t) { // negative-shadow-declaration
+    const_any_pointer_t += 1; // negative-shadow-use
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.c");
+    let source = consumer.read_to_string().expect("recovered type source");
+    let forward_at = |start: usize| {
+        let line_start = source[..start].rfind('\n').map_or(0, |newline| newline + 1);
+        let line = source[..start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let column = source[line_start..start].chars().count() + 1;
+        brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "consumer.c".to_string(),
+                    line: Some(line),
+                    column: Some(column),
+                }],
+            },
+        )
+        .results
+        .into_iter()
+        .next()
+        .expect("one forward recovered-type lookup result")
+    };
+    let ordinary_range = fixture_token_range(
+        &source,
+        "    other::Alias *ordinary = 0; // positive-ordinary-qualified-type",
+        "other::Alias",
+    );
+    let shadow_ranges = BTreeSet::from([
+        fixture_token_range(
+            &source,
+            "void shadow_type_name(int const_any_pointer_t) { // negative-shadow-declaration",
+            "const_any_pointer_t",
+        ),
+        fixture_token_range(
+            &source,
+            "    const_any_pointer_t += 1; // negative-shadow-use",
+            "const_any_pointer_t",
+        ),
+    ]);
+
+    let cases = [
+        (
+            "const_any_pointer_t",
+            "    __block const_any_pointer_t *keys = keybuf; // positive-recovered-block-type",
+            "const_any_pointer_t",
+            0,
+        ),
+        (
+            "other.Alias",
+            "    other::Alias *ordinary = 0; // positive-ordinary-qualified-type",
+            "other::Alias",
+            "other::".len(),
+        ),
+    ];
+    for (fq_name, line, token, focus_offset) in cases {
+        let target = definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Class && unit.fq_name() == fq_name && !unit.is_synthetic()
+        });
+        let expected = BTreeSet::from([fixture_token_range(&source, line, token)]);
+        let positive_start =
+            expected.iter().next().expect("one positive type range").0 + focus_offset;
+        let forward = forward_at(positive_start);
+        assert_eq!("resolved", forward.status, "{forward:#?}");
+        assert!(
+            forward
+                .definitions
+                .iter()
+                .any(|definition| definition.fqn.as_deref() == Some(fq_name)),
+            "public forward lookup must resolve the positive {fq_name} type: {forward:#?}"
+        );
+
+        let targeted =
+            authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &consumer);
+        assert_eq!(
+            targeted, expected,
+            "targeted inverse lookup must distinguish recovered and ordinary qualified types for {fq_name}"
+        );
+        let whole = UsageFinder::new().find_usages_default(&analyzer, &[target.clone()]);
+        let whole_ranges = whole
+            .all_hits_including_imports()
+            .into_iter()
+            .filter(|hit| hit.file == consumer)
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            whole_ranges, expected,
+            "whole-workspace lookup must distinguish recovered and ordinary qualified types for {fq_name}"
+        );
+        if fq_name == "const_any_pointer_t" {
+            assert!(
+                !targeted.contains(&ordinary_range)
+                    && !whole_ranges.contains(&ordinary_range)
+                    && targeted.is_disjoint(&shadow_ranges)
+                    && whole_ranges.is_disjoint(&shadow_ranges),
+                "ordinary qualification and lexical shadows must not leak into the recovered typedef target: targeted={targeted:#?}, whole={whole_ranges:#?}"
+            );
+        }
+    }
 }
 
 #[test]
