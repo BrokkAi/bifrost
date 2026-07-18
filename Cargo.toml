@@ -19,6 +19,8 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 bincode = "1.3.3"
+cap-std = { version = "4.0.2", default-features = false }
+cap-fs-ext = { version = "4.0.2", default-features = false, features = ["std"] }
 # NLP / semantic_search stack. The embedder is voyageai/voyage-4-nano
 # (Qwen3-bidirectional), served by the PyTorch SDPA sidecar (one process per device,
 # fused attention on CUDA/Metal/CPU) — see `nlp/voyage_sidecar.rs` and

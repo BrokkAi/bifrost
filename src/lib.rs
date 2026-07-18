@@ -48,6 +48,7 @@ mod test_support;
 mod text_utils;
 pub mod tool_arguments;
 mod util;
+mod workspace_document;
 pub use analyzer::policy;
 pub use analyzer::usages;
 

@@ -28,13 +28,13 @@ use crate::{
     },
     searchtools_render::{RenderOptions, RenderText},
     structured_data::{jq, xml_select, xml_skim},
+    workspace_document::{WorkspaceDocumentError, WorkspaceRoot, read_workspace_document},
 };
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fmt;
-use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -162,6 +162,7 @@ pub struct SearchToolsService {
 
 struct WorkspaceSession {
     snapshot: Arc<WorkspaceAnalyzer>,
+    document_root: Arc<WorkspaceRoot>,
     watcher: SessionWatcher,
     #[cfg(feature = "nlp")]
     semantic: Option<Arc<SemanticIndexer>>,
@@ -179,17 +180,19 @@ enum SessionWatcher {
 struct WorkspaceQueryScope {
     source_snapshot: Arc<WorkspaceAnalyzer>,
     snapshot: Arc<WorkspaceAnalyzer>,
+    document_root: Arc<WorkspaceRoot>,
     context: Arc<crate::analyzer::AnalyzerQueryContext>,
 }
 
 impl WorkspaceQueryScope {
-    fn new(source_snapshot: Arc<WorkspaceAnalyzer>) -> Self {
+    fn new(source_snapshot: Arc<WorkspaceAnalyzer>, document_root: Arc<WorkspaceRoot>) -> Self {
         let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
-        Self::with_context(source_snapshot, context)
+        Self::with_context(source_snapshot, document_root, context)
     }
 
     fn with_context(
         source_snapshot: Arc<WorkspaceAnalyzer>,
+        document_root: Arc<WorkspaceRoot>,
         context: Arc<crate::analyzer::AnalyzerQueryContext>,
     ) -> Self {
         let snapshot = Arc::new(source_snapshot.as_ref().clone());
@@ -197,6 +200,7 @@ impl WorkspaceQueryScope {
         Self {
             source_snapshot,
             snapshot,
+            document_root,
             context,
         }
     }
@@ -206,7 +210,15 @@ impl WorkspaceQueryScope {
     }
 
     fn scope_snapshot(&self, source_snapshot: Arc<WorkspaceAnalyzer>) -> Self {
-        Self::with_context(source_snapshot, Arc::clone(&self.context))
+        Self::with_context(
+            source_snapshot,
+            Arc::clone(&self.document_root),
+            Arc::clone(&self.context),
+        )
+    }
+
+    fn document_root(&self) -> &WorkspaceRoot {
+        &self.document_root
     }
 
     fn finish<T>(
@@ -710,7 +722,7 @@ impl SearchToolsService {
     }
 
     fn query_code_result_for_snapshot(
-        snapshot: &WorkspaceAnalyzer,
+        snapshot: &WorkspaceQueryScope,
         arguments: Value,
     ) -> Result<crate::analyzer::structural::CodeQueryResult, SearchToolsServiceError> {
         let query = Self::decode_query_code_input(snapshot, arguments)?;
@@ -721,7 +733,7 @@ impl SearchToolsService {
     }
 
     fn decode_query_code_input(
-        snapshot: &WorkspaceAnalyzer,
+        snapshot: &WorkspaceQueryScope,
         arguments: Value,
     ) -> Result<crate::analyzer::structural::CodeQuery, SearchToolsServiceError> {
         let Some(query_file) = arguments.get("query_file") else {
@@ -741,7 +753,7 @@ impl SearchToolsService {
             SearchToolsServiceError::invalid_params("query_file must be a string path")
         })?;
         let root = snapshot.analyzer().project().root();
-        let path = root.join(query_file);
+        let path = Path::new(query_file);
         let extension = match path.extension().and_then(|extension| extension.to_str()) {
             Some("rql") | Some("json") => path.extension().and_then(|extension| extension.to_str()),
             Some(extension) => {
@@ -755,15 +767,23 @@ impl SearchToolsService {
                 )));
             }
         };
-        let contents = Self::read_query_file(&path, query_file)?;
+        let contents = read_workspace_document(
+            snapshot.document_root(),
+            path,
+            &["rql", "json"],
+            MAX_QUERY_FILE_BYTES,
+        )
+        .map_err(|error| Self::query_file_read_error(query_file, error))?;
         let value = match extension {
-            Some("rql") => crate::analyzer::structural::query::sexp::sexp_to_json(&contents)
-                .map_err(|error| {
-                    SearchToolsServiceError::invalid_params(format!(
-                        "failed to parse RQL query file `{query_file}`: {error}"
-                    ))
-                }),
-            Some("json") => serde_json::from_str::<Value>(&contents).map_err(|error| {
+            Some("rql") => crate::analyzer::structural::query::sexp::sexp_to_json(
+                contents.source(),
+            )
+            .map_err(|error| {
+                SearchToolsServiceError::invalid_params(format!(
+                    "failed to parse RQL query file `{query_file}`: {error}"
+                ))
+            }),
+            Some("json") => serde_json::from_str::<Value>(contents.source()).map_err(|error| {
                 SearchToolsServiceError::invalid_params(format!(
                     "failed to parse JSON query file `{query_file}`: {error}"
                 ))
@@ -779,44 +799,37 @@ impl SearchToolsService {
         })
     }
 
-    fn read_query_file(path: &Path, query_file: &str) -> Result<String, SearchToolsServiceError> {
-        let metadata = fs::metadata(path).map_err(|error| {
-            SearchToolsServiceError::invalid_params(format!(
-                "failed to read query file `{query_file}`: {error}"
-            ))
-        })?;
-        if !metadata.is_file() {
-            return Err(SearchToolsServiceError::invalid_params(format!(
-                "query file `{query_file}` must be a regular file"
-            )));
-        }
-        if metadata.len() > MAX_QUERY_FILE_BYTES {
-            return Err(SearchToolsServiceError::invalid_params(format!(
-                "query file `{query_file}` is too large: {} bytes exceeds {MAX_QUERY_FILE_BYTES}",
-                metadata.len()
-            )));
-        }
-
-        let file = fs::File::open(path).map_err(|error| {
-            SearchToolsServiceError::invalid_params(format!(
-                "failed to read query file `{query_file}`: {error}"
-            ))
-        })?;
-        let mut contents = String::new();
-        file.take(MAX_QUERY_FILE_BYTES + 1)
-            .read_to_string(&mut contents)
-            .map_err(|error| {
-                SearchToolsServiceError::invalid_params(format!(
-                    "failed to read query file `{query_file}`: {error}"
-                ))
-            })?;
-        if contents.len() as u64 > MAX_QUERY_FILE_BYTES {
-            return Err(SearchToolsServiceError::invalid_params(format!(
-                "query file `{query_file}` is too large: more than {MAX_QUERY_FILE_BYTES} bytes"
-            )));
-        }
-
-        Ok(contents)
+    fn query_file_read_error(
+        query_file: &str,
+        error: WorkspaceDocumentError,
+    ) -> SearchToolsServiceError {
+        let message = match error {
+            WorkspaceDocumentError::NotRegularFile { .. } => {
+                format!("query file `{query_file}` must be a regular file")
+            }
+            WorkspaceDocumentError::TooLarge {
+                bytes: Some(bytes),
+                max_bytes,
+                ..
+            } => {
+                format!("query file `{query_file}` is too large: {bytes} bytes exceeds {max_bytes}")
+            }
+            WorkspaceDocumentError::TooLarge {
+                bytes: None,
+                max_bytes,
+                ..
+            } => format!("query file `{query_file}` is too large: more than {max_bytes} bytes"),
+            WorkspaceDocumentError::SymlinkNotAllowed { .. } => format!(
+                "failed to read query file `{query_file}`: query file path resolves outside active workspace or traverses a symbolic link"
+            ),
+            WorkspaceDocumentError::PathEscapesWorkspace { .. } => {
+                format!(
+                    "failed to read query file `{query_file}`: query file path resolves outside active workspace"
+                )
+            }
+            error => format!("failed to read query file `{query_file}`: {error}"),
+        };
+        SearchToolsServiceError::invalid_params(message)
     }
 
     pub fn active_workspace_root(&self) -> PathBuf {
@@ -1270,7 +1283,10 @@ impl SearchToolsService {
             UpdateStrategy::WatchFiles => Self::apply_watcher_delta(session),
             UpdateStrategy::Manual => {}
         }
-        Ok(WorkspaceQueryScope::new(Arc::clone(&session.snapshot)))
+        Ok(WorkspaceQueryScope::new(
+            Arc::clone(&session.snapshot),
+            Arc::clone(&session.document_root),
+        ))
     }
 
     fn handle_get_symbol_sources(
@@ -1333,7 +1349,10 @@ impl SearchToolsService {
             UpdateStrategy::Manual => {}
         }
         Ok((
-            WorkspaceQueryScope::new(Arc::clone(&session.snapshot)),
+            WorkspaceQueryScope::new(
+                Arc::clone(&session.snapshot),
+                Arc::clone(&session.document_root),
+            ),
             session.semantic.clone(),
         ))
     }
@@ -1731,6 +1750,10 @@ fn assemble_session(
     semantic_indexing: bool,
     watcher_starter: &WatcherStarter,
 ) -> Result<WorkspaceSession, String> {
+    let document_root = Arc::new(
+        WorkspaceRoot::open(project.root())
+            .map_err(|error| format!("Failed to open workspace document root: {error}"))?,
+    );
     let watcher = start_session_watcher(Arc::clone(&project), update_strategy, watcher_starter)?;
     let snapshot = Arc::new(workspace);
     #[cfg(feature = "nlp")]
@@ -1739,6 +1762,7 @@ fn assemble_session(
     let _ = semantic_indexing;
     Ok(WorkspaceSession {
         snapshot,
+        document_root,
         watcher,
         #[cfg(feature = "nlp")]
         semantic,
@@ -2119,7 +2143,9 @@ mod analyzer_failure_boundary_tests {
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join("Model.java"), "class Model {}\n").unwrap();
         let (_project, workspace) = build_transient_workspace(root).unwrap();
-        let scope = WorkspaceQueryScope::new(Arc::new(workspace));
+        let document_root =
+            Arc::new(WorkspaceRoot::open(workspace.analyzer().project().root()).unwrap());
+        let scope = WorkspaceQueryScope::new(Arc::new(workspace), document_root);
         scope
             .context
             .record_store_error(StoreError::new("injected store failure"));
@@ -2198,6 +2224,7 @@ public partial class MudDialogContainer
             root: RwLock::new(project.root().to_path_buf()),
             session: RwLock::new(Some(WorkspaceSession {
                 snapshot: Arc::new(workspace),
+                document_root: Arc::new(WorkspaceRoot::open(project.root()).unwrap()),
                 watcher: SessionWatcher::Disabled,
                 #[cfg(feature = "nlp")]
                 semantic: None,
@@ -2429,6 +2456,7 @@ mod tests {
             root: RwLock::new(dir.path().to_path_buf()),
             session: RwLock::new(Some(WorkspaceSession {
                 snapshot,
+                document_root: Arc::new(WorkspaceRoot::open(dir.path()).unwrap()),
                 watcher: SessionWatcher::Disabled,
                 semantic: Some(indexer.clone()),
             })),
