@@ -4315,6 +4315,16 @@ fn cpp_class_declaration_strength(
     analyzer: &dyn IAnalyzer,
     candidate: &CodeUnit,
 ) -> CppClassDeclarationStrength {
+    if let Some(prepared) = resolve_analyzer::<CppAnalyzer>(analyzer)
+        .and_then(|cpp| cpp.prepared_syntax(candidate.source()))
+    {
+        return cpp_class_declaration_strength_in_tree(
+            analyzer,
+            candidate,
+            prepared.source(),
+            prepared.tree().root_node(),
+        );
+    }
     let Some(source) = analyzer.indexed_source(candidate.source()) else {
         return CppClassDeclarationStrength::Unknown;
     };
@@ -4332,10 +4342,19 @@ fn cpp_class_declaration_strength(
     let Some(tree) = parser.parse(&source, None) else {
         return CppClassDeclarationStrength::Unknown;
     };
+    cpp_class_declaration_strength_in_tree(analyzer, candidate, &source, tree.root_node())
+}
+
+fn cpp_class_declaration_strength_in_tree(
+    analyzer: &dyn IAnalyzer,
+    candidate: &CodeUnit,
+    source: &str,
+    root: Node<'_>,
+) -> CppClassDeclarationStrength {
     let ranges = analyzer.ranges(candidate);
     let mut saw_forward = false;
     for range in ranges {
-        let mut stack = vec![tree.root_node()];
+        let mut stack = vec![root];
         while let Some(node) = stack.pop() {
             if node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
                 continue;
@@ -4350,7 +4369,7 @@ fn cpp_class_declaration_strength(
                     }
                     saw_forward = true;
                 } else if let Some(has_body) =
-                    recovered_exported_class_has_body(node, &source, candidate.identifier())
+                    recovered_exported_class_has_body(node, source, candidate.identifier())
                 {
                     if has_body {
                         return CppClassDeclarationStrength::Full;
@@ -4950,5 +4969,100 @@ mod tests {
             ),
             DirectOwnerResolution::Ambiguous
         ));
+    }
+
+    #[test]
+    fn class_strength_reuses_one_prepared_tree_for_qgis_sized_sibling_set() {
+        const SIBLING_COUNT: usize = 113;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), "siblings.h");
+        let mut source = String::from("#pragma once\nnamespace qgis {\n");
+        for index in 0..SIBLING_COUNT {
+            if index % 2 == 0 {
+                source.push_str(&format!("class Sibling{index};\n"));
+            } else {
+                source.push_str(&format!("struct Sibling{index} {{ int value; }};\n"));
+            }
+        }
+        source.push_str("}\n");
+        file.write(&source).expect("write sibling fixture");
+
+        let project = Arc::new(crate::analyzer::TestProject::new(
+            &root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let workspace = crate::analyzer::WorkspaceAnalyzer::build(
+            project,
+            crate::analyzer::AnalyzerConfig::default(),
+        );
+        let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
+        let mut candidates = cpp
+            .get_all_declarations()
+            .into_iter()
+            .filter(|candidate| {
+                candidate.is_class()
+                    && candidate.package_name() == "qgis"
+                    && candidate.short_name().starts_with("Sibling")
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| {
+            candidate
+                .short_name()
+                .trim_start_matches("Sibling")
+                .parse::<usize>()
+                .expect("numeric sibling suffix")
+        });
+        assert_eq!(candidates.len(), SIBLING_COUNT, "physical siblings");
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.source() == &file),
+            "every candidate must share the same source: {candidates:#?}"
+        );
+
+        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+        assert!(
+            cpp.prepared_syntax(&file).is_some(),
+            "prepare shared syntax"
+        );
+        cpp.reset_cpp_owner_resolution_counts_for_test();
+        let strengths = candidates
+            .iter()
+            .map(|candidate| cpp_class_declaration_strength(workspace.analyzer(), candidate))
+            .collect::<Vec<_>>();
+        for (index, strength) in strengths.into_iter().enumerate() {
+            let expected = if index % 2 == 0 {
+                CppClassDeclarationStrength::Forward
+            } else {
+                CppClassDeclarationStrength::Full
+            };
+            assert!(
+                strength == expected,
+                "Sibling{index} strength changed: expected {}, got {}",
+                if expected == CppClassDeclarationStrength::Forward {
+                    "forward"
+                } else {
+                    "full"
+                },
+                if strength == CppClassDeclarationStrength::Forward {
+                    "forward"
+                } else if strength == CppClassDeclarationStrength::Full {
+                    "full"
+                } else {
+                    "unknown"
+                }
+            );
+        }
+        assert_eq!(
+            cpp.cpp_class_strength_parse_count_for_test(),
+            0,
+            "class strength must not reparse an already-prepared source"
+        );
+        assert_eq!(
+            cpp.prepared_syntax_parse_count_for_test(&file),
+            1,
+            "all candidates must share the request-scoped prepared tree"
+        );
     }
 }
