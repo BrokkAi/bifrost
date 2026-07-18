@@ -184,9 +184,13 @@ fn companion_apply_owner_is_unambiguous(
         return false;
     };
     if let Some(structural_owner) = scala.structural_parent_of(target) {
-        return scala
+        if scala
             .project_types()
-            .type_accepts_object_roles(scala, &structural_owner);
+            .type_accepts_object_roles(scala, &structural_owner)
+        {
+            return true;
+        }
+        return inherited_companion_apply_fallback_is_unambiguous(scala, target, &structural_owner);
     }
     let normalized_target = scala_normalized_fq_name(&target.fq_name());
     !scala
@@ -200,6 +204,56 @@ fn companion_apply_owner_is_unambiguous(
                 .project_types()
                 .type_accepts_object_roles(scala, &candidate_owner)
         })
+}
+
+fn inherited_companion_apply_fallback_is_unambiguous(
+    scala: &ScalaAnalyzer,
+    target: &CodeUnit,
+    owner: &CodeUnit,
+) -> bool {
+    let index = scala.global_usage_definition_index();
+    let normalized_target = scala_normalized_fq_name(&target.fq_name());
+    if index
+        .by_normalized_fqn(&normalized_target)
+        .iter()
+        .any(|candidate| candidate.is_function() && candidate != target)
+    {
+        return false;
+    }
+
+    let normalized_owner = scala_normalized_fq_name(&owner.fq_name());
+    let mut companions = index
+        .by_normalized_fqn(&normalized_owner)
+        .iter()
+        .filter(|candidate| {
+            candidate.is_class()
+                && *candidate != owner
+                && scala
+                    .project_types()
+                    .type_accepts_object_roles(scala, candidate)
+        });
+    let Some(companion) = companions.next() else {
+        return false;
+    };
+    if companions.next().is_some() {
+        return false;
+    }
+
+    let Some(facts) = scala.forward_owner_facts(companion) else {
+        return false;
+    };
+    !facts.supertype_lookup_paths.is_empty()
+        && std::iter::once(companion.clone())
+            .chain(scala.get_ancestors(companion))
+            .all(|candidate_owner| {
+                !scala
+                    .definitions(&format!("{}.apply", candidate_owner.fq_name()))
+                    .any(|candidate| {
+                        candidate.is_function()
+                            && scala.structural_parent_of(&candidate).as_ref()
+                                == Some(&candidate_owner)
+                    })
+            })
 }
 
 struct InheritedMemberOwners {

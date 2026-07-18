@@ -1350,6 +1350,83 @@ object Action {
 }
 
 #[test]
+fn scala_inherited_companion_apply_fallback_preserves_exact_owner_identity() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "app/Factories.scala",
+            r#"package app
+
+trait KnownFactory {
+  def apply(value: Int): Int
+}
+
+class ExternalBacked {
+  def apply(index: Int): Int = index
+}
+object ExternalBacked extends external.Factory[ExternalBacked]
+
+class Plain {
+  def apply(index: Int): Int = index
+}
+object Plain
+
+class Known {
+  def apply(index: Int): Int = index
+}
+object Known extends KnownFactory
+
+class Duplicate {
+  def apply(index: Int): Int = index
+}
+object Duplicate extends external.Factory[Duplicate]
+
+object Use {
+  val external = ExternalBacked(1)
+  val plain = Plain(2)
+  val known = Known(3)
+  val duplicate = Duplicate(4)
+}
+"#,
+        ),
+        (
+            "app/Duplicate.scala",
+            r#"package app
+object Duplicate extends external.Factory[Duplicate]
+"#,
+        ),
+        (
+            "other/Factories.scala",
+            r#"package other
+class ExternalBacked {
+  def apply(index: Int): Int = index
+}
+object ExternalBacked extends external.Factory[ExternalBacked]
+object Use {
+  val external = ExternalBacked(5)
+}
+"#,
+        ),
+    ]);
+
+    let external = definition(&analyzer, "app.ExternalBacked.apply");
+    let external_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&external)));
+    assert_hit_contains(&external_hits, "val external = ExternalBacked(1)");
+    assert_no_hit_contains(&external_hits, "val external = ExternalBacked(5)");
+
+    for (target_fqn, rejected_call) in [
+        ("app.Plain.apply", "val plain = Plain(2)"),
+        ("app.Known.apply", "val known = Known(3)"),
+        ("app.Duplicate.apply", "val duplicate = Duplicate(4)"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_no_hit_contains(&target_hits, rejected_call);
+    }
+}
+
+#[test]
 fn scala_union_receiver_requires_every_structured_alternative_to_share_member_family() {
     let consumer_source = r#"package app
 
