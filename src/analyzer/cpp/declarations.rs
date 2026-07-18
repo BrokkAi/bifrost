@@ -2846,8 +2846,7 @@ fn cpp_parameter_type(parameter: Node<'_>, source: &str) -> String {
         .child_by_field_name("type")
         .map(|node| normalize_cpp_whitespace(node_text(node, source)))
         .unwrap_or_default();
-    let declarator_suffix = parameter
-        .child_by_field_name("declarator")
+    let declarator_suffix = cpp_parameter_declarator(parameter)
         .map(|node| cpp_declarator_suffix_without_name(node, source))
         .unwrap_or_default();
 
@@ -2861,28 +2860,68 @@ fn cpp_parameter_type(parameter: Node<'_>, source: &str) -> String {
     normalize_cpp_type_text(&combined)
 }
 
+fn cpp_parameter_declarator(parameter: Node<'_>) -> Option<Node<'_>> {
+    parameter.child_by_field_name("declarator").or_else(|| {
+        // Some unnamed prototype parameters expose their abstract declarator
+        // as a direct named child without the grammar's `declarator` field.
+        // Recover only the structured abstract-declarator node; the parameter's
+        // type and qualifiers are distinct children and must not be guessed from
+        // source text.
+        let mut cursor = parameter.walk();
+        parameter
+            .named_children(&mut cursor)
+            .find(|child| is_cpp_abstract_declarator(child.kind()))
+    })
+}
+
+fn is_cpp_abstract_declarator(kind: &str) -> bool {
+    matches!(
+        kind,
+        "abstract_pointer_declarator"
+            | "abstract_reference_declarator"
+            | "abstract_array_declarator"
+            | "abstract_function_declarator"
+            | "abstract_parenthesized_declarator"
+    )
+}
+
+fn cpp_nested_declarator(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("declarator").or_else(|| {
+        if is_cpp_abstract_declarator(node.kind()) {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| is_cpp_abstract_declarator(child.kind()))
+        } else {
+            // Named declarators historically use their last named child when
+            // tree-sitter omits the field. Keep that broad fallback for
+            // attributed, variadic, and recovered named shapes.
+            last_named_child(node)
+        }
+    })
+}
+
 fn cpp_declarator_suffix_without_name(node: Node<'_>, source: &str) -> String {
     match node.kind() {
         "identifier" | "field_identifier" => String::new(),
-        "pointer_declarator" => {
-            let inner = node
-                .child_by_field_name("declarator")
-                .or_else(|| last_named_child(node))
+        "pointer_declarator" | "abstract_pointer_declarator" => {
+            let inner = cpp_nested_declarator(node)
                 .map(|child| cpp_declarator_suffix_without_name(child, source))
                 .unwrap_or_default();
             format!("*{inner}")
         }
-        "reference_declarator" => {
-            let inner = node
-                .child_by_field_name("declarator")
-                .or_else(|| last_named_child(node))
+        "reference_declarator" | "abstract_reference_declarator" => {
+            let inner = cpp_nested_declarator(node)
                 .map(|child| cpp_declarator_suffix_without_name(child, source))
                 .unwrap_or_default();
-            format!("&{inner}")
+            let reference = node
+                .children(&mut node.walk())
+                .find(|child| matches!(child.kind(), "&" | "&&"))
+                .map(|child| node_text(child, source))
+                .unwrap_or("&");
+            format!("{reference}{inner}")
         }
-        "array_declarator" => {
-            let inner = node
-                .child_by_field_name("declarator")
+        "array_declarator" | "abstract_array_declarator" => {
+            let inner = cpp_nested_declarator(node)
                 .map(|child| cpp_declarator_suffix_without_name(child, source))
                 .unwrap_or_default();
             let size = node
@@ -2891,14 +2930,14 @@ fn cpp_declarator_suffix_without_name(node: Node<'_>, source: &str) -> String {
                 .unwrap_or_default();
             format!("{inner}[{size}]")
         }
-        "parenthesized_declarator" => node
-            .child_by_field_name("declarator")
-            .or_else(|| last_named_child(node))
-            .map(|child| format!("({})", cpp_declarator_suffix_without_name(child, source)))
-            .unwrap_or_default(),
-        "function_declarator" => {
-            let inner = node
-                .child_by_field_name("declarator")
+        "parenthesized_declarator" | "abstract_parenthesized_declarator" => {
+            let inner = cpp_nested_declarator(node);
+            inner
+                .map(|child| format!("({})", cpp_declarator_suffix_without_name(child, source)))
+                .unwrap_or_default()
+        }
+        "function_declarator" | "abstract_function_declarator" => {
+            let inner = cpp_nested_declarator(node)
                 .map(|child| cpp_declarator_suffix_without_name(child, source))
                 .unwrap_or_default();
             let params = node

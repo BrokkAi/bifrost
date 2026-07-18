@@ -6992,6 +6992,135 @@ void consume(char selected) {
 }
 
 #[test]
+fn authoritative_cpp_usage_unifies_abstract_prototype_declarators_with_named_definitions() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "api.h",
+            r#"typedef struct zip_extra_field zip_extra_field_t;
+void _zip_ef_free(zip_extra_field_t*);
+"#,
+        ),
+        (
+            "probe.c",
+            r#"#include "api.h"
+struct zip_extra_field { int value; };
+void _zip_ef_free(zip_extra_field_t *ef) { ef->value = 0; }
+void consume(zip_extra_field_t *from) { _zip_ef_free(from); }
+"#,
+        ),
+        (
+            "forms.hpp",
+            r#"#pragma once
+struct Payload {};
+void pointer_form(Payload*);
+void lvalue_form(Payload&);
+void rvalue_form(Payload&&);
+void nested_reference_form(Payload *&);
+void array_form(Payload[4]);
+void function_form(void (*)(Payload*));
+"#,
+        ),
+        (
+            "forms.cpp",
+            r#"#include "forms.hpp"
+void pointer_form(Payload *value) {}
+void lvalue_form(Payload &value) {}
+void rvalue_form(Payload &&value) {}
+void nested_reference_form(Payload *&value) {}
+void array_form(Payload value[4]) {}
+void function_form(void (*value)(Payload*)) {}
+"#,
+        ),
+    ]);
+
+    let declarations = analyzer.get_all_declarations();
+    for (name, expected_signature) in [
+        ("_zip_ef_free", "(zip_extra_field_t *)"),
+        ("pointer_form", "(Payload *)"),
+        ("lvalue_form", "(Payload &)"),
+        ("rvalue_form", "(Payload &&)"),
+        ("nested_reference_form", "(Payload *&)"),
+        ("array_form", "(Payload [4])"),
+        ("function_form", "(void (*)(Payload *))"),
+    ] {
+        let signatures = declarations
+            .iter()
+            .filter(|unit| unit.kind() == CodeUnitType::Function && unit.fq_name() == name)
+            .map(|unit| {
+                (
+                    slash_path(unit.source()),
+                    unit.signature().map(str::to_string),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            signatures.len(),
+            2,
+            "fixture must retain one prototype and one definition for {name}: {signatures:#?}"
+        );
+        assert!(
+            signatures
+                .iter()
+                .all(|(_, signature)| signature.as_deref() == Some(expected_signature)),
+            "abstract prototype and named definition must share {name} identity: {signatures:#?}"
+        );
+    }
+
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "_zip_ef_free"
+            && slash_path(unit.source()) == "probe.c"
+    });
+    let consumer = project.file("probe.c");
+    let source = consumer.read_to_string().expect("consumer source");
+    let start = source
+        .find("_zip_ef_free(from)")
+        .expect("pointer-parameter call");
+    let end = start + "_zip_ef_free".len();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    assert_eq!(
+        query.candidate_files,
+        std::iter::once(consumer.clone()).collect(),
+        "authoritative query must scan only probe.c"
+    );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = query.result
+    else {
+        panic!("expected authoritative C free-function usage success");
+    };
+    let hits = hits_by_overload.get(&target).cloned().unwrap_or_default();
+    assert_eq!(hits.len(), 1, "only the exact call should hit: {hits:#?}");
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == consumer && hit.start_offset == start && hit.end_offset == end
+        }),
+        "missing exact pointer-parameter call {start}..{end}: {hits:#?}"
+    );
+    assert_eq!(
+        unproven_total_by_overload
+            .get(&target)
+            .copied()
+            .unwrap_or_default(),
+        0,
+        "the definition-selected call must be proven"
+    );
+}
+
+#[test]
 fn authoritative_cpp_usage_resolves_constructor_owner_from_malformed_export_definition() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
         ("widget_fwd.h", "namespace views { class Widget; }\n"),
