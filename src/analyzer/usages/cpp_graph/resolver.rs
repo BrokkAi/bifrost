@@ -1636,11 +1636,11 @@ pub(super) enum EnclosingMemberOwnerResolution {
     Missing,
 }
 
-pub(super) fn resolve_enclosing_member_owner(
+pub(super) fn resolve_declaring_member_owner(
     analyzer: &dyn IAnalyzer,
     visibility: &VisibilityIndex,
     file: &ProjectFile,
-    enclosing_owner: &CodeUnit,
+    receiver_owner: &CodeUnit,
     member_name: &str,
 ) -> EnclosingMemberOwnerResolution {
     let Some(hierarchy) = analyzer.type_hierarchy_provider() else {
@@ -1667,11 +1667,14 @@ pub(super) fn resolve_enclosing_member_owner(
             _ => EnclosingMemberOwnerResolution::Ambiguous,
         }
     };
-    let direct = resolve_level(std::slice::from_ref(enclosing_owner));
+    // The first declaration on each structured base path hides deeper names,
+    // regardless of whether its callable overload is applicable at a particular
+    // call site. Applicability is checked only after this owner is established.
+    let direct = resolve_level(std::slice::from_ref(receiver_owner));
     if !matches!(direct, EnclosingMemberOwnerResolution::Missing) {
         return direct;
     }
-    let mut stack = hierarchy.get_direct_ancestors(enclosing_owner);
+    let mut stack = hierarchy.get_direct_ancestors(receiver_owner);
     let mut propagated_counts: HashMap<CodeUnit, u8> = HashMap::default();
     let mut path_matches = Vec::new();
     while let Some(owner) = stack.pop() {

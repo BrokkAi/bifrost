@@ -9094,6 +9094,209 @@ struct NestedDepthSkew : Composite {
 }
 
 #[test]
+fn authoritative_cpp_explicit_derived_receivers_use_unique_inherited_declaring_owner() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"#pragma once
+namespace demo {
+struct Base { void run(int value); };
+struct OtherBase { void run(int value); };
+struct Derived : Base {};
+struct Override : Base { void run(int value); };
+struct Hidden : Base { void run(int first, int second); };
+struct Ambiguous : Base, OtherBase {};
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "types.h"
+namespace demo {
+void exercise(Base& direct, Derived* pointer, Derived value, Override override_value,
+              Hidden hidden, OtherBase unrelated, Ambiguous ambiguous) {
+    direct.run(1); // positive-direct-base-control
+    pointer->run(2); // positive-derived-pointer
+    value.run(3); // positive-derived-value
+    override_value.run(4); // negative-derived-override
+    hidden.run(5); // negative-nearer-name-hides-even-when-inapplicable
+    unrelated.run(6); // negative-unrelated-owner
+    ambiguous.run(7); // negative-distinct-base-paths
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Base.run"
+            && slash_path(unit.source()) == "types.h"
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("derived receiver source");
+    let positives = [
+        "    direct.run(1); // positive-direct-base-control",
+        "    pointer->run(2); // positive-derived-pointer",
+        "    value.run(3); // positive-derived-value",
+    ]
+    .map(|line| fixture_token_range(&source, line, "run"));
+    let expected = positives.into_iter().collect::<BTreeSet<_>>();
+    let negatives = [
+        "    override_value.run(4); // negative-derived-override",
+        "    hidden.run(5); // negative-nearer-name-hides-even-when-inapplicable",
+        "    unrelated.run(6); // negative-unrelated-owner",
+        "    ambiguous.run(7); // negative-distinct-base-paths",
+    ]
+    .map(|line| fixture_token_range(&source, line, "run"));
+
+    for (start, end) in &expected {
+        let line_start = source[..*start]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let line = source[..*start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let column = source[line_start..*start].chars().count() + 1;
+        let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "consumer.cc".to_string(),
+                    line: Some(line),
+                    column: Some(column),
+                }],
+            },
+        );
+        assert_eq!(
+            "resolved", forward.results[0].status,
+            "positive receiver run token {start}..{end} must resolve: {forward:#?}"
+        );
+        assert!(
+            forward.results[0]
+                .definitions
+                .iter()
+                .any(|definition| definition.fqn.as_deref() == Some("demo.Base.run")),
+            "positive receiver run token {start}..{end} must resolve to Base.run: {forward:#?}"
+        );
+    }
+
+    let targeted = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &consumer);
+    let whole = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let whole_ranges = whole
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == consumer)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        (&targeted, &whole_ranges),
+        (&expected, &expected),
+        "targeted and whole-workspace explicit receiver lookup must agree on Base.run"
+    );
+    assert!(
+        negatives
+            .into_iter()
+            .all(|negative| { !targeted.contains(&negative) && !whole_ranges.contains(&negative) }),
+        "override, hiding, unrelated, and ambiguous receivers must remain excluded: targeted={targeted:#?}, whole={whole_ranges:#?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_bare_calls_are_not_reinterpreted_as_same_named_receiver_values() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"#pragma once
+namespace demo {
+struct Trap { void collide(int value); };
+extern Trap collide;
+struct Base {
+    void collide(int value);
+    void direct();
+};
+struct Derived : Base { void inherited(); };
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "types.h"
+namespace demo {
+void Base::direct() {
+    collide(1); // positive-bare-direct-value-name-collision
+}
+void Derived::inherited() {
+    collide(2); // positive-bare-inherited-value-name-collision
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Base.collide"
+            && slash_path(unit.source()) == "types.h"
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("bare call source");
+    let expected = BTreeSet::from([
+        fixture_token_range(
+            &source,
+            "    collide(1); // positive-bare-direct-value-name-collision",
+            "collide",
+        ),
+        fixture_token_range(
+            &source,
+            "    collide(2); // positive-bare-inherited-value-name-collision",
+            "collide",
+        ),
+    ]);
+
+    for (start, end) in &expected {
+        let line_start = source[..*start]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let line = source[..*start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let column = source[line_start..*start].chars().count() + 1;
+        let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "consumer.cc".to_string(),
+                    line: Some(line),
+                    column: Some(column),
+                }],
+            },
+        );
+        assert_eq!(
+            "resolved", forward.results[0].status,
+            "bare collide token {start}..{end} must resolve: {forward:#?}"
+        );
+        assert!(
+            forward.results[0]
+                .definitions
+                .iter()
+                .any(|definition| definition.fqn.as_deref() == Some("demo.Base.collide")),
+            "bare collide token {start}..{end} must resolve to Base.collide: {forward:#?}"
+        );
+    }
+
+    let targeted = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &consumer);
+    assert_eq!(
+        targeted, expected,
+        "bare calls must retain their implicit owner instead of reinterpreting the identifier as a receiver value"
+    );
+}
+
+#[test]
 fn authoritative_cpp_ordinary_using_type_imports_are_lexical_and_surface_consistent() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

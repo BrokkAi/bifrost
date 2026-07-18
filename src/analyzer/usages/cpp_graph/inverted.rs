@@ -36,7 +36,7 @@ use super::resolver::{
     infer_cpp_initializer_binding, infer_cpp_initializer_type, is_declaration_name,
     is_declarator_node, is_nested_type_node, normalize_type_text,
     out_of_line_member_definition_owner, recovered_macro_function_return_type,
-    resolve_enclosing_member_owner, same_visible_symbol, type_owner_of,
+    resolve_declaring_member_owner, same_visible_symbol, type_owner_of,
 };
 use super::syntax::explicit_qualified_callable_value;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
@@ -79,7 +79,7 @@ where
                 source: parsed.source.as_str(),
                 ordinary_type_imports,
                 class_ranges: ClassRangeIndex::build(analyzer, file),
-                enclosing_member_cache: HashMap::default(),
+                declaring_member_cache: HashMap::default(),
                 collector,
             };
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -95,7 +95,7 @@ struct CppScan<'a, 'b> {
     source: &'a str,
     ordinary_type_imports: OrdinaryTypeImportCell,
     class_ranges: ClassRangeIndex,
-    enclosing_member_cache: HashMap<CodeUnit, HashMap<String, EnclosingMemberOwnerResolution>>,
+    declaring_member_cache: HashMap<CodeUnit, HashMap<String, EnclosingMemberOwnerResolution>>,
     collector: &'a mut EdgeCollector<'b>,
 }
 
@@ -391,23 +391,32 @@ fn record_call(
             if receiver_is_self_like(receiver) {
                 return;
             }
-            if let Some(owner) = receiver_type_unit(receiver, ctx, bindings, 32) {
-                let applicable = match ctx
-                    .visibility
-                    .visible_member_for_owner_name(ctx.file, &owner, name)
-                {
-                    VisibleMemberResolution::Callable(callables) => {
-                        callables.iter().any(|callable| {
-                            cpp_callable_arity(ctx.analyzer, callable).accepts(call_arity(node))
-                        })
+            if let Some(receiver_owner) = receiver_type_unit(receiver, ctx, bindings, 32) {
+                match resolve_declaring_member_owner_cached(ctx, &receiver_owner, name) {
+                    EnclosingMemberOwnerResolution::Owner(owner) => {
+                        match ctx
+                            .visibility
+                            .visible_member_for_owner_name(ctx.file, &owner, name)
+                        {
+                            VisibleMemberResolution::Callable(callables) => {
+                                if let Some(callable) = callables.iter().find(|callable| {
+                                    cpp_callable_arity(ctx.analyzer, callable)
+                                        .accepts(call_arity(node))
+                                }) {
+                                    ctx.record(callable.fq_name(), field);
+                                }
+                            }
+                            VisibleMemberResolution::AmbiguousKind => {
+                                ctx.record_unproven(name, field);
+                            }
+                            VisibleMemberResolution::NonCallable
+                            | VisibleMemberResolution::Missing => {}
+                        }
                     }
-                    VisibleMemberResolution::NonCallable => false,
-                    VisibleMemberResolution::AmbiguousKind | VisibleMemberResolution::Missing => {
-                        true
+                    EnclosingMemberOwnerResolution::Ambiguous => {
+                        ctx.record_unproven(name, field);
                     }
-                };
-                if applicable {
-                    ctx.record(format!("{}.{name}", owner.fq_name()), field);
+                    EnclosingMemberOwnerResolution::Missing => {}
                 }
             } else {
                 ctx.record_unproven(name, field);
@@ -425,7 +434,7 @@ fn record_call(
                 return;
             }
             if let Some(enclosing_owner) = enclosing_callable_owner(function, ctx) {
-                match resolve_enclosing_member_owner_cached(ctx, &enclosing_owner, name) {
+                match resolve_declaring_member_owner_cached(ctx, &enclosing_owner, name) {
                     EnclosingMemberOwnerResolution::Owner(owner)
                         if !same_visible_symbol(&owner, &enclosing_owner) =>
                     {
@@ -471,28 +480,28 @@ fn record_call(
     }
 }
 
-fn resolve_enclosing_member_owner_cached(
+fn resolve_declaring_member_owner_cached(
     ctx: &mut CppScan<'_, '_>,
-    enclosing_owner: &CodeUnit,
+    receiver_owner: &CodeUnit,
     name: &str,
 ) -> EnclosingMemberOwnerResolution {
     if let Some(cached) = ctx
-        .enclosing_member_cache
-        .get(enclosing_owner)
+        .declaring_member_cache
+        .get(receiver_owner)
         .and_then(|by_name| by_name.get(name))
         .cloned()
     {
         return cached;
     }
-    let resolution = resolve_enclosing_member_owner(
+    let resolution = resolve_declaring_member_owner(
         ctx.analyzer,
         ctx.visibility,
         ctx.file,
-        enclosing_owner,
+        receiver_owner,
         name,
     );
-    ctx.enclosing_member_cache
-        .entry(enclosing_owner.clone())
+    ctx.declaring_member_cache
+        .entry(receiver_owner.clone())
         .or_default()
         .insert(name.to_string(), resolution.clone());
     resolution

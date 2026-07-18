@@ -1003,14 +1003,14 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         {
             return;
         }
-        if receiver_matches_target(receiver, ctx) {
-            if receiver_is_self_like(receiver) {
+        match explicit_receiver_target_resolution(receiver, ctx) {
+            MethodReceiverTargetResolution::Target if receiver_is_self_like(receiver) => {
                 push_self_receiver_hit(operator, ctx);
-            } else {
-                push_hit(operator, ctx);
             }
-        } else if !receiver_has_known_non_target(receiver, ctx) {
-            push_unproven_hit(operator, ctx);
+            MethodReceiverTargetResolution::Target => push_hit(operator, ctx),
+            MethodReceiverTargetResolution::Missing => push_unproven_hit(operator, ctx),
+            MethodReceiverTargetResolution::NonTarget
+            | MethodReceiverTargetResolution::Ambiguous => {}
         }
         return;
     }
@@ -1051,21 +1051,31 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         return;
     }
-    if receiver_matches_target(function, ctx) {
-        if receiver_is_self_like(function) {
+    match call_function_target_resolution(function, ctx) {
+        MethodReceiverTargetResolution::Target if receiver_is_self_like(function) => {
             push_self_receiver_hit(function_terminal_node(function), ctx);
-        } else {
+        }
+        MethodReceiverTargetResolution::Target => {
             push_hit(function_terminal_node(function), ctx);
         }
-    } else if same_owner_context(function, ctx) {
-        push_self_receiver_hit(function_terminal_node(function), ctx);
-    } else if function.kind() == "identifier" && resolves_to_lexical_free_function(function, ctx) {
-        // A visible namespace/free function is a proven negative once the
-        // enclosing structured owner and its hierarchy contain no such member.
-    } else if !receiver_has_known_non_target(function, ctx)
-        && !known_non_target_owner_context(function, ctx)
-    {
-        push_unproven_hit(function_terminal_node(function), ctx);
+        MethodReceiverTargetResolution::NonTarget | MethodReceiverTargetResolution::Ambiguous => {}
+        MethodReceiverTargetResolution::Missing if same_owner_context(function, ctx) => {
+            push_self_receiver_hit(function_terminal_node(function), ctx);
+        }
+        MethodReceiverTargetResolution::Missing
+            if function.kind() == "identifier"
+                && resolves_to_lexical_free_function(function, ctx) =>
+        {
+            // A visible namespace/free function is a proven negative once the
+            // enclosing structured owner and its hierarchy contain no such member.
+        }
+        MethodReceiverTargetResolution::Missing
+            if !receiver_has_known_non_target(function, ctx)
+                && !known_non_target_owner_context(function, ctx) =>
+        {
+            push_unproven_hit(function_terminal_node(function), ctx);
+        }
+        MethodReceiverTargetResolution::Missing => {}
     }
 }
 
@@ -1947,6 +1957,116 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     }
 }
 
+fn declaring_owner_for_explicit_receiver(
+    receiver: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> EnclosingMemberOwnerResolution {
+    if receiver_is_self_like(receiver) {
+        return EnclosingMemberOwnerResolution::Missing;
+    }
+    let receiver_units = receiver_type_units(receiver, ctx.source, ctx);
+    let mut declaring_owner = None;
+    for receiver_owner in receiver_units {
+        match cached_declaring_member_owner(&receiver_owner, ctx) {
+            EnclosingMemberOwnerResolution::Owner(owner) => {
+                if declaring_owner
+                    .as_ref()
+                    .is_some_and(|existing| !same_visible_symbol(existing, &owner))
+                {
+                    return EnclosingMemberOwnerResolution::Ambiguous;
+                }
+                declaring_owner = Some(owner);
+            }
+            EnclosingMemberOwnerResolution::Ambiguous => {
+                return EnclosingMemberOwnerResolution::Ambiguous;
+            }
+            EnclosingMemberOwnerResolution::Missing => {}
+        }
+    }
+    declaring_owner
+        .map(EnclosingMemberOwnerResolution::Owner)
+        .unwrap_or(EnclosingMemberOwnerResolution::Missing)
+}
+
+fn declaring_owner_from_call_function(
+    function: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> Option<EnclosingMemberOwnerResolution> {
+    match function.kind() {
+        "field_expression" => function
+            .child_by_field_name("argument")
+            .or_else(|| function.child_by_field_name("object"))
+            .map(|receiver| declaring_owner_for_explicit_receiver(receiver, ctx))
+            .or(Some(EnclosingMemberOwnerResolution::Missing)),
+        "call_expression" => function
+            .child_by_field_name("function")
+            .and_then(|inner| declaring_owner_from_call_function(inner, ctx)),
+        _ => None,
+    }
+}
+
+enum MethodReceiverTargetResolution {
+    Target,
+    NonTarget,
+    Ambiguous,
+    Missing,
+}
+
+fn method_receiver_target_resolution(
+    node: Node<'_>,
+    declaring_owner: EnclosingMemberOwnerResolution,
+    ctx: &ScanCtx<'_>,
+) -> MethodReceiverTargetResolution {
+    let Some(target_owner) = ctx.spec.owner.as_ref() else {
+        return MethodReceiverTargetResolution::Missing;
+    };
+    match declaring_owner {
+        EnclosingMemberOwnerResolution::Owner(owner)
+            if receiver_owner_matches_target(&owner, target_owner, ctx) =>
+        {
+            MethodReceiverTargetResolution::Target
+        }
+        EnclosingMemberOwnerResolution::Owner(owner)
+            if receiver_owner_is_known_non_target(&owner, target_owner, ctx) =>
+        {
+            MethodReceiverTargetResolution::NonTarget
+        }
+        EnclosingMemberOwnerResolution::Owner(_) => MethodReceiverTargetResolution::Missing,
+        EnclosingMemberOwnerResolution::Ambiguous => MethodReceiverTargetResolution::Ambiguous,
+        EnclosingMemberOwnerResolution::Missing if receiver_matches_target(node, ctx) => {
+            MethodReceiverTargetResolution::Target
+        }
+        EnclosingMemberOwnerResolution::Missing if receiver_has_known_non_target(node, ctx) => {
+            MethodReceiverTargetResolution::NonTarget
+        }
+        EnclosingMemberOwnerResolution::Missing => MethodReceiverTargetResolution::Missing,
+    }
+}
+
+fn explicit_receiver_target_resolution(
+    receiver: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> MethodReceiverTargetResolution {
+    method_receiver_target_resolution(
+        receiver,
+        declaring_owner_for_explicit_receiver(receiver, ctx),
+        ctx,
+    )
+}
+
+fn call_function_target_resolution(
+    function: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> MethodReceiverTargetResolution {
+    let Some(declaring_owner) = declaring_owner_from_call_function(function, ctx) else {
+        // A bare function identifier has an implicit receiver. Do not reinterpret
+        // that identifier as a same-named type or value before enclosing-owner
+        // lookup gets a chance to establish the member call.
+        return MethodReceiverTargetResolution::Missing;
+    };
+    method_receiver_target_resolution(function, declaring_owner, ctx)
+}
+
 fn receiver_owner_matches_target(
     receiver_owner: &CodeUnit,
     target_owner: &CodeUnit,
@@ -2689,26 +2809,7 @@ fn structured_owner_context_resolution(
     if receiver_owner_matches_target(&enclosing_owner, target_owner, ctx) {
         return StructuredOwnerContextResolution::Target;
     }
-    let cached = ctx
-        .member_owner_cache
-        .borrow()
-        .get(&enclosing_owner)
-        .cloned();
-    let member_owner = if let Some(cached) = cached {
-        cached
-    } else {
-        let resolved = resolve_enclosing_member_owner(
-            ctx.analyzer,
-            ctx.visibility,
-            ctx.file,
-            &enclosing_owner,
-            &ctx.spec.member_name,
-        );
-        ctx.member_owner_cache
-            .borrow_mut()
-            .insert(enclosing_owner, resolved.clone());
-        resolved
-    };
+    let member_owner = cached_declaring_member_owner(&enclosing_owner, ctx);
     match member_owner {
         EnclosingMemberOwnerResolution::Owner(owner)
             if receiver_owner_matches_target(&owner, target_owner, ctx) =>
@@ -2719,6 +2820,26 @@ fn structured_owner_context_resolution(
         EnclosingMemberOwnerResolution::Ambiguous => StructuredOwnerContextResolution::Ambiguous,
         EnclosingMemberOwnerResolution::Missing => StructuredOwnerContextResolution::Missing,
     }
+}
+
+fn cached_declaring_member_owner(
+    receiver_owner: &CodeUnit,
+    ctx: &ScanCtx<'_>,
+) -> EnclosingMemberOwnerResolution {
+    if let Some(cached) = ctx.member_owner_cache.borrow().get(receiver_owner).cloned() {
+        return cached;
+    }
+    let resolved = resolve_declaring_member_owner(
+        ctx.analyzer,
+        ctx.visibility,
+        ctx.file,
+        receiver_owner,
+        &ctx.spec.member_name,
+    );
+    ctx.member_owner_cache
+        .borrow_mut()
+        .insert(receiver_owner.clone(), resolved.clone());
+    resolved
 }
 
 fn structured_enclosing_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
