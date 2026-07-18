@@ -363,12 +363,68 @@ pub(crate) fn is_identifier_node(node: Node<'_>) -> bool {
 pub(crate) fn is_type_like_reference(node: Node<'_>, source: &str) -> bool {
     node.kind() == "type_identifier"
         || is_constructor_like_reference(node, source)
+        || is_anonymous_instance_mixin_type_reference(node, source)
+        || is_infix_type_operator_reference(node)
         || parent_kind(node).is_some_and(|kind| {
             matches!(
                 kind,
                 "type" | "generic_type" | "parameterized_type" | "extends_clause"
             )
         })
+}
+
+/// Tree-sitter parses Scala 2-style anonymous mixins such as
+/// `new Base with First with Mixin` as a left-associated `infix_expression`
+/// chain. Only the right-hand operands of a `with` chain rooted at an
+/// `instance_expression` are type roles; an ordinary term infix expression is
+/// not.
+fn is_anonymous_instance_mixin_type_reference(node: Node<'_>, source: &str) -> bool {
+    let mut operand = node;
+    while let Some(parent) = operand.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "generic_type" | "applied_constructor_type" | "annotated_type" | "type"
+        ) && (parent.child_by_field_name("type") == Some(operand)
+            || parent.named_child(0) == Some(operand))
+    }) {
+        operand = parent;
+    }
+
+    let Some(expression) = operand.parent().filter(|parent| {
+        parent.kind() == "infix_expression"
+            && parent.child_by_field_name("right") == Some(operand)
+            && parent
+                .child_by_field_name("operator")
+                .is_some_and(|operator| node_text(operator, source).trim() == "with")
+    }) else {
+        return false;
+    };
+
+    let Some(mut left) = expression.child_by_field_name("left") else {
+        return false;
+    };
+    loop {
+        if left.kind() == "instance_expression" {
+            return true;
+        }
+        let Some(previous) = left.child_by_field_name("left").filter(|_| {
+            left.kind() == "infix_expression"
+                && left
+                    .child_by_field_name("operator")
+                    .is_some_and(|operator| node_text(operator, source).trim() == "with")
+        }) else {
+            return false;
+        };
+        left = previous;
+    }
+}
+
+/// In `A TypeOperator B`, the grammar exposes `TypeOperator` as the exact
+/// `operator` field of `infix_type`, even when it is an ordinary `identifier`.
+fn is_infix_type_operator_reference(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "infix_type" && parent.child_by_field_name("operator") == Some(node)
+    })
 }
 
 pub(crate) fn is_scala_object_reference(node: Node<'_>) -> bool {

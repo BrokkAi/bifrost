@@ -494,6 +494,65 @@ class Consumer {
 }
 
 #[test]
+fn scala_inverted_type_edges_include_mixin_and_infix_type_roles_only() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Roles.scala",
+            r#"package model
+
+class Base
+trait First
+trait InHandler
+trait OutHandler
+object InHandler
+
+infix abstract class CanEqual[A, B]
+object CanEqual
+"#,
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+
+import model.{Base, First, InHandler, OutHandler, CanEqual}
+
+object Use {
+  def mixinRole(): Base =
+    new Base with First with InHandler with OutHandler {}
+
+  def infixTypeRole[A, B](evidence: A CanEqual B): Unit = ()
+
+  def termObjectRole: Any = InHandler
+  def ordinaryInfix(left: String, right: String): String = left CanEqual right
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "app.Use$.mixinRole", "model.InHandler"),
+        "anonymous mixin RHS should edge to the exact trait: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "app.Use$.infixTypeRole", "model.CanEqual"),
+        "infix_type operator should edge to the exact type constructor: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$.termObjectRole", "model.InHandler"),
+        "term object role must not edge to its companion trait: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$.ordinaryInfix", "model.CanEqual"),
+        "ordinary term infix operator must not become a type role: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn scala_inverted_companion_nested_and_wildcard_object_roles_are_exact() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

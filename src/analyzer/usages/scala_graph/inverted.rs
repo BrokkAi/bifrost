@@ -2585,6 +2585,16 @@ fn record_reference(
             {
                 return;
             }
+            if is_scala_class_reference(node, ctx.source)
+                && let Some(fqn) = ctx.resolver.resolve(name).or_else(|| {
+                    (bindings.resolve_symbol(name).is_unknown() && !bindings.is_shadowed(name))
+                        .then(|| ctx.lexically_visible_type(node.start_byte(), name))
+                        .flatten()
+                })
+            {
+                ctx.record(fqn, node);
+                return;
+            }
             if let Some(owner) = exact_owner_field_binding(bindings, name) {
                 match ctx.types.field_for_owner_member(ctx.scala, &owner, name) {
                     FieldResolution::Resolved(field) => {

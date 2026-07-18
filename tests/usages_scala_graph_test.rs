@@ -206,6 +206,96 @@ object Use {
 }
 
 #[test]
+fn scala_type_roles_cover_anonymous_mixins_and_infix_type_operators() {
+    let use_source = r#"package app
+
+import model.{Base, First, InHandler, OutHandler, CanEqual}
+
+object Use {
+  def mixinRole(): Base =
+    new Base with First with InHandler with OutHandler {} // positive-mixin
+
+  def infixTypeRole[A, B](evidence: A CanEqual B): Unit = () // positive-infix-type
+
+  def termObjectRole: Any = InHandler // negative-term-object
+  def ordinaryInfix(left: String, right: String): String = left CanEqual right // negative-term-infix
+}
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Roles.scala",
+            r#"package model
+
+class Base
+trait First
+trait InHandler
+trait OutHandler
+object InHandler
+
+infix abstract class CanEqual[A, B]
+object CanEqual
+"#,
+        ),
+        (
+            "other/Roles.scala",
+            r#"package other
+trait InHandler
+infix abstract class CanEqual[A, B]
+"#,
+        ),
+        ("app/Use.scala", use_source),
+    ]);
+
+    for (symbol, positive_marker, negative_marker) in [
+        ("model.InHandler", "positive-mixin", "negative-term-object"),
+        (
+            "model.CanEqual",
+            "positive-infix-type",
+            "negative-term-infix",
+        ),
+    ] {
+        let target = definition(&analyzer, symbol);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_line(&target_hits, line_of(use_source, positive_marker));
+        assert_no_hit_line(&target_hits, line_of(use_source, negative_marker));
+        assert!(
+            target_hits
+                .iter()
+                .all(|hit| hit.file.rel_path() != "other/Roles.scala"),
+            "unrelated type identity leaked for {symbol}: {target_hits:#?}"
+        );
+
+        let mcp = call_search_tool_json(
+            project.root(),
+            "scan_usages_by_reference",
+            &json!({
+                "symbols": [symbol],
+                "include_tests": true,
+            })
+            .to_string(),
+        );
+        let result = &mcp["results"][0];
+        assert_eq!(result["status"], "found", "{mcp}");
+        let mcp_lines = result["files"]
+            .as_array()
+            .expect("MCP usage files")
+            .iter()
+            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+            .filter_map(|hit| hit["line"].as_u64())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            mcp_lines.contains(&(line_of(use_source, positive_marker) as u64)),
+            "MCP result omitted {positive_marker}: {mcp}"
+        );
+        assert!(
+            !mcp_lines.contains(&(line_of(use_source, negative_marker) as u64)),
+            "MCP result included {negative_marker}: {mcp}"
+        );
+    }
+}
+
+#[test]
 fn scala_usage_finder_preserves_exact_companion_nested_and_ambiguous_object_roles() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (
