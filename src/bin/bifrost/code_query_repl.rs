@@ -916,10 +916,18 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
     }
 
     for diagnostic in &output.diagnostics {
+        let kind = format!(
+            "{} [{}]",
+            diagnostic.impact.as_str(),
+            diagnostic.code.as_str()
+        );
         let label = if diagnostic.branch.is_empty() {
-            "note:".to_string()
+            format!("{kind}:")
         } else {
-            format!("note [branch {}]:", format_branch_path(&diagnostic.branch))
+            format!(
+                "{kind} [branch {}]:",
+                format_branch_path(&diagnostic.branch)
+            )
         };
         out.push_str(&format!(
             "{} {}\n",

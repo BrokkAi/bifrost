@@ -8,7 +8,9 @@
 mod common;
 
 use brokk_bifrost::analyzer::structural::{
-    CodeQuery, CodeQueryExecutionLimits, CodeQueryResult, execute, execute_with_limits,
+    CodeQuery, CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
+    CodeQueryExecutionLimits, CodeQueryResult, FileFacts, NormalizedKind, Role,
+    StructuralSearchProvider, execute, execute_with_limits,
 };
 use brokk_bifrost::{
     AnalyzerConfig, CodeUnit, DeclarationInfo, IAnalyzer, Language, Project, ProjectFile, Range,
@@ -62,6 +64,55 @@ struct NoProviderAnalyzer {
     project: Arc<dyn Project>,
     files: BTreeSet<ProjectFile>,
     languages: BTreeSet<Language>,
+    provider: Option<UnavailableStructuralProvider>,
+}
+
+#[derive(Clone, Copy)]
+enum ProviderGap {
+    Source,
+    Facts,
+}
+
+#[derive(Clone)]
+struct UnavailableStructuralProvider {
+    file: ProjectFile,
+    language: Language,
+    source: String,
+    gap: ProviderGap,
+}
+
+impl StructuralSearchProvider for UnavailableStructuralProvider {
+    fn structural_language(&self) -> Language {
+        self.language
+    }
+
+    fn structural_files(&self) -> Vec<ProjectFile> {
+        vec![self.file.clone()]
+    }
+
+    fn structural_source(&self, file: &ProjectFile) -> Option<String> {
+        (*file == self.file && matches!(self.gap, ProviderGap::Facts)).then(|| self.source.clone())
+    }
+
+    fn structural_facts(&self, _file: &ProjectFile) -> Option<Arc<FileFacts>> {
+        None
+    }
+
+    fn structural_extraction_count(&self) -> u64 {
+        0
+    }
+
+    fn structural_hydration_count(&self) -> u64 {
+        0
+    }
+
+    fn structural_supports_kind(&self, _kind: NormalizedKind) -> bool {
+        true
+    }
+
+    fn structural_supports_role(&self, _role: Role) -> bool {
+        true
+    }
 }
 
 impl NoProviderAnalyzer {
@@ -70,6 +121,27 @@ impl NoProviderAnalyzer {
             project,
             files: BTreeSet::from([file]),
             languages: BTreeSet::from([language]),
+            provider: None,
+        }
+    }
+
+    fn with_provider_gap(
+        project: Arc<dyn Project>,
+        file: ProjectFile,
+        language: Language,
+        source: impl Into<String>,
+        gap: ProviderGap,
+    ) -> Self {
+        Self {
+            project,
+            files: BTreeSet::from([file.clone()]),
+            languages: BTreeSet::from([language]),
+            provider: Some(UnavailableStructuralProvider {
+                file,
+                language,
+                source: source.into(),
+                gap,
+            }),
         }
     }
 }
@@ -164,6 +236,13 @@ impl IAnalyzer for NoProviderAnalyzer {
     fn search_definitions(&self, _pattern: &str, _auto_quote: bool) -> BTreeSet<CodeUnit> {
         BTreeSet::new()
     }
+
+    fn structural_search_providers(&self) -> Vec<&dyn StructuralSearchProvider> {
+        self.provider
+            .iter()
+            .map(|provider| provider as &dyn StructuralSearchProvider)
+            .collect()
+    }
 }
 
 fn assert_truncation_diagnostic(output: &CodeQueryResult, limit: usize) {
@@ -172,6 +251,8 @@ fn assert_truncation_diagnostic(output: &CodeQueryResult, limit: usize) {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.language == "workspace"
+                && diagnostic.code == CodeQueryDiagnosticCode::ResultLimitReached
+                && diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete
                 && diagnostic
                     .message
                     .contains(&format!("returned the first {limit} results"))
@@ -188,6 +269,8 @@ fn assert_truncation_diagnostic(output: &CodeQueryResult, limit: usize) {
 fn has_broad_query_diagnostic(output: &CodeQueryResult) -> bool {
     output.diagnostics.iter().any(|diagnostic| {
         diagnostic.language == "workspace"
+            && diagnostic.code == CodeQueryDiagnosticCode::BroadQuery
+            && diagnostic.impact == CodeQueryDiagnosticImpact::Advisory
             && diagnostic.message.contains("broad unanchored")
             && diagnostic.message.contains("where")
             && diagnostic.message.contains("languages")
@@ -409,6 +492,7 @@ fn broad_unanchored_large_complete_queries_get_guidance() {
     );
     assert!(!output.truncated);
     assert_broad_query_diagnostic(&output);
+    assert_eq!(output.completion(), CodeQueryCompletion::Complete);
 }
 
 #[test]
@@ -445,6 +529,7 @@ fn execution_budget_bounds_unanchored_no_match_queries() {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.language == "workspace"
+                && diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
                 && diagnostic.message.contains("execution budget")),
         "missing execution-budget diagnostic: {:?}",
         output.diagnostics
@@ -481,12 +566,57 @@ fn analyzer_language_without_provider_surfaces_as_diagnostic() {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.language == "ruby"
+                && diagnostic.code == CodeQueryDiagnosticCode::MissingStructuralAdapter
                 && diagnostic
                     .message
                     .contains("no structural adapter for ruby yet")),
         "expected a ruby no-provider diagnostic, got: {:?}",
         output.diagnostics
     );
+}
+
+#[test]
+fn provider_listed_seed_files_with_unavailable_source_or_facts_are_incomplete() {
+    let source = "def run():\n    eval(input)\n";
+    for (gap, unavailable) in [
+        (ProviderGap::Source, "indexed source snapshot"),
+        (ProviderGap::Facts, "normalized structural facts"),
+    ] {
+        let project = InlineTestProject::with_language(Language::Python)
+            .file("src/tool.py", source)
+            .build();
+        let analyzer = NoProviderAnalyzer::with_provider_gap(
+            project.project_dyn(),
+            project.file("src/tool.py"),
+            Language::Python,
+            source,
+            gap,
+        );
+
+        let output = run(
+            &analyzer,
+            json!({ "match": { "kind": "call", "callee": { "name": "eval" } } }),
+        );
+
+        assert!(output.structural_matches().is_empty(), "{output:?}");
+        assert!(output.truncated, "omitted seed data must set truncated");
+        assert!(matches!(
+            output.completion(),
+            CodeQueryCompletion::Incomplete { ref codes }
+                if codes.contains(&CodeQueryDiagnosticCode::SemanticResultsOmitted)
+        ));
+        assert!(
+            output.diagnostics.iter().any(|diagnostic| {
+                diagnostic.language == "python"
+                    && diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
+                    && diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete
+                    && diagnostic.message.contains("src/tool.py")
+                    && diagnostic.message.contains(unavailable)
+            }),
+            "missing producer-origin diagnostic for {unavailable}: {:?}",
+            output.diagnostics
+        );
+    }
 }
 
 #[test]
@@ -572,6 +702,7 @@ fn not_kind_precision_limits_surface_as_capability_diagnostics() {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.language == "python"
+                && diagnostic.code == CodeQueryDiagnosticCode::UnsupportedStructuralFeature
                 && diagnostic.message.contains("constructor")),
         "not_kind constraints should be validated: {:?}",
         output.diagnostics

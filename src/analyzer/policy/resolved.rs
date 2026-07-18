@@ -288,6 +288,10 @@ impl ResolvedEndpointDependency {
         &self.origins
     }
 
+    pub(crate) const fn origins_capacity(&self) -> usize {
+        self.origins.capacity()
+    }
+
     /// Mint a local or catalog endpoint from its complete typed composed
     /// projection. No caller supplies either endpoint hash.
     pub(crate) fn from_composed_model(
@@ -474,6 +478,10 @@ impl ResolvedMatchDirectoryManifest {
 
     pub fn selected(&self) -> &[ResolvedEndpointManifestEntry] {
         &self.selected
+    }
+
+    pub(crate) const fn selected_capacity(&self) -> usize {
+        self.selected.capacity()
     }
 
     pub const fn semantic_hash(&self) -> MatchSetManifestHash {

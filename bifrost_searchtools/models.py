@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 
 def _render_numbered_block(text: str, start_line: int) -> str:
@@ -578,8 +579,60 @@ def _code_query_result_item(data: dict) -> CodeQueryResultItem:
     raise ValueError(f"unknown code query result_type: {result_type!r}")
 
 
+class CodeQueryDiagnosticCode(StrEnum):
+    INVALID_PLAN = "invalid_plan"
+    CANCELLED = "cancelled"
+    UNSUPPORTED_STRUCTURAL_FEATURE = "unsupported_structural_feature"
+    MISSING_STRUCTURAL_ADAPTER = "missing_structural_adapter"
+    UNSUPPORTED_IMPORT_ANALYSIS = "unsupported_import_analysis"
+    SEMANTIC_RESULTS_OMITTED = "semantic_results_omitted"
+    RECEIVER_ANALYSIS_PARTIAL = "receiver_analysis_partial"
+    CALL_RELATION_BUDGET_EXHAUSTED = "call_relation_budget_exhausted"
+    CALL_RELATION_PARSE_FAILED = "call_relation_parse_failed"
+    CALL_RELATION_CANDIDATES_OMITTED = "call_relation_candidates_omitted"
+    CALL_RELATION_TARGETS_AMBIGUOUS = "call_relation_targets_ambiguous"
+    CALL_RELATION_CANDIDATE_LIMIT = "call_relation_candidate_limit"
+    CALL_RELATION_ANALYSIS_FAILED = "call_relation_analysis_failed"
+    REFERENCE_SOURCE_BYTES_TRUNCATED = "reference_source_bytes_truncated"
+    REFERENCE_CANDIDATE_FILES_TRUNCATED = "reference_candidate_files_truncated"
+    REFERENCE_CANDIDATES_OMITTED = "reference_candidates_omitted"
+    REFERENCE_TARGETS_AMBIGUOUS = "reference_targets_ambiguous"
+    REFERENCE_CALLSITE_LIMIT = "reference_callsite_limit"
+    REFERENCE_ANALYSIS_FAILED = "reference_analysis_failed"
+    USES_PARSER_UNSUPPORTED = "uses_parser_unsupported"
+    USES_CANDIDATE_LIMIT = "uses_candidate_limit"
+    USES_TARGETS_AMBIGUOUS = "uses_targets_ambiguous"
+    USES_CANDIDATES_OMITTED = "uses_candidates_omitted"
+    EXECUTION_BUDGET_EXHAUSTED = "execution_budget_exhausted"
+    PIPELINE_BUDGET_EXHAUSTED = "pipeline_budget_exhausted"
+    IMPORT_GRAPH_BUDGET_EXHAUSTED = "import_graph_budget_exhausted"
+    RESULT_LIMIT_REACHED = "result_limit_reached"
+    BROAD_QUERY = "broad_query"
+
+
+class CodeQueryDiagnosticImpact(StrEnum):
+    ADVISORY = "advisory"
+    INCOMPLETE = "incomplete"
+    INVALID = "invalid"
+
+
+class CodeQueryCompletionKind(StrEnum):
+    COMPLETE = "complete"
+    INCOMPLETE = "incomplete"
+    CANCELLED = "cancelled"
+    INVALID = "invalid"
+
+
+@dataclass(frozen=True)
+class CodeQueryCompletion:
+    kind: CodeQueryCompletionKind
+    codes: tuple[CodeQueryDiagnosticCode, ...] = ()
+
+
 @dataclass(frozen=True)
 class CodeQueryDiagnostic:
+    code: CodeQueryDiagnosticCode
+    impact: CodeQueryDiagnosticImpact
     language: str
     message: str
     branch: list[int] = field(default_factory=list)
@@ -587,6 +640,8 @@ class CodeQueryDiagnostic:
     @classmethod
     def from_dict(cls, data: dict) -> CodeQueryDiagnostic:
         return cls(
+            code=CodeQueryDiagnosticCode(data["code"]),
+            impact=CodeQueryDiagnosticImpact(data["impact"]),
             language=data["language"],
             message=data["message"],
             branch=[int(index) for index in data.get("branch", [])],
@@ -594,7 +649,7 @@ class CodeQueryDiagnostic:
 
     def render_text(self) -> str:
         branch = f" [branch {'.'.join(map(str, self.branch))}]" if self.branch else ""
-        return f"note{branch}: {self.message}"
+        return f"{self.impact.value} [{self.code.value}]{branch}: {self.message}"
 
 
 @dataclass(frozen=True)
@@ -621,6 +676,30 @@ class CodeQueryResult:
     @property
     def count(self) -> int:
         return len(self.results)
+
+    @property
+    def completion(self) -> CodeQueryCompletion:
+        invalid = self._codes_with_impact(CodeQueryDiagnosticImpact.INVALID)
+        if invalid:
+            return CodeQueryCompletion(CodeQueryCompletionKind.INVALID, invalid)
+        if any(
+            diagnostic.code is CodeQueryDiagnosticCode.CANCELLED
+            for diagnostic in self.diagnostics
+        ):
+            return CodeQueryCompletion(CodeQueryCompletionKind.CANCELLED)
+        incomplete = self._codes_with_impact(CodeQueryDiagnosticImpact.INCOMPLETE)
+        if self.truncated or incomplete:
+            return CodeQueryCompletion(CodeQueryCompletionKind.INCOMPLETE, incomplete)
+        return CodeQueryCompletion(CodeQueryCompletionKind.COMPLETE)
+
+    def _codes_with_impact(
+        self, impact: CodeQueryDiagnosticImpact
+    ) -> tuple[CodeQueryDiagnosticCode, ...]:
+        codes: list[CodeQueryDiagnosticCode] = []
+        for diagnostic in self.diagnostics:
+            if diagnostic.impact is impact and diagnostic.code not in codes:
+                codes.append(diagnostic.code)
+        return tuple(codes)
 
     def render_text(self) -> str:
         if self.rendered_text is not None:

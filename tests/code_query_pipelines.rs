@@ -1,7 +1,8 @@
 mod common;
 
 use brokk_bifrost::analyzer::structural::{
-    CodeQuery, CodeQueryExecutionLimits, CodeQueryResult, execute, execute_with_limits,
+    CodeQuery, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, CodeQueryResult, execute,
+    execute_with_limits,
 };
 use brokk_bifrost::{AnalyzerConfig, WorkspaceAnalyzer};
 use common::InlineTestProject;
@@ -333,10 +334,14 @@ export function simple() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|diagnostic| diagnostic["message"]
-                .as_str()
-                .unwrap()
-                .contains("max_targets")),
+            .any(|diagnostic| {
+                diagnostic["code"] == "receiver_analysis_partial"
+                    && diagnostic["impact"] == "incomplete"
+                    && diagnostic["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("max_targets")
+            }),
         "{result}"
     );
 
@@ -1698,6 +1703,7 @@ fn unsupported_import_provider_is_diagnostic_not_silent() {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.language == "php"
+                && diagnostic.code == CodeQueryDiagnosticCode::UnsupportedImportAnalysis
                 && diagnostic.message.contains("structured import analysis")),
         "{:?}",
         result.diagnostics
@@ -1745,10 +1751,9 @@ fn pipeline_budget_returns_partial_results_with_diagnostic() {
     assert!(result.truncated);
     assert_eq!(result.results.len(), 1);
     assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("pipeline budget exhausted")),
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::PipelineBudgetExhausted
+        }),
         "{:?}",
         result.diagnostics
     );
@@ -1782,7 +1787,9 @@ fn intermediate_budget_exhaustion_never_returns_wrong_terminal_type() {
         result
             .diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.message.contains("pipeline budget exhausted"))
+            .filter(|diagnostic| {
+                diagnostic.code == CodeQueryDiagnosticCode::PipelineBudgetExhausted
+            })
             .count(),
         1,
         "{:?}",
@@ -1823,10 +1830,10 @@ fn reference_scans_charge_workspace_budgets_and_do_not_leak_intermediate_sites()
         "reference sites are not the declared file terminal domain"
     );
     assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("examining 0 references")),
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+                && diagnostic.message.contains("examining 0 references")
+        }),
         "{:?}",
         result.diagnostics
     );
@@ -1862,10 +1869,9 @@ fn call_scans_report_zero_remaining_workspace_budget() {
     assert!(result.truncated, "{:?}", result.diagnostics);
     assert!(result.results.is_empty());
     assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("execution budget exhausted")),
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::ExecutionBudgetExhausted
+        }),
         "{:?}",
         result.diagnostics
     );
@@ -1900,10 +1906,9 @@ fn inbound_reference_scan_admits_candidate_sources_before_graph_work() {
     assert!(result.truncated, "{:?}", result.diagnostics);
     assert!(result.results.is_empty());
     assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("source-byte budget truncated")),
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::ReferenceSourceBytesTruncated
+        }),
         "{:?}",
         result.diagnostics
     );
@@ -2056,10 +2061,10 @@ fn invalid_semantic_inputs_are_diagnostic_but_supported_leaves_are_not() {
     );
     assert!(invalid.results.is_empty());
     assert!(
-        invalid
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("not a type declaration")),
+        invalid.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::SemanticResultsOmitted
+                && diagnostic.message.contains("not a type declaration")
+        }),
         "{:?}",
         invalid.diagnostics
     );
@@ -2333,10 +2338,9 @@ fn deep_hierarchy_provenance_is_bounded_by_pipeline_work_budget() {
     assert!(result.truncated);
     assert!(result.results.len() < 100, "{}", result.results.len());
     assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|diagnostic| { diagnostic.message.contains("pipeline budget exhausted") })
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::PipelineBudgetExhausted
+        })
     );
 }
 
@@ -2372,10 +2376,9 @@ fn deep_call_provenance_is_bounded_by_pipeline_work_budget() {
     assert!(result.truncated);
     assert!(result.results.len() < 100, "{}", result.results.len());
     assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("pipeline budget exhausted")),
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::PipelineBudgetExhausted
+        }),
         "{:?}",
         result.diagnostics
     );
@@ -2502,7 +2505,9 @@ fn seed_budget_emits_one_aggregated_diagnostic() {
         result
             .diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.message.contains("pipeline budget exhausted"))
+            .filter(|diagnostic| {
+                diagnostic.code == CodeQueryDiagnosticCode::PipelineBudgetExhausted
+            })
             .count(),
         1,
         "{:?}",
@@ -2523,10 +2528,10 @@ fn invalid_programmatic_pipeline_is_diagnostic_not_panic() {
     let result = execute(workspace.analyzer(), &query);
     assert!(result.results.is_empty());
     assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("invalid query at steps[0]")),
+        result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == CodeQueryDiagnosticCode::InvalidPlan
+                && diagnostic.message.contains("invalid query at steps[0]")
+        }),
         "{:?}",
         result.diagnostics
     );
@@ -2554,12 +2559,9 @@ fn empty_seed_frontier_does_not_build_import_graph() {
         },
     );
     assert!(!result.truncated, "{:?}", result.diagnostics);
-    assert!(
-        result
-            .diagnostics
-            .iter()
-            .all(|diagnostic| !diagnostic.message.contains("import graph budget exhausted"))
-    );
+    assert!(result.diagnostics.iter().all(|diagnostic| {
+        diagnostic.code != CodeQueryDiagnosticCode::ImportGraphBudgetExhausted
+    }));
 }
 
 #[test]
@@ -2589,7 +2591,9 @@ fn reverse_import_graph_work_is_bounded_and_diagnostic() {
         result
             .diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.message.contains("import graph budget exhausted"))
+            .filter(|diagnostic| {
+                diagnostic.code == CodeQueryDiagnosticCode::ImportGraphBudgetExhausted
+            })
             .count(),
         1,
         "{:?}",

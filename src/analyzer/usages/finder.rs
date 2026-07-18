@@ -228,6 +228,7 @@ impl UsageFinder {
                 graph_failure = Some(diagnostic.clone());
                 FuzzyResult::Failure {
                     fq_name: diagnostic.fq_name,
+                    reason_kind: diagnostic.reason_kind,
                     reason: diagnostic.reason,
                 }
             }
@@ -235,6 +236,7 @@ impl UsageFinder {
                 graph_failure = Some(diagnostic.clone());
                 FuzzyResult::Failure {
                     fq_name: diagnostic.fq_name,
+                    reason_kind: diagnostic.reason_kind,
                     reason: diagnostic.reason,
                 }
             }

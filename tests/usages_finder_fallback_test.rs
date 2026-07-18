@@ -159,7 +159,11 @@ export function run() {
     assert_eq!("UsageFinder", diagnostic.strategy);
     assert_eq!("unsupported_target_language", diagnostic.reason_kind);
     assert!(
-        matches!(result.result, FuzzyResult::Failure { .. }),
+        matches!(
+            result.result,
+            FuzzyResult::Failure { ref reason_kind, .. }
+                if reason_kind == "unsupported_target_language"
+        ),
         "unsupported graph language should fail without regex, got {:?}",
         result.result
     );

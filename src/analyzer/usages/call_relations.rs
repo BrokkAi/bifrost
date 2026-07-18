@@ -119,6 +119,47 @@ pub(crate) struct CallRelationWork {
     pub(crate) examined_candidates: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CallRelationDiagnosticCode {
+    BudgetExhausted,
+    ParseFailed,
+    CandidatesOmitted,
+    TargetsAmbiguous,
+    CandidateLimit,
+    AnalysisFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CallRelationDiagnostic {
+    pub(crate) code: CallRelationDiagnosticCode,
+    pub(crate) message: String,
+    /// Stable producer context for debugging without parsing the message.
+    pub(crate) context: String,
+    /// Structured usage-analysis reason when this originated below the call
+    /// relation layer.
+    pub(crate) reason_kind: Option<String>,
+}
+
+impl CallRelationDiagnostic {
+    fn new(code: CallRelationDiagnosticCode, message: String, context: String) -> Self {
+        Self {
+            code,
+            message,
+            context,
+            reason_kind: None,
+        }
+    }
+
+    fn analysis_failed(message: String, context: String, reason_kind: String) -> Self {
+        Self {
+            code: CallRelationDiagnosticCode::AnalysisFailed,
+            message,
+            context,
+            reason_kind: Some(reason_kind),
+        }
+    }
+}
+
 impl CallRelationWork {
     fn add(&mut self, other: Self) {
         self.scanned_files = self.scanned_files.saturating_add(other.scanned_files);
@@ -136,14 +177,20 @@ pub(crate) struct CallRelationResult {
     pub(crate) sites: Vec<CallSite>,
     pub(crate) truncated: bool,
     pub(crate) cancelled: bool,
-    pub(crate) diagnostics: Vec<String>,
+    pub(crate) diagnostics: Vec<CallRelationDiagnostic>,
     pub(crate) work: CallRelationWork,
 }
 
 #[derive(Default)]
 pub(crate) struct CallBindingCache {
-    formals: HashMap<CodeUnit, FormalParameterLayout>,
-    python_receiver_is_class: HashMap<(ProjectFile, usize, usize), bool>,
+    formals: HashMap<CodeUnit, Option<FormalParameterLayout>>,
+    python_receiver_is_class: HashMap<(ProjectFile, usize, usize), Option<bool>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum CallBindingStatus {
+    Complete,
+    Unavailable,
 }
 
 #[derive(Default)]
@@ -170,6 +217,143 @@ impl CallSyntaxCache {
 }
 
 pub(crate) struct CallRelationService;
+
+struct OutgoingCallCandidate {
+    proof: Option<UsageProof>,
+    callees: Vec<CodeUnit>,
+    omitted: usize,
+    ambiguous: bool,
+    fully_retained: bool,
+}
+
+fn resolve_outgoing_call_candidate(
+    analyzer: &dyn IAnalyzer,
+    status: DefinitionLookupStatus,
+    definitions: Vec<CodeUnit>,
+) -> OutgoingCallCandidate {
+    let (proof, ambiguous) = match status {
+        DefinitionLookupStatus::Resolved => (Some(UsageProof::Proven), false),
+        DefinitionLookupStatus::Ambiguous => (Some(UsageProof::Unproven), true),
+        _ => {
+            return OutgoingCallCandidate {
+                proof: None,
+                callees: Vec::new(),
+                omitted: 1,
+                ambiguous: false,
+                fully_retained: false,
+            };
+        }
+    };
+
+    let mut callees = Vec::new();
+    let mut omitted = 0usize;
+    for definition in definitions {
+        if let Some(callee) = nearest_call_relation_unit(analyzer, definition) {
+            callees.push(callee);
+        } else {
+            omitted = omitted.saturating_add(1);
+        }
+    }
+    if callees.is_empty() && omitted == 0 {
+        // A resolved/ambiguous outcome promises at least one candidate site.
+        // An empty definition set therefore omits one lower-bound candidate.
+        omitted = 1;
+    }
+    let fully_retained = omitted == 0 && !callees.is_empty();
+    OutgoingCallCandidate {
+        proof,
+        callees,
+        omitted,
+        ambiguous,
+        fully_retained,
+    }
+}
+
+fn append_outgoing_candidate_diagnostics(
+    diagnostics: &mut Vec<CallRelationDiagnostic>,
+    caller: &CodeUnit,
+    ambiguous: usize,
+    retained_ambiguous: usize,
+    omitted: usize,
+) {
+    // Ambiguity is advisory only when every alternative survived the
+    // definition-to-callable projection. Otherwise the omission diagnostic is
+    // the completeness-bearing outcome and we must not claim all candidates
+    // were emitted as unproven.
+    if ambiguous > 0 && retained_ambiguous == ambiguous {
+        diagnostics.push(CallRelationDiagnostic::new(
+            CallRelationDiagnosticCode::TargetsAmbiguous,
+            format!(
+                "call targets for {} were ambiguous at {ambiguous} candidate site{}; all candidates are unproven",
+                caller.fq_name(),
+                if ambiguous == 1 { "" } else { "s" }
+            ),
+            caller.fq_name().to_string(),
+        ));
+    }
+    if omitted > 0 {
+        diagnostics.push(CallRelationDiagnostic::new(
+            CallRelationDiagnosticCode::CandidatesOmitted,
+            format!(
+                "omitted {omitted} unresolved call candidate{} for {}",
+                if omitted == 1 { "" } else { "s" },
+                caller.fq_name()
+            ),
+            caller.fq_name().to_string(),
+        ));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncomingCallOmission {
+    CallerUnavailable,
+    SyntaxUnavailable,
+}
+
+fn project_incoming_call_hit(
+    analyzer: &dyn IAnalyzer,
+    syntax_cache: &mut CallSyntaxCache,
+    target: &CodeUnit,
+    hit: UsageHit,
+    proof: UsageProof,
+) -> Result<CallSite, IncomingCallOmission> {
+    let caller = nearest_call_relation_unit(analyzer, hit.enclosing.clone())
+        .ok_or(IncomingCallOmission::CallerUnavailable)?;
+    let syntax = syntax_cache
+        .syntax_for_range(analyzer, &hit.file, hit.start_offset, hit.end_offset)
+        .ok_or(IncomingCallOmission::SyntaxUnavailable)?;
+    Ok(raw_call_site(
+        hit.file,
+        caller,
+        target.clone(),
+        syntax,
+        proof,
+    ))
+}
+
+fn append_incoming_projection_omission(
+    diagnostics: &mut Vec<CallRelationDiagnostic>,
+    target: &CodeUnit,
+    omitted: usize,
+) {
+    if omitted == 0 {
+        return;
+    }
+    // The ambiguity producer claims every returned candidate is available as
+    // an unproven edge. Once projection drops one, incompleteness replaces
+    // that advisory for this incoming scan.
+    diagnostics
+        .retain(|diagnostic| diagnostic.code != CallRelationDiagnosticCode::TargetsAmbiguous);
+    diagnostics.push(CallRelationDiagnostic::new(
+        CallRelationDiagnosticCode::CandidatesOmitted,
+        format!(
+            "omitted {omitted} incoming call candidate{} for {} because exact caller or call syntax was unavailable",
+            if omitted == 1 { "" } else { "s" },
+            target.fq_name()
+        ),
+        target.fq_name().to_string(),
+    ));
+}
 
 impl CallRelationService {
     /// Resolve one exact whole-call span against one exact source snapshot.
@@ -313,9 +497,14 @@ impl CallRelationService {
             return CallRelationResult::default();
         }
         if limits.max_files == 0 || limits.max_source_bytes == 0 || limits.max_candidates == 0 {
+            let context = target.fq_name().to_string();
             return CallRelationResult {
                 truncated: true,
-                diagnostics: vec![format!("call relation budget omitted {}", target.fq_name())],
+                diagnostics: vec![CallRelationDiagnostic::new(
+                    CallRelationDiagnosticCode::BudgetExhausted,
+                    format!("call relation budget omitted {}", target.fq_name()),
+                    context,
+                )],
                 ..CallRelationResult::default()
             };
         }
@@ -336,10 +525,31 @@ impl CallRelationService {
             examined_candidates: 0,
         };
         let (hits, mut truncated, mut diagnostics) = call_hits(query.result, target);
+        if query.source_bytes_truncated {
+            diagnostics.push(CallRelationDiagnostic::new(
+                CallRelationDiagnosticCode::BudgetExhausted,
+                format!(
+                    "call relation source-byte budget truncated candidate files for {}",
+                    target.fq_name()
+                ),
+                target.fq_name().to_string(),
+            ));
+        }
+        if query.candidate_files_truncated {
+            diagnostics.push(CallRelationDiagnostic::new(
+                CallRelationDiagnosticCode::BudgetExhausted,
+                format!(
+                    "call relation file budget truncated candidate files for {}",
+                    target.fq_name()
+                ),
+                target.fq_name().to_string(),
+            ));
+        }
         truncated |= query.candidate_files_truncated || query.source_bytes_truncated;
         let mut syntax_cache = CallSyntaxCache::default();
         let mut sites = Vec::new();
         let mut cancelled = false;
+        let mut omitted = 0usize;
         for (hit, proof) in hits.into_iter().take(limits.max_candidates) {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 cancelled = true;
@@ -353,24 +563,14 @@ impl CallRelationService {
                 continue;
             }
             work.examined_candidates = work.examined_candidates.saturating_add(1);
-            let Some(caller) = nearest_call_relation_unit(analyzer, hit.enclosing.clone()) else {
-                continue;
-            };
-            let Some(syntax) = syntax_cache.syntax_for_range(
-                analyzer,
-                &hit.file,
-                hit.start_offset,
-                hit.end_offset,
-            ) else {
-                continue;
-            };
-            sites.push(raw_call_site(
-                hit.file,
-                caller,
-                target.clone(),
-                syntax,
-                proof,
-            ));
+            match project_incoming_call_hit(analyzer, &mut syntax_cache, target, hit, proof) {
+                Ok(site) => sites.push(site),
+                Err(_) => omitted = omitted.saturating_add(1),
+            }
+        }
+        if omitted > 0 {
+            truncated = true;
+            append_incoming_projection_omission(&mut diagnostics, target, omitted);
         }
 
         // Usage graphs intentionally suppress references enclosed by the target
@@ -407,6 +607,15 @@ impl CallRelationService {
         if sites.len() > limits.max_candidates {
             sites.truncate(limits.max_candidates);
             truncated = true;
+            diagnostics.push(CallRelationDiagnostic::new(
+                CallRelationDiagnosticCode::CandidateLimit,
+                format!(
+                    "call relation retained the first {} call candidates for {}",
+                    limits.max_candidates,
+                    target.fq_name()
+                ),
+                target.fq_name().to_string(),
+            ));
         }
         diagnostics.sort();
         diagnostics.dedup();
@@ -446,9 +655,14 @@ impl CallRelationService {
             return CallRelationResult::default();
         }
         if limits.max_files == 0 || limits.max_source_bytes == 0 || limits.max_candidates == 0 {
+            let context = caller.fq_name().to_string();
             return CallRelationResult {
                 truncated: true,
-                diagnostics: vec![format!("call relation budget omitted {}", caller.fq_name())],
+                diagnostics: vec![CallRelationDiagnostic::new(
+                    CallRelationDiagnosticCode::BudgetExhausted,
+                    format!("call relation budget omitted {}", caller.fq_name()),
+                    context,
+                )],
                 ..CallRelationResult::default()
             };
         }
@@ -460,30 +674,67 @@ impl CallRelationService {
             };
         }
         let Some(source) = analyzer.indexed_source(caller.source()).map(Arc::new) else {
-            return CallRelationResult::default();
+            return CallRelationResult {
+                diagnostics: vec![CallRelationDiagnostic::analysis_failed(
+                    format!("indexed source is unavailable for {}", caller.source()),
+                    caller.fq_name().to_string(),
+                    "indexed_source_unavailable".to_string(),
+                )],
+                ..CallRelationResult::default()
+            };
         };
         if source.len() > limits.max_source_bytes || limits.max_files == 0 {
+            let context = caller.source().to_string();
             return CallRelationResult {
                 truncated: true,
-                diagnostics: vec![format!("call relation budget omitted {}", caller.source())],
+                diagnostics: vec![CallRelationDiagnostic::new(
+                    CallRelationDiagnosticCode::BudgetExhausted,
+                    format!("call relation budget omitted {}", caller.source()),
+                    context,
+                )],
                 ..CallRelationResult::default()
             };
         }
         let language = language_for_file(caller.source());
         let Some(tree) = parse_tree_for_language(caller.source(), language, &source) else {
             return CallRelationResult {
-                diagnostics: vec![format!("failed to parse {}", caller.source())],
+                diagnostics: vec![CallRelationDiagnostic::new(
+                    CallRelationDiagnosticCode::ParseFailed,
+                    format!("failed to parse {}", caller.source()),
+                    caller.source().to_string(),
+                )],
                 ..CallRelationResult::default()
             };
         };
         let Some(caller_range) = analyzer.ranges_of(caller).into_iter().min_by_key(range_key)
         else {
-            return CallRelationResult::default();
+            return CallRelationResult {
+                diagnostics: vec![CallRelationDiagnostic::analysis_failed(
+                    format!("declaration range is unavailable for {}", caller.fq_name()),
+                    caller.fq_name().to_string(),
+                    "declaration_range_unavailable".to_string(),
+                )],
+                ..CallRelationResult::default()
+            };
         };
         let candidate_limit = limits.max_candidates.saturating_add(1);
         let candidates =
             call_reference_ranges_in_tree(&tree, language, &caller_range, candidate_limit);
         let truncated = candidates.len() > limits.max_candidates;
+        let mut diagnostics = truncated
+            .then(|| {
+                CallRelationDiagnostic::new(
+                    CallRelationDiagnosticCode::CandidateLimit,
+                    format!(
+                        "call relation retained the first {} call candidates for {}",
+                        limits.max_candidates,
+                        caller.fq_name()
+                    ),
+                    caller.fq_name().to_string(),
+                )
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
         let candidates = candidates
             .into_iter()
             .take(limits.max_candidates)
@@ -498,27 +749,34 @@ impl CallRelationService {
         );
         let mut sites = Vec::new();
         let mut syntax_cache = CallSyntaxCache::default();
+        let mut ambiguous = 0usize;
+        let mut retained_ambiguous = 0usize;
+        let mut omitted = 0usize;
         for (candidate, outcome) in batch.resolved {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 break;
             }
-            let proof = match outcome.status {
-                DefinitionLookupStatus::Resolved => UsageProof::Proven,
-                DefinitionLookupStatus::Ambiguous => UsageProof::Unproven,
-                _ => continue,
+            let resolution =
+                resolve_outgoing_call_candidate(analyzer, outcome.status, outcome.definitions);
+            let Some(proof) = resolution.proof else {
+                omitted = omitted.saturating_add(resolution.omitted);
+                continue;
             };
+            ambiguous = ambiguous.saturating_add(usize::from(resolution.ambiguous));
             let Some(syntax) = syntax_cache.syntax_for_range(
                 analyzer,
                 caller.source(),
                 candidate.start_byte,
                 candidate.end_byte,
             ) else {
+                omitted = omitted.saturating_add(1);
                 continue;
             };
-            for definition in outcome.definitions {
-                let Some(callee) = nearest_call_relation_unit(analyzer, definition) else {
-                    continue;
-                };
+            omitted = omitted.saturating_add(resolution.omitted);
+            if resolution.ambiguous && resolution.fully_retained {
+                retained_ambiguous = retained_ambiguous.saturating_add(1);
+            }
+            for callee in resolution.callees {
                 sites.push(raw_call_site(
                     caller.source().clone(),
                     caller.clone(),
@@ -528,12 +786,19 @@ impl CallRelationService {
                 ));
             }
         }
+        append_outgoing_candidate_diagnostics(
+            &mut diagnostics,
+            caller,
+            ambiguous,
+            retained_ambiguous,
+            omitted,
+        );
         sort_and_dedup_sites(&mut sites);
         CallRelationResult {
             sites,
             truncated,
             cancelled: batch.cancelled,
-            diagnostics: Vec::new(),
+            diagnostics,
             work: CallRelationWork {
                 scanned_files: 1,
                 scanned_source_bytes: source.len(),
@@ -673,7 +938,11 @@ fn apply_dispatch_outcome(
 fn call_hits(
     result: FuzzyResult,
     target: &CodeUnit,
-) -> (Vec<(UsageHit, UsageProof)>, bool, Vec<String>) {
+) -> (
+    Vec<(UsageHit, UsageProof)>,
+    bool,
+    Vec<CallRelationDiagnostic>,
+) {
     match result {
         FuzzyResult::Success {
             hits_by_overload,
@@ -697,9 +966,13 @@ fn call_hits(
             );
             let diagnostics = (omitted > 0)
                 .then(|| {
-                    format!(
-                        "omitted {omitted} unproven call candidates for {}",
-                        target.fq_name()
+                    CallRelationDiagnostic::new(
+                        CallRelationDiagnosticCode::CandidatesOmitted,
+                        format!(
+                            "omitted {omitted} unproven call candidates for {}",
+                            target.fq_name()
+                        ),
+                        target.fq_name().to_string(),
                     )
                 })
                 .into_iter()
@@ -715,9 +988,13 @@ fn call_hits(
                 .map(|hit| (hit, UsageProof::Unproven))
                 .collect(),
             false,
-            vec![format!(
-                "call targets for {} are ambiguous; candidates are unproven",
-                target.fq_name()
+            vec![CallRelationDiagnostic::new(
+                CallRelationDiagnosticCode::TargetsAmbiguous,
+                format!(
+                    "call targets for {} are ambiguous; candidates are unproven",
+                    target.fq_name()
+                ),
+                target.fq_name().to_string(),
             )],
         ),
         FuzzyResult::TooManyCallsites {
@@ -732,12 +1009,28 @@ fn call_hits(
                 .map(|hit| (hit, UsageProof::Proven))
                 .collect(),
             true,
-            vec![format!(
-                "found {total_callsites} call candidates for {}, retaining the first {limit}",
-                target.fq_name()
+            vec![CallRelationDiagnostic::new(
+                CallRelationDiagnosticCode::CandidateLimit,
+                format!(
+                    "found {total_callsites} call candidates for {}, retaining the first {limit}",
+                    target.fq_name()
+                ),
+                target.fq_name().to_string(),
             )],
         ),
-        FuzzyResult::Failure { reason, .. } => (Vec::new(), false, vec![reason]),
+        FuzzyResult::Failure {
+            reason_kind,
+            reason,
+            ..
+        } => (
+            Vec::new(),
+            false,
+            vec![CallRelationDiagnostic::analysis_failed(
+                reason,
+                target.fq_name().to_string(),
+                reason_kind,
+            )],
+        ),
     }
 }
 
@@ -783,17 +1076,28 @@ pub(crate) fn bind_call_site_arguments(
     analyzer: &dyn IAnalyzer,
     site: &mut CallSite,
     cache: &mut CallBindingCache,
-) {
+) -> CallBindingStatus {
     let Some((formal_owner, constructor_binding)) = formal_owner_for_site(analyzer, site) else {
-        return;
+        return CallBindingStatus::Unavailable;
     };
-    let layout = cache
+    let Some(layout) = cache
         .formals
         .entry(formal_owner.clone())
         .or_insert_with(|| formal_slots_for_unit(analyzer, &formal_owner))
-        .clone();
-    let bind_first = constructor_binding
-        || python_first_formal_is_bound(analyzer, site, &formal_owner, &layout, cache);
+        .clone()
+    else {
+        return CallBindingStatus::Unavailable;
+    };
+    let Some(bind_first) = python_first_formal_is_bound(
+        analyzer,
+        site,
+        &formal_owner,
+        &layout,
+        cache,
+        constructor_binding,
+    ) else {
+        return CallBindingStatus::Unavailable;
+    };
     let mut ordinary_slots = layout
         .slots
         .iter()
@@ -837,6 +1141,7 @@ pub(crate) fn bind_call_site_arguments(
             .map(|name| canonical_parameter_name(name));
         argument.variadic = slot.is_some_and(|(_, slot)| slot.variadic.is_some());
     }
+    CallBindingStatus::Complete
 }
 
 fn formal_owner_for_site(analyzer: &dyn IAnalyzer, site: &CallSite) -> Option<(CodeUnit, bool)> {
@@ -862,22 +1167,27 @@ fn python_first_formal_is_bound(
     formal_owner: &CodeUnit,
     layout: &FormalParameterLayout,
     cache: &mut CallBindingCache,
-) -> bool {
+    constructor_binding: bool,
+) -> Option<bool> {
+    if constructor_binding {
+        return Some(true);
+    }
     if language_for_file(formal_owner.source()) != Language::Python
         || !analyzer
             .parent_of(formal_owner)
             .is_some_and(|owner| owner.is_class())
     {
-        return false;
+        return Some(false);
     }
     match layout.python_binding {
-        Some(PythonMethodBinding::Static) | None => false,
-        Some(PythonMethodBinding::Class) => site.receiver.is_some(),
+        Some(PythonMethodBinding::Static) | None => Some(false),
+        Some(PythonMethodBinding::Class) => Some(site.receiver.is_some()),
         Some(PythonMethodBinding::Instance) => {
             let Some(receiver) = site.receiver else {
-                return false;
+                return Some(false);
             };
-            !python_receiver_resolves_to_class(analyzer, site, receiver, cache)
+            python_receiver_resolves_to_class(analyzer, site, receiver, cache)
+                .map(|is_class| !is_class)
         }
     }
 }
@@ -887,7 +1197,7 @@ fn python_receiver_resolves_to_class(
     site: &CallSite,
     receiver: Range,
     cache: &mut CallBindingCache,
-) -> bool {
+) -> Option<bool> {
     let key = (site.file.clone(), receiver.start_byte, receiver.end_byte);
     if let Some(is_class) = cache.python_receiver_is_class.get(&key) {
         return *is_class;
@@ -911,28 +1221,25 @@ fn python_receiver_resolves_to_class(
             .into_iter()
             .next()
         })
-        .is_some_and(|outcome| {
-            outcome.status == DefinitionLookupStatus::Resolved
-                && outcome.definitions.iter().any(CodeUnit::is_class)
+        .and_then(|outcome| {
+            (outcome.status == DefinitionLookupStatus::Resolved)
+                .then(|| outcome.definitions.iter().any(CodeUnit::is_class))
         });
     cache.python_receiver_is_class.insert(key, is_class);
     is_class
 }
 
-fn formal_slots_for_unit(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> FormalParameterLayout {
+fn formal_slots_for_unit(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+) -> Option<FormalParameterLayout> {
     if unit.is_class() {
-        return FormalParameterLayout::default();
+        return None;
     }
-    let Some(source) = analyzer.indexed_source(unit.source()) else {
-        return FormalParameterLayout::default();
-    };
+    let source = analyzer.indexed_source(unit.source())?;
     let language = language_for_file(unit.source());
-    let Some(tree) = parse_tree_for_language(unit.source(), language, &source) else {
-        return FormalParameterLayout::default();
-    };
-    let Some(range) = analyzer.ranges_of(unit).into_iter().min_by_key(range_key) else {
-        return FormalParameterLayout::default();
-    };
+    let tree = parse_tree_for_language(unit.source(), language, &source)?;
+    let range = analyzer.ranges_of(unit).into_iter().min_by_key(range_key)?;
     formal_parameter_slots(language, tree.root_node(), &source, &range)
 }
 
@@ -997,7 +1304,9 @@ mod tests {
     use crate::analyzer::usages::get_definition::{
         DefinitionLookupDiagnostic, DefinitionLookupOutcome,
     };
-    use crate::analyzer::{CodeUnitType, Language};
+    use crate::analyzer::{
+        CodeUnitType, Language, PythonAnalyzer, TestProject, TypescriptAnalyzer,
+    };
     use crate::test_support::AnalyzerFixture;
 
     fn call_span(source: &str, call: &str) -> Range {
@@ -1594,5 +1903,232 @@ object Calls {
                 vec![CallDispatchBoundaryKind::Unresolved(status)]
             );
         }
+    }
+
+    fn empty_typescript_analyzer() -> (tempfile::TempDir, TypescriptAnalyzer, ProjectFile) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root.clone(), Language::TypeScript));
+        let file = ProjectFile::new(root, "src/app.ts");
+        (temp, analyzer, file)
+    }
+
+    #[test]
+    fn binding_status_distinguishes_missing_layout_from_known_empty_layout() {
+        let (_temp, analyzer, missing_file) = empty_typescript_analyzer();
+        let missing = CodeUnit::new(missing_file.clone(), CodeUnitType::Function, "", "missing");
+        let range = Range {
+            start_byte: 0,
+            end_byte: 1,
+            start_line: 1,
+            end_line: 1,
+        };
+        let mut missing_site = CallSite {
+            file: missing_file,
+            range,
+            callee_range: range,
+            caller: missing.clone(),
+            callee: missing,
+            kind: CallSyntaxKind::Function,
+            proof: UsageProof::Proven,
+            receiver: None,
+            arguments: Vec::new(),
+        };
+        assert_eq!(
+            bind_call_site_arguments(
+                &analyzer,
+                &mut missing_site,
+                &mut CallBindingCache::default(),
+            ),
+            CallBindingStatus::Unavailable
+        );
+
+        let source = "export function noArgs() {}\n";
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), "src/app.ts");
+        file.write(source).expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let no_args = analyzer
+            .all_declarations()
+            .find(|unit| unit.short_name() == "noArgs")
+            .expect("known callable");
+        let mut known_site = CallSite {
+            file,
+            range,
+            callee_range: range,
+            caller: no_args.clone(),
+            callee: no_args,
+            kind: CallSyntaxKind::Function,
+            proof: UsageProof::Proven,
+            receiver: None,
+            arguments: Vec::new(),
+        };
+        assert_eq!(
+            bind_call_site_arguments(&analyzer, &mut known_site, &mut CallBindingCache::default(),),
+            CallBindingStatus::Complete
+        );
+    }
+
+    #[test]
+    fn unresolved_python_receiver_does_not_claim_a_complete_formal_binding() {
+        let source = "class Service:\n    def run(self, payload):\n        pass\n";
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let service_file = ProjectFile::new(root.clone(), "service.py");
+        service_file.write(source).expect("write source");
+        let analyzer =
+            PythonAnalyzer::from_project(TestProject::new(root.clone(), Language::Python));
+        let callee = analyzer
+            .search_definitions("run", false)
+            .into_iter()
+            .find(CodeUnit::is_callable)
+            .expect("instance method");
+        let call_file = ProjectFile::new(root, "missing_caller.py");
+        let caller = CodeUnit::new(call_file.clone(), CodeUnitType::Function, "", "caller");
+        let range = Range {
+            start_byte: 0,
+            end_byte: 1,
+            start_line: 1,
+            end_line: 1,
+        };
+        let mut site = CallSite {
+            file: call_file,
+            range,
+            callee_range: range,
+            caller,
+            callee,
+            kind: CallSyntaxKind::Method,
+            proof: UsageProof::Proven,
+            receiver: Some(range),
+            arguments: vec![CallArgument {
+                range,
+                name: None,
+                position: Some(0),
+                formal_index: None,
+                formal_name: None,
+                variadic: false,
+                spread: false,
+            }],
+        };
+
+        let status =
+            bind_call_site_arguments(&analyzer, &mut site, &mut CallBindingCache::default());
+
+        assert_eq!(status, CallBindingStatus::Unavailable);
+        assert_eq!(site.arguments[0].formal_index, None);
+    }
+
+    #[test]
+    fn incoming_projection_reports_an_unmappable_enclosing_unit() {
+        let (_temp, analyzer, file) = empty_typescript_analyzer();
+        let target = CodeUnit::new(file.clone(), CodeUnitType::Function, "", "target");
+        let enclosing = CodeUnit::new(file.clone(), CodeUnitType::Field, "", "value");
+        let hit = UsageHit::new(file, 1, 0, 6, enclosing, 1.0, "target()");
+
+        assert_eq!(
+            project_incoming_call_hit(
+                &analyzer,
+                &mut CallSyntaxCache::default(),
+                &target,
+                hit,
+                UsageProof::Proven,
+            ),
+            Err(IncomingCallOmission::CallerUnavailable)
+        );
+    }
+
+    #[test]
+    fn incoming_projection_reports_unavailable_structured_call_syntax() {
+        let (_temp, analyzer, file) = empty_typescript_analyzer();
+        let target = CodeUnit::new(file.clone(), CodeUnitType::Function, "", "target");
+        let caller = CodeUnit::new(file.clone(), CodeUnitType::Function, "", "caller");
+        let hit = UsageHit::new(file, 1, 0, 6, caller, 1.0, "target()");
+
+        assert_eq!(
+            project_incoming_call_hit(
+                &analyzer,
+                &mut CallSyntaxCache::default(),
+                &target,
+                hit,
+                UsageProof::Proven,
+            ),
+            Err(IncomingCallOmission::SyntaxUnavailable)
+        );
+    }
+
+    #[test]
+    fn incoming_projection_omission_replaces_ambiguity_advisory() {
+        let (_temp, _analyzer, file) = empty_typescript_analyzer();
+        let target = CodeUnit::new(file, CodeUnitType::Function, "", "target");
+        let mut diagnostics = vec![CallRelationDiagnostic::new(
+            CallRelationDiagnosticCode::TargetsAmbiguous,
+            "ambiguous".to_string(),
+            target.fq_name().to_string(),
+        )];
+
+        append_incoming_projection_omission(&mut diagnostics, &target, 1);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            CallRelationDiagnosticCode::CandidatesOmitted
+        );
+        assert_eq!(diagnostics[0].context, target.fq_name());
+    }
+
+    #[test]
+    fn ambiguous_outgoing_targets_count_empty_and_unmappable_definitions_as_omitted() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root.clone(), Language::TypeScript));
+        let file = ProjectFile::new(root, "src/app.ts");
+        let callable = CodeUnit::new(file.clone(), CodeUnitType::Function, "", "target");
+        let non_callable = CodeUnit::new(file, CodeUnitType::Field, "", "value");
+
+        let empty = resolve_outgoing_call_candidate(
+            &analyzer,
+            DefinitionLookupStatus::Ambiguous,
+            Vec::new(),
+        );
+        assert_eq!(empty.omitted, 1);
+        assert!(empty.callees.is_empty());
+        assert!(!empty.fully_retained);
+
+        let partial = resolve_outgoing_call_candidate(
+            &analyzer,
+            DefinitionLookupStatus::Ambiguous,
+            vec![callable, non_callable],
+        );
+        assert_eq!(partial.callees.len(), 1);
+        assert_eq!(partial.omitted, 1);
+        assert!(!partial.fully_retained);
+    }
+
+    #[test]
+    fn ambiguous_outgoing_advisory_requires_every_candidate_to_survive() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root, "src/app.ts");
+        let caller = CodeUnit::new(file, CodeUnitType::Function, "", "caller");
+        let mut diagnostics = Vec::new();
+
+        append_outgoing_candidate_diagnostics(&mut diagnostics, &caller, 1, 0, 1);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            CallRelationDiagnosticCode::CandidatesOmitted
+        );
+
+        diagnostics.clear();
+        append_outgoing_candidate_diagnostics(&mut diagnostics, &caller, 1, 1, 0);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            CallRelationDiagnosticCode::TargetsAmbiguous
+        );
     }
 }

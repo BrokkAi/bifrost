@@ -14,6 +14,9 @@ sys.path.insert(0, str(ROOT))
 
 from bifrost_searchtools import (
     CodeQueryCallSite,
+    CodeQueryCompletionKind,
+    CodeQueryDiagnosticCode,
+    CodeQueryDiagnosticImpact,
     CodeQueryExpressionSite,
     CodeQueryFile,
     CodeQueryMatch,
@@ -49,6 +52,85 @@ def _git_commit(root: Path, message: str) -> None:
         cwd=root,
         check=True,
     )
+
+
+class CodeQueryModelTest(unittest.TestCase):
+    def test_typed_diagnostics_drive_completion_without_message_parsing(self) -> None:
+        advisory = CodeQueryResult.from_dict(
+            {
+                "results": [],
+                "truncated": False,
+                "diagnostics": [
+                    {
+                        "code": "broad_query",
+                        "impact": "advisory",
+                        "language": "workspace",
+                        "message": "wording is not part of completion",
+                    }
+                ],
+            }
+        )
+        self.assertIs(
+            advisory.diagnostics[0].code, CodeQueryDiagnosticCode.BROAD_QUERY
+        )
+        self.assertIs(
+            advisory.diagnostics[0].impact, CodeQueryDiagnosticImpact.ADVISORY
+        )
+        self.assertIs(advisory.completion.kind, CodeQueryCompletionKind.COMPLETE)
+        self.assertIn("advisory [broad_query]", advisory.render_text())
+
+        incomplete = CodeQueryResult.from_dict(
+            {
+                "results": [],
+                "truncated": False,
+                "diagnostics": [
+                    {
+                        "code": "missing_structural_adapter",
+                        "impact": "incomplete",
+                        "language": "rust",
+                        "message": "arbitrary localized wording",
+                    }
+                ],
+            }
+        )
+        self.assertIs(incomplete.completion.kind, CodeQueryCompletionKind.INCOMPLETE)
+        self.assertEqual(
+            incomplete.completion.codes,
+            (CodeQueryDiagnosticCode.MISSING_STRUCTURAL_ADAPTER,),
+        )
+
+        invalid = CodeQueryResult.from_dict(
+            {
+                "results": [],
+                "truncated": False,
+                "diagnostics": [
+                    {
+                        "code": "invalid_plan",
+                        "impact": "invalid",
+                        "language": "workspace",
+                        "message": "not inspected",
+                    }
+                ],
+            }
+        )
+        self.assertIs(invalid.completion.kind, CodeQueryCompletionKind.INVALID)
+
+        cancelled = CodeQueryResult.from_dict(
+            {
+                "results": [],
+                "truncated": True,
+                "diagnostics": [
+                    {
+                        "code": "cancelled",
+                        "impact": "incomplete",
+                        "language": "workspace",
+                        "message": "not inspected",
+                    }
+                ],
+            }
+        )
+        self.assertIs(cancelled.completion.kind, CodeQueryCompletionKind.CANCELLED)
+
 
 class SearchToolsClientTest(unittest.TestCase):
     @classmethod

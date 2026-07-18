@@ -65,6 +65,7 @@ pub use analyzer::{
     TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
     WorkspaceAnalyzer, collect_workspace_files,
 };
+pub use cancellation::CancellationToken;
 pub use project_watcher::{ChangeDelta, ProjectChangeWatcher};
 pub use searchtools_service::{
     SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode, ToolOutput,
