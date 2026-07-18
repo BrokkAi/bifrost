@@ -342,7 +342,13 @@ fn seed_scope_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
 fn seed_inline_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     match node.kind() {
-        "val_definition" | "var_definition" => seed_value_definition(node, ctx),
+        "val_definition" | "var_definition" => {
+            if let Some(owner) = direct_template_field_owner(node, ctx) {
+                seed_owner_field_definition(node, &owner, ctx);
+            } else {
+                seed_value_definition(node, ctx);
+            }
+        }
         "function_definition" => {
             if let Some(name) = node.child_by_field_name("name") {
                 let name = node_text(name, ctx.source).trim();
@@ -357,9 +363,6 @@ fn seed_inline_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
 fn seed_owner_field_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if ctx.spec.owner.is_none() {
-        return;
-    }
-    if !enclosing_type_matches_owner(node, ctx) {
         return;
     }
     let mut cursor = node.walk();
@@ -396,21 +399,29 @@ fn seed_direct_field_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
-            "val_definition" | "var_definition" => seed_owner_field_definition(child, ctx),
+            "val_definition" | "var_definition" => {
+                if let Some(owner) = direct_template_field_owner(child, ctx) {
+                    seed_owner_field_definition(child, &owner, ctx);
+                }
+            }
             "function_definition"
+            | "function_declaration"
             | "class_definition"
             | "object_definition"
             | "trait_definition"
-            | "enum_definition" => {}
+            | "enum_definition"
+            | "block"
+            | "block_expression"
+            | "indented_block"
+            | "case_clause"
+            | "lambda_expression"
+            | "anonymous_function" => {}
             _ => seed_direct_field_bindings(child, ctx),
         }
     }
 }
 
-fn seed_owner_field_definition(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    let Some(owner_fq_name) = ctx.spec.owner_fq_name.as_deref() else {
-        return;
-    };
+fn seed_owner_field_definition(node: Node<'_>, owner_fq_name: &str, ctx: &mut ScanCtx<'_>) {
     let Some(pattern) = node.child_by_field_name("pattern") else {
         return;
     };
@@ -420,13 +431,31 @@ fn seed_owner_field_definition(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn enclosing_type_matches_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    let Some(owner_name) = ctx.spec.owner_name.as_deref() else {
-        return false;
-    };
-    node.child_by_field_name("name")
-        .map(|name| node_text(name, ctx.source).trim().trim_end_matches('$') == owner_name)
-        .unwrap_or(false)
+fn direct_template_field_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        match ancestor.kind() {
+            "template_body" | "enum_body" => {
+                let owner = enclosing_owner_fq_name(node, ctx)?;
+                return (ctx.spec.owner_fq_name.as_deref() == Some(owner.as_str()))
+                    .then_some(owner);
+            }
+            "function_definition"
+            | "function_declaration"
+            | "class_definition"
+            | "object_definition"
+            | "trait_definition"
+            | "enum_definition"
+            | "block"
+            | "block_expression"
+            | "indented_block"
+            | "case_clause"
+            | "lambda_expression"
+            | "anonymous_function" => return None,
+            _ => current = ancestor.parent(),
+        }
+    }
+    None
 }
 
 fn seed_parameter_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -853,22 +882,7 @@ fn is_direct_owner_field_declaration_identifier(node: Node<'_>, ctx: &ScanCtx<'_
     {
         return false;
     }
-    let mut current = parent.parent();
-    while let Some(ancestor) = current {
-        match ancestor.kind() {
-            "function_definition"
-            | "block"
-            | "block_expression"
-            | "case_clause"
-            | "lambda_expression"
-            | "anonymous_function" => return false,
-            "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
-                return enclosing_type_matches_owner(ancestor, ctx);
-            }
-            _ => current = ancestor.parent(),
-        }
-    }
-    false
+    direct_template_field_owner(parent, ctx).is_some()
 }
 
 fn previous_word(value: &str) -> Option<&str> {

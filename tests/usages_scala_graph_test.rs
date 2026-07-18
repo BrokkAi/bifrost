@@ -3119,6 +3119,59 @@ object Utility {
 }
 
 #[test]
+fn scala_template_field_initializers_preserve_member_identity_without_leaking_local_decoys() {
+    let source = r#"
+package app
+
+class ORSet {
+  protected val elementsMap: Map[String, Int] = Map.empty
+  private val copiedBefore = elementsMap // positive-before
+  private val localBlock = { val elementsMap = Map("local" -> 1); elementsMap } // negative-local-block
+  private val copiedAfter = elementsMap // positive-after
+
+  def methodLocal: Map[String, Int] = {
+    val elementsMap = Map("method" -> 1)
+    elementsMap // negative-method-local
+  }
+
+  final class Nested {
+    private val elementsMap = Map("nested" -> 1)
+    private val nestedCopy = elementsMap // negative-nested-owner
+  }
+}
+
+final class InheritedORSet extends ORSet {
+  private val inheritedCopy = elementsMap // positive-inherited
+}
+
+final class ShadowingORSet extends ORSet {
+  protected val elementsMap: Map[String, Int] = Map("shadow" -> 1)
+  private val shadowCopy = elementsMap // negative-subclass-shadow
+}
+
+final class Unrelated {
+  private val elementsMap = Map("unrelated" -> 1)
+  private val copied = elementsMap // negative-unrelated-owner
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/ORSet.scala", source)]);
+    let elements_map = definition(&analyzer, "app.ORSet.elementsMap");
+
+    let hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&elements_map)),
+    );
+
+    assert_hit_contains(&hits, "positive-before");
+    assert_hit_contains(&hits, "positive-after");
+    assert_hit_contains(&hits, "positive-inherited");
+    assert_no_hit_contains(&hits, "negative-local-block");
+    assert_no_hit_contains(&hits, "negative-method-local");
+    assert_no_hit_contains(&hits, "negative-nested-owner");
+    assert_no_hit_contains(&hits, "negative-subclass-shadow");
+    assert_no_hit_contains(&hits, "negative-unrelated-owner");
+}
+
+#[test]
 fn scala_graph_keeps_receiver_inference_scoped_and_conservative() {
     let consumer_source = r#"
 package app
