@@ -2852,6 +2852,66 @@ object NumberUse {
 }
 
 #[test]
+fn scan_usages_by_reference_finds_scala_unqualified_type_roles() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Model.scala",
+            r#"package model
+class Extracted(val value: Int)
+object Extracted { def unapply(value: Any): Option[Int] = None }
+class Built(val value: Int)
+abstract class Zero
+final class Projected private (val value: Int)
+object Projected { def apply(value: Int): Projected = new Projected(value) }
+trait Growable { def +=(value: Int): Unit }
+"#,
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+import model.*
+object Use {
+  def extract(value: Any): Int = value match { case Extracted(found) => found; case _ => 0 } // mcp-extractor
+  val built = Built(1) // mcp-universal
+  val projected = Projected(2) // mcp-apply
+  val zero = new Zero: // mcp-zero
+    override def toString = "zero"
+  def grow(target: Growable): Unit = target += 1 // mcp-infix
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    for (symbol, expected) in [
+        ("model.Extracted", "mcp-extractor"),
+        ("model.Built", "mcp-universal"),
+        ("model.Projected.apply", "mcp-apply"),
+        ("model.Zero", "mcp-zero"),
+        ("model.Growable.+=", "mcp-infix"),
+    ] {
+        let args = serde_json::json!({"symbols": [symbol], "include_tests": true}).to_string();
+        let payload = service
+            .call_tool_json("scan_usages_by_reference", &args)
+            .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        let usage = only_result(&value);
+        assert_eq!(usage["status"], "found", "{symbol}: {value}");
+        assert!(
+            usage["files"].as_array().into_iter().flatten().any(|file| {
+                file["hits"].as_array().into_iter().flatten().any(|hit| {
+                    hit["snippet"]
+                        .as_str()
+                        .is_some_and(|snippet| snippet.contains(expected))
+                })
+            }),
+            "{symbol} missing {expected:?}: {value}"
+        );
+    }
+}
+
+#[test]
 fn scan_usages_by_reference_finds_scala_structured_selection_roles() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

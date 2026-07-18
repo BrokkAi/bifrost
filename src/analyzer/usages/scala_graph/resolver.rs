@@ -765,10 +765,7 @@ impl Visibility {
             ambiguous_direct_member_names: ambiguous_wildcard_members(scala, file, spec),
         };
 
-        let file_package = Some(active_package);
-        if file == spec.target.source()
-            || file_package.as_deref() == Some(spec.target.package_name())
-        {
+        if file == spec.target.source() || active_package == spec.target.package_name() {
             visibility.type_names.insert(spec.member_name.clone());
             if spec.owner.is_none() {
                 visibility
@@ -784,7 +781,7 @@ impl Visibility {
         if spec
             .owner
             .as_ref()
-            .is_some_and(|owner| file_package.as_deref() == Some(owner.package_name()))
+            .is_some_and(|owner| active_package == owner.package_name())
             && let Some(owner_name) = spec.owner_name.as_ref()
             && let Some(owner) = spec.owner.as_ref()
         {
@@ -792,12 +789,12 @@ impl Visibility {
         }
 
         for owner in &spec.family_owners {
-            if file == owner.source() || file_package.as_deref() == Some(owner.package_name()) {
+            if file == owner.source() || active_package == owner.package_name() {
                 visibility.add_owner_name(scala_display_name(owner), owner.fq_name());
             }
         }
         for owner in &spec.receiver_owners {
-            if file == owner.source() || file_package.as_deref() == Some(owner.package_name()) {
+            if file == owner.source() || active_package == owner.package_name() {
                 visibility.add_receiver_type_name(scala_display_name(owner), owner.fq_name());
             }
         }
@@ -830,9 +827,8 @@ impl Visibility {
             visibility.type_names.insert(spec.member_name.clone());
         }
 
-        let file_package = file_package.unwrap_or_default();
         for import in imports {
-            visibility.apply_import(scala, resolver, import, spec, &file_package);
+            visibility.apply_import(scala, resolver, import, spec, active_package);
         }
 
         visibility.retain_exact_visible_bindings(resolver, spec);

@@ -923,9 +923,15 @@ pub(crate) fn call_arities_for_reference(node: Node<'_>) -> Option<Vec<usize>> {
             instance
                 .named_children(&mut cursor)
                 .find(|child| child.kind() == "arguments")
-        })?;
-        let mut cursor = arguments.walk();
-        arities.push(arguments.named_children(&mut cursor).count());
+        });
+        if let Some(arguments) = arguments {
+            let mut cursor = arguments.walk();
+            arities.push(arguments.named_children(&mut cursor).count());
+        } else {
+            // `new T:` / `new T { ... }` has no `arguments` child, but it still
+            // invokes the argumentless primary constructor.
+            arities.push(0);
+        }
         expression = instance;
     }
     while let Some(call) = expression.parent() {

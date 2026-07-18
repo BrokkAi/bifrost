@@ -632,6 +632,7 @@ pub(super) fn resolve_scala(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_scala_bare_apply_fast_path(
     scala: &ScalaAnalyzer,
     analyzer: &dyn IAnalyzer,

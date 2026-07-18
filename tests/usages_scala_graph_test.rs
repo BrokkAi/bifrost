@@ -196,7 +196,7 @@ object Use {
     assert_no_hit_contains(&class_hits, "val bareObject = Token");
     assert_no_hit_contains(&class_hits, "Token.type");
     assert_no_hit_contains(&class_hits, "Token.Nested");
-    assert_no_hit_contains(&class_hits, "case Token(found)");
+    assert_hit_contains(&class_hits, "case Token(found)");
     assert!(
         class_hits
             .iter()
@@ -2462,7 +2462,7 @@ object Use {
     let settings_hits =
         hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&settings)));
     assert_hit_contains(&settings_hits, "val settings = ModelSettings(2)");
-    assert_no_hit_contains(&settings_hits, "case ModelSettings(number)");
+    assert_hit_contains(&settings_hits, "case ModelSettings(number)");
     assert_no_hit_contains(&settings_hits, "ModelSettings()");
 
     let plain = definition(&analyzer, "model.Plain");
@@ -2470,6 +2470,116 @@ object Use {
         hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&plain)));
     assert_no_hit_contains(&plain_hits, "Plain(3)");
     assert_no_hit_contains(&plain_hits, "case Plain(number)");
+}
+
+#[test]
+fn scala_unqualified_type_roles_follow_exact_callable_precedence() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Model.scala",
+            r#"package model
+class Extracted(val value: Int)
+object Extracted {
+  def unapply(value: Any): Option[Int] = None
+}
+class Built(val value: Int)
+abstract class Zero
+final class Projected private (val value: Int)
+object Projected {
+  def apply(value: Int): Projected = new Projected(value)
+}
+class Other
+class Plain(val value: Int)
+object Plain {
+  def apply(value: Int): Other = new Other
+}
+object LexicalCollision {
+  def apply(value: Int): Other = new Other
+}
+trait Growable {
+  def +=(value: Int): Unit
+}
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+import model.*
+object Use {
+  def extract(value: Any): Int = value match {
+    case Extracted(found) => found // positive-extractor
+    case _ => 0
+  }
+  val built = Built(1) // positive-universal
+  val projected = Projected(2) // positive-projected-apply
+  val plain = Plain(3) // positive-other-return-apply
+  val explicitlyPlain = new Plain(4) // positive-explicit-constructor
+  val zero = new Zero: // positive-zero-arity
+    override def toString = "zero"
+  def grow(target: Growable): Unit = target += 1 // positive-infix
+}
+class LocalWins {
+  def Projected(value: Int): Int = value
+  val value = Projected(9) // negative-same-name-member
+}
+class NestedWins {
+  class LexicalCollision(val value: Int)
+  val value = LexicalCollision(7) // positive-lexical-collision
+}
+"#,
+        ),
+    ]);
+
+    for (target, expected) in [
+        ("model.Extracted", "positive-extractor"),
+        ("model.Built", "positive-universal"),
+        ("model.Built.Built", "positive-universal"),
+        ("model.Projected", "positive-projected-apply"),
+        ("model.Projected$.apply", "positive-projected-apply"),
+        ("model.Zero", "positive-zero-arity"),
+        ("model.Growable.+=", "positive-infix"),
+        ("model.Plain$.apply", "positive-other-return-apply"),
+        (
+            "app.NestedWins.LexicalCollision",
+            "positive-lexical-collision",
+        ),
+        (
+            "app.NestedWins.LexicalCollision.LexicalCollision",
+            "positive-lexical-collision",
+        ),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&target_hits, expected);
+        assert_no_hit_contains(&target_hits, "negative-same-name-member");
+    }
+
+    let plain = definition(&analyzer, "model.Plain");
+    let plain_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&plain)));
+    assert_no_hit_contains(&plain_hits, "positive-other-return-apply");
+
+    let plain_constructor = definition(&analyzer, "model.Plain.Plain");
+    let constructor_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&plain_constructor)),
+    );
+    assert_hit_contains(&constructor_hits, "positive-explicit-constructor");
+    assert_no_hit_contains(&constructor_hits, "positive-other-return-apply");
+
+    let projected_constructor = definition(&analyzer, "model.Projected.Projected");
+    let projected_constructor_hits = hits(
+        UsageFinder::new()
+            .find_usages_default(&analyzer, std::slice::from_ref(&projected_constructor)),
+    );
+    assert_no_hit_contains(&projected_constructor_hits, "positive-projected-apply");
+
+    let imported_collision = definition(&analyzer, "model.LexicalCollision$.apply");
+    let imported_collision_hits = hits(
+        UsageFinder::new()
+            .find_usages_default(&analyzer, std::slice::from_ref(&imported_collision)),
+    );
+    assert_no_hit_contains(&imported_collision_hits, "positive-lexical-collision");
 }
 
 #[test]
@@ -2652,7 +2762,7 @@ object Owner {
         assert_no_hit_line(&class_hits, line_of(consumer_source, marker));
     }
 
-    let imports = analyzer.import_info_of(&definition(&analyzer, "app.Consumer").source());
+    let imports = analyzer.import_info_of(definition(&analyzer, "app.Consumer").source());
     assert_eq!(
         8,
         imports.len(),

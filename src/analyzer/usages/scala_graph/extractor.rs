@@ -130,14 +130,17 @@ pub(super) struct ScanCtx<'a> {
     import_context_cursor: usize,
     package_contexts: ScalaPackageContextIndex,
     package_context_cursor: usize,
-    active_resolver_key: Option<(Vec<String>, Vec<usize>)>,
-    resolver_contexts: HashMap<(Vec<String>, Vec<usize>), (Arc<NameResolver>, Arc<Visibility>)>,
+    active_resolver_key: Option<ResolverContextKey>,
+    resolver_contexts: HashMap<ResolverContextKey, ResolverContext>,
     pub(super) bindings: &'a mut LocalInferenceEngine<String>,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
     pub(super) max_usages: usize,
     pub(super) limit_exceeded: &'a mut bool,
     pub(super) enclosing_cache: HashMap<(usize, usize), Option<CodeUnit>>,
 }
+
+type ResolverContextKey = (Vec<String>, Vec<usize>);
+type ResolverContext = (Arc<NameResolver>, Arc<Visibility>);
 
 enum ScanEvent<'tree> {
     Enter(Node<'tree>),
@@ -317,16 +320,22 @@ fn scan_call_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn companion_apply_call_is_proven(function: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
+    let lexical_type = lexically_visible_nested_type(function, text, ctx);
     ctx.spec.accepts_companion_apply_syntax
         && ctx.spec.owner_name.as_deref() == Some(text)
         && !has_member_qualifier(function)
         && !is_locally_shadowed(ctx, text)
+        && !bare_call_is_claimed_by_enclosing_member(function, text, ctx)
         && member_call_arity_matches(function, ctx)
-        && (ctx
-            .visibility
-            .owner_fq_name_for(text)
-            .is_some_and(|owner| ctx.spec.owner_fq_matches(owner))
-            || nested_target_owner_is_lexically_visible(function, ctx))
+        && lexical_type.map_or_else(
+            || {
+                ctx.visibility
+                    .owner_fq_name_for(text)
+                    .is_some_and(|owner| ctx.spec.owner_fq_matches(owner))
+                    || nested_target_owner_is_lexically_visible(function, ctx)
+            },
+            |lexical_type| ctx.spec.owner_fq_matches(&lexical_type),
+        )
 }
 
 fn nested_target_owner_is_lexically_visible(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -1085,27 +1094,44 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 );
             let class_reference = qualified.is_none()
                 && is_scala_class_reference(node, ctx.source)
+                && !is_call_function_reference(node)
                 && !ctx.spec.is_object_type
                 && (lexical_type_matches
                     || lexical_type.is_none() && ctx.visibility.class_type_name_matches(text))
                 && class_call_shape_matches;
+            let class_application = qualified.is_none()
+                && is_call_function_reference(node)
+                && !ctx.spec.is_object_type
+                && !bare_call_is_claimed_by_enclosing_member(node, text, ctx)
+                && (lexical_type_matches
+                    || lexical_type.is_none() && ctx.visibility.class_type_name_matches(text))
+                && ctx.types.class_application_matches(
+                    ctx.scala,
+                    &ctx.name_resolver,
+                    &ctx.spec.target,
+                    call_arities_for_reference(node).as_deref(),
+                );
             let bare_method_value_context = is_bare_companion_method_value_reference(node)
                 .then(|| companion_method_value_context(node, ctx));
             let object_reference = qualified.is_none()
                 && object_syntax
                 && (ctx.visibility.object_type_name_matches(text) || lexical_type_matches)
-                && (ctx.spec.is_object_type
-                    || ctx.spec.accepts_stable_object_role
-                    || (is_extractor_reference(node) || is_infix_pattern_operator(node))
-                        && ctx.spec.accepts_extractor_role
-                    || is_call_function_reference(node)
-                        && ctx.spec.accepts_apply_role
-                        && ctx.types.class_companion_apply_call_matches(
-                            ctx.scala,
-                            &ctx.name_resolver,
-                            &ctx.spec.target,
-                            call_arities_for_reference(node).as_deref(),
-                        ));
+                && if is_call_function_reference(node) {
+                    !bare_call_is_claimed_by_enclosing_member(node, text, ctx)
+                        && (ctx.spec.is_object_type
+                            || ctx.spec.accepts_apply_role
+                                && ctx.types.class_companion_apply_call_matches(
+                                    ctx.scala,
+                                    &ctx.name_resolver,
+                                    &ctx.spec.target,
+                                    call_arities_for_reference(node).as_deref(),
+                                ))
+                } else {
+                    ctx.spec.is_object_type
+                        || ctx.spec.accepts_stable_object_role
+                        || (is_extractor_reference(node) || is_infix_pattern_operator(node))
+                            && ctx.spec.accepts_extractor_role
+                };
             let incompatible_companion_object_reference = qualified.is_none()
                 && ctx.spec.is_object_type
                 && matches!(
@@ -1139,6 +1165,7 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 };
             (qualified_role_matches
                 || class_reference
+                || class_application
                 || object_reference
                 || incompatible_companion_object_reference
                 || companion_method_value
@@ -1179,8 +1206,17 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 || (lexical_owner_matches
                     || lexical_owner.is_none() && ctx.visibility.class_type_name_matches(text))
                     && !type_reference_is_locally_bound(text, ctx)
+                    && !bare_call_is_claimed_by_enclosing_member(node, text, ctx)
                     && is_constructor_like_reference(node, ctx.source)
                     && member_call_arity_matches(node, ctx)
+                    && (!is_call_function_reference(node)
+                        || ctx.spec.owner.as_ref().is_some_and(|owner| {
+                            ctx.types.class_application_uses_constructor(
+                                ctx.scala,
+                                owner,
+                                call_arities_for_reference(node).as_deref(),
+                            )
+                        }))
         }
         TargetKind::Method => member_reference_is_proven(node, text, ctx),
         TargetKind::Field => {
@@ -1232,6 +1268,24 @@ fn named_argument_field_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>)
 
 fn type_reference_is_locally_bound(text: &str, ctx: &ScanCtx<'_>) -> bool {
     !ctx.bindings.resolve_symbol(text).is_unknown() || ctx.bindings.is_shadowed(text)
+}
+
+fn bare_call_is_claimed_by_enclosing_member(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
+    if !is_call_function_reference(node) {
+        return false;
+    }
+    let Some(owner) = enclosing_owner_fq_name(node, ctx) else {
+        return false;
+    };
+    !matches!(
+        ctx.types.bare_member_declarations(
+            ctx.scala,
+            &owner,
+            text,
+            call_arities_for_reference(node).as_deref(),
+        ),
+        BareMemberResolution::NoMatch
+    )
 }
 
 fn seed_value_binding_identifier(node: Node<'_>, text: &str, ctx: &mut ScanCtx<'_>) -> bool {

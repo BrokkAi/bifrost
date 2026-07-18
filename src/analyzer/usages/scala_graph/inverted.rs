@@ -30,10 +30,11 @@ use super::syntax::{
     ScalaCallableParameterList, ScalaImportContextIndex, ScalaMethodValueContext,
     ScalaPackageContextIndex, ScalaParameterListKind, ScalaQualifiedStableTypeRole,
     ScalaSourceFacts, call_arities_for_reference, is_bare_companion_method_value_reference,
-    is_constructor_like_reference, is_scala_class_reference, is_scala_object_reference,
-    is_terminal_stable_field_reference, node_text, parenthesized_arity,
-    qualified_stable_type_reference, resolve_stable_object_expression,
-    scala_import_is_visible_at_byte, scala_source_facts, stable_identifier_reference,
+    is_constructor_like_reference, is_extractor_reference, is_infix_pattern_operator,
+    is_scala_class_reference, is_scala_object_reference, is_terminal_stable_field_reference,
+    node_text, parenthesized_arity, qualified_stable_type_reference,
+    resolve_stable_object_expression, scala_import_is_visible_at_byte, scala_source_facts,
+    stable_identifier_reference,
 };
 use crate::analyzer::scala::{
     ScalaAdapter, ScalaSupertypeLookupPath, ScalaWildcardOwnerFacts,
@@ -970,7 +971,7 @@ impl ProjectTypes {
         while let Some(parent) = scope {
             let lexical = state
                 .children
-                .get(&parent)
+                .get(parent)
                 .into_iter()
                 .flatten()
                 .filter(|unit| unit.is_class() && scala_simple_type_name(unit) == *first)
@@ -1426,6 +1427,67 @@ impl ProjectTypes {
         target: &CodeUnit,
     ) -> bool {
         self.is_case_class(scala, target)
+            || self
+                .exact_companion_objects(scala, target)
+                .iter()
+                .any(|companion| {
+                    ["unapply", "unapplySeq"].iter().any(|member| {
+                        self.members_for_exact_owner_name(&companion.fq_name(), member)
+                            .iter()
+                            .any(|unit| unit.is_function())
+                    })
+                })
+    }
+
+    pub(super) fn class_application_matches(
+        &self,
+        scala: &ScalaAnalyzer,
+        resolver: &NameResolver,
+        target: &CodeUnit,
+        call_arities: Option<&[usize]>,
+    ) -> bool {
+        if self.class_companion_apply_call_matches(scala, resolver, target, call_arities) {
+            return true;
+        }
+        if self
+            .exact_companion_objects(scala, target)
+            .iter()
+            .any(|companion| {
+                !self
+                    .method_declarations_for_owner_member(
+                        scala,
+                        &companion.fq_name(),
+                        "apply",
+                        call_arities,
+                    )
+                    .is_empty()
+            })
+        {
+            return false;
+        }
+        self.constructor_call_shape_matches(scala, &target.fq_name(), call_arities)
+    }
+
+    pub(super) fn class_application_uses_constructor(
+        &self,
+        scala: &ScalaAnalyzer,
+        target: &CodeUnit,
+        call_arities: Option<&[usize]>,
+    ) -> bool {
+        !self
+            .exact_companion_objects(scala, target)
+            .iter()
+            .any(|companion| {
+                !self
+                    .method_declarations_for_owner_member(
+                        scala,
+                        &companion.fq_name(),
+                        "apply",
+                        call_arities,
+                    )
+                    .is_empty()
+            })
+            && self.constructor_call_shape_matches(scala, &target.fq_name(), call_arities)
     }
 
     pub(super) fn class_accepts_apply_role(
@@ -2586,6 +2648,19 @@ fn record_reference(
             }
             let text = node_text(node, ctx.source);
             let object_reference = is_scala_object_reference(node);
+            if (is_extractor_reference(node) || is_infix_pattern_operator(node))
+                && bindings.resolve_symbol(text).is_unknown()
+                && !bindings.is_shadowed(text)
+                && let Some(fqn) = ctx
+                    .lexically_visible_type(node.start_byte(), text)
+                    .or_else(|| ctx.resolver.resolve(text))
+                && let Some(target) = ctx
+                    .types
+                    .type_by_normalized_fqn(&scala_normalized_fq_name(&fqn))
+                && ctx.types.class_accepts_extractor_role(ctx.scala, target)
+            {
+                ctx.record(target.fq_name(), node);
+            }
             let resolved = if object_reference {
                 ctx.resolver.resolve_object(text)
             } else if is_scala_class_reference(node, ctx.source) {
@@ -2688,29 +2763,66 @@ fn record_reference(
                     }
                     if let Some(owner) = ctx.enclosing_class(function.start_byte()) {
                         let call_arities = call_arities_for_reference(function);
-                        let targets = ctx.types.method_targets_for_owner_member(
+                        let mut targets = ctx.types.method_targets_for_owner_member(
                             ctx.scala,
                             owner,
                             name,
                             call_arities.as_deref(),
                         );
                         if targets.is_empty() {
-                            for target in ctx.types.inherited_method_targets_for_owner_member(
+                            targets = ctx.types.inherited_method_targets_for_owner_member(
                                 ctx.scala,
                                 owner,
                                 name,
                                 call_arities.as_deref(),
-                            ) {
-                                ctx.record(target, function);
-                            }
-                        } else {
+                            );
+                        }
+                        if !targets.is_empty() {
                             for target in targets {
                                 ctx.record(target, function);
                             }
+                            return;
                         }
                     }
+                    record_unqualified_type_application(function, name, ctx, bindings);
                 }
                 _ => {}
+            }
+        }
+        "infix_expression" => {
+            let (Some(receiver), Some(operator)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("operator"),
+            ) else {
+                return;
+            };
+            let member = node_text(operator, ctx.source).trim();
+            if member.is_empty() {
+                return;
+            }
+            let Some(owner) = receiver_type_fqn(receiver, ctx, bindings) else {
+                return;
+            };
+            let call_arities = call_arities_for_reference(operator);
+            let direct = ctx.types.method_targets_for_owner_member(
+                ctx.scala,
+                &owner,
+                member,
+                call_arities.as_deref(),
+            );
+            if direct.is_empty() {
+                for target in ctx.types.inherited_method_targets_for_owner_member(
+                    ctx.scala,
+                    &owner,
+                    member,
+                    call_arities.as_deref(),
+                ) {
+                    ctx.record(target, operator);
+                }
+            } else {
+                for target in direct {
+                    ctx.record(target, operator);
+                }
             }
         }
         "identifier" | "operator_identifier" => {
@@ -2725,6 +2837,21 @@ fn record_reference(
                 return;
             }
             let bare_companion_method_value = is_bare_companion_method_value_reference(node);
+            if (is_extractor_reference(node) || is_infix_pattern_operator(node))
+                && let Some(fqn) = (bindings.resolve_symbol(name).is_unknown()
+                    && !bindings.is_shadowed(name))
+                .then(|| {
+                    ctx.lexically_visible_type(node.start_byte(), name)
+                        .or_else(|| ctx.resolver.resolve(name))
+                })
+                .flatten()
+                && let Some(target) = ctx
+                    .types
+                    .type_by_normalized_fqn(&scala_normalized_fq_name(&fqn))
+                && ctx.types.class_accepts_extractor_role(ctx.scala, target)
+            {
+                ctx.record(target.fq_name(), node);
+            }
             if is_scala_class_reference(node, ctx.source)
                 && !bare_companion_method_value
                 && let Some(fqn) = (bindings.resolve_symbol(name).is_unknown()
@@ -2856,6 +2983,88 @@ fn record_reference(
     }
 }
 
+fn record_unqualified_type_application(
+    function: Node<'_>,
+    name: &str,
+    ctx: &mut ScalaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<ScalaBinding>,
+) -> bool {
+    if !bindings.resolve_symbol(name).is_unknown() || bindings.is_shadowed(name) {
+        return false;
+    }
+    let call_arities = call_arities_for_reference(function);
+    let class_fqn = ctx
+        .lexically_visible_type(function.start_byte(), name)
+        .or_else(|| ctx.resolver.resolve(name));
+    let target = class_fqn.as_ref().and_then(|class_fqn| {
+        ctx.types
+            .type_by_normalized_fqn(&scala_normalized_fq_name(class_fqn))
+            .cloned()
+    });
+    let apply_owners = if let Some(target) = target.as_ref() {
+        ctx.types
+            .exact_companion_objects(ctx.scala, target)
+            .into_iter()
+            .map(|companion| companion.fq_name())
+            .collect::<Vec<_>>()
+    } else {
+        ctx.resolver.resolve_object(name).into_iter().collect()
+    };
+    let apply_targets = apply_owners
+        .iter()
+        .flat_map(|object| {
+            ctx.types.method_targets_for_owner_member(
+                ctx.scala,
+                object,
+                "apply",
+                call_arities.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !apply_targets.is_empty() {
+        if let Some(target) = target.as_ref()
+            && ctx.types.class_application_matches(
+                ctx.scala,
+                &ctx.resolver,
+                target,
+                call_arities.as_deref(),
+            )
+        {
+            ctx.record(target.fq_name(), function);
+        }
+        for apply in apply_targets {
+            ctx.record(apply, function);
+        }
+        return true;
+    }
+
+    if let Some(target) = target {
+        if ctx.types.class_application_matches(
+            ctx.scala,
+            &ctx.resolver,
+            &target,
+            call_arities.as_deref(),
+        ) {
+            ctx.record(target.fq_name(), function);
+        }
+        for constructor in ctx
+            .types
+            .method_declarations_for_owner_member(
+                ctx.scala,
+                &target.fq_name(),
+                name,
+                call_arities.as_deref(),
+            )
+            .into_iter()
+            .filter(CodeUnit::is_synthetic)
+        {
+            ctx.record(constructor.fq_name(), function);
+        }
+        return true;
+    }
+    false
+}
+
 fn record_qualified_stable_reference(
     node: Node<'_>,
     ctx: &mut ScalaScan<'_, '_>,
@@ -2894,12 +3103,12 @@ fn record_qualified_stable_reference(
                         ctx.types.class_companion_apply_call_matches(
                             ctx.scala,
                             &ctx.resolver,
-                            &target,
+                            target,
                             call_arities.as_deref(),
                         )
                     }
                     ScalaQualifiedStableTypeRole::Extractor => {
-                        ctx.types.class_accepts_extractor_role(ctx.scala, &target)
+                        ctx.types.class_accepts_extractor_role(ctx.scala, target)
                     }
                     ScalaQualifiedStableTypeRole::Type
                     | ScalaQualifiedStableTypeRole::Constructor => unreachable!(),

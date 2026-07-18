@@ -477,8 +477,6 @@ class Consumer {
     for caller in [
         "example.Consumer.objectBare",
         "example.Consumer.nestedOwner",
-        "example.Consumer.extractor",
-        "example.Consumer.infixExtractor",
     ] {
         assert!(
             has_edge(&value, caller, "example.Token$"),
@@ -488,6 +486,21 @@ class Consumer {
         assert!(
             !has_edge(&value, caller, "example.Token"),
             "object role in {caller} must not edge to the class: {}",
+            value["edges"]
+        );
+    }
+    for caller in [
+        "example.Consumer.extractor",
+        "example.Consumer.infixExtractor",
+    ] {
+        assert!(
+            has_edge(&value, caller, "example.Token$"),
+            "object role in {caller} should edge to the companion object: {}",
+            value["edges"]
+        );
+        assert!(
+            has_edge(&value, caller, "example.Token"),
+            "exact companion extractor in {caller} should project to the class: {}",
             value["edges"]
         );
     }
@@ -793,6 +806,84 @@ object Use {
         "{}",
         value["edges"]
     );
+}
+
+#[test]
+fn scala_inverted_lowers_unqualified_type_roles_with_exact_precedence() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Model.scala",
+            r#"package model
+class Extracted(val value: Int)
+object Extracted { def unapply(value: Any): Option[Int] = None }
+class Built(val value: Int)
+abstract class Zero
+final class Projected private (val value: Int)
+object Projected { def apply(value: Int): Projected = new Projected(value) }
+class Other
+class Plain(val value: Int)
+object Plain { def apply(value: Int): Other = new Other }
+object LexicalCollision { def apply(value: Int): Other = new Other }
+trait Growable { def +=(value: Int): Unit }
+"#,
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+import model.*
+object Use {
+  def extract(value: Any): Int = value match { case Extracted(found) => found; case _ => 0 }
+  def built = Built(1)
+  def projected = Projected(2)
+  def plain = Plain(3)
+  def explicitlyPlain = new Plain(4)
+  def zero = new Zero:
+    override def toString = "zero"
+  def grow(target: Growable): Unit = target += 1
+}
+class LocalWins {
+  def Projected(value: Int): Int = value
+  def value = Projected(9)
+}
+class NestedWins {
+  class LexicalCollision(val value: Int)
+  def value = LexicalCollision(7)
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    for (caller, callee) in [
+        ("app.Use$.extract", "model.Extracted"),
+        ("app.Use$.built", "model.Built"),
+        ("app.Use$.projected", "model.Projected"),
+        ("app.Use$.projected", "model.Projected$.apply"),
+        ("app.Use$.plain", "model.Plain$.apply"),
+        ("app.Use$.explicitlyPlain", "model.Plain"),
+        ("app.Use$.zero", "model.Zero"),
+        ("app.Use$.grow", "model.Growable.+="),
+        ("app.LocalWins.value", "app.LocalWins.Projected"),
+        ("app.NestedWins.value", "app.NestedWins.LexicalCollision"),
+    ] {
+        assert!(
+            has_edge(&value, caller, callee),
+            "expected {caller} -> {callee}: {}",
+            value["edges"]
+        );
+    }
+    for (caller, callee) in [
+        ("app.Use$.plain", "model.Plain"),
+        ("app.LocalWins.value", "model.Projected"),
+        ("app.LocalWins.value", "model.Projected$.apply"),
+        ("app.NestedWins.value", "model.LexicalCollision$.apply"),
+    ] {
+        assert!(
+            !has_edge(&value, caller, callee),
+            "unexpected {caller} -> {callee}: {}",
+            value["edges"]
+        );
+    }
 }
 
 #[test]
