@@ -2104,13 +2104,15 @@ fn callable_shape_matches(
             if call_arities.len() > declared.len() {
                 return false;
             }
-            call_arities
+            let provided_lists_match = call_arities
                 .iter()
                 .zip(declared)
-                .all(|(call_arity, declared)| declared.arity.accepts(*call_arity))
-                && declared[call_arities.len()..]
-                    .iter()
-                    .all(|list| list.kind == ScalaParameterListKind::Contextual)
+                .all(|(call_arity, declared)| declared.arity.accepts(*call_arity));
+            provided_lists_match
+                && (unique_callable
+                    || declared[call_arities.len()..]
+                        .iter()
+                        .all(|list| list.kind == ScalaParameterListKind::Contextual))
         }
         None => declared.first().is_none_or(|list| list.arity.total() == 0) || unique_callable,
     }
