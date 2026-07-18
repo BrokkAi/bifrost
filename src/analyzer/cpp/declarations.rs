@@ -1,8 +1,9 @@
 use super::*;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{
-    CallableArity, CppTemplateExpression, CppTemplateMetadata, CppTemplateParameterKind,
-    CppTemplateParameterMetadata, CppTemplateTerm, ParameterMetadata, Range, SignatureMetadata,
+    CallableArity, CppTemplateAliasTargetMetadata, CppTemplateExpression, CppTemplateMetadata,
+    CppTemplateParameterKind, CppTemplateParameterMetadata, CppTemplateTerm, ParameterMetadata,
+    Range, SignatureMetadata,
 };
 use regex::Regex;
 use tree_sitter::Node;
@@ -1404,6 +1405,12 @@ impl<'a> CppVisitor<'a> {
                 .add_code_unit(code_unit.clone(), node, self.source, None, None);
             self.parsed
                 .add_signature(code_unit.clone(), signature.clone());
+            if let Some(metadata) = &scope.template_metadata {
+                let mut metadata = metadata.clone();
+                metadata.primary_fq_name = code_unit.fq_name();
+                self.parsed
+                    .set_cpp_template_metadata(code_unit.clone(), metadata);
+            }
             if let Some(parent) = &scope.class_unit {
                 self.parsed.add_child(parent.clone(), code_unit.clone());
             } else if let Some(module) = &scope.module {
@@ -2412,22 +2419,20 @@ fn cpp_template_metadata(
             default: cpp_template_parameter_default_expression(parameter, source, &parameter_names),
         })
         .collect();
-    let specialization_arguments = name_node
-        .child_by_field_name("arguments")
-        .map(|arguments| {
-            let mut cursor = arguments.walk();
-            arguments
-                .named_children(&mut cursor)
-                .filter(|argument| !argument.is_extra() && argument.kind() != "comment")
-                .map(|argument| cpp_template_expression(argument, source, &parameter_names))
-                .collect()
-        })
-        .unwrap_or_default();
+    let specialization_arguments = if declaration_child.kind() == "alias_declaration" {
+        Vec::new()
+    } else {
+        cpp_template_argument_expressions(name_node, source, &parameter_names).unwrap_or_default()
+    };
+    let alias_target = (declaration_child.kind() == "alias_declaration")
+        .then(|| cpp_template_alias_target(declaration_child, source, &parameter_names))
+        .flatten();
     Some(CppTemplateMetadata {
         primary_name,
         primary_fq_name: String::new(),
         parameters,
         specialization_arguments,
+        alias_target,
     })
 }
 
@@ -2444,7 +2449,80 @@ fn cpp_templated_class_name_node(node: Node<'_>) -> Option<Node<'_>> {
                 None
             }
         }
+        "alias_declaration" => node.child_by_field_name("name"),
         _ => None,
+    }
+}
+
+fn cpp_template_alias_target(
+    alias: Node<'_>,
+    source: &str,
+    parameter_names: &[String],
+) -> Option<CppTemplateAliasTargetMetadata> {
+    let mut type_node = alias.child_by_field_name("type")?;
+    while type_node.kind() == "type_descriptor" {
+        type_node = type_node.child_by_field_name("type")?;
+    }
+    let global = type_node.child_by_field_name("scope").is_none()
+        && type_node.child(0).is_some_and(|child| child.kind() == "::");
+    let mut components = Vec::new();
+    cpp_template_target_components(type_node, source, &mut components)?;
+    let arguments = cpp_template_argument_expressions(type_node, source, parameter_names);
+    (!components.is_empty()).then_some(CppTemplateAliasTargetMetadata {
+        components,
+        global,
+        arguments,
+    })
+}
+
+fn cpp_template_target_components(
+    node: Node<'_>,
+    source: &str,
+    out: &mut Vec<String>,
+) -> Option<()> {
+    match node.kind() {
+        "identifier" | "namespace_identifier" | "type_identifier" => {
+            out.push(node_text(node, source).to_string());
+            Some(())
+        }
+        "template_type" => {
+            cpp_template_target_components(node.child_by_field_name("name")?, source, out)
+        }
+        "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier" => {
+            if let Some(scope) = node.child_by_field_name("scope") {
+                cpp_template_target_components(scope, source, out)?;
+            }
+            cpp_template_target_components(node.child_by_field_name("name")?, source, out)
+        }
+        _ => None,
+    }
+}
+
+fn cpp_template_argument_expressions(
+    mut node: Node<'_>,
+    source: &str,
+    parameter_names: &[String],
+) -> Option<Vec<CppTemplateExpression>> {
+    loop {
+        match node.kind() {
+            "template_type" | "template_function" => {
+                let arguments = node.child_by_field_name("arguments")?;
+                let mut cursor = arguments.walk();
+                return Some(
+                    arguments
+                        .named_children(&mut cursor)
+                        .filter(|argument| !argument.is_extra() && argument.kind() != "comment")
+                        .map(|argument| cpp_template_expression(argument, source, parameter_names))
+                        .collect(),
+                );
+            }
+            "qualified_identifier" | "scoped_type_identifier" | "type_descriptor" => {
+                node = node
+                    .child_by_field_name("name")
+                    .or_else(|| node.child_by_field_name("type"))?;
+            }
+            _ => return None,
+        }
     }
 }
 

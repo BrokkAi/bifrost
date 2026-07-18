@@ -2465,6 +2465,33 @@ fn resolve_type_node_lexically_for_target(
     let Some((components, global)) = type_reference_components(node, source) else {
         return LexicalTypeResolution::Missing;
     };
+    if let Some(arguments) = cpp_template_reference_arguments(node, source) {
+        let alias_resolution = resolve_type_components_lexically_at_preserving_alias(
+            node,
+            &components,
+            global,
+            analyzer,
+            visibility,
+            ordinary_type_imports,
+            file,
+            source,
+        );
+        return match alias_resolution {
+            LexicalTypeResolution::Resolved {
+                unit,
+                components,
+                candidates,
+            } => match visibility.resolve_template_arguments(file, unit, &arguments) {
+                Ok(unit) => LexicalTypeResolution::Resolved {
+                    unit,
+                    components,
+                    candidates,
+                },
+                Err(()) => LexicalTypeResolution::Ambiguous,
+            },
+            unresolved => unresolved,
+        };
+    }
     resolve_type_components_lexically_at_for_target(
         node,
         &components,
@@ -2674,6 +2701,32 @@ fn resolve_type_components_lexically_at(
         file,
         source,
         None,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_type_components_lexically_at_preserving_alias(
+    node: Node<'_>,
+    components: &[String],
+    global: bool,
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    ordinary_type_imports: &OrdinaryTypeImportCell,
+    file: &ProjectFile,
+    source: &str,
+) -> LexicalTypeResolution {
+    resolve_type_components_lexically_at_inner(
+        node,
+        components,
+        global,
+        analyzer,
+        visibility,
+        ordinary_type_imports,
+        file,
+        source,
+        None,
+        true,
     )
 }
 
@@ -2699,6 +2752,7 @@ fn resolve_type_components_lexically_at_for_target(
         file,
         source,
         Some(target),
+        false,
     )
 }
 
@@ -2713,6 +2767,7 @@ fn resolve_type_components_lexically_at_inner(
     file: &ProjectFile,
     source: &str,
     direct_target: Option<&CodeUnit>,
+    preserve_alias: bool,
 ) -> LexicalTypeResolution {
     let lexical_scope = if global {
         Vec::new()
@@ -2731,27 +2786,37 @@ fn resolve_type_components_lexically_at_inner(
             LexicalScopeResolution::Missing => return LexicalTypeResolution::Missing,
         }
     };
-    let normal = direct_target.map_or_else(
-        || {
-            visibility.resolve_type_components_lexically(
-                analyzer,
-                file,
-                components,
-                global,
-                &lexical_scope,
-            )
-        },
-        |target| {
-            visibility.resolve_type_components_lexically_for_target(
-                analyzer,
-                file,
-                components,
-                global,
-                &lexical_scope,
-                target,
-            )
-        },
-    );
+    let normal = if preserve_alias {
+        visibility.resolve_type_components_lexically_for_forward(
+            analyzer,
+            file,
+            components,
+            global,
+            &lexical_scope,
+        )
+    } else {
+        direct_target.map_or_else(
+            || {
+                visibility.resolve_type_components_lexically(
+                    analyzer,
+                    file,
+                    components,
+                    global,
+                    &lexical_scope,
+                )
+            },
+            |target| {
+                visibility.resolve_type_components_lexically_for_target(
+                    analyzer,
+                    file,
+                    components,
+                    global,
+                    &lexical_scope,
+                    target,
+                )
+            },
+        )
+    };
     let normal_depth = match &normal {
         LexicalTypeResolution::Resolved { components, .. } => {
             Some(components.len().saturating_sub(1))
@@ -2771,9 +2836,8 @@ fn resolve_type_components_lexically_at_inner(
         {
             normal
         }
-        OrdinaryTypeImportResolution::Resolved(import) => {
-            visibility.resolve_imported_type_candidate(analyzer, file, import, direct_target)
-        }
+        OrdinaryTypeImportResolution::Resolved(import) => visibility
+            .resolve_imported_type_candidate(analyzer, file, import, direct_target, preserve_alias),
         OrdinaryTypeImportResolution::Ambiguous { lexical_depth }
             if normal_depth.is_some_and(|depth| depth > lexical_depth) =>
         {

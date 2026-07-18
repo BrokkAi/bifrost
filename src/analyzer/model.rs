@@ -293,11 +293,20 @@ pub(crate) struct CppTemplateParameterMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CppTemplateAliasTargetMetadata {
+    pub(crate) components: Vec<String>,
+    pub(crate) global: bool,
+    pub(crate) arguments: Option<Vec<CppTemplateExpression>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CppTemplateMetadata {
     pub(crate) primary_name: String,
     pub(crate) primary_fq_name: String,
     pub(crate) parameters: Vec<CppTemplateParameterMetadata>,
     pub(crate) specialization_arguments: Vec<CppTemplateExpression>,
+    #[serde(default)]
+    pub(crate) alias_target: Option<CppTemplateAliasTargetMetadata>,
 }
 
 impl SignatureMetadata {

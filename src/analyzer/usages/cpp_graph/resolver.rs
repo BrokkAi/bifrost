@@ -574,6 +574,7 @@ enum StructuredAliasTarget {
     Named {
         components: Vec<String>,
         global: bool,
+        arguments: Option<Vec<CppTemplateExpression>>,
     },
 }
 
@@ -717,12 +718,63 @@ impl VisibilityIndex {
             .map(Some)
     }
 
-    fn resolve_template_arguments(
+    pub(super) fn resolve_template_arguments(
         &self,
         file: &ProjectFile,
         primary: CodeUnit,
         arguments: &[CppTemplateExpression],
     ) -> std::result::Result<CodeUnit, ()> {
+        self.resolve_template_arguments_inner(file, primary, arguments, &mut HashSet::default())
+    }
+
+    fn resolve_template_arguments_inner(
+        &self,
+        file: &ProjectFile,
+        primary: CodeUnit,
+        arguments: &[CppTemplateExpression],
+        seen_aliases: &mut HashSet<CodeUnit>,
+    ) -> std::result::Result<CodeUnit, ()> {
+        if let Some(metadata) = self.cpp_template_metadata.get(&primary)
+            && let Some(alias_target) = &metadata.alias_target
+        {
+            if !seen_aliases.insert(primary.clone()) {
+                return Err(());
+            }
+            let (_, bindings) =
+                cpp_bind_template_arguments(&metadata.parameters, arguments).ok_or(())?;
+            let target_name = alias_target.components.join("::");
+            let target_primary = if alias_target.global {
+                unique_logical_type_candidate(self.type_candidates(file, &target_name))
+            } else {
+                self.resolve_unique_type_for_declaration(file, &primary, &target_name)
+            };
+            let Some(target_primary) = target_primary else {
+                // A dependent or external RHS cannot be canonicalized from the
+                // indexed graph. Preserve the alias's direct identity instead
+                // of inventing a target from its source spelling.
+                return Ok(primary);
+            };
+            let Some(target_arguments) = &alias_target.arguments else {
+                return Ok(target_primary);
+            };
+            let target_arguments = target_arguments
+                .iter()
+                .map(|argument| {
+                    Some(CppTemplateExpression {
+                        text: argument.text.clone(),
+                        term: cpp_substitute_template_term(&argument.term, &bindings)?,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or(())?;
+            return self.resolve_template_arguments_inner(
+                file,
+                target_primary,
+                &target_arguments,
+                seen_aliases,
+            );
+        }
+
         let primary_fq_name = self
             .cpp_template_metadata
             .get(&primary)
@@ -778,26 +830,7 @@ impl VisibilityIndex {
         if explicit_arguments.len() > primary_parameters.len() {
             return None;
         }
-        let mut expanded = explicit_arguments
-            .iter()
-            .map(cpp_clone_template_expression_iterative)
-            .collect::<Vec<_>>();
-        let mut primary_bindings = HashMap::default();
-        for (parameter, argument) in primary_parameters.iter().zip(&expanded) {
-            primary_bindings.insert(
-                parameter.name.clone(),
-                cpp_clone_template_term_iterative(&argument.term),
-            );
-        }
-        for parameter in primary_parameters.iter().skip(expanded.len()) {
-            let default = parameter.default.as_ref()?;
-            let term = cpp_substitute_template_term(&default.term, &primary_bindings)?;
-            primary_bindings.insert(parameter.name.clone(), term.clone());
-            expanded.push(CppTemplateExpression {
-                text: default.text.clone(),
-                term,
-            });
-        }
+        let (expanded, _) = cpp_bind_template_arguments(&primary_parameters, explicit_arguments)?;
 
         let mut applicable = Vec::new();
         for unit in family {
@@ -894,12 +927,17 @@ impl VisibilityIndex {
         file: &ProjectFile,
         import: &OrdinaryTypeImport,
         direct_target: Option<&CodeUnit>,
+        preserve_alias: bool,
     ) -> LexicalTypeResolution {
         let candidates = [&import.target];
-        let resolution = direct_target.map_or(
-            TypeCandidateResolution::Canonical,
-            TypeCandidateResolution::PreserveTarget,
-        );
+        let resolution = if preserve_alias {
+            TypeCandidateResolution::PreserveAlias
+        } else {
+            direct_target.map_or(
+                TypeCandidateResolution::Canonical,
+                TypeCandidateResolution::PreserveTarget,
+            )
+        };
         let Some(unit) = self.resolve_type_candidates(analyzer, file, &candidates, resolution)
         else {
             return LexicalTypeResolution::Ambiguous;
@@ -1197,14 +1235,26 @@ impl VisibilityIndex {
         declaration: &CodeUnit,
         target: &StructuredAliasTarget,
     ) -> Option<CodeUnit> {
-        let StructuredAliasTarget::Named { components, global } = target else {
+        let StructuredAliasTarget::Named {
+            components,
+            global,
+            arguments,
+        } = target
+        else {
             return None;
         };
         let qualified = components.join("::");
-        if *global {
-            return unique_logical_type_candidate(self.type_candidates(visible_from, &qualified));
+        let primary = if *global {
+            unique_logical_type_candidate(self.type_candidates(visible_from, &qualified))
+        } else {
+            self.resolve_unique_type_for_declaration(visible_from, declaration, &qualified)
+        }?;
+        match arguments {
+            Some(arguments) => self
+                .resolve_template_arguments(visible_from, primary, arguments)
+                .ok(),
+            None => Some(primary),
         }
-        self.resolve_unique_type_for_declaration(visible_from, declaration, &qualified)
     }
 
     fn unique_canonical_type_candidate(
@@ -2675,7 +2725,12 @@ fn structured_alias_type_target(
         && type_node.child(0).is_some_and(|child| child.kind() == "::");
     let mut components = Vec::new();
     append_structured_type_components(type_node, source, &mut components)?;
-    (!components.is_empty()).then_some(StructuredAliasTarget::Named { components, global })
+    let arguments = cpp_template_reference_arguments(type_node, source);
+    (!components.is_empty()).then_some(StructuredAliasTarget::Named {
+        components,
+        global,
+        arguments,
+    })
 }
 
 fn append_structured_type_components(
@@ -3457,7 +3512,7 @@ pub(super) fn append_cpp_name_components(
     Some(())
 }
 
-fn cpp_template_reference_arguments(
+pub(super) fn cpp_template_reference_arguments(
     mut node: Node<'_>,
     source: &str,
 ) -> Option<Vec<CppTemplateExpression>> {
@@ -3545,6 +3600,36 @@ fn cpp_reconcile_primary_template_parameters(
         }
     }
     Some(merged)
+}
+
+fn cpp_bind_template_arguments(
+    parameters: &[CppTemplateParameterMetadata],
+    explicit_arguments: &[CppTemplateExpression],
+) -> Option<(Vec<CppTemplateExpression>, HashMap<String, CppTemplateTerm>)> {
+    if explicit_arguments.len() > parameters.len() {
+        return None;
+    }
+    let mut expanded = explicit_arguments
+        .iter()
+        .map(cpp_clone_template_expression_iterative)
+        .collect::<Vec<_>>();
+    let mut bindings = HashMap::default();
+    for (parameter, argument) in parameters.iter().zip(&expanded) {
+        bindings.insert(
+            parameter.name.clone(),
+            cpp_clone_template_term_iterative(&argument.term),
+        );
+    }
+    for parameter in parameters.iter().skip(expanded.len()) {
+        let default = parameter.default.as_ref()?;
+        let term = cpp_substitute_template_term(&default.term, &bindings)?;
+        bindings.insert(parameter.name.clone(), term.clone());
+        expanded.push(CppTemplateExpression {
+            text: default.text.clone(),
+            term,
+        });
+    }
+    Some((expanded, bindings))
 }
 
 fn cpp_specialization_matches(

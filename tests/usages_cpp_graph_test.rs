@@ -9092,6 +9092,233 @@ struct Params {
 }
 
 #[test]
+fn authoritative_cpp_template_alias_arguments_select_canonical_specializations() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "aliases.h",
+            r#"#pragma once
+namespace alias_dispatch {
+struct Item {};
+struct Special {};
+struct SharedTag {};
+
+template <typename Value, typename Tag> class Holder {};
+template <typename Value> class Holder<Value, SharedTag> {};
+template <> class Holder<Special, SharedTag> {};
+
+template <typename Value> class Primary {};
+
+template <typename Left, typename Right> class Ambiguous {};
+template <typename Left> class Ambiguous<Left, int> {};
+template <typename Right> class Ambiguous<int, Right> {};
+
+namespace aliases {
+template <typename Value> using Node = Holder<Value, SharedTag>;
+template <typename Value = Item> using DefaultNode = Holder<Value, SharedTag>;
+template <typename Value> using PrimaryNode = Primary<Value>;
+using FullNode = Holder<Special, SharedTag>;
+
+struct Catalog {
+  template <typename Value> using NestedNode = Holder<Value, SharedTag>;
+};
+
+template <typename Value> using CycleA = CycleB<Value>;
+template <typename Value> using CycleB = CycleA<Value>;
+template <typename Value> using AmbiguousNode = Ambiguous<Value, Value>;
+}  // namespace aliases
+}  // namespace alias_dispatch
+"#,
+        )
+        .file(
+            "site.cc",
+            r#"#include "aliases.h"
+namespace use_aliases {
+using alias_dispatch::Item;
+using alias_dispatch::Special;
+
+alias_dispatch::aliases::Node<Item> partial_value; // positive-partial
+alias_dispatch::aliases::Node<Special> full_via_template; // positive-full-template
+alias_dispatch::aliases::FullNode full_via_ordinary; // positive-full-ordinary
+alias_dispatch::aliases::DefaultNode<> defaulted_partial; // positive-default
+alias_dispatch::aliases::PrimaryNode<Item> primary_value; // positive-primary
+alias_dispatch::aliases::Catalog::NestedNode<Item> nested_partial; // positive-nested
+alias_dispatch::aliases::CycleA<Item> cycle_value; // conservative-cycle
+alias_dispatch::aliases::AmbiguousNode<int> ambiguous_value; // conservative-ambiguity
+}  // namespace use_aliases
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let definition = |fq_name: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Class && unit.fq_name() == fq_name
+        })
+    };
+    let partial = definition("alias_dispatch.Holder<Value, SharedTag>");
+    let full = definition("alias_dispatch.Holder<Special, SharedTag>");
+    let primary = definition("alias_dispatch.Primary");
+    let site = project.file("site.cc");
+    let source = site.read_to_string().expect("site source");
+    let forward_at = |line: &str, token: &str| {
+        let start = fixture_token_range(&source, line, token).0;
+        let line_start = source[..start].rfind('\n').map_or(0, |newline| newline + 1);
+        brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "site.cc".to_string(),
+                    line: Some(
+                        source[..start]
+                            .bytes()
+                            .filter(|byte| *byte == b'\n')
+                            .count()
+                            + 1,
+                    ),
+                    column: Some(source[line_start..start].chars().count() + 1),
+                }],
+            },
+        )
+        .results
+        .into_iter()
+        .next()
+        .expect("one forward result")
+    };
+    let forward_cases = [
+        (
+            "alias_dispatch::aliases::Node<Item> partial_value; // positive-partial",
+            "Node",
+            partial.fq_name(),
+        ),
+        (
+            "alias_dispatch::aliases::Node<Special> full_via_template; // positive-full-template",
+            "Node",
+            full.fq_name(),
+        ),
+        (
+            "alias_dispatch::aliases::FullNode full_via_ordinary; // positive-full-ordinary",
+            "FullNode",
+            full.fq_name(),
+        ),
+        (
+            "alias_dispatch::aliases::DefaultNode<> defaulted_partial; // positive-default",
+            "DefaultNode",
+            partial.fq_name(),
+        ),
+        (
+            "alias_dispatch::aliases::PrimaryNode<Item> primary_value; // positive-primary",
+            "PrimaryNode",
+            primary.fq_name(),
+        ),
+        (
+            "alias_dispatch::aliases::Catalog::NestedNode<Item> nested_partial; // positive-nested",
+            "NestedNode",
+            partial.fq_name(),
+        ),
+    ];
+    for (line, token, expected) in &forward_cases {
+        let forward = forward_at(line, token);
+        assert_eq!("resolved", forward.status, "{line}: {forward:#?}");
+        assert!(
+            !forward.definitions.is_empty()
+                && forward
+                    .definitions
+                    .iter()
+                    .all(|definition| definition.fqn.as_deref() == Some(expected.as_str())),
+            "alias application must select {expected}: {forward:#?}"
+        );
+    }
+    for (line, token) in [
+        (
+            "alias_dispatch::aliases::CycleA<Item> cycle_value; // conservative-cycle",
+            "CycleA",
+        ),
+        (
+            "alias_dispatch::aliases::AmbiguousNode<int> ambiguous_value; // conservative-ambiguity",
+            "AmbiguousNode",
+        ),
+    ] {
+        let forward = forward_at(line, token);
+        assert!(
+            forward.status != "resolved" || forward.definitions.is_empty(),
+            "alias cycles and ambiguous specializations must fail closed: {forward:#?}"
+        );
+    }
+
+    let positive_partial = [
+        "alias_dispatch::aliases::Node<Item>",
+        "alias_dispatch::aliases::DefaultNode<>",
+        "alias_dispatch::aliases::Catalog::NestedNode<Item>",
+    ]
+    .map(|type_name| {
+        let start = source.find(type_name).expect("positive alias type");
+        (start, start + type_name.len())
+    });
+    let positive_full = [
+        "alias_dispatch::aliases::Node<Special>",
+        "alias_dispatch::aliases::FullNode",
+    ]
+    .map(|type_name| {
+        let start = source.find(type_name).expect("negative alias type");
+        (start, start + type_name.len())
+    });
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(site.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&partial),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = query.result
+    else {
+        panic!("expected authoritative alias-specialization query success");
+    };
+    let targeted = hits_by_overload
+        .get(&partial)
+        .into_iter()
+        .flatten()
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(targeted, BTreeSet::from(positive_partial));
+    assert!(unproven_total_by_overload.values().all(|count| *count == 0));
+    let whole = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&partial))
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == site)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(whole, targeted);
+    assert!(
+        positive_full
+            .iter()
+            .all(|range| !targeted.contains(range) && !whole.contains(range))
+    );
+
+    let expected_full = BTreeSet::from(positive_full);
+    let targeted_full = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&full), &site);
+    let whole_full = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&full))
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == site)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        (&targeted_full, &whole_full),
+        (&expected_full, &expected_full),
+        "template and ordinary aliases must both route to the full specialization"
+    );
+}
+
+#[test]
 fn authoritative_cpp_nested_out_of_line_owner_token_resolves_as_nested_class() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -10948,7 +11175,8 @@ void exercise(Context* first, Context* second) {
             targeted, expected,
             "targeted inverse lookup must preserve the recovered logical arity for {name}"
         );
-        let whole = UsageFinder::new().find_usages_default(&analyzer, &[target.clone()]);
+        let whole =
+            UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
         let whole_ranges = whole
             .all_hits_including_imports()
             .into_iter()
@@ -11075,7 +11303,8 @@ void shadow_type_name(int const_any_pointer_t) { // negative-shadow-declaration
             targeted, expected,
             "targeted inverse lookup must distinguish recovered and ordinary qualified types for {fq_name}"
         );
-        let whole = UsageFinder::new().find_usages_default(&analyzer, &[target.clone()]);
+        let whole =
+            UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
         let whole_ranges = whole
             .all_hits_including_imports()
             .into_iter()

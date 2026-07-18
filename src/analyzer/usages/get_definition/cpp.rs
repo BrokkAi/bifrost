@@ -288,6 +288,25 @@ fn resolve_cpp_type(
             format!("`{text}` is not a C++ reference site"),
         );
     }
+    if let Some(template_node) = cpp_template_application_node(node) {
+        match visibility.resolve_type_node_result(file, template_node, source) {
+            Ok(Some(unit)) => {
+                return candidates_outcome(cpp_type_definition_candidates(
+                    analyzer,
+                    visibility,
+                    file,
+                    context.bounded_support(),
+                    unit,
+                ));
+            }
+            Err(()) => {
+                return ambiguous_definition(format!(
+                    "`{text}` has an ambiguous C++ template specialization"
+                ));
+            }
+            Ok(None) => {}
+        }
+    }
     if let Some(qualifier) = cpp_focused_type_qualifier(node, source) {
         let namespace = cpp_lexical_namespace(node, source);
         let mut root = node;
@@ -353,6 +372,30 @@ fn resolve_cpp_type(
         node,
         &text,
     )
+}
+
+fn cpp_template_application_node(mut node: Node<'_>) -> Option<Node<'_>> {
+    let mut application = (node.kind() == "template_type").then_some(node);
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "template_type" && parent.child_by_field_name("name") == Some(node) {
+            node = parent;
+            application = Some(node);
+            continue;
+        }
+        if application.is_some()
+            && matches!(
+                parent.kind(),
+                "qualified_identifier" | "scoped_type_identifier"
+            )
+            && parent.child_by_field_name("name") == Some(node)
+        {
+            node = parent;
+            application = Some(node);
+            continue;
+        }
+        break;
+    }
+    application
 }
 
 fn resolve_cpp_type_without_focused_qualifier(

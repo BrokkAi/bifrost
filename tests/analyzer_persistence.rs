@@ -786,6 +786,82 @@ template <typename T> class choice<T, T*> {
 }
 
 #[test]
+fn warm_cpp_template_alias_specialization_dispatch_matches_cold_analysis() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(
+        root,
+        "choice.h",
+        r#"namespace persist {
+struct Special {};
+struct Shared {};
+template <typename T, typename Tag> class choice {};
+template <typename T> class choice<T, Shared> {};
+template <> class choice<Special, Shared> {};
+template <typename T> using selected = choice<T, Shared>;
+}
+"#,
+    );
+    let caller =
+        "#include \"choice.h\"\nusing persist::Special;\npersist::selected<Special> value;\n";
+    write_file(root, "app.cpp", caller);
+    write_file(root, "other.py", "def unrelated():\n    return 1\n");
+    let repo = init_git_repo(root);
+    commit_all(&repo, "init");
+    let project = language_python_project(root, Language::Cpp);
+    let line = caller.lines().nth(2).unwrap();
+    let query = brokk_bifrost::searchtools::DefinitionReferenceQuery {
+        path: "app.cpp".to_string(),
+        line: Some(3),
+        column: Some(line.find("selected").unwrap() + 1),
+    };
+
+    let cold = build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let cold_result = brokk_bifrost::searchtools::get_definitions_by_location(
+        cold.analyzer(),
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![query.clone()],
+        },
+    );
+    assert_eq!(cold_result.results[0].status, "resolved");
+    assert_eq!(
+        cold_result.results[0].definitions[0].fqn.as_deref(),
+        Some("persist.choice<Special, Shared>")
+    );
+    drop(cold);
+
+    let warm_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let warm = build_persisted_with_progress(project, AnalyzerConfig::default(), {
+        let events = Arc::clone(&warm_events);
+        move |event| events.lock().unwrap().push(event)
+    });
+    assert_eq!(
+        parsed_file_count(&warm_events.lock().unwrap()),
+        0,
+        "warm build must hydrate template-alias metadata without reparsing"
+    );
+    let warm_result = brokk_bifrost::searchtools::get_definitions_by_location(
+        warm.analyzer(),
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![query],
+        },
+    );
+    assert_eq!(warm_result.results[0].status, cold_result.results[0].status);
+    assert_eq!(
+        warm_result.results[0]
+            .definitions
+            .iter()
+            .map(|definition| definition.fqn.as_deref())
+            .collect::<Vec<_>>(),
+        cold_result.results[0]
+            .definitions
+            .iter()
+            .map(|definition| definition.fqn.as_deref())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn warm_multilanguage_java_imported_receiver_query_is_candidate_bounded() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
