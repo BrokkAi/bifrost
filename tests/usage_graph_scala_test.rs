@@ -251,6 +251,69 @@ object Ignored:
 }
 
 #[test]
+fn usage_graph_resolves_structured_scala_field_chains() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Fields.scala",
+            r#"package model
+class Leaf(val token: Int) { def read(): Int = token }
+class Middle(val leaf: Leaf)
+class Base(val inherited: Middle)
+class Child extends Base(new Middle(new Leaf(1))) {
+  def inheritedBare: Int = inherited.leaf.token
+  def inheritedShadow(inherited: other.Middle): Int = inherited.leaf.token
+}
+object Stable { val middle: Middle = new Middle(new Leaf(2)) }
+object Owners { final class State(val leaf: Leaf) }
+"#,
+        )
+        .file(
+            "other/Fields.scala",
+            "package other\nclass Leaf(val token: Int)\nclass Middle(val leaf: Leaf)\n",
+        )
+        .file(
+            "dup/First.scala",
+            "package dup\nclass Owner(val value: Int)\n",
+        )
+        .file(
+            "dup/Second.scala",
+            "package dup\nclass Owner(val value: Int)\n",
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+import model.{Child, Middle, Owners, Stable}
+object Use {
+  def typed(middle: Middle): Int = middle.leaf.read()
+  def inherited(child: Child): Int = child.inherited.leaf.read()
+  def stable: Int = Stable.middle.leaf.read()
+  def nested: Int = { val state = new Owners.State(new model.Leaf(1)); state.leaf.read() }
+  def localShadow(middle: other.Middle): Int = middle.leaf.read()
+  def ambiguous(owner: dup.Owner): Int = owner.value
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    for caller in [
+        "app.Use$.typed",
+        "app.Use$.inherited",
+        "app.Use$.stable",
+        "app.Use$.nested",
+    ] {
+        assert!(has_edge(&value, caller, "model.Leaf.read"), "{value}");
+    }
+    assert!(!has_edge(
+        &value,
+        "model.Child.inheritedShadow",
+        "model.Leaf.read"
+    ));
+    assert!(!has_edge(&value, "app.Use$.localShadow", "model.Leaf.read"));
+    assert!(!has_edge(&value, "app.Use$.ambiguous", "dup.Owner.value"));
+}
+
+#[test]
 fn scoped_usage_graph_skips_unrelated_invalid_scala_callers() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

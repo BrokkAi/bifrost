@@ -7,6 +7,7 @@ use tree_sitter::{Node, Parser};
 pub(crate) struct ScalaSourceFacts {
     pub(crate) callable_alternatives_by_range:
         HashMap<(usize, usize), ScalaCallableSourceAlternative>,
+    pub(crate) field_type_paths_by_range: HashMap<(usize, usize), Vec<String>>,
     pub(crate) stable_owner_ranges: HashSet<(usize, usize)>,
     pub(crate) case_class_ranges: HashSet<(usize, usize)>,
 }
@@ -50,6 +51,17 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
         match node.kind() {
+            "val_definition" | "var_definition" | "class_parameter" => {
+                if let Some(path) = node
+                    .child_by_field_name("type")
+                    .map(|type_node| scala_type_lookup_segments(type_node, source))
+                    .filter(|segments| !segments.is_empty())
+                {
+                    facts
+                        .field_type_paths_by_range
+                        .insert((node.start_byte(), node.end_byte()), path);
+                }
+            }
             "function_definition" | "function_declaration" => {
                 let mut cursor = node.walk();
                 let parameter_lists = node

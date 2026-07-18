@@ -38,6 +38,7 @@ use crate::analyzer::scala::{
     ScalaAdapter, ScalaSupertypeLookupPath, ScalaWildcardOwnerFacts,
     resolve_scala_wildcard_import_environment, scala_class_parameter_field_keyword,
     scala_import_path, scala_normalize_full_name, scala_simple_type_name,
+    scala_type_lookup_segments,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usage_facts::CallableFacts;
@@ -77,6 +78,17 @@ pub(super) enum BareMemberResolution {
     NoMatch,
     Unresolved,
     Resolved(Vec<CodeUnit>),
+}
+
+pub(super) enum FieldResolution {
+    NoMatch,
+    Unresolved,
+    Resolved(ResolvedField),
+}
+
+pub(super) struct ResolvedField {
+    pub(super) declaration: CodeUnit,
+    pub(super) declared_type: Option<String>,
 }
 
 /// Every class/object/trait/enum the project declares, indexed for the per-file
@@ -284,6 +296,92 @@ impl ProjectTypes {
             .find(|unit| unit.is_class())
             .map(|owner| scala.get_ancestors(&owner))
             .unwrap_or_default()
+    }
+
+    fn direct_field_ancestors_for_owner(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner_fqn: &str,
+    ) -> Vec<CodeUnit> {
+        if let Some(ancestors_by_owner) = &self.direct_ancestors_by_owner {
+            return ancestors_by_owner
+                .get(owner_fqn)
+                .cloned()
+                .unwrap_or_default();
+        }
+        scala
+            .definitions(owner_fqn)
+            .find(|unit| unit.is_class())
+            .map(|owner| scala.get_direct_ancestors(&owner))
+            .unwrap_or_default()
+    }
+
+    pub(super) fn field_for_owner_member(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner_fqn: &str,
+        member: &str,
+    ) -> FieldResolution {
+        let mut level = vec![owner_fqn.to_string()];
+        let mut seen = HashSet::default();
+        while !level.is_empty() {
+            let mut matches = Vec::new();
+            let mut next = Vec::new();
+            for owner in level {
+                if !seen.insert(owner.clone()) {
+                    continue;
+                }
+                matches.extend(
+                    self.members_for_exact_owner_name(&owner, member)
+                        .into_iter()
+                        .filter(|unit| unit.is_field() && !scala.is_type_alias(unit))
+                        .cloned(),
+                );
+                next.extend(
+                    self.direct_field_ancestors_for_owner(scala, &owner)
+                        .into_iter()
+                        .map(|ancestor| ancestor.fq_name()),
+                );
+            }
+            if !matches.is_empty() {
+                let mut unique = HashSet::default();
+                matches.retain(|field| unique.insert(field.clone()));
+                if matches.len() != 1 {
+                    return FieldResolution::Unresolved;
+                }
+                let declaration = matches.pop().expect("one exact Scala field");
+                let declared_type = self.field_declared_type(scala, &declaration);
+                return FieldResolution::Resolved(ResolvedField {
+                    declaration,
+                    declared_type,
+                });
+            }
+            level = next;
+        }
+        FieldResolution::NoMatch
+    }
+
+    fn field_declared_type(&self, scala: &ScalaAnalyzer, declaration: &CodeUnit) -> Option<String> {
+        let source_facts = self.source_facts_for_file(scala, declaration.source());
+        let resolver = NameResolver::for_file_types(scala, declaration, self);
+        let mut resolved = HashSet::default();
+        for range in self.declaration_ranges_for(scala, declaration) {
+            if let Some(path) = source_facts
+                .field_type_paths_by_range
+                .get(&(range.start_byte, range.end_byte))
+                && let Some(field_type) = self.resolve_type_in_declaration_context(&resolver, path)
+            {
+                resolved.insert(field_type);
+            }
+        }
+        match resolved.len() {
+            1 => return resolved.into_iter().next(),
+            2.. => return None,
+            0 => {}
+        }
+        self.facts
+            .fact_for_declaration(declaration)
+            .and_then(|facts| facts.return_type_fqn.clone())
     }
 
     fn is_scala_trait_declaration(&self, scala: &ScalaAnalyzer, code_unit: &CodeUnit) -> bool {
@@ -1094,13 +1192,15 @@ impl ProjectTypes {
             .find(|unit| unit.is_function() || unit.is_field())
     }
 
-    fn exact_field(&self, owner_fqn: &str, member: &str) -> Option<String> {
+    fn exact_field(&self, scala: &ScalaAnalyzer, owner_fqn: &str, member: &str) -> Option<String> {
         let field_fqn = format!("{owner_fqn}.{member}");
-        self.index
+        let fields = self
+            .index
             .by_fqn(&field_fqn)
             .iter()
-            .find(|unit| unit.is_field())
-            .map(CodeUnit::fq_name)
+            .filter(|unit| unit.is_field() && !scala.is_type_alias(unit))
+            .collect::<Vec<_>>();
+        (fields.len() == 1).then(|| fields[0].fq_name())
     }
 
     pub(super) fn constructor_call_shape_matches(
@@ -2485,12 +2585,15 @@ fn record_reference(
             {
                 return;
             }
-            if let Some(owner) = exact_owner_field_binding(bindings, name)
-                && ctx.enclosing_class(node.start_byte()) == Some(owner.as_str())
-                && let Some(field) = ctx.types.exact_field(&owner, name)
-            {
-                ctx.record(field, node);
-                return;
+            if let Some(owner) = exact_owner_field_binding(bindings, name) {
+                match ctx.types.field_for_owner_member(ctx.scala, &owner, name) {
+                    FieldResolution::Resolved(field) => {
+                        ctx.record(field.declaration.fq_name(), node);
+                        return;
+                    }
+                    FieldResolution::Unresolved => return,
+                    FieldResolution::NoMatch => {}
+                }
             }
             if bindings.is_shadowed(name) {
                 return;
@@ -2508,7 +2611,7 @@ fn record_reference(
                     &ctx.resolver,
                     owner_segments,
                     true,
-                ) && let Some(field) = ctx.types.exact_field(&owner, member)
+                ) && let Some(field) = ctx.types.exact_field(ctx.scala, &owner, member)
                 {
                     ctx.record(field, node);
                     return;
@@ -2524,22 +2627,37 @@ fn record_reference(
                 return;
             }
             if is_terminal_stable_field_reference(node) {
-                if let Some(qualifier) = node
+                let qualifier = node
                     .parent()
-                    .and_then(|expression| expression.child_by_field_name("value"))
-                    && let Some(owner) = stable_object_expression_fqn(qualifier, ctx, bindings)
-                    && let Some(field) = ctx.types.exact_field(&owner, name)
+                    .and_then(|expression| expression.child_by_field_name("value"));
+                if let Some(qualifier) = qualifier
+                    && let Some(owner) = receiver_type_fqn(qualifier, ctx, bindings)
                 {
-                    ctx.record(field, node);
-                } else if let Some(qualifier) = node
-                    .parent()
-                    .and_then(|expression| expression.child_by_field_name("value"))
-                    && let Some(owner) = stable_object_expression_fqn(qualifier, ctx, bindings)
-                    && let Some(object) = ctx.types.exact_nested_object(ctx.scala, &owner, name)
-                {
-                    ctx.record(object, node);
+                    match ctx.types.field_for_owner_member(ctx.scala, &owner, name) {
+                        FieldResolution::Resolved(field) => {
+                            ctx.record(field.declaration.fq_name(), node);
+                        }
+                        FieldResolution::Unresolved => return,
+                        FieldResolution::NoMatch => {
+                            if let Some(object) =
+                                ctx.types.exact_nested_object(ctx.scala, &owner, name)
+                            {
+                                ctx.record(object, node);
+                            }
+                        }
+                    }
                 }
                 return;
+            }
+            if let Some(owner) = ctx.enclosing_class(node.start_byte()) {
+                match ctx.types.field_for_owner_member(ctx.scala, owner, name) {
+                    FieldResolution::Resolved(field) => {
+                        ctx.record(field.declaration.fq_name(), node);
+                        return;
+                    }
+                    FieldResolution::Unresolved => return,
+                    FieldResolution::NoMatch => {}
+                }
             }
             if is_scala_object_reference(node)
                 && let Some(fqn) = ctx.resolver.resolve_object(name)
@@ -2632,6 +2750,16 @@ fn receiver_type_fqn(
             first_precise(bindings, name)
                 .and_then(|binding| binding.receiver_type)
                 .or_else(|| {
+                    if bindings.is_shadowed(name) {
+                        return None;
+                    }
+                    let owner = ctx.enclosing_class(receiver.start_byte())?;
+                    match ctx.types.field_for_owner_member(ctx.scala, owner, name) {
+                        FieldResolution::Resolved(field) => field.declared_type,
+                        FieldResolution::NoMatch | FieldResolution::Unresolved => None,
+                    }
+                })
+                .or_else(|| {
                     (!bindings.is_shadowed(name)).then(|| {
                         ctx.resolver.resolve_member(name).and_then(|method| {
                             ctx.types
@@ -2647,7 +2775,19 @@ fn receiver_type_fqn(
                     })?
                 })
         }
-        "field_expression" => stable_object_expression_fqn(receiver, ctx, bindings),
+        "field_expression" => stable_object_expression_fqn(receiver, ctx, bindings).or_else(|| {
+            let value = receiver.child_by_field_name("value")?;
+            let field = receiver.child_by_field_name("field")?;
+            let owner = receiver_type_fqn(value, ctx, bindings)?;
+            let member = node_text(field, ctx.source).trim();
+            if member.is_empty() {
+                return None;
+            }
+            match ctx.types.field_for_owner_member(ctx.scala, &owner, member) {
+                FieldResolution::Resolved(field) => field.declared_type,
+                FieldResolution::NoMatch | FieldResolution::Unresolved => None,
+            }
+        }),
         "call_expression" => call_result_type(receiver, ctx, bindings),
         kind => scala_literal_type_name(kind).map(str::to_string),
     }
@@ -2777,9 +2917,9 @@ fn seed_parameter(
     if binding_name.is_empty() {
         return;
     }
-    let resolved = parameter.child_by_field_name("type").and_then(|type_node| {
-        resolve_receiver_type(&ctx.resolver, node_text(type_node, ctx.source))
-    });
+    let resolved = parameter
+        .child_by_field_name("type")
+        .and_then(|type_node| resolve_receiver_type_node(type_node, ctx));
     seed_binding(binding_name, resolved, declaration_owner, bindings);
 }
 
@@ -2848,9 +2988,7 @@ fn seed_value_definition_with_owner(
     // or a call with a declared factory return.
     let resolved = node
         .child_by_field_name("type")
-        .and_then(|type_node| {
-            resolve_receiver_type(&ctx.resolver, node_text(type_node, ctx.source))
-        })
+        .and_then(|type_node| resolve_receiver_type_node(type_node, ctx))
         .or_else(|| {
             node.child_by_field_name("value")
                 .and_then(|value| constructed_type(value, ctx))
@@ -2894,8 +3032,8 @@ fn constructed_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
         let mut cursor = node.walk();
         return node
             .named_children(&mut cursor)
-            .find(|child| child.kind() == "type_identifier" || child.kind() == "generic_type")
-            .and_then(|type_node| ctx.resolver.resolve(node_text(type_node, ctx.source)));
+            .find(|child| !matches!(child.kind(), "arguments" | "template_body"))
+            .and_then(|type_node| resolve_receiver_type_node(type_node, ctx));
     }
     None
 }
@@ -2993,10 +3131,18 @@ fn exact_owner_field_binding(
     first_precise(bindings, name).and_then(|binding| binding.declaration_owner)
 }
 
-fn resolve_receiver_type(resolver: &NameResolver, type_text: &str) -> Option<String> {
-    resolver
-        .resolve(type_text)
-        .or_else(|| scala_builtin_type_name(type_text).map(str::to_string))
+fn resolve_receiver_type_node(type_node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
+    let path = scala_type_lookup_segments(type_node, ctx.source);
+    if path.is_empty() {
+        return None;
+    }
+    ctx.types
+        .resolve_type_in_declaration_context(&ctx.resolver, &path)
+        .or_else(|| {
+            (path.len() == 1)
+                .then(|| scala_builtin_type_name(&path[0]).map(str::to_string))
+                .flatten()
+        })
 }
 
 fn visible_extensions(

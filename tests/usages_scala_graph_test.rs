@@ -577,6 +577,117 @@ class Container(val service: Service) {
 }
 
 #[test]
+fn scala_usage_finder_resolves_exact_structured_field_chains() {
+    let consumer = r#"package app
+
+import model.{AliasOnly, Child, Middle, Owners, Stable}
+
+object Use {
+  def typed(middle: Middle): Int = middle.leaf.token // positive-typed-chain
+  def inherited(child: Child): Int = child.inherited.leaf.token // positive-inherited-selection
+  def stable: Int = Stable.middle.leaf.token // positive-stable-chain
+  def nested: Int = {
+    val state = new Owners.State(1)
+    state.maximumHeapSize // positive-qualified-nested-constructor
+  }
+  def localShadow(middle: other.Middle): Int = middle.leaf.token // negative-local-shadow
+  def unrelated(middle: other.Middle): Int = middle.leaf.token // negative-unrelated-owner
+  def ambiguous(owner: dup.Owner): Int = owner.value // negative-ambiguous-owner
+  def aliasIsNotATerm: Any = AliasOnly.Value // negative-type-alias-term
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Fields.scala",
+            r#"package model
+
+class Leaf(val token: Int)
+class Middle(val leaf: Leaf)
+class Base(val inherited: Middle)
+class Child extends Base(new Middle(new Leaf(1))) {
+  def bare: Int = inherited.leaf.token // positive-inherited-bare
+  def shadow(inherited: other.Middle): Int = inherited.leaf.token // negative-inherited-shadow
+}
+object Stable { val middle: Middle = new Middle(new Leaf(2)) }
+object Owners { final class State(var maximumHeapSize: Int) }
+object AliasOnly { type Value = Int }
+"#,
+        ),
+        (
+            "other/Fields.scala",
+            r#"package other
+class Leaf(val token: Int)
+class Middle(val leaf: Leaf)
+"#,
+        ),
+        (
+            "dup/First.scala",
+            "package dup\nclass Owner(val value: Int)\n",
+        ),
+        (
+            "dup/Second.scala",
+            "package dup\nclass Owner(val value: Int)\n",
+        ),
+        ("app/Use.scala", consumer),
+    ]);
+
+    let leaf = definition(&analyzer, "model.Middle.leaf");
+    let leaf_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&leaf)));
+    for expected in [
+        "positive-typed-chain",
+        "positive-inherited-selection",
+        "positive-stable-chain",
+        "positive-inherited-bare",
+    ] {
+        assert_hit_contains(&leaf_hits, expected);
+    }
+    for rejected in [
+        "negative-local-shadow",
+        "negative-unrelated-owner",
+        "negative-inherited-shadow",
+    ] {
+        assert_no_hit_contains(&leaf_hits, rejected);
+    }
+
+    let token = definition(&analyzer, "model.Leaf.token");
+    let token_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&token)));
+    for expected in [
+        "positive-typed-chain",
+        "positive-inherited-selection",
+        "positive-stable-chain",
+        "positive-inherited-bare",
+    ] {
+        assert_hit_contains(&token_hits, expected);
+    }
+    assert_no_hit_contains(&token_hits, "negative-local-shadow");
+
+    let inherited = definition(&analyzer, "model.Base.inherited");
+    let inherited_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&inherited)));
+    assert_hit_contains(&inherited_hits, "positive-inherited-selection");
+    assert_hit_contains(&inherited_hits, "positive-inherited-bare");
+    assert_no_hit_contains(&inherited_hits, "negative-inherited-shadow");
+
+    let maximum_heap_size = definition(&analyzer, "model.Owners$.State.maximumHeapSize");
+    let state_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&maximum_heap_size)),
+    );
+    assert_hit_contains(&state_hits, "positive-qualified-nested-constructor");
+
+    let ambiguous = definition(&analyzer, "dup.Owner.value");
+    let ambiguous_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&ambiguous)));
+    assert_no_hit_contains(&ambiguous_hits, "negative-ambiguous-owner");
+
+    let alias = definition(&analyzer, "model.AliasOnly$.Value");
+    let alias_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&alias)));
+    assert_no_hit_contains(&alias_hits, "negative-type-alias-term");
+}
+
+#[test]
 fn scala_usage_finder_resolves_infix_extractor_object_identity() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (

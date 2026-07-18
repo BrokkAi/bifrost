@@ -1,5 +1,8 @@
-use super::inverted::{BareMemberResolution, MemberReturnResolution, NameResolver, ProjectTypes};
+use super::inverted::{
+    BareMemberResolution, FieldResolution, MemberReturnResolution, NameResolver, ProjectTypes,
+};
 use crate::analyzer::scala::imports::scala_import_infos_from_node;
+use crate::analyzer::scala::scala_type_lookup_segments;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
@@ -628,6 +631,10 @@ fn seed_parameter(parameter: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         return;
     }
+    if let Some(owner) = type_node.and_then(|type_node| resolve_type_node(type_node, ctx)) {
+        ctx.bindings.seed_symbol(name.to_string(), owner);
+        return;
+    }
     let type_name = type_node.map(|type_node| node_text(type_node, ctx.source).trim());
     seed_or_shadow_typed_symbol(name, type_name, None, ctx);
 }
@@ -641,21 +648,58 @@ fn seed_value_definition(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         .child_by_field_name("type")
         .map(|type_node| node_text(type_node, ctx.source).trim());
     let value = node.child_by_field_name("value");
+    let resolved_type_owner = node
+        .child_by_field_name("type")
+        .and_then(|type_node| resolve_type_node(type_node, ctx));
+    let resolved_constructed_owner = value.and_then(|value| constructed_type_owner(value, ctx));
     let value_name =
         value.and_then(|value_node| constructor_type_name(node_text(value_node, ctx.source)));
     let resolved_value_owner = value.and_then(|value| call_initializer_return_owner(value, ctx));
-    if type_name.is_none() && value_name.is_none() && resolved_value_owner.is_none() {
+    if resolved_type_owner.is_none()
+        && resolved_constructed_owner.is_none()
+        && type_name.is_none()
+        && value_name.is_none()
+        && resolved_value_owner.is_none()
+    {
         seed_value_definition_from_text(node_text(node, ctx.source), ctx);
         return;
     }
     for name in pattern_names(pattern, ctx.source) {
-        if let Some(owner) = resolved_value_owner.as_deref() {
+        if let Some(owner) = resolved_type_owner
+            .as_deref()
+            .or(resolved_constructed_owner.as_deref())
+            .or(resolved_value_owner.as_deref())
+        {
             ctx.bindings
                 .seed_symbol(name.to_string(), owner.to_string());
         } else {
             seed_or_shadow_typed_symbol(name, type_name, value_name, ctx);
         }
     }
+}
+
+fn constructed_type_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
+    if node.kind() != "instance_expression" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| !matches!(child.kind(), "arguments" | "template_body"))
+        .and_then(|type_node| resolve_type_node(type_node, ctx))
+}
+
+fn resolve_type_node(type_node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
+    let path = scala_type_lookup_segments(type_node, ctx.source);
+    if path.is_empty() {
+        return None;
+    }
+    ctx.types
+        .resolve_type_in_declaration_context(&ctx.name_resolver, &path)
+        .or_else(|| {
+            (path.len() == 1)
+                .then(|| scala_builtin_type_name(&path[0]).map(str::to_string))
+                .flatten()
+        })
 }
 
 fn refresh_assignment_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -1195,6 +1239,18 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
                 && member_call_arity_matches(node, ctx)
         };
     };
+    if ctx.spec.kind == TargetKind::Field
+        && let Some(owner_fq_name) = structured_receiver_type(qualifier_node, ctx)
+    {
+        return match ctx.types.field_for_owner_member(
+            ctx.scala,
+            &owner_fq_name,
+            &ctx.spec.member_name,
+        ) {
+            FieldResolution::Resolved(field) => field.declaration == ctx.spec.target,
+            FieldResolution::NoMatch | FieldResolution::Unresolved => false,
+        };
+    }
     if let Some(owner_fq_name) = stable_object_expression_fqn(qualifier_node, ctx) {
         return ctx.spec.owner_fq_matches(&owner_fq_name) && member_call_arity_matches(node, ctx);
     }
@@ -1488,6 +1544,55 @@ fn extension_receiver_type(receiver: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Stri
                         .flatten()
                 })
         }
+        kind => scala_literal_type_name(kind).map(str::to_string),
+    }
+}
+
+fn structured_receiver_type(receiver: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
+    match receiver.kind() {
+        "identifier" => {
+            let name = node_text(receiver, ctx.source).trim();
+            if name == "this" {
+                return enclosing_owner_fq_name(receiver, ctx);
+            }
+            ctx.bindings
+                .resolve_symbol(name)
+                .as_precise()
+                .and_then(single_precise_target)
+                .or_else(|| {
+                    if ctx.bindings.is_shadowed(name) {
+                        return None;
+                    }
+                    let owner = enclosing_owner_fq_name(receiver, ctx)?;
+                    match ctx.types.field_for_owner_member(ctx.scala, &owner, name) {
+                        FieldResolution::Resolved(field) => field.declared_type,
+                        FieldResolution::NoMatch | FieldResolution::Unresolved => None,
+                    }
+                })
+                .or_else(|| {
+                    (!ctx.bindings.is_shadowed(name))
+                        .then(|| {
+                            ctx.name_resolver
+                                .resolve_object(name)
+                                .or_else(|| ctx.name_resolver.resolve(name))
+                        })
+                        .flatten()
+                })
+        }
+        "field_expression" => stable_object_expression_fqn(receiver, ctx).or_else(|| {
+            let value = receiver.child_by_field_name("value")?;
+            let field = receiver.child_by_field_name("field")?;
+            let owner = structured_receiver_type(value, ctx)?;
+            let member = node_text(field, ctx.source).trim();
+            if member.is_empty() {
+                return None;
+            }
+            match ctx.types.field_for_owner_member(ctx.scala, &owner, member) {
+                FieldResolution::Resolved(field) => field.declared_type,
+                FieldResolution::NoMatch | FieldResolution::Unresolved => None,
+            }
+        }),
+        "call_expression" => call_initializer_return_owner(receiver, ctx),
         kind => scala_literal_type_name(kind).map(str::to_string),
     }
 }

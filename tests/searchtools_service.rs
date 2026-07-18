@@ -2924,6 +2924,105 @@ object Use {
 }
 
 #[test]
+fn scan_usages_by_reference_resolves_exact_scala_field_chains() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Fields.scala",
+            r#"package model
+class Leaf(val token: Int)
+class Middle(val leaf: Leaf)
+class Base(val inherited: Middle)
+class Child extends Base(new Middle(new Leaf(1))) {
+  def inheritedBare: Int = inherited.leaf.token // positive-inherited-bare
+  def inheritedShadow(inherited: other.Middle): Int = inherited.leaf.token // negative-shadow
+}
+object Stable { val middle: Middle = new Middle(new Leaf(2)) }
+object Owners { final class State(var maximumHeapSize: Int) }
+"#,
+        )
+        .file(
+            "other/Fields.scala",
+            "package other\nclass Leaf(val token: Int)\nclass Middle(val leaf: Leaf)\n",
+        )
+        .file(
+            "dup/First.scala",
+            "package dup\nclass Owner(val value: Int)\n",
+        )
+        .file(
+            "dup/Second.scala",
+            "package dup\nclass Owner(val value: Int)\n",
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+import model.{Child, Middle, Owners, Stable}
+object Use {
+  def typed(middle: Middle): Int = middle.leaf.token // positive-typed
+  def inherited(child: Child): Int = child.inherited.leaf.token // positive-inherited
+  def stable: Int = Stable.middle.leaf.token // positive-stable
+  def nested: Int = { val state = new Owners.State(1); state.maximumHeapSize } // positive-nested
+  def localShadow(middle: other.Middle): Int = middle.leaf.token // negative-shadow
+  def ambiguous(owner: dup.Owner): Int = owner.value // negative-ambiguous
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    for (symbol, expected) in [
+        ("model.Middle.leaf", "positive-typed"),
+        ("model.Leaf.token", "positive-stable"),
+        ("model.Base.inherited", "positive-inherited-bare"),
+        ("model.Owners$.State.maximumHeapSize", "positive-nested"),
+    ] {
+        let args = serde_json::json!({"symbols": [symbol], "include_tests": true}).to_string();
+        let payload = service
+            .call_tool_json("scan_usages_by_reference", &args)
+            .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        let usage = only_result(&value);
+        assert_eq!(usage["status"], "found", "{value}");
+        let snippets = usage["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+            .filter_map(|hit| hit["snippet"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            snippets.iter().any(|snippet| snippet.contains(expected)),
+            "expected {expected:?}: {value}"
+        );
+        assert!(
+            snippets
+                .iter()
+                .all(|snippet| !snippet.contains("negative-shadow")),
+            "local-shadow decoy leaked: {value}"
+        );
+    }
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["dup.Owner.value"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+    assert!(
+        usage["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+            .filter_map(|hit| hit["snippet"].as_str())
+            .all(|snippet| !snippet.contains("negative-ambiguous")),
+        "ambiguous source identity leaked: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_by_reference_resolves_scala_call_initializer_receiver() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

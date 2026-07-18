@@ -297,6 +297,104 @@ object StableUse {
     }
 
     #[test]
+    fn scala_inverted_resolves_exact_structured_field_chains() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let write = |path: &str, source: &str| {
+            ProjectFile::new(root.clone(), path).write(source).unwrap();
+        };
+        write(
+            "model/Fields.scala",
+            r#"package model
+class Leaf(val token: Int)
+class Middle(val leaf: Leaf)
+class Base(val inherited: Middle)
+class Child extends Base(new Middle(new Leaf(1))) {
+  def inheritedBare: Int = inherited.leaf.token
+  def inheritedShadow(inherited: other.Middle): Int = inherited.leaf.token
+}
+object Stable { val middle: Middle = new Middle(new Leaf(2)) }
+object Owners { final class State(var maximumHeapSize: Int) }
+object AliasOnly { type Value = Int }
+"#,
+        );
+        write(
+            "other/Fields.scala",
+            "package other\nclass Leaf(val token: Int)\nclass Middle(val leaf: Leaf)\n",
+        );
+        write(
+            "dup/First.scala",
+            "package dup\nclass Owner(val value: Int)\n",
+        );
+        write(
+            "dup/Second.scala",
+            "package dup\nclass Owner(val value: Int)\n",
+        );
+        write(
+            "app/Use.scala",
+            r#"package app
+import model.{AliasOnly, Child, Middle, Owners, Stable}
+object Use {
+  def typed(middle: Middle): Int = middle.leaf.token
+  def inherited(child: Child): Int = child.inherited.leaf.token
+  def stable: Int = Stable.middle.leaf.token
+  def nested: Int = { val state = new Owners.State(1); state.maximumHeapSize }
+  def localShadow(middle: other.Middle): Int = middle.leaf.token
+  def ambiguous(owner: dup.Owner): Int = owner.value
+  def aliasIsNotATerm: Any = AliasOnly.Value
+}
+"#,
+        );
+
+        let project = TestProject::new(root, Language::Scala);
+        let analyzer = ScalaAnalyzer::new(Arc::new(project));
+        let nodes: HashSet<String> = analyzer
+            .all_declarations()
+            .map(|unit| unit.fq_name())
+            .collect();
+        let edges = build_scala_usage_edges(&analyzer, &nodes, |_| true)
+            .expect("Scala inverted field-chain build should succeed");
+        let has_edge = |caller: &str, callee: &str| {
+            edges
+                .edges
+                .contains_key(&(caller.to_string(), callee.to_string()))
+        };
+
+        for caller in ["app.Use$.typed", "app.Use$.inherited", "app.Use$.stable"] {
+            assert!(
+                has_edge(caller, "model.Middle.leaf"),
+                "missing {caller} -> leaf"
+            );
+            assert!(
+                has_edge(caller, "model.Leaf.token"),
+                "missing {caller} -> token"
+            );
+        }
+        assert!(has_edge(
+            "model.Child.inheritedBare",
+            "model.Base.inherited"
+        ));
+        assert!(has_edge("model.Child.inheritedBare", "model.Middle.leaf"));
+        assert!(has_edge("model.Child.inheritedBare", "model.Leaf.token"));
+        assert!(has_edge("app.Use$.inherited", "model.Base.inherited"));
+        assert!(has_edge("app.Use$.stable", "model.Stable$.middle"));
+        assert!(has_edge(
+            "app.Use$.nested",
+            "model.Owners$.State.maximumHeapSize"
+        ));
+
+        for caller in ["app.Use$.localShadow", "model.Child.inheritedShadow"] {
+            assert!(!has_edge(caller, "model.Middle.leaf"));
+            assert!(!has_edge(caller, "model.Leaf.token"));
+        }
+        assert!(!has_edge("app.Use$.ambiguous", "dup.Owner.value"));
+        assert!(!has_edge(
+            "app.Use$.aliasIsNotATerm",
+            "model.AliasOnly$.Value"
+        ));
+    }
+
+    #[test]
     fn scala_usage_graph_bulk_fetch_bypasses_lru_and_preserves_point_entry() {
         const FILE_COUNT: usize = 132;
         let temp = tempfile::tempdir().unwrap();
