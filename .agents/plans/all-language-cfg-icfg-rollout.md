@@ -42,7 +42,10 @@ This plan keeps CodeQuery and RQL exposure out of scope because issue #824 owns 
 - [x] (2026-07-18 14:17+02:00) Milestone 4d: added the real iterative Go adapter and shared matched-return ICFG conformance for functions, methods, function literals, sequencing, branches, loops, abrupt completion, ordinary calls, range, channel operations, deferred calls, and goroutine creation, with exact typed boundaries for incomplete switch, select, non-local, scheduling, and panic behavior.
 - [x] (2026-07-18 14:17+02:00) Closed the Milestone 4d specialist review by adding a terminal `Calls` gap for omitted selected-only `select` work, marking deterministic linearization where Go leaves relative operand evaluation unspecified, and proving shadowed `panic` and `recover` remain ordinary location-first CFG/ICFG calls rather than name-special-cased control.
 - [x] (2026-07-18 14:17+02:00) Passed 37 CFG, 17 ICFG, 37 language-conformance, and 11 provider contract tests, formatting, diff checks, strict all-target/all-feature clippy, and the complete host-access `nlp,python` repository suite for the reviewed Go tree (1,053 library tests passed, 4 ignored, plus every binary, integration, and doc-test target).
-- [ ] Milestone 4e: roll the contract through Rust, then review and checkpoint it independently.
+- [x] (2026-07-18 15:47+02:00) Milestone 4e: added the real iterative Rust adapter and shared matched-return ICFG conformance for functions, associated methods, nested functions, closures, async blocks, generator blocks, sequencing, branches, loops, labeled control, calls, `?`, await, yield, semicolonless tail returns, and disconnected dead syntax.
+- [x] (2026-07-18 15:47+02:00) Closed the Milestone 4e specialist findings by making labeled-block break acceptance explicit across the shared builder; preserving grouped/glob imports while enabling generic and turbofish dispatch; and reporting implicit trait calls, terminal macro/try behavior, and every encountered parameter, lexical, pattern-binding, assignment-replacement, and abrupt-path Drop omission without fabricated calls or cleanup bodies.
+- [x] (2026-07-18 15:47+02:00) Passed 39 CFG, 17 ICFG, 55 language-conformance, 11 provider, and 483 definition contract tests, formatting, diff checks, and strict all-target/all-feature clippy for the reviewed Rust tree.
+- [x] (2026-07-18 15:52+02:00) Passed the complete host-access `nlp,python` repository suite for the final reviewed Rust tree across every library, binary, integration, and doc-test target.
 - [ ] Milestone 4f: roll the contract through PHP, then review and checkpoint it independently.
 - [ ] Milestone 4g: roll the contract through Scala, then review and checkpoint it independently.
 - [ ] Milestone 4h: roll the contract through Ruby, then review and checkpoint it independently.
@@ -123,6 +126,18 @@ This plan keeps CodeQuery and RQL exposure out of scope because issue #824 owns 
 
 - Observation: `defer`, `go`, and `select` pressure call completeness at individual syntax sites rather than requiring another ICFG transfer kind.
   Evidence: `defer f(args)` and `go f(args)` eagerly evaluate the structured function value and arguments but do not invoke the outer call synchronously. The adapter therefore omits only that outer `SemanticCallSite`, retains nested eager calls, and reports `DeferredExecution`/`CleanupControlFlow` or `ConcurrentSpawn` plus `Calls` gaps. A terminal `select` similarly reports omitted selected receive-target and case-body calls instead of fabricating a chosen case.
+
+- Observation: Rust cleanup incompleteness cannot be represented honestly only at normal fallthrough or only for direct `let` declarations.
+  Evidence: parameters, `for`/`while let`/`if let`/match bindings, assignment replacement, and lexical locals may require `Drop` on normal, return, throw, break, or continue paths. Opaque shared cleanup-scope markers now attach `CleanupControlFlow`, `ResourceManagement`, `Calls`, and `ExceptionalControlFlow` gaps to the exact normal or abrupt point without emitting a `Drop::drop` call site or destructor body.
+
+- Observation: Rust try blocks, macros, and implicit trait operations require different conservative boundaries.
+  Evidence: lowering `?` inside an unsupported `try {}` through the enclosing procedure fabricated a return, so the whole try block and macro token tree are terminal typed boundaries. Operators, indexing, autoderef, method receiver adjustment, and await polling retain their structured operand prefixes but publish exact implicit-call and exceptional gaps.
+
+- Observation: Rust generic-call dispatch must distinguish structured turbofish wrappers from grouped and glob import paths.
+  Evidence: the exact-location resolver unwraps `generic_function` for free and method calls and stops lexical expansion before `::<`, while retaining `::{` and `::*`; direct generic ICFG cases and all 483 definition tests remain green.
+
+- Observation: unlabeled-break acceptance is independent of whether a breakable construct has a label.
+  Evidence: Rust labeled blocks and Java/JavaScript labeled statements reject unlabeled breaks, while loops and switches accept them. `ScopeBinding::Breakable` now records that property explicitly, with shared-builder and end-to-end regressions.
 
 ## Decision Log
 
@@ -238,6 +253,18 @@ This plan keeps CodeQuery and RQL exposure out of scope because issue #824 owns 
   Rationale: a nondeterministic builder would make IDs, rendering, and caches unstable, while an unqualified linear chain would overclaim semantics. The source-backed parent gap preserves reproducibility and explicitly prevents consumers from treating the chosen order as complete; forms wholly ordered by Go's call, receive, and logical-operation rule remain exact.
   Date/Author: 2026-07-18 / Codex after Milestone 4d specialist review.
 
+- Decision: use shared cleanup scopes as opaque Rust omission markers and report unknown Drop behavior at exact normal and abrupt points instead of synthesizing destructor control or calls.
+  Rationale: syntax proves that parameters, bindings, replaced values, or locals may require cleanup but not their types, Drop implementations, order, unwinding behavior, or call targets. Marker scopes preserve structured completion destinations and expose incomplete behavior without inventing topology.
+  Date/Author: 2026-07-18 / Codex after Milestone 4e specialist review.
+
+- Decision: keep unsupported Rust try blocks and macro expansion terminal while preserving known prefixes for implicit trait operations and async polling.
+  Rationale: descending into an unsupported try block misroutes residual completion, and token-tree scanning fabricates macro semantics. Structured operator, indexing, receiver, and await operands remain visible, but their implicit operations are typed gaps rather than ICFG call sites.
+  Date/Author: 2026-07-18 / Codex after Milestone 4e specialist review.
+
+- Decision: make unlabeled-break acceptance explicit in the shared breakable-scope contract.
+  Rationale: label matching alone cannot distinguish switches from labeled statements or blocks. Loops and switches accept unlabeled breaks; labeled statement/block scopes accept only a matching labeled break.
+  Date/Author: 2026-07-18 / Codex after Milestone 4e specialist review.
+
 - Decision: start with immutable demand-built in-memory artifacts and generation-local ICFG memoization; decide persistence only from #817 measurements.
   Rationale: CSR/CSC is a hot traversal layout while SQLite is a lifecycle mechanism. They are complementary. A measured no-go is acceptable, and a whole-workspace ICFG is never persisted or traversed through SQL.
   Date/Author: 2026-07-17 / Codex and user.
@@ -267,6 +294,8 @@ Milestone 4b is complete in the working tree. C# now enumerates methods, instanc
 Milestone 4c is complete in the working tree. Python now enumerates functions, methods, local definitions, and lambdas with lexical ownership that keeps defaults and annotations in the defining scope, then lowers the common control/call core, exact `for`/`while` else routes, explicit raise, `try`/`except`/`else`/`finally`, await points, and source-backed advanced-feature boundaries through the shared immutable CFG. Context managers, async iteration, match, comprehension protocols, generator suspension, and other incomplete runtime protocols remain capability- and point-scoped gaps. The shared ICFG now distinguishes deferred callable invocation from async/generator shape, so Python coroutine and generator calls return through modeled continuation edges without falsely entering suspended bodies. Review-driven fixtures prove comprehension eager prefixes, chained-comparison short-circuiting, assertion failure routing, indexed loop-target evaluation, and truth-protocol uncertainty in addition to direct cross-file calls, matched returns, nested callable separation, loop-else, handler/cleanup, and deferred-call cases.
 
 Milestone 4d is complete in the working tree. Go now enumerates functions, pointer and value receiver methods, and function literals as separate immediate procedures, then lowers the common control/call core, three-clause and infinite loops, range source and per-iteration target evaluation, short-circuit conditions, channel operands, and exact abrupt routing through the shared immutable CFG and demand-materialized ICFG. Dynamic `defer` execution, goroutine scheduling, switch/type-switch selection, `select`, goto/fallthrough, range protocols, channel blocking, and implicit panic behavior remain exact capability- and point-scoped gaps. Review-driven fixtures prove selected-only calls are never fabricated, unspecified operand ordering is visibly incomplete, and shadowed `panic`/`recover` names resolve as ordinary calls with matched returns. No Go-specific graph, resolver, or ICFG implementation was introduced.
+
+Milestone 4e is complete in the working tree. Rust now enumerates functions, associated methods, nested functions, closures, async blocks, and generator blocks as distinct procedures, classifies receiver-free associated functions as static, and records async/generator invocation as deferred. The adapter lowers the common control/call core, match guards, labels and loop values, semicolonless control-expression tails, ordinary and generic calls, `?`, await, yield, and dead syntax through the shared immutable CFG and demand-materialized ICFG. Unsupported try blocks and macro token trees stop at terminal typed boundaries; implicit trait calls and all encountered RAII/Drop behavior remain capability- and point-scoped on normal and abrupt paths without fabricated call sites or cleanup bodies. Review also fixed shared unlabeled-break routing and preserved grouped/glob imports while adding generic/turbofish resolution. No Rust-specific graph or ICFG implementation was introduced; PHP is the next checkpoint.
 
 ## Context and Orientation
 
@@ -707,3 +736,5 @@ Plan revision note (2026-07-18): Completed Milestone 4b after independent review
 Plan revision note (2026-07-18): Completed Milestone 4c after independent review. Python now supplies real source-backed callable CFGs and direct matched-return ICFGs across its common core, while coroutine and generator calls use a shared deferred-invocation boundary rather than fabricated body entry. Review corrected comprehension eager prefixes, comparison short-circuiting, assertion routing, runtime loop targets, and truth-protocol gaps. Go is the next independently reviewed checkpoint.
 
 Plan revision note (2026-07-18): Completed Milestone 4d after independent review. Go now supplies real source-backed callable CFGs and matched shared-ICFG calls across its common core, while `defer`, goroutine scheduling, range, channel, switch, select, and non-local omissions remain exact typed boundaries. Review added missing selected-call completeness, made Go's partial evaluation-order guarantee explicit without sacrificing deterministic topology, and proved shadowed `panic`/`recover` are ordinary calls. Rust is the next independently reviewed checkpoint.
+
+Plan revision note (2026-07-18): Completed Milestone 4e after independent review. Rust now supplies source-backed callable CFGs and matched shared-ICFG calls across functions, methods, nested callables, closures, labels, match, loops, calls, semicolonless tails, `?`, await, and generators. Review made parameter, lexical, pattern-binding, assignment-replacement, and abrupt-path RAII omissions explicit without fabricated Drop calls; stopped unsupported try blocks and macros at typed boundaries; exposed implicit trait calls; corrected labeled-block break routing; and preserved grouped imports while enabling generic/turbofish dispatch. PHP is the next independently reviewed checkpoint.

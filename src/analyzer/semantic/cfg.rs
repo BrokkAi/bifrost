@@ -312,7 +312,7 @@ impl ProcedureCfgBuilder {
                     continue_target,
                     continue_edge_kind,
                 } => {
-                    if label_matches(request.label, label.as_deref()) {
+                    if label_matches(request.label, label.as_deref(), true) {
                         if request.kind == CompletionKind::Break {
                             return Some(CompletionRoute::new(
                                 CompletionTarget::new(
@@ -337,11 +337,12 @@ impl ProcedureCfgBuilder {
                 }
                 ScopeBinding::Breakable {
                     label,
+                    accepts_unlabeled,
                     break_target,
                     break_edge_kind,
                 } => {
                     if request.kind == CompletionKind::Break
-                        && label_matches(request.label, label.as_deref())
+                        && label_matches(request.label, label.as_deref(), *accepts_unlabeled)
                     {
                         return Some(CompletionRoute::new(
                             CompletionTarget::new(
@@ -614,6 +615,9 @@ pub(crate) enum ScopeBinding {
     },
     Breakable {
         label: Option<Box<str>>,
+        /// Whether an unlabeled `break` targets this construct. Switches do;
+        /// labeled blocks and statements do not.
+        accepts_unlabeled: bool,
         break_target: ProgramPointId,
         break_edge_kind: ControlEdgeKind,
     },
@@ -720,8 +724,12 @@ pub(crate) enum DriveError<E> {
     Step(E),
 }
 
-fn label_matches(requested: Option<&str>, candidate: Option<&str>) -> bool {
-    requested.is_none_or(|label| candidate == Some(label))
+fn label_matches(
+    requested: Option<&str>,
+    candidate: Option<&str>,
+    accepts_unlabeled: bool,
+) -> bool {
+    requested.map_or(accepts_unlabeled, |label| candidate == Some(label))
 }
 
 fn derive_blocks(
@@ -959,6 +967,7 @@ mod tests {
             None,
             ScopeBinding::Breakable {
                 label: None,
+                accepts_unlabeled: true,
                 break_target: outer_test,
                 break_edge_kind: ControlEdgeKind::LoopBack,
             },
@@ -972,6 +981,49 @@ mod tests {
             .expect("break should resolve through the nested breakable scope");
         assert_eq!(route.destination().target(), outer_test);
         assert_eq!(route.destination().edge_kind(), ControlEdgeKind::LoopBack);
+    }
+
+    #[test]
+    fn unlabeled_break_skips_a_labeled_block_and_targets_the_enclosing_loop() {
+        let mut builder = builder();
+        let loop_break = point(&mut builder, SemanticEffect::Entry);
+        let loop_continue = point(&mut builder, SemanticEffect::Entry);
+        let block_break = point(&mut builder, SemanticEffect::Entry);
+        let loop_scope = builder.push_scope(
+            None,
+            ScopeBinding::Loop {
+                label: Some("outer".into()),
+                break_target: loop_break,
+                break_edge_kind: ControlEdgeKind::Normal,
+                continue_target: loop_continue,
+                continue_edge_kind: ControlEdgeKind::LoopBack,
+            },
+        );
+        let block_scope = builder.push_scope(
+            Some(loop_scope),
+            ScopeBinding::Breakable {
+                label: Some("block".into()),
+                accepts_unlabeled: false,
+                break_target: block_break,
+                break_edge_kind: ControlEdgeKind::Normal,
+            },
+        );
+
+        let unlabeled = builder
+            .resolve_completion(
+                block_scope,
+                &CompletionRequest::new(CompletionKind::Break, None),
+            )
+            .expect("unlabeled break should resolve to the enclosing loop");
+        assert_eq!(unlabeled.destination().target(), loop_break);
+
+        let labeled = builder
+            .resolve_completion(
+                block_scope,
+                &CompletionRequest::new(CompletionKind::Break, Some("block")),
+            )
+            .expect("matching labeled break should resolve to the block merge");
+        assert_eq!(labeled.destination().target(), block_break);
     }
 
     #[test]
@@ -1018,6 +1070,7 @@ mod tests {
             Some(loop_scope),
             ScopeBinding::Breakable {
                 label: None,
+                accepts_unlabeled: true,
                 break_target: switch_merge,
                 break_edge_kind: ControlEdgeKind::Normal,
             },

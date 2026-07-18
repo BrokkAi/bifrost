@@ -2271,6 +2271,88 @@ fn typescript_matching_labeled_break_completes_normally() {
 }
 
 #[test]
+fn javascript_unlabeled_break_skips_a_nested_labeled_block() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "src/labeled_block.js",
+            r#"
+                function nested(flag) {
+                    outer: while (flag) {
+                        block: {
+                            break;
+                        }
+                        afterBlock();
+                    }
+                    afterLoop();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/labeled_block.js");
+    graph
+        .bind("break", PointSelector::new("break;").procedure("nested"))
+        .bind(
+            "after_block",
+            PointSelector::new("afterBlock()")
+                .procedure("nested")
+                .effect("invoke"),
+        )
+        .bind(
+            "after_loop",
+            PointSelector::new("afterLoop()")
+                .procedure("nested")
+                .effect("invoke"),
+        );
+
+    graph.assert_unreachable("break", "after_block");
+    graph.assert_reachable("break", "after_loop");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn java_unlabeled_break_skips_a_nested_labeled_statement() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/LabeledBlock.java",
+            r#"
+                class LabeledBlock {
+                    static void nested(boolean flag) {
+                        outer: while (flag) {
+                            block: {
+                                break;
+                            }
+                            afterBlock();
+                        }
+                        afterLoop();
+                    }
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "src/LabeledBlock.java");
+    graph
+        .bind("break", PointSelector::new("break;").procedure("nested"))
+        .bind(
+            "after_block",
+            PointSelector::new("afterBlock()")
+                .procedure("nested")
+                .effect("invoke"),
+        )
+        .bind(
+            "after_loop",
+            PointSelector::new("afterLoop()")
+                .procedure("nested")
+                .effect("invoke"),
+        );
+
+    graph.assert_unreachable("break", "after_block");
+    graph.assert_reachable("break", "after_loop");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
 fn typescript_enumeration_preflights_cumulative_and_deep_identity_budgets() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(

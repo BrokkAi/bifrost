@@ -1399,6 +1399,89 @@ pub fn format_value() {}
 }
 
 #[test]
+fn rust_imported_turbofish_function_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+mod util;
+use crate::util::leaf;
+
+pub fn run() {
+    leaf::<u8>();
+}
+"#,
+        )
+        .file("util.rs", "pub fn leaf<T>() {}\n")
+        .build();
+
+    let line = "    leaf::<u8>();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":6,"column":{}}}]}}"#,
+            column_of(line, "leaf")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["reference"]["target"], "leaf", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "leaf", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "util.rs", "{value}");
+}
+
+#[test]
+fn rust_generic_method_call_prefers_method_over_same_named_field() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+mod model;
+use crate::model::Worker;
+
+pub fn run(worker: Worker) {
+    worker.make::<u8>();
+}
+"#,
+        )
+        .file(
+            "model.rs",
+            r#"
+pub struct Worker {
+    pub make: usize,
+}
+
+impl Worker {
+    pub fn make<T>(&self) {}
+}
+"#,
+        )
+        .build();
+
+    let line = "    worker.make::<u8>();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":6,"column":{}}}]}}"#,
+            column_of(line, "make")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["reference"]["target"], "worker.make", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().expect("definitions").len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["fqn"], "Worker.make", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "model.rs", "{value}");
+    assert_eq!(result["definitions"][0]["kind"], "function", "{value}");
+}
+
+#[test]
 fn rust_definition_lookup_ignores_other_language_normalized_fqn_collisions() {
     let rust_source = "pub struct Widget;\n\nimpl Widget {\n    pub fn build() -> Self {\n        Self\n    }\n}\n";
     let project = InlineTestProject::new()

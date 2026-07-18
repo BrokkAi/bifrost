@@ -1207,6 +1207,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 Some(scope),
                 ScopeBinding::Breakable {
                     label: Some(Box::<str>::from(label)),
+                    accepts_unlabeled: false,
                     break_target: next.point,
                     break_edge_kind: next.kind,
                 },
@@ -2228,6 +2229,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             Some(scope),
             ScopeBinding::Breakable {
                 label: label.map(Box::<str>::from),
+                accepts_unlabeled: true,
                 break_target: next.point,
                 break_edge_kind: next.kind,
             },

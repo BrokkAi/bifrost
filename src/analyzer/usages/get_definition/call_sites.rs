@@ -651,6 +651,9 @@ fn rust_call_reference_candidate(node: Node<'_>) -> bool {
                 return true;
             }
             "scoped_identifier" | "field_expression" => current = parent,
+            "generic_function" if parent.child_by_field_name("function") == Some(current) => {
+                current = parent;
+            }
             _ => return false,
         }
     }
@@ -803,6 +806,30 @@ mod tests {
 
         assert_eq!(&source[outer.start_byte..outer.end_byte], "outer");
         assert_eq!(&source[inner.start_byte..inner.end_byte], "inner");
+    }
+
+    #[test]
+    fn exact_rust_turbofish_call_span_uses_the_wrapped_function() {
+        let source = "fn leaf<T>() {}\nstruct Worker;\nimpl Worker { fn make<T>(&self) {} }\nfn caller(worker: Worker) { leaf::<u8>(); worker.make::<u8>(); }\n";
+        let file = file("lib.rs");
+        let tree =
+            parse_tree_for_language(&file, Language::Rust, source).expect("Rust syntax tree");
+
+        let leaf = call_reference_range_for_call(
+            &tree,
+            Language::Rust,
+            &byte_range(source, "leaf::<u8>()"),
+        )
+        .expect("generic free-function reference");
+        let make = call_reference_range_for_call(
+            &tree,
+            Language::Rust,
+            &byte_range(source, "worker.make::<u8>()"),
+        )
+        .expect("generic method reference");
+
+        assert_eq!(&source[leaf.start_byte..leaf.end_byte], "leaf");
+        assert_eq!(&source[make.start_byte..make.end_byte], "make");
     }
 
     #[test]

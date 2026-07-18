@@ -246,6 +246,1836 @@ func GoRoot() int {
 }
 
 #[test]
+fn rust_direct_call_conformance() {
+    assert_direct_call_conformance(DirectCallFixture {
+        language: Language::Rust,
+        dialect: SemanticLanguage::Standard(Language::Rust),
+        callee_path: "leaf.rs",
+        callee_source: r#"
+            pub fn rust_leaf() -> i32 {
+                7
+            }
+        "#,
+        callee_declaration: "pub fn rust_leaf() -> i32",
+        callee_name: "rust_leaf",
+        caller_path: "lib.rs",
+        caller_source: r#"
+            mod leaf;
+            use crate::leaf::rust_leaf;
+
+            pub fn rust_root() -> i32 {
+                rust_leaf()
+            }
+        "#,
+        caller_declaration: "pub fn rust_root() -> i32",
+        caller_name: "rust_root",
+        call: "rust_leaf()",
+    });
+}
+
+#[test]
+fn rust_turbofish_direct_call_uses_the_shared_dispatch_oracle() {
+    assert_direct_call_conformance(DirectCallFixture {
+        language: Language::Rust,
+        dialect: SemanticLanguage::Standard(Language::Rust),
+        callee_path: "leaf.rs",
+        callee_source: r#"
+            pub fn generic_leaf<T>() -> i32 {
+                7
+            }
+        "#,
+        callee_declaration: "pub fn generic_leaf<T>() -> i32",
+        callee_name: "generic_leaf",
+        caller_path: "lib.rs",
+        caller_source: r#"
+            mod leaf;
+            use crate::leaf::generic_leaf;
+
+            pub fn generic_root() -> i32 {
+                generic_leaf::<u8>()
+            }
+        "#,
+        caller_declaration: "pub fn generic_root() -> i32",
+        caller_name: "generic_root",
+        call: "generic_leaf::<u8>()",
+    });
+}
+
+#[test]
+fn rust_generic_method_call_uses_the_shared_dispatch_oracle() {
+    assert_direct_call_conformance(DirectCallFixture {
+        language: Language::Rust,
+        dialect: SemanticLanguage::Standard(Language::Rust),
+        callee_path: "worker.rs",
+        callee_source: r#"
+            pub struct Worker;
+
+            impl Worker {
+                pub fn step<T>(&self) -> i32 {
+                    7
+                }
+            }
+        "#,
+        callee_declaration: "pub fn step<T>(&self) -> i32",
+        callee_name: "step",
+        caller_path: "lib.rs",
+        caller_source: r#"
+            mod worker;
+            use crate::worker::Worker;
+
+            pub fn method_root(worker: &Worker) -> i32 {
+                worker.step::<u8>()
+            }
+        "#,
+        caller_declaration: "pub fn method_root(worker: &Worker) -> i32",
+        caller_name: "method_root",
+        call: "worker.step::<u8>()",
+    });
+}
+
+#[test]
+fn rust_async_function_calls_are_deferred_icfg_boundaries() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "leaf.rs",
+            r#"
+                pub async fn async_leaf() -> i32 {
+                    7
+                }
+            "#,
+        )
+        .file(
+            "lib.rs",
+            r#"
+                mod leaf;
+                use crate::leaf::async_leaf;
+
+                pub fn make_future() {
+                    let _pending = async_leaf();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let callee = SemanticGraph::materialize(&project, &analyzer, "leaf.rs");
+    let async_leaf = callee
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("async_leaf")
+        })
+        .expect("missing Rust async function procedure");
+    assert!(async_leaf.properties().is_async);
+    assert!(!async_leaf.properties().is_generator);
+    assert_eq!(
+        async_leaf.properties().invocation,
+        ProcedureInvocationKind::Deferred
+    );
+
+    let mut graph = IcfgGraph::materialize(
+        &project,
+        &analyzer,
+        "lib.rs",
+        PointSelector::new("pub fn make_future()")
+            .procedure("make_future")
+            .effect("entry"),
+    );
+    graph
+        .bind_call(
+            "async_call",
+            "lib.rs",
+            PointSelector::new("async_leaf()")
+                .procedure("make_future")
+                .effect("invoke"),
+        )
+        .bind_node(
+            "caller_entry",
+            "lib.rs",
+            PointSelector::new("pub fn make_future()")
+                .procedure("make_future")
+                .effect("entry"),
+            root(),
+        )
+        .bind_node(
+            "async_invoke",
+            "lib.rs",
+            PointSelector::new("async_leaf()")
+                .procedure("make_future")
+                .effect("invoke"),
+            root(),
+        )
+        .bind_node(
+            "normal_continuation",
+            "lib.rs",
+            PointSelector::new("async_leaf()")
+                .procedure("make_future")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+            root(),
+        )
+        .bind_node(
+            "exceptional_continuation",
+            "lib.rs",
+            PointSelector::new("async_leaf()")
+                .procedure("make_future")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+            root(),
+        );
+
+    graph.assert_outcome(IcfgOutcomeKind::Complete);
+    graph.assert_boundary(
+        "async_invoke",
+        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchDeferred(
+            DeferredInvocationKind::Async,
+        ))
+        .originating_call("async_call"),
+    );
+    graph.assert_successors(
+        "async_invoke",
+        &[
+            icfg_edge(
+                "normal_continuation",
+                IcfgEdgeKind::CallToNormalContinuation,
+            )
+            .originating_call("async_call"),
+            icfg_edge(
+                "exceptional_continuation",
+                IcfgEdgeKind::CallToExceptionalContinuation,
+            )
+            .originating_call("async_call"),
+        ],
+    );
+    graph.assert_predecessors(
+        "normal_continuation",
+        &[
+            icfg_edge("async_invoke", IcfgEdgeKind::CallToNormalContinuation)
+                .originating_call("async_call"),
+        ],
+    );
+    graph.assert_reachable("caller_entry", "normal_continuation");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn rust_labeled_blocks_do_not_capture_unlabeled_loop_breaks() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "rust/labeled.rs",
+            r#"
+                fn labeled_flow() {
+                    'outer: loop {
+                        'block: {
+                            if leave_loop() {
+                                break;
+                            }
+                            break 'block;
+                        }
+                        after_block();
+                        break 'outer;
+                    }
+                    done();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "rust/labeled.rs");
+    graph
+        .bind(
+            "entry",
+            PointSelector::new("fn labeled_flow()")
+                .procedure("labeled_flow")
+                .effect("entry"),
+        )
+        .bind(
+            "leave_invoke",
+            PointSelector::new("leave_loop()")
+                .procedure("labeled_flow")
+                .effect("invoke"),
+        )
+        .bind(
+            "unlabeled_break",
+            PointSelector::new("break;")
+                .procedure("labeled_flow")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "block_break",
+            PointSelector::new("break 'block;")
+                .procedure("labeled_flow")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "outer_break",
+            PointSelector::new("break 'outer;")
+                .procedure("labeled_flow")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "after_block",
+            PointSelector::new("after_block()")
+                .procedure("labeled_flow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "done",
+            PointSelector::new("done()")
+                .procedure("labeled_flow")
+                .anchor_occurrence(0),
+        );
+
+    graph.assert_reachable("entry", "leave_invoke");
+    graph.assert_successors(
+        "unlabeled_break",
+        &[cfg_edge("done", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "block_break",
+        &[cfg_edge("after_block", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors("outer_break", &[cfg_edge("done", ControlEdgeKind::Normal)]);
+    graph.assert_predecessors(
+        "done",
+        &[
+            cfg_edge("unlabeled_break", ControlEdgeKind::Normal),
+            cfg_edge("outer_break", ControlEdgeKind::Normal),
+        ],
+    );
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn rust_branches_early_returns_and_dead_syntax_have_exact_topology() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "rust/branch.rs",
+            r#"
+                fn branch(flag: bool) {
+                    before();
+                    if flag {
+                        yes();
+                        return;
+                        dead_after_return();
+                    } else {
+                        no();
+                    }
+                    after();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "rust/branch.rs");
+    graph
+        .bind(
+            "entry",
+            PointSelector::new("fn branch(flag: bool)")
+                .procedure("branch")
+                .effect("entry"),
+        )
+        .bind(
+            "condition",
+            PointSelector::new("flag")
+                .occurrence(1)
+                .procedure("branch")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "yes_block",
+            PointSelector::new(
+                r#"{
+                        yes();
+                        return;
+                        dead_after_return();
+                    }"#,
+            )
+            .procedure("branch")
+            .anchor_occurrence(0),
+        )
+        .bind(
+            "yes_statement",
+            PointSelector::new("yes()")
+                .procedure("branch")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "no_block",
+            PointSelector::new(
+                r#"{
+                        no();
+                    }"#,
+            )
+            .procedure("branch")
+            .anchor_occurrence(0),
+        )
+        .bind(
+            "no_statement",
+            PointSelector::new("no()")
+                .procedure("branch")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "no_normal",
+            PointSelector::new("no()")
+                .procedure("branch")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "return",
+            PointSelector::new("return;")
+                .procedure("branch")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "normal_exit",
+            PointSelector::new("fn branch(flag: bool)")
+                .procedure("branch")
+                .effect("normal_exit"),
+        )
+        .bind(
+            "after_statement",
+            PointSelector::new("after()")
+                .procedure("branch")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_invoke",
+            PointSelector::new("after()")
+                .procedure("branch")
+                .effect("invoke"),
+        )
+        .bind(
+            "dead_invoke",
+            PointSelector::new("dead_after_return()")
+                .procedure("branch")
+                .effect("invoke"),
+        );
+
+    graph.assert_successors(
+        "condition",
+        &[
+            cfg_edge("yes_block", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("no_block", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "yes_block",
+        &[cfg_edge("yes_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "no_block",
+        &[cfg_edge("no_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "after_statement",
+        &[cfg_edge("no_normal", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "return",
+        &[cfg_edge("normal_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("entry", "after_invoke");
+    graph.assert_unreachable("return", "after_invoke");
+    graph.assert_unreachable("entry", "dead_invoke");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn rust_semicolonless_control_tail_is_an_implicit_value_return() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "rust/control_tail.rs",
+            r#"
+                fn choose(flag: bool) -> i32 {
+                    if flag {
+                        left()
+                    } else {
+                        right()
+                    }
+                }
+
+                fn choose_unit(flag: bool) {
+                    if flag {
+                        unit_left();
+                    } else {
+                        unit_right();
+                    };
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "rust/control_tail.rs");
+    graph
+        .bind(
+            "condition",
+            PointSelector::new("flag")
+                .occurrence(1)
+                .procedure("choose")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "left_block",
+            PointSelector::new(
+                r#"{
+                        left()
+                    }"#,
+            )
+            .procedure("choose")
+            .anchor_occurrence(0),
+        )
+        .bind(
+            "left",
+            PointSelector::new("left()")
+                .procedure("choose")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "left_normal",
+            PointSelector::new("left()")
+                .procedure("choose")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "right_block",
+            PointSelector::new(
+                r#"{
+                        right()
+                    }"#,
+            )
+            .procedure("choose")
+            .anchor_occurrence(0),
+        )
+        .bind(
+            "right",
+            PointSelector::new("right()")
+                .procedure("choose")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "right_normal",
+            PointSelector::new("right()")
+                .procedure("choose")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "implicit_return",
+            PointSelector::new("if flag")
+                .occurrence(0)
+                .procedure("choose")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "normal_exit",
+            PointSelector::new("fn choose(flag: bool)")
+                .procedure("choose")
+                .effect("normal_exit"),
+        );
+
+    graph.assert_successors(
+        "condition",
+        &[
+            cfg_edge("left_block", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("right_block", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors("left_block", &[cfg_edge("left", ControlEdgeKind::Normal)]);
+    graph.assert_successors("right_block", &[cfg_edge("right", ControlEdgeKind::Normal)]);
+    graph.assert_successors(
+        "left_normal",
+        &[cfg_edge("implicit_return", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "right_normal",
+        &[cfg_edge("implicit_return", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "implicit_return",
+        &[
+            cfg_edge("left_normal", ControlEdgeKind::Normal),
+            cfg_edge("right_normal", ControlEdgeKind::Normal),
+        ],
+    );
+    graph.assert_successors(
+        "implicit_return",
+        &[cfg_edge("normal_exit", ControlEdgeKind::Normal)],
+    );
+
+    let procedure = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("choose")
+        })
+        .expect("missing Rust choose procedure");
+    let (return_point, return_value) = procedure
+        .points()
+        .iter()
+        .find_map(|point| {
+            point.events.iter().find_map(|event| match event.effect {
+                SemanticEffect::ProcedureReturn { value: Some(value) } => Some((point.id, value)),
+                _ => None,
+            })
+        })
+        .expect("semicolonless control tail should publish a value return");
+    assert!(procedure.gaps().iter().any(|gap| {
+        gap.point == return_point
+            && gap.subject == SemanticGapSubject::Value(return_value)
+            && gap.capability == SemanticCapability::Values
+            && gap.kind == SemanticGapKind::Unknown
+    }));
+
+    let unit = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("choose_unit")
+        })
+        .expect("missing Rust choose_unit procedure");
+    assert!(
+        unit.points().iter().all(|point| point
+            .events
+            .iter()
+            .all(|event| !matches!(event.effect, SemanticEffect::ProcedureReturn { .. }))),
+        "semicolon-terminated unit control flow must not publish a value return"
+    );
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn rust_named_nested_callables_are_separate_with_honest_invocation_kinds() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "rust/callables.rs",
+            r#"
+                fn top_level() {
+                    top_body();
+                }
+
+                struct Counter;
+
+                impl Counter {
+                    fn step(&self) {
+                        method_body();
+                    }
+
+                    fn create() {
+                        associated_body();
+                    }
+                }
+
+                fn outer() {
+                    fn local() {
+                        local_body();
+                    }
+
+                    let plain = || {
+                        closure_body();
+                    };
+                    let async_closure = async || {
+                        async_closure_body().await;
+                    };
+                    let future = async move {
+                        future_body().await;
+                    };
+                    let stream = gen move {
+                        yield stream_value();
+                    };
+                    outer_body();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "rust/callables.rs");
+
+    for (alias, declaration, procedure, body_call) in [
+        ("top", "fn top_level()", "top_level", "top_body()"),
+        ("method", "fn step(&self)", "step", "method_body()"),
+        ("associated", "fn create()", "create", "associated_body()"),
+        ("local", "fn local()", "local", "local_body()"),
+        ("plain", "||", "plain", "closure_body()"),
+        (
+            "async_closure",
+            "async ||",
+            "async_closure",
+            "async_closure_body()",
+        ),
+        ("future", "async move", "future", "future_body()"),
+        ("stream", "gen move", "stream", "stream_value()"),
+        ("outer", "fn outer()", "outer", "outer_body()"),
+    ] {
+        graph
+            .bind(
+                format!("{alias}_entry"),
+                PointSelector::new(declaration)
+                    .procedure(procedure)
+                    .effect("entry"),
+            )
+            .bind(
+                format!("{alias}_invoke"),
+                PointSelector::new(body_call)
+                    .procedure(procedure)
+                    .effect("invoke"),
+            );
+        graph.assert_reachable(&format!("{alias}_entry"), &format!("{alias}_invoke"));
+    }
+
+    for body_call in [
+        "local_body()",
+        "closure_body()",
+        "async_closure_body()",
+        "future_body()",
+        "stream_value()",
+    ] {
+        let error = graph
+            .try_bind(
+                format!("outer_must_not_own_{body_call}"),
+                PointSelector::new(body_call)
+                    .procedure("outer")
+                    .effect("invoke"),
+            )
+            .expect_err("nested callable execution must stay outside the enclosing CFG");
+        assert!(
+            error.to_string().contains("matched no semantic"),
+            "unexpected selector result for {body_call}: {error}"
+        );
+    }
+
+    let procedures = graph.artifact().procedures();
+    let named = |name: &str, kind: ProcedureKind| {
+        procedures
+            .iter()
+            .find(|procedure| {
+                procedure.kind() == kind
+                    && procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+            })
+            .unwrap_or_else(|| panic!("missing Rust {kind:?} procedure {name}"))
+    };
+    let top = named("top_level", ProcedureKind::Function);
+    let method = named("step", ProcedureKind::Method);
+    let associated = named("create", ProcedureKind::Method);
+    let outer = named("outer", ProcedureKind::Function);
+    let local = named("local", ProcedureKind::LocalFunction);
+    let plain = named("plain", ProcedureKind::Closure);
+    let async_closure = named("async_closure", ProcedureKind::Closure);
+    let future = named("future", ProcedureKind::Closure);
+    let stream = named("stream", ProcedureKind::Closure);
+
+    for procedure in [top, method, associated, outer] {
+        assert!(procedure.lexical_parent().is_none());
+    }
+    for procedure in [local, plain, async_closure, future, stream] {
+        assert_eq!(procedure.lexical_parent(), Some(outer.id()));
+    }
+    for procedure in [top, method, associated, outer, local, plain] {
+        assert!(!procedure.properties().is_async);
+        assert!(!procedure.properties().is_generator);
+        assert_eq!(
+            procedure.properties().invocation,
+            ProcedureInvocationKind::Immediate
+        );
+    }
+    assert!(!method.properties().is_static);
+    assert!(associated.properties().is_static);
+    for procedure in [async_closure, future] {
+        assert!(procedure.properties().is_async);
+        assert!(!procedure.properties().is_generator);
+        assert_eq!(
+            procedure.properties().invocation,
+            ProcedureInvocationKind::Deferred
+        );
+    }
+    assert!(!stream.properties().is_async);
+    assert!(stream.properties().is_generator);
+    assert_eq!(
+        stream.properties().invocation,
+        ProcedureInvocationKind::Deferred
+    );
+
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn rust_match_evaluates_the_subject_before_guarded_arm_selection() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "rust/match.rs",
+            r#"
+                fn choose() -> i32 {
+                    let chosen = match inspect_subject() {
+                        0 if allow_first() => first_value(),
+                        99 => fallback_value(),
+                    };
+                    after_match(chosen)
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "rust/match.rs");
+    graph
+        .bind(
+            "subject_normal",
+            PointSelector::new("inspect_subject()")
+                .procedure("choose")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "match_decision",
+            PointSelector::new("match inspect_subject()")
+                .procedure("choose")
+                .effect("gap")
+                .outgoing_kind(ControlEdgeKind::SwitchCase),
+        )
+        .bind(
+            "guarded_candidate",
+            PointSelector::new("0 if allow_first()")
+                .procedure("choose")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "fallback_candidate",
+            PointSelector::new("99")
+                .procedure("choose")
+                .outgoing_kind(ControlEdgeKind::SwitchCase),
+        )
+        .bind(
+            "guard_decision",
+            PointSelector::new("allow_first()")
+                .procedure("choose")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "first_arm",
+            PointSelector::new("first_value()")
+                .procedure("choose")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "fallback_arm",
+            PointSelector::new("fallback_value()")
+                .procedure("choose")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_match",
+            PointSelector::new("after_match(chosen)")
+                .procedure("choose")
+                .effect("invoke"),
+        );
+
+    graph.assert_successors(
+        "subject_normal",
+        &[cfg_edge("match_decision", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "match_decision",
+        &[
+            cfg_edge("guarded_candidate", ControlEdgeKind::SwitchCase),
+            cfg_edge("fallback_candidate", ControlEdgeKind::SwitchCase),
+        ],
+    );
+    graph.assert_successors(
+        "guard_decision",
+        &[
+            cfg_edge("first_arm", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("fallback_candidate", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_point_gap(
+        "match_decision",
+        SemanticCapability::NormalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_reachable("subject_normal", "after_match");
+    graph.assert_unreachable("match_decision", "subject_normal");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn rust_implicit_trait_operations_publish_exact_call_and_exception_gaps() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "rust/implicit_calls.rs",
+            r#"
+                fn implicit_operations(
+                    left: Number,
+                    right: Number,
+                    values: Values,
+                    index: usize,
+                    holder: Holder,
+                ) {
+                    let _sum = left + right;
+                    let _item = values[index];
+                    let _negated = -make_number();
+                    let _field = holder.field;
+                    holder.method();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "rust/implicit_calls.rs");
+    graph
+        .bind(
+            "binary_boundary",
+            PointSelector::new("left + right")
+                .procedure("implicit_operations")
+                .effect("gap"),
+        )
+        .bind(
+            "index_boundary",
+            PointSelector::new("values[index]")
+                .procedure("implicit_operations")
+                .effect("gap"),
+        )
+        .bind(
+            "make_number_normal",
+            PointSelector::new("make_number()")
+                .procedure("implicit_operations")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "unary_boundary",
+            PointSelector::new("-make_number()")
+                .procedure("implicit_operations")
+                .effect("gap"),
+        )
+        .bind(
+            "field_boundary",
+            PointSelector::new("holder.field")
+                .procedure("implicit_operations")
+                .effect("gap"),
+        )
+        .bind(
+            "method_invoke",
+            PointSelector::new("holder.method()")
+                .procedure("implicit_operations")
+                .effect("invoke"),
+        );
+
+    graph.assert_successors(
+        "make_number_normal",
+        &[cfg_edge("unary_boundary", ControlEdgeKind::Normal)],
+    );
+    for boundary in [
+        "binary_boundary",
+        "index_boundary",
+        "unary_boundary",
+        "field_boundary",
+        "method_invoke",
+    ] {
+        graph.assert_point_gap(
+            boundary,
+            SemanticCapability::Calls,
+            SemanticGapKind::Unknown,
+        );
+        graph.assert_point_gap(
+            boundary,
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapKind::Unknown,
+        );
+    }
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+}
+
+#[test]
+fn rust_try_operator_routes_success_and_residual_after_operand_calls() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "rust/try_operator.rs",
+            r#"
+                fn propagate() -> Result<i32, Problem> {
+                    let value = fallible()?;
+                    after_success(value);
+                    Ok(value)
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "rust/try_operator.rs");
+    graph
+        .bind(
+            "operand_invoke",
+            PointSelector::new("fallible()")
+                .procedure("propagate")
+                .effect("invoke"),
+        )
+        .bind(
+            "operand_normal",
+            PointSelector::new("fallible()")
+                .procedure("propagate")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "try_branch",
+            PointSelector::new("fallible()?")
+                .procedure("propagate")
+                .effect("gap")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "success_binding",
+            PointSelector::new("let value = fallible()?;")
+                .procedure("propagate")
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "residual_return",
+            PointSelector::new("fallible()?")
+                .procedure("propagate")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "after_success",
+            PointSelector::new("after_success(value)")
+                .procedure("propagate")
+                .effect("invoke"),
+        )
+        .bind(
+            "normal_exit",
+            PointSelector::new("fn propagate()")
+                .procedure("propagate")
+                .effect("normal_exit"),
+        );
+
+    graph.assert_successors(
+        "operand_normal",
+        &[cfg_edge("try_branch", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "try_branch",
+        &[
+            cfg_edge("success_binding", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("residual_return", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "residual_return",
+        &[cfg_edge("normal_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_point_gap(
+        "try_branch",
+        SemanticCapability::NormalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_point_gap(
+        "try_branch",
+        SemanticCapability::Calls,
+        SemanticGapKind::Unknown,
+    );
+    let procedure = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("propagate")
+        })
+        .expect("missing Rust propagate procedure");
+    let residual = procedure
+        .points()
+        .iter()
+        .find(|point| {
+            point
+                .events
+                .iter()
+                .any(|event| matches!(event.effect, SemanticEffect::ProcedureReturn { .. }))
+                && procedure.gaps().iter().any(|gap| {
+                    gap.point == point.id
+                        && gap.capability == SemanticCapability::CleanupControlFlow
+                })
+        })
+        .expect("missing Rust ? residual return point");
+    assert!(procedure.gaps().iter().any(|gap| {
+        gap.point == residual.id
+            && matches!(gap.subject, SemanticGapSubject::Value(_))
+            && gap.capability == SemanticCapability::Values
+            && gap.kind == SemanticGapKind::Unknown
+    }));
+    assert!(procedure.gaps().iter().any(|gap| {
+        gap.point == residual.id
+            && matches!(gap.subject, SemanticGapSubject::Value(_))
+            && gap.capability == SemanticCapability::CleanupControlFlow
+            && gap.kind == SemanticGapKind::Unknown
+    }));
+    graph.assert_reachable("operand_invoke", "after_success");
+    graph.assert_unreachable("residual_return", "after_success");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn rust_try_block_stops_at_a_typed_boundary_without_fabricated_returns() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "rust/try_block.rs",
+            r#"
+                fn scoped_try() {
+                    let result: Result<i32, Problem> = try {
+                        inner_fallible()?;
+                        1
+                    };
+                    after_try(result);
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "rust/try_block.rs");
+    graph
+        .bind(
+            "entry",
+            PointSelector::new("fn scoped_try()")
+                .procedure("scoped_try")
+                .effect("entry"),
+        )
+        .bind(
+            "try_boundary",
+            PointSelector::new(
+                r#"try {
+                        inner_fallible()?;
+                        1
+                    }"#,
+            )
+            .procedure("scoped_try")
+            .effect("gap"),
+        )
+        .bind(
+            "after_try",
+            PointSelector::new("after_try(result)")
+                .procedure("scoped_try")
+                .effect("invoke"),
+        )
+        .bind(
+            "normal_exit",
+            PointSelector::new("fn scoped_try()")
+                .procedure("scoped_try")
+                .effect("normal_exit"),
+        );
+
+    for (capability, kind) in [
+        (
+            SemanticCapability::NormalControlFlow,
+            SemanticGapKind::Unsupported,
+        ),
+        (SemanticCapability::Calls, SemanticGapKind::Unknown),
+        (
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapKind::Unknown,
+        ),
+        (
+            SemanticCapability::CleanupControlFlow,
+            SemanticGapKind::Unknown,
+        ),
+        (
+            SemanticCapability::ResourceManagement,
+            SemanticGapKind::Unknown,
+        ),
+        (SemanticCapability::Values, SemanticGapKind::Unsupported),
+    ] {
+        graph.assert_point_gap("try_boundary", capability, kind);
+    }
+    graph.assert_successors("try_boundary", &[]);
+    graph.assert_reachable("entry", "try_boundary");
+    graph.assert_unreachable("entry", "after_try");
+    graph.assert_unreachable("entry", "normal_exit");
+    let error = graph
+        .try_bind(
+            "fabricated_inner_call",
+            PointSelector::new("inner_fallible()")
+                .procedure("scoped_try")
+                .effect("invoke"),
+        )
+        .expect_err("unsupported try-block internals must not fabricate calls");
+    assert!(
+        error.to_string().contains("matched no semantic"),
+        "unexpected try-block call selector: {error}"
+    );
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn rust_await_evaluates_its_operand_before_explicit_resume_topology() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "rust/await.rs",
+            r#"
+                async fn wait_one() {
+                    let value = make_future().await;
+                    after_await(value);
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "rust/await.rs");
+    graph
+        .bind(
+            "future_normal",
+            PointSelector::new("make_future()")
+                .procedure("wait_one")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "suspend",
+            PointSelector::new("make_future().await")
+                .procedure("wait_one")
+                .effect("async_suspend"),
+        )
+        .bind(
+            "normal_resume",
+            PointSelector::new("make_future().await")
+                .procedure("wait_one")
+                .effect("async_resume")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "exceptional_resume",
+            PointSelector::new("make_future().await")
+                .procedure("wait_one")
+                .effect("async_resume")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "await_binding",
+            PointSelector::new("let value = make_future().await;")
+                .procedure("wait_one")
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "after_await",
+            PointSelector::new("after_await(value)")
+                .procedure("wait_one")
+                .effect("invoke"),
+        )
+        .bind(
+            "exceptional_exit",
+            PointSelector::new("async fn wait_one()")
+                .procedure("wait_one")
+                .effect("exceptional_exit"),
+        );
+
+    graph.assert_successors(
+        "future_normal",
+        &[cfg_edge("suspend", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "suspend",
+        &[
+            cfg_edge("normal_resume", ControlEdgeKind::AsyncNormal),
+            cfg_edge("exceptional_resume", ControlEdgeKind::AsyncExceptional),
+        ],
+    );
+    graph.assert_successors(
+        "normal_resume",
+        &[cfg_edge("await_binding", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "exceptional_resume",
+        &[cfg_edge("exceptional_exit", ControlEdgeKind::Exceptional)],
+    );
+    graph.assert_point_gap(
+        "suspend",
+        SemanticCapability::AsyncSuspendResume,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_point_gap(
+        "suspend",
+        SemanticCapability::Calls,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_point_gap(
+        "suspend",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    for capability in [
+        SemanticCapability::ResourceManagement,
+        SemanticCapability::CleanupControlFlow,
+        SemanticCapability::Calls,
+        SemanticCapability::ExceptionalControlFlow,
+    ] {
+        graph.assert_point_gap("exceptional_resume", capability, SemanticGapKind::Unknown);
+    }
+    graph.assert_reachable("future_normal", "after_await");
+    graph.assert_unreachable("exceptional_resume", "after_await");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn rust_generator_yield_evaluates_its_operand_then_stops_at_the_gap() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "rust/yield.rs",
+            r#"
+                fn make_stream() {
+                    let stream = gen move {
+                        yield produce();
+                        after_yield();
+                    };
+                    consume(stream);
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "rust/yield.rs");
+    graph
+        .bind(
+            "stream_entry",
+            PointSelector::new("gen move")
+                .procedure("stream")
+                .effect("entry"),
+        )
+        .bind(
+            "produce_normal",
+            PointSelector::new("produce()")
+                .procedure("stream")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "yield_boundary",
+            PointSelector::new("yield produce()")
+                .procedure("stream")
+                .effect("gap"),
+        )
+        .bind(
+            "after_yield",
+            PointSelector::new("after_yield()")
+                .procedure("stream")
+                .effect("invoke"),
+        );
+
+    graph.assert_successors(
+        "produce_normal",
+        &[cfg_edge("yield_boundary", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "yield_boundary",
+        &[cfg_edge("produce_normal", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors("yield_boundary", &[]);
+    graph.assert_point_gap(
+        "yield_boundary",
+        SemanticCapability::GeneratorSuspension,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_reachable("stream_entry", "yield_boundary");
+    graph.assert_unreachable("stream_entry", "after_yield");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn rust_macro_token_trees_are_terminal_without_fabricated_calls() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "rust/macro.rs",
+            r#"
+                fn opaque_macro() {
+                    opaque!(hidden_call());
+                    after_macro();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "rust/macro.rs");
+    graph
+        .bind(
+            "entry",
+            PointSelector::new("fn opaque_macro()")
+                .procedure("opaque_macro")
+                .effect("entry"),
+        )
+        .bind(
+            "macro_boundary",
+            PointSelector::new("opaque!(hidden_call())")
+                .procedure("opaque_macro")
+                .effect("gap"),
+        )
+        .bind(
+            "after_macro",
+            PointSelector::new("after_macro()")
+                .procedure("opaque_macro")
+                .effect("invoke"),
+        );
+
+    for capability in [
+        SemanticCapability::NormalControlFlow,
+        SemanticCapability::Calls,
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticCapability::NonLocalControl,
+        SemanticCapability::CleanupControlFlow,
+        SemanticCapability::ResourceManagement,
+    ] {
+        graph.assert_point_gap("macro_boundary", capability, SemanticGapKind::Unsupported);
+    }
+    graph.assert_successors("macro_boundary", &[]);
+    graph.assert_reachable("entry", "macro_boundary");
+    graph.assert_unreachable("entry", "after_macro");
+    let error = graph
+        .try_bind(
+            "fabricated_hidden_call",
+            PointSelector::new("hidden_call()")
+                .procedure("opaque_macro")
+                .effect("invoke"),
+        )
+        .expect_err("macro token trees must not fabricate nested call sites");
+    assert!(
+        error.to_string().contains("matched no semantic"),
+        "unexpected hidden macro call selector result: {error}"
+    );
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn rust_raii_scope_exit_preserves_normal_flow_with_exact_gaps() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "rust/raii.rs",
+            r#"
+                fn scoped_resource() {
+                    before_scope();
+                    {
+                        let guard = acquire();
+                        use_guard(&guard);
+                    }
+                    after_scope();
+                }
+
+                fn branch_resource(flag: bool) {
+                    if flag {
+                        let guard = acquire_branch();
+                        use_branch(&guard);
+                    }
+                    after_branch();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "rust/raii.rs");
+    graph
+        .bind(
+            "acquire_exceptional",
+            PointSelector::new("acquire()")
+                .procedure("scoped_resource")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "use_normal",
+            PointSelector::new("use_guard(&guard)")
+                .procedure("scoped_resource")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "scope_exit",
+            PointSelector::new("{\n                        let guard = acquire();")
+                .procedure("scoped_resource")
+                .effect("gap")
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "after_scope_statement",
+            PointSelector::new("after_scope()")
+                .procedure("scoped_resource")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_scope_invoke",
+            PointSelector::new("after_scope()")
+                .procedure("scoped_resource")
+                .effect("invoke"),
+        )
+        .bind(
+            "exceptional_exit",
+            PointSelector::new("fn scoped_resource()")
+                .procedure("scoped_resource")
+                .effect("exceptional_exit"),
+        )
+        .bind(
+            "branch_use_normal",
+            PointSelector::new("use_branch(&guard)")
+                .procedure("branch_resource")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "branch_scope_exit",
+            PointSelector::new(
+                r#"{
+                        let guard = acquire_branch();
+                        use_branch(&guard);
+                    }"#,
+            )
+            .procedure("branch_resource")
+            .effect("gap")
+            .anchor_occurrence(1),
+        )
+        .bind(
+            "after_branch_statement",
+            PointSelector::new("after_branch()")
+                .procedure("branch_resource")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_branch_invoke",
+            PointSelector::new("after_branch()")
+                .procedure("branch_resource")
+                .effect("invoke"),
+        );
+
+    graph.assert_successors(
+        "use_normal",
+        &[cfg_edge("scope_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "scope_exit",
+        &[cfg_edge("after_scope_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "acquire_exceptional",
+        &[cfg_edge("exceptional_exit", ControlEdgeKind::Exceptional)],
+    );
+    for capability in [
+        SemanticCapability::ResourceManagement,
+        SemanticCapability::CleanupControlFlow,
+        SemanticCapability::Calls,
+        SemanticCapability::ExceptionalControlFlow,
+    ] {
+        graph.assert_point_gap("acquire_exceptional", capability, SemanticGapKind::Unknown);
+    }
+    graph.assert_point_gap(
+        "scope_exit",
+        SemanticCapability::ResourceManagement,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_point_gap(
+        "scope_exit",
+        SemanticCapability::CleanupControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_point_gap(
+        "scope_exit",
+        SemanticCapability::Calls,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_point_gap(
+        "scope_exit",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_reachable("use_normal", "after_scope_invoke");
+    graph.assert_unreachable("acquire_exceptional", "after_scope_invoke");
+    graph.assert_successors(
+        "branch_use_normal",
+        &[cfg_edge("branch_scope_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "branch_scope_exit",
+        &[cfg_edge("after_branch_statement", ControlEdgeKind::Normal)],
+    );
+    for capability in [
+        SemanticCapability::ResourceManagement,
+        SemanticCapability::CleanupControlFlow,
+        SemanticCapability::Calls,
+        SemanticCapability::ExceptionalControlFlow,
+    ] {
+        graph.assert_point_gap("branch_scope_exit", capability, SemanticGapKind::Unknown);
+    }
+    graph.assert_reachable("branch_use_normal", "after_branch_invoke");
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+}
+
+#[test]
+fn rust_raii_abrupt_exits_report_gaps_on_the_actual_transfer_points() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "rust/raii_abrupt.rs",
+            r#"
+                fn return_with_resource() {
+                    {
+                        let guard = acquire_return();
+                        use_return(&guard);
+                        return;
+                    }
+                    dead_after_return();
+                }
+
+                fn loop_with_resource(repeat: bool) {
+                    loop {
+                        let guard = acquire_loop();
+                        use_loop(&guard);
+                        if repeat {
+                            continue;
+                        }
+                        break;
+                    }
+                    after_loop();
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "rust/raii_abrupt.rs");
+    graph
+        .bind(
+            "return_transfer",
+            PointSelector::new("return;")
+                .procedure("return_with_resource")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "return_normal_exit",
+            PointSelector::new("fn return_with_resource()")
+                .procedure("return_with_resource")
+                .effect("normal_exit"),
+        )
+        .bind(
+            "dead_after_return",
+            PointSelector::new("dead_after_return()")
+                .procedure("return_with_resource")
+                .effect("invoke"),
+        )
+        .bind(
+            "loop_body",
+            PointSelector::new(
+                r#"{
+                        let guard = acquire_loop();
+                        use_loop(&guard);
+                        if repeat {
+                            continue;
+                        }
+                        break;
+                    }"#,
+            )
+            .procedure("loop_with_resource")
+            .anchor_occurrence(0),
+        )
+        .bind(
+            "continue_transfer",
+            PointSelector::new("continue;")
+                .procedure("loop_with_resource")
+                .outgoing_kind(ControlEdgeKind::LoopBack),
+        )
+        .bind(
+            "break_transfer",
+            PointSelector::new("break;")
+                .procedure("loop_with_resource")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "after_loop",
+            PointSelector::new("after_loop()")
+                .procedure("loop_with_resource")
+                .anchor_occurrence(0),
+        );
+
+    graph.assert_successors(
+        "return_transfer",
+        &[cfg_edge("return_normal_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_unreachable("return_transfer", "dead_after_return");
+    graph.assert_successors(
+        "continue_transfer",
+        &[cfg_edge("loop_body", ControlEdgeKind::LoopBack)],
+    );
+    graph.assert_successors(
+        "break_transfer",
+        &[cfg_edge("after_loop", ControlEdgeKind::Normal)],
+    );
+    for transfer in ["return_transfer", "continue_transfer", "break_transfer"] {
+        for capability in [
+            SemanticCapability::ResourceManagement,
+            SemanticCapability::CleanupControlFlow,
+            SemanticCapability::Calls,
+            SemanticCapability::ExceptionalControlFlow,
+        ] {
+            graph.assert_point_gap(transfer, capability, SemanticGapKind::Unknown);
+        }
+    }
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn rust_parameter_pattern_and_assignment_drop_omissions_are_point_scoped() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "rust/drop_bindings.rs",
+            r#"
+                fn drop_bindings(
+                    mut parameter: Guard,
+                    items: Vec<Guard>,
+                    maybe: Option<Guard>,
+                    stop: bool,
+                ) {
+                    parameter = replacement();
+                    if stop {
+                        return;
+                    }
+                    for item in items {
+                        consume(item);
+                        break;
+                    }
+                    if let Some(value) = maybe {
+                        consume(value);
+                    }
+                    match replacement() {
+                        Some(value) => consume(value),
+                        None => {}
+                    }
+                }
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "rust/drop_bindings.rs");
+    graph
+        .bind(
+            "normal_exit",
+            PointSelector::new("fn drop_bindings(")
+                .procedure("drop_bindings")
+                .effect("normal_exit"),
+        )
+        .bind(
+            "exceptional_exit",
+            PointSelector::new("fn drop_bindings(")
+                .procedure("drop_bindings")
+                .effect("exceptional_exit"),
+        )
+        .bind(
+            "return",
+            PointSelector::new("return;")
+                .procedure("drop_bindings")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "assignment",
+            PointSelector::new("parameter = replacement()")
+                .procedure("drop_bindings")
+                .effect("gap"),
+        )
+        .bind(
+            "for_body",
+            PointSelector::new(
+                r#"{
+                        consume(item);
+                        break;
+                    }"#,
+            )
+            .procedure("drop_bindings")
+            .effect("gap")
+            .anchor_occurrence(0),
+        )
+        .bind(
+            "for_break",
+            PointSelector::new("break;")
+                .procedure("drop_bindings")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "if_let_body",
+            PointSelector::new(
+                r#"{
+                        consume(value);
+                    }"#,
+            )
+            .procedure("drop_bindings")
+            .effect("gap")
+            .anchor_occurrence(0),
+        )
+        .bind(
+            "match_pattern",
+            PointSelector::new("Some(value)")
+                .occurrence(1)
+                .procedure("drop_bindings")
+                .effect("gap")
+                .anchor_occurrence(0),
+        );
+
+    for alias in [
+        "normal_exit",
+        "exceptional_exit",
+        "return",
+        "for_body",
+        "for_break",
+        "if_let_body",
+        "match_pattern",
+    ] {
+        for capability in [
+            SemanticCapability::ResourceManagement,
+            SemanticCapability::CleanupControlFlow,
+            SemanticCapability::Calls,
+            SemanticCapability::ExceptionalControlFlow,
+        ] {
+            graph.assert_point_gap(alias, capability, SemanticGapKind::Unknown);
+        }
+    }
+    for capability in [
+        SemanticCapability::ResourceManagement,
+        SemanticCapability::CleanupControlFlow,
+        SemanticCapability::Calls,
+        SemanticCapability::ExceptionalControlFlow,
+    ] {
+        graph.assert_point_gap("assignment", capability, SemanticGapKind::Unknown);
+    }
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
 fn go_functions_methods_and_func_literals_are_distinct_immediate_procedures() {
     let project = InlineTestProject::with_language(Language::Go)
         .file(

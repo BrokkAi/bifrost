@@ -2099,6 +2099,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             Some(scope),
             ScopeBinding::Breakable {
                 label: None,
+                accepts_unlabeled: true,
                 break_target: next.point,
                 break_edge_kind: next.kind,
             },

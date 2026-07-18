@@ -8,6 +8,7 @@ mod graph_support;
 mod hierarchy;
 mod imports;
 pub(crate) mod lexical_scope;
+mod semantic;
 pub(crate) mod structural;
 mod tests;
 mod usage_index;
@@ -59,7 +60,6 @@ pub struct RustAnalyzer {
 }
 
 crate::analyzer::impl_forward_query_provider!(RustAnalyzer);
-crate::analyzer::semantic::impl_forward_program_semantics_provider!(RustAnalyzer);
 
 impl RustAnalyzer {
     fn indexed_sources_unchanged(&self, changed_files: &BTreeSet<ProjectFile>) -> bool {
