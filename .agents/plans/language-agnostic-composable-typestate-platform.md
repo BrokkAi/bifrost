@@ -37,6 +37,8 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [x] (2026-07-17 16:54+02:00) Completed the #816 dispatch prerequisite and #818 TypeScript/Java vertical slice: exact whole-call resolution, one bounded context-bearing ICFG, matched normal/exceptional returns, typed incomplete boundaries, source-generation validation, shared inline assertions, and post-milestone review are complete. The shared adapter contract is frozen for the remaining #815 languages.
 - [x] (2026-07-17 17:00+02:00) Created and natively attached the nine remaining #815 rollout children: #887 JavaScript/JSX, #886 C#, #888 Python, #889 Go, #891 Rust, #890 PHP, #892 Scala, #893 Ruby, and #894 C/C++, each cross-linked to #816 and #818.
 - [x] (2026-07-18 10:45+02:00) Completed #815 Milestone 4a: JavaScript and JSX now share the structured TypeScript lowering core behind exact flavor identities and pass the common direct-call CFG/ICFG conformance contract with point-scoped advanced-feature gaps.
+- [x] (2026-07-18 11:52+02:00) Completed #815 Milestone 4b: C# now supplies real callable CFGs and direct matched-return ICFGs through the frozen shared provider, builder, dispatch, and snapshot boundary; independent review fixed indexed-call evaluation, target-typed object-initializer order, and conditional-compilation gaps before checkpoint validation.
+- [x] (2026-07-18 12:06+02:00) Validated the reviewed C# checkpoint with formatting, diff checks, strict all-target/all-feature clippy, and the complete host-access `nlp,python` repository suite (1,053 library tests passed, 4 ignored, plus every binary, integration, and doc-test target).
 - [ ] Complete #816 in parallel: expose reusable dispatch, value, heap, and bounded access-path oracles for the reference languages.
 - [x] Complete #818's internal TypeScript/Java control-topology slice: stitch CFG fragments through existing call relations into a demand-materialized ICFG. Public query exposure and value/heap transfers remain in their owning issues.
 - [ ] Complete #819 as needed: add iterative reachability, reverse postorder, SCC, and loop utilities; add dominators only after a named client justifies them.
@@ -105,6 +107,9 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - Observation: the first post-reference rollout did not require a second adapter engine or ICFG implementation.
   Evidence: JavaScript/JSX reuse the TypeScript structured lowerer with explicit grammar-flavor branches and unchanged TypeScript fingerprints, while the existing location-first dispatch facade and context-bearing `WorkspaceIcfgProvider` materialize their cross-file calls without language-specific stitching.
 
+- Observation: the first independently implemented post-reference adapter also fit the frozen graph and dispatch boundary, while exposing why conformance must exercise grammar-specific evaluation shapes.
+  Evidence: C# direct calls use the existing dispatch oracle and shared ICFG unchanged. Review-driven tests were still needed to prove indexed delegate evaluation, conditional element binding, target-typed object initializers, and terminal configuration-dependent `#if` boundaries, because those shapes use different tree-sitter fields than superficially similar member and object-creation expressions.
+
 ## Decision Log
 
 - Decision: target meet-over-valid-interprocedural-paths analysis rather than SMT-backed path feasibility.
@@ -161,6 +166,10 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 
 - Decision: reuse the JavaScript/TypeScript structured lowering core through flavor-specific semantic providers while preserving separate durable adapter/configuration fingerprints.
   Rationale: shared control mechanics eliminate drift, but exact prepared-language validation and JavaScript-specific fields, resource declarations, and JSX gaps keep each grammar honest. JSX remains a JavaScript source flavor rather than a new persisted semantic dialect.
+  Date: 2026-07-18.
+
+- Decision: keep C# as a structured language adapter over the shared iterative CFG/ICFG mechanics, and represent unavailable conditional-compilation selection as a terminal source-backed control gap.
+  Rationale: C# callable identity and syntax require an adapter, not another graph or resolver. Selecting a preprocessor arm without compilation symbols would fabricate control, while silently filtering the node would hide incompleteness; the typed boundary preserves both the common contract and honest uncertainty.
   Date: 2026-07-18.
 
 - Decision: keep language-semantic summaries separate from rule-specific protocol summaries.
@@ -245,6 +254,8 @@ The planning milestone produced root epic #813, thirteen native subissues, and t
 Issue #814 is the first completed implementation milestone. Checkpoint `296c1de1` plus guided-review fixes `1faf8b9b` provide the immutable language-neutral IR/event contract, durable and dense identities, total capabilities, typed outcomes and errors, finite budgets, provider boundary, invariant validation, scoped handles, and bounded renderer. TypeScript and Java remained the right contract fixtures, but they intentionally build neutral artifacts rather than claiming real adapters. The file-level artifact and procedure-local row model survived review without prematurely selecting CSR/CSC or persistence.
 
 The handoff remains narrow: #815 builds real TypeScript/Java callable CFG adapters, #816 refines dynamic dispatch plus value/heap targets, #818 adds matched ICFG call/return edges, and #817 measures lifecycle/storage before persisting anything. Review made this boundary stricter by introducing typed unavailable continuations, exact invoke/suspend outgoing topology, exact gap/evidence correlations, constrained partial local targets, bounded atomic construction, streaming rendering, and materialization-scoped handles.
+
+The first two post-reference rollout checkpoints validate that boundary from both reuse and independent-adapter directions. JavaScript/JSX share the TypeScript lowering family; C# maps its own structured syntax into the same builder, exact-location dispatch oracle, and context-bearing ICFG. C# conformance now covers direct calls, common branches and loops, nested callables, async resumes, cleanup, generator and non-local boundaries, indexed nested calls, target-typed initializers, and configuration-dependent preprocessing without adding a C#-specific graph service.
 
 #815 Milestone 1a is the first implementation checkpoint after #814. It preserves the rich edge payload once, assigns canonical procedure-local edge IDs, and supplies exact outgoing and incoming views without selecting persistence or exposing query vocabulary. Specialist review corrected topology counting for provenance-parallel edges, made invalid procedure-local point IDs fail explicitly, required canonical incoming hydration order, and strengthened renderer-schema assertions. The complete feature suite and strict all-feature clippy pass; production semantic lowering remains the next checkpoint rather than an implied capability of this graph substrate.
 
@@ -1471,3 +1482,5 @@ Plan revision note (2026-07-17): Recorded completion of #815 Milestone 2. The Ja
 Plan revision note (2026-07-17): Recorded completion of the #816 dispatch prerequisite and #818 TypeScript/Java internal control slice. Exact call expressions reuse the existing resolver, while one bounded context-bearing provider owns generation validation, invoke expansion, matched returns, typed boundaries, and dense predecessor/successor snapshots. The reviewed cross-language adapter boundary is frozen; value/heap transfer, public query exposure, and solver work remain outside the focused rollout.
 
 Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4a. JavaScript and JSX now pass the same source-backed callable CFG and matched-return ICFG contract as the reference pair through a flavor-aware shared JS/TS lowerer. JavaScript resource management, generator suspension, and JSX uncertainty remain exact point-scoped gaps; the remaining adapters continue in the focused rollout plan.
+
+Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4b after specialist review. C# now passes the shared callable-CFG and matched-return ICFG contract with structured control, handlers, cleanup, async points, nested callable identity, and exact advanced-feature gaps. Review corrected grammar-sensitive indexed-call, target-typed-initializer, and conditional-compilation omissions; Python is the next adapter checkpoint in the focused rollout plan.
