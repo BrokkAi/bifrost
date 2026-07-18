@@ -182,7 +182,6 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "get_type_by_location",
             "rename_symbol",
             "usage_graph",
-            "analyze_commit",
             "refresh",
             "activate_workspace",
             "get_active_workspace",
@@ -212,6 +211,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "report_long_method_and_god_object_smells",
             "report_dead_code_and_unused_abstraction_smells",
             "report_secret_like_code",
+            "analyze_commit",
             "classify_test_files",
         ];
         #[cfg(feature = "nlp")]
@@ -224,7 +224,6 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "get_type_by_location",
             "rename_symbol",
             "usage_graph",
-            "analyze_commit",
             "semantic_search",
             "refresh",
             "activate_workspace",
@@ -255,6 +254,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "report_long_method_and_god_object_smells",
             "report_dead_code_and_unused_abstraction_smells",
             "report_secret_like_code",
+            "analyze_commit",
             "classify_test_files",
         ];
         expected
@@ -776,13 +776,18 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         "get_type_by_location",
         "rename_symbol",
         "usage_graph",
-        "analyze_commit",
     ];
     #[cfg(feature = "nlp")]
     core_expected.push("semantic_search");
     core_expected.extend(["refresh", "activate_workspace", "get_active_workspace"]);
 
     assert_server_tool_names(&fixture_root, "core", &core_expected);
+    assert_unknown_tool(
+        &fixture_root,
+        "core",
+        "analyze_commit",
+        json!({ "revision": "HEAD" }),
+    );
     assert_unknown_tool(
         &fixture_root,
         "core",
@@ -816,7 +821,6 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "get_type_by_location",
             "rename_symbol",
             "usage_graph",
-            "analyze_commit",
         ],
     );
     assert_server_tool_names(
@@ -873,6 +877,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "report_long_method_and_god_object_smells",
             "report_dead_code_and_unused_abstraction_smells",
             "report_secret_like_code",
+            "analyze_commit",
         ],
     );
     #[cfg(feature = "nlp")]

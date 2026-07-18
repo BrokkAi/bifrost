@@ -234,7 +234,6 @@ mod tests {
             "get_type_by_location",
             "rename_symbol",
             "usage_graph",
-            "analyze_commit",
         ]
         .into_iter()
         .map(str::to_string)
@@ -333,6 +332,7 @@ mod tests {
                 "report_long_method_and_god_object_smells",
                 "report_dead_code_and_unused_abstraction_smells",
                 "report_secret_like_code",
+                "analyze_commit",
                 "classify_test_files",
             ]
             .into_iter()

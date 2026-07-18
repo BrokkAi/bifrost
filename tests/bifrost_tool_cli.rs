@@ -569,6 +569,36 @@ fn removed_search_ast_tool_name_is_reported_as_unknown() {
 }
 
 #[test]
+fn analyze_commit_remains_available_in_tool_cli() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    let repo = Repository::init(root).expect("init repo");
+    fs::write(root.join("lib.rs"), "pub fn answer() -> i32 { 1 }\n").expect("write base");
+    commit_paths(&repo, &["lib.rs"], "base");
+    fs::write(root.join("lib.rs"), "pub fn answer() -> i32 { 2 }\n").expect("write change");
+    commit_paths(&repo, &["lib.rs"], "change");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(root)
+        .arg("--tool")
+        .arg("analyze_commit")
+        .arg("--args")
+        .arg(r#"{"revision":"HEAD"}"#)
+        .output()
+        .expect("run bifrost --tool analyze_commit");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("json stdout");
+    assert_eq!(payload["isError"], false, "{payload}");
+    assert!(payload["structuredContent"]["commit"]["hash"].is_string());
+}
+
+#[test]
 fn query_code_tool_returns_structural_matches() {
     let output = Command::new(env!("CARGO_BIN_EXE_bifrost"))
         .arg("--root")

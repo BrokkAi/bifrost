@@ -16,6 +16,7 @@ pub const SLOPCOP_TOOL_NAMES: &[&str] = &[
     "report_long_method_and_god_object_smells",
     "report_dead_code_and_unused_abstraction_smells",
     "report_secret_like_code",
+    "analyze_commit",
 ];
 
 pub fn run_slopcop_stdio_server(
@@ -419,6 +420,26 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
                         "description": "Include lower-confidence short credential-like assignments."
                     }
                 }
+            }),
+        ),
+        tool_descriptor(
+            "analyze_commit",
+            "Analyze a normal single-parent commit against its parent and return Bifrost-resolved semantic patch effects: changed files, introduced/edited/deleted/moved symbols, dependency symbols, signature/import/call-edge changes, changed test symbols, and large-callsite truncation notices.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "revision": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Commit hash, branch, or tag resolving to a single-parent commit."
+                    },
+                    "include_tests": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Include symbols and call edges from detected test files."
+                    }
+                },
+                "required": ["revision"]
             }),
         ),
     ]
