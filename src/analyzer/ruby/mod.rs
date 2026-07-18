@@ -4,6 +4,7 @@ mod declarations;
 mod hierarchy;
 mod imports;
 mod mixins;
+mod semantic;
 pub(crate) mod structural;
 mod tests;
 
@@ -55,7 +56,6 @@ pub struct RubyAnalyzer {
 }
 
 crate::analyzer::impl_forward_query_provider!(RubyAnalyzer);
-crate::analyzer::semantic::impl_forward_program_semantics_provider!(RubyAnalyzer);
 
 impl RubyAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {

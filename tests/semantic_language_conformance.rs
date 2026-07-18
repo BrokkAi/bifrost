@@ -3,8 +3,8 @@ mod common;
 use brokk_bifrost::analyzer::semantic::{
     CallableReferenceKind, CallableTargetResolution, ControlEdgeKind, DeclarationSegmentKind,
     DeferredInvocationKind, IcfgEdgeKind, ProcedureInvocationKind, ProcedureKind,
-    ProcedureSemantics, SemanticCapability, SemanticEffect, SemanticGapKind, SemanticGapSubject,
-    SemanticLanguage,
+    ProcedureSemantics, SemanticCallSite, SemanticCapability, SemanticEffect, SemanticGapKind,
+    SemanticGapSubject, SemanticLanguage,
 };
 use brokk_bifrost::{AnalyzerConfig, Language};
 
@@ -33,6 +33,97 @@ struct DirectCallFixture {
 
 fn root() -> CallContextSelector {
     CallContextSelector::root()
+}
+
+fn procedure_named<'artifact>(
+    graph: &'artifact SemanticGraph,
+    name: &str,
+    kind: ProcedureKind,
+) -> &'artifact ProcedureSemantics {
+    graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure.kind() == kind
+                && procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+        })
+        .unwrap_or_else(|| panic!("missing {kind:?} procedure {name}"))
+}
+
+fn call_site_source<'source>(
+    procedure: &ProcedureSemantics,
+    source: &'source str,
+    call: &SemanticCallSite,
+) -> &'source str {
+    let span = procedure
+        .source_mapping(call.source)
+        .expect("semantic call site must retain a source mapping")
+        .locator
+        .anchor()
+        .span();
+    source
+        .get(span.start_byte() as usize..span.end_byte() as usize)
+        .expect("semantic call-site source span must index the fixture")
+}
+
+fn exact_call_site<'procedure>(
+    procedure: &'procedure ProcedureSemantics,
+    source: &str,
+    expected_source: &str,
+) -> &'procedure SemanticCallSite {
+    procedure
+        .call_sites()
+        .iter()
+        .find(|call| call_site_source(procedure, source, call) == expected_source)
+        .unwrap_or_else(|| panic!("missing semantic call site for {expected_source:?}"))
+}
+
+fn assert_no_exact_call_site(
+    procedure: &ProcedureSemantics,
+    source: &str,
+    unexpected_source: &str,
+) {
+    assert!(
+        procedure
+            .call_sites()
+            .iter()
+            .all(|call| call_site_source(procedure, source, call) != unexpected_source),
+        "unexpected eager semantic call site for {unexpected_source:?}"
+    );
+}
+
+fn assert_call_site_gap(
+    procedure: &ProcedureSemantics,
+    source: &str,
+    call_source: &str,
+    capability: SemanticCapability,
+    kind: SemanticGapKind,
+) {
+    let call = exact_call_site(procedure, source, call_source);
+    let point = procedure
+        .point(call.point)
+        .expect("semantic call site must own a program point");
+    assert!(
+        point.events.iter().any(|event| {
+            let SemanticEffect::Gap { gap } = &event.effect else {
+                return false;
+            };
+            procedure.gap(*gap).is_some_and(|gap| {
+                gap.point == call.point
+                    && gap.subject == SemanticGapSubject::CallSite(call.id)
+                    && gap.capability == capability
+                    && gap.kind == kind
+            })
+        }),
+        "missing CallSite-scoped {capability:?}:{kind:?} gap for {call_source:?}"
+    );
 }
 
 fn assert_direct_call_conformance(fixture: DirectCallFixture) {
@@ -13574,6 +13665,2841 @@ fn scala_infix_right_associative_and_postfix_calls_have_icfg_and_source_order() 
         "postfix_receiver",
         &[cfg_edge("postfix_invoke", ControlEdgeKind::Normal)],
     );
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn ruby_cross_file_singleton_call_conformance() {
+    assert_direct_call_conformance(DirectCallFixture {
+        language: Language::Ruby,
+        dialect: SemanticLanguage::Standard(Language::Ruby),
+        callee_path: "ruby/ruby_library.rb",
+        callee_source: r#"
+            class RubyLibrary
+              def self.ruby_leaf
+                7
+              end
+            end
+        "#,
+        callee_declaration: "def self.ruby_leaf",
+        callee_name: "ruby_leaf",
+        caller_path: "ruby/ruby_caller.rb",
+        caller_source: r#"
+            require_relative "ruby_library"
+
+            class RubyCaller
+              def self.ruby_root
+                RubyLibrary.ruby_leaf()
+              end
+            end
+        "#,
+        caller_declaration: "def self.ruby_root",
+        caller_name: "ruby_root",
+        call: "RubyLibrary.ruby_leaf()",
+    });
+}
+
+#[test]
+fn ruby_same_class_bare_call_uses_the_shared_icfg() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "ruby/same_class.rb",
+            r#"
+                class SameClass
+                  def leaf
+                    7
+                  end
+
+                  def root
+                    if leaf
+                      1
+                    else
+                      0
+                    end
+                  end
+                end
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = IcfgGraph::materialize(
+        &project,
+        &analyzer,
+        "ruby/same_class.rb",
+        PointSelector::new("def root")
+            .procedure("root")
+            .effect("entry"),
+    );
+    graph
+        .bind_call(
+            "bare_call",
+            "ruby/same_class.rb",
+            PointSelector::new("leaf")
+                .occurrence(1)
+                .procedure("root")
+                .effect("invoke"),
+        )
+        .bind_node(
+            "caller_entry",
+            "ruby/same_class.rb",
+            PointSelector::new("def root")
+                .procedure("root")
+                .effect("entry"),
+            root(),
+        )
+        .bind_node(
+            "invoke",
+            "ruby/same_class.rb",
+            PointSelector::new("leaf")
+                .occurrence(1)
+                .procedure("root")
+                .effect("invoke"),
+            root(),
+        )
+        .bind_node(
+            "callee_entry",
+            "ruby/same_class.rb",
+            PointSelector::new("def leaf")
+                .procedure("leaf")
+                .effect("entry"),
+            ["bare_call"],
+        )
+        .bind_node(
+            "callee_normal_exit",
+            "ruby/same_class.rb",
+            PointSelector::new("def leaf")
+                .procedure("leaf")
+                .effect("normal_exit"),
+            ["bare_call"],
+        )
+        .bind_node(
+            "normal_continuation",
+            "ruby/same_class.rb",
+            PointSelector::new("leaf")
+                .occurrence(1)
+                .procedure("root")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+            root(),
+        );
+
+    graph.assert_outcome(IcfgOutcomeKind::Complete);
+    graph.assert_successors(
+        "invoke",
+        &[icfg_edge("callee_entry", IcfgEdgeKind::Call).originating_call("bare_call")],
+    );
+    graph.assert_predecessors(
+        "callee_entry",
+        &[icfg_edge("invoke", IcfgEdgeKind::Call).originating_call("bare_call")],
+    );
+    graph.assert_successors(
+        "callee_normal_exit",
+        &[icfg_edge("normal_continuation", IcfgEdgeKind::NormalReturn)
+            .originating_call("bare_call")],
+    );
+    graph.assert_predecessors(
+        "normal_continuation",
+        &[icfg_edge("callee_normal_exit", IcfgEdgeKind::NormalReturn)
+            .originating_call("bare_call")],
+    );
+    graph.assert_reachable("caller_entry", "normal_continuation");
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("IcfgNodeId"));
+    assert!(!rendered.contains("IcfgEdgeId"));
+}
+
+#[test]
+fn ruby_methods_singletons_lambdas_and_attached_blocks_are_separate() {
+    const SOURCE: &str = r#"
+        def top_level
+          top_body()
+        end
+
+        class Worker
+          def initialize
+            constructor_body()
+          end
+
+          def step
+            method_body()
+          end
+
+          def self.build
+            singleton_body()
+          end
+
+          class << self
+            def create
+              singleton_class_body()
+            end
+          end
+        end
+
+        def outer(items)
+          callback = ->(value) { lambda_body(value) }
+          items.each do |item|
+            block_body(item)
+          end
+          outer_body()
+        end
+    "#;
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file("ruby/callables.rb", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "ruby/callables.rb");
+
+    for (alias, declaration, procedure, body_call) in [
+        ("top", "def top_level", "top_level", "top_body()"),
+        (
+            "constructor",
+            "def initialize",
+            "initialize",
+            "constructor_body()",
+        ),
+        ("method", "def step", "step", "method_body()"),
+        ("singleton", "def self.build", "build", "singleton_body()"),
+        (
+            "singleton_class",
+            "def create",
+            "create",
+            "singleton_class_body()",
+        ),
+        ("outer", "def outer(items)", "outer", "outer_body()"),
+    ] {
+        graph
+            .bind(
+                format!("{alias}_entry"),
+                PointSelector::new(declaration)
+                    .procedure(procedure)
+                    .effect("entry"),
+            )
+            .bind(
+                format!("{alias}_body"),
+                PointSelector::new(body_call)
+                    .procedure(procedure)
+                    .effect("invoke"),
+            );
+        graph.assert_reachable(&format!("{alias}_entry"), &format!("{alias}_body"));
+    }
+    graph
+        .bind(
+            "lambda_entry",
+            PointSelector::new("->(value) { lambda_body(value) }").effect("entry"),
+        )
+        .bind(
+            "lambda_body",
+            PointSelector::new("lambda_body(value)").effect("invoke"),
+        )
+        .bind(
+            "block_entry",
+            PointSelector::new("do |item|\n            block_body(item)\n          end")
+                .effect("entry"),
+        )
+        .bind(
+            "block_body",
+            PointSelector::new("block_body(item)").effect("invoke"),
+        );
+    graph.assert_reachable("lambda_entry", "lambda_body");
+    graph.assert_reachable("block_entry", "block_body");
+
+    let top = procedure_named(&graph, "top_level", ProcedureKind::Method);
+    let constructor = procedure_named(&graph, "initialize", ProcedureKind::Constructor);
+    let method = procedure_named(&graph, "step", ProcedureKind::Method);
+    let singleton = procedure_named(&graph, "build", ProcedureKind::Method);
+    let singleton_class = procedure_named(&graph, "create", ProcedureKind::Method);
+    let outer = procedure_named(&graph, "outer", ProcedureKind::Method);
+    let lambdas = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .filter(|procedure| procedure.kind() == ProcedureKind::Lambda)
+        .collect::<Vec<_>>();
+    let closures = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .filter(|procedure| procedure.kind() == ProcedureKind::Closure)
+        .collect::<Vec<_>>();
+    assert_eq!(lambdas.len(), 1, "arrow syntax must publish one lambda");
+    assert_eq!(
+        closures.len(),
+        1,
+        "the attached block must publish one closure"
+    );
+    let lambda = lambdas[0];
+    let closure = closures[0];
+
+    for procedure in [top, constructor, method, singleton, singleton_class, outer] {
+        assert!(procedure.lexical_parent().is_none());
+        assert_eq!(
+            procedure.properties().invocation,
+            ProcedureInvocationKind::Immediate
+        );
+    }
+    assert!(!constructor.properties().is_static);
+    assert!(!method.properties().is_static);
+    assert!(singleton.properties().is_static);
+    assert!(singleton_class.properties().is_static);
+    assert_eq!(lambda.lexical_parent(), Some(outer.id()));
+    assert_eq!(closure.lexical_parent(), Some(outer.id()));
+    assert_eq!(
+        lambda.properties().invocation,
+        ProcedureInvocationKind::Immediate
+    );
+    assert_eq!(
+        closure.properties().invocation,
+        ProcedureInvocationKind::Immediate
+    );
+
+    for nested in ["lambda_body(value)", "block_body(item)"] {
+        assert_no_exact_call_site(outer, SOURCE, nested);
+    }
+    assert_call_site_gap(
+        outer,
+        SOURCE,
+        "items.each do |item|\n            block_body(item)\n          end",
+        SemanticCapability::DeferredExecution,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn ruby_parameters_assigned_locals_and_block_parameters_are_not_bare_calls() {
+    const SOURCE: &str = r#"
+        class Shadowing
+          def helper
+            1
+          end
+
+          def run(parameter, items)
+            assigned = helper()
+            parameter
+            assigned
+            items.each do |item|
+              item
+            end
+            helper
+          end
+        end
+    "#;
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file("ruby/shadowing.rb", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "ruby/shadowing.rb");
+    let run = procedure_named(&graph, "run", ProcedureKind::Method);
+
+    exact_call_site(run, SOURCE, "helper()");
+    exact_call_site(
+        run,
+        SOURCE,
+        "items.each do |item|\n              item\n            end",
+    );
+    exact_call_site(run, SOURCE, "helper");
+    for local_read in ["parameter", "assigned"] {
+        assert_no_exact_call_site(run, SOURCE, local_read);
+    }
+    let closure = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| procedure.kind() == ProcedureKind::Closure)
+        .expect("attached each block must publish a closure");
+    assert_no_exact_call_site(closure, SOURCE, "item");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn ruby_local_bindings_follow_parser_encounter_order_across_closures() {
+    const SOURCE: &str = r#"
+        class ParseOrder
+          def before_assignment
+            target
+            target = seed()
+          end
+
+          def after_assignment
+            target = seed()
+            target
+          end
+
+          def closure_order
+            before_capture = -> { future_binding }
+            future_binding = seed()
+            existing_binding = seed()
+            after_capture = -> { existing_binding }
+            self_capture = -> { self_capture }
+            reassigned_capture = -> do
+              existing_binding
+              existing_binding = refresh()
+              existing_binding
+            end
+          end
+        end
+    "#;
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file("ruby/parse_order.rb", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "ruby/parse_order.rb");
+
+    let before_assignment = procedure_named(&graph, "before_assignment", ProcedureKind::Method);
+    exact_call_site(before_assignment, SOURCE, "target");
+    exact_call_site(before_assignment, SOURCE, "seed()");
+
+    let after_assignment = procedure_named(&graph, "after_assignment", ProcedureKind::Method);
+    exact_call_site(after_assignment, SOURCE, "seed()");
+    assert_no_exact_call_site(after_assignment, SOURCE, "target");
+
+    let before_capture = procedure_named(&graph, "before_capture", ProcedureKind::Lambda);
+    exact_call_site(before_capture, SOURCE, "future_binding");
+
+    let after_capture = procedure_named(&graph, "after_capture", ProcedureKind::Lambda);
+    assert_no_exact_call_site(after_capture, SOURCE, "existing_binding");
+
+    let self_capture = procedure_named(&graph, "self_capture", ProcedureKind::Lambda);
+    assert_no_exact_call_site(self_capture, SOURCE, "self_capture");
+
+    let reassigned_capture = procedure_named(&graph, "reassigned_capture", ProcedureKind::Lambda);
+    assert_no_exact_call_site(reassigned_capture, SOURCE, "existing_binding");
+    exact_call_site(reassigned_capture, SOURCE, "refresh()");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn ruby_captured_implicit_default_and_pattern_bindings_are_not_bare_calls() {
+    const SOURCE: &str = r#"
+        class Lexical
+          def leaf
+            true
+          end
+
+          def run(parameter, items, optional = default_value())
+            captured = -> { parameter }
+            items.map { _1.transform }
+            if leaf
+              first()
+            elsif fallback
+              second()
+            else
+              third()
+            end
+            case items
+            in {name:}
+              name
+            else
+              nil
+            end
+          end
+        end
+    "#;
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file("ruby/lexical_bindings.rb", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "ruby/lexical_bindings.rb");
+    graph
+        .bind(
+            "run_entry",
+            PointSelector::new("def run(parameter, items, optional = default_value())")
+                .procedure("run")
+                .effect("entry"),
+        )
+        .bind(
+            "leaf_normal",
+            PointSelector::new("leaf")
+                .occurrence(1)
+                .procedure("run")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "leaf_decision",
+            PointSelector::new("leaf")
+                .occurrence(1)
+                .procedure("run")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "first_statement",
+            PointSelector::new("first()")
+                .procedure("run")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "elsif_entry",
+            PointSelector::new("elsif fallback")
+                .procedure("run")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "fallback_invoke",
+            PointSelector::new("fallback")
+                .procedure("run")
+                .effect("invoke"),
+        )
+        .bind(
+            "fallback_normal",
+            PointSelector::new("fallback")
+                .procedure("run")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "fallback_decision",
+            PointSelector::new("fallback")
+                .procedure("run")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "second_statement",
+            PointSelector::new("second()")
+                .procedure("run")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "third_statement",
+            PointSelector::new("third()")
+                .procedure("run")
+                .anchor_occurrence(0),
+        );
+
+    graph.assert_point_gap(
+        "run_entry",
+        SemanticCapability::Calls,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_point_gap(
+        "run_entry",
+        SemanticCapability::Values,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_point_gap(
+        "run_entry",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_successors(
+        "leaf_normal",
+        &[cfg_edge("leaf_decision", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "leaf_decision",
+        &[
+            cfg_edge("first_statement", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("elsif_entry", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "elsif_entry",
+        &[cfg_edge("fallback_invoke", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "fallback_normal",
+        &[cfg_edge("fallback_decision", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "fallback_decision",
+        &[
+            cfg_edge("second_statement", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("third_statement", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+
+    let run = procedure_named(&graph, "run", ProcedureKind::Method);
+    for non_call in ["default_value()", "parameter", "_1", "name"] {
+        assert_no_exact_call_site(run, SOURCE, non_call);
+    }
+    for nested in ["parameter", "_1.transform"] {
+        assert_no_exact_call_site(run, SOURCE, nested);
+    }
+    let captured = procedure_named(&graph, "captured", ProcedureKind::Lambda);
+    assert_no_exact_call_site(captured, SOURCE, "parameter");
+    let numbered = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| procedure.kind() == ProcedureKind::Closure)
+        .expect("map block must publish a closure");
+    assert_no_exact_call_site(numbered, SOURCE, "_1");
+    exact_call_site(numbered, SOURCE, "_1.transform");
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn ruby_implicit_returns_preserve_branch_and_case_values() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "ruby/implicit_returns.rb",
+            r#"
+                def choose(flag)
+                  if flag
+                    left()
+                  else
+                    right()
+                  end
+                end
+
+                def classify(value)
+                  case value
+                  when 0
+                    zero()
+                  when 1, 2
+                    small()
+                  else
+                    other()
+                  end
+                end
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "ruby/implicit_returns.rb");
+    graph
+        .bind(
+            "choose_entry",
+            PointSelector::new("def choose(flag)")
+                .procedure("choose")
+                .effect("entry"),
+        )
+        .bind(
+            "choose_decision",
+            PointSelector::new("flag")
+                .occurrence(1)
+                .procedure("choose")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "left_entry",
+            PointSelector::new("left()")
+                .procedure("choose")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "right_entry",
+            PointSelector::new("right()")
+                .procedure("choose")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "left_normal",
+            PointSelector::new("left()")
+                .procedure("choose")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "right_normal",
+            PointSelector::new("right()")
+                .procedure("choose")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "choose_return",
+            PointSelector::new("if flag")
+                .procedure("choose")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "choose_normal_exit",
+            PointSelector::new("def choose(flag)")
+                .procedure("choose")
+                .effect("normal_exit"),
+        )
+        .bind(
+            "classify_entry",
+            PointSelector::new("def classify(value)")
+                .procedure("classify")
+                .effect("entry"),
+        )
+        .bind(
+            "zero_normal",
+            PointSelector::new("zero()")
+                .procedure("classify")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "small_normal",
+            PointSelector::new("small()")
+                .procedure("classify")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "other_normal",
+            PointSelector::new("other()")
+                .procedure("classify")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "classify_return",
+            PointSelector::new("case value")
+                .procedure("classify")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "classify_normal_exit",
+            PointSelector::new("def classify(value)")
+                .procedure("classify")
+                .effect("normal_exit"),
+        );
+
+    graph.assert_successors(
+        "choose_decision",
+        &[
+            cfg_edge("left_entry", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("right_entry", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_predecessors(
+        "choose_return",
+        &[
+            cfg_edge("left_normal", ControlEdgeKind::Normal),
+            cfg_edge("right_normal", ControlEdgeKind::Normal),
+        ],
+    );
+    graph.assert_successors(
+        "choose_return",
+        &[cfg_edge("choose_normal_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("choose_entry", "choose_return");
+
+    graph.assert_predecessors(
+        "classify_return",
+        &[
+            cfg_edge("zero_normal", ControlEdgeKind::Normal),
+            cfg_edge("small_normal", ControlEdgeKind::Normal),
+            cfg_edge("other_normal", ControlEdgeKind::Normal),
+        ],
+    );
+    graph.assert_successors(
+        "classify_return",
+        &[cfg_edge("classify_normal_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("classify_entry", "zero_normal");
+    graph.assert_reachable("classify_entry", "small_normal");
+    graph.assert_reachable("classify_entry", "other_normal");
+    graph.assert_unreachable("zero_normal", "small_normal");
+    graph.assert_unreachable("small_normal", "other_normal");
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn ruby_loops_abrupt_completions_and_dead_regions_have_exact_topology() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "ruby/loop_flow.rb",
+            r#"
+                def flow(keep, skip, repeat, stop)
+                  while keep
+                    if skip
+                      next next_value()
+                    end
+                    if repeat
+                      redo
+                    end
+                    break break_value() if stop
+                    body()
+                  end
+                  after_loop()
+                  return final_value()
+                  dead_after_return()
+                end
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "ruby/loop_flow.rb");
+    graph
+        .bind(
+            "entry",
+            PointSelector::new("def flow(keep, skip, repeat, stop)")
+                .procedure("flow")
+                .effect("entry"),
+        )
+        .bind(
+            "while_condition_entry",
+            PointSelector::new("keep")
+                .occurrence(1)
+                .procedure("flow")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "while_decision",
+            PointSelector::new("keep")
+                .occurrence(1)
+                .procedure("flow")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "loop_body",
+            PointSelector::new(
+                r#"if skip
+                      next next_value()
+                    end
+                    if repeat
+                      redo
+                    end
+                    break break_value() if stop
+                    body()"#,
+            )
+            .procedure("flow")
+            .anchor_occurrence(0),
+        )
+        .bind(
+            "next_value_normal",
+            PointSelector::new("next_value()")
+                .procedure("flow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "next_transfer",
+            PointSelector::new("next next_value()")
+                .procedure("flow")
+                .outgoing_kind(ControlEdgeKind::LoopBack),
+        )
+        .bind(
+            "redo_transfer",
+            PointSelector::new("redo")
+                .procedure("flow")
+                .outgoing_kind(ControlEdgeKind::LoopBack),
+        )
+        .bind(
+            "break_value_normal",
+            PointSelector::new("break_value()")
+                .procedure("flow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "break_transfer",
+            PointSelector::new("break break_value()")
+                .procedure("flow")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "body_normal",
+            PointSelector::new("body()")
+                .procedure("flow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::LoopBack),
+        )
+        .bind(
+            "after_loop_statement",
+            PointSelector::new("after_loop()")
+                .procedure("flow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_loop_invoke",
+            PointSelector::new("after_loop()")
+                .procedure("flow")
+                .effect("invoke"),
+        )
+        .bind(
+            "return_transfer",
+            PointSelector::new("return final_value()")
+                .procedure("flow")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "normal_exit",
+            PointSelector::new("def flow(keep, skip, repeat, stop)")
+                .procedure("flow")
+                .effect("normal_exit"),
+        )
+        .bind(
+            "dead_invoke",
+            PointSelector::new("dead_after_return()")
+                .procedure("flow")
+                .effect("invoke"),
+        );
+
+    graph.assert_successors(
+        "while_decision",
+        &[
+            cfg_edge("loop_body", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("after_loop_statement", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "next_value_normal",
+        &[cfg_edge("next_transfer", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "next_transfer",
+        &[cfg_edge("while_condition_entry", ControlEdgeKind::LoopBack)],
+    );
+    graph.assert_successors(
+        "redo_transfer",
+        &[cfg_edge("loop_body", ControlEdgeKind::LoopBack)],
+    );
+    graph.assert_successors(
+        "break_value_normal",
+        &[cfg_edge("break_transfer", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "break_transfer",
+        &[cfg_edge("after_loop_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "body_normal",
+        &[cfg_edge("while_condition_entry", ControlEdgeKind::LoopBack)],
+    );
+    graph.assert_predecessors(
+        "after_loop_statement",
+        &[
+            cfg_edge("while_decision", ControlEdgeKind::ConditionalFalse),
+            cfg_edge("break_transfer", ControlEdgeKind::Normal),
+        ],
+    );
+    graph.assert_successors(
+        "return_transfer",
+        &[cfg_edge("normal_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("entry", "after_loop_invoke");
+    graph.assert_unreachable("return_transfer", "dead_invoke");
+    graph.assert_unreachable("entry", "dead_invoke");
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn ruby_rescue_else_ensure_routes_normal_handled_and_unmatched_completion() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "ruby/rescue_flow.rb",
+            r#"
+                def guarded
+                  begin
+                    work()
+                  rescue Problem
+                    handled()
+                  else
+                    clean_path()
+                  ensure
+                    cleanup()
+                  end
+                  after_try()
+                end
+            "#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "ruby/rescue_flow.rb");
+    graph
+        .bind(
+            "entry",
+            PointSelector::new("def guarded")
+                .procedure("guarded")
+                .effect("entry"),
+        )
+        .bind(
+            "work_normal",
+            PointSelector::new("work()")
+                .procedure("guarded")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "work_exceptional",
+            PointSelector::new("work()")
+                .procedure("guarded")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "handler_dispatch",
+            PointSelector::new("begin")
+                .procedure("guarded")
+                .effect("gap")
+                .outgoing_kind(ControlEdgeKind::SwitchCase),
+        )
+        .bind(
+            "handler_entry",
+            PointSelector::new("rescue Problem\n                    handled()")
+                .procedure("guarded")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "unmatched_exception",
+            PointSelector::new("begin")
+                .procedure("guarded")
+                .outgoing_kind(ControlEdgeKind::Cleanup),
+        )
+        .bind(
+            "handled_normal",
+            PointSelector::new("handled()")
+                .procedure("guarded")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "handled_exceptional",
+            PointSelector::new("handled()")
+                .procedure("guarded")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Cleanup),
+        )
+        .bind(
+            "clean_normal",
+            PointSelector::new("clean_path()")
+                .procedure("guarded")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "clean_exceptional",
+            PointSelector::new("clean_path()")
+                .procedure("guarded")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Cleanup),
+        )
+        .bind(
+            "normal_cleanup_normal",
+            PointSelector::new("cleanup()")
+                .procedure("guarded")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal)
+                .anchor_occurrence(6),
+        )
+        .bind(
+            "exceptional_cleanup_normal",
+            PointSelector::new("cleanup()")
+                .procedure("guarded")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional)
+                .anchor_occurrence(2),
+        )
+        .bind(
+            "after_try_statement",
+            PointSelector::new("after_try()")
+                .procedure("guarded")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_try_invoke",
+            PointSelector::new("after_try()")
+                .procedure("guarded")
+                .effect("invoke"),
+        )
+        .bind(
+            "exceptional_exit",
+            PointSelector::new("def guarded")
+                .procedure("guarded")
+                .effect("exceptional_exit"),
+        );
+
+    graph.assert_successors(
+        "work_exceptional",
+        &[cfg_edge("handler_dispatch", ControlEdgeKind::Exceptional)],
+    );
+    graph.assert_successors(
+        "handler_dispatch",
+        &[
+            cfg_edge("handler_entry", ControlEdgeKind::SwitchCase),
+            cfg_edge("unmatched_exception", ControlEdgeKind::Exceptional),
+        ],
+    );
+    graph.assert_point_gap(
+        "handler_dispatch",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_reachable("work_normal", "clean_normal");
+    graph.assert_reachable("handled_normal", "normal_cleanup_normal");
+    graph.assert_reachable("clean_normal", "normal_cleanup_normal");
+    graph.assert_reachable("unmatched_exception", "exceptional_cleanup_normal");
+    graph.assert_reachable("handled_exceptional", "exceptional_cleanup_normal");
+    graph.assert_reachable("clean_exceptional", "exceptional_cleanup_normal");
+    graph.assert_unreachable("clean_exceptional", "handler_entry");
+    graph.assert_unreachable("handled_exceptional", "handler_entry");
+    graph.assert_successors(
+        "normal_cleanup_normal",
+        &[cfg_edge("after_try_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "exceptional_cleanup_normal",
+        &[cfg_edge("exceptional_exit", ControlEdgeKind::Exceptional)],
+    );
+    graph.assert_reachable("entry", "after_try_invoke");
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn ruby_return_and_shadowable_raise_run_ensure_before_completion() {
+    const SOURCE: &str = r#"
+        def returning
+          begin
+            return value()
+          ensure
+            cleanup_return()
+          end
+          dead_after_return()
+        end
+
+        def raising
+          begin
+            raise(problem())
+          ensure
+            cleanup_raise()
+          end
+          after_raise()
+        end
+    "#;
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file("ruby/ensure_abrupt.rb", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "ruby/ensure_abrupt.rb");
+    graph
+        .bind(
+            "return_entry",
+            PointSelector::new("def returning")
+                .procedure("returning")
+                .effect("entry"),
+        )
+        .bind(
+            "value_normal",
+            PointSelector::new("value()")
+                .procedure("returning")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "cleanup_return_normal",
+            PointSelector::new("cleanup_return()")
+                .procedure("returning")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal)
+                .anchor_occurrence(6),
+        )
+        .bind(
+            "return_transfer",
+            PointSelector::new("return value()")
+                .procedure("returning")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "return_normal_exit",
+            PointSelector::new("def returning")
+                .procedure("returning")
+                .effect("normal_exit"),
+        )
+        .bind(
+            "dead_after_return",
+            PointSelector::new("dead_after_return()")
+                .procedure("returning")
+                .effect("invoke"),
+        )
+        .bind(
+            "problem_normal",
+            PointSelector::new("problem()")
+                .procedure("raising")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "raise_invoke",
+            PointSelector::new("raise(problem())")
+                .procedure("raising")
+                .effect("invoke"),
+        )
+        .bind(
+            "raise_normal",
+            PointSelector::new("raise(problem())")
+                .procedure("raising")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Cleanup)
+                .anchor_occurrence(2),
+        )
+        .bind(
+            "raise_exceptional",
+            PointSelector::new("raise(problem())")
+                .procedure("raising")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Cleanup)
+                .anchor_occurrence(3),
+        )
+        .bind(
+            "normal_cleanup_raise",
+            PointSelector::new("cleanup_raise()")
+                .procedure("raising")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal)
+                .anchor_occurrence(6),
+        )
+        .bind(
+            "exceptional_cleanup_raise",
+            PointSelector::new("cleanup_raise()")
+                .procedure("raising")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional)
+                .anchor_occurrence(2),
+        )
+        .bind(
+            "after_raise_statement",
+            PointSelector::new("after_raise()")
+                .procedure("raising")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_raise_invoke",
+            PointSelector::new("after_raise()")
+                .procedure("raising")
+                .effect("invoke"),
+        )
+        .bind(
+            "raise_exceptional_exit",
+            PointSelector::new("def raising")
+                .procedure("raising")
+                .effect("exceptional_exit"),
+        );
+
+    graph.assert_reachable("return_entry", "value_normal");
+    graph.assert_reachable("value_normal", "return_transfer");
+    graph.assert_reachable("return_transfer", "cleanup_return_normal");
+    graph.assert_successors(
+        "cleanup_return_normal",
+        &[cfg_edge("return_normal_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_unreachable("return_entry", "dead_after_return");
+
+    graph.assert_successors(
+        "problem_normal",
+        &[cfg_edge("raise_invoke", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("raise_normal", "normal_cleanup_raise");
+    graph.assert_reachable("normal_cleanup_raise", "after_raise_invoke");
+    graph.assert_reachable("raise_exceptional", "exceptional_cleanup_raise");
+    graph.assert_successors(
+        "exceptional_cleanup_raise",
+        &[cfg_edge(
+            "raise_exceptional_exit",
+            ControlEdgeKind::Exceptional,
+        )],
+    );
+    graph.assert_unreachable("raise_exceptional", "after_raise_statement");
+    let raising = procedure_named(&graph, "raising", ProcedureKind::Method);
+    exact_call_site(raising, SOURCE, "raise(problem())");
+    assert!(
+        raising.points().iter().all(|point| point
+            .events
+            .iter()
+            .all(|event| !matches!(&event.effect, SemanticEffect::Throw { .. }))),
+        "shadowable Ruby raise syntax must not be terminalized as an unconditional throw"
+    );
+    graph.assert_adjacency_symmetric();
+}
+
+#[test]
+fn ruby_block_and_lambda_abrupt_control_are_not_conflated() {
+    const SOURCE: &str = r#"
+        def block_control(items)
+          items.each do |item|
+            if item == :return
+              return escape(item)
+            end
+            if item == :break
+              break stop(item)
+            end
+            next skip(item) if item == :next
+            redo if item == :redo
+            block_body(item)
+          end
+          after_block()
+        end
+
+        def lambda_control
+          callback = -> do
+            return lambda_value()
+            dead_inside_lambda()
+          end
+          after_lambda_creation()
+        end
+    "#;
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file("ruby/non_local_control.rb", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "ruby/non_local_control.rb");
+    graph
+        .bind(
+            "block_entry",
+            PointSelector::new("do |item|")
+                .effect("entry")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "block_return",
+            PointSelector::new("return escape(item)").effect("gap"),
+        )
+        .bind(
+            "block_body_entry",
+            PointSelector::new("if item == :return").anchor_occurrence(0),
+        )
+        .bind(
+            "block_nonlocal_boundary",
+            PointSelector::new(
+                r#"if item == :return
+              return escape(item)
+            end
+            if item == :break
+              break stop(item)
+            end
+            next skip(item) if item == :next
+            redo if item == :redo
+            block_body(item)"#,
+            )
+            .anchor_occurrence(0),
+        )
+        .bind(
+            "block_break",
+            PointSelector::new("break stop(item)").effect("gap"),
+        )
+        .bind(
+            "block_next",
+            PointSelector::new("next skip(item)").effect("procedure_return"),
+        )
+        .bind(
+            "block_redo",
+            PointSelector::new("redo")
+                .occurrence(0)
+                .outgoing_kind(ControlEdgeKind::LoopBack),
+        )
+        .bind(
+            "block_normal_exit",
+            PointSelector::new("do |item|").effect("normal_exit"),
+        )
+        .bind(
+            "lambda_outer_entry",
+            PointSelector::new("def lambda_control")
+                .procedure("lambda_control")
+                .effect("entry"),
+        )
+        .bind("lambda_entry", PointSelector::new("-> do").effect("entry"))
+        .bind(
+            "lambda_return",
+            PointSelector::new("return lambda_value()").effect("procedure_return"),
+        )
+        .bind(
+            "lambda_normal_exit",
+            PointSelector::new("-> do").effect("normal_exit"),
+        )
+        .bind(
+            "dead_lambda",
+            PointSelector::new("dead_inside_lambda()").effect("invoke"),
+        )
+        .bind(
+            "outer_after_lambda",
+            PointSelector::new("after_lambda_creation()")
+                .procedure("lambda_control")
+                .effect("invoke"),
+        );
+
+    for boundary in ["block_return", "block_break"] {
+        graph.assert_successors(
+            boundary,
+            &[cfg_edge("block_nonlocal_boundary", ControlEdgeKind::Normal)],
+        );
+        graph.assert_point_gap(
+            boundary,
+            SemanticCapability::NonLocalControl,
+            SemanticGapKind::Unsupported,
+        );
+        graph.assert_reachable("block_entry", boundary);
+        graph.assert_unreachable(boundary, "block_normal_exit");
+    }
+    graph.assert_successors("block_nonlocal_boundary", &[]);
+    graph.assert_successors(
+        "block_next",
+        &[cfg_edge("block_normal_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "block_redo",
+        &[cfg_edge("block_body_entry", ControlEdgeKind::LoopBack)],
+    );
+    graph.assert_successors(
+        "lambda_return",
+        &[cfg_edge("lambda_normal_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("lambda_entry", "lambda_return");
+    graph.assert_unreachable("lambda_entry", "dead_lambda");
+    graph.assert_reachable("lambda_entry", "lambda_normal_exit");
+
+    let block_control = procedure_named(&graph, "block_control", ProcedureKind::Method);
+    for nested in [
+        "escape(item)",
+        "stop(item)",
+        "skip(item)",
+        "block_body(item)",
+    ] {
+        assert_no_exact_call_site(block_control, SOURCE, nested);
+    }
+    let lambda_control = procedure_named(&graph, "lambda_control", ProcedureKind::Method);
+    for nested in ["lambda_value()", "dead_inside_lambda()"] {
+        assert_no_exact_call_site(lambda_control, SOURCE, nested);
+    }
+    graph.assert_reachable("lambda_outer_entry", "outer_after_lambda");
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn ruby_nonlocal_block_control_runs_ensure_before_the_unknown_boundary() {
+    const SOURCE: &str = r#"
+        def return_from_block(items)
+          items.each do |item|
+            begin
+              return escape(item)
+            ensure
+              return_cleanup(item)
+            end
+          end
+          dead_after_return_block()
+        end
+
+        def break_from_block(items)
+          items.each do |item|
+            begin
+              break stop(item)
+            ensure
+              break_cleanup(item)
+            end
+          end
+          after_break_block()
+        end
+    "#;
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file("ruby/nonlocal_cleanup.rb", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "ruby/nonlocal_cleanup.rb");
+    graph
+        .bind(
+            "return_transfer",
+            PointSelector::new("return escape(item)").effect("gap"),
+        )
+        .bind(
+            "return_cleanup_normal",
+            PointSelector::new("return_cleanup(item)")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal)
+                .anchor_occurrence(6),
+        )
+        .bind(
+            "return_unknown_boundary",
+            PointSelector::new(
+                r#"begin
+              return escape(item)
+            ensure
+              return_cleanup(item)
+            end"#,
+            )
+            .anchor_occurrence(0),
+        )
+        .bind(
+            "break_transfer",
+            PointSelector::new("break stop(item)").effect("gap"),
+        )
+        .bind(
+            "break_cleanup_normal",
+            PointSelector::new("break_cleanup(item)")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal)
+                .anchor_occurrence(6),
+        )
+        .bind(
+            "break_unknown_boundary",
+            PointSelector::new(
+                r#"begin
+              break stop(item)
+            ensure
+              break_cleanup(item)
+            end"#,
+            )
+            .anchor_occurrence(0),
+        );
+
+    for (transfer, cleanup, boundary) in [
+        (
+            "return_transfer",
+            "return_cleanup_normal",
+            "return_unknown_boundary",
+        ),
+        (
+            "break_transfer",
+            "break_cleanup_normal",
+            "break_unknown_boundary",
+        ),
+    ] {
+        graph.assert_point_gap(
+            transfer,
+            SemanticCapability::NonLocalControl,
+            SemanticGapKind::Unsupported,
+        );
+        graph.assert_reachable(transfer, cleanup);
+        graph.assert_successors(cleanup, &[cfg_edge(boundary, ControlEdgeKind::Normal)]);
+        graph.assert_predecessors(boundary, &[cfg_edge(cleanup, ControlEdgeKind::Normal)]);
+        graph.assert_successors(boundary, &[]);
+    }
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn ruby_overrideable_negation_and_writer_assignments_keep_exact_control_boundaries() {
+    const SOURCE: &str = r#"
+        def operators(flag, receiver)
+          !probe(flag)
+          not predicate(flag)
+          either ||= choose_rhs()
+          both &&= confirm_rhs()
+          receiver&.value = safe_rhs()
+          receiver.value = writer_rhs()
+          receiver[index_rhs()] = element_rhs()
+          after_operators()
+        end
+    "#;
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file("ruby/operators_and_writers.rb", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph =
+        SemanticGraph::materialize(&project, &analyzer, "ruby/operators_and_writers.rb");
+    graph
+        .bind(
+            "probe_normal",
+            PointSelector::new("probe(flag)")
+                .procedure("operators")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "bang_boundary",
+            PointSelector::new("!probe(flag)")
+                .procedure("operators")
+                .effect("gap"),
+        )
+        .bind(
+            "predicate_normal",
+            PointSelector::new("predicate(flag)")
+                .procedure("operators")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "not_boundary",
+            PointSelector::new("not predicate(flag)")
+                .procedure("operators")
+                .effect("gap"),
+        )
+        .bind(
+            "either_decision",
+            PointSelector::new("either")
+                .procedure("operators")
+                .outgoing_kind(ControlEdgeKind::ConditionalFalse),
+        )
+        .bind(
+            "choose_rhs_entry",
+            PointSelector::new("choose_rhs()")
+                .procedure("operators")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "either_terminal",
+            PointSelector::new("either ||= choose_rhs()")
+                .procedure("operators")
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "either_merge",
+            PointSelector::new("either ||= choose_rhs()")
+                .procedure("operators")
+                .effect("gap")
+                .anchor_occurrence(2),
+        )
+        .bind(
+            "both_decision",
+            PointSelector::new("both")
+                .procedure("operators")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "confirm_rhs_entry",
+            PointSelector::new("confirm_rhs()")
+                .procedure("operators")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "both_terminal",
+            PointSelector::new("both &&= confirm_rhs()")
+                .procedure("operators")
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "both_merge",
+            PointSelector::new("both &&= confirm_rhs()")
+                .procedure("operators")
+                .effect("gap")
+                .anchor_occurrence(2),
+        )
+        .bind(
+            "safe_decision",
+            PointSelector::new("receiver&.value")
+                .procedure("operators")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "safe_rhs_entry",
+            PointSelector::new("safe_rhs()")
+                .procedure("operators")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "safe_writer_dispatch",
+            PointSelector::new("receiver&.value = safe_rhs()")
+                .procedure("operators")
+                .effect("gap")
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "safe_merge",
+            PointSelector::new("receiver&.value = safe_rhs()")
+                .procedure("operators")
+                .effect("gap")
+                .anchor_occurrence(2),
+        )
+        .bind(
+            "attribute_writer_dispatch",
+            PointSelector::new("receiver.value = writer_rhs()")
+                .procedure("operators")
+                .effect("gap"),
+        )
+        .bind(
+            "index_normal",
+            PointSelector::new("index_rhs()")
+                .procedure("operators")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "element_rhs_entry",
+            PointSelector::new("element_rhs()")
+                .procedure("operators")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "element_writer_dispatch",
+            PointSelector::new("receiver[index_rhs()] = element_rhs()")
+                .procedure("operators")
+                .effect("gap"),
+        );
+
+    graph.assert_successors(
+        "probe_normal",
+        &[cfg_edge("bang_boundary", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "predicate_normal",
+        &[cfg_edge("not_boundary", ControlEdgeKind::Normal)],
+    );
+    for boundary in ["bang_boundary", "not_boundary"] {
+        for (capability, kind) in [
+            (SemanticCapability::Calls, SemanticGapKind::Unsupported),
+            (
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unknown,
+            ),
+            (
+                SemanticCapability::NormalControlFlow,
+                SemanticGapKind::Unknown,
+            ),
+        ] {
+            graph.assert_point_gap(boundary, capability, kind);
+        }
+    }
+
+    graph.assert_successors(
+        "either_decision",
+        &[
+            cfg_edge("choose_rhs_entry", ControlEdgeKind::ConditionalFalse),
+            cfg_edge("either_merge", ControlEdgeKind::ConditionalTrue),
+        ],
+    );
+    graph.assert_predecessors(
+        "either_merge",
+        &[
+            cfg_edge("either_terminal", ControlEdgeKind::Normal),
+            cfg_edge("either_decision", ControlEdgeKind::ConditionalTrue),
+        ],
+    );
+    graph.assert_successors(
+        "both_decision",
+        &[
+            cfg_edge("confirm_rhs_entry", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("both_merge", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_predecessors(
+        "both_merge",
+        &[
+            cfg_edge("both_terminal", ControlEdgeKind::Normal),
+            cfg_edge("both_decision", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+
+    graph.assert_successors(
+        "safe_decision",
+        &[
+            cfg_edge("safe_rhs_entry", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("safe_merge", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_predecessors(
+        "safe_merge",
+        &[
+            cfg_edge("safe_writer_dispatch", ControlEdgeKind::Normal),
+            cfg_edge("safe_decision", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_unreachable("safe_merge", "safe_rhs_entry");
+    graph.assert_successors(
+        "index_normal",
+        &[cfg_edge("element_rhs_entry", ControlEdgeKind::Normal)],
+    );
+    for writer in [
+        "safe_writer_dispatch",
+        "attribute_writer_dispatch",
+        "element_writer_dispatch",
+    ] {
+        graph.assert_point_gap(
+            writer,
+            SemanticCapability::Calls,
+            SemanticGapKind::Unsupported,
+        );
+        graph.assert_point_gap(
+            writer,
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapKind::Unknown,
+        );
+    }
+
+    let operators = procedure_named(&graph, "operators", ProcedureKind::Method);
+    for writer_target in ["receiver&.value", "receiver.value", "receiver[index_rhs()]"] {
+        assert_no_exact_call_site(operators, SOURCE, writer_target);
+    }
+    for explicit_call in [
+        "probe(flag)",
+        "predicate(flag)",
+        "choose_rhs()",
+        "confirm_rhs()",
+        "safe_rhs()",
+        "writer_rhs()",
+        "index_rhs()",
+        "element_rhs()",
+    ] {
+        exact_call_site(operators, SOURCE, explicit_call);
+    }
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn ruby_case_patterns_evaluate_explicit_calls_before_implicit_matching() {
+    const SOURCE: &str = r#"
+        def classify(subject)
+          case subject_value(subject)
+          when first_pattern(), second_pattern()
+            first_match()
+          when later_pattern()
+            later_match()
+          else
+            no_match()
+          end
+        end
+
+        def choose_without_subject
+          case
+          when predicate(), fallback()
+            chosen()
+          else
+            not_chosen()
+          end
+        end
+    "#;
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file("ruby/case_pattern_calls.rb", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "ruby/case_pattern_calls.rb");
+    graph
+        .bind(
+            "subject_normal",
+            PointSelector::new("subject_value(subject)")
+                .procedure("classify")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "first_pattern_entry",
+            PointSelector::new("first_pattern()")
+                .procedure("classify")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "first_pattern_normal",
+            PointSelector::new("first_pattern()")
+                .procedure("classify")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "first_pattern_exceptional",
+            PointSelector::new("first_pattern()")
+                .procedure("classify")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "first_pattern_decision",
+            PointSelector::new("first_pattern()")
+                .procedure("classify")
+                .effect("gap")
+                .outgoing_kind(ControlEdgeKind::SwitchCase)
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "second_pattern_entry",
+            PointSelector::new("second_pattern()")
+                .procedure("classify")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "second_pattern_normal",
+            PointSelector::new("second_pattern()")
+                .procedure("classify")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "second_pattern_decision",
+            PointSelector::new("second_pattern()")
+                .procedure("classify")
+                .effect("gap")
+                .outgoing_kind(ControlEdgeKind::SwitchCase)
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "later_pattern_entry",
+            PointSelector::new("later_pattern()")
+                .procedure("classify")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "later_pattern_normal",
+            PointSelector::new("later_pattern()")
+                .procedure("classify")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "later_pattern_decision",
+            PointSelector::new("later_pattern()")
+                .procedure("classify")
+                .effect("gap")
+                .outgoing_kind(ControlEdgeKind::SwitchCase)
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "first_clause_body",
+            PointSelector::new("when first_pattern(), second_pattern()\n            first_match()")
+                .procedure("classify")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "later_clause_body",
+            PointSelector::new("when later_pattern()\n            later_match()")
+                .procedure("classify")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "else_body",
+            PointSelector::new("else\n            no_match()")
+                .procedure("classify")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "exceptional_exit",
+            PointSelector::new("def classify(subject)")
+                .procedure("classify")
+                .effect("exceptional_exit"),
+        )
+        .bind(
+            "predicate_normal",
+            PointSelector::new("predicate()")
+                .procedure("choose_without_subject")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "predicate_decision",
+            PointSelector::new("predicate()")
+                .procedure("choose_without_subject")
+                .effect("gap")
+                .outgoing_kind(ControlEdgeKind::SwitchCase)
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "fallback_entry",
+            PointSelector::new("fallback()")
+                .procedure("choose_without_subject")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "fallback_normal",
+            PointSelector::new("fallback()")
+                .procedure("choose_without_subject")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "fallback_decision",
+            PointSelector::new("fallback()")
+                .procedure("choose_without_subject")
+                .effect("gap")
+                .outgoing_kind(ControlEdgeKind::SwitchCase)
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "chosen_body",
+            PointSelector::new("when predicate(), fallback()\n            chosen()")
+                .procedure("choose_without_subject")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "not_chosen_body",
+            PointSelector::new("else\n            not_chosen()")
+                .procedure("choose_without_subject")
+                .anchor_occurrence(0),
+        );
+
+    graph.assert_successors(
+        "subject_normal",
+        &[cfg_edge("first_pattern_entry", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "first_pattern_normal",
+        &[cfg_edge("first_pattern_decision", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "first_pattern_decision",
+        &[
+            cfg_edge("first_clause_body", ControlEdgeKind::SwitchCase),
+            cfg_edge("second_pattern_entry", ControlEdgeKind::Normal),
+        ],
+    );
+    graph.assert_predecessors(
+        "second_pattern_entry",
+        &[cfg_edge("first_pattern_decision", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "second_pattern_normal",
+        &[cfg_edge("second_pattern_decision", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "second_pattern_decision",
+        &[
+            cfg_edge("first_clause_body", ControlEdgeKind::SwitchCase),
+            cfg_edge("later_pattern_entry", ControlEdgeKind::Normal),
+        ],
+    );
+    graph.assert_successors(
+        "later_pattern_normal",
+        &[cfg_edge("later_pattern_decision", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "later_pattern_decision",
+        &[
+            cfg_edge("later_clause_body", ControlEdgeKind::SwitchCase),
+            cfg_edge("else_body", ControlEdgeKind::Normal),
+        ],
+    );
+    graph.assert_successors(
+        "first_pattern_exceptional",
+        &[cfg_edge("exceptional_exit", ControlEdgeKind::Exceptional)],
+    );
+    for decision in [
+        "first_pattern_decision",
+        "second_pattern_decision",
+        "later_pattern_decision",
+    ] {
+        for (capability, kind) in [
+            (SemanticCapability::Calls, SemanticGapKind::Unsupported),
+            (
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unknown,
+            ),
+            (SemanticCapability::Values, SemanticGapKind::Unknown),
+        ] {
+            graph.assert_point_gap(decision, capability, kind);
+        }
+    }
+
+    graph.assert_successors(
+        "predicate_normal",
+        &[cfg_edge("predicate_decision", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "predicate_decision",
+        &[
+            cfg_edge("chosen_body", ControlEdgeKind::SwitchCase),
+            cfg_edge("fallback_entry", ControlEdgeKind::Normal),
+        ],
+    );
+    graph.assert_predecessors(
+        "fallback_entry",
+        &[cfg_edge("predicate_decision", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "fallback_normal",
+        &[cfg_edge("fallback_decision", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "fallback_decision",
+        &[
+            cfg_edge("chosen_body", ControlEdgeKind::SwitchCase),
+            cfg_edge("not_chosen_body", ControlEdgeKind::Normal),
+        ],
+    );
+    for decision in ["predicate_decision", "fallback_decision"] {
+        graph.assert_point_gap(
+            decision,
+            SemanticCapability::Values,
+            SemanticGapKind::Unknown,
+        );
+    }
+
+    let classify = procedure_named(&graph, "classify", ProcedureKind::Method);
+    for explicit_call in [
+        "subject_value(subject)",
+        "first_pattern()",
+        "second_pattern()",
+        "later_pattern()",
+        "first_match()",
+        "later_match()",
+        "no_match()",
+    ] {
+        exact_call_site(classify, SOURCE, explicit_call);
+    }
+    let choose = procedure_named(&graph, "choose_without_subject", ProcedureKind::Method);
+    for explicit_call in ["predicate()", "fallback()", "chosen()", "not_chosen()"] {
+        exact_call_site(choose, SOURCE, explicit_call);
+    }
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn ruby_callable_table_mutation_and_destructured_writers_do_not_fabricate_calls() {
+    const SOURCE: &str = r#"
+        class CallableTable
+          alias replacement original
+          undef retired
+
+          def assign(receiver)
+            receiver[index_call()], local = left_rhs(), right_rhs()
+            after_assign(local)
+          end
+        end
+    "#;
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file("ruby/callable_table_and_destructuring.rb", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(
+        &project,
+        &analyzer,
+        "ruby/callable_table_and_destructuring.rb",
+    );
+    graph
+        .bind(
+            "alias_mutation",
+            PointSelector::new("alias replacement original").effect("gap"),
+        )
+        .bind(
+            "undef_mutation",
+            PointSelector::new("undef retired").effect("gap"),
+        )
+        .bind(
+            "index_normal",
+            PointSelector::new("index_call()")
+                .procedure("assign")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "rhs_list_entry",
+            PointSelector::new("left_rhs(), right_rhs()")
+                .procedure("assign")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "left_rhs_normal",
+            PointSelector::new("left_rhs()")
+                .procedure("assign")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "right_rhs_entry",
+            PointSelector::new("right_rhs()")
+                .procedure("assign")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "writer_dispatch",
+            PointSelector::new("receiver[index_call()], local = left_rhs(), right_rhs()")
+                .procedure("assign")
+                .effect("gap"),
+        );
+
+    graph.assert_successors(
+        "alias_mutation",
+        &[cfg_edge("undef_mutation", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "undef_mutation",
+        &[cfg_edge("alias_mutation", ControlEdgeKind::Normal)],
+    );
+    for mutation in ["alias_mutation", "undef_mutation"] {
+        graph.assert_point_gap(
+            mutation,
+            SemanticCapability::CallableReferences,
+            SemanticGapKind::Unsupported,
+        );
+    }
+    graph.assert_successors(
+        "index_normal",
+        &[cfg_edge("rhs_list_entry", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "left_rhs_normal",
+        &[cfg_edge("right_rhs_entry", ControlEdgeKind::Normal)],
+    );
+    graph.assert_point_gap(
+        "writer_dispatch",
+        SemanticCapability::Calls,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_point_gap(
+        "writer_dispatch",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+
+    for procedure in graph.artifact().procedures() {
+        for method_name in ["replacement", "original", "retired"] {
+            assert_no_exact_call_site(procedure, SOURCE, method_name);
+        }
+    }
+    let assign = procedure_named(&graph, "assign", ProcedureKind::Method);
+    assert_no_exact_call_site(assign, SOURCE, "receiver[index_call()]");
+    for explicit_call in [
+        "index_call()",
+        "left_rhs()",
+        "right_rhs()",
+        "after_assign(local)",
+    ] {
+        exact_call_site(assign, SOURCE, explicit_call);
+    }
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn ruby_nested_arguments_safe_navigation_and_attached_blocks_preserve_order() {
+    const SOURCE: &str = r#"
+        def evaluate(service)
+          result = combine(first(), second(inner()))
+          service&.run(argument()) do
+            deferred_body()
+          end
+          after(result)
+        end
+    "#;
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file("ruby/call_order.rb", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "ruby/call_order.rb");
+    graph
+        .bind(
+            "entry",
+            PointSelector::new("def evaluate(service)")
+                .procedure("evaluate")
+                .effect("entry"),
+        )
+        .bind(
+            "first_normal",
+            PointSelector::new("first()")
+                .procedure("evaluate")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "second_expression",
+            PointSelector::new("second(inner())")
+                .procedure("evaluate")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "inner_normal",
+            PointSelector::new("inner()")
+                .procedure("evaluate")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "second_invoke",
+            PointSelector::new("second(inner())")
+                .procedure("evaluate")
+                .effect("invoke"),
+        )
+        .bind(
+            "second_normal",
+            PointSelector::new("second(inner())")
+                .procedure("evaluate")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "combine_invoke",
+            PointSelector::new("combine(first(), second(inner()))")
+                .procedure("evaluate")
+                .effect("invoke"),
+        )
+        .bind(
+            "combine_normal",
+            PointSelector::new("combine(first(), second(inner()))")
+                .procedure("evaluate")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "safe_decision",
+            PointSelector::new("service&.run(argument()) do")
+                .procedure("evaluate")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "argument_expression",
+            PointSelector::new("argument()")
+                .procedure("evaluate")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "argument_normal",
+            PointSelector::new("argument()")
+                .procedure("evaluate")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "safe_invoke",
+            PointSelector::new(
+                "service&.run(argument()) do\n            deferred_body()\n          end",
+            )
+            .procedure("evaluate")
+            .effect("invoke"),
+        )
+        .bind(
+            "safe_normal",
+            PointSelector::new(
+                "service&.run(argument()) do\n            deferred_body()\n          end",
+            )
+            .procedure("evaluate")
+            .effect("call_continuation")
+            .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "safe_exceptional",
+            PointSelector::new(
+                "service&.run(argument()) do\n            deferred_body()\n          end",
+            )
+            .procedure("evaluate")
+            .effect("call_continuation")
+            .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "after_statement",
+            PointSelector::new("after(result)")
+                .procedure("evaluate")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_invoke",
+            PointSelector::new("after(result)")
+                .procedure("evaluate")
+                .effect("invoke"),
+        )
+        .bind(
+            "closure_entry",
+            PointSelector::new("do\n            deferred_body()\n          end").effect("entry"),
+        )
+        .bind(
+            "deferred_body",
+            PointSelector::new("deferred_body()").effect("invoke"),
+        );
+
+    graph.assert_successors(
+        "first_normal",
+        &[cfg_edge("second_expression", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("second_expression", "inner_normal");
+    graph.assert_successors(
+        "inner_normal",
+        &[cfg_edge("second_invoke", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "second_normal",
+        &[cfg_edge("combine_invoke", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("combine_normal", "safe_decision");
+    graph.assert_successors(
+        "safe_decision",
+        &[
+            cfg_edge("argument_expression", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("after_statement", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "argument_normal",
+        &[cfg_edge("safe_invoke", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "safe_invoke",
+        &[
+            cfg_edge("safe_normal", ControlEdgeKind::Normal),
+            cfg_edge("safe_exceptional", ControlEdgeKind::Exceptional),
+        ],
+    );
+    graph.assert_successors(
+        "safe_normal",
+        &[cfg_edge("after_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "after_statement",
+        &[
+            cfg_edge("safe_decision", ControlEdgeKind::ConditionalFalse),
+            cfg_edge("safe_normal", ControlEdgeKind::Normal),
+        ],
+    );
+    graph.assert_reachable("closure_entry", "deferred_body");
+    graph.assert_reachable("entry", "after_invoke");
+    let evaluate = procedure_named(&graph, "evaluate", ProcedureKind::Method);
+    assert_no_exact_call_site(evaluate, SOURCE, "deferred_body()");
+    assert_call_site_gap(
+        evaluate,
+        SOURCE,
+        "service&.run(argument()) do\n            deferred_body()\n          end",
+        SemanticCapability::DeferredExecution,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn ruby_yield_retry_and_metaprogramming_boundaries_are_explicit() {
+    const SOURCE: &str = r#"
+        def invoke_block(value)
+          yielded = yield(argument(value))
+          after_yield(yielded)
+        end
+
+        def retrying
+          begin
+            attempt()
+          rescue Temporary
+            retry
+          ensure
+            retry_cleanup()
+          end
+          after_retry()
+        end
+
+        def dynamic(receiver)
+          receiver.send(:target, nested())
+          self.class.define_method(:generated) do
+            generated_body()
+          end
+          after_dynamic()
+        end
+    "#;
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file("ruby/boundaries.rb", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "ruby/boundaries.rb");
+    graph
+        .bind(
+            "argument_normal",
+            PointSelector::new("argument(value)")
+                .procedure("invoke_block")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "yield_boundary",
+            PointSelector::new("yield(argument(value))")
+                .procedure("invoke_block")
+                .effect("gap"),
+        )
+        .bind(
+            "yield_assignment",
+            PointSelector::new("yielded = yield(argument(value))")
+                .procedure("invoke_block")
+                .effect("gap")
+                .anchor_occurrence(1),
+        )
+        .bind(
+            "after_yield_statement",
+            PointSelector::new("after_yield(yielded)")
+                .procedure("invoke_block")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_yield",
+            PointSelector::new("after_yield(yielded)")
+                .procedure("invoke_block")
+                .effect("invoke"),
+        )
+        .bind(
+            "yield_exceptional_exit",
+            PointSelector::new("def invoke_block(value)")
+                .procedure("invoke_block")
+                .effect("exceptional_exit"),
+        )
+        .bind(
+            "protected_body_entry",
+            PointSelector::new(
+                "begin\n            attempt()\n          rescue Temporary\n            retry\n          ensure\n            retry_cleanup()\n          end",
+            )
+                .procedure("retrying")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "retry_transfer",
+            PointSelector::new("retry")
+                .procedure("retrying")
+                .outgoing_kind(ControlEdgeKind::LoopBack),
+        )
+        .bind(
+            "after_retry",
+            PointSelector::new("after_retry()")
+                .procedure("retrying")
+                .effect("invoke"),
+        )
+        .bind(
+            "nested_normal",
+            PointSelector::new("nested()")
+                .procedure("dynamic")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "send_invoke",
+            PointSelector::new("receiver.send(:target, nested())")
+                .procedure("dynamic")
+                .effect("invoke"),
+        )
+        .bind(
+            "define_method_invoke",
+            PointSelector::new(
+                "self.class.define_method(:generated) do\n            generated_body()\n          end",
+            )
+            .procedure("dynamic")
+            .effect("invoke"),
+        )
+        .bind(
+            "generated_closure_entry",
+            PointSelector::new("do\n            generated_body()\n          end").effect("entry"),
+        )
+        .bind(
+            "generated_body",
+            PointSelector::new("generated_body()").effect("invoke"),
+        )
+        .bind(
+            "after_dynamic",
+            PointSelector::new("after_dynamic()")
+                .procedure("dynamic")
+                .effect("invoke"),
+        );
+
+    graph.assert_successors(
+        "argument_normal",
+        &[cfg_edge("yield_boundary", ControlEdgeKind::Normal)],
+    );
+    for (capability, kind) in [
+        (SemanticCapability::Calls, SemanticGapKind::Unsupported),
+        (
+            SemanticCapability::NonLocalControl,
+            SemanticGapKind::Unknown,
+        ),
+        (SemanticCapability::Values, SemanticGapKind::Unknown),
+    ] {
+        graph.assert_point_gap("yield_boundary", capability, kind);
+    }
+    graph.assert_successors(
+        "yield_boundary",
+        &[
+            cfg_edge("yield_assignment", ControlEdgeKind::Normal),
+            cfg_edge("yield_exceptional_exit", ControlEdgeKind::Exceptional),
+        ],
+    );
+    graph.assert_successors(
+        "yield_assignment",
+        &[cfg_edge("after_yield_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("after_yield_statement", "after_yield");
+    let invoke_block = procedure_named(&graph, "invoke_block", ProcedureKind::Method);
+    assert_no_exact_call_site(invoke_block, SOURCE, "yield(argument(value))");
+
+    graph.assert_successors(
+        "retry_transfer",
+        &[cfg_edge("protected_body_entry", ControlEdgeKind::LoopBack)],
+    );
+    graph.assert_reachable("protected_body_entry", "after_retry");
+
+    graph.assert_successors(
+        "nested_normal",
+        &[cfg_edge("send_invoke", ControlEdgeKind::Normal)],
+    );
+    graph.assert_point_gap(
+        "send_invoke",
+        SemanticCapability::CallableReferences,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_point_gap(
+        "define_method_invoke",
+        SemanticCapability::CallableReferences,
+        SemanticGapKind::Unknown,
+    );
+    let dynamic = procedure_named(&graph, "dynamic", ProcedureKind::Method);
+    assert_call_site_gap(
+        dynamic,
+        SOURCE,
+        "receiver.send(:target, nested())",
+        SemanticCapability::Calls,
+        SemanticGapKind::Unsupported,
+    );
+    assert_call_site_gap(
+        dynamic,
+        SOURCE,
+        "self.class.define_method(:generated) do\n            generated_body()\n          end",
+        SemanticCapability::Calls,
+        SemanticGapKind::Unknown,
+    );
+    assert_call_site_gap(
+        dynamic,
+        SOURCE,
+        "self.class.define_method(:generated) do\n            generated_body()\n          end",
+        SemanticCapability::DeferredExecution,
+        SemanticGapKind::Unknown,
+    );
+    assert_no_exact_call_site(dynamic, SOURCE, "generated_body()");
+    graph.assert_reachable("generated_closure_entry", "generated_body");
+    graph.assert_reachable("define_method_invoke", "after_dynamic");
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn ruby_fibers_threads_and_ractors_keep_runtime_boundaries_explicit() {
+    const SOURCE: &str = r#"
+        def schedule
+          fiber = Fiber.new do
+            fiber_body()
+          end
+          thread = Thread.new do
+            thread_body()
+          end
+          ractor = Ractor.new do
+            ractor_body()
+          end
+          after_schedule(fiber, thread, ractor)
+        end
+
+        def suspend
+          result = Fiber.yield(value())
+          after_suspend(result)
+        end
+    "#;
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file("ruby/runtime_boundaries.rb", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "ruby/runtime_boundaries.rb");
+    graph
+        .bind(
+            "fiber_invoke",
+            PointSelector::new("Fiber.new do\n            fiber_body()\n          end")
+                .procedure("schedule")
+                .effect("invoke"),
+        )
+        .bind(
+            "fiber_normal",
+            PointSelector::new("Fiber.new do\n            fiber_body()\n          end")
+                .procedure("schedule")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "fiber_exceptional",
+            PointSelector::new("Fiber.new do\n            fiber_body()\n          end")
+                .procedure("schedule")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "thread_invoke",
+            PointSelector::new("Thread.new do\n            thread_body()\n          end")
+                .procedure("schedule")
+                .effect("invoke"),
+        )
+        .bind(
+            "thread_normal",
+            PointSelector::new("Thread.new do\n            thread_body()\n          end")
+                .procedure("schedule")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "thread_exceptional",
+            PointSelector::new("Thread.new do\n            thread_body()\n          end")
+                .procedure("schedule")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "ractor_invoke",
+            PointSelector::new("Ractor.new do\n            ractor_body()\n          end")
+                .procedure("schedule")
+                .effect("invoke"),
+        )
+        .bind(
+            "ractor_normal",
+            PointSelector::new("Ractor.new do\n            ractor_body()\n          end")
+                .procedure("schedule")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "ractor_exceptional",
+            PointSelector::new("Ractor.new do\n            ractor_body()\n          end")
+                .procedure("schedule")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "after_schedule",
+            PointSelector::new("after_schedule(fiber, thread, ractor)")
+                .procedure("schedule")
+                .effect("invoke"),
+        )
+        .bind(
+            "fiber_closure_entry",
+            PointSelector::new("do\n            fiber_body()\n          end").effect("entry"),
+        )
+        .bind(
+            "fiber_body",
+            PointSelector::new("fiber_body()").effect("invoke"),
+        )
+        .bind(
+            "thread_closure_entry",
+            PointSelector::new("do\n            thread_body()\n          end").effect("entry"),
+        )
+        .bind(
+            "thread_body",
+            PointSelector::new("thread_body()").effect("invoke"),
+        )
+        .bind(
+            "ractor_closure_entry",
+            PointSelector::new("do\n            ractor_body()\n          end").effect("entry"),
+        )
+        .bind(
+            "ractor_body",
+            PointSelector::new("ractor_body()").effect("invoke"),
+        )
+        .bind(
+            "value_normal",
+            PointSelector::new("value()")
+                .procedure("suspend")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "yield_invoke",
+            PointSelector::new("Fiber.yield(value())")
+                .procedure("suspend")
+                .effect("invoke"),
+        )
+        .bind(
+            "yield_normal",
+            PointSelector::new("Fiber.yield(value())")
+                .procedure("suspend")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "yield_exceptional",
+            PointSelector::new("Fiber.yield(value())")
+                .procedure("suspend")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "after_suspend",
+            PointSelector::new("after_suspend(result)")
+                .procedure("suspend")
+                .effect("invoke"),
+        );
+
+    graph.assert_successors(
+        "fiber_invoke",
+        &[
+            cfg_edge("fiber_normal", ControlEdgeKind::Normal),
+            cfg_edge("fiber_exceptional", ControlEdgeKind::Exceptional),
+        ],
+    );
+    graph.assert_reachable("fiber_normal", "thread_invoke");
+    graph.assert_successors(
+        "thread_invoke",
+        &[
+            cfg_edge("thread_normal", ControlEdgeKind::Normal),
+            cfg_edge("thread_exceptional", ControlEdgeKind::Exceptional),
+        ],
+    );
+    graph.assert_reachable("thread_normal", "ractor_invoke");
+    graph.assert_successors(
+        "ractor_invoke",
+        &[
+            cfg_edge("ractor_normal", ControlEdgeKind::Normal),
+            cfg_edge("ractor_exceptional", ControlEdgeKind::Exceptional),
+        ],
+    );
+    graph.assert_reachable("ractor_normal", "after_schedule");
+    graph.assert_reachable("fiber_closure_entry", "fiber_body");
+    graph.assert_reachable("thread_closure_entry", "thread_body");
+    graph.assert_reachable("ractor_closure_entry", "ractor_body");
+
+    let schedule = procedure_named(&graph, "schedule", ProcedureKind::Method);
+    for body in ["fiber_body()", "thread_body()", "ractor_body()"] {
+        assert_no_exact_call_site(schedule, SOURCE, body);
+    }
+    for call_source in [
+        "Fiber.new do\n            fiber_body()\n          end",
+        "Thread.new do\n            thread_body()\n          end",
+        "Ractor.new do\n            ractor_body()\n          end",
+    ] {
+        assert_call_site_gap(
+            schedule,
+            SOURCE,
+            call_source,
+            SemanticCapability::DeferredExecution,
+            SemanticGapKind::Unknown,
+        );
+    }
+    assert_call_site_gap(
+        schedule,
+        SOURCE,
+        "Fiber.new do\n            fiber_body()\n          end",
+        SemanticCapability::GeneratorSuspension,
+        SemanticGapKind::Unknown,
+    );
+    for call_source in [
+        "Thread.new do\n            thread_body()\n          end",
+        "Ractor.new do\n            ractor_body()\n          end",
+    ] {
+        assert_call_site_gap(
+            schedule,
+            SOURCE,
+            call_source,
+            SemanticCapability::ConcurrentSpawn,
+            SemanticGapKind::Unknown,
+        );
+    }
+
+    graph.assert_successors(
+        "value_normal",
+        &[cfg_edge("yield_invoke", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "yield_invoke",
+        &[
+            cfg_edge("yield_normal", ControlEdgeKind::Normal),
+            cfg_edge("yield_exceptional", ControlEdgeKind::Exceptional),
+        ],
+    );
+    graph.assert_reachable("yield_normal", "after_suspend");
+    let suspend = procedure_named(&graph, "suspend", ProcedureKind::Method);
+    assert_call_site_gap(
+        suspend,
+        SOURCE,
+        "Fiber.yield(value())",
+        SemanticCapability::GeneratorSuspension,
+        SemanticGapKind::Unknown,
+    );
+
     graph.assert_adjacency_symmetric();
     let rendered = graph.render_topology();
     assert_eq!(rendered, graph.render_topology());

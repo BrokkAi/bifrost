@@ -9,8 +9,9 @@ use crate::analyzer::lexical_definitions::{
 use crate::analyzer::structural::FileFacts;
 use crate::analyzer::usages::get_definition::{
     CallSiteSyntax, CallSyntaxKind, DefinitionLookupOutcome, DefinitionLookupRequest,
-    DefinitionLookupStatus, call_reference_range_for_call, call_reference_ranges_in_tree,
-    call_site_syntax_for_reference, parse_tree_for_language, resolve_definition_batch_with_source,
+    DefinitionLookupStatus, ExactCallReference, ExactCallReferenceGap,
+    call_reference_ranges_in_tree, call_site_syntax_for_reference, exact_call_reference_for_call,
+    parse_tree_for_language, resolve_definition_batch_with_source,
     resolve_definition_batch_with_source_and_cancellation,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
@@ -216,8 +217,7 @@ impl CallRelationService {
                 work,
             );
         };
-        let Some(callee_range) =
-            call_reference_range_for_call(&tree, language, &location.call_span)
+        let Some(reference) = exact_call_reference_for_call(&tree, language, &location.call_span)
         else {
             return unresolved_dispatch_lookup(
                 DefinitionLookupStatus::InvalidLocation,
@@ -227,6 +227,17 @@ impl CallRelationService {
                 ),
                 work,
             );
+        };
+        let callee_range = match reference {
+            ExactCallReference::Resolvable(range) => range,
+            ExactCallReference::Unsupported(ExactCallReferenceGap::RubyCallableObject) => {
+                return unresolved_dispatch_lookup(
+                    DefinitionLookupStatus::NoDefinition,
+                    "unsupported_ruby_callable_object_dispatch: resolving `receiver.(...)` requires value/heap callable-target information"
+                        .to_string(),
+                    work,
+                );
+            }
         };
         let batch = resolve_call_references_with_source(
             analyzer,
@@ -1028,6 +1039,230 @@ mod tests {
         assert_eq!(lookup.targets[0].definition.fq_name(), "Example.helper");
         assert_eq!(lookup.targets[0].proof, UsageProof::Proven);
         assert!(lookup.boundaries.is_empty(), "{lookup:#?}");
+    }
+
+    #[test]
+    fn exact_dispatch_resolves_ruby_bare_calls_at_the_identifier_span() {
+        let source = r#"class Example
+  def target
+  end
+
+  def caller
+    target
+  end
+end
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Ruby, &[("example.rb", source)]);
+        let lookup = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            &ExactCallLocation {
+                file: ProjectFile::new(fixture.project_root(), "example.rb"),
+                call_span: call_span(source, "target"),
+            },
+            Arc::new(source.to_string()),
+            generous_limits(),
+            None,
+        );
+
+        assert_eq!(lookup.status, Some(DefinitionLookupStatus::Resolved));
+        assert_eq!(lookup.targets.len(), 1, "{lookup:#?}");
+        assert_eq!(lookup.targets[0].definition.fq_name(), "Example.target");
+        assert_eq!(lookup.targets[0].proof, UsageProof::Proven);
+        assert!(lookup.boundaries.is_empty(), "{lookup:#?}");
+    }
+
+    #[test]
+    fn exact_dispatch_resolves_ruby_safe_navigation_calls_with_blocks() {
+        let source = r#"class Service
+  def run(value)
+  end
+end
+
+class Caller
+  def call
+    service = Service.new
+    service&.run(1) { |value| value }
+  end
+end
+"#;
+        let call = "service&.run(1) { |value| value }";
+        let fixture = AnalyzerFixture::new_for_language(Language::Ruby, &[("example.rb", source)]);
+        let lookup = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            &ExactCallLocation {
+                file: ProjectFile::new(fixture.project_root(), "example.rb"),
+                call_span: call_span(source, call),
+            },
+            Arc::new(source.to_string()),
+            generous_limits(),
+            None,
+        );
+
+        assert_eq!(lookup.status, Some(DefinitionLookupStatus::Resolved));
+        assert_eq!(lookup.targets.len(), 1, "{lookup:#?}");
+        assert_eq!(lookup.targets[0].definition.fq_name(), "Service.run");
+        assert_eq!(lookup.targets[0].proof, UsageProof::Proven);
+        assert!(lookup.boundaries.is_empty(), "{lookup:#?}");
+    }
+
+    #[test]
+    fn exact_dispatch_keeps_ruby_dynamic_send_as_an_unresolved_boundary() {
+        let source = r#"class Example
+  def target
+  end
+
+  def caller
+    public_send(:target)
+  end
+end
+"#;
+        let call = "public_send(:target)";
+        let fixture = AnalyzerFixture::new_for_language(Language::Ruby, &[("example.rb", source)]);
+        let lookup = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            &ExactCallLocation {
+                file: ProjectFile::new(fixture.project_root(), "example.rb"),
+                call_span: call_span(source, call),
+            },
+            Arc::new(source.to_string()),
+            generous_limits(),
+            None,
+        );
+
+        assert_eq!(lookup.status, Some(DefinitionLookupStatus::NoDefinition));
+        assert!(lookup.targets.is_empty(), "{lookup:#?}");
+        assert_eq!(
+            lookup.boundaries,
+            vec![CallDispatchBoundaryKind::Unresolved(
+                DefinitionLookupStatus::NoDefinition
+            )]
+        );
+        assert!(
+            lookup
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("unsupported_ruby_dynamic_dispatch")),
+            "{lookup:#?}"
+        );
+    }
+
+    #[test]
+    fn exact_dispatch_resolves_ruby_operator_methods_from_the_operator_token() {
+        let source = r#"class Example
+  def +(value)
+    value
+  end
+
+  def [](index)
+    index
+  end
+
+  def caller
+    self.+(1)
+    self.[](2)
+  end
+end
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Ruby, &[("example.rb", source)]);
+
+        for (call, target) in [("self.+(1)", "Example.+"), ("self.[](2)", "Example.[]")] {
+            let lookup = CallRelationService::dispatch_at_bounded(
+                fixture.analyzer.analyzer(),
+                &ExactCallLocation {
+                    file: ProjectFile::new(fixture.project_root(), "example.rb"),
+                    call_span: call_span(source, call),
+                },
+                Arc::new(source.to_string()),
+                generous_limits(),
+                None,
+            );
+
+            assert_eq!(lookup.status, Some(DefinitionLookupStatus::Resolved));
+            assert_eq!(lookup.targets.len(), 1, "{call}: {lookup:#?}");
+            assert_eq!(lookup.targets[0].definition.fq_name(), target);
+            assert_eq!(lookup.targets[0].proof, UsageProof::Proven);
+            assert!(lookup.boundaries.is_empty(), "{call}: {lookup:#?}");
+        }
+    }
+
+    #[test]
+    fn exact_dispatch_keeps_ruby_callable_objects_as_a_typed_unresolved_boundary() {
+        let source = r#"class Example
+  def caller(callable)
+    callable.(1)
+  end
+end
+"#;
+        let call = "callable.(1)";
+        let fixture = AnalyzerFixture::new_for_language(Language::Ruby, &[("example.rb", source)]);
+        let lookup = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            &ExactCallLocation {
+                file: ProjectFile::new(fixture.project_root(), "example.rb"),
+                call_span: call_span(source, call),
+            },
+            Arc::new(source.to_string()),
+            generous_limits(),
+            None,
+        );
+
+        assert_eq!(lookup.status, Some(DefinitionLookupStatus::NoDefinition));
+        assert!(lookup.targets.is_empty(), "{lookup:#?}");
+        assert_eq!(
+            lookup.boundaries,
+            vec![CallDispatchBoundaryKind::Unresolved(
+                DefinitionLookupStatus::NoDefinition
+            )]
+        );
+        assert!(
+            lookup
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("unsupported_ruby_callable_object_dispatch")),
+            "{lookup:#?}"
+        );
+    }
+
+    #[test]
+    fn ruby_outgoing_relations_keep_attached_block_calls_separate() {
+        let source = r#"class Example
+  def target
+  end
+
+  def nested
+  end
+
+  def direct
+  end
+
+  def caller
+    target() do
+      nested()
+    end
+    direct()
+  end
+end
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Ruby, &[("example.rb", source)]);
+        let analyzer = fixture.analyzer.analyzer();
+        let caller = analyzer
+            .definitions("Example.caller")
+            .next()
+            .expect("Ruby caller");
+
+        let relation =
+            CallRelationService::outgoing_bounded(analyzer, &caller, generous_limits(), None);
+        let callees = relation
+            .sites
+            .iter()
+            .map(|site| site.callee.fq_name())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            callees,
+            vec!["Example.target".to_string(), "Example.direct".to_string()],
+            "{relation:#?}"
+        );
     }
 
     #[test]

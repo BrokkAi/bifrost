@@ -37,6 +37,23 @@ pub(crate) struct CallSiteSyntax {
     pub(crate) kind: CallSyntaxKind,
 }
 
+/// Structured result of mapping one exact whole-call span to its dispatch
+/// reference. Some call expressions do not name a statically resolvable
+/// declaration; retaining that shape keeps exact dispatch from degrading them
+/// to an `InvalidLocation` parse failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExactCallReference {
+    Resolvable(Range),
+    Unsupported(ExactCallReferenceGap),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExactCallReferenceGap {
+    /// `proc.(value)` invokes the value held by the receiver. Resolving its
+    /// target requires value/heap information rather than a method-name lookup.
+    RubyCallableObject,
+}
+
 pub(crate) fn call_reference_ranges_in_tree(
     tree: &Tree,
     language: Language,
@@ -55,11 +72,23 @@ pub(crate) fn call_reference_ranges_in_tree(
 /// calls have different exact spans even when a cursor-based lookup would land
 /// inside both.  Callee selection remains tree-sitter-structured through the
 /// language's named fields and call-reference predicate.
-pub(crate) fn call_reference_range_for_call(
+#[cfg(test)]
+fn call_reference_range_for_call(
     tree: &Tree,
     language: Language,
     call_span: &Range,
 ) -> Option<Range> {
+    match exact_call_reference_for_call(tree, language, call_span)? {
+        ExactCallReference::Resolvable(range) => Some(range),
+        ExactCallReference::Unsupported(_) => None,
+    }
+}
+
+pub(crate) fn exact_call_reference_for_call(
+    tree: &Tree,
+    language: Language,
+    call_span: &Range,
+) -> Option<ExactCallReference> {
     if call_span.start_byte >= call_span.end_byte {
         return None;
     }
@@ -67,12 +96,27 @@ pub(crate) fn call_reference_range_for_call(
         .root_node()
         .named_descendant_for_byte_range(call_span.start_byte, call_span.end_byte)?;
     loop {
-        if node.start_byte() == call_span.start_byte
-            && node.end_byte() == call_span.end_byte
-            && is_call_expression_node(node, language)
-        {
-            let callee = callee_node_for_call(node, language)?;
-            return call_reference_leaf(callee, language).map(node_range);
+        if node.start_byte() == call_span.start_byte && node.end_byte() == call_span.end_byte {
+            // A Ruby implicit-receiver call without arguments has no `call`
+            // wrapper in tree-sitter; its complete expression is the
+            // identifier itself. Semantic lowering has already classified the
+            // exact span as a call after accounting for parser-ordered lexical
+            // locals. Legacy outgoing discovery keeps its narrower structural
+            // classification for body-statement bare calls.
+            if language == Language::Ruby && ruby_exact_bare_call_identifier(node) {
+                return Some(ExactCallReference::Resolvable(node_range(node)));
+            }
+            if is_call_expression_node(node, language) {
+                if language == Language::Ruby && ruby_callable_object_call(node) {
+                    return Some(ExactCallReference::Unsupported(
+                        ExactCallReferenceGap::RubyCallableObject,
+                    ));
+                }
+                let callee = callee_node_for_call(node, language)?;
+                return call_reference_leaf(callee, language)
+                    .map(node_range)
+                    .map(ExactCallReference::Resolvable);
+            }
         }
         let parent = node.parent()?;
         if parent.start_byte() != call_span.start_byte || parent.end_byte() != call_span.end_byte {
@@ -425,13 +469,13 @@ fn scala_terminal_callee_leaf(mut node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn call_reference_leaf(node: Node<'_>, language: Language) -> Option<Node<'_>> {
-    if node.child_count() == 0 {
+    if node.named_child_count() == 0 {
         return is_call_reference_candidate(node, language).then_some(node);
     }
     let mut best = None;
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
-        if current.child_count() == 0 && is_call_reference_candidate(current, language) {
+        if current.named_child_count() == 0 && is_call_reference_candidate(current, language) {
             best = Some(current);
             continue;
         }
@@ -511,7 +555,7 @@ fn collect_call_reference_ranges(
         if is_nested_callable_node(node, language, search_range) {
             continue;
         }
-        if node.child_count() == 0 {
+        if node.named_child_count() == 0 {
             if is_call_reference_candidate(node, language)
                 && node.start_byte() >= search_range.start_byte
                 && node.end_byte() <= search_range.end_byte
@@ -546,6 +590,9 @@ fn is_nested_callable_node(node: Node<'_>, language: Language, search_range: &Ra
         && (node.kind() == "given_definition"
             || (node.kind() == "case_block" && scala_case_block_is_partial_function(node)))
     {
+        return true;
+    }
+    if language == Language::Ruby && ruby_nested_callable_node(node) {
         return true;
     }
     matches!(
@@ -585,6 +632,25 @@ fn scala_case_block_is_partial_function(node: Node<'_>) -> bool {
     })
 }
 
+fn ruby_nested_callable_node(node: Node<'_>) -> bool {
+    match node.kind() {
+        // The block nested directly under `lambda` is the lambda's body, not
+        // a second callable. Attached blocks and do-blocks are independently
+        // invoked Ruby closures and must not leak their calls into the method
+        // or initializer that creates them.
+        "block" | "do_block" => node.parent().is_none_or(|parent| parent.kind() != "lambda"),
+        // Ruby type and singleton-class bodies execute in their own semantic
+        // initializer contexts. The leading range guard above still permits a
+        // query rooted at one of these exact nodes to traverse its own body.
+        "class" | "singleton_class" => true,
+        // BEGIN/END bodies execute at load/exit lifecycle boundaries. They are
+        // represented by semantic gaps, not as calls of the lexically
+        // surrounding method or type initializer.
+        "begin_block" | "end_block" => true,
+        _ => false,
+    }
+}
+
 fn is_call_reference_candidate(node: Node<'_>, language: Language) -> bool {
     if !is_reference_candidate_kind(node.kind()) {
         return false;
@@ -621,6 +687,7 @@ fn is_reference_candidate_kind(kind: &str) -> bool {
             | "simple_name"
             | "identifier_token"
             | "operator_identifier"
+            | "operator"
     )
 }
 
@@ -816,13 +883,29 @@ fn ruby_bare_call_identifier(node: Node<'_>) -> bool {
             .is_some_and(|parent| parent.kind() == "body_statement")
 }
 
+fn ruby_callable_object_call(node: Node<'_>) -> bool {
+    node.kind() == "call"
+        && node.child_by_field_name("receiver").is_some()
+        && node.child_by_field_name("operator").is_some()
+        && node.child_by_field_name("method").is_none()
+        && node.child_by_field_name("arguments").is_some()
+}
+
+fn ruby_exact_bare_call_identifier(node: Node<'_>) -> bool {
+    node.kind() == "identifier"
+        && !node.parent().is_some_and(|parent| {
+            parent.kind() == "call" && parent.child_by_field_name("method") == Some(node)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
 
     use super::{
-        call_reference_range_for_call, call_reference_ranges_in_tree, call_signature_context,
-        call_site_syntax_for_reference,
+        ExactCallReference, ExactCallReferenceGap, call_reference_range_for_call,
+        call_reference_ranges_in_tree, call_signature_context, call_site_syntax_for_reference,
+        exact_call_reference_for_call,
     };
     use crate::analyzer::ruby::structural::RUBY_STRUCTURAL_SPEC;
     use crate::analyzer::structural::extract::extract_file_facts;
@@ -1103,6 +1186,160 @@ object Calls {
         assert_eq!(
             &source[site.range.start_byte..site.range.end_byte],
             "target"
+        );
+    }
+
+    #[test]
+    fn exact_ruby_call_spans_use_the_terminal_callee_for_every_ordinary_form() {
+        let source = r#"def caller(service)
+  bare_target
+  parenthesized(1)
+  command 2
+  service.received(3)
+  service&.safe_call(4)
+  Service::scoped(5)
+  with_block(6) { block_only() }
+  with_do 7 do
+    do_only()
+  end
+end
+"#;
+        let file = file("calls.rb");
+        let tree =
+            parse_tree_for_language(&file, Language::Ruby, source).expect("Ruby syntax tree");
+
+        for (call, callee) in [
+            ("bare_target", "bare_target"),
+            ("parenthesized(1)", "parenthesized"),
+            ("command 2", "command"),
+            ("service.received(3)", "received"),
+            ("service&.safe_call(4)", "safe_call"),
+            ("Service::scoped(5)", "scoped"),
+            ("with_block(6) { block_only() }", "with_block"),
+            ("with_do 7 do\n    do_only()\n  end", "with_do"),
+        ] {
+            let reference =
+                call_reference_range_for_call(&tree, Language::Ruby, &byte_range(source, call))
+                    .unwrap_or_else(|| panic!("missing exact Ruby call reference for `{call}`"));
+            assert_eq!(
+                &source[reference.start_byte..reference.end_byte],
+                callee,
+                "wrong exact Ruby callee for `{call}`"
+            );
+        }
+
+        assert!(
+            call_reference_range_for_call(
+                &tree,
+                Language::Ruby,
+                &byte_range(source, "parenthesized")
+            )
+            .is_none(),
+            "the callee token alone is not the exact span of a wrapped call"
+        );
+    }
+
+    #[test]
+    fn exact_ruby_operator_calls_and_callable_objects_keep_their_structured_shape() {
+        let source = r#"def caller(obj, callable)
+  obj.+(1)
+  obj.[](2)
+  callable.(3)
+end
+"#;
+        let file = file("operators.rb");
+        let tree =
+            parse_tree_for_language(&file, Language::Ruby, source).expect("Ruby syntax tree");
+
+        for (call, callee) in [("obj.+(1)", "+"), ("obj.[](2)", "[]")] {
+            let reference =
+                call_reference_range_for_call(&tree, Language::Ruby, &byte_range(source, call))
+                    .unwrap_or_else(|| {
+                        panic!("missing exact Ruby operator reference for `{call}`")
+                    });
+            assert_eq!(
+                &source[reference.start_byte..reference.end_byte],
+                callee,
+                "wrong exact Ruby operator callee for `{call}`"
+            );
+        }
+
+        assert_eq!(
+            exact_call_reference_for_call(
+                &tree,
+                Language::Ruby,
+                &byte_range(source, "callable.(3)")
+            ),
+            Some(ExactCallReference::Unsupported(
+                ExactCallReferenceGap::RubyCallableObject
+            ))
+        );
+    }
+
+    #[test]
+    fn ruby_outgoing_candidates_stop_at_nested_execution_boundaries() {
+        let outer = r#"class Outer
+  setup()
+  around() do
+    nested_block()
+  end
+
+  class Nested
+    nested_class()
+  end
+
+  class << self
+    nested_singleton()
+  end
+
+  BEGIN { begin_only() }
+  END { end_only() }
+
+  local_value = 1
+  consume(local_value)
+  finish()
+end"#;
+        let source = format!("{outer}\n");
+        let file = file("boundaries.rb");
+        let tree =
+            parse_tree_for_language(&file, Language::Ruby, &source).expect("Ruby syntax tree");
+
+        let names_in = |range: Range| {
+            call_reference_ranges_in_tree(&tree, Language::Ruby, &range, 20)
+                .into_iter()
+                .map(|range| source[range.start_byte..range.end_byte].to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            names_in(byte_range(&source, outer)),
+            vec!["setup", "around", "consume", "finish"]
+        );
+        assert_eq!(
+            names_in(byte_range(&source, "do\n    nested_block()\n  end")),
+            vec!["nested_block"]
+        );
+        assert_eq!(
+            names_in(byte_range(
+                &source,
+                "class Nested\n    nested_class()\n  end"
+            )),
+            vec!["nested_class"]
+        );
+        assert_eq!(
+            names_in(byte_range(
+                &source,
+                "class << self\n    nested_singleton()\n  end"
+            )),
+            vec!["nested_singleton"]
+        );
+        assert_eq!(
+            names_in(byte_range(&source, "BEGIN { begin_only() }")),
+            vec!["begin_only"]
+        );
+        assert_eq!(
+            names_in(byte_range(&source, "END { end_only() }")),
+            vec!["end_only"]
         );
     }
 
