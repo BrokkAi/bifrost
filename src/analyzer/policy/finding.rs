@@ -1666,7 +1666,7 @@ pub struct PolicyFinding {
 
 impl PolicyFinding {
     #[allow(clippy::too_many_arguments)]
-    pub fn try_new(
+    pub(crate) fn try_new(
         policy_id: PolicyId,
         policy_hash: PolicySemanticHash,
         severity: FindingSeverity,
@@ -2094,7 +2094,7 @@ pub struct PolicyRun {
 
 impl PolicyRun {
     #[allow(clippy::too_many_arguments)]
-    pub fn try_new(
+    pub(crate) fn try_new(
         policy_id: PolicyId,
         policy_hash: PolicySemanticHash,
         analysis_type: PolicyAnalysisType,
@@ -2128,13 +2128,13 @@ impl PolicyRun {
         }
         tighten_vec(&mut findings);
 
+        diagnostics.sort_by(compare_policy_diagnostics);
+        diagnostics.dedup();
         if diagnostics.len() > budget.max_diagnostics() {
             return Err(PolicyRunError::TooManyDiagnostics {
                 max: budget.max_diagnostics(),
             });
         }
-        diagnostics.sort_by(compare_policy_diagnostics);
-        diagnostics.dedup();
         tighten_vec(&mut diagnostics);
 
         if diagnostics_truncated && completion.is_complete() {
@@ -2613,6 +2613,39 @@ fn append_classification_refs<'a>(
     }
 }
 
+pub(crate) fn insert_policy_diagnostic_bounded(
+    diagnostics: &mut Vec<PolicyDiagnostic>,
+    diagnostic: PolicyDiagnostic,
+    max_diagnostics: usize,
+) -> bool {
+    let mut truncated = normalize_policy_diagnostics_bounded(diagnostics, max_diagnostics);
+    match diagnostics.binary_search_by(|current| compare_policy_diagnostics(current, &diagnostic)) {
+        Ok(_) => truncated,
+        Err(index) => {
+            diagnostics.insert(index, diagnostic);
+            if diagnostics.len() > max_diagnostics {
+                diagnostics.truncate(max_diagnostics);
+                truncated = true;
+            }
+            truncated
+        }
+    }
+}
+
+pub(crate) fn normalize_policy_diagnostics_bounded(
+    diagnostics: &mut Vec<PolicyDiagnostic>,
+    max_diagnostics: usize,
+) -> bool {
+    diagnostics.sort_by(compare_policy_diagnostics);
+    diagnostics.dedup();
+    if diagnostics.len() > max_diagnostics {
+        diagnostics.truncate(max_diagnostics);
+        true
+    } else {
+        false
+    }
+}
+
 fn compare_policy_diagnostics(
     left: &PolicyDiagnostic,
     right: &PolicyDiagnostic,
@@ -2941,8 +2974,7 @@ mod tests {
     use super::*;
     use crate::analyzer::policy::cvss::{
         CvssAssessment, CvssAssessmentProvenance, CvssAssessmentSet, CvssAssessmentVariant,
-        CvssAssessmentVariantId, CvssEvidenceSetHash, CvssUnscoredReason, SourceScenarioSetHash,
-        VulnerabilityIdentity,
+        CvssEvidenceSetHash, CvssUnscoredReason, SourceScenarioSetHash, VulnerabilityIdentity,
     };
     use crate::analyzer::policy::definition::{
         CvssBaseMetric, CvssVersion, PolicyAnalysis, PolicySelector, RqlpDocument,
@@ -3062,7 +3094,6 @@ mod tests {
         )
         .unwrap();
         let variant = CvssAssessmentVariant::try_new(
-            CvssAssessmentVariantId::from_bytes([3; 32]),
             vulnerability,
             source_scenarios,
             false,
@@ -3632,5 +3663,45 @@ mod tests {
             .unwrap_err(),
             PolicyRunError::CompletionDoesNotReflectDiagnostics
         );
+    }
+
+    #[test]
+    fn bounded_diagnostic_insertion_deduplicates_before_applying_the_cap() {
+        let diagnostic = |message: &str| {
+            PolicyDiagnostic::try_new(
+                PolicyDiagnosticCode::EvaluationFailure,
+                PolicyDiagnosticSeverity::Warning,
+                PolicyDiagnosticImpact::RunIncomplete,
+                message,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        let mut retained = Vec::new();
+        assert!(!insert_policy_diagnostic_bounded(
+            &mut retained,
+            diagnostic("same cause"),
+            1,
+        ));
+        assert!(!insert_policy_diagnostic_bounded(
+            &mut retained,
+            diagnostic("same cause"),
+            1,
+        ));
+        assert_eq!(retained.len(), 1);
+
+        retained.clear();
+        assert!(!insert_policy_diagnostic_bounded(
+            &mut retained,
+            diagnostic("z cause"),
+            1,
+        ));
+        assert!(insert_policy_diagnostic_bounded(
+            &mut retained,
+            diagnostic("a cause"),
+            1,
+        ));
+        assert_eq!(retained[0].message(), "a cause");
     }
 }

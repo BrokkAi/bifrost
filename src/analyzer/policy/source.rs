@@ -476,6 +476,7 @@ struct Decoder {
     local_taint_entry_ids: HashSet<String>,
     classification_combination_refs: Vec<(FindingCombinationId, Range<usize>)>,
     classification_expectation_refs: Vec<(TypestateExpectationId, Range<usize>)>,
+    combination_classification_ranges: Vec<Range<usize>>,
     selector_paths: HashSet<String>,
 }
 
@@ -488,6 +489,7 @@ impl Decoder {
             local_taint_entry_ids: HashSet::new(),
             classification_combination_refs: Vec::new(),
             classification_expectation_refs: Vec::new(),
+            combination_classification_ranges: Vec::new(),
             selector_paths: HashSet::new(),
         }
     }
@@ -592,6 +594,15 @@ impl Decoder {
             .get("classification")
             .map(|value| self.decode_classification(value, analysis_kind, "/classification"))
             .transpose()?;
+        if classification.is_none()
+            && let Some(range) = self.combination_classification_ranges.first()
+        {
+            return Err(source_error(
+                "combination-classification-without-fallback",
+                range.clone(),
+                "finding-combination add-classifications requires a top-level classification fallback",
+            ));
+        }
         self.validate_classification_references(&analysis)?;
         let report = fields
             .get("report")
@@ -1582,6 +1593,10 @@ impl Decoder {
                     .collect(),
             });
             let dependency_path = format!("{path}/{}", json_pointer_segment(id.as_str()));
+            if let Some(item) = fields.get("add-classifications") {
+                self.combination_classification_ranges
+                    .push(item.range.clone());
+            }
             result.push(FindingCombinationSpec {
                 id,
                 source: self.decode_endpoint_predicate(fields.required("source"), context)?,
@@ -4292,6 +4307,21 @@ mod tests {
 
     #[test]
     fn validates_classification_and_precedence_references_at_exact_tokens() {
+        let classification_without_fallback = taint_policy(
+            r#":finding-combinations [(finding-combination :id specific
+              :source (categories :all [input]) :sink (categories :all [sink])
+              :message "M"
+              :add-classifications [(classification-id :taxonomy "CWE" :id "CWE-20")])]"#,
+        );
+        let error = parse(&classification_without_fallback)
+            .unwrap_err()
+            .diagnostic;
+        assert_eq!(error.code, "combination-classification-without-fallback");
+        assert_eq!(
+            &classification_without_fallback[error.range],
+            r#"[(classification-id :taxonomy "CWE" :id "CWE-20")]"#
+        );
+
         let missing_combination = r#"(policy :id "test.reference" :name "Reference" :message "M"
           :severity warning :analysis (analysis :type taint :mode may
             :sources (endpoint-set) :sinks (endpoint-set))

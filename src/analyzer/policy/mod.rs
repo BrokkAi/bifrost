@@ -15,12 +15,16 @@ mod format;
 mod future_evidence;
 mod identity;
 mod loading;
+mod projection;
 mod registry;
 mod report;
 mod resolved;
 mod retained;
 pub mod schema;
 mod source;
+
+#[cfg(test)]
+mod adapter_seam_tests;
 
 pub use crate::schema_version::{SchemaInference, SchemaVersionOrigin, SchemaVersionResolution};
 pub use budget::*;

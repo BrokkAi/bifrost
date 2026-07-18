@@ -1,8 +1,14 @@
 //! Schema-version-1 CVSS evidence and assessment report values.
 //!
-//! This module validates and canonically normalizes already established CVSS
-//! facts. It intentionally does not select overlays, reduce evidence, build
-//! vectors, or calculate scores.
+//! Public callers can provide typed authoring and overlay inputs, but only the
+//! crate-owned reducer can seal evidence, scores, and coherent variant IDs.
+
+mod identity;
+mod policy_evidence;
+mod reduction;
+mod vector;
+
+pub(crate) use reduction::{CvssFindingProjection, reduce_cvss_for_finding};
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -39,7 +45,7 @@ const SELECTED_VARIANT_RATIONALE: &str =
 const UNSCORED_VARIANT_RATIONALE: &str = "no complete scored variant";
 
 macro_rules! define_digest {
-    ($name:ident) => {
+    ($name:ident, $constructor_visibility:vis) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name([u8; 32]);
 
@@ -47,7 +53,7 @@ macro_rules! define_digest {
             /// Wrap a digest produced by the corresponding domain-separated
             /// identity/evidence builder. This shape layer deliberately does
             /// not derive semantic digests itself.
-            pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+            $constructor_visibility const fn from_bytes(bytes: [u8; 32]) -> Self {
                 Self(bytes)
             }
 
@@ -79,11 +85,14 @@ macro_rules! define_digest {
     };
 }
 
-define_digest!(CvssEvidenceContentHash);
-define_digest!(CvssEvidenceSetHash);
-define_digest!(VulnerabilityIdentity);
-define_digest!(CvssAssessmentVariantId);
-define_digest!(SourceScenarioSetHash);
+// Adapter-supplied hashes stay publicly constructible because the projection
+// DTOs verify them in `try_normalized` before reduction. Reducer-owned report
+// identities deliberately do not expose a public byte-wrapping authority.
+define_digest!(CvssEvidenceContentHash, pub);
+define_digest!(CvssEvidenceSetHash, pub(crate));
+define_digest!(VulnerabilityIdentity, pub(crate));
+define_digest!(CvssAssessmentVariantId, pub(self));
+define_digest!(SourceScenarioSetHash, pub);
 
 /// The provenance family of one established metric fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -109,6 +118,8 @@ pub struct CvssMetricEvidence {
     value: CvssMetricValue,
     basis: CvssEvidenceBasis,
     evidence_refs: Vec<EvidenceRef>,
+    #[serde(skip)]
+    evidence_refs_truncated: bool,
     rationale: String,
     assumptions: Vec<String>,
     assessor_or_tool: String,
@@ -126,7 +137,36 @@ impl CvssMetricEvidence {
         metric: CvssMetric,
         value: CvssMetricValue,
         basis: CvssEvidenceBasis,
+        evidence_refs: Vec<EvidenceRef>,
+        rationale: String,
+        assumptions: Vec<String>,
+        assessor_or_tool: String,
+        assessed_at: Option<String>,
+        system_scope: CvssEvidenceScope,
+        content_hash: CvssEvidenceContentHash,
+    ) -> Result<Self, CvssValidationError> {
+        Self::try_new_retained(
+            metric,
+            value,
+            basis,
+            evidence_refs,
+            false,
+            rationale,
+            assumptions,
+            assessor_or_tool,
+            assessed_at,
+            system_scope,
+            content_hash,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_new_retained(
+        metric: CvssMetric,
+        value: CvssMetricValue,
+        basis: CvssEvidenceBasis,
         mut evidence_refs: Vec<EvidenceRef>,
+        evidence_refs_truncated: bool,
         rationale: String,
         mut assumptions: Vec<String>,
         assessor_or_tool: String,
@@ -151,7 +191,7 @@ impl CvssMetricEvidence {
                 actual: system_scope,
             });
         }
-        normalize_evidence_refs(&mut evidence_refs, true)
+        normalize_evidence_refs(&mut evidence_refs, !evidence_refs_truncated)
             .map_err(CvssValidationError::EvidenceReferences)?;
         validate_required_text(&rationale, MAX_REPORT_PROSE_BYTES)
             .map_err(|reason| CvssValidationError::InvalidRationale { reason })?;
@@ -170,6 +210,7 @@ impl CvssMetricEvidence {
             value,
             basis,
             evidence_refs,
+            evidence_refs_truncated,
             rationale,
             assumptions,
             assessor_or_tool,
@@ -193,6 +234,13 @@ impl CvssMetricEvidence {
 
     pub fn evidence_refs(&self) -> &[EvidenceRef] {
         &self.evidence_refs
+    }
+
+    pub(crate) fn retain_evidence_refs(&mut self, retained: &[EvidenceRef]) {
+        let original_len = self.evidence_refs.len();
+        self.evidence_refs
+            .retain(|reference| retained.binary_search(reference).is_ok());
+        self.evidence_refs_truncated |= self.evidence_refs.len() != original_len;
     }
 
     pub fn rationale(&self) -> &str {
@@ -220,11 +268,12 @@ impl CvssMetricEvidence {
     }
 
     fn validate(&self) -> Result<(), CvssValidationError> {
-        Self::try_new(
+        Self::try_new_retained(
             self.metric,
             self.value,
             self.basis,
             self.evidence_refs.clone(),
+            self.evidence_refs_truncated,
             self.rationale.clone(),
             self.assumptions.clone(),
             self.assessor_or_tool.clone(),
@@ -286,14 +335,14 @@ pub enum CvssUnscoredReason {
 }
 
 impl CvssUnscoredReason {
-    pub fn conflicting_metric_evidence(
+    pub(crate) fn conflicting_metric_evidence(
         metric: CvssMetric,
         evidence_set_hash: CvssEvidenceSetHash,
         mut evidence_refs: Vec<EvidenceRef>,
         evidence_refs_truncated: bool,
         omitted_evidence_refs_lower_bound: u64,
     ) -> Result<Self, CvssValidationError> {
-        normalize_evidence_refs(&mut evidence_refs, true)
+        normalize_evidence_refs(&mut evidence_refs, !evidence_refs_truncated)
             .map_err(CvssValidationError::EvidenceReferences)?;
         validate_truncation(
             "conflicting_metric_evidence.evidence_refs",
@@ -309,7 +358,7 @@ impl CvssUnscoredReason {
         })
     }
 
-    pub fn incoherent_scenario(
+    pub(crate) fn incoherent_scenario(
         scenario_set_hash: SourceScenarioSetHash,
         mut scenario_ids: Vec<SourceScenarioId>,
         scenario_ids_truncated: bool,
@@ -401,8 +450,7 @@ impl CvssComponentResult {
         score: f64,
         severity: CvssSeverity,
     ) -> Result<Self, CvssValidationError> {
-        validate_cvss_vector(&vector)?;
-        validate_score(score, severity)?;
+        vector::validate_component_values(nomenclature, &vector, score, severity)?;
         Ok(Self {
             nomenclature,
             vector,
@@ -488,7 +536,7 @@ pub struct CvssAssessmentProvenance {
 }
 
 impl CvssAssessmentProvenance {
-    pub fn try_new(
+    pub(crate) fn try_new(
         reducer: String,
         mut evidence_refs: Vec<EvidenceRef>,
         mut overlay_scopes: Vec<PolicyOverlayScope>,
@@ -498,14 +546,14 @@ impl CvssAssessmentProvenance {
             .map_err(|reason| CvssValidationError::InvalidReducer { reason })?;
         normalize_evidence_refs(&mut evidence_refs, false)
             .map_err(CvssValidationError::EvidenceReferences)?;
+        overlay_scopes.sort();
+        overlay_scopes.dedup();
         if overlay_scopes.len() > MAX_CVSS_OVERLAYS {
             return Err(CvssValidationError::TooManyItems {
                 field: "cvss_provenance.overlay_scopes",
                 max: MAX_CVSS_OVERLAYS,
             });
         }
-        overlay_scopes.sort();
-        overlay_scopes.dedup();
         content_hashes.sort();
         content_hashes.dedup();
         if content_hashes.len() > MAX_CVSS_EVIDENCE_RECORDS {
@@ -558,7 +606,7 @@ pub struct CvssAssessmentSet {
 }
 
 impl CvssAssessmentSet {
-    pub fn try_new(
+    pub(crate) fn try_new(
         mut variants: Vec<CvssAssessmentVariant>,
         selected_for_display: Option<CvssAssessmentVariantId>,
     ) -> Result<Self, CvssValidationError> {
@@ -582,6 +630,10 @@ impl CvssAssessmentSet {
         let has_scored = variants
             .iter()
             .any(|variant| matches!(variant.assessment, CvssAssessment::Scored { .. }));
+        let expected_selection = deterministic_display_selection(&variants);
+        if selected_for_display != expected_selection {
+            return Err(CvssValidationError::IncorrectSelection);
+        }
         let selection_rationale = if has_scored {
             let selected = selected_for_display.ok_or(CvssValidationError::MissingSelection)?;
             let selected_variant = variants
@@ -616,6 +668,29 @@ impl CvssAssessmentSet {
 
     pub fn selection_rationale(&self) -> Option<&str> {
         self.selection_rationale.as_deref()
+    }
+
+    /// Severity of the deterministic scored display winner. All-unscored
+    /// assessment sets deliberately return `None` so policy severity can use
+    /// its authored fallback without treating missing evidence as a score.
+    pub(crate) fn selected_severity(&self) -> Option<CvssSeverity> {
+        let selected = self.selected_for_display?;
+        let variant = self
+            .variants
+            .iter()
+            .find(|variant| variant.id == selected)?;
+        let CvssAssessment::Scored {
+            nomenclature,
+            components,
+            ..
+        } = &variant.assessment
+        else {
+            return None;
+        };
+        components
+            .iter()
+            .find(|component| component.nomenclature == *nomenclature)
+            .map(|component| component.severity)
     }
 
     pub(crate) fn append_evidence_refs<'a>(&'a self, output: &mut Vec<&'a EvidenceRef>) {
@@ -672,8 +747,7 @@ pub struct CvssAssessmentVariant {
 
 impl CvssAssessmentVariant {
     #[allow(clippy::too_many_arguments)]
-    pub fn try_new(
-        id: CvssAssessmentVariantId,
+    pub(crate) fn try_new(
         vulnerability_identity: VulnerabilityIdentity,
         mut source_scenarios: Vec<SourceScenarioId>,
         source_scenarios_truncated: bool,
@@ -698,6 +772,11 @@ impl CvssAssessmentVariant {
         witness_refs.sort();
         witness_refs.dedup();
         assessment.validate()?;
+        let id = identity::variant_id(
+            vulnerability_identity,
+            source_scenario_set_hash,
+            &assessment,
+        );
         Ok(Self {
             id,
             vulnerability_identity,
@@ -749,7 +828,6 @@ impl CvssAssessmentVariant {
 
     fn validate(&self) -> Result<(), CvssValidationError> {
         Self::try_new(
-            self.id,
             self.vulnerability_identity,
             self.source_scenarios.clone(),
             self.source_scenarios_truncated,
@@ -853,6 +931,11 @@ impl CvssAssessment {
         if !all_base_metrics_established(&metrics) {
             return Err(CvssValidationError::IncompleteScoredBaseMetrics);
         }
+        let expected_nomenclature =
+            vector::validate_scored_vectors(&vector, &components, &metrics)?;
+        if nomenclature != expected_nomenclature {
+            return Err(CvssValidationError::MissingNamedComponent { nomenclature });
+        }
         Ok(Self::Scored {
             version,
             nomenclature,
@@ -863,7 +946,7 @@ impl CvssAssessment {
         })
     }
 
-    pub fn unscored(
+    pub(crate) fn unscored(
         version: CvssVersion,
         mut established: Vec<CvssMetricEvidence>,
         mut missing_base_metrics: Vec<CvssBaseMetric>,
@@ -900,6 +983,14 @@ impl CvssAssessment {
 
     pub const fn is_scored(&self) -> bool {
         matches!(self, Self::Scored { .. })
+    }
+
+    fn metric_evidence(&self) -> impl Iterator<Item = &CvssMetricEvidence> {
+        let values = match self {
+            Self::Scored { metrics, .. } => metrics,
+            Self::Unscored { established, .. } => established,
+        };
+        values.iter()
     }
 
     fn append_evidence_refs<'a>(&'a self, output: &mut Vec<&'a EvidenceRef>) {
@@ -1160,6 +1251,7 @@ pub enum CvssValidationError {
     DanglingSelection,
     SelectedVariantIsUnscored,
     UnexpectedUnscoredSelection,
+    IncorrectSelection,
 }
 
 impl fmt::Display for CvssValidationError {
@@ -1274,6 +1366,9 @@ impl fmt::Display for CvssValidationError {
             Self::UnexpectedUnscoredSelection => {
                 formatter.write_str("an all-unscored CVSS set cannot select a display variant")
             }
+            Self::IncorrectSelection => formatter.write_str(
+                "CVSS display selection does not match the deterministic score/vector/id winner",
+            ),
         }
     }
 }
@@ -1384,6 +1479,42 @@ fn validate_score(score: f64, severity: CvssSeverity) -> Result<(), CvssValidati
         return Err(CvssValidationError::ScoreSeverityMismatch { score, severity });
     }
     Ok(())
+}
+
+fn deterministic_display_selection(
+    variants: &[CvssAssessmentVariant],
+) -> Option<CvssAssessmentVariantId> {
+    variants
+        .iter()
+        .filter_map(|variant| {
+            let CvssAssessment::Scored {
+                vector, components, ..
+            } = variant.assessment()
+            else {
+                return None;
+            };
+            let component = components
+                .iter()
+                .max_by_key(|component| nomenclature_completeness(component.nomenclature()))?;
+            Some((variant, component.score(), vector))
+        })
+        .min_by(
+            |(left, left_score, left_vector), (right, right_score, right_vector)| {
+                right_score
+                    .total_cmp(left_score)
+                    .then_with(|| left_vector.cmp(right_vector))
+                    .then_with(|| left.id().cmp(&right.id()))
+            },
+        )
+        .map(|(variant, _, _)| variant.id())
+}
+
+const fn nomenclature_completeness(value: CvssNomenclature) -> u8 {
+    match value {
+        CvssNomenclature::B => 0,
+        CvssNomenclature::BT | CvssNomenclature::BE => 1,
+        CvssNomenclature::BTE => 2,
+    }
 }
 
 const fn basis_allows_metric(basis: CvssEvidenceBasis, metric: CvssMetric) -> bool {
@@ -1901,19 +2032,18 @@ mod tests {
     }
 
     #[test]
-    fn provenance_bounds_overlay_input_before_deduplication() {
-        assert!(matches!(
-            CvssAssessmentProvenance::try_new(
-                "bifrost.cvss-v4".to_string(),
-                Vec::new(),
-                vec![PolicyOverlayScope::AllFindings; MAX_CVSS_OVERLAYS + 1],
-                Vec::new(),
-            ),
-            Err(CvssValidationError::TooManyItems {
-                field: "cvss_provenance.overlay_scopes",
-                max: MAX_CVSS_OVERLAYS,
-            })
-        ));
+    fn provenance_bounds_unique_overlay_scopes_after_normalization() {
+        let provenance = CvssAssessmentProvenance::try_new(
+            "bifrost.cvss-v4".to_string(),
+            Vec::new(),
+            vec![PolicyOverlayScope::AllFindings; MAX_CVSS_OVERLAYS + 1],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            provenance.overlay_scopes(),
+            &[PolicyOverlayScope::AllFindings]
+        );
     }
 
     #[test]
@@ -1954,7 +2084,6 @@ mod tests {
         )
         .unwrap();
         let variant = CvssAssessmentVariant::try_new(
-            CvssAssessmentVariantId::from_bytes([2; 32]),
             VulnerabilityIdentity::from_bytes([3; 32]),
             Vec::new(),
             false,
@@ -1965,13 +2094,17 @@ mod tests {
             assessment,
         )
         .unwrap();
-        let set = CvssAssessmentSet::try_new(
-            vec![variant],
-            Some(CvssAssessmentVariantId::from_bytes([2; 32])),
-        )
-        .unwrap();
+        let selected = variant.id();
+        let set = CvssAssessmentSet::try_new(vec![variant], Some(selected)).unwrap();
         assert_eq!(set.variants().len(), 1);
         assert_eq!(set.selection_rationale(), Some(SELECTED_VARIANT_RATIONALE));
+        assert_eq!(set.selected_severity(), Some(CvssSeverity::Critical));
+        let mut tampered = set.variants()[0].clone();
+        tampered.id = CvssAssessmentVariantId::from_bytes([99; 32]);
+        assert!(matches!(
+            tampered.validate(),
+            Err(CvssValidationError::NonCanonicalVariant)
+        ));
 
         let unscored = CvssAssessment::unscored(
             CvssVersion::V4_0,
@@ -1981,9 +2114,22 @@ mod tests {
             provenance(),
         )
         .unwrap();
-        let json = serde_json::to_value(unscored).unwrap();
+        let json = serde_json::to_value(&unscored).unwrap();
         assert_eq!(json["type"], "unscored");
         assert_eq!(json["missing_base_metrics"], json!(["AV", "SA"]));
+        let unscored_variant = CvssAssessmentVariant::try_new(
+            VulnerabilityIdentity::from_bytes([6; 32]),
+            Vec::new(),
+            false,
+            0,
+            SourceScenarioSetHash::from_bytes([7; 32]),
+            Vec::new(),
+            false,
+            unscored,
+        )
+        .unwrap();
+        let unscored_set = CvssAssessmentSet::try_new(vec![unscored_variant], None).unwrap();
+        assert_eq!(unscored_set.selected_severity(), None);
     }
 
     #[test]

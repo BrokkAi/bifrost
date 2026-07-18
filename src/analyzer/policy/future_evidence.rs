@@ -1,11 +1,11 @@
 //! Schema-version-1 taint and typestate evidence plus the #824 projection handoff.
 //!
-//! The projection structs in this module are the deliberate public adapter
-//! boundary. Their fields are public so the future analysis adapter can remain
-//! independent of policy reporting, but values are not trusted until
-//! `try_normalized` has validated every identity/hash relationship and applied
-//! canonical ordering. Report evidence has private fields and can only be
-//! constructed through the validated constructors below.
+//! This module owns the normalized fact and final evidence shapes. The actual
+//! adapter handoff is the sealed, crate-private authority/envelope boundary in
+//! `projection`: raw adapters cannot construct public findings or runs. Facts
+//! remain reusable reducer inputs, but authority validation joins them to one
+//! exact loaded policy before the private report-evidence constructors below
+//! can be called.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -30,7 +30,9 @@ use super::finding_identity::{
     OpaqueFindingKey, SourceScenarioId, StableIdentityDerivation, StableSemanticIdentity,
     TypestateScenarioId, WitnessId,
 };
-use super::identity::{EndpointAnalysisProjectionHash, EndpointSemanticHash};
+use super::identity::{
+    EndpointAnalysisProjectionHash, EndpointSemanticHash, TypestateAuthoringProjectionHash,
+};
 use super::resolved::{ResolvedCatalogIdentity, ResolvedEndpointIdentity};
 use super::retained::{RetainedSize, retained_extra};
 
@@ -563,7 +565,7 @@ pub struct TaintOriginEvidence {
 }
 
 impl TaintOriginEvidence {
-    pub fn try_new(
+    pub(crate) fn try_new(
         source_endpoint: ResolvedEndpointIdentity,
         source_label: TaintLabel,
         source_evidence: Option<TaintSourceEvidence>,
@@ -652,7 +654,7 @@ pub struct TaintFindingEvidence {
 
 impl TaintFindingEvidence {
     #[allow(clippy::too_many_arguments)]
-    pub fn try_new(
+    pub(crate) fn try_new(
         analysis_finding_id: AnalysisFindingId,
         anchor: TaintFindingAnchor,
         sink: AnalysisEventRef,
@@ -757,14 +759,13 @@ impl TaintFindingEvidence {
             }
         }
         tighten_vec(&mut origins);
-        let evidence_ref_count = origins.iter().try_fold(0_usize, |total, origin| {
-            total
-                .checked_add(origin.evidence_refs.len())
-                .ok_or(FutureEvidenceError::TooManyItems {
-                    field: "origin_evidence_refs",
-                    max_items: budget.max_evidence_refs_per_finding(),
-                })
-        })?;
+        let mut evidence_refs = origins
+            .iter()
+            .flat_map(|origin| origin.evidence_refs.iter().cloned())
+            .collect::<Vec<_>>();
+        evidence_refs.sort();
+        evidence_refs.dedup();
+        let evidence_ref_count = evidence_refs.len();
         if evidence_ref_count > budget.max_evidence_refs_per_finding() {
             return Err(FutureEvidenceError::TooManyItems {
                 field: "origin_evidence_refs",
@@ -1019,10 +1020,13 @@ impl RetainedSize for ResolvedTypestateTerminal {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[must_use = "projection facts must be normalized and validated before policy reduction"]
 pub struct TypestatePolicyProjectionFacts {
+    #[serde(serialize_with = "serialize_display_value")]
+    pub authoring_projection_hash: TypestateAuthoringProjectionHash,
     pub protocol_hash: TypestateProtocolHash,
     pub binding_plan_hash: TypestateBindingPlanHash,
     pub source_endpoint: ResolvedEndpointIdentity,
     pub source_endpoint_hash: EndpointSemanticHash,
+    pub source_endpoint_analysis_projection_hash: EndpointAnalysisProjectionHash,
     pub source_categories: Vec<PolicyCategoryId>,
     pub source_display_name: String,
     pub violation_site: Option<StableSemanticIdentity>,
@@ -1032,13 +1036,23 @@ pub struct TypestatePolicyProjectionFacts {
     pub semantic_hash: TypestateProjectionFactsHash,
 }
 
+fn serialize_display_value<T, S>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+where
+    T: fmt::Display,
+    S: Serializer,
+{
+    serializer.collect_str(value)
+}
+
 impl TypestatePolicyProjectionFacts {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
+        authoring_projection_hash: TypestateAuthoringProjectionHash,
         protocol_hash: TypestateProtocolHash,
         binding_plan_hash: TypestateBindingPlanHash,
         source_endpoint: ResolvedEndpointIdentity,
         source_endpoint_hash: EndpointSemanticHash,
+        source_endpoint_analysis_projection_hash: EndpointAnalysisProjectionHash,
         source_categories: Vec<PolicyCategoryId>,
         source_display_name: String,
         violation_site: Option<StableSemanticIdentity>,
@@ -1047,10 +1061,12 @@ impl TypestatePolicyProjectionFacts {
         budget: &PolicyBudget,
     ) -> Result<Self, FutureEvidenceError> {
         let mut value = Self {
+            authoring_projection_hash,
             protocol_hash,
             binding_plan_hash,
             source_endpoint,
             source_endpoint_hash,
+            source_endpoint_analysis_projection_hash,
             source_categories,
             source_display_name,
             violation_site,
@@ -1320,7 +1336,7 @@ pub struct TypestateFindingEvidence {
 
 impl TypestateFindingEvidence {
     #[allow(clippy::too_many_arguments)]
-    pub fn try_new(
+    pub(crate) fn try_new(
         analysis_finding_id: AnalysisFindingId,
         anchor: TypestateFindingAnchor,
         protocol_hash: TypestateProtocolHash,
@@ -1741,15 +1757,9 @@ fn taint_source_content_hash(fact: &TaintSourceProjectionFact) -> CvssEvidenceCo
     let mut hasher = CanonicalHasher::new(CVSS_STATIC_EVIDENCE_DOMAIN);
     hash_endpoint_identity(&mut hasher, &fact.source_endpoint);
     hasher.field(
-        "source_endpoint_semantic_hash",
-        fact.source_endpoint_semantic_hash.as_bytes(),
-    );
-    hasher.field(
         "source_endpoint_analysis_projection_hash",
         fact.source_endpoint_analysis_projection_hash.as_bytes(),
     );
-    hasher.field("source_display_name", fact.source_display_name.as_bytes());
-    hash_string_ids(&mut hasher, "source_categories", &fact.source_categories);
     hasher.field("source_label", fact.source_label.as_str().as_bytes());
     hash_taint_source_evidence(&mut hasher, fact.source_evidence.as_ref());
     hasher.sequence(
@@ -1758,7 +1768,6 @@ fn taint_source_content_hash(fact: &TaintSourceProjectionFact) -> CvssEvidenceCo
         |hasher, scenario| hasher.value(scenario.as_str().as_bytes()),
     );
     hasher.field("scenario_set_hash", fact.scenario_set_hash.as_bytes());
-    hasher.field("evidence_ref", fact.evidence_ref.as_str().as_bytes());
     CvssEvidenceContentHash::from_bytes(hasher.finish())
 }
 
@@ -1806,12 +1815,20 @@ fn typestate_projection_facts_hash(
     facts: &TypestatePolicyProjectionFacts,
 ) -> TypestateProjectionFactsHash {
     let mut hasher = CanonicalHasher::new(TYPESTATE_PROJECTION_FACTS_DOMAIN);
+    hasher.field(
+        "authoring_projection_hash",
+        facts.authoring_projection_hash.as_bytes(),
+    );
     hasher.field("protocol_hash", facts.protocol_hash.as_bytes());
     hasher.field("binding_plan_hash", facts.binding_plan_hash.as_bytes());
     hash_endpoint_identity(&mut hasher, &facts.source_endpoint);
     hasher.field(
         "source_endpoint_hash",
         facts.source_endpoint_hash.as_bytes(),
+    );
+    hasher.field(
+        "source_endpoint_analysis_projection_hash",
+        facts.source_endpoint_analysis_projection_hash.as_bytes(),
     );
     hash_string_ids(&mut hasher, "source_categories", &facts.source_categories);
     hasher.field("source_display_name", facts.source_display_name.as_bytes());
@@ -1824,7 +1841,7 @@ fn typestate_projection_facts_hash(
     TypestateProjectionFactsHash(hasher.finish())
 }
 
-fn typestate_violation_hash(
+pub(crate) fn typestate_violation_hash(
     violation: &TypestateViolationEvidence,
     violation_site: &StableSemanticIdentity,
     scenario_set_hash: TypestateScenarioSetHash,
@@ -2524,10 +2541,12 @@ mod tests {
 
     fn typestate_projection() -> TypestatePolicyProjectionFacts {
         TypestatePolicyProjectionFacts::try_new(
+            TypestateAuthoringProjectionHash::from_bytes([4; 32]),
             TypestateProtocolHash::from_canonical_bytes(b"protocol"),
             TypestateBindingPlanHash::from_canonical_bytes(b"bindings"),
             endpoint("subject"),
             EndpointSemanticHash::from_bytes([5; 32]),
+            EndpointAnalysisProjectionHash::from_bytes([6; 32]),
             vec![PolicyCategoryId::new("resource").unwrap()],
             "resource handle".to_string(),
             Some(stable_identity(
@@ -2609,6 +2628,52 @@ mod tests {
 
         let empty = SourceScenarioSetHash::try_from_scenarios(Vec::new()).unwrap();
         assert_eq!(empty, empty_source_scenario_set_hash());
+    }
+
+    #[test]
+    fn static_witness_hash_excludes_presentation_and_policy_assertion_fields() {
+        let base = source_fact("source-a", "untrusted", "request body", &["path-a"]);
+        let presentation_changed = TaintSourceProjectionFact::try_new(
+            base.source_endpoint.clone(),
+            EndpointSemanticHash::from_bytes([9; 32]),
+            base.source_endpoint_analysis_projection_hash,
+            "renamed request body".to_string(),
+            vec![PolicyCategoryId::new("different.category").unwrap()],
+            base.source_label.clone(),
+            base.source_evidence.clone(),
+            base.source_scenario_ids.clone(),
+            base.evidence_ref.clone(),
+        )
+        .unwrap();
+        assert_eq!(base.content_hash, presentation_changed.content_hash);
+
+        let evidence_ref_changed = TaintSourceProjectionFact::try_new(
+            base.source_endpoint.clone(),
+            base.source_endpoint_semantic_hash,
+            base.source_endpoint_analysis_projection_hash,
+            base.source_display_name.clone(),
+            base.source_categories.clone(),
+            base.source_label.clone(),
+            base.source_evidence.clone(),
+            base.source_scenario_ids.clone(),
+            EvidenceRef::try_new("renamed-feed", "same-static-fact").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(base.content_hash, evidence_ref_changed.content_hash);
+
+        let analysis_changed = TaintSourceProjectionFact::try_new(
+            base.source_endpoint.clone(),
+            base.source_endpoint_semantic_hash,
+            EndpointAnalysisProjectionHash::from_bytes([8; 32]),
+            base.source_display_name.clone(),
+            base.source_categories.clone(),
+            base.source_label.clone(),
+            base.source_evidence.clone(),
+            base.source_scenario_ids.clone(),
+            base.evidence_ref.clone(),
+        )
+        .unwrap();
+        assert_ne!(base.content_hash, analysis_changed.content_hash);
     }
 
     #[test]
@@ -3044,6 +3109,74 @@ mod tests {
             serde_json::to_value(valid).unwrap()["source_scenario_set_hash"],
             json!(projection.source_facts[0].scenario_set_hash.to_string())
         );
+    }
+
+    #[test]
+    fn taint_finding_counts_shared_origin_evidence_refs_once() {
+        let projection = taint_projection(vec![source_fact(
+            "source",
+            "untrusted",
+            "source",
+            &["path-a", "path-b"],
+        )]);
+        let fact = &projection.source_facts[0];
+        let anchor = TaintFindingAnchor::strong(
+            stable_identity(StableIdentityDerivation::CanonicalAstIdentity, "sink-call"),
+            fact.source_endpoint_analysis_projection_hash,
+            projection.sink_endpoint_analysis_projection_hash,
+            fact.scenario_set_hash,
+        )
+        .unwrap();
+        let origins = fact
+            .source_scenario_ids
+            .iter()
+            .map(|scenario| {
+                TaintOriginEvidence::try_new(
+                    fact.source_endpoint.clone(),
+                    fact.source_label.clone(),
+                    fact.source_evidence.clone(),
+                    PolicySourceLocation::artifact(
+                        WorkspaceRelativePath::new("src/source.rs").unwrap(),
+                    ),
+                    scenario.clone(),
+                    vec![fact.evidence_ref.clone()],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let budget = PolicyBudget::builder()
+            .with_max_evidence_refs_per_finding(1)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let evidence = TaintFindingEvidence::try_new(
+            AnalysisFindingId::try_new("taint", "finding").unwrap(),
+            anchor,
+            AnalysisEventRef::try_new("taint", "sink-event").unwrap(),
+            fact.source_endpoint.clone(),
+            projection.sink_endpoint.clone(),
+            fact.source_display_name.clone(),
+            projection.sink_display_name.clone(),
+            fact.source_categories.clone(),
+            projection.sink_categories.clone(),
+            None,
+            projection.sink_tags.clone(),
+            projection.sink_impacts.clone(),
+            projection.reached_source_labels.clone(),
+            origins,
+            false,
+            fact.source_scenario_ids.clone(),
+            false,
+            0,
+            fact.scenario_set_hash,
+            Vec::new(),
+            false,
+            projection.semantic_hash,
+            &budget,
+        )
+        .unwrap();
+        assert_eq!(evidence.origins().len(), 2);
     }
 
     #[test]

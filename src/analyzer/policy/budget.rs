@@ -18,6 +18,7 @@ const MAX_DIAGNOSTICS: usize = 256;
 const MAX_RELATED_LOCATIONS_PER_FINDING: usize = 64;
 const MAX_EVIDENCE_REFS_PER_FINDING: usize = 256;
 const MAX_EVIDENCE_BYTES_PER_FINDING: usize = 64 * 1024;
+const MAX_ORIGINS_PER_FINDING: usize = 256;
 const MAX_WITNESSES_PER_FINDING: usize = 64;
 const MAX_WITNESS_STEPS: usize = 1_024;
 const MAX_WITNESS_BYTES: usize = 1024 * 1024;
@@ -43,6 +44,7 @@ pub struct PolicyBudget {
     max_related_locations_per_finding: usize,
     max_evidence_refs_per_finding: usize,
     max_evidence_bytes_per_finding: usize,
+    max_origins_per_finding: usize,
     max_witnesses_per_finding: usize,
     max_witness_steps: usize,
     max_witness_bytes: usize,
@@ -69,6 +71,7 @@ impl Default for PolicyBudget {
             max_related_locations_per_finding: MAX_RELATED_LOCATIONS_PER_FINDING,
             max_evidence_refs_per_finding: MAX_EVIDENCE_REFS_PER_FINDING,
             max_evidence_bytes_per_finding: MAX_EVIDENCE_BYTES_PER_FINDING,
+            max_origins_per_finding: MAX_ORIGINS_PER_FINDING,
             // These are host hard caps.  The effective witness limits are the
             // minimum of these values and the authored PolicyReportOptions.
             max_witnesses_per_finding: MAX_WITNESSES_PER_FINDING,
@@ -112,6 +115,10 @@ impl PolicyBudget {
 
     pub const fn max_evidence_bytes_per_finding(&self) -> usize {
         self.max_evidence_bytes_per_finding
+    }
+
+    pub const fn max_origins_per_finding(&self) -> usize {
+        self.max_origins_per_finding
     }
 
     pub const fn max_witnesses_per_finding(&self) -> usize {
@@ -214,6 +221,7 @@ pub enum PolicyBudgetField {
     RelatedLocationsPerFinding,
     EvidenceRefsPerFinding,
     EvidenceBytesPerFinding,
+    OriginsPerFinding,
     WitnessesPerFinding,
     WitnessSteps,
     WitnessBytes,
@@ -242,6 +250,7 @@ impl PolicyBudgetField {
             Self::RelatedLocationsPerFinding => "related_locations_per_finding",
             Self::EvidenceRefsPerFinding => "evidence_refs_per_finding",
             Self::EvidenceBytesPerFinding => "evidence_bytes_per_finding",
+            Self::OriginsPerFinding => "origins_per_finding",
             Self::WitnessesPerFinding => "witnesses_per_finding",
             Self::WitnessSteps => "witness_steps",
             Self::WitnessBytes => "witness_bytes",
@@ -378,6 +387,12 @@ impl PolicyBudgetBuilder {
         max_evidence_bytes_per_finding,
         EvidenceBytesPerFinding,
         MAX_EVIDENCE_BYTES_PER_FINDING
+    );
+    policy_budget_setter!(
+        with_max_origins_per_finding,
+        max_origins_per_finding,
+        OriginsPerFinding,
+        MAX_ORIGINS_PER_FINDING
     );
     policy_budget_setter!(
         with_max_witnesses_per_finding,
@@ -520,6 +535,7 @@ mod tests {
         assert_eq!(budget.max_related_locations_per_finding(), 64);
         assert_eq!(budget.max_evidence_refs_per_finding(), 256);
         assert_eq!(budget.max_evidence_bytes_per_finding(), 64 * 1024);
+        assert_eq!(budget.max_origins_per_finding(), 256);
         assert_eq!(budget.max_witnesses_per_finding(), 64);
         assert_eq!(budget.max_witness_steps(), 1_024);
         assert_eq!(budget.max_witness_bytes(), 1024 * 1024);
@@ -557,6 +573,8 @@ mod tests {
             .with_max_evidence_refs_per_finding(0)
             .unwrap()
             .with_max_evidence_bytes_per_finding(0)
+            .unwrap()
+            .with_max_origins_per_finding(0)
             .unwrap()
             .with_max_witnesses_per_finding(0)
             .unwrap()
@@ -624,6 +642,11 @@ mod tests {
         assert!(
             PolicyBudget::builder()
                 .with_max_evidence_bytes_per_finding(MAX_EVIDENCE_BYTES_PER_FINDING + 1)
+                .is_err()
+        );
+        assert!(
+            PolicyBudget::builder()
+                .with_max_origins_per_finding(MAX_ORIGINS_PER_FINDING + 1)
                 .is_err()
         );
         assert!(
