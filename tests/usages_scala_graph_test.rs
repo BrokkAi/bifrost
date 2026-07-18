@@ -1363,6 +1363,7 @@ object Use {
   def nested(v: model.CompletionValue.Workspace | model.CompletionValue.Extension |
       model.CompletionValue.Interpolator | model.CompletionValue.ImplicitClass): Option[String] =
     v.insertText
+  def concrete(v: model.CompletionValue.Interpolator): Option[String] = v.insertText
   def unsupported(v: Workspace | Unrelated): Option[String] = v.insertText
   def duplicate(v: Duplicate | Extension): Option[String] = v.insertText
 }
@@ -1380,7 +1381,9 @@ object CompletionValue {
   object Symbolic
   class Workspace extends Symbolic
   class Extension extends Symbolic
-  class Interpolator extends Symbolic
+  class Interpolator extends Symbolic {
+    override val insertText: Option[String] = Some("interpolated")
+  }
   class ImplicitClass extends CompletionValue
 }
 class Unrelated

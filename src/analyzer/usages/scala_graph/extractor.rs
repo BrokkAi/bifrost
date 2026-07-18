@@ -1102,19 +1102,29 @@ fn receiver_binding_matches(node: Node<'_>, qualifier: &str, ctx: &ScanCtx<'_>) 
     if !member_call_arity_matches(node, ctx) {
         return false;
     }
-    ctx.bindings
-        .resolve_symbol(qualifier)
+    let resolution = ctx.bindings.resolve_symbol(qualifier);
+    if let Some(targets) = resolution
         .as_precise()
-        .is_some_and(|targets| {
-            !targets.is_empty()
-                && targets
-                    .iter()
-                    .all(|target| receiver_owner_matches_target_family(target, ctx))
-        })
-        || ctx
-            .visibility
-            .receiver_fq_name_for(qualifier)
-            .is_some_and(|owner_fq_name| ctx.spec.receiver_owner_fq_matches(owner_fq_name))
+        .filter(|targets| !targets.is_empty())
+    {
+        // Multiple precise receiver owners originate from a parser-proven union type. Scala
+        // selects a member shared by every alternative through their common ancestor; a
+        // compatible field override on one alternative does not erase that inherited family.
+        if targets.len() > 1 {
+            return targets
+                .iter()
+                .all(|target| receiver_owner_inherits_target_family(target, ctx));
+        }
+        if targets
+            .iter()
+            .all(|target| receiver_owner_matches_target_family(target, ctx))
+        {
+            return true;
+        }
+    }
+    ctx.visibility
+        .receiver_fq_name_for(qualifier)
+        .is_some_and(|owner_fq_name| ctx.spec.receiver_owner_fq_matches(owner_fq_name))
 }
 
 fn receiver_owner_matches_target_family(owner_fq_name: &str, ctx: &ScanCtx<'_>) -> bool {
@@ -1136,6 +1146,25 @@ fn receiver_owner_matches_target_family(owner_fq_name: &str, ctx: &ScanCtx<'_>) 
         return false;
     };
     receiver_owner_resolves_to_method_family(owner, ctx)
+}
+
+fn receiver_owner_inherits_target_family(owner_fq_name: &str, ctx: &ScanCtx<'_>) -> bool {
+    let mut owners = ctx
+        .scala
+        .definitions(owner_fq_name)
+        .filter(|unit| unit.is_class());
+    let Some(owner) = owners.next() else {
+        return false;
+    };
+    if owners.next().is_some() {
+        return false;
+    }
+    ctx.spec.owner_fq_matches(owner_fq_name)
+        || ctx
+            .scala
+            .get_ancestors(&owner)
+            .iter()
+            .any(|ancestor| ctx.spec.owner_fq_matches(&ancestor.fq_name()))
 }
 
 fn receiver_owner_resolves_to_method_family(owner: CodeUnit, ctx: &ScanCtx<'_>) -> bool {
