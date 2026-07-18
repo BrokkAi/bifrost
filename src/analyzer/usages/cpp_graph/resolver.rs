@@ -1263,7 +1263,8 @@ impl VisibilityIndex {
         target: &CodeUnit,
     ) -> Option<CodeUnit> {
         let mut current = candidate.clone();
-        let mut matched_target = same_visible_symbol(&current, target);
+        let mut matched_target = same_visible_symbol(&current, target)
+            || self.compatible_primary_template_redeclarations(&current, target);
         let mut seen = HashSet::default();
         loop {
             if !seen.insert(current.clone()) {
@@ -1285,8 +1286,30 @@ impl VisibilityIndex {
                 return matched_target.then(|| target.clone());
             };
             current = next;
-            matched_target |= same_visible_symbol(&current, target);
+            matched_target |= same_visible_symbol(&current, target)
+                || self.compatible_primary_template_redeclarations(&current, target);
         }
+    }
+
+    fn compatible_primary_template_redeclarations(
+        &self,
+        left: &CodeUnit,
+        right: &CodeUnit,
+    ) -> bool {
+        let (Some(left_metadata), Some(right_metadata)) = (
+            self.cpp_template_metadata.get(left),
+            self.cpp_template_metadata.get(right),
+        ) else {
+            return false;
+        };
+        left_metadata.primary_fq_name == right_metadata.primary_fq_name
+            && left_metadata.specialization_arguments.is_empty()
+            && right_metadata.specialization_arguments.is_empty()
+            && cpp_reconcile_primary_template_parameters(
+                &[(left, left_metadata), (right, right_metadata)],
+                right,
+            )
+            .is_some()
     }
 
     fn resolve_unique_type_for_declaration(
@@ -4435,6 +4458,28 @@ mod tests {
         assert_eq!(
             first_type_spec.type_scan_key(),
             duplicate_type_spec.type_scan_key()
+        );
+
+        let divergent_signature = CodeUnit::with_signature(
+            ProjectFile::new(root.clone(), "definition.h"),
+            CodeUnitType::Class,
+            "gfx",
+            "Size",
+            Some("<typename Value>".to_string()),
+            false,
+        );
+        let divergent_signature_spec = TargetSpec::new(
+            divergent_signature.clone(),
+            TargetKind::Type,
+            Some(divergent_signature),
+            "Size".to_string(),
+            None,
+            None,
+        );
+        assert_ne!(
+            first_type_spec.type_scan_key(),
+            divergent_signature_spec.type_scan_key(),
+            "#803 requires each divergent physical target spec to remain independently scanned"
         );
 
         let other_namespace = CodeUnit::with_signature(

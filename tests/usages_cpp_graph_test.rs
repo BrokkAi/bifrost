@@ -2027,6 +2027,211 @@ void hidden_call(GURL& value, GURL& other) {
 }
 
 #[test]
+fn authoritative_cpp_primary_template_redeclarations_route_inverse_types_in_either_target_order() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"#pragma once
+namespace dep {
+template <typename T, int N = 0> class Box;
+class Owner {};
+template <typename T> class KindConflict;
+template <typename T> class ArityConflict;
+template <typename T> class Specialized;
+}
+"#,
+        )
+        .file(
+            "types_def.h",
+            r#"#pragma once
+#include "types.h"
+namespace dep {
+template <typename Value, int Count> class Box {};
+template <int Value> class KindConflict {};
+template <typename Value, typename Extra> class ArityConflict {};
+template <typename Value> class Specialized {};
+template <typename Value> class Specialized<Value*> {};
+}
+"#,
+        )
+        .file(
+            "use.h",
+            r#"#pragma once
+#include "types_def.h"
+namespace app {
+class Consumer {
+ public:
+  void qualified(dep::Box<int> value); // positive-qualified
+  void nested(dep::Box<dep::Owner> value); // positive-nested-template
+  void incompatible_kind(dep::KindConflict<int> value); // negative-kind
+  void incompatible_arity(dep::ArityConflict<int> value); // negative-arity
+  void primary_specialized(dep::Specialized<int> value); // negative-partial-target
+};
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_all_declarations();
+    let physical_targets = |fq_name: &str| {
+        let mut targets = declarations
+            .iter()
+            .filter(|unit| unit.kind() == CodeUnitType::Class && unit.fq_name() == fq_name)
+            .cloned()
+            .collect::<Vec<_>>();
+        targets.sort_by_key(|unit| slash_path(unit.source()));
+        targets
+    };
+    let box_targets = physical_targets("dep.Box");
+    assert_eq!(
+        box_targets.len(),
+        2,
+        "physical Box targets: {box_targets:#?}"
+    );
+    assert!(
+        box_targets.iter().any(|unit| {
+            unit.signature() == Some("<typename T, int N = 0>")
+                && slash_path(unit.source()) == "types.h"
+        }) && box_targets.iter().any(|unit| {
+            unit.signature() == Some("<typename Value, int Count>")
+                && slash_path(unit.source()) == "types_def.h"
+        }),
+        "the fixture must retain divergent physical signatures and alpha-renamed parameters: {box_targets:#?}"
+    );
+
+    let consumer = project.file("use.h");
+    let source = consumer.read_to_string().expect("consumer source");
+    let qualified = fixture_token_range(
+        &source,
+        "  void qualified(dep::Box<int> value); // positive-qualified",
+        "Box",
+    );
+    let nested = fixture_token_range(
+        &source,
+        "  void nested(dep::Box<dep::Owner> value); // positive-nested-template",
+        "Box",
+    );
+    for range in [qualified, nested] {
+        let line_start = source[..range.0]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "use.h".to_string(),
+                    line: Some(
+                        source[..range.0]
+                            .bytes()
+                            .filter(|byte| *byte == b'\n')
+                            .count()
+                            + 1,
+                    ),
+                    column: Some(source[line_start..range.0].chars().count() + 1),
+                }],
+            },
+        )
+        .results
+        .into_iter()
+        .next()
+        .expect("one Box forward result");
+        assert_eq!(forward.status, "resolved", "{forward:#?}");
+        assert_eq!(
+            forward
+                .definitions
+                .iter()
+                .map(|definition| definition.path.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["types.h", "types_def.h"]),
+            "forward lookup must retain both compatible physical Box targets: {forward:#?}"
+        );
+    }
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let covers = |hits: &BTreeSet<brokk_bifrost::usages::UsageHit>, range: (usize, usize)| {
+        hits.iter().any(|hit| {
+            hit.file == consumer && hit.start_offset <= range.0 && range.1 <= hit.end_offset
+        })
+    };
+
+    for targets in [
+        [box_targets[0].clone(), box_targets[1].clone()],
+        [box_targets[1].clone(), box_targets[0].clone()],
+    ] {
+        let query = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(&analyzer, &targets, Some(&provider), 1, 1000);
+        let FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } = query.result
+        else {
+            panic!("expected compatible primary-template success for {targets:#?}");
+        };
+        let hits = hits_by_overload
+            .get(&targets[0])
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(hits.len(), 2, "target-order Box hits: {hits:#?}");
+        assert!(covers(&hits, qualified), "missing qualified Box: {hits:#?}");
+        assert!(covers(&hits, nested), "missing nested Box: {hits:#?}");
+        assert_eq!(
+            unproven_total_by_overload
+                .get(&targets[0])
+                .copied()
+                .unwrap_or_default(),
+            0,
+            "compatible physical targets must be proven in either target order"
+        );
+    }
+
+    for (fq_name, marker) in [
+        ("dep.KindConflict", "negative-kind"),
+        ("dep.ArityConflict", "negative-arity"),
+    ] {
+        let targets = physical_targets(fq_name);
+        assert_eq!(targets.len(), 2, "physical negative targets for {fq_name}");
+        let query = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(&analyzer, &targets, Some(&provider), 1, 1000);
+        let FuzzyResult::Success {
+            hits_by_overload, ..
+        } = query.result
+        else {
+            panic!("expected conservative negative success for {fq_name}");
+        };
+        assert!(
+            hits_by_overload.values().all(|hits| hits.is_empty()),
+            "{marker} must not collapse incompatible physical primaries: {hits_by_overload:#?}"
+        );
+    }
+
+    let partial_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "dep.Specialized<Value*>"
+    });
+    let partial_query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&partial_target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = partial_query.result
+    else {
+        panic!("expected conservative partial-specialization negative");
+    };
+    assert!(
+        hits_by_overload.values().all(|hits| hits.is_empty()),
+        "a partial specialization must remain distinct from compatible physical primaries: {hits_by_overload:#?}"
+    );
+}
+
+#[test]
 fn authoritative_cpp_usage_keeps_two_direct_owner_declarations_ambiguous() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
         (
