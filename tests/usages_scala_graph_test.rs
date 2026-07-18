@@ -3272,6 +3272,121 @@ class Workflow {
 }
 
 #[test]
+fn scala_unqualified_inherited_call_resolves_package_relative_mixin() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "akka/actor/dungeon/ReceiveTimeout.scala",
+            r#"package akka.actor.dungeon
+
+object ReceiveTimeout
+
+trait ReceiveTimeout {
+  protected def checkReceiveTimeoutIfNeeded(message: Any, beforeReceive: Any): Unit = ()
+}
+"#,
+        ),
+        (
+            "akka/actor/other/OtherTimeout.scala",
+            r#"package akka.actor.other
+
+trait OtherTimeout {
+  protected def checkReceiveTimeoutIfNeeded(message: Any, beforeReceive: Any): Unit = ()
+}
+"#,
+        ),
+        (
+            "dungeon/ReceiveTimeout.scala",
+            r#"package dungeon
+
+trait ReceiveTimeout {
+  protected def checkReceiveTimeoutIfNeeded(message: Any, beforeReceive: Any): Unit = ()
+}
+"#,
+        ),
+        (
+            "akka/actor/ActorCell.scala",
+            r#"package akka.actor
+
+class ActorCell extends dungeon.ReceiveTimeout {
+  def invoke(message: Any, beforeReceive: Any): Unit = {
+    checkReceiveTimeoutIfNeeded(message, beforeReceive)
+  }
+}
+
+class ConflictedCell extends dungeon.ReceiveTimeout with other.OtherTimeout {
+  def invoke(message: Any, beforeReceive: Any): Unit = {
+    checkReceiveTimeoutIfNeeded(message, beforeReceive)
+  }
+}
+
+class DuplicateCell extends duplicate.SharedTimeout {
+  def invoke(message: Any, beforeReceive: Any): Unit = {
+    checkReceiveTimeoutIfNeeded(message, beforeReceive)
+  }
+}
+"#,
+        ),
+        (
+            "akka/actor/duplicate/First.scala",
+            r#"package akka.actor.duplicate
+trait SharedTimeout {
+  protected def checkReceiveTimeoutIfNeeded(message: Any, beforeReceive: Any): Unit = ()
+}
+"#,
+        ),
+        (
+            "akka/actor/duplicate/Second.scala",
+            r#"package akka.actor.duplicate
+trait SharedTimeout {
+  protected def checkReceiveTimeoutIfNeeded(message: Any, beforeReceive: Any): Unit = ()
+}
+"#,
+        ),
+        (
+            "unrelated/Cell.scala",
+            r#"package unrelated
+class Cell {
+  def checkReceiveTimeoutIfNeeded(message: Any, beforeReceive: Any): Unit = ()
+  def invoke(message: Any, beforeReceive: Any): Unit =
+    checkReceiveTimeoutIfNeeded(message, beforeReceive)
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(
+        &analyzer,
+        "akka.actor.dungeon.ReceiveTimeout.checkReceiveTimeoutIfNeeded",
+    );
+    let target_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    assert_hit_contains(
+        &target_hits,
+        "checkReceiveTimeoutIfNeeded(message, beforeReceive)",
+    );
+    assert_no_hit_in_enclosing(&target_hits, "akka.actor.ConflictedCell.invoke");
+    assert_no_hit_in_enclosing(&target_hits, "unrelated.Cell.invoke");
+
+    let root_package_decoy = definition(
+        &analyzer,
+        "dungeon.ReceiveTimeout.checkReceiveTimeoutIfNeeded",
+    );
+    let root_package_hits = hits(
+        UsageFinder::new()
+            .find_usages_default(&analyzer, std::slice::from_ref(&root_package_decoy)),
+    );
+    assert_no_hit_in_enclosing(&root_package_hits, "akka.actor.ActorCell.invoke");
+
+    let duplicate = definition(
+        &analyzer,
+        "akka.actor.duplicate.SharedTimeout.checkReceiveTimeoutIfNeeded",
+    );
+    let duplicate_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&duplicate)));
+    assert_no_hit_in_enclosing(&duplicate_hits, "akka.actor.DuplicateCell.invoke");
+}
+
+#[test]
 fn scala_graph_connects_class_methods_to_overrides_and_child_receivers() {
     let source = r#"
 package exact

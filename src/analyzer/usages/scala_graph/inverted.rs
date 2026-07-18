@@ -634,7 +634,42 @@ impl ProjectTypes {
             }
             scope = parent_by_child.get(parent).copied();
         }
+        if resolver.has_type_or_object_binding(first) {
+            return self.resolve_type_in_declaration_context(resolver, segments);
+        }
+        if let Some(relative) = self.resolve_package_relative_type(&state.package_name, segments) {
+            return Some(relative);
+        }
         self.resolve_type_in_declaration_context(resolver, segments)
+    }
+
+    fn resolve_package_relative_type(
+        &self,
+        package_name: &str,
+        segments: &[String],
+    ) -> Option<String> {
+        if package_name.is_empty() || segments.is_empty() {
+            return None;
+        }
+        let normalized =
+            scala_normalized_fq_name(&format!("{package_name}.{}", segments.join(".")));
+        let candidates = self
+            .index
+            .by_normalized_fqn(&normalized)
+            .iter()
+            .filter(|unit| unit.is_class())
+            .collect::<Vec<_>>();
+        let ordinary = candidates
+            .iter()
+            .copied()
+            .filter(|unit| !unit.short_name().ends_with('$'))
+            .collect::<Vec<_>>();
+        let preferred = if ordinary.is_empty() {
+            candidates
+        } else {
+            ordinary
+        };
+        (preferred.len() == 1).then(|| preferred[0].fq_name())
     }
 
     fn resolve_nested_type_segments(
