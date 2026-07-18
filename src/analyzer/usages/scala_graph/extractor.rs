@@ -17,7 +17,8 @@ use crate::analyzer::usages::scala_graph::syntax::{
     is_identifier_node, is_owner_qualified_this, is_scala_class_reference,
     is_scala_object_reference, is_terminal_stable_field_reference, member_qualifier,
     member_qualifier_node, named_argument_invocation_owner, node_text, parenthesized_arity,
-    resolve_stable_object_expression, terminal_invocation_owner_name,
+    resolve_stable_object_expression, scala_union_type_alternative_paths,
+    terminal_invocation_owner_name,
 };
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ProjectFile, Range, ScalaAnalyzer, TypeHierarchyProvider,
@@ -208,14 +209,39 @@ fn scan_call_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn companion_apply_call_is_proven(function: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
-    ctx.spec.member_name == "apply"
+    ctx.spec.accepts_companion_apply_syntax
+        && ctx.spec.owner_name.as_deref() == Some(text)
         && !has_member_qualifier(function)
         && !is_locally_shadowed(ctx, text)
         && member_call_arity_matches(function, ctx)
-        && ctx
+        && (ctx
             .visibility
             .owner_fq_name_for(text)
             .is_some_and(|owner| ctx.spec.owner_fq_matches(owner))
+            || nested_target_owner_is_lexically_visible(function, ctx))
+}
+
+fn nested_target_owner_is_lexically_visible(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(owner) = ctx.spec.owner.as_ref() else {
+        return false;
+    };
+    let Some(target_parent) = ctx.analyzer.parent_of(owner) else {
+        return false;
+    };
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    };
+    let mut current = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
+    while let Some(unit) = current {
+        if unit == target_parent {
+            return true;
+        }
+        current = ctx.analyzer.parent_of(&unit);
+    }
+    false
 }
 
 fn scan_infix_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -470,9 +496,25 @@ fn seed_parameter(parameter: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if name.is_empty() {
         return;
     }
-    let type_name = parameter
-        .child_by_field_name("type")
-        .map(|type_node| node_text(type_node, ctx.source).trim());
+    let type_node = parameter.child_by_field_name("type");
+    if let Some(type_node) = type_node
+        && let Some(paths) = scala_union_type_alternative_paths(type_node, ctx.source)
+    {
+        let owners = paths
+            .iter()
+            .map(|path| {
+                ctx.types
+                    .resolve_type_in_declaration_context(&ctx.name_resolver, path)
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(owners) = owners {
+            ctx.bindings.seed_symbol_many(name.to_string(), owners);
+        } else {
+            ctx.bindings.declare_shadow(name.to_string());
+        }
+        return;
+    }
+    let type_name = type_node.map(|type_node| node_text(type_node, ctx.source).trim());
     seed_or_shadow_typed_symbol(name, type_name, None, ctx);
 }
 
@@ -1064,14 +1106,80 @@ fn receiver_binding_matches(node: Node<'_>, qualifier: &str, ctx: &ScanCtx<'_>) 
         .resolve_symbol(qualifier)
         .as_precise()
         .is_some_and(|targets| {
-            targets
-                .iter()
-                .any(|target| ctx.spec.receiver_owner_fq_matches(target))
+            !targets.is_empty()
+                && targets
+                    .iter()
+                    .all(|target| receiver_owner_matches_target_family(target, ctx))
         })
         || ctx
             .visibility
             .receiver_fq_name_for(qualifier)
             .is_some_and(|owner_fq_name| ctx.spec.receiver_owner_fq_matches(owner_fq_name))
+}
+
+fn receiver_owner_matches_target_family(owner_fq_name: &str, ctx: &ScanCtx<'_>) -> bool {
+    let mut owners = ctx
+        .scala
+        .definitions(owner_fq_name)
+        .filter(|unit| unit.is_class());
+    let owner = owners.next();
+    if owners.next().is_some() {
+        return false;
+    }
+    if ctx.spec.receiver_owner_fq_matches(owner_fq_name) {
+        return true;
+    }
+    if ctx.spec.kind != TargetKind::Method {
+        return false;
+    }
+    let Some(owner) = owner else {
+        return false;
+    };
+    receiver_owner_resolves_to_method_family(owner, ctx)
+}
+
+fn receiver_owner_resolves_to_method_family(owner: CodeUnit, ctx: &ScanCtx<'_>) -> bool {
+    let mut level = vec![owner];
+    let mut seen = HashSet::default();
+    while !level.is_empty() {
+        let mut declaring_owners = Vec::new();
+        let mut next = Vec::new();
+        for owner in level {
+            if !seen.insert(owner.clone()) {
+                continue;
+            }
+            let member_fqn = format!(
+                "{}.{}",
+                scala_normalized_fq_name(&owner.fq_name()),
+                ctx.spec.member_name
+            );
+            let direct = ctx
+                .scala
+                .definitions(&member_fqn)
+                .filter(|member| ctx.scala.parent_of(member).as_ref() == Some(&owner))
+                .collect::<Vec<_>>();
+            if direct.iter().any(CodeUnit::is_field) {
+                return false;
+            }
+            if direct.iter().any(CodeUnit::is_function) {
+                declaring_owners.push(owner);
+            } else {
+                next.extend(ctx.scala.get_direct_ancestors(&owner));
+            }
+        }
+        if !declaring_owners.is_empty() {
+            return declaring_owners.into_iter().all(|declaring_owner| {
+                ctx.spec.owner_fq_matches(&declaring_owner.fq_name())
+                    || ctx
+                        .scala
+                        .get_ancestors(&declaring_owner)
+                        .iter()
+                        .any(|ancestor| ctx.spec.owner_fq_matches(&ancestor.fq_name()))
+            });
+        }
+        level = next;
+    }
+    false
 }
 
 fn enclosing_matches_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {

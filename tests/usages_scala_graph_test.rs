@@ -1350,6 +1350,140 @@ object Action {
 }
 
 #[test]
+fn scala_union_receiver_requires_every_structured_alternative_to_share_member_family() {
+    let consumer_source = r#"package app
+
+import model.CompletionValue.Workspace
+import model.CompletionValue.Extension
+import model.Unrelated
+import model.Duplicate
+
+object Use {
+  def imported(v: Workspace | Extension): Option[String] = v.insertText
+  def nested(v: model.CompletionValue.Workspace | model.CompletionValue.Extension |
+      model.CompletionValue.Interpolator | model.CompletionValue.ImplicitClass): Option[String] =
+    v.insertText
+  def unsupported(v: Workspace | Unrelated): Option[String] = v.insertText
+  def duplicate(v: Duplicate | Extension): Option[String] = v.insertText
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/CompletionValue.scala",
+            r#"package model
+
+sealed trait CompletionValue {
+  def insertText: Option[String] = None
+}
+object CompletionValue {
+  sealed trait Symbolic extends CompletionValue
+  object Symbolic
+  class Workspace extends Symbolic
+  class Extension extends Symbolic
+  class Interpolator extends Symbolic
+  class ImplicitClass extends CompletionValue
+}
+class Unrelated
+"#,
+        ),
+        (
+            "model/InheritedDuplicate.scala",
+            "package model\nclass Duplicate extends CompletionValue\n",
+        ),
+        (
+            "model/PlainDuplicate.scala",
+            "package model\nclass Duplicate\n",
+        ),
+        ("app/Use.scala", consumer_source),
+    ]);
+
+    let insert_text = definition(&analyzer, "model.CompletionValue.insertText");
+    let hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&insert_text)));
+    let lines = hits.iter().map(|hit| hit.line).collect::<BTreeSet<_>>();
+    assert_eq!(
+        lines,
+        BTreeSet::from([
+            line_of(consumer_source, "def imported"),
+            line_of(consumer_source, "    v.insertText"),
+        ]),
+        "only unions whose alternatives all inherit the member may resolve: {hits:#?}"
+    );
+}
+
+#[test]
+fn scala_nested_structural_owners_cover_field_apply_and_inherited_call_families() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "left/Owners.scala",
+            r#"package left
+object Outer {
+  class Base {
+    val marker: Int = 1
+    def run(value: Int): Int = value
+    def apply(value: Int): Int = value
+  }
+  class Child extends Base {
+    val inheritedField = marker
+    val inheritedCall = run(1)
+  }
+  object Factory { def apply(value: Int): Child = new Child }
+  val made = Factory(1)
+  val notAnInstanceApply = Base(1)
+}
+"#,
+        ),
+        (
+            "right/Owners.scala",
+            r#"package right
+object Outer {
+  class Base {
+    val marker: Int = 2
+    def run(value: Int): Int = value + 1
+  }
+  class Child extends Base {
+    val inheritedField = marker
+    val inheritedCall = run(2)
+  }
+  object Factory { def apply(value: Int): Child = new Child }
+  val made = Factory(2)
+}
+"#,
+        ),
+    ]);
+
+    for (target_fqn, expected) in [
+        ("left.Outer$.Base.marker", "val inheritedField = marker"),
+        ("left.Outer$.Base.run", "val inheritedCall = run(1)"),
+        ("left.Outer$.Factory$.apply", "val made = Factory(1)"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let parent = analyzer
+            .parent_of(&target)
+            .unwrap_or_else(|| panic!("missing structural parent for {target_fqn}"));
+        assert_eq!(
+            parent.source(),
+            target.source(),
+            "member ownership must preserve exact source identity"
+        );
+        let hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&hits, expected);
+        assert!(
+            hits.iter()
+                .all(|hit| hit.file.rel_path() != "right/Owners.scala"),
+            "unrelated nested owner leaked for {target_fqn}: {hits:#?}"
+        );
+    }
+
+    let instance_apply = definition(&analyzer, "left.Outer$.Base.apply");
+    let instance_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&instance_apply)),
+    );
+    assert_no_hit_contains(&instance_hits, "Base(1)");
+}
+
+#[test]
 fn scala_import_hits_ignore_unrelated_aliased_import_path() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         ("Target.scala", "package app\n\nclass Target\n"),

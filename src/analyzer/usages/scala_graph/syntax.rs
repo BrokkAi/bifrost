@@ -79,6 +79,42 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
     Some(facts)
 }
 
+/// Return the parser-derived lookup paths of every direct alternative in a
+/// Scala 3 union type. Tree-sitter represents `A | B` as an `infix_type`; only
+/// the `|` operator is flattened, so unrelated infix/compound type syntax is
+/// never reinterpreted as a union.
+pub(crate) fn scala_union_type_alternative_paths(
+    node: Node<'_>,
+    source: &str,
+) -> Option<Vec<Vec<String>>> {
+    if !is_union_type(node, source) {
+        return None;
+    }
+
+    let mut alternatives = Vec::new();
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if is_union_type(current, source) {
+            stack.push(current.child_by_field_name("right")?);
+            stack.push(current.child_by_field_name("left")?);
+            continue;
+        }
+        let path = scala_type_lookup_segments(current, source);
+        if path.is_empty() {
+            return None;
+        }
+        alternatives.push(path);
+    }
+    (!alternatives.is_empty()).then_some(alternatives)
+}
+
+fn is_union_type(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "infix_type"
+        && node
+            .child_by_field_name("operator")
+            .is_some_and(|operator| node_text(operator, source).trim() == "|")
+}
+
 fn enclosing_extension_receiver_type_path(node: Node<'_>, source: &str) -> Option<Vec<String>> {
     let mut current = node.parent();
     while let Some(ancestor) = current {

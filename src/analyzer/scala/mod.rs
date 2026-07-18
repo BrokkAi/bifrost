@@ -146,6 +146,10 @@ pub struct ScalaAnalyzer {
 crate::analyzer::impl_forward_query_provider!(ScalaAnalyzer);
 
 impl ScalaAnalyzer {
+    pub(crate) fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        self.inner.structural_parent_of(code_unit)
+    }
+
     pub(crate) fn forward_owner_facts(
         &self,
         code_unit: &CodeUnit,
@@ -448,6 +452,11 @@ impl IAnalyzer for ScalaAnalyzer {
             .into_iter()
             .filter(|child| !child.is_synthetic())
             .collect()
+    }
+
+    fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        self.structural_parent_of(code_unit)
+            .or_else(|| IAnalyzer::parent_of(&self.inner, code_unit))
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {

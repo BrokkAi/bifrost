@@ -1,4 +1,4 @@
-use super::inverted::{CachedCallableAlternatives, NameResolver};
+use super::inverted::{CachedCallableAlternatives, NameResolver, is_package_level_type};
 use crate::analyzer::usages::scala_graph::syntax::{parenthesized_arity, scala_import_path};
 use crate::analyzer::{
     CallableArity, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile,
@@ -34,6 +34,7 @@ pub(super) struct TargetSpec {
     pub(super) is_object_type: bool,
     pub(super) accepts_object_roles: bool,
     pub(super) unapplied_reference_is_unambiguous: bool,
+    pub(super) accepts_companion_apply_syntax: bool,
 }
 
 impl TargetSpec {
@@ -67,6 +68,7 @@ impl TargetSpec {
                 is_object_type,
                 accepts_object_roles,
                 unapplied_reference_is_unambiguous: false,
+                accepts_companion_apply_syntax: false,
             });
         }
 
@@ -119,6 +121,9 @@ impl TargetSpec {
                 .sum::<usize>()
                 == 1;
         let member_owners = inherited_member_owners(scala, &owner, kind, &member_name, arity);
+        let accepts_companion_apply_syntax = kind == TargetKind::Method
+            && member_name == "apply"
+            && companion_apply_owner_is_unambiguous(scala, target, owner.as_ref());
         let family_owner_fq_names = member_owners
             .family_owners
             .iter()
@@ -148,6 +153,7 @@ impl TargetSpec {
             is_object_type: false,
             accepts_object_roles: false,
             unapplied_reference_is_unambiguous,
+            accepts_companion_apply_syntax,
         })
     }
 
@@ -167,6 +173,33 @@ impl TargetSpec {
         self.owner.as_ref().map(CodeUnit::fq_name).as_deref() != Some(owner_fq_name)
             && self.family_owner_fq_names.contains(owner_fq_name)
     }
+}
+
+fn companion_apply_owner_is_unambiguous(
+    scala: &ScalaAnalyzer,
+    target: &CodeUnit,
+    owner: Option<&CodeUnit>,
+) -> bool {
+    let Some(_owner) = owner else {
+        return false;
+    };
+    if let Some(structural_owner) = scala.structural_parent_of(target) {
+        return scala
+            .project_types()
+            .type_accepts_object_roles(scala, &structural_owner);
+    }
+    let normalized_target = scala_normalized_fq_name(&target.fq_name());
+    !scala
+        .global_usage_definition_index()
+        .by_normalized_fqn(&normalized_target)
+        .iter()
+        .filter(|candidate| candidate.is_function() && *candidate != target)
+        .filter_map(|candidate| scala.structural_parent_of(candidate))
+        .any(|candidate_owner| {
+            scala
+                .project_types()
+                .type_accepts_object_roles(scala, &candidate_owner)
+        })
 }
 
 struct InheritedMemberOwners {
@@ -503,7 +536,9 @@ fn scala_declared_type_in_package(
     preferred_scala_type(
         scala
             .global_usage_definition_index()
-            .types_in_package(package_name, simple),
+            .types_in_package(package_name, simple)
+            .iter()
+            .filter(|unit| is_package_level_type(unit)),
     )
     .map(|unit| unit.fq_name())
 }
@@ -593,6 +628,10 @@ pub(in crate::analyzer::usages) fn method_call_arity_applies(
 }
 
 fn owner_of(scala: &ScalaAnalyzer, target: &CodeUnit) -> Option<CodeUnit> {
+    if let Some(owner) = scala.structural_parent_of(target) {
+        return owner.is_class().then_some(owner);
+    }
+
     if let Some((owner_short, _)) = target.short_name().rsplit_once('.') {
         let owner_fq = if target.package_name().is_empty() {
             owner_short.to_string()
@@ -757,7 +796,11 @@ impl Visibility {
         );
 
         self.owner_name_to_fq_name.retain(|name, expected| {
-            resolver.resolve_object(name).as_deref() == Some(expected.as_str())
+            resolver.resolve_object(name).is_some_and(|resolved| {
+                resolved == *expected
+                    || spec.accepts_companion_apply_syntax
+                        && scala_normalized_fq_name(&resolved) == scala_normalized_fq_name(expected)
+            })
         });
         self.owner_names
             .retain(|name| self.owner_name_to_fq_name.contains_key(name));

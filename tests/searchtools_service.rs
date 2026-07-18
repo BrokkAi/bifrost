@@ -2970,6 +2970,110 @@ object Action {
 }
 
 #[test]
+fn scan_usages_by_reference_resolves_shared_scala_union_receiver_member() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/CompletionValue.scala",
+            r#"package model
+sealed trait CompletionValue { def insertText: Option[String] = None }
+object CompletionValue {
+  sealed trait Symbolic extends CompletionValue
+  class Workspace extends Symbolic
+  class Extension extends Symbolic
+}
+class Unrelated
+"#,
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+import model.CompletionValue.Workspace
+import model.CompletionValue.Extension
+import model.Unrelated
+object Use {
+  def shared(v: Workspace | Extension): Option[String] = v.insertText
+  def rejected(v: Workspace | Unrelated): Option[String] = v.insertText
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["model.CompletionValue.insertText"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+
+    assert_eq!(usage["status"], "found", "{value}");
+    assert_eq!(usage["total_hits"], 1, "{value}");
+    assert!(
+        usage["files"][0]["hits"][0]["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("def shared")),
+        "{value}"
+    );
+}
+
+#[test]
+fn scan_usages_by_location_does_not_expose_nested_scala_type_through_wildcard_import() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "kyo/Chunk.scala",
+            r#"package kyo
+
+sealed abstract class Chunk[+A]:
+  final def dropLeft(n: Int): Chunk[A] = this
+"#,
+        )
+        .file(
+            "kyo/internal/Queue.scala",
+            r#"package kyo.internal
+
+object Queue:
+  final class Chunk
+"#,
+        )
+        .file(
+            "kyo/Channel.scala",
+            r#"package kyo
+
+import kyo.internal.*
+
+object Channel:
+  def offerAll[A](initial: Chunk[A]): Chunk[A] =
+    def loop(currentChunk: Chunk[A]): Chunk[A] =
+      currentChunk.dropLeft(1)
+
+    loop(initial)
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"kyo/Chunk.scala","line":4,"column":13}],"include_tests":true}"#,
+        )
+        .expect("location scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let usage = only_result(&value);
+    assert_eq!("found", usage["status"], "payload: {value}");
+    assert_eq!(Some(1), usage["total_hits"].as_u64(), "payload: {value}");
+    assert!(
+        usage["files"][0]["hits"][0]["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("currentChunk.dropLeft(1)")),
+        "payload: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_labels_override_declarations_and_reports_resolved_definition() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

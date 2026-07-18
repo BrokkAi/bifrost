@@ -209,6 +209,11 @@ impl ProjectTypes {
                 self,
                 &required_names,
             );
+            let parent_by_child = state
+                .children
+                .iter()
+                .flat_map(|(parent, children)| children.iter().map(move |child| (child, parent)))
+                .collect::<HashMap<_, _>>();
             for (owner, lookup_paths) in lookup_paths_by_owner {
                 if !owner.is_class() {
                     continue;
@@ -216,9 +221,13 @@ impl ProjectTypes {
                 let mut ancestors = Vec::new();
                 let mut seen = HashSet::default();
                 for path in lookup_paths {
-                    let Some(fqn) =
-                        self.resolve_type_in_declaration_context(&resolver, path.segments())
-                    else {
+                    let Some(fqn) = self.resolve_type_in_owner_context(
+                        &resolver,
+                        path.segments(),
+                        &owner,
+                        state,
+                        &parent_by_child,
+                    ) else {
                         continue;
                     };
                     if !seen.insert(fqn.clone()) {
@@ -531,7 +540,7 @@ impl ProjectTypes {
             .or_else(|| scala_builtin_type_name(type_text).map(str::to_string))
     }
 
-    fn resolve_type_in_declaration_context(
+    pub(super) fn resolve_type_in_declaration_context(
         &self,
         resolver: &NameResolver,
         segments: &[String],
@@ -587,6 +596,73 @@ impl ProjectTypes {
         let qualified = segments.join(".");
         self.type_by_normalized_fqn(&scala_normalized_fq_name(&qualified))
             .map(CodeUnit::fq_name)
+    }
+
+    fn resolve_type_in_owner_context(
+        &self,
+        resolver: &NameResolver,
+        segments: &[String],
+        owner: &CodeUnit,
+        state: &FileState,
+        parent_by_child: &HashMap<&CodeUnit, &CodeUnit>,
+    ) -> Option<String> {
+        let (first, rest) = segments.split_first()?;
+        let mut scope = parent_by_child.get(owner).copied();
+        while let Some(parent) = scope {
+            let lexical = state
+                .children
+                .get(&parent)
+                .into_iter()
+                .flatten()
+                .filter(|unit| unit.is_class() && scala_simple_type_name(unit) == *first)
+                .collect::<Vec<_>>();
+            if !lexical.is_empty() {
+                let ordinary = lexical
+                    .iter()
+                    .copied()
+                    .filter(|unit| !unit.short_name().ends_with('$'))
+                    .map(CodeUnit::fq_name)
+                    .collect::<HashSet<_>>();
+                let candidates = if ordinary.is_empty() {
+                    lexical.into_iter().map(CodeUnit::fq_name).collect()
+                } else {
+                    ordinary
+                };
+                return (candidates.len() == 1)
+                    .then(|| self.resolve_nested_type_segments(candidates, rest))
+                    .flatten();
+            }
+            scope = parent_by_child.get(parent).copied();
+        }
+        self.resolve_type_in_declaration_context(resolver, segments)
+    }
+
+    fn resolve_nested_type_segments(
+        &self,
+        mut candidates: HashSet<String>,
+        segments: &[String],
+    ) -> Option<String> {
+        for segment in segments {
+            let mut nested_candidates = HashSet::default();
+            for owner in candidates {
+                for candidate in [format!("{owner}.{segment}"), format!("{owner}.{segment}$")] {
+                    nested_candidates.extend(
+                        self.index
+                            .by_fqn(&candidate)
+                            .iter()
+                            .filter(|unit| unit.is_class())
+                            .map(CodeUnit::fq_name),
+                    );
+                }
+            }
+            if nested_candidates.is_empty() {
+                return None;
+            }
+            candidates = nested_candidates;
+        }
+        (candidates.len() == 1)
+            .then(|| candidates.into_iter().next())
+            .flatten()
     }
 
     fn has_package_prefix(&self, segments: &[String]) -> bool {
@@ -1409,7 +1485,7 @@ fn owner_fqn(unit: &CodeUnit) -> Option<String> {
     })
 }
 
-fn is_package_level_type(unit: &CodeUnit) -> bool {
+pub(super) fn is_package_level_type(unit: &CodeUnit) -> bool {
     !unit.short_name().contains('.')
 }
 
