@@ -1457,12 +1457,18 @@ fn extract_function_info(
     let declarator_name_node = declarator
         .child_by_field_name("declarator")
         .or_else(|| last_named_child(declarator))?;
-    let raw_name = normalize_cpp_whitespace(&extract_declarator_name(declarator_name_node, source));
-    if raw_name.is_empty() {
-        return None;
-    }
-
-    let (owner_path, name, package_name) = split_cpp_name(&raw_name, scope);
+    let (owner_path, name, package_name) = if let Some(parts) =
+        split_structured_templated_cpp_name(declarator_name_node, source, scope)
+    {
+        parts
+    } else {
+        let raw_name =
+            normalize_cpp_whitespace(&extract_declarator_name(declarator_name_node, source));
+        if raw_name.is_empty() {
+            return None;
+        }
+        split_cpp_name(&raw_name, scope)
+    };
     let full_text = normalize_cpp_whitespace(node_text(declarator, source));
     let suffix = full_text
         .split_once(node_text(parameters_node, source))
@@ -1619,6 +1625,99 @@ fn split_cpp_name(raw_name: &str, scope: &ScopeInfo) -> (Option<String>, String,
         .as_ref()
         .map(|parent| parent.short_name().to_string());
     (owner_path, cleaned.to_string(), package_name)
+}
+
+struct CppQualifiedNameComponent {
+    name: String,
+    is_template_id: bool,
+}
+
+fn split_structured_templated_cpp_name(
+    declarator_name: Node<'_>,
+    source: &str,
+    scope: &ScopeInfo,
+) -> Option<(Option<String>, String, String)> {
+    if declarator_name.kind() != "qualified_identifier" {
+        return None;
+    }
+
+    let mut components = Vec::new();
+    let mut current = declarator_name;
+    let mut explicitly_global = false;
+    loop {
+        if current.kind() == "qualified_identifier" {
+            if let Some(component) = current.child_by_field_name("scope") {
+                components.push(canonical_cpp_qualified_component(component, source)?);
+            } else if components.is_empty() {
+                explicitly_global = true;
+            } else {
+                return None;
+            }
+            current = current.child_by_field_name("name")?;
+        } else {
+            components.push(canonical_cpp_qualified_component(current, source)?);
+            break;
+        }
+    }
+
+    let terminal = components.pop()?;
+    let owner_start = components
+        .iter()
+        .position(|component| component.is_template_id)?;
+    let explicit_package = components[..owner_start]
+        .iter()
+        .map(|component| component.name.as_str())
+        .collect::<Vec<_>>()
+        .join("::");
+    let package_name = match (
+        explicitly_global,
+        scope.package_name.is_empty(),
+        explicit_package.is_empty(),
+    ) {
+        (true, _, _) => explicit_package,
+        (false, _, true) => scope.package_name.clone(),
+        (false, true, false) => explicit_package,
+        (false, false, false) => format!("{}::{explicit_package}", scope.package_name),
+    };
+    let owner_path = components[owner_start..]
+        .iter()
+        .map(|component| component.name.as_str())
+        .collect::<Vec<_>>()
+        .join("$");
+    if owner_path.is_empty() || terminal.name.is_empty() {
+        return None;
+    }
+
+    Some((Some(owner_path), terminal.name, package_name))
+}
+
+fn canonical_cpp_qualified_component(
+    mut component: Node<'_>,
+    source: &str,
+) -> Option<CppQualifiedNameComponent> {
+    let mut is_template_id = false;
+    loop {
+        match component.kind() {
+            "template_type" => {
+                is_template_id = true;
+                component = component.child_by_field_name("name")?;
+            }
+            "dependent_name" => component = component.named_child(0)?,
+            "identifier"
+            | "field_identifier"
+            | "namespace_identifier"
+            | "type_identifier"
+            | "operator_name"
+            | "destructor_name" => {
+                let name = normalize_cpp_whitespace(node_text(component, source));
+                return (!name.is_empty()).then_some(CppQualifiedNameComponent {
+                    name,
+                    is_template_id,
+                });
+            }
+            _ => component = component.child_by_field_name("name")?,
+        }
+    }
 }
 
 fn extract_declarator_name(node: Node<'_>, source: &str) -> String {

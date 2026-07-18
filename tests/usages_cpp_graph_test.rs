@@ -10354,3 +10354,184 @@ void exercise(base::HistogramTester& tester, base::WrongOwner& wrong) {
         BTreeSet::from([int_range])
     );
 }
+
+#[test]
+fn authoritative_cpp_templated_out_of_line_owners_use_canonical_declaration_identity() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "owners.h",
+            r#"#pragma once
+namespace demo {
+template <typename T> struct Box { void Ping(); };
+template <typename T> struct WrongBox { void Ping(); };
+
+template <typename T> struct Owner {
+    Box<T> field_;
+    void Check();
+    void GlobalCheck();
+};
+struct PlainOwner {
+    Box<float> field_;
+    void Check();
+};
+template <typename T> struct WrongOwner {
+    WrongBox<T> field_;
+    void Check();
+};
+namespace nested {
+template <typename T> struct NamespacedOwner {
+    Box<T> field_;
+    void Check();
+};
+}
+template <typename T> struct Outer {
+    struct Inner {
+        Box<T> field_;
+        void Check();
+    };
+};
+}
+namespace wrong {
+template <typename T> struct Owner {
+    demo::WrongBox<T> field_;
+    void Check();
+};
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "owners.h"
+namespace demo {
+void local_control() {
+    Box<float> local;
+    local.Ping(); // positive-local-template-receiver
+}
+void PlainOwner::Check() {
+    field_.Ping(); // positive-nontemplate-out-of-line-field
+}
+template <typename T>
+void Owner<T>::Check() {
+    field_.Ping(); // positive-template-out-of-line-field
+}
+template <typename T>
+void WrongOwner<T>::Check() {
+    field_.Ping(); // negative-wrong-owner-field
+}
+template <typename T>
+void Outer<T>::Inner::Check() {
+    field_.Ping(); // positive-nested-template-owner-field
+}
+}
+template <typename T>
+void demo::nested::NamespacedOwner<T>::Check() {
+    field_.Ping(); // positive-namespace-qualified-template-owner-field
+}
+template <typename T>
+void wrong::Owner<T>::Check() {
+    field_.Ping(); // negative-wrong-namespace-template-owner-field
+}
+template <typename T>
+void ::demo::Owner<T>::GlobalCheck() {
+    field_.Ping(); // positive-leading-global-template-owner-field
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function
+            && unit.fq_name() == "demo.Box.Ping"
+            && slash_path(unit.source()) == "owners.h"
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let expected = [
+        "    local.Ping(); // positive-local-template-receiver",
+        "    field_.Ping(); // positive-nontemplate-out-of-line-field",
+        "    field_.Ping(); // positive-template-out-of-line-field",
+        "    field_.Ping(); // positive-nested-template-owner-field",
+        "    field_.Ping(); // positive-namespace-qualified-template-owner-field",
+        "    field_.Ping(); // positive-leading-global-template-owner-field",
+    ]
+    .map(|line| fixture_token_range(&source, line, "Ping"))
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let negatives = [
+        "    field_.Ping(); // negative-wrong-owner-field",
+        "    field_.Ping(); // negative-wrong-namespace-template-owner-field",
+    ]
+    .map(|line| fixture_token_range(&source, line, "Ping"));
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let targeted_query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = targeted_query.result
+    else {
+        panic!("expected authoritative templated-owner success");
+    };
+    let targeted = hits_by_overload
+        .values()
+        .flatten()
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        targeted, expected,
+        "templated out-of-line definitions must retain their canonical declaration owner: {hits_by_overload:#?}"
+    );
+    assert!(
+        unproven_total_by_overload.values().all(|count| *count == 0),
+        "wrong owners must be proven exclusions: {unproven_total_by_overload:#?}"
+    );
+
+    let whole = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let whole_ranges = whole
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == consumer)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(whole_ranges, expected);
+    assert!(
+        negatives
+            .into_iter()
+            .all(|negative| { !targeted.contains(&negative) && !whole_ranges.contains(&negative) })
+    );
+
+    let declarations = analyzer.get_all_declarations();
+    for (fqn, template_parameter) in [
+        ("demo.Owner.Check", "<typename T>"),
+        ("demo.Owner.GlobalCheck", "<typename T>"),
+        ("demo.Outer$Inner.Check", "<typename T>"),
+        ("demo::nested.NamespacedOwner.Check", "<typename T>"),
+        ("wrong.Owner.Check", "<typename T>"),
+    ] {
+        let matching = declarations
+            .iter()
+            .filter(|unit| unit.kind() == CodeUnitType::Function && unit.fq_name() == fqn)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            2,
+            "header declaration and out-of-line definition must share {fqn}: {matching:#?}"
+        );
+        assert!(
+            matching.iter().all(|unit| unit
+                .signature()
+                .is_some_and(|signature| signature.contains(template_parameter))),
+            "canonicalizing the owner must preserve template metadata: {matching:#?}"
+        );
+    }
+}
