@@ -1,8 +1,9 @@
 mod common;
 
 use brokk_bifrost::analyzer::semantic::{
-    ControlEdgeKind, DeclarationSegmentKind, DeferredInvocationKind, IcfgEdgeKind,
-    ProcedureInvocationKind, ProcedureKind, SemanticCapability, SemanticGapKind, SemanticLanguage,
+    CallableTargetResolution, ControlEdgeKind, DeclarationSegmentKind, DeferredInvocationKind,
+    IcfgEdgeKind, ProcedureInvocationKind, ProcedureKind, SemanticCapability, SemanticEffect,
+    SemanticGapKind, SemanticGapSubject, SemanticLanguage,
 };
 use brokk_bifrost::{AnalyzerConfig, Language};
 
@@ -215,6 +216,1995 @@ fn java_direct_call_conformance() {
         caller_name: "javaRoot",
         call: "JavaLibrary.javaLeaf()",
     });
+}
+
+#[test]
+fn go_direct_call_conformance() {
+    assert_direct_call_conformance(DirectCallFixture {
+        language: Language::Go,
+        dialect: SemanticLanguage::Standard(Language::Go),
+        callee_path: "go/conformance/library.go",
+        callee_source: r#"package conformance
+
+func GoLeaf() int {
+    return 7
+}
+"#,
+        callee_declaration: "func GoLeaf() int",
+        callee_name: "GoLeaf",
+        caller_path: "go/conformance/caller.go",
+        caller_source: r#"package conformance
+
+func GoRoot() int {
+    return GoLeaf()
+}
+"#,
+        caller_declaration: "func GoRoot() int",
+        caller_name: "GoRoot",
+        call: "GoLeaf()",
+    });
+}
+
+#[test]
+fn go_functions_methods_and_func_literals_are_distinct_immediate_procedures() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "go/callables.go",
+            r#"package conformance
+
+type Counter struct{}
+
+func topLevel() {
+    topBody()
+}
+
+func (counter *Counter) Step() {
+    methodBody()
+}
+
+func outer() {
+    literal := func() {
+        literalBody()
+    }
+    _ = literal
+    outerBody()
+}
+"#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "go/callables.go");
+    graph
+        .bind(
+            "top_entry",
+            PointSelector::new("func topLevel()")
+                .procedure("topLevel")
+                .effect("entry"),
+        )
+        .bind(
+            "top_invoke",
+            PointSelector::new("topBody()")
+                .procedure("topLevel")
+                .effect("invoke"),
+        )
+        .bind(
+            "top_normal",
+            PointSelector::new("topBody()")
+                .procedure("topLevel")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "top_exceptional",
+            PointSelector::new("topBody()")
+                .procedure("topLevel")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "method_entry",
+            PointSelector::new("func (counter *Counter) Step()")
+                .procedure("Step")
+                .effect("entry"),
+        )
+        .bind(
+            "method_invoke",
+            PointSelector::new("methodBody()")
+                .procedure("Step")
+                .effect("invoke"),
+        )
+        .bind(
+            "method_normal",
+            PointSelector::new("methodBody()")
+                .procedure("Step")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "method_exceptional",
+            PointSelector::new("methodBody()")
+                .procedure("Step")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "outer_entry",
+            PointSelector::new("func outer()")
+                .procedure("outer")
+                .effect("entry"),
+        )
+        .bind(
+            "outer_invoke",
+            PointSelector::new("outerBody()")
+                .procedure("outer")
+                .effect("invoke"),
+        )
+        .bind(
+            "outer_normal",
+            PointSelector::new("outerBody()")
+                .procedure("outer")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "outer_exceptional",
+            PointSelector::new("outerBody()")
+                .procedure("outer")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "literal_entry",
+            PointSelector::new("func() {")
+                .procedure("literal")
+                .effect("entry"),
+        )
+        .bind(
+            "literal_invoke",
+            PointSelector::new("literalBody()")
+                .procedure("literal")
+                .effect("invoke"),
+        )
+        .bind(
+            "literal_normal",
+            PointSelector::new("literalBody()")
+                .procedure("literal")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "literal_exceptional",
+            PointSelector::new("literalBody()")
+                .procedure("literal")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        );
+
+    for (entry, invoke, normal, exceptional) in [
+        ("top_entry", "top_invoke", "top_normal", "top_exceptional"),
+        (
+            "method_entry",
+            "method_invoke",
+            "method_normal",
+            "method_exceptional",
+        ),
+        (
+            "outer_entry",
+            "outer_invoke",
+            "outer_normal",
+            "outer_exceptional",
+        ),
+        (
+            "literal_entry",
+            "literal_invoke",
+            "literal_normal",
+            "literal_exceptional",
+        ),
+    ] {
+        graph.assert_successors(
+            invoke,
+            &[
+                cfg_edge(normal, ControlEdgeKind::Normal),
+                cfg_edge(exceptional, ControlEdgeKind::Exceptional),
+            ],
+        );
+        graph.assert_predecessors(normal, &[cfg_edge(invoke, ControlEdgeKind::Normal)]);
+        graph.assert_predecessors(
+            exceptional,
+            &[cfg_edge(invoke, ControlEdgeKind::Exceptional)],
+        );
+        graph.assert_reachable(entry, invoke);
+    }
+    let error = graph
+        .try_bind(
+            "literal_body_in_outer",
+            PointSelector::new("literalBody()")
+                .procedure("outer")
+                .effect("invoke"),
+        )
+        .expect_err("func-literal execution must remain outside the enclosing CFG");
+    assert!(
+        error.to_string().contains("matched no semantic"),
+        "unexpected selector result: {error}"
+    );
+
+    let procedures = graph.artifact().procedures();
+    let named = |name: &str, kind: ProcedureKind| {
+        procedures
+            .iter()
+            .find(|procedure| {
+                procedure.kind() == kind
+                    && procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+            })
+            .unwrap_or_else(|| panic!("missing Go {kind:?} procedure {name}"))
+    };
+    let top = named("topLevel", ProcedureKind::Function);
+    let method = named("Step", ProcedureKind::Method);
+    let outer = named("outer", ProcedureKind::Function);
+    let literal = named("literal", ProcedureKind::Lambda);
+    assert!(top.lexical_parent().is_none());
+    assert!(method.lexical_parent().is_none());
+    assert!(outer.lexical_parent().is_none());
+    assert_eq!(literal.lexical_parent(), Some(outer.id()));
+    for procedure in [top, method, outer, literal] {
+        assert_eq!(
+            procedure.properties().invocation,
+            ProcedureInvocationKind::Immediate
+        );
+        assert!(!procedure.properties().is_async);
+        assert!(!procedure.properties().is_generator);
+    }
+
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn go_if_initializers_short_circuit_and_three_clause_loops_route_abrupt_flow() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "go/control.go",
+            r#"package conformance
+
+func branchFlow() {
+    if ready := initIf(); ready && leftCheck() || rightCheck() {
+        ifTrue()
+    } else {
+        ifFalse()
+    }
+    afterIf()
+}
+
+func loopFlow() int {
+    for index := initLoop(); loopCheck(index); index = updateLoop(index) {
+        if returnNow(index) {
+            return finish(index)
+            deadAfterReturn()
+        }
+        if breakNow(index) {
+            break
+            deadAfterBreak()
+        }
+        if continueNow(index) {
+            continue
+            deadAfterContinue()
+        }
+        loopBody(index)
+    }
+    afterLoop()
+    return 0
+    deadAfterFinalReturn()
+}
+"#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "go/control.go");
+    graph
+        .bind(
+            "branch_entry",
+            PointSelector::new("func branchFlow()")
+                .procedure("branchFlow")
+                .effect("entry"),
+        )
+        .bind(
+            "init_if_invoke",
+            PointSelector::new("initIf()")
+                .procedure("branchFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "init_if_normal",
+            PointSelector::new("initIf()")
+                .procedure("branchFlow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "init_if_exceptional",
+            PointSelector::new("initIf()")
+                .procedure("branchFlow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "ready_decision",
+            PointSelector::new("ready")
+                .occurrence(1)
+                .procedure("branchFlow")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "left_expression",
+            PointSelector::new("leftCheck()")
+                .procedure("branchFlow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "left_invoke",
+            PointSelector::new("leftCheck()")
+                .procedure("branchFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "left_normal",
+            PointSelector::new("leftCheck()")
+                .procedure("branchFlow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "left_exceptional",
+            PointSelector::new("leftCheck()")
+                .procedure("branchFlow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "left_decision",
+            PointSelector::new("leftCheck()")
+                .procedure("branchFlow")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "right_expression",
+            PointSelector::new("rightCheck()")
+                .procedure("branchFlow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "right_invoke",
+            PointSelector::new("rightCheck()")
+                .procedure("branchFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "right_normal",
+            PointSelector::new("rightCheck()")
+                .procedure("branchFlow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "right_exceptional",
+            PointSelector::new("rightCheck()")
+                .procedure("branchFlow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "right_decision",
+            PointSelector::new("rightCheck()")
+                .procedure("branchFlow")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "if_true_block",
+            PointSelector::new("ifTrue()")
+                .procedure("branchFlow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "if_true_invoke",
+            PointSelector::new("ifTrue()")
+                .procedure("branchFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "if_true_normal",
+            PointSelector::new("ifTrue()")
+                .procedure("branchFlow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "if_false_block",
+            PointSelector::new("ifFalse()")
+                .procedure("branchFlow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "if_false_invoke",
+            PointSelector::new("ifFalse()")
+                .procedure("branchFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "if_false_normal",
+            PointSelector::new("ifFalse()")
+                .procedure("branchFlow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "after_if_statement",
+            PointSelector::new("afterIf()")
+                .procedure("branchFlow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_if_invoke",
+            PointSelector::new("afterIf()")
+                .procedure("branchFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "loop_entry",
+            PointSelector::new("func loopFlow() int")
+                .procedure("loopFlow")
+                .effect("entry"),
+        )
+        .bind(
+            "init_loop_invoke",
+            PointSelector::new("initLoop()")
+                .procedure("loopFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "loop_check_invoke",
+            PointSelector::new("loopCheck(index)")
+                .procedure("loopFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "loop_condition_entry",
+            PointSelector::new("loopCheck(index)")
+                .procedure("loopFlow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "loop_check_normal",
+            PointSelector::new("loopCheck(index)")
+                .procedure("loopFlow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "loop_decision",
+            PointSelector::new("loopCheck(index)")
+                .procedure("loopFlow")
+                .outgoing_kind(ControlEdgeKind::ConditionalFalse),
+        )
+        .bind(
+            "update_statement",
+            PointSelector::new("index = updateLoop(index)")
+                .procedure("loopFlow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "update_invoke",
+            PointSelector::new("updateLoop(index)")
+                .procedure("loopFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "update_normal",
+            PointSelector::new("updateLoop(index)")
+                .procedure("loopFlow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "update_boundary",
+            PointSelector::new("index = updateLoop(index)")
+                .procedure("loopFlow")
+                .anchor_occurrence(1)
+                .outgoing_kind(ControlEdgeKind::LoopBack),
+        )
+        .bind(
+            "continue_transfer",
+            PointSelector::new("continue")
+                .procedure("loopFlow")
+                .outgoing_kind(ControlEdgeKind::LoopBack),
+        )
+        .bind(
+            "break_transfer",
+            PointSelector::new("break")
+                .procedure("loopFlow")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "return_transfer",
+            PointSelector::new("return finish(index)")
+                .procedure("loopFlow")
+                .effect("procedure_return"),
+        )
+        .bind(
+            "loop_normal_exit",
+            PointSelector::new("func loopFlow() int")
+                .procedure("loopFlow")
+                .effect("normal_exit"),
+        )
+        .bind(
+            "loop_body_invoke",
+            PointSelector::new("loopBody(index)")
+                .procedure("loopFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "loop_body_normal",
+            PointSelector::new("loopBody(index)")
+                .procedure("loopFlow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "after_loop_statement",
+            PointSelector::new("afterLoop()")
+                .procedure("loopFlow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_loop_invoke",
+            PointSelector::new("afterLoop()")
+                .procedure("loopFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "dead_after_return",
+            PointSelector::new("deadAfterReturn()")
+                .procedure("loopFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "dead_after_break",
+            PointSelector::new("deadAfterBreak()")
+                .procedure("loopFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "dead_after_continue",
+            PointSelector::new("deadAfterContinue()")
+                .procedure("loopFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "dead_after_final_return",
+            PointSelector::new("deadAfterFinalReturn()")
+                .procedure("loopFlow")
+                .effect("invoke"),
+        );
+
+    for (invoke, normal, exceptional) in [
+        ("init_if_invoke", "init_if_normal", "init_if_exceptional"),
+        ("left_invoke", "left_normal", "left_exceptional"),
+        ("right_invoke", "right_normal", "right_exceptional"),
+    ] {
+        graph.assert_successors(
+            invoke,
+            &[
+                cfg_edge(normal, ControlEdgeKind::Normal),
+                cfg_edge(exceptional, ControlEdgeKind::Exceptional),
+            ],
+        );
+    }
+    graph.assert_reachable("init_if_normal", "ready_decision");
+    graph.assert_successors(
+        "ready_decision",
+        &[
+            cfg_edge("left_expression", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("right_expression", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "left_normal",
+        &[cfg_edge("left_decision", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "right_expression",
+        &[
+            cfg_edge("ready_decision", ControlEdgeKind::ConditionalFalse),
+            cfg_edge("left_decision", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_successors(
+        "right_normal",
+        &[cfg_edge("right_decision", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("left_decision", "if_true_invoke");
+    graph.assert_reachable("right_decision", "if_true_invoke");
+    graph.assert_reachable("right_decision", "if_false_invoke");
+    graph.assert_reachable("if_true_block", "if_true_invoke");
+    graph.assert_reachable("if_false_block", "if_false_invoke");
+    graph.assert_successors(
+        "if_true_normal",
+        &[cfg_edge("after_if_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "if_false_normal",
+        &[cfg_edge("after_if_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "after_if_statement",
+        &[
+            cfg_edge("if_true_normal", ControlEdgeKind::Normal),
+            cfg_edge("if_false_normal", ControlEdgeKind::Normal),
+        ],
+    );
+    graph.assert_reachable("branch_entry", "after_if_invoke");
+
+    graph.assert_reachable("init_loop_invoke", "loop_check_invoke");
+    graph.assert_successors(
+        "loop_check_normal",
+        &[cfg_edge("loop_decision", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("loop_decision", "loop_body_invoke");
+    graph.assert_successors(
+        "continue_transfer",
+        &[cfg_edge("update_statement", ControlEdgeKind::LoopBack)],
+    );
+    graph.assert_successors(
+        "loop_body_normal",
+        &[cfg_edge("update_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("update_statement", "update_invoke");
+    graph.assert_successors(
+        "update_normal",
+        &[cfg_edge("update_boundary", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "update_boundary",
+        &[cfg_edge("loop_condition_entry", ControlEdgeKind::LoopBack)],
+    );
+    graph.assert_reachable("loop_condition_entry", "loop_check_invoke");
+    graph.assert_successors(
+        "break_transfer",
+        &[cfg_edge("after_loop_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "return_transfer",
+        &[cfg_edge("loop_normal_exit", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("loop_entry", "after_loop_invoke");
+    for dead in [
+        "dead_after_return",
+        "dead_after_break",
+        "dead_after_continue",
+        "dead_after_final_return",
+    ] {
+        graph.assert_unreachable("loop_entry", dead);
+    }
+
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn go_defer_and_spawn_evaluate_operands_without_immediate_target_calls() {
+    const SOURCE: &str = r#"package conformance
+
+func deferredTarget(value int) {}
+func spawnedTarget(value int) {}
+
+func makeDeferred() func(int) { return deferredTarget }
+func makeSpawned() func(int) { return spawnedTarget }
+func deferredArg() int { return 1 }
+func spawnedArg() int { return 2 }
+func between() {}
+func afterSchedule() {}
+
+func schedule() {
+    defer makeDeferred()(deferredArg())
+    between()
+    go makeSpawned()(spawnedArg())
+    afterSchedule()
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go/scheduling.go", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "go/scheduling.go");
+    graph
+        .bind(
+            "schedule_entry",
+            PointSelector::new("func schedule()")
+                .procedure("schedule")
+                .effect("entry"),
+        )
+        .bind(
+            "make_deferred_invoke",
+            PointSelector::new("makeDeferred()")
+                .procedure("schedule")
+                .effect("invoke"),
+        )
+        .bind(
+            "make_deferred_normal",
+            PointSelector::new("makeDeferred()")
+                .procedure("schedule")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "make_deferred_exceptional",
+            PointSelector::new("makeDeferred()")
+                .procedure("schedule")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "deferred_arg_expression",
+            PointSelector::new("deferredArg()")
+                .procedure("schedule")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "deferred_arg_invoke",
+            PointSelector::new("deferredArg()")
+                .procedure("schedule")
+                .effect("invoke"),
+        )
+        .bind(
+            "deferred_arg_normal",
+            PointSelector::new("deferredArg()")
+                .procedure("schedule")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "deferred_arg_exceptional",
+            PointSelector::new("deferredArg()")
+                .procedure("schedule")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "defer_boundary",
+            PointSelector::new("defer ")
+                .procedure("schedule")
+                .effect("gap"),
+        )
+        .bind(
+            "between_statement",
+            PointSelector::new("between()")
+                .procedure("schedule")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "between_invoke",
+            PointSelector::new("between()")
+                .procedure("schedule")
+                .effect("invoke"),
+        )
+        .bind(
+            "between_normal",
+            PointSelector::new("between()")
+                .procedure("schedule")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "make_spawned_expression",
+            PointSelector::new("makeSpawned()")
+                .procedure("schedule")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "spawn_statement",
+            PointSelector::new("go makeSpawned()(spawnedArg())")
+                .procedure("schedule")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "make_spawned_invoke",
+            PointSelector::new("makeSpawned()")
+                .procedure("schedule")
+                .effect("invoke"),
+        )
+        .bind(
+            "make_spawned_normal",
+            PointSelector::new("makeSpawned()")
+                .procedure("schedule")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "make_spawned_exceptional",
+            PointSelector::new("makeSpawned()")
+                .procedure("schedule")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "spawned_arg_expression",
+            PointSelector::new("spawnedArg()")
+                .procedure("schedule")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "spawned_arg_invoke",
+            PointSelector::new("spawnedArg()")
+                .procedure("schedule")
+                .effect("invoke"),
+        )
+        .bind(
+            "spawned_arg_normal",
+            PointSelector::new("spawnedArg()")
+                .procedure("schedule")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "spawned_arg_exceptional",
+            PointSelector::new("spawnedArg()")
+                .procedure("schedule")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "spawn_boundary",
+            PointSelector::new("go makeSpawned")
+                .procedure("schedule")
+                .effect("gap"),
+        )
+        .bind(
+            "after_schedule_statement",
+            PointSelector::new("afterSchedule()")
+                .procedure("schedule")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_schedule_invoke",
+            PointSelector::new("afterSchedule()")
+                .procedure("schedule")
+                .effect("invoke"),
+        );
+
+    for (invoke, normal, exceptional) in [
+        (
+            "make_deferred_invoke",
+            "make_deferred_normal",
+            "make_deferred_exceptional",
+        ),
+        (
+            "deferred_arg_invoke",
+            "deferred_arg_normal",
+            "deferred_arg_exceptional",
+        ),
+        (
+            "make_spawned_invoke",
+            "make_spawned_normal",
+            "make_spawned_exceptional",
+        ),
+        (
+            "spawned_arg_invoke",
+            "spawned_arg_normal",
+            "spawned_arg_exceptional",
+        ),
+    ] {
+        graph.assert_successors(
+            invoke,
+            &[
+                cfg_edge(normal, ControlEdgeKind::Normal),
+                cfg_edge(exceptional, ControlEdgeKind::Exceptional),
+            ],
+        );
+    }
+    graph.assert_successors(
+        "make_deferred_normal",
+        &[cfg_edge("deferred_arg_expression", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "deferred_arg_expression",
+        &[cfg_edge("make_deferred_normal", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "deferred_arg_normal",
+        &[cfg_edge("defer_boundary", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "defer_boundary",
+        &[cfg_edge("deferred_arg_normal", ControlEdgeKind::Normal)],
+    );
+    graph.assert_point_gap(
+        "defer_boundary",
+        SemanticCapability::DeferredExecution,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_point_gap(
+        "defer_boundary",
+        SemanticCapability::CleanupControlFlow,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_successors(
+        "defer_boundary",
+        &[cfg_edge("between_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "between_normal",
+        &[cfg_edge("spawn_statement", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "spawn_statement",
+        &[cfg_edge("make_spawned_expression", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "make_spawned_normal",
+        &[cfg_edge("spawned_arg_expression", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "spawned_arg_expression",
+        &[cfg_edge("make_spawned_normal", ControlEdgeKind::Normal)],
+    );
+    graph.assert_successors(
+        "spawned_arg_normal",
+        &[cfg_edge("spawn_boundary", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "spawn_boundary",
+        &[cfg_edge("spawned_arg_normal", ControlEdgeKind::Normal)],
+    );
+    graph.assert_point_gap(
+        "spawn_boundary",
+        SemanticCapability::ConcurrentSpawn,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_successors(
+        "spawn_boundary",
+        &[cfg_edge(
+            "after_schedule_statement",
+            ControlEdgeKind::Normal,
+        )],
+    );
+    graph.assert_reachable("schedule_entry", "after_schedule_invoke");
+
+    let schedule = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("schedule")
+        })
+        .expect("missing Go schedule procedure");
+    let snippet = |start: u32, end: u32| {
+        SOURCE
+            .get(start as usize..end as usize)
+            .expect("semantic source mapping should index the inline Go source")
+    };
+    let mut call_texts = schedule
+        .call_sites()
+        .iter()
+        .map(|call| {
+            let span = schedule
+                .source_mapping(call.source)
+                .expect("validated Go call site should retain its source mapping")
+                .locator
+                .anchor()
+                .span();
+            snippet(span.start_byte(), span.end_byte())
+        })
+        .collect::<Vec<_>>();
+    call_texts.sort_unstable();
+    assert_eq!(
+        call_texts,
+        vec![
+            "afterSchedule()",
+            "between()",
+            "deferredArg()",
+            "makeDeferred()",
+            "makeSpawned()",
+            "spawnedArg()",
+        ]
+    );
+    let mut invoke_texts = schedule
+        .points()
+        .iter()
+        .filter(|point| {
+            point
+                .events
+                .iter()
+                .any(|event| matches!(event.effect, SemanticEffect::Invoke { .. }))
+        })
+        .map(|point| {
+            let span = schedule
+                .source_mapping(point.source)
+                .expect("validated Go invoke point should retain its source mapping")
+                .locator
+                .anchor()
+                .span();
+            snippet(span.start_byte(), span.end_byte())
+        })
+        .collect::<Vec<_>>();
+    invoke_texts.sort_unstable();
+    assert_eq!(invoke_texts, call_texts);
+    assert!(!call_texts.contains(&"makeDeferred()(deferredArg())"));
+    assert!(!call_texts.contains(&"makeSpawned()(spawnedArg())"));
+
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+
+    let mut icfg = IcfgGraph::materialize(
+        &project,
+        &analyzer,
+        "go/scheduling.go",
+        PointSelector::new("func schedule()")
+            .procedure("schedule")
+            .effect("entry"),
+    );
+    icfg.bind_node(
+        "icfg_schedule_entry",
+        "go/scheduling.go",
+        PointSelector::new("func schedule()")
+            .procedure("schedule")
+            .effect("entry"),
+        root(),
+    )
+    .bind_node(
+        "icfg_after_schedule",
+        "go/scheduling.go",
+        PointSelector::new("afterSchedule()")
+            .procedure("schedule")
+            .effect("invoke"),
+        root(),
+    );
+    for target in ["deferredTarget", "spawnedTarget"] {
+        let error = icfg
+            .try_bind_node(
+                format!("unexpected_{target}_entry"),
+                "go/scheduling.go",
+                PointSelector::new(format!("func {target}(value int)"))
+                    .procedure(target)
+                    .effect("entry"),
+                root(),
+            )
+            .expect_err("defer/go target body must not be entered as an immediate call");
+        assert!(error.to_string().contains("matched 0 snapshot node"));
+    }
+    icfg.assert_outcome(IcfgOutcomeKind::Complete);
+    icfg.assert_reachable("icfg_schedule_entry", "icfg_after_schedule");
+    icfg.assert_adjacency_symmetric();
+    let rendered = icfg.render_topology();
+    assert_eq!(rendered, icfg.render_topology());
+    assert!(!rendered.contains("IcfgNodeId"));
+    assert!(!rendered.contains("IcfgEdgeId"));
+}
+
+#[test]
+fn go_range_evaluates_source_once_and_runtime_targets_each_iteration() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "go/range.go",
+            r#"package conformance
+
+func rangeFlow(sink []int) {
+    for sink[index()] = range source() {
+        rangeBody()
+    }
+    afterRange()
+}
+"#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "go/range.go");
+    graph
+        .bind(
+            "entry",
+            PointSelector::new("func rangeFlow(sink []int)")
+                .procedure("rangeFlow")
+                .effect("entry"),
+        )
+        .bind(
+            "source_invoke",
+            PointSelector::new("source()")
+                .procedure("rangeFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "source_normal",
+            PointSelector::new("source()")
+                .procedure("rangeFlow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "source_exceptional",
+            PointSelector::new("source()")
+                .procedure("rangeFlow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "range_dispatch",
+            PointSelector::new("for sink[index()] = range source()")
+                .procedure("rangeFlow")
+                .effect("gap")
+                .outgoing_kind(ControlEdgeKind::ConditionalTrue),
+        )
+        .bind(
+            "target_entry",
+            PointSelector::new("sink[index()]")
+                .procedure("rangeFlow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "target_evaluation",
+            PointSelector::new("sink[index()]")
+                .procedure("rangeFlow")
+                .effect("gap")
+                .anchor_occurrence(2),
+        )
+        .bind(
+            "index_invoke",
+            PointSelector::new("index()")
+                .procedure("rangeFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "index_normal",
+            PointSelector::new("index()")
+                .procedure("rangeFlow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "index_exceptional",
+            PointSelector::new("index()")
+                .procedure("rangeFlow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "target_binding",
+            PointSelector::new("sink[index()]")
+                .procedure("rangeFlow")
+                .effect("gap")
+                .anchor_occurrence(1)
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "body_block",
+            PointSelector::new("rangeBody()")
+                .procedure("rangeFlow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "body_invoke",
+            PointSelector::new("rangeBody()")
+                .procedure("rangeFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "body_normal",
+            PointSelector::new("rangeBody()")
+                .procedure("rangeFlow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::LoopBack),
+        )
+        .bind(
+            "after_statement",
+            PointSelector::new("afterRange()")
+                .procedure("rangeFlow")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "after_invoke",
+            PointSelector::new("afterRange()")
+                .procedure("rangeFlow")
+                .effect("invoke"),
+        );
+
+    graph.assert_successors(
+        "source_invoke",
+        &[
+            cfg_edge("source_normal", ControlEdgeKind::Normal),
+            cfg_edge("source_exceptional", ControlEdgeKind::Exceptional),
+        ],
+    );
+    graph.assert_successors(
+        "source_normal",
+        &[cfg_edge("range_dispatch", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "range_dispatch",
+        &[
+            cfg_edge("source_normal", ControlEdgeKind::Normal),
+            cfg_edge("body_normal", ControlEdgeKind::LoopBack),
+        ],
+    );
+    graph.assert_point_gap(
+        "range_dispatch",
+        SemanticCapability::Calls,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_point_gap(
+        "range_dispatch",
+        SemanticCapability::NormalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_successors(
+        "range_dispatch",
+        &[
+            cfg_edge("target_entry", ControlEdgeKind::ConditionalTrue),
+            cfg_edge("after_statement", ControlEdgeKind::ConditionalFalse),
+        ],
+    );
+    graph.assert_predecessors(
+        "target_entry",
+        &[cfg_edge("range_dispatch", ControlEdgeKind::ConditionalTrue)],
+    );
+    graph.assert_successors(
+        "target_entry",
+        &[cfg_edge("target_evaluation", ControlEdgeKind::Normal)],
+    );
+    graph.assert_reachable("target_evaluation", "index_invoke");
+    graph.assert_successors(
+        "index_invoke",
+        &[
+            cfg_edge("index_normal", ControlEdgeKind::Normal),
+            cfg_edge("index_exceptional", ControlEdgeKind::Exceptional),
+        ],
+    );
+    graph.assert_successors(
+        "index_normal",
+        &[cfg_edge("target_binding", ControlEdgeKind::Normal)],
+    );
+    graph.assert_point_gap(
+        "target_binding",
+        SemanticCapability::Calls,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_point_gap(
+        "target_binding",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_reachable("target_binding", "body_invoke");
+    graph.assert_successors(
+        "body_normal",
+        &[cfg_edge("range_dispatch", ControlEdgeKind::LoopBack)],
+    );
+    graph.assert_predecessors(
+        "after_statement",
+        &[cfg_edge(
+            "range_dispatch",
+            ControlEdgeKind::ConditionalFalse,
+        )],
+    );
+    graph.assert_reachable("entry", "after_invoke");
+    graph.assert_unreachable("after_statement", "source_invoke");
+
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn go_switch_goto_and_select_stop_at_typed_boundaries() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "go/boundaries.go",
+            r#"package conformance
+
+func switchFlow() {
+    switch selector() {
+    case 0:
+        firstCase()
+        fallthrough
+    case 1:
+        secondCase()
+    default:
+        defaultCase()
+    }
+    afterSwitch()
+}
+
+func gotoFlow() {
+    beforeGoto()
+    goto Target
+    deadAfterGoto()
+Target:
+    targetBody()
+}
+
+func selectFlow(channel chan int) {
+    select {
+    case <-channel:
+        selectedCase()
+    default:
+        selectedDefault()
+    }
+    afterSelect()
+}
+"#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "go/boundaries.go");
+    graph
+        .bind(
+            "switch_entry",
+            PointSelector::new("func switchFlow()")
+                .procedure("switchFlow")
+                .effect("entry"),
+        )
+        .bind(
+            "selector_invoke",
+            PointSelector::new("selector()")
+                .procedure("switchFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "selector_normal",
+            PointSelector::new("selector()")
+                .procedure("switchFlow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "selector_exceptional",
+            PointSelector::new("selector()")
+                .procedure("switchFlow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "switch_boundary",
+            PointSelector::new("case 0:")
+                .procedure("switchFlow")
+                .effect("gap"),
+        )
+        .bind(
+            "after_switch",
+            PointSelector::new("afterSwitch()")
+                .procedure("switchFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "goto_entry",
+            PointSelector::new("func gotoFlow()")
+                .procedure("gotoFlow")
+                .effect("entry"),
+        )
+        .bind(
+            "before_goto_invoke",
+            PointSelector::new("beforeGoto()")
+                .procedure("gotoFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "before_goto_normal",
+            PointSelector::new("beforeGoto()")
+                .procedure("gotoFlow")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "goto_boundary",
+            PointSelector::new("goto Target")
+                .procedure("gotoFlow")
+                .effect("gap"),
+        )
+        .bind(
+            "dead_after_goto",
+            PointSelector::new("deadAfterGoto()")
+                .procedure("gotoFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "target_body",
+            PointSelector::new("targetBody()")
+                .procedure("gotoFlow")
+                .effect("invoke"),
+        )
+        .bind(
+            "select_entry",
+            PointSelector::new("func selectFlow(channel chan int)")
+                .procedure("selectFlow")
+                .effect("entry"),
+        )
+        .bind(
+            "select_boundary",
+            PointSelector::new("default:\n        selectedDefault()")
+                .procedure("selectFlow")
+                .effect("gap"),
+        )
+        .bind(
+            "after_select",
+            PointSelector::new("afterSelect()")
+                .procedure("selectFlow")
+                .effect("invoke"),
+        );
+
+    graph.assert_successors(
+        "selector_invoke",
+        &[
+            cfg_edge("selector_normal", ControlEdgeKind::Normal),
+            cfg_edge("selector_exceptional", ControlEdgeKind::Exceptional),
+        ],
+    );
+    graph.assert_successors(
+        "selector_normal",
+        &[cfg_edge("switch_boundary", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "switch_boundary",
+        &[cfg_edge("selector_normal", ControlEdgeKind::Normal)],
+    );
+    graph.assert_point_gap(
+        "switch_boundary",
+        SemanticCapability::NormalControlFlow,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_point_gap(
+        "switch_boundary",
+        SemanticCapability::Calls,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_point_gap(
+        "switch_boundary",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_successors("switch_boundary", &[]);
+    graph.assert_reachable("switch_entry", "switch_boundary");
+    graph.assert_unreachable("switch_entry", "after_switch");
+    for deferred_case_call in ["firstCase()", "secondCase()", "defaultCase()"] {
+        let error = graph
+            .try_bind(
+                format!("unscheduled_{deferred_case_call}"),
+                PointSelector::new(deferred_case_call)
+                    .procedure("switchFlow")
+                    .effect("invoke"),
+            )
+            .expect_err("unsupported switch cases must not be guessed");
+        assert!(error.to_string().contains("matched no semantic"));
+    }
+
+    graph.assert_successors(
+        "before_goto_normal",
+        &[cfg_edge("goto_boundary", ControlEdgeKind::Normal)],
+    );
+    graph.assert_predecessors(
+        "goto_boundary",
+        &[cfg_edge("before_goto_normal", ControlEdgeKind::Normal)],
+    );
+    graph.assert_point_gap(
+        "goto_boundary",
+        SemanticCapability::NonLocalControl,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_successors("goto_boundary", &[]);
+    graph.assert_reachable("goto_entry", "before_goto_invoke");
+    graph.assert_unreachable("goto_entry", "dead_after_goto");
+    graph.assert_unreachable("goto_entry", "target_body");
+
+    graph.assert_point_gap(
+        "select_boundary",
+        SemanticCapability::NormalControlFlow,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_point_gap(
+        "select_boundary",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_successors("select_boundary", &[]);
+    graph.assert_reachable("select_entry", "select_boundary");
+    graph.assert_unreachable("select_entry", "after_select");
+    for deferred_case_call in ["selectedCase()", "selectedDefault()"] {
+        let error = graph
+            .try_bind(
+                format!("unscheduled_{deferred_case_call}"),
+                PointSelector::new(deferred_case_call)
+                    .procedure("selectFlow")
+                    .effect("invoke"),
+            )
+            .expect_err("unsupported select cases must not be guessed");
+        assert!(error.to_string().contains("matched no semantic"));
+    }
+
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn go_select_selected_receive_lhs_and_case_bodies_are_not_fabricated() {
+    const SOURCE: &str = r#"package conformance
+
+func selectAssignment(channel chan int, sink []int) {
+    select {
+    case sink[index()] = <-channel:
+        selectedCase()
+    default:
+        selectedDefault()
+    }
+    afterSelectAssignment()
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go/select_assignment.go", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "go/select_assignment.go");
+    graph
+        .bind(
+            "entry",
+            PointSelector::new("func selectAssignment(channel chan int, sink []int)")
+                .procedure("selectAssignment")
+                .effect("entry"),
+        )
+        .bind(
+            "select_boundary",
+            PointSelector::new("select {\n    case sink[index()] = <-channel:")
+                .procedure("selectAssignment")
+                .effect("gap"),
+        )
+        .bind(
+            "after_select",
+            PointSelector::new("afterSelectAssignment()")
+                .procedure("selectAssignment")
+                .effect("invoke"),
+        );
+
+    graph.assert_point_gap(
+        "select_boundary",
+        SemanticCapability::Calls,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_point_gap(
+        "select_boundary",
+        SemanticCapability::NormalControlFlow,
+        SemanticGapKind::Unsupported,
+    );
+    graph.assert_point_gap(
+        "select_boundary",
+        SemanticCapability::ExceptionalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_successors("select_boundary", &[]);
+    graph.assert_reachable("entry", "select_boundary");
+    graph.assert_unreachable("entry", "after_select");
+
+    for selected_only_call in ["index()", "selectedCase()", "selectedDefault()"] {
+        let error = graph
+            .try_bind(
+                format!("fabricated_{selected_only_call}"),
+                PointSelector::new(selected_only_call)
+                    .procedure("selectAssignment")
+                    .effect("invoke"),
+            )
+            .expect_err("selected-only select work must not be fabricated as eager control flow");
+        assert!(error.to_string().contains("matched no semantic"));
+    }
+
+    let procedure = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("selectAssignment")
+        })
+        .expect("missing Go selectAssignment procedure");
+    let mut call_texts = procedure
+        .call_sites()
+        .iter()
+        .map(|call| {
+            let span = procedure
+                .source_mapping(call.source)
+                .expect("validated Go call site should retain its source mapping")
+                .locator
+                .anchor()
+                .span();
+            SOURCE
+                .get(span.start_byte() as usize..span.end_byte() as usize)
+                .expect("semantic source mapping should index the inline Go source")
+        })
+        .collect::<Vec<_>>();
+    call_texts.sort_unstable();
+    assert_eq!(call_texts, vec!["afterSelectAssignment()"]);
+
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn go_unspecified_composite_element_order_is_an_explicit_gap() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file(
+            "go/unspecified_order.go",
+            r#"package conformance
+
+func mutate() int { return 1 }
+func first() int { return 1 }
+func second() int { return 2 }
+
+func unspecifiedOrder(pointer *int) []int {
+    values := []int{*pointer, mutate()}
+    return values
+}
+
+func specifiedCallOrder() []int {
+    return []int{first(), second()}
+}
+"#,
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "go/unspecified_order.go");
+    graph
+        .bind(
+            "entry",
+            PointSelector::new("func unspecifiedOrder(pointer *int) []int")
+                .procedure("unspecifiedOrder")
+                .effect("entry"),
+        )
+        .bind(
+            "order_gap",
+            PointSelector::new("[]int{*pointer, mutate()}")
+                .procedure("unspecifiedOrder")
+                .effect("gap")
+                .anchor_occurrence(0),
+        )
+        .bind(
+            "mutate_invoke",
+            PointSelector::new("mutate()")
+                .procedure("unspecifiedOrder")
+                .effect("invoke"),
+        )
+        .bind(
+            "mutate_normal",
+            PointSelector::new("mutate()")
+                .procedure("unspecifiedOrder")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "mutate_exceptional",
+            PointSelector::new("mutate()")
+                .procedure("unspecifiedOrder")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        );
+
+    graph.assert_point_gap(
+        "order_gap",
+        SemanticCapability::NormalControlFlow,
+        SemanticGapKind::Unknown,
+    );
+    graph.assert_successors(
+        "mutate_invoke",
+        &[
+            cfg_edge("mutate_normal", ControlEdgeKind::Normal),
+            cfg_edge("mutate_exceptional", ControlEdgeKind::Exceptional),
+        ],
+    );
+    graph.assert_reachable("entry", "mutate_invoke");
+
+    let error = graph
+        .try_bind(
+            "specified_call_order_gap",
+            PointSelector::new("[]int{first(), second()}")
+                .procedure("specifiedCallOrder")
+                .effect("gap")
+                .anchor_occurrence(0),
+        )
+        .expect_err("Go's lexical ordering of call-only evaluation must remain exact");
+    assert!(
+        error.to_string().contains("matched no semantic"),
+        "unexpected selector result: {error}"
+    );
+
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+}
+
+#[test]
+fn go_shadowed_panic_and_recover_remain_ordinary_location_first_calls() {
+    const SOURCE: &str = r#"package conformance
+
+func panic(value int) int { return value }
+func recover() int { return 7 }
+
+func shadowBuiltins() int {
+    return panic(recover())
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go/shadowed_builtins.go", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let mut graph = SemanticGraph::materialize(&project, &analyzer, "go/shadowed_builtins.go");
+    graph
+        .bind(
+            "caller_entry",
+            PointSelector::new("func shadowBuiltins() int")
+                .procedure("shadowBuiltins")
+                .effect("entry"),
+        )
+        .bind(
+            "recover_invoke",
+            PointSelector::new("recover()")
+                .procedure("shadowBuiltins")
+                .effect("invoke"),
+        )
+        .bind(
+            "recover_normal",
+            PointSelector::new("recover()")
+                .procedure("shadowBuiltins")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "recover_exceptional",
+            PointSelector::new("recover()")
+                .procedure("shadowBuiltins")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        )
+        .bind(
+            "panic_invoke",
+            PointSelector::new("panic(recover())")
+                .procedure("shadowBuiltins")
+                .effect("invoke"),
+        )
+        .bind(
+            "panic_normal",
+            PointSelector::new("panic(recover())")
+                .procedure("shadowBuiltins")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Normal),
+        )
+        .bind(
+            "panic_exceptional",
+            PointSelector::new("panic(recover())")
+                .procedure("shadowBuiltins")
+                .effect("call_continuation")
+                .outgoing_kind(ControlEdgeKind::Exceptional),
+        );
+
+    graph.assert_successors(
+        "recover_invoke",
+        &[
+            cfg_edge("recover_normal", ControlEdgeKind::Normal),
+            cfg_edge("recover_exceptional", ControlEdgeKind::Exceptional),
+        ],
+    );
+    graph.assert_successors(
+        "panic_invoke",
+        &[
+            cfg_edge("panic_normal", ControlEdgeKind::Normal),
+            cfg_edge("panic_exceptional", ControlEdgeKind::Exceptional),
+        ],
+    );
+    graph.assert_reachable("recover_normal", "panic_invoke");
+    graph.assert_reachable("caller_entry", "panic_normal");
+
+    let caller = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("shadowBuiltins")
+        })
+        .expect("missing Go shadowBuiltins procedure");
+    for expected_source in ["panic(recover())", "recover()"] {
+        let call = caller
+            .call_sites()
+            .iter()
+            .find(|call| {
+                let span = caller
+                    .source_mapping(call.source)
+                    .expect("validated Go call site should retain its source mapping")
+                    .locator
+                    .anchor()
+                    .span();
+                SOURCE.get(span.start_byte() as usize..span.end_byte() as usize)
+                    == Some(expected_source)
+            })
+            .unwrap_or_else(|| panic!("missing ordinary Go call site for {expected_source}"));
+        assert!(matches!(
+            call.declared_targets,
+            CallableTargetResolution::Unknown
+        ));
+        let point = caller
+            .point(call.point)
+            .expect("call-site point should remain in its procedure");
+        let gaps = point
+            .events
+            .iter()
+            .filter_map(|event| match &event.effect {
+                SemanticEffect::Gap { gap } => caller.gap(*gap),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(gaps.iter().any(|gap| {
+            gap.subject == SemanticGapSubject::Value(call.callee)
+                && gap.capability == SemanticCapability::CallableReferences
+                && gap.kind == SemanticGapKind::Unknown
+        }));
+        assert!(gaps.iter().any(|gap| {
+            gap.subject == SemanticGapSubject::CallSite(call.id)
+                && gap.capability == SemanticCapability::Calls
+                && gap.kind == SemanticGapKind::Unknown
+        }));
+    }
+
+    graph.assert_adjacency_symmetric();
+    let rendered = graph.render_topology();
+    assert_eq!(rendered, graph.render_topology());
+    assert!(!rendered.contains("ProgramPointId"));
+    assert!(!rendered.contains("ControlEdgeId"));
+
+    let mut icfg = IcfgGraph::materialize(
+        &project,
+        &analyzer,
+        "go/shadowed_builtins.go",
+        PointSelector::new("func shadowBuiltins() int")
+            .procedure("shadowBuiltins")
+            .effect("entry"),
+    );
+    icfg.bind_call(
+        "recover_call",
+        "go/shadowed_builtins.go",
+        PointSelector::new("recover()")
+            .procedure("shadowBuiltins")
+            .effect("invoke"),
+    )
+    .bind_call(
+        "panic_call",
+        "go/shadowed_builtins.go",
+        PointSelector::new("panic(recover())")
+            .procedure("shadowBuiltins")
+            .effect("invoke"),
+    )
+    .bind_node(
+        "icfg_recover_invoke",
+        "go/shadowed_builtins.go",
+        PointSelector::new("recover()")
+            .procedure("shadowBuiltins")
+            .effect("invoke"),
+        root(),
+    )
+    .bind_node(
+        "recover_entry",
+        "go/shadowed_builtins.go",
+        PointSelector::new("func recover() int")
+            .procedure("recover")
+            .effect("entry"),
+        ["recover_call"],
+    )
+    .bind_node(
+        "recover_exit",
+        "go/shadowed_builtins.go",
+        PointSelector::new("func recover() int")
+            .procedure("recover")
+            .effect("normal_exit"),
+        ["recover_call"],
+    )
+    .bind_node(
+        "recover_continuation",
+        "go/shadowed_builtins.go",
+        PointSelector::new("recover()")
+            .procedure("shadowBuiltins")
+            .effect("call_continuation")
+            .outgoing_kind(ControlEdgeKind::Normal),
+        root(),
+    )
+    .bind_node(
+        "icfg_panic_invoke",
+        "go/shadowed_builtins.go",
+        PointSelector::new("panic(recover())")
+            .procedure("shadowBuiltins")
+            .effect("invoke"),
+        root(),
+    )
+    .bind_node(
+        "panic_entry",
+        "go/shadowed_builtins.go",
+        PointSelector::new("func panic(value int) int")
+            .procedure("panic")
+            .effect("entry"),
+        ["panic_call"],
+    )
+    .bind_node(
+        "panic_exit",
+        "go/shadowed_builtins.go",
+        PointSelector::new("func panic(value int) int")
+            .procedure("panic")
+            .effect("normal_exit"),
+        ["panic_call"],
+    )
+    .bind_node(
+        "panic_continuation",
+        "go/shadowed_builtins.go",
+        PointSelector::new("panic(recover())")
+            .procedure("shadowBuiltins")
+            .effect("call_continuation")
+            .outgoing_kind(ControlEdgeKind::Normal),
+        root(),
+    );
+
+    icfg.assert_outcome(IcfgOutcomeKind::Complete);
+    icfg.assert_successors(
+        "icfg_recover_invoke",
+        &[icfg_edge("recover_entry", IcfgEdgeKind::Call).originating_call("recover_call")],
+    );
+    icfg.assert_successors(
+        "recover_exit",
+        &[
+            icfg_edge("recover_continuation", IcfgEdgeKind::NormalReturn)
+                .originating_call("recover_call"),
+        ],
+    );
+    icfg.assert_successors(
+        "icfg_panic_invoke",
+        &[icfg_edge("panic_entry", IcfgEdgeKind::Call).originating_call("panic_call")],
+    );
+    icfg.assert_successors(
+        "panic_exit",
+        &[icfg_edge("panic_continuation", IcfgEdgeKind::NormalReturn)
+            .originating_call("panic_call")],
+    );
+    icfg.assert_adjacency_symmetric();
+    let rendered = icfg.render_topology();
+    assert_eq!(rendered, icfg.render_topology());
+    assert!(!rendered.contains("IcfgNodeId"));
+    assert!(!rendered.contains("IcfgEdgeId"));
 }
 
 #[test]

@@ -5,6 +5,7 @@ pub(crate) mod diagnostics;
 mod hierarchy;
 mod imports;
 pub(crate) mod packages;
+mod semantic;
 pub(crate) mod structural;
 mod tests;
 
@@ -35,7 +36,6 @@ pub struct GoAnalyzer {
 }
 
 crate::analyzer::impl_forward_query_provider!(GoAnalyzer);
-crate::analyzer::semantic::impl_forward_program_semantics_provider!(GoAnalyzer);
 
 impl GoAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {

@@ -40,6 +40,7 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [x] (2026-07-18 11:52+02:00) Completed #815 Milestone 4b: C# now supplies real callable CFGs and direct matched-return ICFGs through the frozen shared provider, builder, dispatch, and snapshot boundary; independent review fixed indexed-call evaluation, target-typed object-initializer order, and conditional-compilation gaps before checkpoint validation.
 - [x] (2026-07-18 12:06+02:00) Validated the reviewed C# checkpoint with formatting, diff checks, strict all-target/all-feature clippy, and the complete host-access `nlp,python` repository suite (1,053 library tests passed, 4 ignored, plus every binary, integration, and doc-test target).
 - [x] (2026-07-18 13:11+02:00) Completed and validated #815 Milestone 4c: Python now supplies real callable CFGs and direct matched-return ICFGs through the shared engine, with deferred coroutine/generator invocation modeled explicitly; specialist review fixes, 37 CFG, 17 ICFG, 28 language-conformance, 11 provider tests, strict clippy, and the complete host-access feature suite are green.
+- [x] (2026-07-18 14:17+02:00) Completed and validated #815 Milestone 4d: Go now supplies real callable CFGs and matched-return ICFGs through the shared engine; specialist review made selected-call omissions and partially unspecified evaluation order explicit, proved shadowed `panic`/`recover` dispatch, and passed 37 CFG, 17 ICFG, 37 language-conformance, 11 provider tests, strict clippy, and the complete host-access feature suite.
 - [ ] Complete #816 in parallel: expose reusable dispatch, value, heap, and bounded access-path oracles for the reference languages.
 - [x] Complete #818's internal TypeScript/Java control-topology slice: stitch CFG fragments through existing call relations into a demand-materialized ICFG. Public query exposure and value/heap transfers remain in their owning issues.
 - [ ] Complete #819 as needed: add iterative reachability, reverse postorder, SCC, and loop utilities; add dominators only after a named client justifies them.
@@ -114,6 +115,12 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - Observation: async and generator flags are insufficient to determine call-to-body control across languages.
   Evidence: Python coroutine/generator calls, JavaScript generators, and C# iterators create suspended objects, while JavaScript and C# async calls begin synchronously. The common procedure contract now records invocation timing independently, and the single ICFG represents deferred targets as typed boundaries with explicit caller-continuation models rather than false body entry.
 
+- Observation: deterministic semantic topology and language-defined evaluation order are separate contracts.
+  Evidence: Go fully orders calls, method calls, receives, and logical operations but leaves some surrounding operands and composite-literal elements unordered. The Go adapter retains deterministic source-order rows for identity and rendering while attaching source-backed control gaps to the exact parents whose relative order is incomplete.
+
+- Observation: scheduled or selected calls can be syntactically identifiable without being valid immediate ICFG transfers.
+  Evidence: Go `defer` and `go` evaluate function values and arguments immediately but schedule the outer call for later or concurrent execution; `select` evaluates communication operands before choosing one case. Omitting only the non-immediate or selected-only calls and reporting typed call/scheduling gaps preserves known evaluation without fabricating control.
+
 ## Decision Log
 
 - Decision: target meet-over-valid-interprocedural-paths analysis rather than SMT-backed path feasibility.
@@ -174,6 +181,10 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 
 - Decision: keep C# as a structured language adapter over the shared iterative CFG/ICFG mechanics, and represent unavailable conditional-compilation selection as a terminal source-backed control gap.
   Rationale: C# callable identity and syntax require an adapter, not another graph or resolver. Selecting a preprocessor arm without compilation symbols would fabricate control, while silently filtering the node would hide incompleteness; the typed boundary preserves both the common contract and honest uncertainty.
+  Date: 2026-07-18.
+
+- Decision: keep Go on the shared CFG/ICFG boundary by modeling `defer`, `go`, and `select` as exact known prefixes plus typed incomplete points, and by qualifying deterministic source-order linearization wherever Go leaves relative operand order unspecified.
+  Rationale: an outer `defer` or goroutine call is not an immediate call-to-entry transfer, a selected case cannot be chosen statically, and nondeterministic graph construction would destabilize identities. Existing scheduling, call, control, cleanup, spawn, and exceptional capability gaps preserve these distinctions without a Go-specific ICFG or false topology.
   Date: 2026-07-18.
 
 - Decision: keep language-semantic summaries separate from rule-specific protocol summaries.
@@ -1490,3 +1501,5 @@ Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4a. JavaS
 Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4b after specialist review. C# now passes the shared callable-CFG and matched-return ICFG contract with structured control, handlers, cleanup, async points, nested callable identity, and exact advanced-feature gaps. Review corrected grammar-sensitive indexed-call, target-typed-initializer, and conditional-compilation omissions; Python is the next adapter checkpoint in the focused rollout plan.
 
 Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4c after specialist review. Python now passes the shared callable-CFG and matched-return ICFG contract with exact loop-else, nested callable ownership, handlers and cleanup, typed protocol gaps, and deferred coroutine/generator invocation. Review corrected comprehension eager evaluation, comparison short-circuiting, assertion failure routing, loop-target evaluation, and truth-protocol gaps; Go is the next adapter checkpoint in the focused rollout plan.
+
+Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4d after specialist review. Go now passes the shared callable-CFG and matched-return ICFG contract across functions, methods, literals, branches, loops, calls, range, channel operands, deferred calls, and goroutine creation. Review made selected-only call omissions and partially unspecified evaluation order explicit and proved shadowed `panic`/`recover` dispatch; Rust is the next adapter checkpoint in the focused rollout plan.
