@@ -17,6 +17,7 @@ use crate::analyzer::structural::query::sexp::{
 use crate::schema_version::SchemaVersionResolution;
 use crate::sexp::{Expr, ExprKind, SexpParseLimits, parse_sexp_with_limits};
 
+use super::classification::{TextValidationError, validate_single_line_text};
 use super::definition::*;
 use super::schema::{
     AtomDomain, CollectionOrder, CvssBaseMetricSchema, CvssMetricScopeSchema, FieldPlacement,
@@ -30,6 +31,7 @@ pub const MAX_RQLP_SOURCE_BYTES: usize = 256 * 1024;
 pub const MAX_RQLP_SEXP_DEPTH: usize = 128;
 pub const MAX_RQLP_SEXP_NODES: usize = 4_096;
 pub const MAX_RQLP_SOURCE_DIAGNOSTICS: usize = 64;
+pub const MAX_POLICY_SOURCE_IDENTITY_BYTES: usize = 1_024;
 
 const MAX_HUMAN_NAME_BYTES: usize = 256;
 const MAX_DISPLAY_TEXT_BYTES: usize = MAX_POLICY_DISPLAY_TEXT_BYTES;
@@ -67,6 +69,50 @@ impl fmt::Display for PolicySourceIdentity {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
+}
+
+/// Validation failures for embedding- and workspace-supplied source labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicySourceIdentityError {
+    Empty,
+    TooLong,
+    ControlCharacter,
+}
+
+impl fmt::Display for PolicySourceIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Empty => "policy source identity must not be empty",
+            Self::TooLong => "policy source identity must be at most 1024 bytes",
+            Self::ControlCharacter => "policy source identity must not contain control characters",
+        })
+    }
+}
+
+impl std::error::Error for PolicySourceIdentityError {}
+
+pub(crate) fn validate_policy_source_identity(
+    identity: &PolicySourceIdentity,
+) -> Result<(), PolicySourceIdentityError> {
+    let label = identity.as_str();
+    if label.is_empty() {
+        return Err(PolicySourceIdentityError::Empty);
+    }
+    if label.len() > MAX_POLICY_SOURCE_IDENTITY_BYTES {
+        return Err(PolicySourceIdentityError::TooLong);
+    }
+    if label.chars().any(char::is_control) {
+        return Err(PolicySourceIdentityError::ControlCharacter);
+    }
+    Ok(())
+}
+
+pub(crate) fn workspace_policy_source_identity(
+    path: &WorkspaceRelativePath,
+) -> Result<PolicySourceIdentity, PolicySourceIdentityError> {
+    let identity = PolicySourceIdentity::new(path.as_str());
+    validate_policy_source_identity(&identity)?;
+    Ok(identity)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3589,23 +3635,17 @@ fn expect_string(expr: &Expr, what: &str, max_bytes: usize) -> Result<String, Po
 }
 
 fn validate_text(value: &str, max_bytes: usize) -> Result<(), String> {
-    if value.len() > max_bytes {
-        return Err(format!("must be at most {max_bytes} bytes"));
-    }
-    if value.chars().any(|ch| {
-        ch.is_control()
-            || matches!(
-                ch,
-                '\u{061c}'
-                    | '\u{200e}'
-                    | '\u{200f}'
-                    | '\u{202a}'..='\u{202e}'
-                    | '\u{2066}'..='\u{2069}'
-            )
-    }) {
-        return Err("must not contain control or bidirectional-control characters".to_string());
-    }
-    Ok(())
+    validate_single_line_text(value, max_bytes).map_err(|error| match error {
+        TextValidationError::TooLong { max_bytes } => {
+            format!("must be at most {max_bytes} bytes")
+        }
+        TextValidationError::UnsafeCharacter => {
+            "must not contain control or bidirectional-control characters".to_string()
+        }
+        TextValidationError::Empty | TextValidationError::InvalidIdentifier => {
+            unreachable!("single-line text validation cannot return {error}")
+        }
+    })
 }
 
 fn expect_token<'a>(expr: &'a Expr, what: &str) -> Result<&'a str, PolicySourceError> {
@@ -3762,8 +3802,19 @@ where
 
 fn decode_help_uri(expr: &Expr) -> Result<String, PolicySourceError> {
     let uri = expect_string(expr, "help URI", MAX_DISPLAY_TEXT_BYTES)?;
-    if !(uri.starts_with("https://") || uri.starts_with("http://"))
+    let authority = uri
+        .strip_prefix("https://")
+        .or_else(|| uri.strip_prefix("http://"));
+    let syntax_violation = std::cell::Cell::new(false);
+    let record_violation = |_| syntax_violation.set(true);
+    let parsed = url::Url::options()
+        .syntax_violation_callback(Some(&record_violation))
+        .parse(&uri);
+    if !matches!(authority.and_then(|value| value.chars().next()), Some(ch) if ch != '/' && ch != '\\')
         || uri.chars().any(char::is_whitespace)
+        || syntax_violation.get()
+        || !matches!(parsed.as_ref().map(url::Url::scheme), Ok("http" | "https"))
+        || !matches!(parsed.as_ref().map(url::Url::host), Ok(Some(_)))
     {
         return Err(source_error(
             "invalid-help-uri",
@@ -4297,6 +4348,40 @@ mod tests {
             definition.taint,
             Some(EndpointTaintSemantics::Source { .. })
         ));
+    }
+
+    #[test]
+    fn help_uri_requires_a_well_formed_http_url_with_a_host() {
+        for uri in [
+            "https://",
+            "https://[",
+            "https:example.test",
+            "https:/example.test",
+            "https:///example.test",
+            "https:////example.test",
+            r"https://example.test\path",
+            "https://example.test/%1",
+            "https://example.test/%zz",
+        ] {
+            let authored_uri = uri.replace('\\', "\\\\");
+            let source = format!(
+                r#"(policy :id "test.help" :name "Help" :help-uri "{authored_uri}"
+                  :message "M" :severity warning
+                  :analysis (analysis :type match :selector (rql (call))))"#
+            );
+            let error = parse(&source).unwrap_err().diagnostic;
+            assert_eq!(error.code, "invalid-help-uri");
+            assert_eq!(&source[error.range], format!(r#""{authored_uri}""#));
+        }
+
+        for uri in ["https://example.test/policy", "http://127.0.0.1/policy"] {
+            let source = format!(
+                r#"(policy :id "test.help" :name "Help" :help-uri "{uri}"
+                  :message "M" :severity warning
+                  :analysis (analysis :type match :selector (rql (call))))"#
+            );
+            parse(&source).unwrap();
+        }
     }
 
     #[test]

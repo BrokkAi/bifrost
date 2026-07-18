@@ -13,6 +13,7 @@ use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::classification::{TextValidationError, validate_required_text};
 use super::definition::{
     CatalogRef, EndpointObservationPhase, MAX_POLICY_DISPLAY_TEXT_BYTES, MAX_POLICY_SET_ITEMS,
     POLICY_DOCUMENT_SCHEMA_VERSION, PolicyCategoryId, PolicyEndpointBinding, PolicyId, PolicyPort,
@@ -1147,24 +1148,7 @@ fn validate_port(
     let PolicyPort::ArgumentName { name } = port else {
         return Ok(());
     };
-    if name.is_empty() {
-        return invalid_entry(kind, id, format!("{field} argument name must not be empty"));
-    }
-    if name.len() > MAX_POLICY_DISPLAY_TEXT_BYTES {
-        return invalid_entry(
-            kind,
-            id,
-            format!("{field} argument name must be at most {MAX_POLICY_DISPLAY_TEXT_BYTES} bytes"),
-        );
-    }
-    if name.chars().any(char::is_control) {
-        return invalid_entry(
-            kind,
-            id,
-            format!("{field} argument name must not contain control characters"),
-        );
-    }
-    Ok(())
+    validate_catalog_author_text(kind, id, &format!("{field} argument name"), name)
 }
 
 fn validate_display_name(
@@ -1172,20 +1156,33 @@ fn validate_display_name(
     id: &TaintEntryId,
     value: &str,
 ) -> Result<(), CatalogRegistryError> {
-    if value.is_empty() {
-        return invalid_entry(kind, id, "display_name must not be empty");
-    }
-    if value.len() > MAX_POLICY_DISPLAY_TEXT_BYTES {
-        return invalid_entry(
+    validate_catalog_author_text(kind, id, "display_name", value)
+}
+
+fn validate_catalog_author_text(
+    kind: CatalogEntryKind,
+    id: &TaintEntryId,
+    field: &str,
+    value: &str,
+) -> Result<(), CatalogRegistryError> {
+    validate_required_text(value, MAX_POLICY_DISPLAY_TEXT_BYTES).map_err(|error| {
+        CatalogRegistryError::InvalidEntry {
             kind,
-            id,
-            format!("display_name must be at most {MAX_POLICY_DISPLAY_TEXT_BYTES} bytes"),
-        );
-    }
-    if value.chars().any(char::is_control) {
-        return invalid_entry(kind, id, "display_name must not contain control characters");
-    }
-    Ok(())
+            id: id.clone(),
+            message: match error {
+                TextValidationError::Empty => format!("{field} must not be empty"),
+                TextValidationError::TooLong { max_bytes } => {
+                    format!("{field} must be at most {max_bytes} bytes")
+                }
+                TextValidationError::UnsafeCharacter => {
+                    format!("{field} must not contain control or bidirectional-control characters")
+                }
+                TextValidationError::InvalidIdentifier => {
+                    unreachable!("author-text validation cannot return {error}")
+                }
+            },
+        }
+    })
 }
 
 fn normalize_nonempty_set<T: Ord>(
@@ -2080,6 +2077,35 @@ mod tests {
     }
 
     #[test]
+    fn typed_registration_rejects_bidi_controls_in_catalog_author_text() {
+        for character in ['\u{202e}', '\u{2066}'] {
+            let mut definition = catalog("bifrost.sources", "request", "request");
+            definition.sources[0].display_name = format!("request{character}name");
+            let error = TaintCatalogRegistry::new_without_workspace(Default::default())
+                .register(definition)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                CatalogRegistryError::InvalidEntry { message, .. }
+                    if message == "display_name must not contain control or bidirectional-control characters"
+            ));
+
+            let mut definition = catalog("bifrost.sources", "request", "request");
+            definition.sources[0].bind = PolicyPort::ArgumentName {
+                name: format!("value{character}name"),
+            };
+            let error = TaintCatalogRegistry::new_without_workspace(Default::default())
+                .register(definition)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                CatalogRegistryError::InvalidEntry { message, .. }
+                    if message == "bind argument name must not contain control or bidirectional-control characters"
+            ));
+        }
+    }
+
+    #[test]
     fn json_registration_hashes_typed_canonical_content_not_layout() {
         let definition =
             normalize_and_validate_catalog(catalog("bifrost.sources", "request", "request"))
@@ -2093,6 +2119,42 @@ mod tests {
         let left_hash = left.register_json_bytes(source.clone(), &compact).unwrap();
         let right_hash = right.register_json_bytes(source, &pretty).unwrap();
         assert_eq!(left_hash, right_hash);
+    }
+
+    #[test]
+    fn json_registration_rejects_bidi_controls_in_catalog_author_text() {
+        let definition =
+            normalize_and_validate_catalog(catalog("bifrost.sources", "request", "request"))
+                .unwrap();
+
+        for character in ['\u{202e}', '\u{2066}'] {
+            let mut value = serde_json::to_value(CatalogWire::from(&definition)).unwrap();
+            value["sources"][0]["display_name"] = Value::String(format!("request{character}name"));
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let error = TaintCatalogRegistry::new_without_workspace(Default::default())
+                .register_json_bytes(CatalogSourceIdentity::new("test").unwrap(), &bytes)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                CatalogRegistryError::InvalidEntry { message, .. }
+                    if message == "display_name must not contain control or bidirectional-control characters"
+            ));
+
+            let mut value = serde_json::to_value(CatalogWire::from(&definition)).unwrap();
+            value["sources"][0]["bind"] = serde_json::json!({
+                "type": "argument_name",
+                "name": format!("value{character}name"),
+            });
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let error = TaintCatalogRegistry::new_without_workspace(Default::default())
+                .register_json_bytes(CatalogSourceIdentity::new("test").unwrap(), &bytes)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                CatalogRegistryError::InvalidEntry { message, .. }
+                    if message == "bind argument name must not contain control or bidirectional-control characters"
+            ));
+        }
     }
 
     #[test]

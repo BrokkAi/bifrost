@@ -17,7 +17,7 @@ use crate::workspace_document::{
 
 use super::source::{
     MAX_RQLP_SOURCE_BYTES, ParsedRqlpDocument, PolicySourceError, PolicySourceIdentity,
-    parse_rqlp_source,
+    PolicySourceIdentityError, parse_rqlp_source, workspace_policy_source_identity,
 };
 use super::{
     LoadedEndpoint, LoadedModelError, PolicySelectorPath, PolicySelectorPathError, RqlpDocument,
@@ -60,8 +60,24 @@ pub(crate) fn read_rqlp_document(
     root: &WorkspaceRoot,
     relative_path: &Path,
 ) -> Result<LoadedRqlpSource, PolicyDocumentLoadError> {
-    let document =
-        read_workspace_document(root, relative_path, &["rqlp"], MAX_POLICY_DOCUMENT_BYTES)?;
+    let workspace_path = WorkspaceRelativePath::try_from_path(relative_path).map_err(|source| {
+        PolicyDocumentLoadError::InvalidWorkspacePath {
+            path: relative_path.to_path_buf(),
+            source,
+        }
+    })?;
+    workspace_policy_source_identity(&workspace_path).map_err(|source| {
+        PolicyDocumentLoadError::InvalidSourceIdentity {
+            identity: PolicySourceIdentity::new(workspace_path.as_str()),
+            source,
+        }
+    })?;
+    let document = read_workspace_document(
+        root,
+        workspace_path.as_path(),
+        &["rqlp"],
+        MAX_POLICY_DOCUMENT_BYTES,
+    )?;
     parse_workspace_rqlp_document(document)
 }
 
@@ -149,7 +165,12 @@ fn parse_workspace_rqlp_document(
                 source,
             }
         })?;
-    let identity = PolicySourceIdentity::new(workspace_path.as_str());
+    let identity = workspace_policy_source_identity(&workspace_path).map_err(|source| {
+        PolicyDocumentLoadError::InvalidSourceIdentity {
+            identity: PolicySourceIdentity::new(workspace_path.as_str()),
+            source,
+        }
+    })?;
     let parsed = parse_rqlp_source(document.source(), identity.clone())
         .map_err(|source| PolicyDocumentLoadError::InvalidSource { identity, source })?;
     Ok(LoadedRqlpSource {
@@ -166,6 +187,10 @@ pub(crate) enum PolicyDocumentLoadError {
         path: std::path::PathBuf,
         source: WorkspaceRelativePathError,
     },
+    InvalidSourceIdentity {
+        identity: PolicySourceIdentity,
+        source: PolicySourceIdentityError,
+    },
     InvalidSource {
         identity: PolicySourceIdentity,
         source: PolicySourceError,
@@ -181,6 +206,9 @@ impl fmt::Display for PolicyDocumentLoadError {
                 "invalid portable workspace path `{}`: {source}",
                 path.display()
             ),
+            Self::InvalidSourceIdentity { source, .. } => {
+                write!(formatter, "invalid policy source identity: {source}")
+            }
             Self::InvalidSource { identity, source } => {
                 write!(formatter, "invalid RQLP document `{identity}`: {source}")
             }
@@ -193,6 +221,7 @@ impl std::error::Error for PolicyDocumentLoadError {
         match self {
             Self::Workspace(error) => Some(error),
             Self::InvalidWorkspacePath { source, .. } => Some(source),
+            Self::InvalidSourceIdentity { source, .. } => Some(source),
             Self::InvalidSource { source, .. } => Some(source),
         }
     }

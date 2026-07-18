@@ -869,6 +869,13 @@ pub(crate) fn validate_required_text(
     if value.is_empty() {
         return Err(TextValidationError::Empty);
     }
+    validate_single_line_text(value, max_bytes)
+}
+
+pub(crate) fn validate_single_line_text(
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), TextValidationError> {
     if value.len() > max_bytes {
         return Err(TextValidationError::TooLong { max_bytes });
     }

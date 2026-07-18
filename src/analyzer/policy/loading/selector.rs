@@ -20,7 +20,8 @@ use crate::workspace_document::{
 
 use super::super::source::{
     ParsedRqlpDocument, PolicySourceDiagnostic, PolicySourceDiagnosticSeverity,
-    PolicySourceIdentity, PolicySourceRelatedDiagnostic, UnresolvedPolicySelectorReference,
+    PolicySourceIdentity, PolicySourceIdentityError, PolicySourceRelatedDiagnostic,
+    UnresolvedPolicySelectorReference, workspace_policy_source_identity,
 };
 
 const MAX_REFERENCED_RQL_BYTES: u64 = 64 * 1024;
@@ -135,6 +136,14 @@ pub(crate) fn resolve_referenced_rql(
     referrer: &PolicySourceIdentity,
     reference: &UnresolvedPolicySelectorReference,
 ) -> Result<ResolvedReferencedRql, ReferencedRqlError> {
+    let source_identity =
+        workspace_policy_source_identity(&reference.workspace_path).map_err(|source| {
+            ReferencedRqlError::InvalidSourceIdentity {
+                referrer: referrer.clone(),
+                reference_range: reference.range.clone(),
+                source,
+            }
+        })?;
     let document = read_workspace_document(
         root,
         Path::new(reference.workspace_path.as_str()),
@@ -146,7 +155,6 @@ pub(crate) fn resolve_referenced_rql(
         reference_range: reference.range.clone(),
         source,
     })?;
-    let source_identity = PolicySourceIdentity::new(reference.workspace_path.as_str());
     let parsed = parse_sexp(document.source()).map_err(|error| {
         source_error(
             "invalid-referenced-rql-s-expression",
@@ -358,6 +366,11 @@ pub(crate) enum ReferencedRqlError {
         reference_range: Range<usize>,
         source: WorkspaceDocumentError,
     },
+    InvalidSourceIdentity {
+        referrer: PolicySourceIdentity,
+        reference_range: Range<usize>,
+        source: PolicySourceIdentityError,
+    },
     Source {
         source: PolicySourceIdentity,
         diagnostic: PolicySourceDiagnostic,
@@ -376,6 +389,15 @@ impl fmt::Display for ReferencedRqlError {
                 "failed to load RQL referenced by `{referrer}` at bytes {}..{}: {source}",
                 reference_range.start, reference_range.end
             ),
+            Self::InvalidSourceIdentity {
+                referrer,
+                reference_range,
+                source,
+            } => write!(
+                formatter,
+                "invalid RQL source identity referenced by `{referrer}` at bytes {}..{}: {source}",
+                reference_range.start, reference_range.end
+            ),
             Self::Source { source, diagnostic } => {
                 write!(
                     formatter,
@@ -391,6 +413,7 @@ impl std::error::Error for ReferencedRqlError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Workspace { source, .. } => Some(source),
+            Self::InvalidSourceIdentity { source, .. } => Some(source),
             Self::Source { .. } => None,
         }
     }
@@ -523,6 +546,37 @@ mod tests {
         assert_eq!(diagnostic.range, 21..22);
         assert_eq!(diagnostic.related[0].source.as_str(), "policies/root.rqlp");
         assert_eq!(diagnostic.related[0].range, 12..42);
+    }
+
+    #[test]
+    fn source_identity_is_bounded_before_referenced_rql_io() {
+        let temp = TempDir::new().unwrap();
+        let root = WorkspaceRoot::open(temp.path()).unwrap();
+        let reference = UnresolvedPolicySelectorReference {
+            path: "/analysis/selector".to_string(),
+            authored_schema_version: None,
+            workspace_path: WorkspaceRelativePath::new(format!(
+                "queries/{}.rql",
+                "a".repeat(1_024)
+            ))
+            .unwrap(),
+            range: 12..42,
+        };
+
+        let error = resolve_referenced_rql(
+            &root,
+            &PolicySourceIdentity::new("policies/root.rqlp"),
+            &reference,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ReferencedRqlError::InvalidSourceIdentity {
+                source: PolicySourceIdentityError::TooLong,
+                ..
+            }
+        ));
     }
 
     #[test]

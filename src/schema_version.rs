@@ -12,29 +12,24 @@ use std::fmt;
 pub(crate) struct SchemaVersionDescriptor {
     pub(crate) version: u32,
     pub(crate) implicit_predecessor: Option<u32>,
-    pub(crate) inference: SchemaInference,
+    /// `true` permits omitted sources to advance through this descriptor's
+    /// compatibility lineage. `false` keeps the version available only to an
+    /// exact authored pin.
+    pub(crate) auto_compatible: bool,
 }
 
 impl SchemaVersionDescriptor {
     pub(crate) const fn new(
         version: u32,
         implicit_predecessor: Option<u32>,
-        inference: SchemaInference,
+        auto_compatible: bool,
     ) -> Self {
         Self {
             version,
             implicit_predecessor,
-            inference,
+            auto_compatible,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SchemaInference {
-    /// Omitted sources may advance to this version from its predecessor.
-    AutoCompatible,
-    /// The version is supported only when the source pins it explicitly.
-    ExplicitOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -161,9 +156,7 @@ impl SchemaVersionRegistry {
             let predecessor_descriptor = descriptors_by_version
                 .get(&predecessor)
                 .expect("predecessor existence was validated above");
-            if descriptor.inference == SchemaInference::AutoCompatible
-                && predecessor_descriptor.inference != SchemaInference::AutoCompatible
-            {
+            if descriptor.auto_compatible && !predecessor_descriptor.auto_compatible {
                 return Err(
                     SchemaVersionRegistryError::IncompatibleImplicitPredecessor {
                         version: descriptor.version,
@@ -175,14 +168,13 @@ impl SchemaVersionRegistry {
 
         let implicit_predecessors = descriptors
             .iter()
-            .filter(|descriptor| descriptor.inference == SchemaInference::AutoCompatible)
+            .filter(|descriptor| descriptor.auto_compatible)
             .filter_map(|descriptor| descriptor.implicit_predecessor)
             .collect::<HashSet<_>>();
         let mut implicit_heads = descriptors
             .iter()
             .filter(|descriptor| {
-                descriptor.inference == SchemaInference::AutoCompatible
-                    && !implicit_predecessors.contains(&descriptor.version)
+                descriptor.auto_compatible && !implicit_predecessors.contains(&descriptor.version)
             })
             .map(|descriptor| descriptor.version)
             .collect::<Vec<_>>();
@@ -288,15 +280,14 @@ fn display_versions(versions: &[u32]) -> String {
 mod tests {
     use super::*;
 
-    const ROOT: SchemaVersionDescriptor =
-        SchemaVersionDescriptor::new(2, None, SchemaInference::AutoCompatible);
+    const ROOT: SchemaVersionDescriptor = SchemaVersionDescriptor::new(2, None, true);
 
     fn descriptor(
         version: u32,
         predecessor: Option<u32>,
-        inference: SchemaInference,
+        auto_compatible: bool,
     ) -> SchemaVersionDescriptor {
-        SchemaVersionDescriptor::new(version, predecessor, inference)
+        SchemaVersionDescriptor::new(version, predecessor, auto_compatible)
     }
 
     #[test]
@@ -321,11 +312,7 @@ mod tests {
 
     #[test]
     fn compatible_successor_becomes_the_implicit_head() {
-        let registry = SchemaVersionRegistry::new(&[
-            ROOT,
-            descriptor(3, Some(2), SchemaInference::AutoCompatible),
-        ])
-        .unwrap();
+        let registry = SchemaVersionRegistry::new(&[ROOT, descriptor(3, Some(2), true)]).unwrap();
 
         assert_eq!(registry.resolve(None).unwrap().version, 3);
         assert_eq!(registry.resolve(Some(2)).unwrap().version, 2);
@@ -335,8 +322,8 @@ mod tests {
     fn explicit_only_successor_never_becomes_the_implicit_head() {
         let registry = SchemaVersionRegistry::new(&[
             ROOT,
-            descriptor(3, Some(2), SchemaInference::AutoCompatible),
-            descriptor(4, Some(3), SchemaInference::ExplicitOnly),
+            descriptor(3, Some(2), true),
+            descriptor(4, Some(3), false),
         ])
         .unwrap();
 
@@ -346,11 +333,7 @@ mod tests {
 
     #[test]
     fn unsupported_explicit_version_does_not_fall_back() {
-        let registry = SchemaVersionRegistry::new(&[
-            ROOT,
-            descriptor(3, Some(2), SchemaInference::ExplicitOnly),
-        ])
-        .unwrap();
+        let registry = SchemaVersionRegistry::new(&[ROOT, descriptor(3, Some(2), false)]).unwrap();
 
         let error = registry.resolve(Some(99)).unwrap_err();
 
@@ -370,9 +353,7 @@ mod tests {
 
     #[test]
     fn missing_predecessors_are_rejected() {
-        let error =
-            SchemaVersionRegistry::new(&[descriptor(2, Some(1), SchemaInference::AutoCompatible)])
-                .unwrap_err();
+        let error = SchemaVersionRegistry::new(&[descriptor(2, Some(1), true)]).unwrap_err();
 
         assert_eq!(
             error,
@@ -386,8 +367,8 @@ mod tests {
     #[test]
     fn predecessor_cycles_are_rejected_before_head_selection() {
         let error = SchemaVersionRegistry::new(&[
-            descriptor(1, Some(2), SchemaInference::AutoCompatible),
-            descriptor(2, Some(1), SchemaInference::AutoCompatible),
+            descriptor(1, Some(2), true),
+            descriptor(2, Some(1), true),
         ])
         .unwrap_err();
 
@@ -400,9 +381,9 @@ mod tests {
     #[test]
     fn explicit_only_nodes_do_not_hide_predecessor_cycles() {
         let error = SchemaVersionRegistry::new(&[
-            descriptor(1, None, SchemaInference::AutoCompatible),
-            descriptor(2, Some(3), SchemaInference::ExplicitOnly),
-            descriptor(3, Some(2), SchemaInference::AutoCompatible),
+            descriptor(1, None, true),
+            descriptor(2, Some(3), false),
+            descriptor(3, Some(2), true),
         ])
         .unwrap_err();
 
@@ -414,20 +395,14 @@ mod tests {
 
     #[test]
     fn registry_requires_an_implicit_head() {
-        let error =
-            SchemaVersionRegistry::new(&[descriptor(2, None, SchemaInference::ExplicitOnly)])
-                .unwrap_err();
+        let error = SchemaVersionRegistry::new(&[descriptor(2, None, false)]).unwrap_err();
 
         assert_eq!(error, SchemaVersionRegistryError::NoImplicitHead);
     }
 
     #[test]
     fn independent_implicit_lineages_are_rejected() {
-        let error = SchemaVersionRegistry::new(&[
-            ROOT,
-            descriptor(3, None, SchemaInference::AutoCompatible),
-        ])
-        .unwrap_err();
+        let error = SchemaVersionRegistry::new(&[ROOT, descriptor(3, None, true)]).unwrap_err();
 
         assert_eq!(
             error,
@@ -441,8 +416,8 @@ mod tests {
     fn forked_implicit_lineages_are_rejected() {
         let error = SchemaVersionRegistry::new(&[
             ROOT,
-            descriptor(3, Some(2), SchemaInference::AutoCompatible),
-            descriptor(4, Some(2), SchemaInference::AutoCompatible),
+            descriptor(3, Some(2), true),
+            descriptor(4, Some(2), true),
         ])
         .unwrap_err();
 
@@ -458,8 +433,8 @@ mod tests {
     fn compatible_lineage_cannot_cross_an_explicit_only_version() {
         let error = SchemaVersionRegistry::new(&[
             ROOT,
-            descriptor(3, Some(2), SchemaInference::ExplicitOnly),
-            descriptor(4, Some(3), SchemaInference::AutoCompatible),
+            descriptor(3, Some(2), false),
+            descriptor(4, Some(3), true),
         ])
         .unwrap_err();
 

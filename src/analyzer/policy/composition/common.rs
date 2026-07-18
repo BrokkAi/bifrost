@@ -12,15 +12,15 @@ use crate::analyzer::policy::definition::*;
 use crate::analyzer::policy::resolved::*;
 use crate::schema_version::SchemaVersionOrigin;
 
-pub const MAX_RESOLVED_ENDPOINTS_PER_ROLE: usize = 4_096;
-pub const MAX_ENDPOINT_ORIGINS: usize = 256;
-pub const MAX_FINDING_COMBINATIONS: usize = 256;
-pub const MAX_RESOLVED_PREDICATE_ENDPOINTS: usize = 4_096;
-pub const MAX_TYPESTATE_EVENTS: usize = 256;
-pub const MAX_TYPESTATE_EXPECTATIONS: usize = 256;
+pub(crate) const MAX_RESOLVED_ENDPOINTS_PER_ROLE: usize = 4_096;
+pub(crate) const MAX_ENDPOINT_ORIGINS: usize = 256;
+pub(crate) const MAX_FINDING_COMBINATIONS: usize = 256;
+pub(crate) const MAX_RESOLVED_PREDICATE_ENDPOINTS: usize = 4_096;
+pub(crate) const MAX_TYPESTATE_EVENTS: usize = 256;
+pub(crate) const MAX_TYPESTATE_EXPECTATIONS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompositionLimits {
+pub(crate) struct CompositionLimits {
     max_endpoints_per_role: usize,
     max_origins_per_endpoint: usize,
     max_finding_combinations: usize,
@@ -43,31 +43,30 @@ impl Default for CompositionLimits {
 }
 
 impl CompositionLimits {
-    pub const fn max_endpoints_per_role(self) -> usize {
+    pub(crate) const fn max_endpoints_per_role(self) -> usize {
         self.max_endpoints_per_role
     }
 
-    pub const fn max_origins_per_endpoint(self) -> usize {
+    pub(crate) const fn max_origins_per_endpoint(self) -> usize {
         self.max_origins_per_endpoint
     }
 
-    pub const fn max_finding_combinations(self) -> usize {
+    pub(crate) const fn max_finding_combinations(self) -> usize {
         self.max_finding_combinations
     }
 
-    pub const fn max_predicate_endpoints(self) -> usize {
-        self.max_predicate_endpoints
-    }
-
-    pub const fn max_typestate_events(self) -> usize {
+    pub(crate) const fn max_typestate_events(self) -> usize {
         self.max_typestate_events
     }
 
-    pub const fn max_typestate_expectations(self) -> usize {
+    pub(crate) const fn max_typestate_expectations(self) -> usize {
         self.max_typestate_expectations
     }
 
-    pub fn with_max_endpoints_per_role(mut self, value: usize) -> Result<Self, CompositionError> {
+    pub(crate) fn with_max_endpoints_per_role(
+        mut self,
+        value: usize,
+    ) -> Result<Self, CompositionError> {
         validate_lowered_limit(
             "max_endpoints_per_role",
             value,
@@ -77,13 +76,10 @@ impl CompositionLimits {
         Ok(self)
     }
 
-    pub fn with_max_origins_per_endpoint(mut self, value: usize) -> Result<Self, CompositionError> {
-        validate_lowered_limit("max_origins_per_endpoint", value, MAX_ENDPOINT_ORIGINS)?;
-        self.max_origins_per_endpoint = value;
-        Ok(self)
-    }
-
-    pub fn with_max_predicate_endpoints(mut self, value: usize) -> Result<Self, CompositionError> {
+    pub(crate) fn with_max_predicate_endpoints(
+        mut self,
+        value: usize,
+    ) -> Result<Self, CompositionError> {
         validate_lowered_limit(
             "max_predicate_endpoints",
             value,
@@ -110,7 +106,7 @@ fn validate_lowered_limit(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CompositionError {
+pub(crate) enum CompositionError {
     InvalidLimit {
         field: &'static str,
         value: usize,
@@ -204,10 +200,6 @@ pub enum CompositionError {
     TypestateEventPrecedence(String),
     TypestateExpectationPrecedence(String),
     DuplicateComposedEntry {
-        kind: &'static str,
-        id: TaintEntryId,
-    },
-    ComposedEntryCollision {
         kind: &'static str,
         id: TaintEntryId,
     },
@@ -363,12 +355,6 @@ impl fmt::Display for CompositionError {
             | Self::LoadedModel(message) => formatter.write_str(message),
             Self::DuplicateComposedEntry { kind, id } => {
                 write!(formatter, "composed {kind} entry repeats ID {id}")
-            }
-            Self::ComposedEntryCollision { kind, id } => {
-                write!(
-                    formatter,
-                    "composed {kind} entry ID {id} has conflicting definitions"
-                )
             }
             Self::InvalidObservationPhase { phase, port } => write!(
                 formatter,

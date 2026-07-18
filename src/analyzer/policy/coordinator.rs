@@ -23,10 +23,7 @@ use super::finding::{
     PolicyFailureReason, PolicyRun, PolicyRunCompletion, PolicyWorkReport,
 };
 use super::loading::{PolicyDocumentLoadError, read_rqlp_document};
-use super::registry::{
-    PolicyRegistry, PolicyRegistryError, PolicyRegistryLimits, PolicySourceIdentityError,
-    validate_policy_source_identity,
-};
+use super::registry::{PolicyRegistry, PolicyRegistryError, PolicyRegistryLimits};
 use super::report::{
     PolicyReportBuilder, PolicyReportDiagnostic, PolicyReportDiagnosticCode, PolicyReportDocument,
     PolicyRuleDescriptor, PolicySourceRange,
@@ -35,7 +32,10 @@ use super::resolved::{
     EndpointDefinitionSchemaResolution, EndpointOrigin, LoadedPolicy, ResolvedEndpointIdentity,
     SelectorOrigin,
 };
-use super::source::{PolicySourceDiagnostic, PolicySourceIdentity, PolicySourceRelatedDiagnostic};
+use super::source::{
+    PolicySourceDiagnostic, PolicySourceIdentity, PolicySourceIdentityError,
+    PolicySourceRelatedDiagnostic, validate_policy_source_identity,
+};
 use super::{PolicyBatchBudget, PolicyBudget};
 
 pub const POLICY_EXIT_CLEAN: u8 = 0;
@@ -492,6 +492,9 @@ fn document_load_diagnostic(
         return invalid_source_identity_diagnostic(&requested_source, identity_error);
     }
     match error {
+        PolicyDocumentLoadError::InvalidSourceIdentity { identity, source } => {
+            invalid_source_identity_diagnostic(identity, *source)
+        }
         PolicyDocumentLoadError::InvalidSource { identity, source } => {
             if let Err(identity_error) = validate_policy_source_identity(identity) {
                 return invalid_source_identity_diagnostic(identity, identity_error);
@@ -828,7 +831,7 @@ mod tests {
     use cap_std::fs::Dir;
 
     use super::*;
-    use crate::analyzer::policy::registry::MAX_POLICY_SOURCE_IDENTITY_BYTES;
+    use crate::analyzer::policy::source::MAX_POLICY_SOURCE_IDENTITY_BYTES;
     use crate::policy::write_policy_json;
 
     fn match_policy(policy_id: &str, name: &str) -> String {
@@ -1127,6 +1130,65 @@ mod tests {
                 .source()
                 .map(PolicySourceIdentity::as_str),
             Some("policies/z.rqlp")
+        );
+    }
+
+    #[test]
+    fn match_directory_entry_limit_retains_its_report_diagnostic_code() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::create_dir(workspace.path().join("endpoints")).expect("endpoint directory");
+        for name in ["ignored-a.txt", "ignored-b.txt", "ignored-c.txt"] {
+            fs::write(workspace.path().join("endpoints").join(name), "ignored")
+                .expect("irrelevant directory entry");
+        }
+        write_policy(
+            workspace.path(),
+            "policies/limit.rqlp",
+            r#"(policy
+  :schema-version 1
+  :id "test.directory-limit"
+  :name "Directory limit"
+  :message (generated-message :relation can-reach)
+  :severity warning
+  :analysis
+    (analysis
+      :type taint
+      :mode may
+      :sources
+        (endpoint-set :include-matches [
+          (match-directory :path "endpoints" :scope recursive
+            :categories (all [input.user]))])
+      :sinks
+        (endpoint-set :include-matches [
+          (match-directory :path "endpoints" :scope recursive
+            :categories (all [output.sensitive]))])))"#,
+        );
+        let limits = PolicyRegistryLimits::default()
+            .with_max_match_directory_entries(2)
+            .expect("lower directory-entry limit");
+
+        let outcome = evaluate_policy_files_with_limits(
+            workspace.path(),
+            &[PathBuf::from("policies/limit.rqlp")],
+            false,
+            PolicyFailOn::Never,
+            PolicyBatchBudget::default(),
+            limits,
+        )
+        .expect("bounded directory report");
+
+        assert_eq!(outcome.exit_status(), POLICY_EXIT_UNRELIABLE);
+        assert!(outcome.report().rules().is_empty());
+        assert!(outcome.report().runs().is_empty());
+        assert_eq!(outcome.report().diagnostics().len(), 1);
+        assert_eq!(
+            outcome.report().diagnostics()[0].code(),
+            PolicyReportDiagnosticCode::MatchDirectoryLimit
+        );
+        assert!(
+            outcome.report().diagnostics()[0]
+                .message()
+                .contains("more than 2 total entries")
         );
     }
 }

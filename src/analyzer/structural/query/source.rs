@@ -3017,13 +3017,11 @@ mod tests {
 
     #[test]
     fn json_schema_validation_uses_the_compatibility_registry() {
-        use crate::schema_version::{
-            SchemaInference, SchemaVersionDescriptor, SchemaVersionRegistry,
-        };
+        use crate::schema_version::{SchemaVersionDescriptor, SchemaVersionRegistry};
 
         let registry = SchemaVersionRegistry::new(&[
-            SchemaVersionDescriptor::new(2, None, SchemaInference::AutoCompatible),
-            SchemaVersionDescriptor::new(3, Some(2), SchemaInference::AutoCompatible),
+            SchemaVersionDescriptor::new(2, None, true),
+            SchemaVersionDescriptor::new(3, Some(2), true),
         ])
         .unwrap();
         for source in [

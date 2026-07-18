@@ -7,7 +7,7 @@
 
 #[cfg(unix)]
 use cap_fs_ext::OpenOptionsExt;
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, DirEntry, File, OpenOptions};
 use std::fmt;
@@ -48,9 +48,9 @@ impl WorkspaceRoot {
     }
 
     /// Open a workspace-relative directory without intentionally traversing a
-    /// symlink. Each component is obtained from its parent directory handle,
-    /// classified before open, and the resulting child handle becomes the
-    /// authority for the next component.
+    /// symlink. Each component is looked up directly from its parent handle,
+    /// classified without following links, and atomically opened no-follow;
+    /// resolving an explicit path never scans unrelated siblings.
     pub(crate) fn open_directory(
         &self,
         relative_path: &Path,
@@ -70,50 +70,28 @@ impl WorkspaceRoot {
                 unreachable!("workspace-relative path validation removes other components");
             };
             traversed.push(name);
-            let mut matching = None;
-            let entries =
-                directory
-                    .entries()
-                    .map_err(|source| WorkspaceDocumentError::ReadDirectory {
-                        path: traversed
-                            .parent()
-                            .map_or_else(PathBuf::new, Path::to_path_buf),
-                        source,
-                    })?;
-            for entry in entries {
-                let entry = entry.map_err(|source| WorkspaceDocumentError::ReadDirectory {
-                    path: traversed
-                        .parent()
-                        .map_or_else(PathBuf::new, Path::to_path_buf),
+            let metadata = directory.symlink_metadata(name).map_err(|source| {
+                WorkspaceDocumentError::OpenDirectory {
+                    path: traversed.clone(),
                     source,
-                })?;
-                if entry.file_name() == name {
-                    matching = Some(entry);
-                    break;
                 }
-            }
-            let entry = matching.ok_or_else(|| WorkspaceDocumentError::OpenDirectory {
-                path: traversed.clone(),
-                source: io::Error::new(io::ErrorKind::NotFound, "directory entry not found"),
             })?;
-            let file_type =
-                entry
-                    .file_type()
-                    .map_err(|source| WorkspaceDocumentError::ReadDirectoryEntry {
-                        path: traversed.clone(),
-                        source,
-                    })?;
-            if file_type.is_symlink() {
+            if metadata.file_type().is_symlink() {
                 return Err(WorkspaceDocumentError::SymlinkNotAllowed {
                     path: traversed.clone(),
                 });
             }
-            if !file_type.is_dir() {
+            if !metadata.is_dir() {
                 return Err(WorkspaceDocumentError::NotDirectory {
                     path: traversed.clone(),
                 });
             }
-            directory = open_directory_entry_nofollow(&entry, traversed.clone())?;
+            directory = directory.open_dir_nofollow(name).map_err(|source| {
+                WorkspaceDocumentError::OpenDirectory {
+                    path: traversed.clone(),
+                    source,
+                }
+            })?;
         }
 
         Ok(WorkspaceDirectory {
@@ -199,9 +177,16 @@ pub(crate) struct WorkspaceDirectory {
 }
 
 impl WorkspaceDirectory {
-    /// Read this directory's immediate entries. Returned entries retain their
-    /// parent directory handle, so opening one remains capability-relative.
-    pub(crate) fn entries(&self) -> Result<Vec<WorkspaceDirectoryEntry>, WorkspaceDocumentError> {
+    /// Read at most `maximum` immediate entries from this directory.
+    ///
+    /// `None` means the directory contains more entries than the caller's
+    /// remaining traversal budget. The scan stops before retaining the excess
+    /// entry. Returned entries retain their parent directory handle, so
+    /// opening one remains capability-relative.
+    pub(crate) fn entries_up_to(
+        &self,
+        maximum: usize,
+    ) -> Result<Option<Vec<WorkspaceDirectoryEntry>>, WorkspaceDocumentError> {
         let mut result = Vec::new();
         let entries =
             self.directory
@@ -215,6 +200,9 @@ impl WorkspaceDirectory {
                 path: self.relative_path.clone(),
                 source,
             })?;
+            if result.len() == maximum {
+                return Ok(None);
+            }
             let name = entry.file_name();
             let name = name
                 .to_str()
@@ -245,7 +233,7 @@ impl WorkspaceDirectory {
             });
         }
         result.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-        Ok(result)
+        Ok(Some(result))
     }
 }
 
@@ -790,6 +778,25 @@ mod tests {
         assert_eq!(document.source(), source);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn explicit_directory_resolution_rejects_symlink_components() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join("real/nested")).unwrap();
+        symlink("real", temp.path().join("linked")).unwrap();
+        let root = WorkspaceRoot::open(temp.path()).unwrap();
+
+        let Err(error) = root.open_directory(Path::new("linked/nested")) else {
+            panic!("symlinked directory component was accepted");
+        };
+
+        assert!(matches!(
+            error,
+            WorkspaceDocumentError::SymlinkNotAllowed { path }
+                if path == Path::new("linked")
+        ));
+    }
+
     #[test]
     fn rejects_absolute_parent_wrong_kind_size_and_utf8() {
         let temp = TempDir::new().unwrap();
@@ -924,7 +931,7 @@ mod tests {
         fs::write(workspace.path().join("replacement.rqlp"), "replacement").unwrap();
         let root = WorkspaceRoot::open(workspace.path()).unwrap();
         let directory = root.open_directory(Path::new("models")).unwrap();
-        let mut entries = directory.entries().unwrap();
+        let mut entries = directory.entries_up_to(usize::MAX).unwrap().unwrap();
         let file = entries.remove(
             entries
                 .iter()
@@ -970,7 +977,7 @@ mod tests {
         fs::write(workspace.path().join("models/endpoint.rqlp"), "endpoint").unwrap();
         let root = WorkspaceRoot::open(workspace.path()).unwrap();
         let directory = root.open_directory(Path::new("models")).unwrap();
-        let mut entries = directory.entries().unwrap();
+        let mut entries = directory.entries_up_to(usize::MAX).unwrap().unwrap();
         let file = entries.remove(
             entries
                 .iter()

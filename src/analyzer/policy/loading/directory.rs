@@ -4,17 +4,20 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::analyzer::policy::{DirectoryScope, RqlpDocument};
-use crate::analyzer::semantic::WorkspaceRelativePath;
+use crate::analyzer::semantic::{WorkspaceRelativePath, WorkspaceRelativePathError};
 use crate::workspace_document::{
-    WorkspaceDirectory, WorkspaceDirectoryEntryKind, WorkspaceDocument, WorkspaceDocumentError,
-    WorkspaceRoot,
+    WorkspaceDirectoryEntry, WorkspaceDirectoryEntryKind, WorkspaceDocument,
+    WorkspaceDocumentError, WorkspaceRoot,
 };
 
-use super::super::source::MAX_RQLP_SOURCE_BYTES;
+use super::super::source::{
+    MAX_RQLP_SOURCE_BYTES, PolicySourceIdentityError, workspace_policy_source_identity,
+};
 use super::{LoadedRqlpSource, PolicyDocumentLoadError, parse_workspace_rqlp_document};
 
 pub(crate) const MAX_MATCH_DIRECTORY_DEPTH: usize = 32;
 pub(crate) const MAX_MATCH_DIRECTORY_CANDIDATES: usize = 4_096;
+pub(crate) const MAX_MATCH_DIRECTORY_ENTRIES: usize = 65_536;
 pub(crate) const MAX_MATCH_DIRECTORY_SOURCE_BYTES: usize = 128 * 1024 * 1024;
 
 /// Per-registry lowering of the schema-fixed directory traversal ceilings.
@@ -22,6 +25,7 @@ pub(crate) const MAX_MATCH_DIRECTORY_SOURCE_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) struct MatchDirectoryLimits {
     max_depth: usize,
     max_candidates: usize,
+    max_entries: usize,
     max_source_bytes: usize,
 }
 
@@ -54,6 +58,20 @@ impl MatchDirectoryLimits {
         Ok(self)
     }
 
+    pub(crate) fn with_max_entries(
+        mut self,
+        max_entries: usize,
+    ) -> Result<Self, MatchDirectoryLimitError> {
+        if max_entries > MAX_MATCH_DIRECTORY_ENTRIES {
+            return Err(MatchDirectoryLimitError::Entries {
+                requested: max_entries,
+                maximum: MAX_MATCH_DIRECTORY_ENTRIES,
+            });
+        }
+        self.max_entries = max_entries;
+        Ok(self)
+    }
+
     pub(crate) fn with_max_source_bytes(
         mut self,
         max_source_bytes: usize,
@@ -74,6 +92,7 @@ impl Default for MatchDirectoryLimits {
         Self {
             max_depth: MAX_MATCH_DIRECTORY_DEPTH,
             max_candidates: MAX_MATCH_DIRECTORY_CANDIDATES,
+            max_entries: MAX_MATCH_DIRECTORY_ENTRIES,
             max_source_bytes: MAX_MATCH_DIRECTORY_SOURCE_BYTES,
         }
     }
@@ -83,6 +102,7 @@ impl Default for MatchDirectoryLimits {
 pub(crate) enum MatchDirectoryLimitError {
     Depth { requested: usize, maximum: usize },
     Candidates { requested: usize, maximum: usize },
+    Entries { requested: usize, maximum: usize },
     SourceBytes { requested: usize, maximum: usize },
 }
 
@@ -96,6 +116,10 @@ impl fmt::Display for MatchDirectoryLimitError {
             Self::Candidates { requested, maximum } => write!(
                 formatter,
                 "match-directory candidate limit {requested} exceeds schema maximum {maximum}"
+            ),
+            Self::Entries { requested, maximum } => write!(
+                formatter,
+                "match-directory entry limit {requested} exceeds schema maximum {maximum}"
             ),
             Self::SourceBytes { requested, maximum } => write!(
                 formatter,
@@ -171,6 +195,11 @@ struct Enumeration {
     documents: Vec<WorkspaceDocument>,
 }
 
+struct DirectoryFrame {
+    depth: usize,
+    entries: std::vec::IntoIter<WorkspaceDirectoryEntry>,
+}
+
 fn enumerate(
     root: &WorkspaceRoot,
     directory: &Path,
@@ -179,81 +208,113 @@ fn enumerate(
     read_documents: bool,
 ) -> Result<Enumeration, EndpointDirectoryError> {
     let root_directory = root.open_directory(directory)?;
-    let mut stack = vec![(root_directory, 0_usize)];
     let mut paths = Vec::new();
     let mut documents = Vec::new();
     let mut retained_source_bytes = 0_usize;
+    let root_entries = root_directory
+        .entries_up_to(limits.max_entries)?
+        .ok_or_else(|| EndpointDirectoryError::EntryLimitExceeded {
+            directory: directory.to_path_buf(),
+            maximum: limits.max_entries,
+        })?;
+    let mut visited_entries = root_entries.len();
+    let mut stack = vec![DirectoryFrame {
+        depth: 0,
+        entries: root_entries.into_iter(),
+    }];
 
-    while let Some((current, depth)) = stack.pop() {
-        let mut child_directories = Vec::<WorkspaceDirectory>::new();
-        for entry in current.entries()? {
-            match entry.kind() {
-                WorkspaceDirectoryEntryKind::Symlink | WorkspaceDirectoryEntryKind::Other => {}
-                WorkspaceDirectoryEntryKind::Directory if scope == DirectoryScope::Direct => {}
-                WorkspaceDirectoryEntryKind::Directory => {
-                    let child_depth = depth + 1;
-                    if child_depth > limits.max_depth {
-                        return Err(EndpointDirectoryError::DepthExceeded {
-                            path: entry.relative_path().to_path_buf(),
-                            maximum: limits.max_depth,
-                        });
-                    }
-                    child_directories.push(entry.open_directory()?);
+    while !stack.is_empty() {
+        let next = stack
+            .last_mut()
+            .and_then(|frame| frame.entries.next().map(|entry| (entry, frame.depth)));
+        let Some((entry, depth)) = next else {
+            stack.pop();
+            continue;
+        };
+
+        match entry.kind() {
+            WorkspaceDirectoryEntryKind::Symlink | WorkspaceDirectoryEntryKind::Other => {}
+            WorkspaceDirectoryEntryKind::Directory if scope == DirectoryScope::Direct => {}
+            WorkspaceDirectoryEntryKind::Directory => {
+                let child_depth = depth + 1;
+                if child_depth > limits.max_depth {
+                    return Err(EndpointDirectoryError::DepthExceeded {
+                        path: entry.relative_path().to_path_buf(),
+                        maximum: limits.max_depth,
+                    });
                 }
-                WorkspaceDirectoryEntryKind::File => {
-                    if entry
-                        .relative_path()
-                        .extension()
-                        .and_then(|value| value.to_str())
-                        != Some("rqlp")
-                    {
-                        continue;
+                let child = entry.open_directory()?;
+                let remaining_entries = limits
+                    .max_entries
+                    .checked_sub(visited_entries)
+                    .expect("visited directory entries never exceed their limit");
+                let child_entries = child.entries_up_to(remaining_entries)?.ok_or_else(|| {
+                    EndpointDirectoryError::EntryLimitExceeded {
+                        directory: directory.to_path_buf(),
+                        maximum: limits.max_entries,
                     }
-                    if paths.len() >= limits.max_candidates {
-                        return Err(EndpointDirectoryError::CandidateLimitExceeded {
-                            directory: directory.to_path_buf(),
-                            maximum: limits.max_candidates,
-                        });
-                    }
-                    paths.push(entry.relative_path().to_path_buf());
-                    if read_documents {
-                        let remaining_source_bytes = limits
-                            .max_source_bytes
-                            .checked_sub(retained_source_bytes)
-                            .expect("retained directory bytes never exceed their limit");
-                        let document = entry
-                            .read_document(
-                                &["rqlp"],
-                                (MAX_RQLP_SOURCE_BYTES.min(remaining_source_bytes)) as u64,
-                            )
-                            .map_err(|error| {
-                                if remaining_source_bytes < MAX_RQLP_SOURCE_BYTES
-                                    && matches!(error, WorkspaceDocumentError::TooLarge { .. })
-                                {
-                                    EndpointDirectoryError::SourceByteLimitExceeded {
-                                        directory: directory.to_path_buf(),
-                                        maximum: limits.max_source_bytes,
-                                    }
-                                } else {
-                                    EndpointDirectoryError::Workspace(error)
+                })?;
+                visited_entries += child_entries.len();
+                stack.push(DirectoryFrame {
+                    depth: child_depth,
+                    entries: child_entries.into_iter(),
+                });
+            }
+            WorkspaceDirectoryEntryKind::File => {
+                if entry
+                    .relative_path()
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    != Some("rqlp")
+                {
+                    continue;
+                }
+                let workspace_path = WorkspaceRelativePath::try_from_path(entry.relative_path())
+                    .map_err(|source| EndpointDirectoryError::InvalidWorkspacePath {
+                        path: entry.relative_path().to_path_buf(),
+                        source,
+                    })?;
+                workspace_policy_source_identity(&workspace_path)
+                    .map_err(|source| EndpointDirectoryError::InvalidSourceIdentity { source })?;
+                if paths.len() >= limits.max_candidates {
+                    return Err(EndpointDirectoryError::CandidateLimitExceeded {
+                        directory: directory.to_path_buf(),
+                        maximum: limits.max_candidates,
+                    });
+                }
+                paths.push(entry.relative_path().to_path_buf());
+                if read_documents {
+                    let remaining_source_bytes = limits
+                        .max_source_bytes
+                        .checked_sub(retained_source_bytes)
+                        .expect("retained directory bytes never exceed their limit");
+                    let document = entry
+                        .read_document(
+                            &["rqlp"],
+                            (MAX_RQLP_SOURCE_BYTES.min(remaining_source_bytes)) as u64,
+                        )
+                        .map_err(|error| {
+                            if remaining_source_bytes < MAX_RQLP_SOURCE_BYTES
+                                && matches!(error, WorkspaceDocumentError::TooLarge { .. })
+                            {
+                                EndpointDirectoryError::SourceByteLimitExceeded {
+                                    directory: directory.to_path_buf(),
+                                    maximum: limits.max_source_bytes,
                                 }
-                            })?;
-                        retained_source_bytes = retained_source_bytes
-                            .checked_add(document.source().len())
-                            .filter(|total| *total <= limits.max_source_bytes)
-                            .ok_or_else(|| EndpointDirectoryError::SourceByteLimitExceeded {
-                                directory: directory.to_path_buf(),
-                                maximum: limits.max_source_bytes,
-                            })?;
-                        documents.push(document);
-                    }
+                            } else {
+                                EndpointDirectoryError::Workspace(error)
+                            }
+                        })?;
+                    retained_source_bytes = retained_source_bytes
+                        .checked_add(document.source().len())
+                        .filter(|total| *total <= limits.max_source_bytes)
+                        .ok_or_else(|| EndpointDirectoryError::SourceByteLimitExceeded {
+                            directory: directory.to_path_buf(),
+                            maximum: limits.max_source_bytes,
+                        })?;
+                    documents.push(document);
                 }
             }
-        }
-        // Stack order is irrelevant to the public result (which is sorted),
-        // but reverse here so the traversal itself is lexical and predictable.
-        for child in child_directories.into_iter().rev() {
-            stack.push((child, depth + 1));
         }
     }
 
@@ -266,11 +327,22 @@ fn enumerate(
 pub(crate) enum EndpointDirectoryError {
     Workspace(WorkspaceDocumentError),
     Policy(PolicyDocumentLoadError),
+    InvalidWorkspacePath {
+        path: PathBuf,
+        source: WorkspaceRelativePathError,
+    },
+    InvalidSourceIdentity {
+        source: PolicySourceIdentityError,
+    },
     DepthExceeded {
         path: PathBuf,
         maximum: usize,
     },
     CandidateLimitExceeded {
+        directory: PathBuf,
+        maximum: usize,
+    },
+    EntryLimitExceeded {
         directory: PathBuf,
         maximum: usize,
     },
@@ -293,6 +365,17 @@ impl fmt::Display for EndpointDirectoryError {
         match self {
             Self::Workspace(error) => error.fmt(formatter),
             Self::Policy(error) => error.fmt(formatter),
+            Self::InvalidWorkspacePath { path, source } => write!(
+                formatter,
+                "invalid portable match-directory path `{}`: {source}",
+                path.display()
+            ),
+            Self::InvalidSourceIdentity { source } => {
+                write!(
+                    formatter,
+                    "invalid match-directory source identity: {source}"
+                )
+            }
             Self::DepthExceeded { path, maximum } => write!(
                 formatter,
                 "match-directory recursion exceeds depth {maximum} at `{}`",
@@ -301,6 +384,11 @@ impl fmt::Display for EndpointDirectoryError {
             Self::CandidateLimitExceeded { directory, maximum } => write!(
                 formatter,
                 "match-directory `{}` contains more than {maximum} `.rqlp` candidates",
+                directory.display()
+            ),
+            Self::EntryLimitExceeded { directory, maximum } => write!(
+                formatter,
+                "match-directory `{}` contains more than {maximum} total entries",
                 directory.display()
             ),
             Self::SourceByteLimitExceeded { directory, maximum } => write!(
@@ -331,8 +419,11 @@ impl std::error::Error for EndpointDirectoryError {
         match self {
             Self::Workspace(error) => Some(error),
             Self::Policy(error) => Some(error),
+            Self::InvalidWorkspacePath { source, .. } => Some(source),
+            Self::InvalidSourceIdentity { source } => Some(source),
             Self::DepthExceeded { .. }
             | Self::CandidateLimitExceeded { .. }
+            | Self::EntryLimitExceeded { .. }
             | Self::SourceByteLimitExceeded { .. }
             | Self::DirectoryChangedDuringLoad { .. }
             | Self::WrongDocumentKind { .. } => None,
@@ -498,6 +589,90 @@ mod tests {
             error,
             EndpointDirectoryError::SourceByteLimitExceeded { maximum, .. }
                 if maximum == first.len() + second.len() - 1
+        ));
+    }
+
+    #[test]
+    fn total_entry_limit_counts_irrelevant_files_before_retention() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir(temp.path().join("models")).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(temp.path().join("models").join(name), "ignored").unwrap();
+        }
+        let root = WorkspaceRoot::open(temp.path()).unwrap();
+        let path = WorkspaceRelativePath::new("models").unwrap();
+        let limits = MatchDirectoryLimits::default().with_max_entries(2).unwrap();
+
+        let error =
+            enumerate_endpoint_directory(&root, &path, DirectoryScope::Direct, limits).unwrap_err();
+
+        assert!(matches!(
+            error,
+            EndpointDirectoryError::EntryLimitExceeded { maximum: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn explicit_directory_resolution_does_not_charge_workspace_siblings() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir(temp.path().join("models")).unwrap();
+        for index in 0..32 {
+            fs::write(
+                temp.path().join(format!("workspace-sibling-{index}.txt")),
+                "ignored",
+            )
+            .unwrap();
+        }
+        let root = WorkspaceRoot::open(temp.path()).unwrap();
+        let path = WorkspaceRelativePath::new("models").unwrap();
+        let limits = MatchDirectoryLimits::default().with_max_entries(1).unwrap();
+
+        let loaded =
+            enumerate_endpoint_directory(&root, &path, DirectoryScope::Direct, limits).unwrap();
+
+        assert!(loaded.entries().is_empty());
+    }
+
+    #[test]
+    fn total_entry_limit_counts_empty_recursive_directories() {
+        let temp = TempDir::new().unwrap();
+        for name in ["a", "b", "c"] {
+            fs::create_dir_all(temp.path().join("models").join(name)).unwrap();
+        }
+        let root = WorkspaceRoot::open(temp.path()).unwrap();
+        let path = WorkspaceRelativePath::new("models").unwrap();
+        let limits = MatchDirectoryLimits::default().with_max_entries(2).unwrap();
+
+        let error = enumerate_endpoint_directory(&root, &path, DirectoryScope::Recursive, limits)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            EndpointDirectoryError::EntryLimitExceeded { maximum: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn directory_candidate_identity_rejects_control_characters_transactionally() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir(temp.path().join("models")).unwrap();
+        fs::write(temp.path().join("models/bad\u{85}.rqlp"), endpoint("bad")).unwrap();
+        let root = WorkspaceRoot::open(temp.path()).unwrap();
+        let path = WorkspaceRelativePath::new("models").unwrap();
+
+        let error = enumerate_endpoint_directory(
+            &root,
+            &path,
+            DirectoryScope::Direct,
+            MatchDirectoryLimits::default(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            EndpointDirectoryError::InvalidSourceIdentity {
+                source: PolicySourceIdentityError::ControlCharacter
+            }
         ));
     }
 

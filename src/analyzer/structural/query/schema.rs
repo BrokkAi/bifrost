@@ -8,7 +8,7 @@
 
 use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
 use crate::schema_version::{
-    SchemaInference, SchemaVersionDescriptor, SchemaVersionRegistry, SchemaVersionResolution,
+    SchemaVersionDescriptor, SchemaVersionRegistry, SchemaVersionResolution,
     UnsupportedSchemaVersion,
 };
 use std::sync::OnceLock;
@@ -18,7 +18,7 @@ use super::ir::{MAX_CAPTURE_LENGTH, MAX_KWARG_NAME_LENGTH, SCHEMA_VERSION};
 const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[SchemaVersionDescriptor::new(
     SCHEMA_VERSION as u32,
     None,
-    SchemaInference::AutoCompatible,
+    true,
 )];
 
 static RQL_SCHEMA_VERSION_REGISTRY: OnceLock<SchemaVersionRegistry> = OnceLock::new();

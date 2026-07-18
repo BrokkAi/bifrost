@@ -349,11 +349,11 @@ fn parses_and_rejects_schema_version() {
 
 #[test]
 fn compatible_schema_successor_changes_only_the_emitted_version() {
-    use crate::schema_version::{SchemaInference, SchemaVersionDescriptor, SchemaVersionRegistry};
+    use crate::schema_version::{SchemaVersionDescriptor, SchemaVersionRegistry};
 
     let registry = SchemaVersionRegistry::new(&[
-        SchemaVersionDescriptor::new(2, None, SchemaInference::AutoCompatible),
-        SchemaVersionDescriptor::new(3, Some(2), SchemaInference::AutoCompatible),
+        SchemaVersionDescriptor::new(2, None, true),
+        SchemaVersionDescriptor::new(3, Some(2), true),
     ])
     .unwrap();
     let source = json!({ "match": { "kind": "call" } });

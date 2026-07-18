@@ -9,7 +9,7 @@ use std::fmt;
 use std::hash::Hash;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PrecedenceError<K> {
+pub(crate) enum PrecedenceError<K> {
     DuplicateNode { node: K },
     DanglingEdge { dominant: K, dominated: K },
     SelfEdge { node: K },
@@ -56,7 +56,7 @@ impl<K: fmt::Debug> std::error::Error for PrecedenceError<K> {}
 
 /// A validated finite DAG with stable node and edge order.
 #[derive(Debug, Clone)]
-pub struct PrecedenceGraph<K> {
+pub(crate) struct PrecedenceGraph<K> {
     nodes: Vec<K>,
     positions: HashMap<K, usize>,
     outgoing: Vec<Vec<usize>>,
@@ -67,7 +67,7 @@ impl<K> PrecedenceGraph<K>
 where
     K: Clone + Eq + Hash + Ord,
 {
-    pub fn try_new(
+    pub(crate) fn try_new(
         nodes: impl IntoIterator<Item = K>,
         edges: impl IntoIterator<Item = (K, K)>,
     ) -> Result<Self, PrecedenceError<K>> {
@@ -154,12 +154,12 @@ where
         })
     }
 
-    pub fn edges(&self) -> &[(K, K)] {
+    pub(crate) fn edges(&self) -> &[(K, K)] {
         &self.edges
     }
 
     /// Return whether `dominant` transitively supersedes `dominated`.
-    pub fn dominates(&self, dominant: &K, dominated: &K) -> bool {
+    pub(crate) fn dominates(&self, dominant: &K, dominated: &K) -> bool {
         let (Some(&start), Some(&target)) =
             (self.positions.get(dominant), self.positions.get(dominated))
         else {
@@ -188,7 +188,7 @@ where
 
     /// Select the one non-superseded candidate, if the candidate set is
     /// non-empty. An incomparable live set is an explicit ambiguity.
-    pub fn unique_winner(
+    pub(crate) fn unique_winner(
         &self,
         candidates: impl IntoIterator<Item = K>,
     ) -> Result<Option<K>, PrecedenceError<K>> {

@@ -9,13 +9,13 @@ use crate::analyzer::policy::definition::*;
 use crate::analyzer::policy::resolved::*;
 
 #[derive(Debug, Clone)]
-pub struct ComposedTypestatePolicy {
-    pub spec: ResolvedTypestatePolicySpec,
-    pub precedence: PolicyPrecedenceManifest,
+pub(crate) struct ComposedTypestatePolicy {
+    pub(crate) spec: ResolvedTypestatePolicySpec,
+    pub(crate) precedence: PolicyPrecedenceManifest,
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn compose_typestate_policy(
+pub(crate) fn compose_typestate_policy(
     policy_id: &PolicyId,
     spec: &TypestatePolicySpec,
     catalogs: &TaintCatalogRegistry,

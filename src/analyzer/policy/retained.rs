@@ -18,7 +18,7 @@ use super::source::PolicySourceIdentity;
 /// capacities of owned strings and vectors and the recursively owned storage
 /// of populated vector elements. Allocator metadata is intentionally outside
 /// the model because it is host-specific.
-pub trait RetainedSize {
+pub(crate) trait RetainedSize {
     fn retained_size(&self) -> usize;
 }
 

@@ -28,12 +28,12 @@ mod source;
 #[cfg(test)]
 mod adapter_seam_tests;
 
-pub use crate::schema_version::{SchemaInference, SchemaVersionOrigin, SchemaVersionResolution};
+pub use crate::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
+pub use crate::workspace_document::{WorkspaceDocumentError, WorkspacePathError};
 pub use budget::*;
 pub use canonical::InlineLocalSemanticProjectionError;
 pub use catalog::*;
 pub use classification::*;
-pub use composition::*;
 pub use coordinator::*;
 pub use cvss::*;
 pub use definition::*;
@@ -47,6 +47,5 @@ pub use registry::*;
 pub use render::*;
 pub use report::*;
 pub use resolved::*;
-pub use retained::*;
 pub(crate) use source::rqlp_source_completion_at;
 pub use source::*;

@@ -29,7 +29,7 @@ use super::loading::{
 use super::resolved::*;
 use super::source::{
     MAX_RQLP_SOURCE_BYTES, ParsedRqlpDocument, PolicySourceError, PolicySourceIdentity,
-    parse_rqlp_source,
+    PolicySourceIdentityError, parse_rqlp_source, validate_policy_source_identity,
 };
 
 pub const MAX_REGISTERED_POLICIES: usize = 256;
@@ -37,8 +37,8 @@ pub const MAX_REGISTERED_ENDPOINTS: usize = 4_096;
 pub const MAX_MATCH_DIRECTORIES_PER_POLICY: usize = 64;
 pub const MAX_POLICY_MATCH_DIRECTORY_DEPTH: usize = 32;
 pub const MAX_POLICY_MATCH_DIRECTORY_CANDIDATES: usize = 4_096;
+pub const MAX_POLICY_MATCH_DIRECTORY_ENTRIES: usize = 65_536;
 pub const MAX_RETAINED_POLICY_SOURCE_AND_SELECTOR_BYTES: usize = 128 * 1024 * 1024;
-pub const MAX_POLICY_SOURCE_IDENTITY_BYTES: usize = 1_024;
 
 /// Per-registry lowerings of the schema-v1 hard ceilings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +48,7 @@ pub struct PolicyRegistryLimits {
     max_match_directories_per_policy: usize,
     max_match_directory_depth: usize,
     max_match_directory_candidates: usize,
+    max_match_directory_entries: usize,
     max_retained_source_and_selector_bytes: usize,
 }
 
@@ -59,6 +60,7 @@ impl Default for PolicyRegistryLimits {
             max_match_directories_per_policy: MAX_MATCH_DIRECTORIES_PER_POLICY,
             max_match_directory_depth: MAX_POLICY_MATCH_DIRECTORY_DEPTH,
             max_match_directory_candidates: MAX_POLICY_MATCH_DIRECTORY_CANDIDATES,
+            max_match_directory_entries: MAX_POLICY_MATCH_DIRECTORY_ENTRIES,
             max_retained_source_and_selector_bytes: MAX_RETAINED_POLICY_SOURCE_AND_SELECTOR_BYTES,
         }
     }
@@ -83,6 +85,10 @@ impl PolicyRegistryLimits {
 
     pub const fn max_match_directory_candidates(self) -> usize {
         self.max_match_directory_candidates
+    }
+
+    pub const fn max_match_directory_entries(self) -> usize {
+        self.max_match_directory_entries
     }
 
     pub const fn max_retained_source_and_selector_bytes(self) -> usize {
@@ -140,6 +146,19 @@ impl PolicyRegistryLimits {
         Ok(self)
     }
 
+    pub fn with_max_match_directory_entries(
+        mut self,
+        value: usize,
+    ) -> Result<Self, PolicyRegistryLimitError> {
+        validate_registry_limit(
+            "max_match_directory_entries",
+            value,
+            MAX_POLICY_MATCH_DIRECTORY_ENTRIES,
+        )?;
+        self.max_match_directory_entries = value;
+        Ok(self)
+    }
+
     pub fn with_max_retained_source_and_selector_bytes(
         mut self,
         value: usize,
@@ -187,26 +206,6 @@ impl fmt::Display for PolicyRegistryLimitError {
 }
 
 impl std::error::Error for PolicyRegistryLimitError {}
-
-/// Validation failures for embedding-supplied diagnostic source labels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PolicySourceIdentityError {
-    Empty,
-    TooLong,
-    ControlCharacter,
-}
-
-impl fmt::Display for PolicySourceIdentityError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Empty => "policy source identity must not be empty",
-            Self::TooLong => "policy source identity must be at most 1024 bytes",
-            Self::ControlCharacter => "policy source identity must not contain control characters",
-        })
-    }
-}
-
-impl std::error::Error for PolicySourceIdentityError {}
 
 #[derive(Debug)]
 struct RegisteredEndpoint {
@@ -1124,6 +1123,7 @@ impl PolicyRegistry {
         let limits = MatchDirectoryLimits::default()
             .with_max_depth(self.limits.max_match_directory_depth)?
             .with_max_candidates(self.limits.max_match_directory_candidates)?
+            .with_max_entries(self.limits.max_match_directory_entries)?
             .with_max_source_bytes(available)?;
         let directory = enumerate_endpoint_directory(root, &key.path, key.scope, limits)?;
         let mut endpoints = Vec::with_capacity(directory.entries().len());
@@ -1352,22 +1352,6 @@ fn extend_set_uses(
             role,
             path: dependency_path(format!("{base}/{index}"))?,
         });
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_policy_source_identity(
-    identity: &PolicySourceIdentity,
-) -> Result<(), PolicySourceIdentityError> {
-    let label = identity.as_str();
-    if label.is_empty() {
-        return Err(PolicySourceIdentityError::Empty);
-    }
-    if label.len() > MAX_POLICY_SOURCE_IDENTITY_BYTES {
-        return Err(PolicySourceIdentityError::TooLong);
-    }
-    if label.chars().any(char::is_control) {
-        return Err(PolicySourceIdentityError::ControlCharacter);
     }
     Ok(())
 }
@@ -1648,7 +1632,9 @@ pub enum PolicyRegistryError {
     MatchDirectoryLimits {
         message: String,
     },
-    Composition(Box<CompositionError>),
+    Composition {
+        message: String,
+    },
     Model(Box<LoadedModelError>),
     SelectorPath(Box<PolicySelectorPathError>),
     Catalog(Box<super::catalog::CatalogRegistryError>),
@@ -1740,7 +1726,7 @@ impl fmt::Display for PolicyRegistryError {
             | Self::SelectorLoad { message }
             | Self::Directory { message }
             | Self::MatchDirectoryLimits { message } => formatter.write_str(message),
-            Self::Composition(error) => error.fmt(formatter),
+            Self::Composition { message } => formatter.write_str(message),
             Self::Model(error) => error.fmt(formatter),
             Self::SelectorPath(error) => error.fmt(formatter),
             Self::Catalog(error) => error.fmt(formatter),
@@ -1833,7 +1819,6 @@ impl std::error::Error for PolicyRegistryError {
             Self::Workspace(error) => Some(error.as_ref()),
             Self::InvalidSourceIdentity(error) => Some(error),
             Self::Source(error) => Some(error.as_ref()),
-            Self::Composition(error) => Some(error.as_ref()),
             Self::Model(error) => Some(error.as_ref()),
             Self::SelectorPath(error) => Some(error.as_ref()),
             Self::Catalog(error) => Some(error.as_ref()),
@@ -1854,7 +1839,6 @@ macro_rules! boxed_error_conversion {
 
 boxed_error_conversion!(WorkspaceDocumentError, Workspace);
 boxed_error_conversion!(PolicySourceError, Source);
-boxed_error_conversion!(CompositionError, Composition);
 boxed_error_conversion!(LoadedModelError, Model);
 boxed_error_conversion!(PolicySelectorPathError, SelectorPath);
 boxed_error_conversion!(super::catalog::CatalogRegistryError, Catalog);
@@ -1867,10 +1851,21 @@ impl From<MatchDirectoryLimitError> for PolicyRegistryError {
     }
 }
 
+impl From<CompositionError> for PolicyRegistryError {
+    fn from(error: CompositionError) -> Self {
+        Self::Composition {
+            message: error.to_string(),
+        }
+    }
+}
+
 impl From<PolicyDocumentLoadError> for PolicyRegistryError {
     fn from(error: PolicyDocumentLoadError) -> Self {
-        Self::DocumentLoad {
-            message: error.to_string(),
+        match error {
+            PolicyDocumentLoadError::InvalidSourceIdentity { source, .. } => source.into(),
+            error => Self::DocumentLoad {
+                message: error.to_string(),
+            },
         }
     }
 }
@@ -1893,8 +1888,15 @@ impl From<SelectorLoadError> for PolicyRegistryError {
 
 impl From<EndpointDirectoryError> for PolicyRegistryError {
     fn from(error: EndpointDirectoryError) -> Self {
-        Self::Directory {
-            message: error.to_string(),
+        let message = error.to_string();
+        match error {
+            EndpointDirectoryError::DepthExceeded { .. }
+            | EndpointDirectoryError::CandidateLimitExceeded { .. }
+            | EndpointDirectoryError::EntryLimitExceeded { .. }
+            | EndpointDirectoryError::SourceByteLimitExceeded { .. } => {
+                Self::MatchDirectoryLimits { message }
+            }
+            _ => Self::Directory { message },
         }
     }
 }

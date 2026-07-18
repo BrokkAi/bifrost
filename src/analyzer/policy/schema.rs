@@ -7,7 +7,7 @@
 
 use super::definition::CvssMetricValueToken;
 use crate::schema_version::{
-    SchemaInference, SchemaVersionDescriptor, SchemaVersionRegistry, SchemaVersionResolution,
+    SchemaVersionDescriptor, SchemaVersionRegistry, SchemaVersionResolution,
     UnsupportedSchemaVersion,
 };
 use std::sync::OnceLock;
@@ -17,7 +17,7 @@ pub const POLICY_SCHEMA_VERSION: u32 = 1;
 const POLICY_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] = &[SchemaVersionDescriptor::new(
     POLICY_SCHEMA_VERSION,
     None,
-    SchemaInference::AutoCompatible,
+    true,
 )];
 
 static POLICY_SCHEMA_VERSION_REGISTRY: OnceLock<SchemaVersionRegistry> = OnceLock::new();

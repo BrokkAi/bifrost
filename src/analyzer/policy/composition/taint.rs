@@ -13,14 +13,14 @@ use crate::analyzer::policy::definition::*;
 use crate::analyzer::policy::resolved::*;
 
 #[derive(Debug, Clone)]
-pub struct ComposedTaintPolicy {
-    pub spec: ResolvedTaintPolicySpec,
-    pub endpoint_dependencies: Vec<ResolvedEndpointDependency>,
-    pub precedence: PolicyPrecedenceManifest,
+pub(crate) struct ComposedTaintPolicy {
+    pub(crate) spec: ResolvedTaintPolicySpec,
+    pub(crate) endpoint_dependencies: Vec<ResolvedEndpointDependency>,
+    pub(crate) precedence: PolicyPrecedenceManifest,
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn compose_taint_policy(
+pub(crate) fn compose_taint_policy(
     policy_id: &PolicyId,
     spec: &TaintPolicySpec,
     catalogs: &TaintCatalogRegistry,

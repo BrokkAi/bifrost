@@ -3,7 +3,7 @@ title: Java
 description: Query Java member calls, constructors, annotations, exceptions, and control flow with query_code.
 ---
 
-> Last verified end to end: 2026-07-14 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-18 (`query_code` schema version 2).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
 
@@ -273,6 +273,8 @@ Java has positional arguments but no keyword-argument syntax. Asking for `kwargs
   "truncated": false,
   "diagnostics": [
     {
+      "code": "unsupported_structural_feature",
+      "impact": "incomplete",
       "language": "java",
       "message": "structural adapter for java does not support role(s): kwargs"
     }

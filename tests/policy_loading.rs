@@ -6,9 +6,9 @@ use brokk_bifrost::analyzer::structural::CodeQuery;
 use brokk_bifrost::policy::{
     CatalogRegistryLimits, PolicyCategoryId, PolicyId, PolicyPort, PolicyRegistry,
     PolicyRegistryError, PolicyRegistryLimits, PolicySelector, PolicySourceIdentity,
-    ResolvedEndpointIdentity, SchemaVersionOrigin, SchemaVersionResolution, SelectorOrigin,
-    TaintCatalogDefinition, TaintCatalogRegistry, TaintEntryId, TaintLabel, TaintSanitizerSpec,
-    TaintSinkSpec, TaintSourceSpec,
+    PolicySourceIdentityError, ResolvedEndpointIdentity, SchemaVersionOrigin,
+    SchemaVersionResolution, SelectorOrigin, TaintCatalogDefinition, TaintCatalogRegistry,
+    TaintEntryId, TaintLabel, TaintSanitizerSpec, TaintSinkSpec, TaintSourceSpec,
 };
 use tempfile::TempDir;
 
@@ -194,6 +194,24 @@ fn public_path_and_byte_boundaries_reject_invalid_documents_transactionally() {
             .is_err()
     );
     assert_eq!(registry.policies().len(), 0);
+
+    let overlong = format!("{}.rqlp", "a".repeat(1_024));
+    for error in [
+        registry.load_policy_path(&overlong).unwrap_err(),
+        registry.load_endpoint_path(&overlong).unwrap_err(),
+    ] {
+        assert!(matches!(
+            error,
+            PolicyRegistryError::InvalidSourceIdentity(PolicySourceIdentityError::TooLong)
+        ));
+    }
+    let error = registry.load_policy_path("bad\u{85}.rqlp").unwrap_err();
+    assert!(matches!(
+        error,
+        PolicyRegistryError::InvalidSourceIdentity(PolicySourceIdentityError::ControlCharacter)
+    ));
+    assert_eq!(registry.policies().len(), 0);
+    assert_eq!(registry.endpoints().len(), 0);
 
     let error = registry
         .register_policy_bytes(PolicySourceIdentity::new("invalid:utf8"), &[0xff])
@@ -561,6 +579,22 @@ fn directory_manifest_pins_and_candidate_limits_are_transactional() {
     let mut limited =
         PolicyRegistry::new_for_workspace(temp.path().to_path_buf(), catalogs(), limits).unwrap();
     assert!(limited.load_policy_path("policy.rqlp").is_err());
+    assert_eq!(limited.policies().len(), 0);
+
+    for name in ["ignored-a.txt", "ignored-b.txt", "ignored-c.txt"] {
+        fs::write(temp.path().join("endpoints").join(name), "ignored").unwrap();
+    }
+    let limits = PolicyRegistryLimits::default()
+        .with_max_match_directory_entries(2)
+        .unwrap();
+    let mut limited =
+        PolicyRegistry::new_for_workspace(temp.path().to_path_buf(), catalogs(), limits).unwrap();
+    let error = limited.load_policy_path("policy.rqlp").unwrap_err();
+    assert!(matches!(
+        error,
+        PolicyRegistryError::MatchDirectoryLimits { .. }
+    ));
+    assert!(error.to_string().contains("total entries"), "{error}");
     assert_eq!(limited.policies().len(), 0);
 }
 

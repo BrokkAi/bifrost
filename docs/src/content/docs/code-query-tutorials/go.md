@@ -3,7 +3,7 @@ title: Go
 description: Query Go selector calls, multi-value assignments, imports, methods, and capability diagnostics with query_code.
 ---
 
-> Last verified end to end: 2026-07-14 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-18 (`query_code` schema version 2).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
 
@@ -188,7 +188,7 @@ The module role is the imported path, not the local alias used by later Go expre
 
 <!-- code-query-case:unsupported-kwargs:expected -->
 ```json
-{"results":[],"truncated":false,"diagnostics":[{"language":"go","message":"structural adapter for go does not support role(s): kwargs"}]}
+{"results":[],"truncated":false,"diagnostics":[{"code":"unsupported_structural_feature","impact":"incomplete","language":"go","message":"structural adapter for go does not support role(s): kwargs"}]}
 ```
 
 <!-- code-query-case:unsupported-decorators:rql -->
@@ -203,7 +203,7 @@ The module role is the imported path, not the local alias used by later Go expre
 
 <!-- code-query-case:unsupported-decorators:expected -->
 ```json
-{"results":[],"truncated":false,"diagnostics":[{"language":"go","message":"structural adapter for go does not support role(s): decorators"}]}
+{"results":[],"truncated":false,"diagnostics":[{"code":"unsupported_structural_feature","impact":"incomplete","language":"go","message":"structural adapter for go does not support role(s): decorators"}]}
 ```
 
 ## Precision Boundary
