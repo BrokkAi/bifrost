@@ -1019,11 +1019,16 @@ pub(in crate::analyzer::usages) fn resolve_bare_call_target(
     for prefix_len in (0..=lexical_scope.len()).rev() {
         let mut qualified = lexical_scope[..prefix_len].to_vec();
         qualified.push(name.to_string());
+        let same_name_resolves_to_type = direct_type_components
+            .is_some_and(|components| components == qualified.as_slice())
+            || type_components.is_some_and(|components| components == qualified.as_slice());
         let mut direct = visibility
             .visible_identifier_candidates(file, name)
             .filter(|candidate| {
                 candidate.is_function()
                     && type_owner_of(analyzer, candidate).is_none()
+                    && !(same_name_resolves_to_type
+                        && visibility.callable_is_constructor_declaration(analyzer, candidate))
                     && cpp_name_for(candidate) == qualified.join("::")
                     && visibility.declaration_visible_at(
                         analyzer,

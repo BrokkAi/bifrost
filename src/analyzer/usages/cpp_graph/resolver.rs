@@ -2763,6 +2763,62 @@ impl VisibilityIndex {
             .flatten()
     }
 
+    pub(in crate::analyzer::usages) fn callable_is_constructor_declaration(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidate: &CodeUnit,
+    ) -> bool {
+        if !candidate.is_function() {
+            return false;
+        }
+        let Some(prepared) = self.cpp.prepared_syntax(candidate.source()) else {
+            return false;
+        };
+        let root = prepared.tree().root_node();
+        let candidate_ranges = analyzer.ranges(candidate);
+        let enclosed_by_matching_type = candidate_ranges.iter().any(|range| {
+            let mut current = root
+                .descendant_for_byte_range(range.start_byte, range.end_byte)
+                .and_then(|node| node.parent());
+            while let Some(node) = current {
+                if matches!(
+                    node.kind(),
+                    "class_specifier" | "struct_specifier" | "union_specifier"
+                ) {
+                    return node
+                        .child_by_field_name("name")
+                        .map(|name| terminal_name(node_text(name, prepared.source())))
+                        .is_some_and(|name| name == candidate.identifier());
+                }
+                current = node.parent();
+            }
+            false
+        });
+        if enclosed_by_matching_type {
+            return true;
+        }
+        let indexed_containment = analyzer
+            .declarations(candidate.source())
+            .into_iter()
+            .filter(|unit| unit.is_class() && unit.identifier() == candidate.identifier())
+            .any(|owner| {
+                analyzer.ranges(&owner).iter().any(|owner_range| {
+                    candidate_ranges.iter().any(|candidate_range| {
+                        owner_range.start_byte <= candidate_range.start_byte
+                            && candidate_range.end_byte <= owner_range.end_byte
+                    })
+                })
+            });
+        if indexed_containment {
+            return true;
+        }
+        let metadata = analyzer.signature_metadata(candidate);
+        !metadata.is_empty()
+            && metadata
+                .iter()
+                .all(|signature| signature.return_type_text().is_none())
+    }
+
     pub(in crate::analyzer::usages) fn type_name_candidates<'b>(
         &'b self,
         file: &ProjectFile,

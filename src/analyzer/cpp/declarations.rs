@@ -352,6 +352,33 @@ fn recover_exported_class_function_definition<'tree>(
         type_node.kind(),
         "class_specifier" | "struct_specifier" | "union_specifier"
     ) {
+        if type_node
+            .child_by_field_name("name")
+            .and_then(|name| direct_identifier_name(name, source))
+            .is_some_and(|name| cpp_export_macro_token(&name))
+        {
+            let mut cursor = node.walk();
+            let errors_before_declarator = node
+                .named_children(&mut cursor)
+                .filter(|child| {
+                    child.kind() == "ERROR"
+                        && child.start_byte() >= type_node.end_byte()
+                        && child.end_byte() <= declarator.start_byte()
+                })
+                .collect::<Vec<_>>();
+            if let Some(name) = errors_before_declarator
+                .iter()
+                .find_map(|error| displaced_exported_class_name(*error, source))
+            {
+                return Some((node, name));
+            }
+            if errors_before_declarator
+                .iter()
+                .any(|error| malformed_inheritance_syntax(*error))
+            {
+                return None;
+            }
+        }
         if let Some(name) = direct_identifier_name(declarator, source)
             && !cpp_export_macro_token(&name)
         {
@@ -387,6 +414,13 @@ fn recover_exported_class_function_definition<'tree>(
         return None;
     }
     class_identifier_before_body(node, source).map(|name| (node, name))
+}
+
+fn malformed_inheritance_syntax(node: Node<'_>) -> bool {
+    (0..node.child_count()).any(|index| {
+        node.child(index)
+            .is_some_and(|child| matches!(child.kind(), ":" | "public" | "protected" | "private"))
+    })
 }
 
 pub(crate) fn is_recovered_exported_class_container(node: Node<'_>, source: &str) -> bool {
@@ -3128,6 +3162,136 @@ mod tests {
         finish_declaration_identity_comparison_probe, start_declaration_identity_comparison_probe,
     };
     use std::fmt::Write;
+
+    #[test]
+    fn exported_single_base_recovery_uses_displaced_class_name() {
+        let source = r#"
+class CORE_EXPORT QgsPoint : public AbstractGeometry
+{
+    Q_GADGET
+
+    Q_PROPERTY( double x READ x WRITE setX )
+    Q_PROPERTY( double y READ y WRITE setY )
+    Q_PROPERTY( double z READ z WRITE setZ )
+    Q_PROPERTY( double m READ m WRITE setM )
+
+  public:
+#ifndef SIP_RUN
+    QgsPoint(
+      double x = std::numeric_limits<double>::quiet_NaN(),
+      double y = std::numeric_limits<double>::quiet_NaN(),
+      double z = std::numeric_limits<double>::quiet_NaN(),
+      double m = std::numeric_limits<double>::quiet_NaN(),
+      Qgis::WkbType wkbType = Qgis::WkbType::Unknown
+    );
+#else
+    QgsPoint( SIP_PYOBJECT x SIP_TYPEHINT( Optional[Union[QgsPoint, QPointF, float]] ) = Py_None, SIP_PYOBJECT y SIP_TYPEHINT( Optional[float] ) = Py_None, SIP_PYOBJECT z SIP_TYPEHINT( Optional[float] ) = Py_None, SIP_PYOBJECT m SIP_TYPEHINT( Optional[float] ) = Py_None, SIP_PYOBJECT wkbType SIP_TYPEHINT( Optional[int] ) = Py_None ) [( double x = 0.0, double y = 0.0, double z = 0.0, double m = 0.0, Qgis::WkbType wkbType = Qgis::WkbType::Unknown )];
+    % MethodCode
+    if ( sipCanConvertToType( a0, sipType_QgsPointXY, SIP_NOT_NONE ) && a1 == Py_None && a2 == Py_None && a3 == Py_None && a4 == Py_None )
+    {
+      int state;
+      sipIsErr = 0;
+      QgsPointXY *p = reinterpret_cast<QgsPointXY *>( sipConvertToType( a0, sipType_QgsPointXY, 0, SIP_NOT_NONE, &state, &sipIsErr ) );
+      if ( !sipIsErr )
+      {
+        sipCpp = new sipQgsPoint( QgsPoint( *p ) );
+      }
+      sipReleaseType( p, sipType_QgsPointXY, state );
+    }
+    else if ( sipCanConvertToType( a0, sipType_QPointF, SIP_NOT_NONE ) && a1 == Py_None && a2 == Py_None && a3 == Py_None && a4 == Py_None )
+    {
+      int state;
+      sipIsErr = 0;
+
+      QPointF *p = reinterpret_cast<QPointF *>( sipConvertToType( a0, sipType_QPointF, 0, SIP_NOT_NONE, &state, &sipIsErr ) );
+      if ( !sipIsErr )
+      {
+        sipCpp = new sipQgsPoint( QgsPoint( *p ) );
+      }
+      sipReleaseType( p, sipType_QPointF, state );
+    }
+    else if (
+      ( a0 == Py_None || PyFloat_AsDouble( a0 ) != -1.0 || !PyErr_Occurred() ) &&
+      ( a1 == Py_None || PyFloat_AsDouble( a1 ) != -1.0 || !PyErr_Occurred() ) &&
+      ( a2 == Py_None || PyFloat_AsDouble( a2 ) != -1.0 || !PyErr_Occurred() ) &&
+      ( a3 == Py_None || PyFloat_AsDouble( a3 ) != -1.0 || !PyErr_Occurred() ) )
+    {
+      double x = a0 == Py_None ? std::numeric_limits<double>::quiet_NaN() : PyFloat_AsDouble( a0 );
+      double y = a1 == Py_None ? std::numeric_limits<double>::quiet_NaN() : PyFloat_AsDouble( a1 );
+      double z = a2 == Py_None ? std::numeric_limits<double>::quiet_NaN() : PyFloat_AsDouble( a2 );
+      double m = a3 == Py_None ? std::numeric_limits<double>::quiet_NaN() : PyFloat_AsDouble( a3 );
+      Qgis::WkbType wkbType = a4 == Py_None ? Qgis::WkbType::Unknown : static_cast<Qgis::WkbType>( sipConvertToEnum( a4, sipType_Qgis_WkbType ) );
+      sipCpp = new sipQgsPoint( QgsPoint( x, y, z, m, wkbType ) );
+    }
+    else // Invalid ctor arguments
+    {
+      PyErr_SetString( PyExc_TypeError, u"Invalid type in constructor arguments."_s.toUtf8().constData() );
+      sipIsErr = 1;
+    }
+    % End
+#endif
+
+    explicit QgsPoint( const QgsPointXY &p ) SIP_SKIP;
+    explicit QgsPoint( QPointF p ) SIP_SKIP;
+    explicit QgsPoint(
+      Qgis::WkbType wkbType,
+      double x = std::numeric_limits<double>::quiet_NaN(),
+      double y = std::numeric_limits<double>::quiet_NaN(),
+      double z = std::numeric_limits<double>::quiet_NaN(),
+      double m = std::numeric_limits<double>::quiet_NaN()
+    ) SIP_SKIP;
+    explicit QgsPoint( const QVector3D &vect, double m = std::numeric_limits<double>::quiet_NaN() ) SIP_SKIP;
+    explicit QgsPoint( const QVector4D &vect ) SIP_SKIP;
+    explicit QgsPoint( const QgsVector3D &vect, double m = std::numeric_limits<double>::quiet_NaN() ) SIP_SKIP;
+#ifndef SIP_RUN
+  private:
+    bool fuzzyHelper(
+      double epsilon,
+      const AbstractGeometry &other,
+      bool is3DFlag,
+      bool isMeasureFlag
+    ) const
+    {
+      return is3DFlag && isMeasureFlag && epsilon > 0 && &other;
+    }
+#endif
+};
+class Ordinary : public Base { public: Ordinary(); };
+class API_EXPORT Plain { public: Plain(); };
+class API_EXPORT : public Base {};
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let file = ProjectFile::new(std::env::temp_dir(), "exported-single-base.cpp");
+        let parsed = CppAdapter.parse_file(&file, source, &tree);
+        let declarations = parsed.declarations();
+
+        for expected in ["QgsPoint", "Ordinary", "Plain"] {
+            assert!(
+                declarations
+                    .iter()
+                    .any(|unit| unit.is_class() && unit.fq_name() == expected),
+                "missing recovered class {expected}: {declarations:#?}"
+            );
+        }
+        assert!(
+            declarations.iter().any(|unit| {
+                unit.is_function()
+                    && unit.fq_name() == "QgsPoint.QgsPoint"
+                    && unit.signature() == Some("(double, double, double, double, Qgis::WkbType)")
+            }),
+            "the conditional default donor must retain the recovered QgsPoint owner: {declarations:#?}"
+        );
+        assert!(
+            declarations.iter().all(|unit| {
+                !unit.is_class() || !matches!(unit.fq_name().as_str(), "AbstractGeometry" | "Base")
+            }),
+            "base declarators and an export macro without a displaced identifier must not become class identities: {declarations:#?}"
+        );
+    }
 
     #[test]
     fn cpp_alias_and_macro_dedup_comparison_count_is_linear() {
