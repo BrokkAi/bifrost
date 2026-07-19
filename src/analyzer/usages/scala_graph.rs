@@ -2,6 +2,7 @@ mod extractor;
 mod hits;
 mod inverted;
 pub(in crate::analyzer::usages) mod local;
+pub(crate) mod namespace;
 mod resolver;
 mod shared;
 pub(super) mod syntax;
@@ -458,10 +459,10 @@ object Use {
         for index in 0..FILE_COUNT {
             let file = ProjectFile::new(root.clone(), format!("C{index}.scala"));
             let source = if index == 0 {
-                "package bulk\n\ntrait Base\n\nobject Extensions {\n  extension (value: String) def run(): Unit = ()\n}\n\nclass C0 extends Base\n".to_string()
+                "package bulk\n\ntrait Base\n\nobject Extensions {\n  extension (value: String) def run(): Unit = ()\n}\n\nclass C0 extends Base {\n  type Alias = String\n  class Nested\n  def alias(value: Alias): Alias = value\n  def nested(value: Nested): Nested = value\n}\n".to_string()
             } else {
                 format!(
-                    "package bulk\n\nimport bulk.Extensions.run\n\nclass C{index} extends Base\n"
+                    "package bulk\n\nimport bulk.Extensions.run\n\nclass C{index} extends Base {{\n  type Alias = String\n  class Nested\n  def alias(value: Alias): Alias = value\n  def nested(value: Nested): Nested = value\n}}\n"
                 )
             };
             file.write(source).unwrap();

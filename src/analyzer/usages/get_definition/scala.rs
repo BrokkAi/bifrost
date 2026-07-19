@@ -7,6 +7,10 @@ use crate::analyzer::scala::{
 use crate::analyzer::usages::scala_graph::local::{
     ScalaLocalBinding, precise_scala_binding, seed_scala_binding,
 };
+use crate::analyzer::usages::scala_graph::namespace::{
+    ScalaTypeNamespaceResolution, resolve_exact_lexical_type_namespace, scala_qualified_type_root,
+    scala_type_reference_is_singleton, scala_unindexed_type_binding_shadows,
+};
 use crate::analyzer::usages::scala_graph::syntax::{
     ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableRole, ScalaCallableSiteRole,
     applied_expression_for_reference, call_arities_for_reference, call_site_shape_for_reference,
@@ -545,6 +549,31 @@ pub(super) fn resolve_scala(
             format!("`{}` is a local Scala pattern binding", site.text),
         );
     }
+    let qualified_type_root = scala_qualified_type_root(node);
+    let qualified_type_segments = scala_type_lookup_segments(qualified_type_root, source);
+    let structured_type_reference = node.kind() == "type_identifier"
+        || matches!(
+            qualified_type_root.kind(),
+            "stable_type_identifier"
+                | "projected_type"
+                | "singleton_type"
+                | "generic_type"
+                | "applied_constructor_type"
+                | "annotated_type"
+        );
+    if structured_type_reference
+        && !scala_type_reference_is_singleton(qualified_type_root)
+        && let Some(root_name) = qualified_type_segments.first()
+        && scala_unindexed_type_binding_shadows(source, qualified_type_root, root_name)
+    {
+        return no_definition(
+            "local_type_binding",
+            format!(
+                "`{}` is a local Scala type binding without a stable indexed identity",
+                site.text
+            ),
+        );
+    }
 
     let resolver = ScalaNameResolver::for_batch(scala, support, &batch).with_lexical_context(
         scala_package_prefixes_at(root, source, node.start_byte()),
@@ -1049,62 +1078,6 @@ fn scala_is_declaration_name(node: Node<'_>) -> bool {
         )
 }
 
-fn scala_unindexed_type_binding_shadows(
-    source: &str,
-    reference: Node<'_>,
-    type_text: &str,
-) -> bool {
-    let Some(name) = scala_type_lookup_segments(reference, source)
-        .into_iter()
-        .next()
-        .or_else(|| {
-            let simple = scala_simple_name(type_text);
-            (!simple.is_empty()).then(|| simple.to_string())
-        })
-    else {
-        return false;
-    };
-
-    let mut current = Some(reference);
-    while let Some(node) = current {
-        let parameters = node.child_by_field_name("type_parameters").or_else(|| {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .find(|child| child.kind() == "type_parameters")
-        });
-        if let Some(parameters) = parameters
-            && scala_type_parameters_declare(parameters, source, &name)
-        {
-            return true;
-        }
-
-        if matches!(node.kind(), "block" | "indented_block") {
-            let mut cursor = node.walk();
-            if node.named_children(&mut cursor).any(|child| {
-                child.kind() == "type_definition"
-                    && child.start_byte() < reference.start_byte()
-                    && child
-                        .child_by_field_name("name")
-                        .is_some_and(|alias| scala_node_text(alias, source).trim() == name)
-            }) {
-                return true;
-            }
-        }
-        current = node.parent();
-    }
-    false
-}
-
-fn scala_type_parameters_declare(parameters: Node<'_>, source: &str, name: &str) -> bool {
-    let mut cursor = parameters.walk();
-    parameters.named_children(&mut cursor).any(|child| {
-        matches!(
-            child.kind(),
-            "identifier" | "operator_identifier" | "type_identifier"
-        ) && scala_node_text(child, source).trim() == name
-    })
-}
-
 fn scala_is_type_position(node: Node<'_>) -> bool {
     let mut current = node;
     while let Some(parent) = current.parent() {
@@ -1226,12 +1199,6 @@ fn resolve_scala_type(
     if text.is_empty() {
         return no_definition("no_reference_text", "Scala type reference is blank");
     }
-    if scala_unindexed_type_binding_shadows(ctx.source, node, text) {
-        return no_definition(
-            "local_type_binding",
-            format!("`{text}` is a local Scala type binding without a stable indexed identity"),
-        );
-    }
     if !scala_is_type_position(node)
         && scala_lexical_binding_declares_name_before(root, ctx.source, text, node.start_byte())
     {
@@ -1239,6 +1206,24 @@ fn resolve_scala_type(
             "local_variable_reference",
             format!("`{text}` is a local Scala value"),
         );
+    }
+    match scala_exact_lexical_type_namespace(ctx, node) {
+        ScalaTypeNamespaceResolution::Resolved(declaration) => {
+            return candidates_outcome(vec![declaration]);
+        }
+        ScalaTypeNamespaceResolution::AuthoritativeMiss => {
+            return no_definition(
+                "local_type_binding",
+                format!("`{text}` is a local Scala type binding without a stable indexed identity"),
+            );
+        }
+        ScalaTypeNamespaceResolution::Ambiguous => {
+            return no_definition(
+                "ambiguous_scala_type",
+                format!("`{text}` resolves to multiple exact Scala type declarations"),
+            );
+        }
+        ScalaTypeNamespaceResolution::NoMatch => {}
     }
     if let Some(root_name) = scala_type_lookup_segments(node, ctx.source).first()
         && root_name != text
@@ -1251,7 +1236,7 @@ fn resolve_scala_type(
             );
         }
     }
-    if let Some(fqn) = scala_resolve_visible_type_node(ctx, resolver, node) {
+    if let Some(fqn) = scala_resolve_visible_type_node_after_lexical_miss(ctx, resolver, node) {
         return scala_fqn_outcome(ctx.support, &fqn, text);
     }
     if scala_import_boundary_for_name(ctx.scala, ctx.support, ctx.file, scala_simple_name(text)) {
@@ -2773,6 +2758,26 @@ fn scala_resolve_visible_type_node(
     if segments.is_empty() {
         return None;
     }
+    match scala_exact_lexical_type_namespace(ctx, node) {
+        ScalaTypeNamespaceResolution::Resolved(declaration) => {
+            return Some(declaration.fq_name());
+        }
+        ScalaTypeNamespaceResolution::AuthoritativeMiss
+        | ScalaTypeNamespaceResolution::Ambiguous => return None,
+        ScalaTypeNamespaceResolution::NoMatch => {}
+    }
+    scala_resolve_visible_type_node_after_lexical_miss(ctx, resolver, node)
+}
+
+fn scala_resolve_visible_type_node_after_lexical_miss(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    node: Node<'_>,
+) -> Option<String> {
+    let segments = scala_type_lookup_segments(node, ctx.source);
+    if segments.is_empty() {
+        return None;
+    }
     let kind = scala_type_node_owner_kind(node);
     let type_text = scala_node_text(node, ctx.source);
     if let Some(local) =
@@ -2795,6 +2800,63 @@ fn scala_resolve_visible_type_node(
             node.start_byte(),
         ),
     }
+}
+
+fn scala_exact_lexical_type_namespace(
+    ctx: ScalaLookupCtx<'_>,
+    node: Node<'_>,
+) -> ScalaTypeNamespaceResolution {
+    let lookup_node = scala_qualified_type_root(node);
+    if scala_type_reference_is_singleton(lookup_node) {
+        return ScalaTypeNamespaceResolution::NoMatch;
+    }
+    let segments = scala_type_lookup_segments(lookup_node, ctx.source);
+    let Some(root_name) = segments.first() else {
+        return ScalaTypeNamespaceResolution::NoMatch;
+    };
+    if scala_unindexed_type_binding_shadows(ctx.source, lookup_node, root_name) {
+        return ScalaTypeNamespaceResolution::AuthoritativeMiss;
+    }
+    let [name] = segments.as_slice() else {
+        return ScalaTypeNamespaceResolution::NoMatch;
+    };
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    };
+    let mut owners = Vec::new();
+    let mut current = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
+    while let Some(unit) = current {
+        current = ctx.scala.structural_parent_of(&unit);
+        if unit.is_class() {
+            owners.push(unit);
+        }
+    }
+    resolve_exact_lexical_type_namespace(
+        owners,
+        name,
+        false,
+        |owner, member| {
+            ctx.support
+                .fqn_direct_children(&owner.fq_name())
+                .into_iter()
+                .filter(|unit| unit.identifier() == member)
+                .filter(|unit| unit.source() == owner.source())
+                .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(owner))
+                .filter(|unit| {
+                    unit.is_class() && !unit.short_name().ends_with('$')
+                        || ctx.scala.is_type_alias(unit)
+                })
+                .collect()
+        },
+        |owner| {
+            ctx.scala
+                .project_types()
+                .exact_direct_ancestor_resolution(ctx.scala, owner)
+        },
+    )
 }
 
 fn scala_same_file_type_fqn(
@@ -3560,22 +3622,7 @@ fn scala_constructed_type(
             )
             .then_some(node)
         })
-        .and_then(|type_node| {
-            let segments = scala_type_lookup_segments(type_node, ctx.source);
-            (segments.len() == 1)
-                .then(|| {
-                    resolve_in_enclosing_scopes(
-                        ctx.analyzer,
-                        ctx.file,
-                        &segments[0],
-                        type_node.start_byte(),
-                        |unit| unit.is_class(),
-                    )
-                })
-                .flatten()
-                .map(|unit| unit.fq_name())
-                .or_else(|| scala_resolve_visible_type_node(ctx, resolver, type_node))
-        })
+        .and_then(|type_node| scala_resolve_visible_type_node(ctx, resolver, type_node))
 }
 
 fn scala_constructor_type_text(value_text: &str) -> Option<&str> {

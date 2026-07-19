@@ -147,6 +147,116 @@ object ImportedFactories {
 }
 
 #[test]
+fn scala_inverted_graph_resolves_exact_lexical_type_namespace_before_lower_tiers() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "lexical/Main.scala",
+            r#"package lexical
+class Collision { class Member }
+object StableCollision { class Member }
+trait Contract { type Result = String; class Inherited }
+class Direct extends Contract {
+  def beforeAlias(value: Result): Result = value
+  type Result = Int
+  def beforeClass(value: Factory): Factory = value
+  class Factory
+}
+class InheritedUse extends Contract {
+  val Result = "term"
+  def alias(value: Result): Result = value
+  def nested(value: Inherited): Inherited = value
+}
+class Covariant[+Collision, +StableCollision] {
+  def blocked(value: Collision): Collision = value
+  def qualifiedBlocked: Any = new StableCollision.Member
+}
+class LocalBarrier {
+  def use: Unit = {
+    type Collision = String
+    type StableCollision = String
+    val blocked: Collision = "ok"
+    val qualifiedBlocked = new StableCollision.Member
+  }
+}
+class QualifiedControl {
+  def value: Any = new StableCollision.Member
+}
+trait DiamondRoot { class Diamond }
+trait DiamondLeft extends DiamondRoot
+trait DiamondRight extends DiamondRoot
+class DiamondUse extends DiamondLeft with DiamondRight {
+  def value(input: Diamond): Diamond = input
+}
+trait Left { class Conflict }
+trait Right { class Conflict }
+class AmbiguousUse extends Left with Right {
+  def value(input: Conflict): Conflict = input
+}
+"#,
+        )
+        .file(
+            "jvm/replica/Base.scala",
+            "package replica\ntrait Base { class Exact }\nclass Local extends Base { def value(input: Exact): Exact = input }\n",
+        )
+        .file(
+            "js/replica/Base.scala",
+            "package replica\ntrait Base { class Exact }\n",
+        )
+        .file(
+            "fallback/replica/Exact.scala",
+            "package replica\nclass Exact\n",
+        )
+        .file(
+            "external/replica/Use.scala",
+            r#"package replica
+class External extends Base { def value(input: Exact): Exact = input }
+class QualifiedExternal extends replica.Base { def value(input: Exact): Exact = input }
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+
+    for (caller, callee) in [
+        ("lexical.Direct.beforeClass", "lexical.Direct.Factory"),
+        ("lexical.InheritedUse.nested", "lexical.Contract.Inherited"),
+        (
+            "lexical.QualifiedControl.value",
+            "lexical.StableCollision$.Member",
+        ),
+        ("lexical.DiamondUse.value", "lexical.DiamondRoot.Diamond"),
+        ("replica.Local.value", "replica.Base.Exact"),
+    ] {
+        assert!(
+            has_edge(&value, caller, callee),
+            "missing exact lexical type edge {caller} -> {callee}: {}",
+            value["edges"]
+        );
+    }
+    for (caller, callee) in [
+        ("lexical.Covariant.blocked", "lexical.Collision"),
+        (
+            "lexical.Covariant.qualifiedBlocked",
+            "lexical.StableCollision$.Member",
+        ),
+        ("lexical.LocalBarrier.use", "lexical.Collision"),
+        (
+            "lexical.LocalBarrier.use",
+            "lexical.StableCollision$.Member",
+        ),
+        ("lexical.AmbiguousUse.value", "lexical.Left.Conflict"),
+        ("lexical.AmbiguousUse.value", "lexical.Right.Conflict"),
+        ("replica.External.value", "replica.Exact"),
+        ("replica.QualifiedExternal.value", "replica.Exact"),
+    ] {
+        assert!(
+            !has_edge(&value, caller, callee),
+            "ambiguous or shadowed lexical type leaked {caller} -> {callee}: {}",
+            value["edges"]
+        );
+    }
+}
+
+#[test]
 fn scala_inverted_graph_filters_callable_roles_before_shape() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

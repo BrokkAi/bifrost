@@ -6595,6 +6595,151 @@ object CandidateCollision {
 }
 
 #[test]
+fn scala_usage_finder_preserves_exact_stable_type_alias_identity() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "root/model/Result.scala",
+            r#"package root.model
+class Box[A]
+object Result {
+  type BoxAlias[A] = Box[A]
+  opaque type Success[A] = A
+  object Success {
+    def apply[A](value: A): Success[A] = value
+    def unapply[A](value: Success[A]): Option[A] = None
+  }
+}
+"#,
+        ),
+        (
+            "root/consumer/Use.scala",
+            r#"package root.consumer
+import root.model.Result
+object Use {
+  val typed: Result.Success[Int] = 1 // positive-exact-stable-alias
+  val constructed = new Result.BoxAlias[Int] // positive-alias-constructor-role
+  val term = Result.Success // negative-term-companion
+  val applied = Result.Success(1) // negative-companion-apply
+  def extracted(value: Any): Any = value match {
+    case Result.Success(found) => found // negative-companion-extractor
+    case _ => value
+  }
+}
+"#,
+        ),
+        (
+            "jvm/dup/Result.scala",
+            "package dup\nobject Result { opaque type Ambiguous = Int }\n",
+        ),
+        (
+            "js/dup/Result.scala",
+            "package dup\nobject Result { opaque type Ambiguous = Int }\n",
+        ),
+        (
+            "consumer/Ambiguous.scala",
+            r#"package consumer
+object Ambiguous {
+  val value: dup.Result.Ambiguous = 1 // negative-physical-alias-ambiguity
+}
+"#,
+        ),
+    ]);
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        analyzer.get_analyzed_files().into_iter().collect(),
+    ));
+
+    let success_candidates = analyzer
+        .get_definitions("root.model.Result$.Success")
+        .into_iter()
+        .collect::<Vec<_>>();
+    assert!(
+        success_candidates
+            .iter()
+            .any(|candidate| analyzer.is_type_alias(candidate)),
+        "expected the opaque alias declaration in {success_candidates:#?}"
+    );
+    let success_companions = analyzer
+        .get_definitions("root.model.Result$.Success$")
+        .into_iter()
+        .collect::<Vec<_>>();
+    assert!(
+        success_companions
+            .iter()
+            .any(|candidate| !analyzer.is_type_alias(candidate)),
+        "expected the separately encoded same-name companion declaration in {success_companions:#?}"
+    );
+    let success_alias = success_candidates
+        .into_iter()
+        .find(|candidate| analyzer.is_type_alias(candidate))
+        .expect("exact opaque alias target");
+    let success_hits = hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&success_alias),
+                Some(&provider),
+                100,
+                100,
+            )
+            .result,
+    );
+    assert_hit_contains(&success_hits, "positive-exact-stable-alias");
+    for marker in [
+        "negative-term-companion",
+        "negative-companion-apply",
+        "negative-companion-extractor",
+    ] {
+        assert_no_hit_contains(&success_hits, marker);
+    }
+
+    let box_alias = analyzer
+        .get_definitions("root.model.Result$.BoxAlias")
+        .into_iter()
+        .find(|candidate| analyzer.is_type_alias(candidate))
+        .expect("exact constructible alias target");
+    let box_alias_hits = hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&box_alias),
+                Some(&provider),
+                100,
+                100,
+            )
+            .result,
+    );
+    assert_hit_contains(&box_alias_hits, "positive-alias-constructor-role");
+
+    let ambiguous_aliases = analyzer
+        .get_definitions("dup.Result$.Ambiguous")
+        .into_iter()
+        .filter(|candidate| analyzer.is_type_alias(candidate))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ambiguous_aliases.len(),
+        2,
+        "expected two physical aliases with the same logical identity"
+    );
+    for alias in ambiguous_aliases {
+        let alias_hits = hits(
+            UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    &analyzer,
+                    std::slice::from_ref(&alias),
+                    Some(&provider),
+                    100,
+                    100,
+                )
+                .result,
+        );
+        assert_no_hit_contains(&alias_hits, "negative-physical-alias-ambiguity");
+    }
+}
+
+#[test]
 fn scala_owned_class_methods_cover_hierarchy_parameterless_and_stable_objects() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (
@@ -6826,6 +6971,7 @@ class Roleful(value: Int) extends Contains {
   def this() = this(0)
   def this(text: String, flag: Boolean) = this(text.length)
 }
+
 object Roleful { def apply(using Context): Roleful = new Roleful(0) }
 object Use {
   given Context = new Context {}
@@ -6907,4 +7053,126 @@ object Use {
     let contains_hits =
         hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&contains)));
     assert_hit_contains(&contains_hits, "role-inherited-infix");
+}
+
+#[test]
+fn scala_usage_finder_resolves_exact_lexical_type_namespace_before_lower_tiers() {
+    let main = r#"package lexical
+class Collision { class Member }
+trait Contract { type Result = String; class Inherited }
+class Direct extends Contract {
+  val beforeAlias: Result = 1 // direct-later-alias
+  type Result = Int
+  val beforeClass: Factory = null // direct-later-class
+  class Factory
+}
+class InheritedUse extends Contract {
+  val Result = "term"
+  val alias: Result = "ok" // inherited-alias-term-collision
+  val nested: Inherited = null // inherited-class
+}
+class Covariant[+Collision] {
+  val blocked: Collision = null // type-param-barrier
+  val qualifiedBlocked: Collision.Member = null // qualified-type-param-barrier
+}
+class LocalBarrier {
+  def use: Unit = {
+    type Collision = String
+    val blocked: Collision = "ok" // local-alias-barrier
+    val qualifiedBlocked: Collision.Member = null // qualified-local-alias-barrier
+  }
+}
+trait DiamondRoot { class Diamond }
+trait DiamondLeft extends DiamondRoot
+trait DiamondRight extends DiamondRoot
+class DiamondUse extends DiamondLeft with DiamondRight {
+  val value: Diamond = null // diamond-dedup
+}
+trait Left { class Conflict }
+trait Right { class Conflict }
+class AmbiguousUse extends Left with Right {
+  val value: Conflict = null // physical-member-ambiguity
+}
+"#;
+    let same_jvm = r#"package replica
+trait Base { class Exact }
+class Local extends Base { val value: Exact = null // same-source-replica
+}
+"#;
+    let external = r#"package replica
+class External extends Base { val value: Exact = null // ambiguous-base-no-fallback
+}
+class QualifiedExternal extends replica.Base { val value: Exact = null // qualified-ambiguous-base-no-fallback
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("lexical/Main.scala", main),
+        ("jvm/replica/Base.scala", same_jvm),
+        (
+            "js/replica/Base.scala",
+            "package replica\ntrait Base { class Exact }\n",
+        ),
+        (
+            "fallback/replica/Exact.scala",
+            "package replica\nclass Exact\n",
+        ),
+        ("external/replica/Use.scala", external),
+    ]);
+
+    for (target, positive, negative) in [
+        (
+            "lexical.Direct.Result",
+            "direct-later-alias",
+            Some("inherited-alias-term-collision"),
+        ),
+        ("lexical.Direct.Factory", "direct-later-class", None),
+        (
+            "lexical.Contract.Result",
+            "inherited-alias-term-collision",
+            Some("direct-later-alias"),
+        ),
+        ("lexical.Contract.Inherited", "inherited-class", None),
+        ("lexical.DiamondRoot.Diamond", "diamond-dedup", None),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&target_hits, positive);
+        if let Some(negative) = negative {
+            assert_no_hit_contains(&target_hits, negative);
+        }
+    }
+
+    let collision = definition(&analyzer, "lexical.Collision");
+    let collision_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&collision)));
+    for marker in [
+        "type-param-barrier",
+        "qualified-type-param-barrier",
+        "local-alias-barrier",
+        "qualified-local-alias-barrier",
+    ] {
+        assert_no_hit_contains(&collision_hits, marker);
+    }
+    for target in ["lexical.Left.Conflict", "lexical.Right.Conflict"] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_no_hit_contains(&target_hits, "physical-member-ambiguity");
+    }
+    let fallback = definition(&analyzer, "replica.Exact");
+    let fallback_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&fallback)));
+    assert_no_hit_contains(&fallback_hits, "ambiguous-base-no-fallback");
+    assert_no_hit_contains(&fallback_hits, "qualified-ambiguous-base-no-fallback");
+
+    let replica_exact = analyzer
+        .get_definitions("replica.Base.Exact")
+        .into_iter()
+        .find(|unit| rel_path_string(unit.source()) == "jvm/replica/Base.scala")
+        .expect("JVM physical nested type");
+    let replica_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&replica_exact)),
+    );
+    assert_hit_contains(&replica_hits, "same-source-replica");
 }

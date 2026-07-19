@@ -41,7 +41,7 @@ impl ScalaAnalyzer {
             }
         }
 
-        let ancestors_by_owner = self
+        let (ancestors_by_owner, _) = self
             .project_types()
             .resolve_direct_ancestors_from_file_states(&file_states);
         for (owner, ancestors) in &ancestors_by_owner {
@@ -101,7 +101,9 @@ impl ScalaAnalyzer {
             if !seen.insert(fqn.clone()) {
                 continue;
             }
-            if let Some(definition) = self.definitions(&fqn).find(|unit| unit.is_class()) {
+            if let crate::analyzer::usages::scala_graph::namespace::ScalaTypeNamespaceResolution::Resolved(definition) =
+                types.exact_type_declaration_for_owner_context(&fqn, code_unit)
+            {
                 ancestors.push(definition);
             }
         }

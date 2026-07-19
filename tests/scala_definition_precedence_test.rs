@@ -658,6 +658,153 @@ object Consumer {
 }
 
 #[test]
+fn scala_forward_lexical_type_namespace_is_exact_order_independent_and_fail_closed() {
+    let main = r#"package lexical
+
+class Collision { class Member }
+
+trait Contract {
+  type Result = String
+  class Inherited
+}
+
+class Direct extends Contract {
+  val beforeAlias: Result = "ok"
+  type Result = Int
+  val beforeClass: Factory = null
+  class Factory
+}
+
+class InheritedUse extends Contract {
+  val Result = "term namespace must not block the inherited type"
+  val alias: Result = "ok"
+  val nested: Inherited = null
+}
+
+class Covariant[+Collision] {
+  val blocked: Collision = null
+  val qualifiedBlocked: Collision.Member = null
+}
+
+class LocalBarrier {
+  def use: Unit = {
+    type Collision = String
+    val blocked: Collision = "ok"
+    val qualifiedBlocked: Collision.Member = null
+  }
+}
+
+trait DiamondRoot { class Diamond }
+trait DiamondLeft extends DiamondRoot
+trait DiamondRight extends DiamondRoot
+class DiamondUse extends DiamondLeft with DiamondRight {
+  val value: Diamond = null
+}
+
+trait Left { class Conflict }
+trait Right { class Conflict }
+class AmbiguousUse extends Left with Right {
+  val value: Conflict = null
+}
+
+class TermVsType {
+  def select[Collision](Collision: Int): Int = Collision
+}
+"#;
+    let same_jvm = r#"package replica
+trait Base { class Exact }
+class Local extends Base { val value: Exact = null }
+"#;
+    let same_js = r#"package replica
+trait Base { class Exact }
+"#;
+    let external = r#"package replica
+class External extends Base { val value: Exact = null }
+class QualifiedExternal extends replica.Base { val value: Exact = null }
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("lexical/Main.scala", main)
+        .file("jvm/replica/Base.scala", same_jvm)
+        .file("js/replica/Base.scala", same_js)
+        .file(
+            "fallback/replica/Exact.scala",
+            "package replica\nclass Exact\n",
+        )
+        .file("external/replica/Use.scala", external)
+        .build();
+    let location = |source: &str, needle: &str| {
+        let marker = source.find(needle).expect("unique lexical type marker");
+        let type_offset = needle.find(": ").map_or(0, |colon| colon + 2);
+        location_in("lexical/Main.scala", source, marker + type_offset)
+    };
+    let last_location = |source: &str, needle: &str| {
+        let marker = source.rfind(needle).expect("last lexical type marker");
+        let type_offset = needle.find(": ").map_or(0, |colon| colon + 2);
+        location_in("lexical/Main.scala", source, marker + type_offset)
+    };
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": [
+            location(main, "Result = \"ok\""),
+            location(main, "Factory = null"),
+            location(main, "alias: Result"),
+            location(main, "nested: Inherited"),
+            location(main, "value: Diamond"),
+            location_in(
+                "jvm/replica/Base.scala",
+                same_jvm,
+                same_jvm.find("Exact = null").expect("same-file inherited type")
+            ),
+            location(main, "blocked: Collision"),
+            location(main, "qualifiedBlocked: Collision.Member"),
+            last_location(main, "val blocked: Collision"),
+            last_location(main, "val qualifiedBlocked: Collision.Member"),
+            location(main, "value: Conflict"),
+            location_in(
+                "external/replica/Use.scala",
+                external,
+                external.find("Exact = null").expect("ambiguous replica type")
+            ),
+            location_in(
+                "external/replica/Use.scala",
+                external,
+                external.rfind("Exact = null").expect("qualified ambiguous replica type")
+            ),
+            location(
+                main,
+                "Collision\n}"
+            ),
+        ]})
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for (index, (fqn, path)) in [
+        ("lexical.Direct.Result", "lexical/Main.scala"),
+        ("lexical.Direct.Factory", "lexical/Main.scala"),
+        ("lexical.Contract.Result", "lexical/Main.scala"),
+        ("lexical.Contract.Inherited", "lexical/Main.scala"),
+        ("lexical.DiamondRoot.Diamond", "lexical/Main.scala"),
+        ("replica.Base.Exact", "jvm/replica/Base.scala"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(results[index]["status"], "resolved", "{value}");
+        assert_eq!(results[index]["definitions"][0]["fqn"], fqn, "{value}");
+        assert_eq!(results[index]["definitions"][0]["path"], path, "{value}");
+    }
+    for result in &results[6..13] {
+        assert_eq!(result["status"], "no_definition", "{value}");
+    }
+    assert_eq!(results[13]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[13]["definitions"][0]["name"], "Collision",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_forward_definition_shares_structured_call_list_semantics() {
     let source = r#"package app
 trait Context

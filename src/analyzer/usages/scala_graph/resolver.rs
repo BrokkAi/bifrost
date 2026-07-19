@@ -32,6 +32,7 @@ pub(super) struct TargetSpec {
     pub(super) callable_arity: Option<CallableArity>,
     pub(super) callable_alternatives: CachedCallableAlternatives,
     pub(super) is_extension_method: bool,
+    pub(super) is_type_alias: bool,
     pub(super) is_object_type: bool,
     pub(super) accepts_extractor_role: bool,
     pub(super) accepts_apply_role: bool,
@@ -44,16 +45,24 @@ pub(super) struct TargetSpec {
 
 impl TargetSpec {
     pub(super) fn from_target(scala: &ScalaAnalyzer, target: &CodeUnit) -> Option<Self> {
-        if target.is_class() {
+        if target.is_class() || scala.is_type_alias(target) {
             let owner_name = scala_display_name(target);
-            let is_object_type = target.short_name().ends_with('$');
+            let is_type_alias = scala.is_type_alias(target);
+            let is_object_type = !is_type_alias && target.short_name().ends_with('$');
             let types = scala.project_types();
-            let companions = types.exact_companion_objects(scala, target);
-            let accepts_extractor_role = types.class_accepts_extractor_role(scala, target);
-            let accepts_apply_role = types.class_accepts_apply_role(scala, target);
-            let accepts_stable_object_role = types.type_is_stable_owner(scala, target);
+            let companions = if is_type_alias {
+                Vec::new()
+            } else {
+                types.exact_companion_objects(scala, target)
+            };
+            let accepts_extractor_role =
+                !is_type_alias && types.class_accepts_extractor_role(scala, target);
+            let accepts_apply_role =
+                !is_type_alias && types.class_accepts_apply_role(scala, target);
+            let accepts_stable_object_role =
+                !is_type_alias && types.type_is_stable_owner(scala, target);
             let mut object_role_fq_names = HashSet::default();
-            if types.type_accepts_object_roles(scala, target) {
+            if !is_type_alias && types.type_accepts_object_roles(scala, target) {
                 object_role_fq_names.insert(target.fq_name());
             }
             object_role_fq_names.extend(companions.iter().map(CodeUnit::fq_name));
@@ -77,6 +86,7 @@ impl TargetSpec {
                 callable_arity: None,
                 callable_alternatives: Arc::new(Vec::new()),
                 is_extension_method: false,
+                is_type_alias,
                 is_object_type,
                 accepts_extractor_role,
                 accepts_apply_role,
@@ -184,6 +194,7 @@ impl TargetSpec {
             callable_arity,
             callable_alternatives,
             is_extension_method,
+            is_type_alias: false,
             is_object_type: false,
             accepts_extractor_role: false,
             accepts_apply_role: false,

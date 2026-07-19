@@ -22,6 +22,11 @@
 //! are an unhandled recall gap, not a wrong edge.
 
 use super::local::{ScalaLocalBinding, precise_scala_binding, seed_scala_binding};
+use super::namespace::{
+    ScalaDirectAncestorResolution, ScalaTypeNamespaceResolution,
+    resolve_exact_lexical_type_namespace, scala_qualified_type_root,
+    scala_type_reference_is_singleton, scala_unindexed_type_binding_shadows,
+};
 use super::resolver::{
     preferred_scala_type, scala_builtin_type_name, scala_extension_receiver_matches_resolved,
     scala_literal_type_name, scala_normalized_fq_name,
@@ -126,6 +131,8 @@ pub(crate) struct ProjectTypes {
     facts: Arc<UsageFactsIndex>,
     direct_ancestors_by_owner: Option<HashMap<String, Vec<CodeUnit>>>,
     direct_ancestors_by_unit: Option<HashMap<CodeUnit, Vec<CodeUnit>>>,
+    ambiguous_direct_ancestor_owners: Option<HashSet<CodeUnit>>,
+    structural_parent_by_unit: Option<HashMap<CodeUnit, CodeUnit>>,
     scala_trait_fqns: Option<HashSet<String>>,
     package_types_by_package: Mutex<HashMap<String, PackageTypeEntries>>,
     package_objects_by_package: Mutex<HashMap<String, PackageTypeEntries>>,
@@ -163,6 +170,8 @@ impl ProjectTypes {
             facts: scala.usage_facts_index_shared(),
             direct_ancestors_by_owner: None,
             direct_ancestors_by_unit: None,
+            ambiguous_direct_ancestor_owners: None,
+            structural_parent_by_unit: None,
             scala_trait_fqns: None,
             package_types_by_package: Mutex::new(HashMap::default()),
             package_objects_by_package: Mutex::new(HashMap::default()),
@@ -219,11 +228,24 @@ impl ProjectTypes {
             },
             &ScalaAdapter,
         ));
+        let structural_parent_by_unit = file_states
+            .values()
+            .flat_map(|state| {
+                state.children.iter().flat_map(|(parent, children)| {
+                    children
+                        .iter()
+                        .cloned()
+                        .map(|child| (child, parent.clone()))
+                })
+            })
+            .collect();
         let mut types = Self {
             index,
             facts,
             direct_ancestors_by_owner: Some(HashMap::default()),
             direct_ancestors_by_unit: Some(HashMap::default()),
+            ambiguous_direct_ancestor_owners: Some(HashSet::default()),
+            structural_parent_by_unit: Some(structural_parent_by_unit),
             scala_trait_fqns: Some(
                 file_states
                     .values()
@@ -241,23 +263,83 @@ impl ProjectTypes {
             override_targets_by_method: Mutex::new(HashMap::default()),
             exported_member_bindings_by_owner: Mutex::new(HashMap::default()),
         };
-        let direct_ancestors_by_unit = types.resolve_direct_ancestors_from_file_states(
-            types
-                .bulk_file_states
-                .as_ref()
-                .expect("bulk Scala file states were just installed"),
-        );
+        let (direct_ancestors_by_unit, ambiguous_direct_ancestor_owners) = types
+            .resolve_direct_ancestors_from_file_states(
+                types
+                    .bulk_file_states
+                    .as_ref()
+                    .expect("bulk Scala file states were just installed"),
+            );
         let direct_ancestors_by_owner = direct_ancestors_by_unit
             .iter()
             .map(|(owner, ancestors)| (owner.fq_name(), ancestors.clone()))
             .collect();
         types.direct_ancestors_by_owner = Some(direct_ancestors_by_owner);
         types.direct_ancestors_by_unit = Some(direct_ancestors_by_unit);
+        types.ambiguous_direct_ancestor_owners = Some(ambiguous_direct_ancestor_owners);
         types
     }
 
     fn bulk_file_state(&self, file: &ProjectFile) -> Option<&FileState> {
         self.bulk_file_states.as_ref()?.get(file)
+    }
+
+    fn is_type_alias(&self, scala: &ScalaAnalyzer, unit: &CodeUnit) -> bool {
+        match &self.bulk_file_states {
+            Some(states) => states
+                .get(unit.source())
+                .is_some_and(|state| state.type_aliases.contains(unit)),
+            None => scala.is_type_alias(unit),
+        }
+    }
+
+    fn is_exact_structural_child(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+        unit: &CodeUnit,
+    ) -> bool {
+        match &self.structural_parent_by_unit {
+            Some(parents) => parents.get(unit) == Some(owner),
+            None => scala.structural_parent_of(unit).as_ref() == Some(owner),
+        }
+    }
+
+    fn exact_structural_parent(&self, scala: &ScalaAnalyzer, unit: &CodeUnit) -> Option<CodeUnit> {
+        match &self.structural_parent_by_unit {
+            Some(parents) => parents.get(unit).cloned(),
+            None => scala.structural_parent_of(unit),
+        }
+    }
+
+    pub(crate) fn exact_type_declaration_for_owner_context(
+        &self,
+        fqn: &str,
+        owner: &CodeUnit,
+    ) -> ScalaTypeNamespaceResolution {
+        let candidates = self
+            .index
+            .by_fqn(fqn)
+            .iter()
+            .filter(|unit| unit.is_class() && unit.fq_name() == fqn)
+            .collect::<Vec<_>>();
+        let same_source = candidates
+            .iter()
+            .copied()
+            .filter(|unit| unit.source() == owner.source())
+            .collect::<Vec<_>>();
+        match same_source.as_slice() {
+            [definition] => {
+                return ScalaTypeNamespaceResolution::Resolved((*definition).clone());
+            }
+            [_, _, ..] => return ScalaTypeNamespaceResolution::Ambiguous,
+            [] => {}
+        }
+        match candidates.as_slice() {
+            [] => ScalaTypeNamespaceResolution::NoMatch,
+            [definition] => ScalaTypeNamespaceResolution::Resolved((*definition).clone()),
+            _ => ScalaTypeNamespaceResolution::Ambiguous,
+        }
     }
 
     fn export_infos_for_owner(
@@ -481,8 +563,9 @@ impl ProjectTypes {
     pub(crate) fn resolve_direct_ancestors_from_file_states(
         &self,
         file_states: &HashMap<ProjectFile, FileState>,
-    ) -> HashMap<CodeUnit, Vec<CodeUnit>> {
+    ) -> (HashMap<CodeUnit, Vec<CodeUnit>>, HashSet<CodeUnit>) {
         let mut ancestors_by_owner = HashMap::default();
+        let mut ambiguous_owners = HashSet::default();
         for (file, state) in file_states {
             if state.supertype_lookup_paths.is_empty() {
                 continue;
@@ -544,15 +627,27 @@ impl ProjectTypes {
                         state,
                         &parent_by_child,
                     ) else {
+                        if self.type_lookup_path_is_ambiguous(resolver, path.segments()) {
+                            ambiguous_owners.insert(owner.clone());
+                            ancestors.clear();
+                            break;
+                        }
                         continue;
                     };
                     if !seen.insert(fqn.clone()) {
                         continue;
                     }
-                    if let Some(definition) =
-                        self.type_by_normalized_fqn(&scala_normalized_fq_name(&fqn))
-                    {
-                        ancestors.push(definition.clone());
+                    match self.exact_type_declaration_for_owner_context(&fqn, &owner) {
+                        ScalaTypeNamespaceResolution::Resolved(definition) => {
+                            ancestors.push(definition);
+                        }
+                        ScalaTypeNamespaceResolution::Ambiguous => {
+                            ambiguous_owners.insert(owner.clone());
+                            ancestors.clear();
+                            break;
+                        }
+                        ScalaTypeNamespaceResolution::NoMatch
+                        | ScalaTypeNamespaceResolution::AuthoritativeMiss => {}
                     }
                 }
                 if !ancestors.is_empty() {
@@ -560,7 +655,7 @@ impl ProjectTypes {
                 }
             }
         }
-        ancestors_by_owner
+        (ancestors_by_owner, ambiguous_owners)
     }
 
     pub(super) fn direct_ancestors_for_owner(
@@ -590,6 +685,79 @@ impl ProjectTypes {
             return ancestors_by_unit.get(owner).cloned().unwrap_or_default();
         }
         scala.get_direct_ancestors(owner)
+    }
+
+    pub(crate) fn exact_direct_ancestor_resolution(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+    ) -> ScalaDirectAncestorResolution {
+        if self
+            .ambiguous_direct_ancestor_owners
+            .as_ref()
+            .is_some_and(|owners| owners.contains(owner))
+        {
+            return ScalaDirectAncestorResolution::Ambiguous;
+        }
+        if let Some(ancestors_by_unit) = &self.direct_ancestors_by_unit {
+            return ScalaDirectAncestorResolution::Resolved(
+                ancestors_by_unit.get(owner).cloned().unwrap_or_default(),
+            );
+        }
+
+        let Some(facts) = scala.forward_owner_facts(owner) else {
+            return ScalaDirectAncestorResolution::Resolved(Vec::new());
+        };
+        let resolver = NameResolver::for_file_types(scala, owner, self);
+        let mut ancestors = Vec::new();
+        let mut seen = HashSet::default();
+        for path in facts.supertype_lookup_paths {
+            let Some(fqn) = self.resolve_type_in_declaration_context(&resolver, path.segments())
+            else {
+                if self.type_lookup_path_is_ambiguous(&resolver, path.segments()) {
+                    return ScalaDirectAncestorResolution::Ambiguous;
+                }
+                continue;
+            };
+            match self.exact_type_declaration_for_owner_context(&fqn, owner) {
+                ScalaTypeNamespaceResolution::Resolved(declaration) => {
+                    if seen.insert(declaration.clone()) {
+                        ancestors.push(declaration);
+                    }
+                }
+                ScalaTypeNamespaceResolution::Ambiguous => {
+                    return ScalaDirectAncestorResolution::Ambiguous;
+                }
+                ScalaTypeNamespaceResolution::NoMatch
+                | ScalaTypeNamespaceResolution::AuthoritativeMiss => {}
+            }
+        }
+        ScalaDirectAncestorResolution::Resolved(ancestors)
+    }
+
+    pub(super) fn exact_lexical_type_namespace(
+        &self,
+        scala: &ScalaAnalyzer,
+        owners_nearest_first: impl IntoIterator<Item = CodeUnit>,
+        name: &str,
+        authoritative_local_barrier: bool,
+    ) -> ScalaTypeNamespaceResolution {
+        resolve_exact_lexical_type_namespace(
+            owners_nearest_first,
+            name,
+            authoritative_local_barrier,
+            |owner, member| {
+                self.members_for_exact_owner_unit(scala, owner, member)
+                    .into_iter()
+                    .filter(|unit| {
+                        unit.is_class() && !unit.short_name().ends_with('$')
+                            || self.is_type_alias(scala, unit)
+                    })
+                    .cloned()
+                    .collect()
+            },
+            |owner| self.exact_direct_ancestor_resolution(scala, owner),
+        )
     }
 
     fn direct_field_ancestors_for_owner(
@@ -628,7 +796,7 @@ impl ProjectTypes {
                 matches.extend(
                     self.members_for_exact_owner_name(&owner, member)
                         .into_iter()
-                        .filter(|unit| unit.is_field() && !scala.is_type_alias(unit))
+                        .filter(|unit| unit.is_field() && !self.is_type_alias(scala, unit))
                         .cloned(),
                 );
                 next.extend(
@@ -685,7 +853,7 @@ impl ProjectTypes {
             if !matches.is_empty() {
                 let type_members = matches
                     .iter()
-                    .filter(|field| scala.is_type_alias(field))
+                    .filter(|field| self.is_type_alias(scala, field))
                     .cloned()
                     .collect::<Vec<_>>();
                 if !type_members.is_empty() {
@@ -1157,7 +1325,7 @@ impl ProjectTypes {
     }
 
     fn member_blocks_callable_lookup(&self, scala: &ScalaAnalyzer, member: &CodeUnit) -> bool {
-        member.is_field() && !scala.is_type_alias(member)
+        member.is_field() && !self.is_type_alias(scala, member)
             || member.is_class() && self.type_is_stable_owner(scala, member)
     }
 
@@ -1650,7 +1818,7 @@ impl ProjectTypes {
         self.members_for_exact_owner_name(&owner.fq_name(), member)
             .into_iter()
             .filter(|unit| unit.source() == owner.source())
-            .filter(|unit| scala.structural_parent_of(unit).as_ref() == Some(owner))
+            .filter(|unit| self.is_exact_structural_child(scala, owner, unit))
             .collect()
     }
 
@@ -1852,6 +2020,46 @@ impl ProjectTypes {
                     .map(CodeUnit::fq_name)
             })
             .or_else(|| scala_builtin_type_name(type_text).map(str::to_string))
+    }
+
+    fn type_lookup_path_is_ambiguous(&self, resolver: &NameResolver, segments: &[String]) -> bool {
+        let Some(first) = segments.first() else {
+            return false;
+        };
+        if resolver.type_binding_is_ambiguous(first) {
+            return true;
+        }
+        let suffix = segments.join(".");
+        resolver
+            .package_prefixes
+            .iter()
+            .map(|package| {
+                if package.is_empty() {
+                    suffix.clone()
+                } else {
+                    format!("{package}.{suffix}")
+                }
+            })
+            .chain(std::iter::once(suffix.clone()))
+            .any(|candidate| {
+                let normalized = scala_normalized_fq_name(&candidate);
+                let candidates = self
+                    .index
+                    .by_normalized_fqn(&normalized)
+                    .iter()
+                    .filter(|unit| unit.is_class())
+                    .collect::<Vec<_>>();
+                let ordinary = candidates
+                    .iter()
+                    .filter(|unit| !unit.short_name().ends_with('$'))
+                    .take(2)
+                    .count();
+                if ordinary > 0 {
+                    ordinary > 1
+                } else {
+                    candidates.len() > 1
+                }
+            })
     }
 
     pub(crate) fn resolve_type_in_declaration_context(
@@ -2289,7 +2497,7 @@ impl ProjectTypes {
             .index
             .by_fqn(&field_fqn)
             .iter()
-            .filter(|unit| unit.is_field() && !scala.is_type_alias(unit))
+            .filter(|unit| unit.is_field() && !self.is_type_alias(scala, unit))
             .collect::<Vec<_>>();
         (fields.len() == 1).then(|| fields[0].fq_name())
     }
@@ -3298,6 +3506,12 @@ impl VisibleNameBindings {
         self.entries.contains_key(name)
     }
 
+    fn is_ambiguous(&self, name: &str) -> bool {
+        self.entries
+            .get(name)
+            .is_some_and(|binding| binding.candidates.len() != 1 || binding.declarations.len() > 1)
+    }
+
     fn priority(&self, name: &str) -> Option<u8> {
         self.entries.get(name).map(|binding| binding.priority)
     }
@@ -3789,6 +4003,14 @@ impl NameResolver {
         self.names.resolve(simple)
     }
 
+    fn type_binding_is_ambiguous(&self, raw: &str) -> bool {
+        let Some(simple) = simple_type_name(raw) else {
+            return false;
+        };
+        self.import_collision_blocks(simple, self.names.priority(simple))
+            || self.names.is_ambiguous(simple)
+    }
+
     pub(crate) fn resolve_object(&self, raw: &str) -> Option<String> {
         let simple = simple_type_name(raw)?;
         if self.import_collision_blocks(simple, self.object_names.priority(simple)) {
@@ -4237,10 +4459,53 @@ impl ScalaScan<'_, '_> {
         self.class_ranges.enclosing_unit(byte)
     }
 
-    fn lexically_visible_type(&self, byte: usize, name: &str) -> Option<String> {
-        self.class_ranges.find_in_enclosing_units(byte, |owner| {
-            self.types.exact_nested_type(&owner.fq_name(), name)
-        })
+    fn exact_lexically_visible_type(&self, node: Node<'_>) -> ScalaTypeNamespaceResolution {
+        let lookup_node = scala_qualified_type_root(node);
+        let segments = scala_type_lookup_segments(lookup_node, self.source);
+        let resolution = self.exact_lexically_visible_type_root(node);
+        if segments.len() == 1 {
+            return resolution;
+        }
+        match resolution {
+            ScalaTypeNamespaceResolution::AuthoritativeMiss
+            | ScalaTypeNamespaceResolution::Ambiguous => resolution,
+            ScalaTypeNamespaceResolution::NoMatch | ScalaTypeNamespaceResolution::Resolved(_) => {
+                ScalaTypeNamespaceResolution::NoMatch
+            }
+        }
+    }
+
+    fn exact_lexically_visible_type_root(&self, node: Node<'_>) -> ScalaTypeNamespaceResolution {
+        let lookup_node = scala_qualified_type_root(node);
+        if scala_type_reference_is_singleton(lookup_node) {
+            return ScalaTypeNamespaceResolution::NoMatch;
+        }
+        let segments = scala_type_lookup_segments(lookup_node, self.source);
+        let Some(root_name) = segments.first() else {
+            return ScalaTypeNamespaceResolution::NoMatch;
+        };
+        if scala_unindexed_type_binding_shadows(self.source, lookup_node, root_name) {
+            return ScalaTypeNamespaceResolution::AuthoritativeMiss;
+        }
+        let mut owners = Vec::new();
+        let mut current = self.class_ranges.enclosing_unit(node.start_byte()).cloned();
+        while let Some(owner) = current {
+            current = self.types.exact_structural_parent(self.scala, &owner);
+            if owner.is_class() {
+                owners.push(owner);
+            }
+        }
+        self.types
+            .exact_lexical_type_namespace(self.scala, owners, root_name, false)
+    }
+
+    fn visible_type(&self, node: Node<'_>, name: &str) -> Option<String> {
+        match self.exact_lexically_visible_type(node) {
+            ScalaTypeNamespaceResolution::Resolved(declaration) => Some(declaration.fq_name()),
+            ScalaTypeNamespaceResolution::NoMatch => self.resolver.resolve(name),
+            ScalaTypeNamespaceResolution::AuthoritativeMiss
+            | ScalaTypeNamespaceResolution::Ambiguous => None,
+        }
     }
 
     fn lexically_visible_object(&self, byte: usize, name: &str) -> Option<String> {
@@ -4248,13 +4513,6 @@ impl ScalaScan<'_, '_> {
             self.types
                 .exact_nested_object(self.scala, &owner.fq_name(), name)
         })
-    }
-
-    fn lexically_visible_type_path(&self, byte: usize, path: &[String]) -> Option<String> {
-        let [name] = path else {
-            return None;
-        };
-        self.lexically_visible_type(byte, name)
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
@@ -4372,9 +4630,7 @@ fn record_reference(
                 && bindings.resolve_symbol(text).is_unknown()
                 && !bindings.is_shadowed(text)
             {
-                let class_fqn = ctx
-                    .lexically_visible_type(node.start_byte(), text)
-                    .or_else(|| ctx.resolver.resolve(text));
+                let class_fqn = ctx.visible_type(node, text);
                 let resolution = ctx.types.resolve_type_application(
                     ctx.scala,
                     &ctx.resolver,
@@ -4402,8 +4658,7 @@ fn record_reference(
                     })
                     .flatten()
             } else if is_scala_class_reference(node, ctx.source) {
-                ctx.lexically_visible_type(node.start_byte(), text)
-                    .or_else(|| ctx.resolver.resolve(text))
+                ctx.visible_type(node, text)
             } else {
                 None
             };
@@ -4591,10 +4846,7 @@ fn record_reference(
             if (is_extractor_reference(node) || is_infix_pattern_operator(node))
                 && let Some(fqn) = (bindings.resolve_symbol(name).is_unknown()
                     && !bindings.is_shadowed(name))
-                .then(|| {
-                    ctx.lexically_visible_type(node.start_byte(), name)
-                        .or_else(|| ctx.resolver.resolve(name))
-                })
+                .then(|| ctx.visible_type(node, name))
                 .flatten()
                 && let Some(target) = ctx
                     .types
@@ -4605,10 +4857,7 @@ fn record_reference(
             }
             if is_scala_class_reference(node, ctx.source)
                 && !bare_companion_method_value
-                && let Some(fqn) = {
-                    ctx.lexically_visible_type(node.start_byte(), name)
-                        .or_else(|| ctx.resolver.resolve(name))
-                }
+                && let Some(fqn) = { ctx.visible_type(node, name) }
             {
                 ctx.record(fqn, node);
                 return;
@@ -4761,9 +5010,7 @@ fn record_unqualified_type_application(
     if !bindings.resolve_symbol(name).is_unknown() || bindings.is_shadowed(name) {
         return false;
     }
-    let class_fqn = ctx
-        .lexically_visible_type(function.start_byte(), name)
-        .or_else(|| ctx.resolver.resolve(name));
+    let class_fqn = ctx.visible_type(function, name);
     let object_fqn = ctx
         .lexically_visible_object(function.start_byte(), name)
         .or_else(|| ctx.resolver.resolve_object(name));
@@ -4812,13 +5059,22 @@ fn record_qualified_stable_reference(
         .segments
         .first()
         .and_then(|root| ctx.lexically_visible_object(node.start_byte(), root));
-    let class_fqn = ctx.types.resolve_qualified_stable_type_at(
-        ctx.scala,
-        &ctx.resolver,
-        &reference.segments,
-        false,
-        lexical_root.clone(),
+    let lexical_type_root = ctx.exact_lexically_visible_type_root(node);
+    let class_lookup_blocked = matches!(
+        lexical_type_root,
+        ScalaTypeNamespaceResolution::AuthoritativeMiss | ScalaTypeNamespaceResolution::Ambiguous
     );
+    let class_fqn = (!class_lookup_blocked)
+        .then(|| {
+            ctx.types.resolve_qualified_stable_type_at(
+                ctx.scala,
+                &ctx.resolver,
+                &reference.segments,
+                false,
+                lexical_root.clone(),
+            )
+        })
+        .flatten();
     let object_fqn = ctx.types.resolve_qualified_stable_type_at(
         ctx.scala,
         &ctx.resolver,
@@ -4827,6 +5083,7 @@ fn record_qualified_stable_reference(
         lexical_root,
     );
     if class_fqn.is_none()
+        && !class_lookup_blocked
         && reference.role == ScalaQualifiedStableTypeRole::Type
         && let Some((member, owner_segments)) = reference.segments.split_last()
     {
@@ -4848,6 +5105,9 @@ fn record_qualified_stable_reference(
         return true;
     }
     if reference.role == ScalaQualifiedStableTypeRole::Type {
+        if class_lookup_blocked {
+            return true;
+        }
         if let Some(fqn) = class_fqn.or(object_fqn) {
             ctx.record(fqn, node);
         }
@@ -5583,9 +5843,7 @@ fn constructed_or_applied_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Optio
         if name.is_empty() {
             return None;
         }
-        let class_fqn = ctx
-            .lexically_visible_type(function.start_byte(), name)
-            .or_else(|| ctx.resolver.resolve(name));
+        let class_fqn = ctx.visible_type(function, name);
         let object_fqn = ctx
             .lexically_visible_object(function.start_byte(), name)
             .or_else(|| ctx.resolver.resolve_object(name));
@@ -5742,11 +6000,16 @@ fn resolve_receiver_type_node(type_node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> O
     if path.is_empty() {
         return None;
     }
-    ctx.lexically_visible_type_path(type_node.start_byte(), &path)
-        .or_else(|| {
-            ctx.types
-                .resolve_type_in_declaration_context(&ctx.resolver, &path)
-        })
+    match ctx.exact_lexically_visible_type(type_node) {
+        ScalaTypeNamespaceResolution::Resolved(declaration) => {
+            return Some(declaration.fq_name());
+        }
+        ScalaTypeNamespaceResolution::AuthoritativeMiss
+        | ScalaTypeNamespaceResolution::Ambiguous => return None,
+        ScalaTypeNamespaceResolution::NoMatch => {}
+    }
+    ctx.types
+        .resolve_type_in_declaration_context(&ctx.resolver, &path)
         .or_else(|| {
             (path.len() == 1)
                 .then(|| scala_builtin_type_name(&path[0]).map(str::to_string))

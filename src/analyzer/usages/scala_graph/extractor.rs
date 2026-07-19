@@ -15,6 +15,10 @@ use crate::analyzer::usages::scala_graph::hits::{
 use crate::analyzer::usages::scala_graph::local::{
     ScalaLocalBinding, precise_scala_binding, seed_scala_binding,
 };
+use crate::analyzer::usages::scala_graph::namespace::{
+    ScalaTypeNamespaceResolution, scala_qualified_type_root, scala_type_reference_is_singleton,
+    scala_unindexed_type_binding_shadows,
+};
 use crate::analyzer::usages::scala_graph::resolver::{
     TargetKind, TargetSpec, Visibility, method_signature_arity, package_name_of,
     scala_builtin_type_name, scala_extension_receiver_matches_resolved, scala_literal_type_name,
@@ -348,27 +352,25 @@ fn companion_apply_call_is_proven(function: Node<'_>, text: &str, ctx: &ScanCtx<
         return true;
     }
 
-    let lexical_type = lexically_visible_nested_type(function, text, ctx);
+    let lexical_type = exact_lexically_visible_type(function, ctx);
     ctx.spec.owner_name.as_deref() == Some(text)
         && !has_member_qualifier(function)
         && !is_locally_shadowed(ctx, text)
         && !bare_call_is_claimed_by_enclosing_member(function, text, ctx)
         && member_call_arity_matches(function, ctx)
-        && lexical_type.map_or_else(
-            || {
+        && match lexical_type {
+            ScalaTypeNamespaceResolution::NoMatch => {
                 ctx.visibility
                     .owner_fq_name_for(text)
                     .is_some_and(|owner| ctx.spec.owner_fq_matches(owner))
                     || nested_target_owner_is_lexically_visible(function, ctx)
-            },
-            |lexical_type| {
-                ctx.spec.owner_fq_matches(&lexical_type)
-                    || ctx.spec.owner.as_ref().is_some_and(|owner| {
-                        scala_normalized_fq_name(&owner.fq_name())
-                            == scala_normalized_fq_name(&lexical_type)
-                    })
-            },
-        )
+            }
+            ScalaTypeNamespaceResolution::Resolved(lexical_type) => {
+                ctx.spec.owner.as_ref() == Some(&lexical_type)
+            }
+            ScalaTypeNamespaceResolution::AuthoritativeMiss
+            | ScalaTypeNamespaceResolution::Ambiguous => false,
+        }
 }
 
 fn nested_target_owner_is_lexically_visible(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -409,8 +411,12 @@ fn resolve_unqualified_type_application(
     {
         return None;
     }
-    let class_fqn =
-        lexically_visible_nested_type(node, name, ctx).or_else(|| ctx.name_resolver.resolve(name));
+    let class_fqn = match exact_lexically_visible_type(node, ctx) {
+        ScalaTypeNamespaceResolution::Resolved(declaration) => Some(declaration.fq_name()),
+        ScalaTypeNamespaceResolution::NoMatch => ctx.name_resolver.resolve(name),
+        ScalaTypeNamespaceResolution::AuthoritativeMiss
+        | ScalaTypeNamespaceResolution::Ambiguous => None,
+    };
     let object_fqn = lexically_visible_nested_object(node, name, ctx)
         .or_else(|| ctx.name_resolver.resolve_object(name));
     (class_fqn.is_some() || object_fqn.is_some()).then(|| {
@@ -839,42 +845,21 @@ fn resolve_type_node(type_node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
     if path.is_empty() {
         return None;
     }
-    lexically_nested_type(type_node, &path, ctx)
-        .or_else(|| {
-            ctx.types
-                .resolve_type_in_declaration_context(&ctx.name_resolver, &path)
-        })
+    match exact_lexically_visible_type(type_node, ctx) {
+        ScalaTypeNamespaceResolution::Resolved(declaration) => {
+            return Some(declaration.fq_name());
+        }
+        ScalaTypeNamespaceResolution::AuthoritativeMiss
+        | ScalaTypeNamespaceResolution::Ambiguous => return None,
+        ScalaTypeNamespaceResolution::NoMatch => {}
+    }
+    ctx.types
+        .resolve_type_in_declaration_context(&ctx.name_resolver, &path)
         .or_else(|| {
             (path.len() == 1)
                 .then(|| scala_builtin_type_name(&path[0]).map(str::to_string))
                 .flatten()
         })
-}
-
-fn lexically_nested_type(
-    type_node: Node<'_>,
-    path: &[String],
-    ctx: &ScanCtx<'_>,
-) -> Option<String> {
-    let [name] = path else {
-        return None;
-    };
-    let range = Range {
-        start_byte: type_node.start_byte(),
-        end_byte: type_node.end_byte(),
-        start_line: type_node.start_position().row,
-        end_line: type_node.end_position().row,
-    };
-    let mut current = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
-    while let Some(unit) = current {
-        if unit.is_class()
-            && let Some(nested) = ctx.types.exact_nested_type(&unit.fq_name(), name)
-        {
-            return Some(nested);
-        }
-        current = ctx.analyzer.parent_of(&unit);
-    }
-    None
 }
 
 fn refresh_assignment_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -1205,10 +1190,12 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     .is_some_and(|fqn| fqn == ctx.spec.target.fq_name());
             let stable_identifier_object_matches = stable_identifier_object_fqn(node, ctx)
                 .is_some_and(|fqn| fqn == ctx.spec.target.fq_name());
-            let lexical_type = lexically_visible_nested_type(node, text, ctx);
-            let lexical_type_matches = lexical_type
-                .as_deref()
-                .is_some_and(|fqn| exact_type_declaration_matches(fqn, &ctx.spec.target, ctx));
+            let lexical_type = exact_lexically_visible_type(node, ctx);
+            let lexical_type_matches = matches!(
+                &lexical_type,
+                ScalaTypeNamespaceResolution::Resolved(declaration)
+                    if declaration == &ctx.spec.target
+            );
             let lexical_object = lexically_visible_nested_object(node, text, ctx);
             let lexical_object_matches = lexical_object.as_deref().is_some_and(|fqn| {
                 fqn == ctx.spec.target.fq_name() || ctx.spec.object_role_fq_matches(fqn)
@@ -1227,7 +1214,8 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 && !is_call_function_reference(node)
                 && !ctx.spec.is_object_type
                 && (lexical_type_matches
-                    || lexical_type.is_none() && ctx.visibility.class_type_name_matches(text))
+                    || matches!(lexical_type, ScalaTypeNamespaceResolution::NoMatch)
+                        && ctx.visibility.class_type_name_matches(text))
                 && class_call_shape_matches;
             let class_application = qualified.is_none()
                 && is_call_function_reference(node)
@@ -1307,6 +1295,14 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     }
                     ScalaMethodValueContext::Incompatible => false,
                 };
+            let stable_alias_type_member = ctx.spec.is_type_alias
+                && qualified.as_ref().is_some_and(|reference| {
+                    matches!(
+                        reference.role,
+                        ScalaQualifiedStableTypeRole::Type
+                            | ScalaQualifiedStableTypeRole::Constructor
+                    ) && member_reference_is_proven(node, text, ctx)
+                });
             qualified_role_matches
                 || class_reference
                 || class_application
@@ -1316,6 +1312,7 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 || companion_method_value
                 || terminal_object_matches
                 || stable_identifier_object_matches
+                || stable_alias_type_member
         }
         TargetKind::Constructor => {
             let qualified = qualified_stable_type_reference(node, ctx.source).filter(|reference| {
@@ -1330,9 +1327,12 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                         resolution.callable_targets.contains(&ctx.spec.target)
                     })
             });
-            let lexical_owner = lexically_visible_nested_type(node, text, ctx);
-            let lexical_owner_matches = lexical_owner.as_deref()
-                == ctx.spec.owner.as_ref().map(CodeUnit::fq_name).as_deref();
+            let lexical_owner = exact_lexically_visible_type(node, ctx);
+            let lexical_owner_matches = matches!(
+                &lexical_owner,
+                ScalaTypeNamespaceResolution::Resolved(owner)
+                    if Some(owner) == ctx.spec.owner.as_ref()
+            );
             let exact_source_owner_matches = ctx.spec.owner.as_ref().is_some_and(|owner| {
                 owner.source() == ctx.file && ctx.spec.owner_name.as_deref() == Some(text)
             });
@@ -1351,8 +1351,9 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     });
             qualified_owner_matches
                 || ((lexical_owner_matches
-                    || exact_source_owner_matches
-                    || lexical_owner.is_none() && ctx.visibility.class_type_name_matches(text))
+                    || matches!(lexical_owner, ScalaTypeNamespaceResolution::NoMatch)
+                        && (exact_source_owner_matches
+                            || ctx.visibility.class_type_name_matches(text)))
                     && (is_constructor_like_reference(node, ctx.source) || extractor_role)
                     && unqualified_constructor_matches)
         }
@@ -1380,23 +1381,53 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn lexically_visible_nested_type(node: Node<'_>, name: &str, ctx: &ScanCtx<'_>) -> Option<String> {
+fn exact_lexically_visible_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> ScalaTypeNamespaceResolution {
+    let lookup_node = scala_qualified_type_root(node);
+    let segments = scala_type_lookup_segments(lookup_node, ctx.source);
+    let resolution = exact_lexically_visible_type_root(node, ctx);
+    if segments.len() == 1 {
+        return resolution;
+    }
+    match resolution {
+        ScalaTypeNamespaceResolution::AuthoritativeMiss
+        | ScalaTypeNamespaceResolution::Ambiguous => resolution,
+        ScalaTypeNamespaceResolution::NoMatch | ScalaTypeNamespaceResolution::Resolved(_) => {
+            ScalaTypeNamespaceResolution::NoMatch
+        }
+    }
+}
+
+fn exact_lexically_visible_type_root(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> ScalaTypeNamespaceResolution {
+    let lookup_node = scala_qualified_type_root(node);
+    if scala_type_reference_is_singleton(lookup_node) {
+        return ScalaTypeNamespaceResolution::NoMatch;
+    }
+    let segments = scala_type_lookup_segments(lookup_node, ctx.source);
+    let Some(root_name) = segments.first() else {
+        return ScalaTypeNamespaceResolution::NoMatch;
+    };
+    if scala_unindexed_type_binding_shadows(ctx.source, lookup_node, root_name) {
+        return ScalaTypeNamespaceResolution::AuthoritativeMiss;
+    }
     let range = Range {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
         start_line: node.start_position().row,
         end_line: node.end_position().row,
     };
+    let mut owners = Vec::new();
     let mut current = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
     while let Some(unit) = current {
-        if unit.is_class()
-            && let Some(nested) = ctx.types.exact_nested_type(&unit.fq_name(), name)
-        {
-            return Some(nested);
+        current = ctx.scala.structural_parent_of(&unit);
+        if unit.is_class() {
+            owners.push(unit);
         }
-        current = ctx.analyzer.parent_of(&unit);
     }
-    None
+    ctx.types
+        .exact_lexical_type_namespace(ctx.scala, owners, root_name, false)
 }
 
 fn lexically_visible_nested_object(
@@ -1430,9 +1461,19 @@ fn resolve_qualified_stable_type_at(
     terminal_object: bool,
     ctx: &ScanCtx<'_>,
 ) -> Option<String> {
-    let lexical_root = segments
-        .first()
-        .and_then(|root| lexically_visible_nested_object(node, root, ctx));
+    let root = segments.first()?;
+    let lexical_root = if terminal_object {
+        lexically_visible_nested_object(node, root, ctx)
+    } else {
+        match exact_lexically_visible_type_root(node, ctx) {
+            ScalaTypeNamespaceResolution::Resolved(declaration) => Some(declaration.fq_name()),
+            ScalaTypeNamespaceResolution::NoMatch => {
+                lexically_visible_nested_object(node, root, ctx)
+            }
+            ScalaTypeNamespaceResolution::AuthoritativeMiss
+            | ScalaTypeNamespaceResolution::Ambiguous => return None,
+        }
+    };
     ctx.types.resolve_qualified_stable_type_at(
         ctx.scala,
         &ctx.name_resolver,
@@ -1581,6 +1622,7 @@ fn previous_word(value: &str) -> Option<&str> {
 }
 
 fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
+    let field_like_target = ctx.spec.kind == TargetKind::Field || ctx.spec.is_type_alias;
     if ctx.visibility.direct_member_names.contains(text)
         && !ctx.visibility.ambiguous_direct_member_names.contains(text)
         && !has_member_qualifier(node)
@@ -1598,7 +1640,7 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
         return false;
     }
 
-    if ctx.spec.kind == TargetKind::Field
+    if field_like_target
         && let Some(reference) = qualified_stable_type_reference(node, ctx.source)
         && let Some((member, owner_segments)) = reference.segments.split_last()
         && member == &ctx.spec.member_name
@@ -1614,7 +1656,7 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
     }
 
     if let Some(owner_fq_name) = stable_identifier_field_owner_fqn(node, ctx) {
-        if ctx.spec.kind == TargetKind::Field {
+        if field_like_target {
             return match ctx.types.field_for_owner_member(
                 ctx.scala,
                 &owner_fq_name,
@@ -1664,8 +1706,7 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
             },
         );
     }
-    if ctx.spec.kind == TargetKind::Field
-        && let Some(owner_fq_name) = structured_receiver_type(qualifier_node, ctx)
+    if field_like_target && let Some(owner_fq_name) = structured_receiver_type(qualifier_node, ctx)
     {
         return match ctx.types.field_for_owner_member(
             ctx.scala,
