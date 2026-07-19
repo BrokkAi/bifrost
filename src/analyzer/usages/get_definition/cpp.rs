@@ -891,11 +891,6 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                     format!("`{name}` is a local C++ value"),
                 );
             }
-            if call_arity.is_none() {
-                return ambiguous_definition(format!(
-                    "the argument count for C++ call `{name}` is unknown after macro expansion"
-                ));
-            }
             if let Some(owner) = cpp_enclosing_class(
                 ctx.analyzer,
                 ctx.support,
@@ -905,7 +900,9 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 ctx.root,
                 name_node.start_byte(),
             ) {
-                let member_candidates =
+                let member_candidates = if call_arity.is_none() {
+                    cpp_member_candidates_lazy(ctx, vec![owner], name, None, || None)
+                } else {
                     cpp_member_candidates_lazy(ctx, vec![owner], name, call_arity, || {
                         cpp_call_argument_types(
                             ctx.analyzer,
@@ -916,8 +913,14 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                             ctx.root,
                             call,
                         )
-                    });
+                    })
+                };
                 if !member_candidates.is_empty() {
+                    if call_arity.is_none() {
+                        return ambiguous_definition(format!(
+                            "the argument count for C++ call `{name}` is unknown after macro expansion"
+                        ));
+                    }
                     return candidates_outcome(member_candidates);
                 }
             }
@@ -938,29 +941,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 ctx.source,
             ) {
                 CppBareCallTargetResolution::FreeFunctions(units) => {
-                    let mut candidates = units
-                        .into_iter()
-                        .flat_map(|unit| {
-                            let indexed = ctx
-                                .support
-                                .fqn(&unit.fq_name())
-                                .into_iter()
-                                .filter(|candidate| {
-                                    cpp_unit_matches_kind(
-                                        ctx.analyzer,
-                                        ctx.support,
-                                        candidate,
-                                        CppTargetKind::FreeFunction,
-                                    )
-                                })
-                                .collect::<Vec<_>>();
-                            if indexed.is_empty() {
-                                vec![unit]
-                            } else {
-                                indexed
-                            }
-                        })
-                        .collect::<Vec<_>>();
+                    let mut candidates = cpp_bare_free_function_definition_candidates(ctx, units);
                     candidates = cpp_filter_candidates_by_call_lazy(
                         candidates,
                         call_arity,
@@ -980,6 +961,20 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                         ctx.file,
                     );
                     return candidates_outcome(candidates);
+                }
+                CppBareCallTargetResolution::UnprovenFreeFunctions(units) => {
+                    if units.len() < 2 {
+                        return ambiguous_definition(format!(
+                            "the argument count for C++ call `{name}` is unknown after macro expansion"
+                        ));
+                    }
+                    let candidates = cpp_bare_free_function_definition_candidates(ctx, units);
+                    return ambiguous_candidates_outcome(
+                        candidates,
+                        format!(
+                            "the argument count for C++ call `{name}` is unknown after macro expansion"
+                        ),
+                    );
                 }
                 CppBareCallTargetResolution::Type(unit) => {
                     let owners = cpp_type_definition_candidates(
@@ -1040,6 +1035,35 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
             ),
         ),
     }
+}
+
+fn cpp_bare_free_function_definition_candidates(
+    ctx: CppLookupCtx<'_, '_>,
+    units: Vec<CodeUnit>,
+) -> Vec<CodeUnit> {
+    units
+        .into_iter()
+        .flat_map(|unit| {
+            let indexed = ctx
+                .support
+                .fqn(&unit.fq_name())
+                .into_iter()
+                .filter(|candidate| {
+                    cpp_unit_matches_kind(
+                        ctx.analyzer,
+                        ctx.support,
+                        candidate,
+                        CppTargetKind::FreeFunction,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if indexed.is_empty() {
+                vec![unit]
+            } else {
+                indexed
+            }
+        })
+        .collect()
 }
 
 fn cpp_callable_name_node(node: Node<'_>) -> Option<Node<'_>> {

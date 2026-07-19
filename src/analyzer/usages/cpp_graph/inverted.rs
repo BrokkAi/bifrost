@@ -570,7 +570,9 @@ fn record_call(
                         ctx.record(unit.fq_name(), function);
                     }
                 }
-                BareCallTargetResolution::CallableShadow | BareCallTargetResolution::Ambiguous => {}
+                BareCallTargetResolution::UnprovenFreeFunctions(_)
+                | BareCallTargetResolution::CallableShadow
+                | BareCallTargetResolution::Ambiguous => {}
                 BareCallTargetResolution::Missing => {}
             }
             // Direct/self member calls are intentionally omitted above; unique inherited

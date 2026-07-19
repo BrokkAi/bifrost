@@ -700,6 +700,7 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
             return;
         }
         BareCallTargetResolution::FreeFunctions(_)
+        | BareCallTargetResolution::UnprovenFreeFunctions(_)
         | BareCallTargetResolution::CallableShadow
         | BareCallTargetResolution::Missing => return,
     }
@@ -734,6 +735,7 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
 pub(in crate::analyzer::usages) enum BareCallTargetResolution {
     Type(CodeUnit),
     FreeFunctions(Vec<CodeUnit>),
+    UnprovenFreeFunctions(Vec<CodeUnit>),
     CallableShadow,
     Ambiguous,
     Missing,
@@ -810,7 +812,7 @@ fn dedupe_callable_candidates(candidates: &mut Vec<CodeUnit>) {
 
 fn resolve_callable_candidates(
     candidates: Vec<CodeUnit>,
-    call_arity: usize,
+    call_arity: Option<usize>,
     reference_byte: usize,
     analyzer: &dyn IAnalyzer,
     visibility: &VisibilityIndex,
@@ -821,6 +823,9 @@ fn resolve_callable_candidates(
     if candidates.is_empty() {
         return BareCallTargetResolution::Missing;
     }
+    let Some(call_arity) = call_arity else {
+        return BareCallTargetResolution::UnprovenFreeFunctions(candidates);
+    };
     let applicable = candidates
         .into_iter()
         .filter(|candidate| {
@@ -885,9 +890,7 @@ pub(in crate::analyzer::usages) fn resolve_bare_call_target(
     if name.is_empty() {
         return BareCallTargetResolution::Missing;
     }
-    let Some(call_arity) = visibility.call_arity_evidence(file, call, source).exact() else {
-        return BareCallTargetResolution::Ambiguous;
-    };
+    let call_arity = visibility.call_arity_evidence(file, call, source).exact();
     let lexical_scope =
         match enclosing_lexical_scope_components(function, analyzer, visibility, file, source) {
             LexicalScopeResolution::Resolved(scope) => scope,
@@ -983,6 +986,9 @@ pub(in crate::analyzer::usages) fn resolve_bare_call_target(
             })
             .collect::<Vec<_>>();
         if !direct_types.is_empty() {
+            if call_arity.is_none() {
+                return BareCallTargetResolution::Ambiguous;
+            }
             return resolve_direct_type_candidates(direct_types, analyzer, visibility, file);
         }
         let directives = at_tier
@@ -1072,6 +1078,9 @@ pub(in crate::analyzer::usages) fn resolve_bare_call_target(
             direct_types.push((unit.clone(), components.clone()));
         }
         if !direct_types.is_empty() {
+            if call_arity.is_none() {
+                return BareCallTargetResolution::Ambiguous;
+            }
             return resolve_direct_type_candidates(direct_types, analyzer, visibility, file);
         }
         let directives = at_tier
@@ -1099,6 +1108,9 @@ pub(in crate::analyzer::usages) fn resolve_bare_call_target(
             );
         }
         if type_components.is_some_and(|components| components == qualified.as_slice()) {
+            if call_arity.is_none() {
+                return BareCallTargetResolution::Ambiguous;
+            }
             return match type_resolution {
                 LexicalTypeResolution::Resolved { unit, .. } => {
                     BareCallTargetResolution::Type(unit)
@@ -1107,6 +1119,9 @@ pub(in crate::analyzer::usages) fn resolve_bare_call_target(
                 LexicalTypeResolution::Missing => BareCallTargetResolution::Missing,
             };
         }
+    }
+    if call_arity.is_none() {
+        return BareCallTargetResolution::Ambiguous;
     }
     match type_resolution {
         LexicalTypeResolution::Resolved { unit, .. } => BareCallTargetResolution::Type(unit),
@@ -1388,7 +1403,15 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     push_hit(terminal, ctx);
                 }
             }
+            BareCallTargetResolution::UnprovenFreeFunctions(units)
+                if units
+                    .iter()
+                    .any(|unit| same_visible_symbol(unit, &ctx.spec.target)) =>
+            {
+                push_unproven_hit(terminal, ctx);
+            }
             BareCallTargetResolution::FreeFunctions(_)
+            | BareCallTargetResolution::UnprovenFreeFunctions(_)
             | BareCallTargetResolution::Type(_)
             | BareCallTargetResolution::CallableShadow => {}
             BareCallTargetResolution::Ambiguous | BareCallTargetResolution::Missing => {

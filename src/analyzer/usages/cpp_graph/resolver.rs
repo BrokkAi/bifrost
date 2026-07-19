@@ -3712,12 +3712,76 @@ fn callable_declaration_activation_in_file(
 pub(super) fn callable_preprocessor_context_is_visible(node: Node<'_>, source: &str) -> bool {
     let mut ancestor = node.parent();
     while let Some(parent) = ancestor {
-        if is_preprocessor_conditional(parent) && !is_file_covering_include_guard(parent, source) {
+        if is_preprocessor_conditional(parent)
+            && !is_file_covering_include_guard(parent, source)
+            && !is_split_cpp_language_linkage_wrapper(parent, node, source)
+        {
             return false;
         }
         ancestor = parent.parent();
     }
     true
+}
+
+fn is_split_cpp_language_linkage_wrapper(
+    conditional: Node<'_>,
+    descendant: Node<'_>,
+    source: &str,
+) -> bool {
+    if conditional.kind() != "preproc_ifdef"
+        || conditional.child_by_field_name("alternative").is_some()
+        || conditional
+            .child_by_field_name("name")
+            .is_none_or(|name| node_text(name, source) != "__cplusplus")
+    {
+        return false;
+    }
+    let mut current = descendant.parent();
+    let linkage = loop {
+        let Some(node) = current else {
+            return false;
+        };
+        if node == conditional {
+            return false;
+        }
+        if node.kind() == "linkage_specification" {
+            break node;
+        }
+        current = node.parent();
+    };
+    if linkage
+        .child_by_field_name("value")
+        .is_none_or(|value| node_text(value, source) != "\"C\"")
+    {
+        return false;
+    }
+    let Some(body) = linkage.child_by_field_name("body") else {
+        return false;
+    };
+    let closes_opening_branch = (0..body.named_child_count())
+        .filter_map(|index| body.named_child(index))
+        .take_while(|child| child.end_byte() <= descendant.start_byte())
+        .any(|child| {
+            child.kind() == "preproc_call"
+                && child
+                    .child_by_field_name("directive")
+                    .is_some_and(|directive| node_text(directive, source) == "#endif")
+        });
+    let reopens_for_closing_brace = (0..body.named_child_count())
+        .filter_map(|index| body.named_child(index))
+        .skip_while(|child| child.start_byte() < descendant.end_byte())
+        .any(|child| {
+            child.kind() == "preproc_ifdef"
+                && child
+                    .child_by_field_name("name")
+                    .is_some_and(|name| node_text(name, source) == "__cplusplus")
+                && (0..child.child_count()).any(|index| {
+                    child
+                        .child(index)
+                        .is_some_and(|token| token.kind() == "#endif" && token.is_missing())
+                })
+        });
+    closes_opening_branch && reopens_for_closing_brace
 }
 
 pub(in crate::analyzer::usages) fn call_arity(node: Node<'_>) -> usize {

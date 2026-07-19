@@ -931,6 +931,24 @@ fn candidates_outcome(mut candidates: Vec<CodeUnit>) -> DefinitionLookupOutcome 
     }
 }
 
+fn ambiguous_candidates_outcome(
+    mut candidates: Vec<CodeUnit>,
+    message: impl Into<String>,
+) -> DefinitionLookupOutcome {
+    sort_units(&mut candidates);
+    candidates.dedup();
+    DefinitionLookupOutcome {
+        status: DefinitionLookupStatus::Ambiguous,
+        reference: None,
+        definitions: candidates,
+        lexical_definition: None,
+        diagnostics: vec![DefinitionLookupDiagnostic {
+            kind: "ambiguous_definition".to_string(),
+            message: message.into(),
+        }],
+    }
+}
+
 fn lexical_definition_outcome(definition: LexicalDefinition) -> DefinitionLookupOutcome {
     DefinitionLookupOutcome {
         status: DefinitionLookupStatus::Resolved,
