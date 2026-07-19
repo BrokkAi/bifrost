@@ -753,6 +753,60 @@ object Use {
 }
 
 #[test]
+fn scala_usage_finder_resolves_lexical_anonymous_mixin_type_role() {
+    let source = r#"package app
+class Kind(message: String)()
+trait Factory
+object Owner {
+  trait Factory { this: Kind =>
+  }
+  val value = new Kind("message")() with Factory // positive-lexical-anonymous-mixin
+  def kind(): Kind = new Kind("term")()
+  val ordinary = kind() with Factory // negative-ordinary-term-infix
+}
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[("app/Owner.scala", source)]);
+
+    let target = definition(&analyzer, "app.Owner$.Factory");
+    let target_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    assert_hit_contains(&target_hits, "positive-lexical-anonymous-mixin");
+    assert_no_hit_contains(&target_hits, "negative-ordinary-term-infix");
+
+    let decoy = definition(&analyzer, "app.Factory");
+    let decoy_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&decoy)));
+    assert_no_hit_contains(&decoy_hits, "positive-lexical-anonymous-mixin");
+
+    let mcp = call_search_tool_json(
+        project.root(),
+        "scan_usages_by_reference",
+        &json!({
+            "symbols": ["app.Owner$.Factory"],
+            "include_tests": true,
+        })
+        .to_string(),
+    );
+    let result = &mcp["results"][0];
+    assert_eq!(result["status"], "found", "{mcp}");
+    let mcp_lines = result["files"]
+        .as_array()
+        .expect("MCP usage files")
+        .iter()
+        .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+        .filter_map(|hit| hit["line"].as_u64())
+        .collect::<BTreeSet<_>>();
+    assert!(
+        mcp_lines.contains(&(line_of(source, "positive-lexical-anonymous-mixin") as u64)),
+        "MCP result omitted the lexical anonymous mixin: {mcp}"
+    );
+    assert!(
+        !mcp_lines.contains(&(line_of(source, "negative-ordinary-term-infix") as u64)),
+        "MCP result treated an ordinary term infix expression as a mixin: {mcp}"
+    );
+}
+
+#[test]
 fn scala_type_roles_cover_anonymous_mixins_and_infix_type_operators() {
     let use_source = r#"package app
 

@@ -1385,6 +1385,7 @@ fn scala_inverted_type_edges_include_mixin_and_infix_type_roles_only() {
             r#"package model
 
 class Base
+class CurriedBase(first: Int)(second: Int)
 trait First
 trait InHandler
 trait OutHandler
@@ -1398,11 +1399,17 @@ object CanEqual
             "app/Use.scala",
             r#"package app
 
-import model.{Base, First, InHandler, OutHandler, CanEqual}
+import model.{Base, CurriedBase, First, InHandler, OutHandler, CanEqual}
 
 object Use {
   def mixinRole(): Base =
     new Base with First with InHandler with OutHandler {}
+
+  def curriedMixinRole(): CurriedBase =
+    new CurriedBase(1)(2) with OutHandler
+
+  def curriedFactory(): CurriedBase = new CurriedBase(1)(2)
+  def ordinaryWith: Any = curriedFactory() with OutHandler
 
   def infixTypeRole[A, B](evidence: A CanEqual B): Unit = ()
 
@@ -1420,6 +1427,11 @@ object Use {
         value["edges"]
     );
     assert!(
+        has_edge(&value, "app.Use$.curriedMixinRole", "model.OutHandler"),
+        "curried anonymous mixin RHS should edge to the exact trait: {}",
+        value["edges"]
+    );
+    assert!(
         has_edge(&value, "app.Use$.infixTypeRole", "model.CanEqual"),
         "infix_type operator should edge to the exact type constructor: {}",
         value["edges"]
@@ -1432,6 +1444,11 @@ object Use {
     assert!(
         !has_edge(&value, "app.Use$.ordinaryInfix", "model.CanEqual"),
         "ordinary term infix operator must not become a type role: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$.ordinaryWith", "model.OutHandler"),
+        "ordinary call infix expression must not become an anonymous mixin type role: {}",
         value["edges"]
     );
 }

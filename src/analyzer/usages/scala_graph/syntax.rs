@@ -706,7 +706,14 @@ fn is_anonymous_instance_mixin_type_reference(node: Node<'_>, source: &str) -> b
         return false;
     };
     loop {
-        if left.kind() == "instance_expression" {
+        let mut constructed = left;
+        while constructed.kind() == "call_expression" {
+            let Some(function) = constructed.child_by_field_name("function") else {
+                return false;
+            };
+            constructed = function;
+        }
+        if constructed.kind() == "instance_expression" {
             return true;
         }
         let Some(previous) = left.child_by_field_name("left").filter(|_| {
