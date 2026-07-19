@@ -657,3 +657,92 @@ object Consumer {
         );
     }
 }
+
+#[test]
+fn scala_forward_definition_shares_structured_call_list_semantics() {
+    let source = r#"package app
+trait Context
+object Api {
+  def block(value: => Int)(using Context): Int = value
+  def aligned(using Context)(value: Int)(using Context): Int = value
+  def contextualOnly(using Context): Int = 1
+  def partial(prefix: String)(line: String): String = prefix + line
+  def select(prefix: String)(line: String): String = prefix + line
+  def select(left: String, right: String)(line: String): String = left + right + line
+  def ambiguous(prefix: String)(line: String): String = prefix + line
+  def ambiguous(prefix: Int)(line: String): String = prefix.toString + line
+}
+object Use {
+  import Api.*
+  given Context = new Context {}
+  def consume(run: String => String): String = run("line")
+  def consumeTwo(run: (String, String) => String): String = run("left", "right")
+  def blockResult: Int = Api.block {
+    val first = 1
+    val second = 2
+    first + second
+  }
+  def alignedResult: Int = Api.aligned(1)
+  def contextualResult: Int = Api.contextualOnly()
+  def partialResult: String = consume(Api.partial("prefix"))
+  def selectedPartial: String = consume(Api.select("prefix"))
+  def wrongExpected: String = consumeTwo(Api.partial("prefix"))
+  // Same-shape overloads remain ambiguous without argument-type evidence.
+  def ambiguousPartial: String = consume(Api.ambiguous("prefix"))
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/App.scala", source)
+        .build();
+    let reference_start = |line: &str, member: &str| {
+        source.find(line).expect("unique reference line")
+            + line.rfind(member).expect("member on reference line")
+    };
+    let references = [
+        ("def blockResult: Int = Api.block {", "block"),
+        ("def alignedResult: Int = Api.aligned(1)", "aligned"),
+        (
+            "def contextualResult: Int = Api.contextualOnly()",
+            "contextualOnly",
+        ),
+        (
+            "def partialResult: String = consume(Api.partial(\"prefix\"))",
+            "partial",
+        ),
+        (
+            "def selectedPartial: String = consume(Api.select(\"prefix\"))",
+            "select",
+        ),
+        (
+            "def wrongExpected: String = consumeTwo(Api.partial(\"prefix\"))",
+            "partial",
+        ),
+        (
+            "def ambiguousPartial: String = consume(Api.ambiguous(\"prefix\"))",
+            "ambiguous",
+        ),
+    ]
+    .into_iter()
+    .map(|(line, member)| location_at(source, reference_start(line, member)))
+    .collect::<Vec<_>>();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    for (result, expected) in results[..5].iter().zip([
+        "app.Api$.block",
+        "app.Api$.aligned",
+        "app.Api$.contextualOnly",
+        "app.Api$.partial",
+        "app.Api$.select",
+    ]) {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+    for result in &results[5..] {
+        assert_eq!(result["status"], "no_definition", "{value}");
+    }
+}

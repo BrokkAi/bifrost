@@ -43,6 +43,59 @@ pub(crate) enum ScalaParameterListKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScalaCallArgumentListKind {
+    Ordinary,
+    Contextual,
+    Block,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScalaCallArgumentList {
+    pub(crate) arity: usize,
+    pub(crate) kind: ScalaCallArgumentListKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScalaCallSiteShape {
+    pub(crate) lists: Vec<ScalaCallArgumentList>,
+    pub(crate) method_value_arity: Option<usize>,
+}
+
+impl ScalaCallSiteShape {
+    pub(crate) fn ordinary(arities: &[usize]) -> Self {
+        Self {
+            lists: arities
+                .iter()
+                .copied()
+                .map(|arity| ScalaCallArgumentList {
+                    arity,
+                    kind: ScalaCallArgumentListKind::Ordinary,
+                })
+                .collect(),
+            method_value_arity: None,
+        }
+    }
+
+    pub(crate) fn with_method_value_arity(mut self, arity: Option<usize>) -> Self {
+        self.method_value_arity = arity;
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScalaCallableUsePolicy {
+    OrdinaryMethod,
+    CompleteCall,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScalaCallShapeRelation {
+    Incompatible,
+    Complete,
+    Partial { next_explicit_arity: CallableArity },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ScalaCallableParameterList {
     pub(crate) arity: CallableArity,
     pub(crate) kind: ScalaParameterListKind,
@@ -1043,14 +1096,21 @@ pub(crate) fn stable_type_qualifier(node: Node<'_>, source: &str) -> Option<Stri
     (!prefix.is_empty()).then_some(prefix)
 }
 
-pub(crate) fn call_arity_for_reference(node: Node<'_>) -> Option<usize> {
-    call_arities_for_reference(node).and_then(|arities| arities.first().copied())
+pub(crate) fn call_arities_for_reference(node: Node<'_>) -> Option<Vec<usize>> {
+    call_site_shape_for_reference(node)
+        .map(|shape| shape.lists.into_iter().map(|list| list.arity).collect())
 }
 
-pub(crate) fn call_arities_for_reference(node: Node<'_>) -> Option<Vec<usize>> {
+pub(crate) fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallSiteShape> {
     let parent = node.parent()?;
     if parent.kind() == "infix_expression" && parent.child_by_field_name("operator") == Some(node) {
-        return Some(vec![1]);
+        return Some(ScalaCallSiteShape {
+            lists: vec![ScalaCallArgumentList {
+                arity: 1,
+                kind: ScalaCallArgumentListKind::Ordinary,
+            }],
+            method_value_arity: None,
+        });
     }
     let mut expression = field_expression_for_member(node).unwrap_or(node);
     if let Some(generic) = expression.parent().filter(|generic| {
@@ -1061,7 +1121,7 @@ pub(crate) fn call_arities_for_reference(node: Node<'_>) -> Option<Vec<usize>> {
     }) {
         expression = generic;
     }
-    let mut arities = Vec::new();
+    let mut lists = Vec::new();
     if let Some(instance) = expression
         .parent()
         .filter(|parent| parent.kind() == "instance_expression")
@@ -1073,12 +1133,14 @@ pub(crate) fn call_arities_for_reference(node: Node<'_>) -> Option<Vec<usize>> {
                 .find(|child| child.kind() == "arguments")
         });
         if let Some(arguments) = arguments {
-            let mut cursor = arguments.walk();
-            arities.push(arguments.named_children(&mut cursor).count());
+            lists.push(call_argument_list(arguments));
         } else {
             // `new T:` / `new T { ... }` has no `arguments` child, but it still
             // invokes the argumentless primary constructor.
-            arities.push(0);
+            lists.push(ScalaCallArgumentList {
+                arity: 0,
+                kind: ScalaCallArgumentListKind::Ordinary,
+            });
         }
         expression = instance;
     }
@@ -1089,11 +1151,178 @@ pub(crate) fn call_arities_for_reference(node: Node<'_>) -> Option<Vec<usize>> {
             break;
         }
         let arguments = call.child_by_field_name("arguments")?;
-        let mut cursor = arguments.walk();
-        arities.push(arguments.named_children(&mut cursor).count());
+        lists.push(call_argument_list(arguments));
         expression = call;
     }
-    (!arities.is_empty()).then_some(arities)
+    (!lists.is_empty()).then_some(ScalaCallSiteShape {
+        lists,
+        method_value_arity: None,
+    })
+}
+
+pub(crate) fn applied_expression_for_reference(node: Node<'_>) -> Option<Node<'_>> {
+    let parent = node.parent()?;
+    if parent.kind() == "infix_expression" && parent.child_by_field_name("operator") == Some(node) {
+        return Some(parent);
+    }
+    let mut expression = field_expression_for_member(node).unwrap_or(node);
+    if let Some(generic) = expression.parent().filter(|generic| {
+        (generic.kind() == "generic_function"
+            && generic.child_by_field_name("function") == Some(expression))
+            || (generic.kind() == "generic_type"
+                && generic.child_by_field_name("type") == Some(expression))
+    }) {
+        expression = generic;
+    }
+    let mut applied = None;
+    if let Some(instance) = expression
+        .parent()
+        .filter(|parent| parent.kind() == "instance_expression")
+    {
+        expression = instance;
+        applied = Some(instance);
+    }
+    while let Some(call) = expression.parent() {
+        if call.kind() != "call_expression"
+            || call.child_by_field_name("function") != Some(expression)
+        {
+            break;
+        }
+        expression = call;
+        applied = Some(call);
+    }
+    applied
+}
+
+fn call_argument_list(arguments: Node<'_>) -> ScalaCallArgumentList {
+    if matches!(arguments.kind(), "block" | "indented_block") {
+        return ScalaCallArgumentList {
+            arity: 1,
+            kind: ScalaCallArgumentListKind::Block,
+        };
+    }
+    let mut children = arguments.walk();
+    let kind = if arguments
+        .children(&mut children)
+        .any(|child| matches!(child.kind(), "using" | "implicit"))
+    {
+        ScalaCallArgumentListKind::Contextual
+    } else {
+        ScalaCallArgumentListKind::Ordinary
+    };
+    let mut named = arguments.walk();
+    ScalaCallArgumentList {
+        arity: arguments.named_children(&mut named).count(),
+        kind,
+    }
+}
+
+pub(crate) fn scala_call_shape_relation(
+    declared: &[ScalaCallableParameterList],
+    actual: &ScalaCallSiteShape,
+) -> ScalaCallShapeRelation {
+    if actual.lists.len() == 1
+        && actual.lists[0].kind == ScalaCallArgumentListKind::Ordinary
+        && actual.lists[0].arity == 0
+        && !declared.is_empty()
+        && declared
+            .iter()
+            .all(|list| list.kind == ScalaParameterListKind::Contextual)
+    {
+        return ScalaCallShapeRelation::Complete;
+    }
+
+    let mut declared_index = 0usize;
+    for actual_list in &actual.lists {
+        match actual_list.kind {
+            ScalaCallArgumentListKind::Ordinary | ScalaCallArgumentListKind::Block => {
+                while declared
+                    .get(declared_index)
+                    .is_some_and(|list| list.kind == ScalaParameterListKind::Contextual)
+                {
+                    declared_index += 1;
+                }
+                let Some(declared_list) = declared.get(declared_index) else {
+                    return ScalaCallShapeRelation::Incompatible;
+                };
+                if declared_list.kind != ScalaParameterListKind::Explicit
+                    || !declared_list.arity.accepts(actual_list.arity)
+                {
+                    return ScalaCallShapeRelation::Incompatible;
+                }
+            }
+            ScalaCallArgumentListKind::Contextual => {
+                let Some(declared_list) = declared.get(declared_index) else {
+                    return ScalaCallShapeRelation::Incompatible;
+                };
+                if declared_list.kind != ScalaParameterListKind::Contextual
+                    || !declared_list.arity.accepts(actual_list.arity)
+                {
+                    return ScalaCallShapeRelation::Incompatible;
+                }
+            }
+        }
+        declared_index += 1;
+    }
+
+    let remaining = &declared[declared_index..];
+    if remaining
+        .iter()
+        .all(|list| list.kind == ScalaParameterListKind::Contextual)
+    {
+        return ScalaCallShapeRelation::Complete;
+    }
+    let mut explicit = remaining
+        .iter()
+        .filter(|list| list.kind == ScalaParameterListKind::Explicit);
+    let Some(next) = explicit.next() else {
+        return ScalaCallShapeRelation::Complete;
+    };
+    if explicit.next().is_some() {
+        return ScalaCallShapeRelation::Incompatible;
+    }
+    ScalaCallShapeRelation::Partial {
+        next_explicit_arity: next.arity,
+    }
+}
+
+pub(crate) fn scala_callable_shape_matches(
+    declared: &[ScalaCallableParameterList],
+    actual: Option<&ScalaCallSiteShape>,
+    policy: ScalaCallableUsePolicy,
+    unique_callable: bool,
+) -> bool {
+    let Some(actual) = actual else {
+        return declared.first().is_none_or(|list| list.arity.total() == 0)
+            || policy == ScalaCallableUsePolicy::OrdinaryMethod && unique_callable;
+    };
+    if !scala_callable_shape_is_candidate(declared, actual, policy) {
+        return false;
+    }
+    match scala_call_shape_relation(declared, actual) {
+        ScalaCallShapeRelation::Incompatible => false,
+        ScalaCallShapeRelation::Complete => true,
+        ScalaCallShapeRelation::Partial { .. } => unique_callable,
+    }
+}
+
+pub(crate) fn scala_callable_shape_is_candidate(
+    declared: &[ScalaCallableParameterList],
+    actual: &ScalaCallSiteShape,
+    policy: ScalaCallableUsePolicy,
+) -> bool {
+    match scala_call_shape_relation(declared, actual) {
+        ScalaCallShapeRelation::Incompatible => false,
+        ScalaCallShapeRelation::Complete => true,
+        ScalaCallShapeRelation::Partial {
+            next_explicit_arity,
+        } => {
+            policy == ScalaCallableUsePolicy::OrdinaryMethod
+                && actual
+                    .method_value_arity
+                    .is_some_and(|arity| next_explicit_arity.accepts(arity))
+        }
+    }
 }
 
 pub(crate) fn infix_receiver_for_operator(node: Node<'_>) -> Option<Node<'_>> {
@@ -1285,6 +1514,145 @@ pub(crate) fn is_declaration_name(node: Node<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn explicit(arity: usize) -> ScalaCallableParameterList {
+        ScalaCallableParameterList {
+            arity: CallableArity::exact(arity),
+            kind: ScalaParameterListKind::Explicit,
+        }
+    }
+
+    fn contextual(arity: usize) -> ScalaCallableParameterList {
+        ScalaCallableParameterList {
+            arity: CallableArity::exact(arity),
+            kind: ScalaParameterListKind::Contextual,
+        }
+    }
+
+    #[test]
+    fn call_site_shape_treats_blocks_as_one_argument_and_records_using_lists() {
+        let source = r#"object Use:
+  val block = run {
+    val first = 1
+    val second = 2
+    first + second
+  }
+  val contextual = run(1)(using context)
+"#;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_scala::LANGUAGE.into())
+            .expect("Scala grammar");
+        let tree = parser.parse(source, None).expect("Scala tree");
+        let mut calls = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "identifier" && node_text(node, source) == "run" {
+                calls.push(node);
+            }
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+        assert_eq!(calls.len(), 2);
+        let block = call_site_shape_for_reference(calls[0]).expect("block call shape");
+        assert_eq!(
+            block.lists,
+            [ScalaCallArgumentList {
+                arity: 1,
+                kind: ScalaCallArgumentListKind::Block,
+            }]
+        );
+        let contextual = call_site_shape_for_reference(calls[1]).expect("contextual call shape");
+        assert_eq!(
+            contextual.lists,
+            [
+                ScalaCallArgumentList {
+                    arity: 1,
+                    kind: ScalaCallArgumentListKind::Ordinary,
+                },
+                ScalaCallArgumentList {
+                    arity: 1,
+                    kind: ScalaCallArgumentListKind::Contextual,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn call_shape_aligns_contextual_lists_and_requires_proven_partial_use() {
+        let ordinary = ScalaCallArgumentList {
+            arity: 1,
+            kind: ScalaCallArgumentListKind::Ordinary,
+        };
+        let empty = ScalaCallArgumentList {
+            arity: 0,
+            kind: ScalaCallArgumentListKind::Ordinary,
+        };
+        let supplied = ScalaCallSiteShape {
+            lists: vec![ordinary],
+            method_value_arity: None,
+        };
+        assert_eq!(
+            scala_call_shape_relation(&[contextual(1), explicit(1), contextual(2)], &supplied),
+            ScalaCallShapeRelation::Complete
+        );
+        assert_eq!(
+            scala_call_shape_relation(&[contextual(1), explicit(1)], &supplied),
+            ScalaCallShapeRelation::Complete
+        );
+        assert_eq!(
+            scala_call_shape_relation(
+                &[contextual(1)],
+                &ScalaCallSiteShape {
+                    lists: vec![empty],
+                    method_value_arity: None,
+                }
+            ),
+            ScalaCallShapeRelation::Complete
+        );
+        assert_eq!(
+            scala_call_shape_relation(
+                &[contextual(1)],
+                &ScalaCallSiteShape {
+                    lists: vec![ordinary],
+                    method_value_arity: None,
+                }
+            ),
+            ScalaCallShapeRelation::Incompatible
+        );
+
+        let partial = ScalaCallSiteShape {
+            lists: vec![ordinary],
+            method_value_arity: Some(1),
+        };
+        assert_eq!(
+            scala_call_shape_relation(&[explicit(1), explicit(1)], &partial),
+            ScalaCallShapeRelation::Partial {
+                next_explicit_arity: CallableArity::exact(1)
+            }
+        );
+        assert!(scala_callable_shape_matches(
+            &[explicit(1), explicit(1)],
+            Some(&partial),
+            ScalaCallableUsePolicy::OrdinaryMethod,
+            true,
+        ));
+        assert!(!scala_callable_shape_matches(
+            &[explicit(1), explicit(1)],
+            Some(&partial),
+            ScalaCallableUsePolicy::OrdinaryMethod,
+            false,
+        ));
+        assert!(!scala_callable_shape_matches(
+            &[explicit(1), explicit(1)],
+            Some(&partial),
+            ScalaCallableUsePolicy::CompleteCall,
+            true,
+        ));
+    }
 
     #[test]
     fn pattern_binders_exclude_types_extractors_operators_and_named_labels() {

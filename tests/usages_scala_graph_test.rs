@@ -1982,6 +1982,64 @@ object Use {
 }
 
 #[test]
+fn scala_usage_finder_shares_structured_call_list_semantics() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Calls.scala",
+        r#"package app
+trait Context
+object Api {
+  def block(value: => Int)(using Context): Int = value
+  def aligned(using Context)(value: Int)(using Context): Int = value
+  def contextualOnly(using Context): Int = 1
+  def partial(prefix: String)(line: String): String = prefix + line
+  def select(prefix: String)(line: String): String = prefix + line
+  def select(left: String, right: String)(line: String): String = left + right + line
+  def ambiguous(prefix: String)(line: String): String = prefix + line
+  def ambiguous(prefix: Int)(line: String): String = prefix.toString + line
+}
+object Use {
+  import Api.*
+  given Context = new Context {}
+  def consume(run: String => String): String = run("line")
+  def consumeTwo(run: (String, String) => String): String = run("left", "right")
+  val blockResult = Api.block {
+    val first = 1
+    val second = 2
+    first + second
+  } // positive-block
+  val alignedResult = Api.aligned(1) // positive-leading-and-trailing-context
+  val contextualResult = Api.contextualOnly() // positive-contextual-empty-application
+  val partialResult = consume(Api.partial("prefix")) // positive-proven-partial
+  val selectedPartial = consume(Api.select("prefix")) // positive-prefix-disambiguated-partial
+  val wrongExpected = consumeTwo(Api.partial("prefix")) // negative-wrong-partial-arity
+  val ambiguousPartial = consume(Api.ambiguous("prefix")) // negative-ambiguous-partial
+}
+"#,
+    )]);
+
+    for (target_fqn, positive) in [
+        ("app.Api$.block", "val blockResult = Api.block {"),
+        ("app.Api$.aligned", "Api.aligned(1)"),
+        ("app.Api$.contextualOnly", "Api.contextualOnly()"),
+        ("app.Api$.partial", "consume(Api.partial(\"prefix\"))"),
+        ("app.Api$.select", "consume(Api.select(\"prefix\"))"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&target_hits, positive);
+        if target_fqn.ends_with(".partial") {
+            assert_no_hit_contains(&target_hits, "negative-wrong-partial-arity");
+        }
+    }
+
+    let ambiguous = definition(&analyzer, "app.Api$.ambiguous");
+    let ambiguous_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&ambiguous)));
+    assert_no_hit_contains(&ambiguous_hits, "negative-ambiguous-partial");
+}
+
+#[test]
 fn scala_usage_finder_routes_chained_wildcard_contextual_apply() {
     let consumer_source = r#"package dotty.tools.dotc.typer
 import dotty.tools.dotc.core.*

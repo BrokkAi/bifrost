@@ -1727,6 +1727,68 @@ class Use(api: Api) {
 }
 
 #[test]
+fn scala_inverted_graph_shares_structured_call_list_semantics() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Calls.scala",
+            r#"package app
+trait Context
+object Api {
+  def block(value: => Int)(using Context): Int = value
+  def aligned(using Context)(value: Int)(using Context): Int = value
+  def contextualOnly(using Context): Int = 1
+  def partial(prefix: String)(line: String): String = prefix + line
+  def select(prefix: String)(line: String): String = prefix + line
+  def select(left: String, right: String)(line: String): String = left + right + line
+  def ambiguous(prefix: String)(line: String): String = prefix + line
+  def ambiguous(prefix: Int)(line: String): String = prefix.toString + line
+}
+object Use {
+  import Api.*
+  given Context = new Context {}
+  def consume(run: String => String): String = run("line")
+  def consumeTwo(run: (String, String) => String): String = run("left", "right")
+  def blockResult: Int = Api.block {
+    val first = 1
+    val second = 2
+    first + second
+  }
+  def alignedResult: Int = Api.aligned(1)
+  def contextualResult: Int = Api.contextualOnly()
+  def partialResult: String = consume(Api.partial("prefix"))
+  def selectedPartial: String = consume(Api.select("prefix"))
+  def wrongExpected: String = consumeTwo(Api.partial("prefix"))
+  // Both overloads have the same call-list shape. Argument types are not
+  // shape evidence, so the partial application must remain ambiguous.
+  def ambiguousPartial: String = consume(Api.ambiguous("prefix"))
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+
+    for (caller, callee) in [
+        ("app.Use$.blockResult", "app.Api$.block"),
+        ("app.Use$.alignedResult", "app.Api$.aligned"),
+        ("app.Use$.contextualResult", "app.Api$.contextualOnly"),
+        ("app.Use$.partialResult", "app.Api$.partial"),
+        ("app.Use$.selectedPartial", "app.Api$.select"),
+    ] {
+        assert!(has_edge(&value, caller, callee), "{}", value["edges"]);
+    }
+    assert!(
+        !has_edge(&value, "app.Use$.wrongExpected", "app.Api$.partial"),
+        "{}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$.ambiguousPartial", "app.Api$.ambiguous"),
+        "{}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn scala_inverted_keeps_overload_shape_receiver_and_return_facts_aligned() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

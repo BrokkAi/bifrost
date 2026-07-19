@@ -5,7 +5,10 @@ use crate::analyzer::scala::{
     scala_lexical_scope_path_at, scala_package_prefixes_at, scala_type_lookup_segments,
 };
 use crate::analyzer::usages::scala_graph::syntax::{
-    call_arity_for_reference, is_scala_case_pattern_binder, scala_pattern_binder_names,
+    ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableUsePolicy,
+    applied_expression_for_reference, call_arities_for_reference, call_site_shape_for_reference,
+    is_scala_case_pattern_binder, scala_callable_shape_is_candidate, scala_callable_shape_matches,
+    scala_pattern_binder_names,
 };
 use crate::analyzer::usages::scala_graph::{
     method_call_arity_applies, method_signature_arity, resolved_extension_receiver_type,
@@ -656,7 +659,14 @@ fn resolve_scala_bare_apply_fast_path(
     if name.is_empty() {
         return None;
     }
-    let call_arity = call_arity_for_reference(function);
+    let ctx = ScalaLookupCtx {
+        scala,
+        analyzer,
+        support,
+        file,
+        source,
+    };
+    let call_shape = scala_call_site_shape(ctx, root, function);
     if scala_active_path_declares_name_before(root, source, name, function.start_byte())
         || scala_enclosing_member_shadows_bare_call(
             scala,
@@ -666,33 +676,34 @@ fn resolve_scala_bare_apply_fast_path(
             function.start_byte(),
             name,
         )
-        || scala_imported_member_shadows_bare_call(scala, support, file, name, call_arity)
+        || scala_imported_member_shadows_bare_call(scala, support, file, name, call_shape.as_ref())
         || resolver.resolve_wildcard_singleton(name) != ScalaNameResolution::Unresolved
     {
         return None;
     }
 
-    let ctx = ScalaLookupCtx {
-        scala,
-        analyzer,
-        support,
-        file,
-        source,
-    };
     let local_segments = [name.to_string()];
     if !scala_type_annotation_has_explicit_import(ctx, name)
         && let Some(owner_fqn) =
             scala_same_file_type_fqn(ctx, &local_segments, ScalaOwnerKind::Class)
     {
         return Some(scala_apply_or_constructor_outcome(
-            scala, support, &owner_fqn, name, call_arity,
+            scala,
+            support,
+            &owner_fqn,
+            name,
+            call_shape.as_ref(),
         ));
     }
     let owner_fqn = resolver
         .resolve_singleton(name)
         .or_else(|| resolver.resolve(name))?;
     Some(scala_apply_or_constructor_outcome(
-        scala, support, &owner_fqn, name, call_arity,
+        scala,
+        support,
+        &owner_fqn,
+        name,
+        call_shape.as_ref(),
     ))
 }
 
@@ -701,7 +712,7 @@ fn scala_apply_or_constructor_outcome(
     support: &dyn BoundedDefinitionLookup,
     owner_fqn: &str,
     reference: &str,
-    call_arity: Option<usize>,
+    call_shape: Option<&ScalaCallSiteShape>,
 ) -> DefinitionLookupOutcome {
     let class_fqn = owner_fqn.trim_end_matches('$');
     let apply_fqn = format!("{class_fqn}$.apply");
@@ -711,7 +722,13 @@ fn scala_apply_or_constructor_outcome(
         .filter(|unit| {
             unit.is_function()
                 && unit.fq_name() == apply_fqn
-                && call_arity.is_none_or(|arity| method_call_arity_applies(scala, unit, arity))
+                && scala_member_unit_applies(
+                    scala,
+                    unit,
+                    call_shape,
+                    ScalaCallableUsePolicy::CompleteCall,
+                    false,
+                )
         })
         .collect::<Vec<_>>();
     if !apply_candidates.is_empty() {
@@ -727,7 +744,13 @@ fn scala_apply_or_constructor_outcome(
             unit.is_function()
                 && unit.is_synthetic()
                 && unit.fq_name() == constructor_fqn
-                && call_arity.is_none_or(|arity| method_call_arity_applies(scala, unit, arity))
+                && scala_member_unit_applies(
+                    scala,
+                    unit,
+                    call_shape,
+                    ScalaCallableUsePolicy::CompleteCall,
+                    false,
+                )
         })
         .collect::<Vec<_>>();
     if !constructor_candidates.is_empty() {
@@ -1067,6 +1090,91 @@ struct ScalaLookupCtx<'a> {
     source: &'a str,
 }
 
+fn scala_call_site_shape(
+    ctx: ScalaLookupCtx<'_>,
+    root: Node<'_>,
+    reference: Node<'_>,
+) -> Option<ScalaCallSiteShape> {
+    let shape = call_site_shape_for_reference(reference)?;
+    let method_value_arity = applied_expression_for_reference(reference)
+        .and_then(|expression| scala_forward_method_value_arity(ctx, root, expression));
+    Some(shape.with_method_value_arity(method_value_arity))
+}
+
+fn scala_forward_method_value_arity(
+    ctx: ScalaLookupCtx<'_>,
+    _root: Node<'_>,
+    expression: Node<'_>,
+) -> Option<usize> {
+    let arguments = expression
+        .parent()
+        .filter(|parent| parent.kind() == "arguments")?;
+    let mut arguments_cursor = arguments.walk();
+    let parameter_index = arguments
+        .named_children(&mut arguments_cursor)
+        .position(|argument| argument == expression)?;
+    let call = arguments.parent().filter(|parent| {
+        parent.kind() == "call_expression"
+            && parent.child_by_field_name("arguments") == Some(arguments)
+    })?;
+    let mut parameter_list = 0usize;
+    let mut function = call.child_by_field_name("function")?;
+    while function.kind() == "call_expression" {
+        parameter_list += 1;
+        function = function.child_by_field_name("function")?;
+    }
+    if function.kind() == "generic_function" {
+        function = function.child_by_field_name("function")?;
+    }
+    if !matches!(function.kind(), "identifier" | "operator_identifier") {
+        return None;
+    }
+    let function_name = scala_node_text(function, ctx.source).trim();
+    if function_name.is_empty() {
+        return None;
+    }
+    let call_arities = call_arities_for_reference(function)?;
+    let mut methods = Vec::new();
+    if let Some(method) = resolve_in_enclosing_scopes(
+        ctx.analyzer,
+        ctx.file,
+        function_name,
+        function.start_byte(),
+        CodeUnit::is_function,
+    ) {
+        methods.push(method);
+    } else if let Some(owner) =
+        scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, function.start_byte())
+    {
+        methods.extend(scala_member_candidate_units(
+            ctx,
+            &owner.fq_name(),
+            function_name,
+            false,
+        ));
+    }
+    methods.sort();
+    methods.dedup();
+    let mut resolved = None;
+    for method in methods {
+        let arity = ctx
+            .scala
+            .project_types()
+            .callable_parameter_function_arity(
+                ctx.scala,
+                &method,
+                &call_arities,
+                parameter_list,
+                parameter_index,
+            )?;
+        if resolved.is_some_and(|resolved| resolved != arity) {
+            return None;
+        }
+        resolved = Some(arity);
+    }
+    resolved
+}
+
 fn resolve_scala_type(
     ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
@@ -1187,6 +1295,12 @@ fn resolve_scala_call(
                 name,
                 function.start_byte(),
                 |unit| unit.is_function(),
+            ) && scala_member_unit_applies(
+                ctx.scala,
+                &unit,
+                scala_call_site_shape(ctx, root, function).as_ref(),
+                ScalaCallableUsePolicy::OrdinaryMethod,
+                true,
             ) {
                 return candidates_outcome(vec![unit]);
             }
@@ -1211,7 +1325,7 @@ fn resolve_scala_call(
             if let Some(imported_member) = scala_wildcard_imported_member_outcome(
                 ctx,
                 name,
-                call_arity_for_reference(function),
+                scala_call_site_shape(ctx, root, function).as_ref(),
             ) {
                 return imported_member;
             }
@@ -1222,7 +1336,7 @@ fn resolve_scala_call(
                         ctx.support,
                         &owner.fqn,
                         name,
-                        call_arity_for_reference(function),
+                        scala_call_site_shape(ctx, root, function).as_ref(),
                     );
                 }
                 ScalaNameResolution::Ambiguous => {
@@ -1241,7 +1355,7 @@ fn resolve_scala_call(
                     ctx.support,
                     &owner_fqn,
                     name,
-                    call_arity_for_reference(function),
+                    scala_call_site_shape(ctx, root, function).as_ref(),
                 );
             }
             if scala_import_boundary_for_name(ctx.scala, ctx.support, ctx.file, name) {
@@ -1423,13 +1537,13 @@ fn resolve_scala_field(
                 bindings,
             )
         });
-        let call_arity = call_arity_for_reference(field_node);
+        let call_shape = scala_call_site_shape(ctx, root, field_node);
         let candidates = scala_applicable_member_candidate_units(
             ctx,
             &owner,
             member,
             include_companion,
-            call_arity,
+            call_shape.as_ref(),
         );
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
@@ -1649,26 +1763,72 @@ fn scala_applicable_member_candidate_units(
     owner_fqn: &str,
     member: &str,
     include_companion: bool,
-    call_arity: Option<usize>,
+    call_shape: Option<&ScalaCallSiteShape>,
 ) -> Vec<CodeUnit> {
-    scala_member_candidate_units(ctx, owner_fqn, member, include_companion)
+    let candidates = scala_member_candidate_units(ctx, owner_fqn, member, include_companion);
+    let callable_count = candidates
+        .iter()
+        .filter(|unit| unit.is_function())
+        .map(|unit| {
+            let alternatives = ctx
+                .scala
+                .project_types()
+                .callable_alternatives_for(ctx.scala, unit);
+            if let Some(call_shape) = call_shape {
+                if !alternatives.is_empty() {
+                    return alternatives
+                        .iter()
+                        .filter(|alternative| {
+                            scala_callable_shape_is_candidate(
+                                &alternative.shape,
+                                call_shape,
+                                ScalaCallableUsePolicy::OrdinaryMethod,
+                            )
+                        })
+                        .count();
+                }
+                let fallback = method_signature_arity(ctx.scala, unit)
+                    .map(crate::analyzer::CallableArity::exact)
+                    .map(ScalaCallableParameterList::explicit)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                return usize::from(scala_callable_shape_is_candidate(
+                    &fallback,
+                    call_shape,
+                    ScalaCallableUsePolicy::OrdinaryMethod,
+                ));
+            }
+            alternatives.len().max(1)
+        })
+        .sum::<usize>();
+    let unique_callable = callable_count == 1;
+    candidates
         .into_iter()
-        .filter(|unit| scala_member_candidate_applies(ctx, unit, call_arity))
+        .filter(|unit| scala_member_candidate_applies(ctx, unit, call_shape, unique_callable))
         .collect()
 }
 
 fn scala_member_candidate_applies(
     ctx: ScalaLookupCtx<'_>,
     unit: &CodeUnit,
-    call_arity: Option<usize>,
+    call_shape: Option<&ScalaCallSiteShape>,
+    unique_callable: bool,
 ) -> bool {
-    scala_member_unit_applies(ctx.scala, unit, call_arity)
+    scala_member_unit_applies(
+        ctx.scala,
+        unit,
+        call_shape,
+        ScalaCallableUsePolicy::OrdinaryMethod,
+        unique_callable,
+    )
 }
 
 fn scala_member_unit_applies(
     scala: &ScalaAnalyzer,
     unit: &CodeUnit,
-    call_arity: Option<usize>,
+    call_shape: Option<&ScalaCallSiteShape>,
+    policy: ScalaCallableUsePolicy,
+    unique_callable: bool,
 ) -> bool {
     if unit.is_field() {
         return true;
@@ -1676,8 +1836,14 @@ fn scala_member_unit_applies(
     if !unit.is_function() {
         return false;
     }
-    match call_arity {
-        Some(call_arity) => method_call_arity_applies(scala, unit, call_arity),
+    let alternatives = scala.project_types().callable_alternatives_for(scala, unit);
+    if !alternatives.is_empty() {
+        return alternatives.iter().any(|alternative| {
+            scala_callable_shape_matches(&alternative.shape, call_shape, policy, unique_callable)
+        });
+    }
+    match call_shape.and_then(|shape| shape.lists.first()) {
+        Some(list) => method_call_arity_applies(scala, unit, list.arity),
         None => method_signature_arity(scala, unit).is_none_or(|arity| arity == 0),
     }
 }
@@ -1735,7 +1901,7 @@ fn scala_extension_receiver_matches(
 fn scala_wildcard_imported_member_outcome(
     ctx: ScalaLookupCtx<'_>,
     member: &str,
-    call_arity: Option<usize>,
+    call_shape: Option<&ScalaCallSiteShape>,
 ) -> Option<DefinitionLookupOutcome> {
     let file_package = scala_package_name_of(ctx.scala, ctx.file).unwrap_or_default();
     let mut contributing_imports = 0_usize;
@@ -1750,7 +1916,7 @@ fn scala_wildcard_imported_member_outcome(
         let import_candidates =
             scala_wildcard_imported_member_units(ctx.support, &path, &file_package, member)
                 .into_iter()
-                .filter(|unit| scala_member_candidate_applies(ctx, unit, call_arity))
+                .filter(|unit| scala_member_candidate_applies(ctx, unit, call_shape, false))
                 .collect::<Vec<_>>();
         if !import_candidates.is_empty() {
             contributing_imports += 1;
@@ -2683,7 +2849,7 @@ fn scala_imported_member_shadows_bare_call(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     name: &str,
-    call_arity: Option<usize>,
+    call_shape: Option<&ScalaCallSiteShape>,
 ) -> bool {
     let file_package = scala_package_name_of(scala, file).unwrap_or_default();
     for import in scala.import_info_of(file) {
@@ -2693,7 +2859,15 @@ fn scala_imported_member_shadows_bare_call(
         if import.is_wildcard {
             if scala_wildcard_imported_member_units(support, &path, &file_package, name)
                 .into_iter()
-                .any(|unit| scala_member_unit_applies(scala, &unit, call_arity))
+                .any(|unit| {
+                    scala_member_unit_applies(
+                        scala,
+                        &unit,
+                        call_shape,
+                        ScalaCallableUsePolicy::OrdinaryMethod,
+                        false,
+                    )
+                })
             {
                 return true;
             }

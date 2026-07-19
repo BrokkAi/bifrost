@@ -27,16 +27,18 @@ use super::resolver::{
 };
 use super::shared::ScalaEdgeGraph;
 use super::syntax::{
-    ScalaCallableParameterList, ScalaCallableRole, ScalaImportContextIndex,
-    ScalaMethodValueContext, ScalaPackageContextIndex, ScalaParameterListKind,
+    ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableRole, ScalaCallableUsePolicy,
+    ScalaImportContextIndex, ScalaMethodValueContext, ScalaPackageContextIndex,
     ScalaQualifiedStableTypeRole, ScalaSourceFacts, call_arities_for_reference,
-    enclosing_template_declarations, is_bare_companion_method_value_reference,
-    is_constructor_like_reference, is_declaration_name, is_extractor_reference,
-    is_infix_pattern_operator, is_scala_case_pattern_binder, is_scala_class_reference,
-    is_scala_object_reference, is_terminal_stable_field_reference, node_text, parenthesized_arity,
-    qualified_stable_type_reference, resolve_stable_object_expression,
-    scala_import_is_visible_at_byte, scala_pattern_binder_names, scala_source_facts,
-    stable_identifier_reference, template_direct_term_member_named, template_self_type,
+    call_site_shape_for_reference, enclosing_template_declarations,
+    is_bare_companion_method_value_reference, is_constructor_like_reference, is_declaration_name,
+    is_extractor_reference, is_infix_pattern_operator, is_scala_case_pattern_binder,
+    is_scala_class_reference, is_scala_object_reference, is_terminal_stable_field_reference,
+    node_text, parenthesized_arity, qualified_stable_type_reference,
+    resolve_stable_object_expression, scala_callable_shape_is_candidate,
+    scala_callable_shape_matches, scala_import_is_visible_at_byte, scala_pattern_binder_names,
+    scala_source_facts, stable_identifier_reference, template_direct_term_member_named,
+    template_self_type,
 };
 use crate::analyzer::scala::{
     ScalaAdapter, ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaExportSelector,
@@ -135,6 +137,21 @@ pub(crate) struct ProjectTypes {
         Mutex<HashMap<ExtensionOwnerMemberKey, ExtensionMethodEntries>>,
     override_targets_by_method: Mutex<HashMap<String, OverrideTargetEntries>>,
     exported_member_bindings_by_owner: Mutex<HashMap<String, Vec<(String, String)>>>,
+}
+
+#[derive(Clone, Copy)]
+enum ScalaCallMatch<'a> {
+    Arities(Option<&'a [usize]>),
+    Shape(&'a ScalaCallSiteShape),
+}
+
+impl ScalaCallMatch<'_> {
+    fn is_unapplied(self) -> bool {
+        match self {
+            Self::Arities(call_arities) => call_arities.is_none(),
+            Self::Shape(shape) => shape.lists.is_empty(),
+        }
+    }
 }
 
 impl ProjectTypes {
@@ -739,6 +756,32 @@ impl ProjectTypes {
         members: &[&CodeUnit],
         call_arities: Option<&[usize]>,
     ) -> Vec<CodeUnit> {
+        self.method_declarations_for_members_matching(
+            scala,
+            members,
+            ScalaCallMatch::Arities(call_arities),
+        )
+    }
+
+    fn method_declarations_for_members_with_shape(
+        &self,
+        scala: &ScalaAnalyzer,
+        members: &[&CodeUnit],
+        call_shape: &ScalaCallSiteShape,
+    ) -> Vec<CodeUnit> {
+        self.method_declarations_for_members_matching(
+            scala,
+            members,
+            ScalaCallMatch::Shape(call_shape),
+        )
+    }
+
+    fn method_declarations_for_members_matching(
+        &self,
+        scala: &ScalaAnalyzer,
+        members: &[&CodeUnit],
+        call: ScalaCallMatch<'_>,
+    ) -> Vec<CodeUnit> {
         let candidates = members
             .iter()
             .filter(|method| method.is_function())
@@ -752,15 +795,41 @@ impl ProjectTypes {
                 })
             })
             .collect::<Vec<_>>();
-        let callable_count = candidates
-            .iter()
-            .map(|(_, _, alternatives)| alternatives.len().max(1))
-            .sum::<usize>();
+        let callable_count = match call {
+            ScalaCallMatch::Arities(_) => candidates
+                .iter()
+                .map(|(_, _, alternatives)| alternatives.len().max(1))
+                .sum::<usize>(),
+            ScalaCallMatch::Shape(shape) => candidates
+                .iter()
+                .map(|(_, facts, alternatives)| {
+                    count_callable_shapes_matching(facts, alternatives, |declared| {
+                        scala_callable_shape_is_candidate(
+                            declared,
+                            shape,
+                            ScalaCallableUsePolicy::OrdinaryMethod,
+                        )
+                    })
+                })
+                .sum::<usize>(),
+        };
         let unique_callable = callable_count == 1;
         candidates
             .iter()
-            .filter(|(_, facts, alternatives)| {
-                method_call_shape_matches(facts, alternatives, call_arities, unique_callable)
+            .filter(|(_, facts, alternatives)| match call {
+                ScalaCallMatch::Arities(call_arities) => {
+                    method_call_shape_matches(facts, alternatives, call_arities, unique_callable)
+                }
+                ScalaCallMatch::Shape(shape) => {
+                    any_callable_shape(facts, alternatives, |declared| {
+                        scala_callable_shape_matches(
+                            declared,
+                            Some(shape),
+                            ScalaCallableUsePolicy::OrdinaryMethod,
+                            unique_callable,
+                        )
+                    })
+                }
             })
             .map(|(method, _, _)| (*method).clone())
             .collect()
@@ -791,6 +860,36 @@ impl ProjectTypes {
         member: &str,
         call_arities: Option<&[usize]>,
     ) -> BareMemberResolution {
+        self.bare_member_declarations_for_owner_matching(
+            scala,
+            owner,
+            member,
+            ScalaCallMatch::Arities(call_arities),
+        )
+    }
+
+    pub(super) fn bare_member_declarations_for_owner_with_shape(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+        member: &str,
+        call_shape: &ScalaCallSiteShape,
+    ) -> BareMemberResolution {
+        self.bare_member_declarations_for_owner_matching(
+            scala,
+            owner,
+            member,
+            ScalaCallMatch::Shape(call_shape),
+        )
+    }
+
+    fn bare_member_declarations_for_owner_matching(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+        member: &str,
+        call: ScalaCallMatch<'_>,
+    ) -> BareMemberResolution {
         if !owner.is_class() {
             return BareMemberResolution::NoMatch;
         }
@@ -814,7 +913,14 @@ impl ProjectTypes {
                 {
                     return BareMemberResolution::Unresolved;
                 }
-                matched.extend(self.method_declarations_for_members(scala, &members, call_arities));
+                matched.extend(match call {
+                    ScalaCallMatch::Arities(call_arities) => {
+                        self.method_declarations_for_members(scala, &members, call_arities)
+                    }
+                    ScalaCallMatch::Shape(call_shape) => {
+                        self.method_declarations_for_members_with_shape(scala, &members, call_shape)
+                    }
+                });
                 next.extend(self.direct_ancestors_for_declaration(scala, &owner));
             }
             if !matched.is_empty() {
@@ -840,14 +946,44 @@ impl ProjectTypes {
         member: &str,
         call_arities: Option<&[usize]>,
     ) -> BareMemberResolution {
+        self.ordinary_class_member_declarations_for_owner_matching(
+            scala,
+            owner,
+            member,
+            ScalaCallMatch::Arities(call_arities),
+        )
+    }
+
+    pub(super) fn ordinary_class_member_declarations_for_owner_with_shape(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+        member: &str,
+        call_shape: &ScalaCallSiteShape,
+    ) -> BareMemberResolution {
+        self.ordinary_class_member_declarations_for_owner_matching(
+            scala,
+            owner,
+            member,
+            ScalaCallMatch::Shape(call_shape),
+        )
+    }
+
+    fn ordinary_class_member_declarations_for_owner_matching(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+        member: &str,
+        call: ScalaCallMatch<'_>,
+    ) -> BareMemberResolution {
         if !owner.is_class() {
             return BareMemberResolution::NoMatch;
         }
-        self.ordinary_class_member_declarations_for_owners(
+        self.ordinary_class_member_declarations_for_owners_matching(
             scala,
             std::slice::from_ref(owner),
             member,
-            call_arities,
+            call,
         )
     }
 
@@ -857,6 +993,36 @@ impl ProjectTypes {
         direct_owners: &[CodeUnit],
         member: &str,
         call_arities: Option<&[usize]>,
+    ) -> BareMemberResolution {
+        self.ordinary_class_member_declarations_for_owners_matching(
+            scala,
+            direct_owners,
+            member,
+            ScalaCallMatch::Arities(call_arities),
+        )
+    }
+
+    pub(super) fn ordinary_class_member_declarations_for_owners_with_shape(
+        &self,
+        scala: &ScalaAnalyzer,
+        direct_owners: &[CodeUnit],
+        member: &str,
+        call_shape: &ScalaCallSiteShape,
+    ) -> BareMemberResolution {
+        self.ordinary_class_member_declarations_for_owners_matching(
+            scala,
+            direct_owners,
+            member,
+            ScalaCallMatch::Shape(call_shape),
+        )
+    }
+
+    fn ordinary_class_member_declarations_for_owners_matching(
+        &self,
+        scala: &ScalaAnalyzer,
+        direct_owners: &[CodeUnit],
+        member: &str,
+        call: ScalaCallMatch<'_>,
     ) -> BareMemberResolution {
         let mut owners = direct_owners.to_vec();
         let mut seen = HashSet::default();
@@ -869,7 +1035,7 @@ impl ProjectTypes {
                 if !seen.insert(owner.clone()) {
                     continue;
                 }
-                if call_arities.is_none()
+                if call.is_unapplied()
                     && self
                         .exact_nested_object(scala, &owner.fq_name(), member)
                         .is_some()
@@ -887,7 +1053,14 @@ impl ProjectTypes {
                 {
                     blocked = true;
                 }
-                let methods = self.method_declarations_for_members(scala, &members, call_arities);
+                let methods = match call {
+                    ScalaCallMatch::Arities(call_arities) => {
+                        self.method_declarations_for_members(scala, &members, call_arities)
+                    }
+                    ScalaCallMatch::Shape(call_shape) => {
+                        self.method_declarations_for_members_with_shape(scala, &members, call_shape)
+                    }
+                };
                 if !methods.is_empty() {
                     if self.is_scala_trait_declaration(scala, &owner) {
                         if methods
@@ -936,7 +1109,7 @@ impl ProjectTypes {
             || member.is_class() && self.type_is_stable_owner(scala, member)
     }
 
-    pub(super) fn callable_parameter_function_arity(
+    pub(crate) fn callable_parameter_function_arity(
         &self,
         scala: &ScalaAnalyzer,
         method: &CodeUnit,
@@ -947,7 +1120,7 @@ impl ProjectTypes {
         let alternatives = self.callable_alternatives_for(scala, method);
         let mut resolved = None;
         for alternative in alternatives.iter().filter(|alternative| {
-            callable_shape_matches(&alternative.shape, Some(call_arities), true)
+            ordinary_callable_shape_matches(&alternative.shape, Some(call_arities), true)
         }) {
             let arity = alternative
                 .parameter_function_arities
@@ -976,6 +1149,36 @@ impl ProjectTypes {
         member: &str,
         call_arities: Option<&[usize]>,
     ) -> BareMemberResolution {
+        self.effective_method_declarations_for_owner_matching(
+            scala,
+            owner_fqn,
+            member,
+            ScalaCallMatch::Arities(call_arities),
+        )
+    }
+
+    fn effective_method_declarations_for_owner_with_shape(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner_fqn: &str,
+        member: &str,
+        call_shape: &ScalaCallSiteShape,
+    ) -> BareMemberResolution {
+        self.effective_method_declarations_for_owner_matching(
+            scala,
+            owner_fqn,
+            member,
+            ScalaCallMatch::Shape(call_shape),
+        )
+    }
+
+    fn effective_method_declarations_for_owner_matching(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner_fqn: &str,
+        member: &str,
+        call: ScalaCallMatch<'_>,
+    ) -> BareMemberResolution {
         let mut declarations = self
             .index
             .by_fqn(owner_fqn)
@@ -991,7 +1194,7 @@ impl ProjectTypes {
         let root_owner = owner.clone();
         let mut abstract_trait_fallback = None;
         for owner in self.linearized_owners(scala, &root_owner) {
-            if call_arities.is_none()
+            if call.is_unapplied()
                 && self
                     .exact_nested_object(scala, &owner.fq_name(), member)
                     .is_some()
@@ -1009,7 +1212,14 @@ impl ProjectTypes {
             {
                 return BareMemberResolution::Unresolved;
             }
-            let methods = self.method_declarations_for_members(scala, &members, call_arities);
+            let methods = match call {
+                ScalaCallMatch::Arities(call_arities) => {
+                    self.method_declarations_for_members(scala, &members, call_arities)
+                }
+                ScalaCallMatch::Shape(shape) => {
+                    self.method_declarations_for_members_with_shape(scala, &members, shape)
+                }
+            };
             if !methods.is_empty() {
                 let inherited_abstract_trait = owner != root_owner
                     && self.is_scala_trait_declaration(scala, &owner)
@@ -1183,7 +1393,7 @@ impl ProjectTypes {
                 continue;
             }
             for alternative in alternatives.iter().filter(|alternative| {
-                callable_shape_matches(&alternative.shape, call_arities, unique_callable)
+                ordinary_callable_shape_matches(&alternative.shape, call_arities, unique_callable)
             }) {
                 let return_type = alternative
                     .return_type
@@ -1975,7 +2185,7 @@ impl ProjectTypes {
         };
         let alternatives = self.callable_alternatives_for(scala, target);
         if alternatives.is_empty() {
-            return callable_shape_matches(
+            return ordinary_callable_shape_matches(
                 &[ScalaCallableParameterList::explicit(CallableArity::exact(
                     0,
                 ))],
@@ -1984,11 +2194,11 @@ impl ProjectTypes {
             );
         }
         alternatives.iter().any(|alternative| {
-            callable_shape_matches(&alternative.shape, Some(call_arities), false)
+            ordinary_callable_shape_matches(&alternative.shape, Some(call_arities), false)
         })
     }
 
-    pub(super) fn callable_alternatives_for(
+    pub(crate) fn callable_alternatives_for(
         &self,
         scala: &ScalaAnalyzer,
         target: &CodeUnit,
@@ -2460,7 +2670,7 @@ impl ProjectTypes {
             .iter()
             .filter(|alternative| {
                 contextual_arities.is_none_or(|arities| {
-                    callable_shape_matches(&alternative.shape, Some(arities), false)
+                    ordinary_callable_shape_matches(&alternative.shape, Some(arities), false)
                 })
             })
             .count();
@@ -3466,36 +3676,63 @@ fn method_call_shape_matches(
         fallback_shapes.as_slice()
     } else {
         return alternatives.iter().any(|alternative| {
-            callable_shape_matches(&alternative.shape, call_arities, unique_callable)
+            ordinary_callable_shape_matches(&alternative.shape, call_arities, unique_callable)
         });
     };
     shapes
         .iter()
-        .any(|declared| callable_shape_matches(declared, call_arities, unique_callable))
+        .any(|declared| ordinary_callable_shape_matches(declared, call_arities, unique_callable))
 }
 
-fn callable_shape_matches(
+fn any_callable_shape(
+    facts: &CallableFacts,
+    alternatives: &[CallableAlternative],
+    mut predicate: impl FnMut(&[ScalaCallableParameterList]) -> bool,
+) -> bool {
+    if !alternatives.is_empty() {
+        return alternatives
+            .iter()
+            .any(|alternative| predicate(&alternative.shape));
+    }
+    let fallback = facts
+        .callable_arity
+        .or_else(|| facts.arity.map(crate::analyzer::CallableArity::exact))
+        .map(|arity| vec![ScalaCallableParameterList::explicit(arity)])
+        .unwrap_or_default();
+    predicate(&fallback)
+}
+
+fn count_callable_shapes_matching(
+    facts: &CallableFacts,
+    alternatives: &[CallableAlternative],
+    mut predicate: impl FnMut(&[ScalaCallableParameterList]) -> bool,
+) -> usize {
+    if !alternatives.is_empty() {
+        return alternatives
+            .iter()
+            .filter(|alternative| predicate(&alternative.shape))
+            .count();
+    }
+    let fallback = facts
+        .callable_arity
+        .or_else(|| facts.arity.map(crate::analyzer::CallableArity::exact))
+        .map(|arity| vec![ScalaCallableParameterList::explicit(arity)])
+        .unwrap_or_default();
+    usize::from(predicate(&fallback))
+}
+
+fn ordinary_callable_shape_matches(
     declared: &[ScalaCallableParameterList],
     call_arities: Option<&[usize]>,
     unique_callable: bool,
 ) -> bool {
-    match call_arities {
-        Some(call_arities) => {
-            if call_arities.len() > declared.len() {
-                return false;
-            }
-            let provided_lists_match = call_arities
-                .iter()
-                .zip(declared)
-                .all(|(call_arity, declared)| declared.arity.accepts(*call_arity));
-            provided_lists_match
-                && (unique_callable
-                    || declared[call_arities.len()..]
-                        .iter()
-                        .all(|list| list.kind == ScalaParameterListKind::Contextual))
-        }
-        None => declared.first().is_none_or(|list| list.arity.total() == 0) || unique_callable,
-    }
+    let actual = call_arities.map(ScalaCallSiteShape::ordinary);
+    scala_callable_shape_matches(
+        declared,
+        actual.as_ref(),
+        ScalaCallableUsePolicy::OrdinaryMethod,
+        unique_callable,
+    )
 }
 
 fn method_key(fqn: &str, arity: Option<usize>) -> String {
@@ -3850,13 +4087,29 @@ fn record_reference(
                         return;
                     }
                     if let Some(owner) = receiver_type_fqn(receiver, ctx, bindings) {
-                        let call_arities = call_arities_for_reference(field);
-                        match ctx.types.effective_method_declarations_for_owner(
-                            ctx.scala,
-                            &owner,
-                            name,
-                            call_arities.as_deref(),
-                        ) {
+                        let Some(call_shape) = call_site_shape_for_reference(field) else {
+                            return;
+                        };
+                        let method_value_arity =
+                            match companion_method_value_context(node, ctx, bindings) {
+                                ScalaMethodValueContext::Function(arity) => Some(arity),
+                                ScalaMethodValueContext::Unknown
+                                | ScalaMethodValueContext::Incompatible => None,
+                            };
+                        let call_shape = call_shape.with_method_value_arity(method_value_arity);
+                        let call_arities = call_shape
+                            .lists
+                            .iter()
+                            .map(|list| list.arity)
+                            .collect::<Vec<_>>();
+                        match ctx
+                            .types
+                            .effective_method_declarations_for_owner_with_shape(
+                                ctx.scala,
+                                &owner,
+                                name,
+                                &call_shape,
+                            ) {
                             BareMemberResolution::Resolved(methods) => {
                                 for method in methods {
                                     ctx.record(method.fq_name(), field);
@@ -3868,7 +4121,7 @@ fn record_reference(
                                     ctx,
                                     name,
                                     Some(&owner),
-                                    call_arities.as_deref(),
+                                    Some(call_arities.as_slice()),
                                 ) {
                                     ctx.record(extension.fqn, field);
                                 }
@@ -3897,15 +4150,29 @@ fn record_reference(
                     if name.is_empty() {
                         return;
                     }
-                    let call_arities = call_arities_for_reference(function);
-                    if record_lexically_visible_call(function, name, call_arities.as_deref(), ctx) {
+                    let Some(call_shape) = call_site_shape_for_reference(function) else {
+                        return;
+                    };
+                    let method_value_arity =
+                        match companion_method_value_context(node, ctx, bindings) {
+                            ScalaMethodValueContext::Function(arity) => Some(arity),
+                            ScalaMethodValueContext::Unknown
+                            | ScalaMethodValueContext::Incompatible => None,
+                        };
+                    let call_shape = call_shape.with_method_value_arity(method_value_arity);
+                    if record_lexically_visible_call(function, name, &call_shape, ctx) {
                         return;
                     }
+                    let call_arities = call_shape
+                        .lists
+                        .iter()
+                        .map(|list| list.arity)
+                        .collect::<Vec<_>>();
                     if let Some(imported) = ctx.resolver.resolve_member(name) {
                         for target in ctx.types.imported_member_targets(
                             ctx.scala,
                             &imported,
-                            call_arities.as_deref(),
+                            Some(call_arities.as_slice()),
                         ) {
                             ctx.record(target, function);
                         }
@@ -4260,17 +4527,24 @@ fn companion_method_value_context(
     ctx: &ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaBinding>,
 ) -> ScalaMethodValueContext {
-    if let Some(definition) = node.parent()
-        && matches!(definition.kind(), "val_definition" | "var_definition")
-        && definition.child_by_field_name("value") == Some(node)
+    if let Some(expected_type) = node
+        .parent()
+        .and_then(|definition| match definition.kind() {
+            "val_definition" | "var_definition"
+                if definition.child_by_field_name("value") == Some(node) =>
+            {
+                definition.child_by_field_name("type")
+            }
+            "function_definition" if definition.child_by_field_name("body") == Some(node) => {
+                definition.child_by_field_name("return_type")
+            }
+            _ => None,
+        })
     {
-        let Some(type_node) = definition.child_by_field_name("type") else {
-            return ScalaMethodValueContext::Unknown;
-        };
-        if type_node.kind() != "function_type" {
+        if expected_type.kind() != "function_type" {
             return ScalaMethodValueContext::Incompatible;
         }
-        let Some(parameter_types) = type_node.child_by_field_name("parameter_types") else {
+        let Some(parameter_types) = expected_type.child_by_field_name("parameter_types") else {
             return ScalaMethodValueContext::Incompatible;
         };
         let mut cursor = parameter_types.walk();
@@ -4423,20 +4697,29 @@ fn record_ordinary_class_methods(
 fn record_lexically_visible_call(
     node: Node<'_>,
     member: &str,
-    call_arities: Option<&[usize]>,
+    call_shape: &ScalaCallSiteShape,
     ctx: &mut ScalaScan<'_, '_>,
 ) -> bool {
+    let call_arities = call_shape
+        .lists
+        .iter()
+        .map(|list| list.arity)
+        .collect::<Vec<_>>();
+    let fallback_arities =
+        (call_shape.method_value_arity.is_none()).then_some(call_arities.as_slice());
     for declaration in enclosing_template_declarations(node) {
         if let Some(owner) = ctx
             .class_ranges
             .unit_for_exact_span(declaration.start_byte(), declaration.end_byte())
         {
-            match ctx.types.effective_method_declarations_for_owner(
-                ctx.scala,
-                &owner.fq_name(),
-                member,
-                call_arities,
-            ) {
+            match ctx
+                .types
+                .effective_method_declarations_for_owner_with_shape(
+                    ctx.scala,
+                    &owner.fq_name(),
+                    member,
+                    call_shape,
+                ) {
                 BareMemberResolution::Resolved(methods) => {
                     for method in methods {
                         ctx.record(method.fq_name(), node);
@@ -4450,7 +4733,7 @@ fn record_lexically_visible_call(
         match ordinary_class_member_declarations_for_template(
             declaration,
             member,
-            call_arities,
+            fallback_arities,
             ctx,
         ) {
             BareMemberResolution::Resolved(methods) => {
@@ -4464,7 +4747,7 @@ fn record_lexically_visible_call(
         }
         if let Some(self_owner) = template_self_type(declaration)
             .and_then(|type_node| resolve_receiver_type_node(type_node, ctx))
-            && record_ordinary_class_methods(&self_owner, member, call_arities, node, ctx)
+            && record_ordinary_class_methods(&self_owner, member, fallback_arities, node, ctx)
         {
             return true;
         }
@@ -5101,7 +5384,11 @@ fn visible_extensions(
     matches.retain(|method| {
         method.alternatives.iter().any(|alternative| {
             extension_alternative_receiver_matches(&ctx.resolver, alternative, receiver_owner)
-                && callable_shape_matches(&alternative.shape, call_arities, unique_callable)
+                && ordinary_callable_shape_matches(
+                    &alternative.shape,
+                    call_arities,
+                    unique_callable,
+                )
         })
     });
     matches
