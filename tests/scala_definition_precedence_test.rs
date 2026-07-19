@@ -1289,3 +1289,129 @@ class Use extends Alias.Tail
     assert_eq!(results[6]["status"], "no_definition", "{value}");
     assert_eq!(results[7]["status"], "no_definition", "{value}");
 }
+
+#[test]
+fn scala_forward_definition_preserves_physical_enclosing_owner_identity() {
+    let replica = |platform: &str| {
+        format!(
+            r#"package replica
+class Base {{
+  var count: Int = 0
+  def ready: Boolean = true
+  def overloaded(value: Int): Int = value
+  def overloaded(value: String): Int = value.length
+  def direct(): Unit = {{
+    val read = count // {platform}-direct-read
+    count += 1 // {platform}-direct-compound
+    count = 2 // {platform}-direct-write
+    val method = ready // {platform}-direct-method
+    val qualified = this.count // {platform}-this-read
+    val qualifiedMethod = this.ready // {platform}-this-method
+    val overload = overloaded(1) // {platform}-overload
+  }}
+}}
+class Local extends Base {{
+  val inherited = count // {platform}-inherited-field
+  val inheritedMethod = ready // {platform}-inherited-method
+}}
+"#
+        )
+    };
+    let jvm = replica("jvm");
+    let js = replica("js");
+    let external = r#"package consumer
+import replica.Base
+class External extends Base {
+  val ambiguousField = count
+  val ambiguousMethod = ready
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("jvm/replica/Base.scala", &jvm)
+        .file("js/replica/Base.scala", &js)
+        .file("consumer/External.scala", external)
+        .build();
+
+    let reference = |path: &str, source: &str, line_marker: &str, name: &str| {
+        let marker = source
+            .find(line_marker)
+            .expect("unique physical-owner marker");
+        let line = source[..marker]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let name = source[line..].find(name).expect("name on marker line");
+        location_in(path, source, line + name)
+    };
+    let mut references = Vec::new();
+    for (path, source, platform) in [
+        ("jvm/replica/Base.scala", jvm.as_str(), "jvm"),
+        ("js/replica/Base.scala", js.as_str(), "js"),
+    ] {
+        for (suffix, name) in [
+            ("direct-read", "count"),
+            ("direct-compound", "count"),
+            ("direct-write", "count"),
+            ("direct-method", "ready"),
+            ("this-read", "count"),
+            ("this-method", "ready"),
+            ("overload", "overloaded"),
+            ("inherited-field", "count"),
+            ("inherited-method", "ready"),
+        ] {
+            references.push(reference(
+                path,
+                source,
+                &format!("{platform}-{suffix}"),
+                name,
+            ));
+        }
+    }
+    references.push(reference(
+        "consumer/External.scala",
+        external,
+        "ambiguousField",
+        "count",
+    ));
+    references.push(reference(
+        "consumer/External.scala",
+        external,
+        "ambiguousMethod",
+        "ready",
+    ));
+
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for (platform_index, path) in ["jvm/replica/Base.scala", "js/replica/Base.scala"]
+        .into_iter()
+        .enumerate()
+    {
+        for result in &results[platform_index * 9..platform_index * 9 + 9] {
+            assert_eq!(result["status"], "resolved", "{value}");
+            assert!(
+                result["definitions"]
+                    .as_array()
+                    .is_some_and(|definitions| !definitions.is_empty()),
+                "{value}"
+            );
+            assert!(
+                result["definitions"]
+                    .as_array()
+                    .expect("definitions")
+                    .iter()
+                    .all(|definition| definition["path"] == path),
+                "{value}"
+            );
+        }
+    }
+    for result in &results[18..] {
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "ambiguous_scala_enclosing_member",
+            "{value}"
+        );
+    }
+}

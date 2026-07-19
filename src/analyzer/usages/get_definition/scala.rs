@@ -9,7 +9,8 @@ use crate::analyzer::usages::scala_graph::local::{
     ScalaLocalBinding, precise_scala_binding, seed_scala_binding,
 };
 use crate::analyzer::usages::scala_graph::namespace::{
-    ScalaTypeNamespaceResolution, resolve_exact_lexical_type_namespace, scala_qualified_type_root,
+    ScalaDirectAncestorResolution, ScalaTypeNamespaceResolution,
+    resolve_exact_lexical_type_namespace, scala_qualified_type_root,
     scala_type_reference_is_singleton, scala_unindexed_type_binding_shadows,
 };
 use crate::analyzer::usages::scala_graph::syntax::{
@@ -660,9 +661,17 @@ pub(super) fn resolve_scala(
             if let Some(owner) =
                 scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, identifier.start_byte())
             {
-                let candidates = scala_member_candidate_units(ctx, &owner.fq_name(), text, false);
-                if !candidates.is_empty() {
-                    return candidates_outcome(candidates);
+                match scala_exact_owner_member_candidate_units(ctx, &owner, text, false) {
+                    ScalaExactMemberResolution::Found(candidates) => {
+                        return candidates_outcome(candidates);
+                    }
+                    ScalaExactMemberResolution::Ambiguous => {
+                        return no_definition(
+                            "ambiguous_scala_enclosing_member",
+                            format!("`{text}` has multiple physical enclosing-owner definitions"),
+                        );
+                    }
+                    ScalaExactMemberResolution::NoMatch => {}
                 }
             }
             if let Some(imported_member) = scala_wildcard_imported_member_outcome(ctx, text, None) {
@@ -1179,13 +1188,10 @@ fn scala_forward_method_value_arity(
         methods.push(method);
     } else if let Some(owner) =
         scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, function.start_byte())
+        && let ScalaExactMemberResolution::Found(candidates) =
+            scala_exact_owner_member_candidate_units(ctx, &owner, function_name, false)
     {
-        methods.extend(scala_member_candidate_units(
-            ctx,
-            &owner.fq_name(),
-            function_name,
-            false,
-        ));
+        methods.extend(candidates);
     }
     methods.sort();
     methods.dedup();
@@ -1341,13 +1347,18 @@ fn resolve_scala_call(
                 name,
                 function.start_byte(),
                 |unit| unit.is_function(),
-            ) && scala_member_unit_applies(
-                ctx.scala,
-                &unit,
-                scala_call_site_shape(ctx, root, function).as_ref(),
-                ScalaCallableSiteRole::Ordinary,
-                true,
-            ) {
+            ) && !ctx
+                .scala
+                .structural_parent_of(&unit)
+                .is_some_and(|owner| owner.is_class())
+                && scala_member_unit_applies(
+                    ctx.scala,
+                    &unit,
+                    scala_call_site_shape(ctx, root, function).as_ref(),
+                    ScalaCallableSiteRole::Ordinary,
+                    true,
+                )
+            {
                 return candidates_outcome(vec![unit]);
             }
             if function.kind() == "identifier"
@@ -1359,13 +1370,23 @@ fn resolve_scala_call(
                 )
                 && owner.identifier() != name
             {
-                let mut candidates =
-                    scala_member_candidate_units(ctx, &owner.fq_name(), name, false);
-                if candidates.is_empty() {
-                    candidates = scala_source_ancestor_member_units(ctx, resolver, function, name);
-                }
-                if !candidates.is_empty() {
-                    return candidates_outcome(candidates);
+                match scala_exact_owner_member_candidate_units(ctx, &owner, name, false) {
+                    ScalaExactMemberResolution::Found(candidates) => {
+                        return candidates_outcome(candidates);
+                    }
+                    ScalaExactMemberResolution::Ambiguous => {
+                        return no_definition(
+                            "ambiguous_scala_enclosing_member",
+                            format!("`{name}` has multiple physical enclosing-owner definitions"),
+                        );
+                    }
+                    ScalaExactMemberResolution::NoMatch => {
+                        let candidates =
+                            scala_source_ancestor_member_units(ctx, resolver, function, name);
+                        if !candidates.is_empty() {
+                            return candidates_outcome(candidates);
+                        }
+                    }
                 }
             }
             if let Some(imported_member) = scala_wildcard_imported_member_outcome(
@@ -1661,6 +1682,37 @@ fn resolve_scala_field(
             "Scala field expression has no receiver",
         );
     };
+    if matches!(receiver.kind(), "identifier" | "type_identifier")
+        && scala_node_text(receiver, ctx.source).trim() == "this"
+        && let Some(owner) =
+            scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, receiver.start_byte())
+    {
+        match scala_exact_owner_member_candidate_units(ctx, &owner, member, false) {
+            ScalaExactMemberResolution::Found(candidates) => {
+                let applicable = scala_filter_callable_units(
+                    ctx.scala,
+                    candidates,
+                    call_shape.as_ref(),
+                    ScalaCallableSiteRole::Ordinary,
+                );
+                if applicable.is_empty() {
+                    return no_definition(
+                        "no_applicable_scala_callable",
+                        format!("`{member}` has no member matching this access"),
+                    );
+                } else {
+                    return candidates_outcome(applicable);
+                }
+            }
+            ScalaExactMemberResolution::Ambiguous => {
+                return no_definition(
+                    "ambiguous_scala_enclosing_member",
+                    format!("`{member}` has multiple physical enclosing-owner definitions"),
+                );
+            }
+            ScalaExactMemberResolution::NoMatch => {}
+        }
+    }
     let bindings = matches!(receiver.kind(), "identifier" | "type_identifier")
         .then(|| scala_bindings_before(ctx, resolver, root, field.start_byte()));
     let owner = match bindings.as_ref() {
@@ -1905,6 +1957,118 @@ fn scala_member_candidate_units(
     }
 
     Vec::new()
+}
+
+enum ScalaExactMemberResolution {
+    Found(Vec<CodeUnit>),
+    NoMatch,
+    Ambiguous,
+}
+
+fn scala_exact_owner_member_candidate_units(
+    ctx: ScalaLookupCtx<'_>,
+    owner: &CodeUnit,
+    member: &str,
+    include_companion: bool,
+) -> ScalaExactMemberResolution {
+    let direct = scala_direct_member_candidate_units_for_owner(ctx, owner, member);
+    if !direct.is_empty() {
+        return ScalaExactMemberResolution::Found(direct);
+    }
+
+    let mut level = match ctx
+        .scala
+        .project_types()
+        .exact_direct_ancestor_resolution(ctx.scala, owner)
+    {
+        ScalaDirectAncestorResolution::Resolved(ancestors) => ancestors,
+        ScalaDirectAncestorResolution::Ambiguous => {
+            return ScalaExactMemberResolution::Ambiguous;
+        }
+    };
+    let mut seen = HashSet::from_iter([owner.clone()]);
+    while !level.is_empty() {
+        let mut matches = Vec::new();
+        let mut next = Vec::new();
+        let mut next_is_ambiguous = false;
+        for ancestor in level {
+            if !seen.insert(ancestor.clone()) {
+                continue;
+            }
+            matches.extend(scala_direct_member_candidate_units_for_owner(
+                ctx, &ancestor, member,
+            ));
+            match ctx
+                .scala
+                .project_types()
+                .exact_direct_ancestor_resolution(ctx.scala, &ancestor)
+            {
+                ScalaDirectAncestorResolution::Resolved(ancestors) => next.extend(ancestors),
+                ScalaDirectAncestorResolution::Ambiguous => next_is_ambiguous = true,
+            }
+        }
+        sort_units(&mut matches);
+        matches.dedup();
+        if !matches.is_empty() {
+            let physical_owners = matches
+                .iter()
+                .filter_map(|unit| ctx.scala.structural_parent_of(unit))
+                .collect::<HashSet<_>>();
+            if physical_owners.len() > 1 {
+                return ScalaExactMemberResolution::Ambiguous;
+            }
+            return ScalaExactMemberResolution::Found(matches);
+        }
+        if next_is_ambiguous {
+            return ScalaExactMemberResolution::Ambiguous;
+        }
+        level = next;
+    }
+
+    if include_companion && !owner.fq_name().ends_with('$') {
+        let companion_fqn = format!("{}$", owner.fq_name());
+        let companions = ctx
+            .support
+            .fqn(&companion_fqn)
+            .into_iter()
+            .filter(|candidate| {
+                candidate.is_class()
+                    && candidate.fq_name() == companion_fqn
+                    && candidate.source() == owner.source()
+            })
+            .collect::<Vec<_>>();
+        match companions.as_slice() {
+            [companion] => {
+                let candidates =
+                    scala_direct_member_candidate_units_for_owner(ctx, companion, member);
+                if !candidates.is_empty() {
+                    return ScalaExactMemberResolution::Found(candidates);
+                }
+            }
+            [_, _, ..] => return ScalaExactMemberResolution::Ambiguous,
+            [] => {}
+        }
+    }
+
+    ScalaExactMemberResolution::NoMatch
+}
+
+fn scala_direct_member_candidate_units_for_owner(
+    ctx: ScalaLookupCtx<'_>,
+    owner: &CodeUnit,
+    member: &str,
+) -> Vec<CodeUnit> {
+    let exact_fqn = format!("{}.{member}", owner.fq_name());
+    let mut candidates = ctx
+        .support
+        .fqn(&exact_fqn)
+        .into_iter()
+        .filter(|unit| unit.fq_name() == exact_fqn)
+        .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(owner))
+        .collect::<Vec<_>>();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
 }
 
 fn scala_applicable_member_candidate_units(
@@ -3118,17 +3282,13 @@ fn scala_fqn_outcome(
 
 fn scala_enclosing_class(
     analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
+    _support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     byte: usize,
 ) -> Option<CodeUnit> {
-    let fqn = ClassRangeIndex::build(analyzer, file)
-        .enclosing(byte)?
-        .to_string();
-    support
-        .fqn(&fqn)
-        .into_iter()
-        .find(|unit| unit.fq_name() == fqn)
+    ClassRangeIndex::build(analyzer, file)
+        .enclosing_unit(byte)
+        .cloned()
 }
 
 fn scala_enclosing_member_shadows_bare_call(
@@ -3145,22 +3305,20 @@ fn scala_enclosing_member_shadows_bare_call(
     if owner.identifier().trim_end_matches('$') == name {
         return false;
     }
-    if scala_owner_declares_member(support, &owner, name) {
-        return true;
+    let ctx = ScalaLookupCtx {
+        scala,
+        analyzer,
+        support,
+        file,
+        source: "",
+    };
+    match scala_exact_owner_member_candidate_units(ctx, &owner, name, false) {
+        ScalaExactMemberResolution::Found(candidates) => candidates
+            .into_iter()
+            .any(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field())),
+        ScalaExactMemberResolution::Ambiguous => true,
+        ScalaExactMemberResolution::NoMatch => false,
     }
-    scala_ancestor_owners(scala, support, owner)
-        .into_iter()
-        .any(|(ancestor, _)| scala_owner_declares_member(support, &ancestor, name))
-}
-
-fn scala_owner_declares_member(
-    support: &dyn BoundedDefinitionLookup,
-    owner: &CodeUnit,
-    name: &str,
-) -> bool {
-    scala_direct_member_candidate_units(support, &owner.fq_name(), name)
-        .into_iter()
-        .any(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))
 }
 
 fn scala_imported_member_shadows_bare_call(
@@ -3559,13 +3717,13 @@ fn scala_call_result_type(
             let owner =
                 scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, function.start_byte())?;
             let call_shape = scala_call_site_shape(ctx, root, function);
-            let candidates = scala_applicable_member_candidate_units(
-                ctx,
-                &owner.fq_name(),
-                name,
-                false,
-                call_shape.as_ref(),
-            );
+            let ScalaExactMemberResolution::Found(candidates) =
+                scala_exact_owner_member_candidate_units(ctx, &owner, name, false)
+            else {
+                return None;
+            };
+            let candidates =
+                scala_applicable_callable_candidate_units(ctx, candidates, call_shape.as_ref());
             scala_coherent_function_return_type(ctx, candidates)
         }
         _ => None,

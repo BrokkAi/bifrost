@@ -876,6 +876,61 @@ impl ProjectTypes {
         }
     }
 
+    pub(super) fn field_for_owner_unit(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+        member: &str,
+    ) -> FieldResolution {
+        let mut level = vec![owner.clone()];
+        let mut seen = HashSet::default();
+        while !level.is_empty() {
+            let mut matches = Vec::new();
+            let mut next = Vec::new();
+            for owner in level {
+                if !seen.insert(owner.clone()) {
+                    continue;
+                }
+                matches.extend(
+                    self.members_for_exact_owner_unit(scala, &owner, member)
+                        .into_iter()
+                        .filter(|unit| unit.is_field() && !self.is_type_alias(scala, unit))
+                        .cloned(),
+                );
+                let ancestors = match self.exact_direct_ancestor_resolution(scala, &owner) {
+                    ScalaDirectAncestorResolution::Resolved(ancestors) if !ancestors.is_empty() => {
+                        ancestors
+                    }
+                    ScalaDirectAncestorResolution::Resolved(_) => {
+                        // The forward hierarchy resolver deliberately fails closed on
+                        // ambiguity, but its bounded fallback cannot currently recover
+                        // every nested lexical supertype. The analyzer hierarchy retains
+                        // exact CodeUnits for that case, so use it only after the exact
+                        // resolver has authoritatively ruled out ambiguity.
+                        self.direct_ancestors_for_declaration(scala, &owner)
+                    }
+                    ScalaDirectAncestorResolution::Ambiguous => {
+                        return FieldResolution::Unresolved;
+                    }
+                };
+                next.extend(ancestors);
+            }
+            matches.sort();
+            matches.dedup();
+            match matches.as_slice() {
+                [field] => {
+                    return FieldResolution::Resolved(ResolvedField {
+                        declaration: field.clone(),
+                        declared_type: self.field_declared_type(scala, field),
+                    });
+                }
+                [_, _, ..] => return FieldResolution::Unresolved,
+                [] => level = next,
+            }
+        }
+        FieldResolution::NoMatch
+    }
+
     pub(super) fn stable_type_member_for_owner(
         &self,
         scala: &ScalaAnalyzer,
@@ -5342,8 +5397,8 @@ fn record_reference(
                 }
                 return;
             }
-            if let Some(owner) = ctx.enclosing_class(node.start_byte()) {
-                match ctx.types.field_for_owner_member(ctx.scala, owner, name) {
+            if let Some(owner) = ctx.enclosing_class_unit(node.start_byte()) {
+                match ctx.types.field_for_owner_unit(ctx.scala, owner, name) {
                     FieldResolution::Resolved(field) => {
                         ctx.record(field.declaration.fq_name(), node);
                         return;
@@ -5592,25 +5647,13 @@ fn record_enclosing_field_qualifier(
     let Some(owner) = ctx.enclosing_class_unit(node.start_byte()) else {
         return false;
     };
-    match ctx.types.field_for_exact_owner(ctx.scala, owner, name) {
+    match ctx.types.field_for_owner_unit(ctx.scala, owner, name) {
         FieldResolution::Resolved(field) => {
             ctx.record(field.declaration.fq_name(), node);
             true
         }
         FieldResolution::Unresolved => true,
-        FieldResolution::NoMatch => {
-            match ctx
-                .types
-                .field_for_owner_member(ctx.scala, &owner.fq_name(), name)
-            {
-                FieldResolution::Resolved(field) => {
-                    ctx.record(field.declaration.fq_name(), node);
-                    true
-                }
-                FieldResolution::Unresolved => true,
-                FieldResolution::NoMatch => false,
-            }
-        }
+        FieldResolution::NoMatch => false,
     }
 }
 

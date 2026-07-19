@@ -7617,3 +7617,70 @@ class QualifiedExternal extends replica.Base { val value: Exact = null // qualif
     );
     assert_hit_contains(&replica_hits, "same-source-replica");
 }
+
+#[test]
+fn scala_targeted_usage_keeps_duplicate_owner_members_source_exact() {
+    let replica = |platform: &str| {
+        format!(
+            r#"package replica
+class Base {{
+  var count: Int = 0
+  def ready: Boolean = true
+  def direct: Int = {{
+    val field = count // {platform}-direct-field
+    val method = ready // {platform}-direct-method
+    field
+  }}
+}}
+class Local extends Base {{
+  val field = count // {platform}-inherited-field
+  val method = ready // {platform}-inherited-method
+}}
+"#
+        )
+    };
+    let jvm = replica("jvm");
+    let js = replica("js");
+    let external = r#"package consumer
+import replica.Base
+class External extends Base {
+  val field = count // ambiguous-external-field
+  val method = ready // ambiguous-external-method
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("jvm/replica/Base.scala", &jvm),
+        ("js/replica/Base.scala", &js),
+        ("consumer/External.scala", external),
+    ]);
+    for (platform, path) in [
+        ("jvm", "jvm/replica/Base.scala"),
+        ("js", "js/replica/Base.scala"),
+    ] {
+        for (member, marker_kind) in [("count", "field"), ("ready", "method")] {
+            let fqn = format!("replica.Base.{member}");
+            let target = analyzer
+                .get_definitions(&fqn)
+                .into_iter()
+                .find(|unit| rel_path_string(unit.source()) == path)
+                .unwrap_or_else(|| panic!("missing {path} physical {fqn}"));
+            let targeted = hits(
+                UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+            );
+            for marker in [
+                format!("{platform}-direct-{marker_kind}"),
+                format!("{platform}-inherited-{marker_kind}"),
+            ] {
+                assert_hit_contains(&targeted, &marker);
+            }
+            let other = if platform == "jvm" { "js" } else { "jvm" };
+            for marker in [
+                format!("{other}-direct-{marker_kind}"),
+                format!("{other}-inherited-{marker_kind}"),
+                format!("ambiguous-external-{marker_kind}"),
+            ] {
+                assert_no_hit_contains(&targeted, &marker);
+            }
+        }
+    }
+}

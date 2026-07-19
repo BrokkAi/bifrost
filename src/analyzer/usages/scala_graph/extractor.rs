@@ -1806,10 +1806,7 @@ fn lexically_visible_field(node: Node<'_>, name: &str, ctx: &ScanCtx<'_>) -> Fie
     let mut current = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
     while let Some(unit) = current {
         if unit.is_class() {
-            match ctx
-                .types
-                .field_for_owner_member(ctx.scala, &unit.fq_name(), name)
-            {
+            match ctx.types.field_for_owner_unit(ctx.scala, &unit, name) {
                 FieldResolution::NoMatch => {}
                 resolution => return resolution,
             }
@@ -1995,12 +1992,20 @@ fn target_is_owned_ordinary_class_method(ctx: &ScanCtx<'_>) -> bool {
 fn methods_match_target_owner(methods: &[CodeUnit], ctx: &ScanCtx<'_>) -> bool {
     !methods.is_empty()
         && methods.iter().all(|method| {
-            method == &ctx.spec.target
-                || ctx
-                    .scala
-                    .structural_parent_of(method)
-                    .or_else(|| ctx.scala.parent_of(method))
-                    .is_some_and(|owner| ctx.spec.owner_fq_matches(&owner.fq_name()))
+            if method == &ctx.spec.target {
+                return true;
+            }
+            let Some(owner) = ctx
+                .scala
+                .structural_parent_of(method)
+                .or_else(|| ctx.scala.parent_of(method))
+            else {
+                return false;
+            };
+            if ctx.spec.owner.as_ref().map(CodeUnit::fq_name) == Some(owner.fq_name()) {
+                return ctx.spec.owner.as_ref() == Some(&owner);
+            }
+            ctx.spec.owner_fq_matches(&owner.fq_name())
         })
 }
 
