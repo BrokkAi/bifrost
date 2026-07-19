@@ -114,6 +114,22 @@ pub(super) fn resolve_js_ts(
     let focused =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte);
 
+    if focused.is_some_and(|node| {
+        jsts_is_commonjs_host_export_assignment_object(node, source)
+            && jsts_visible_receiver_binding_scope(
+                tree.root_node(),
+                source,
+                "module",
+                site.focus_start_byte,
+            )
+            .is_none()
+    }) {
+        return no_definition(
+            "commonjs_host_binding",
+            "the CommonJS `module` host binding is provided by the runtime and has no workspace definition",
+        );
+    }
+
     if let Some(targets) = focused.and_then(|node| {
         JsTsReceiverFactProvider::new_with_batch_data(
             analyzer,
@@ -419,6 +435,39 @@ pub(super) fn resolve_js_ts(
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed JS/TS definition"),
     )
+}
+
+fn jsts_is_commonjs_host_export_assignment_object(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "identifier" || node_text(node, source) != "module" {
+        return false;
+    }
+    let Some(exports_member) = node.parent().filter(|parent| {
+        parent.kind() == "member_expression"
+            && parent
+                .child_by_field_name("object")
+                .is_some_and(|object| object.id() == node.id())
+            && parent
+                .child_by_field_name("property")
+                .is_some_and(|property| node_text(property, source) == "exports")
+    }) else {
+        return false;
+    };
+
+    let mut assignment_target = exports_member;
+    while let Some(parent) = assignment_target.parent().filter(|parent| {
+        parent.kind() == "member_expression"
+            && parent
+                .child_by_field_name("object")
+                .is_some_and(|object| object.id() == assignment_target.id())
+    }) {
+        assignment_target = parent;
+    }
+
+    assignment_target
+        .parent()
+        .filter(|parent| parent.kind() == "assignment_expression")
+        .and_then(|assignment| assignment.child_by_field_name("left"))
+        .is_some_and(|left| left.id() == assignment_target.id())
 }
 
 #[allow(clippy::too_many_arguments)]

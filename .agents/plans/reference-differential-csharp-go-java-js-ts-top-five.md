@@ -15,10 +15,10 @@ The acceptance surface is the MCP `symbols` toolset and its associated Rust and 
 - [x] (2026-07-19 18:30Z) Reconciled the clean current worktree with `origin/master` at `b20da06f6ed1646289dc8bbd6ee9a6ca5b9fcc0d` and read `.agents/PLANS.md` plus the operator runbook at `/home/jonathan/Projects/bifrost/.agents/docs/reference-differential-runbook.md`.
 - [x] (2026-07-19 18:35Z) Independently audited durable campaign evidence and GitHub state. Java has five accepted records at `431f1292`; Go has five accepted records at `20fec8af`; all campaign-created Java and Go issues are assigned to `jbellis` and closed.
 - [x] (2026-07-19 18:38Z) Ran the current runner's no-write dry-run and pinned the canonical 25-repository selection. All 15 C#/JS/TS clone heads match corpus metadata and have no tracked dirtiness; no analyzer process owns a selected clone.
-- [ ] Commit this campaign-start plan, locally exclude generated `.brokk/` cache state in the Azure PowerShell clone, rebuild the release runner from the exact clean checkpoint, and record its checksum.
+- [x] (2026-07-19 18:45Z) Committed the campaign-start plan as `127c5817`, locally excluded generated `.brokk/` state in all 15 selected C#/JS/TS clones, verified their tracked cleanliness, rebuilt the release runner, and recorded SHA-256 `4fcf6bf7c500906cb6ad1e845eac5a450e6b3a14608b22bd34ddcc8c3eb81edf`.
 - [ ] Complete and integrity-check the C# top-five baseline, then exhaustively classify every raw missing row.
 - [ ] File/assign, implement, review, test, and exact-prove every legitimate C# root cause not owned by another user.
-- [ ] Complete the same baseline, disposition, issue, implementation, and proof lifecycle for JavaScript.
+- [ ] Complete the same baseline, disposition, issue, implementation, and proof lifecycle for JavaScript. Completed: all five `127c5817` records and the exhaustive 23-row baseline audit; filed assigned #942/#943; implemented and independently reviewed both fixes; passed focused targeted/whole-graph tests, focused all-feature Clippy, feature-enabled JavaScript definition tests, formatting, and diff checks. Remaining: clean fixing-head exact/full reruns, disposition six Node contract probes, final language gates, integration, and issue closure.
 - [ ] Complete the same baseline, disposition, issue, implementation, and proof lifecycle for TypeScript.
 - [ ] Run final local gates, integrate directly to `origin/master`, rebuild from the clean pushed head, rerun every affected top-five leg, close assigned issues with evidence, and publish compact checked-in reports.
 - [ ] Perform a 25-repository completion audit against the authoritative artifacts, issue state, clean worktree, and remote master, then record the final retrospective.
@@ -36,6 +36,18 @@ The acceptance surface is the MCP `symbols` toolset and its associated Rust and 
 
 - Observation: One selected C# clone has generated cache state visible to Git.
   Evidence: `Azure__azure-powershell` reports only untracked `.brokk/`; the other 14 C#/JS/TS clones are clean. A local `.git/info/exclude` entry is required before accepted persisted-mode evidence.
+
+- Observation: The first JavaScript five-repository record was semantically complete but failed the cleanliness gate for one empty-frontier repository.
+  Evidence: `/mnt/optane/tmp/reference-differential/js-top5-127c5817.jsonl` has five completed pinned-head records, one fingerprint, no file errors, 11,609 total sampled sites, and 23 raw missing rows. Kubernetes reports `repo_dirty=true` solely because its newly generated `.brokk/` was not yet excluded; the local exclude now makes all five checkouts clean, so a fixing-head full rerun is required.
+
+- Observation: Three canonical JavaScript top-five repositories have an empty current JavaScript frontier.
+  Evidence: Kubernetes, KubeEdge, and Karmada each have zero tracked `.js`, `.jsx`, `.mjs`, or `.cjs` files at their pinned heads. The runbook and runner define top-N by language metadata membership, LOC rank, valid clone, and pinned head rather than by a nonempty current frontier. Their completed zero-site records are vacuous but contract-valid and must be disclosed rather than replaced with hand-picked repositories.
+
+- Observation: DevSpace exposed two independent symbols defects despite auditing only 25 eligible JavaScript files.
+  Evidence: `typeof Promise` forward-resolves to the same global property assigned as `window.Promise` but inverse lookup omits the bare read (#942). Two independent `module.exports` sites forward-resolve the CommonJS runtime host binding to an unrelated exported configuration property named `module` (#943). Both issues were created assigned to `jbellis` before implementation.
+
+- Observation: A browser-global alias cannot be inferred from the declaration name alone.
+  Evidence: Independent review of the first #942 draft found false-positive paths through local/imported `window`, later lexical `Promise` declarations (including TDZ and `var` hoisting), and a missing whole-graph edge for explicit `window.Promise`. The accepted implementation builds a shared tree-sitter lexical index only for files with exact same-file JavaScript `window.<one segment>` field/function candidates, validates the declaration receiver structurally, and covers both targeted and whole-graph paths.
 
 ## Decision Log
 
@@ -63,9 +75,21 @@ The acceptance surface is the MCP `symbols` toolset and its associated Rust and 
   Rationale: Both boundaries are explicit user instructions. Formatting, Clippy, focused tests, and `cargo test --features nlp,python` remain mandatory local gates.
   Date/Author: 2026-07-19 / Codex
 
+- Decision: Retain canonical zero-frontier repositories in the JavaScript top five.
+  Rationale: `run-corpus --repos-per-language 5` is the authoritative membership and ranking operation. Substituting the next repository with current JS files would silently change the contract to an unstated rule and contradict prior accepted polyglot corpus precedent.
+  Date/Author: 2026-07-19 / Codex
+
+- Decision: Reject the first #942 implementation until lexical `window`, hoisted/TDZ shadowing, explicit-member parity, and parent-lookup cost are covered.
+  Rationale: Independent review found real false-positive and performance risks not exercised by the first parameter-shadow control. Focused green tests are evidence only for the cases they cover, not acceptance of a broader alias rule.
+  Date/Author: 2026-07-19 / Codex
+
+- Decision: Accept the revised #942 and narrow #943 implementations for fixing-head production proof.
+  Rationale: #942 now gates all added indexing and parent lookup behind exact JavaScript browser-global candidates, rejects lexical receiver/property shadows, and preserves explicit-member parity. #943 follows assignment/member AST fields and retains explicit lexical CommonJS bindings and exported-property consumer resolution. The focused targeted suite passed 80 tests with two pre-existing ignores, the whole graph suite passed 21 tests, all-feature focused Clippy passed, and the feature-enabled JavaScript definition slice passed 23 tests.
+  Date/Author: 2026-07-19 / Codex
+
 ## Outcomes & Retrospective
 
-The evidence audit establishes 10 of the requested 25 accepted repository records before new execution: all five Java repositories at clean head `431f1292` and all five Go repositories at clean head `20fec8af`. Their legitimate issue families are closed and assigned to `jbellis`. The remaining operational work is three uniform top-five legs for C#, JavaScript, and TypeScript, followed by any required fix/final-confirmation cycles and the final master integration. This section remains incomplete until all 25 records, dispositions, tickets, tests, and remote state pass the completion audit.
+The evidence audit establishes 10 of the requested 25 accepted repository records before new execution: all five Java repositories at clean head `431f1292` and all five Go repositories at clean head `20fec8af`. Their legitimate issue families are closed and assigned to `jbellis`. The first JavaScript leg completed five records in 2m41s at 2.45 GiB peak RSS and found 23 raw rows: 20 reproduce the exact accepted Node N=1 sample, while three DevSpace rows reduce to assigned issues #942 and #943. Fourteen Node rows are declaration/frontier or wrong-forward artifacts, two are likely forward identity defects, and four require clean exact public-contract probes before final disposition. Both assigned DevSpace fixes have now passed independent review and focused local gates; clean exact and full fixing-head production evidence remains outstanding. C#, TypeScript, final JavaScript confirmation, full gates, issue closures, and master integration remain incomplete.
 
 ## Context and Orientation
 
@@ -165,3 +189,7 @@ No production interface change is planned in advance. Preserve the existing diff
 C# uses the C# tree-sitter analyzer; JavaScript and TypeScript have distinct language frontiers but share substantial ECMAScript resolution and usage machinery. Declaration-emission or identity changes may require a language-local analysis epoch bump so persisted caches cannot retain stale facts. Avoid new dependencies, persistence schemas, or public API shapes unless a reduced production root cause requires them and this plan records the decision.
 
 Revision note (2026-07-19 18:40Z): Created this self-contained five-language completion plan after auditing accepted Java/Go evidence and issue state, pinning all 25 canonical repositories, proving the remaining 15 C#/JS/TS clone heads and tracked cleanliness, and recording the user's issue-assignment, delegation, symbols-scope, local-test, no-CI-wait, direct-master, exhaustive-triage, and final-confirmation boundaries before analyzer mutation.
+
+Revision note (2026-07-19 19:25Z): Recorded the published clean campaign checkpoint and runner checksum, the five-record JavaScript baseline and its single invalid dirtiness flag, the canonical zero-frontier decision, exhaustive 23-row partition, assigned #942/#943 defects, clone-local cache exclusions, and the independent review controls required before accepting #942.
+
+Revision note (2026-07-19 20:10Z): Recorded acceptance of the revised candidate-gated #942 browser-global implementation and narrow #943 CommonJS host-binding correction after independent review, structured shadowing/parity controls, focused targeted and whole-graph suites, focused all-feature Clippy, feature-enabled JavaScript definition tests, formatting, and diff checks.

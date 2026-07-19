@@ -7466,6 +7466,70 @@ function run(widget) {
 }
 
 #[test]
+fn javascript_commonjs_host_module_does_not_resolve_to_exported_module_property() {
+    let commonjs_source = r#"module.exports = {
+  module: { rules: [] },
+};
+"#;
+    let consumer_source = "const config = require('./webpack.config');\nconfig.module.rules;\n";
+    let local_source = "const module = { exports: null };\nmodule.exports = {};\nmodule;\n";
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("webpack.config.js", commonjs_source)
+        .file("consumer.js", consumer_source)
+        .file("local.js", local_source)
+        .build();
+
+    let host = lookup(
+        project.root(),
+        &location_reference("webpack.config.js", commonjs_source, 0),
+    );
+    assert_eq!(host["results"][0]["status"], "no_definition", "{host}");
+    assert_eq!(
+        host["results"][0]["diagnostics"][0]["kind"], "commonjs_host_binding",
+        "{host}"
+    );
+
+    let property = lookup(
+        project.root(),
+        &location_reference(
+            "consumer.js",
+            consumer_source,
+            consumer_source.find("module.rules").expect("module use"),
+        ),
+    );
+    assert_eq!(property["results"][0]["status"], "resolved", "{property}");
+    assert_eq!(
+        property["results"][0]["definitions"][0]["fqn"], "module",
+        "{property}"
+    );
+    assert_eq!(
+        property["results"][0]["definitions"][0]["path"], "webpack.config.js",
+        "{property}"
+    );
+
+    for local_reference in [
+        local_source
+            .find("module.exports")
+            .expect("local member use"),
+        local_source.rfind("module;").expect("local bare use"),
+    ] {
+        let local = lookup(
+            project.root(),
+            &location_reference("local.js", local_source, local_reference),
+        );
+        assert_eq!(local["results"][0]["status"], "resolved", "{local}");
+        assert_eq!(
+            local["results"][0]["definitions"][0]["path"], "local.js",
+            "{local}"
+        );
+        assert_eq!(
+            local["results"][0]["definitions"][0]["start_line"], 1,
+            "{local}"
+        );
+    }
+}
+
+#[test]
 fn javascript_same_file_object_literal_property_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(

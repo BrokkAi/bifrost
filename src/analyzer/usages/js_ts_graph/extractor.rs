@@ -1,7 +1,7 @@
 use crate::analyzer::js_ts::imports::require_call_module_specifier;
 use crate::analyzer::js_ts::syntax::{
-    is_commonjs_require_declarator, is_declaration_identifier, is_object_in_member_expression,
-    is_property_key_in_member, slice,
+    JsTsLexicalBindingIndex, is_commonjs_require_declarator, is_declaration_identifier,
+    is_object_in_member_expression, is_property_key_in_member, slice,
 };
 use crate::analyzer::usages::get_definition::js_ts::{
     ts_resolve_type_text_to_property_owners, ts_type_annotation_text,
@@ -13,7 +13,8 @@ use crate::analyzer::usages::js_ts_graph::hits::{
     record_unproven_hit,
 };
 use crate::analyzer::usages::js_ts_graph::resolver::{
-    JsTsUsageIndex, is_static_member, member_name,
+    JsTsUsageIndex, browser_global_property_shape, is_static_member, member_name,
+    unbound_browser_global_property,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{ExportEntry, ExportIndex, ImportBinder, UsageHit};
@@ -43,11 +44,18 @@ pub(super) fn scan_files_for_seeds(
 ) -> BTreeSet<UsageHit> {
     let collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
     let unproven_collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
+    let browser_global_shape = (language == Language::JavaScript)
+        .then(|| browser_global_property_shape(target))
+        .flatten();
     let target_owner = analyzer.parent_of(target);
     let target_member = target_owner
         .as_ref()
         .is_none_or(|owner| !owner.is_module() && !owner.is_file_scope())
         .then(|| member_name(target))
+        .flatten();
+    let browser_global_object = target_owner
+        .is_none()
+        .then(|| browser_global_shape.map(|(object, _)| object))
         .flatten();
     let target_short = target_seed_identifier(target, target_owner.as_ref());
     let reference_needle = target_member.as_deref().unwrap_or(&target_short);
@@ -110,6 +118,12 @@ pub(super) fn scan_files_for_seeds(
         }
 
         let root = tree_ref.root_node();
+        let lexical_bindings = (browser_global_object.is_some() && target_self_file)
+            .then(|| JsTsLexicalBindingIndex::build(root, source_str));
+        let browser_global_object = lexical_bindings.as_ref().and_then(|lexical_bindings| {
+            unbound_browser_global_property(analyzer, target, root, source_str, lexical_bindings)
+                .map(|(object, _)| object)
+        });
         let receiver_facts = JsTsReceiverFactProvider::new(
             analyzer,
             analyzer.global_usage_definition_index(),
@@ -127,6 +141,7 @@ pub(super) fn scan_files_for_seeds(
             target,
             target_short: &target_short,
             target_member: target_member.as_deref(),
+            browser_global_object,
             edges: &edges,
             seeds,
             target_self_file,
@@ -136,6 +151,7 @@ pub(super) fn scan_files_for_seeds(
             imports,
             aliases,
             receiver_facts,
+            lexical_bindings,
             scope_stack: vec![HashMap::default()],
             binding_engine,
             hits: &mut local_hits,
@@ -177,6 +193,8 @@ pub(super) struct ScanCtx<'a> {
     target_short: &'a str,
     /// For members, the member name (e.g. `foo` in `BaseClass.foo`); otherwise None.
     target_member: Option<&'a str>,
+    /// Exact host object for a parentless browser-global property such as `window.Promise`.
+    browser_global_object: Option<&'a str>,
     /// Import edges from this file that resolve to the target's seed set.
     edges: &'a [ImportEdge],
     /// Exported names that resolve to the target, including local and re-export aliases.
@@ -190,6 +208,7 @@ pub(super) struct ScanCtx<'a> {
     imports: ImportBinder,
     aliases: AliasResolver,
     receiver_facts: JsTsReceiverFactProvider<'a, 'a>,
+    lexical_bindings: Option<JsTsLexicalBindingIndex>,
     scope_stack: Vec<HashMap<String, LocalBinding>>,
     binding_engine: LocalInferenceEngine<&'static str>,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
@@ -752,11 +771,19 @@ fn collect_pattern_identifiers_into(
 }
 
 fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if ctx.target_member.is_some() {
+    if ctx.target_member.is_some() && ctx.browser_global_object.is_none() {
         return;
     }
     let text = slice(node, ctx.source);
     if text.is_empty() {
+        return;
+    }
+    if ctx.browser_global_object.is_some()
+        && ctx
+            .lexical_bindings
+            .as_ref()
+            .is_some_and(|bindings| bindings.is_bound_at(text, node.start_byte()))
+    {
         return;
     }
     if !ctx.binds_target(text) {
@@ -799,6 +826,21 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     };
     let object_text = slice(object, ctx.source);
     let property_text = slice(property, ctx.source);
+
+    if let (Some(global_object), Some(target_member)) =
+        (ctx.browser_global_object, ctx.target_member)
+        && property_text == target_member
+    {
+        if simple_identifier_text(object, ctx.source) == Some(global_object)
+            && !ctx
+                .lexical_bindings
+                .as_ref()
+                .is_some_and(|bindings| bindings.is_bound_at(global_object, object.start_byte()))
+        {
+            record_hit(property, ctx);
+        }
+        return;
+    }
 
     // `Namespace.Foo` / `require("./mod").Foo` style access. ESM namespace imports
     // still key by the target's local name; CommonJS module-object edges carry the

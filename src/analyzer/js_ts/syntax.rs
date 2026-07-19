@@ -3,7 +3,201 @@ use crate::analyzer::js_ts::imports::{
     parse_commonjs_require_bindings_from_node,
 };
 use crate::analyzer::usages::{ImportBinder, ImportBinding, ImportKind};
+use crate::hash::HashMap;
 use tree_sitter::{Node, Tree};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LexicalBindingScope {
+    start_byte: usize,
+    end_byte: usize,
+}
+
+/// Tree-sitter-derived lexical bindings, indexed by the source range in which
+/// each name shadows an outer/global binding. Declaration order is deliberately
+/// irrelevant: `var` is hoisted and lexical declarations are in the TDZ for
+/// their entire scope.
+pub(crate) struct JsTsLexicalBindingIndex {
+    scopes_by_name: HashMap<String, Vec<LexicalBindingScope>>,
+}
+
+impl JsTsLexicalBindingIndex {
+    pub(crate) fn build(root: Node<'_>, source: &str) -> Self {
+        let mut index = Self {
+            scopes_by_name: HashMap::default(),
+        };
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "import_statement" => {
+                    let mut binder = ImportBinder::empty();
+                    visit_import_statement(node, source, &mut binder);
+                    let scope = node_scope(root);
+                    for name in binder.bindings.keys() {
+                        index.insert(name, scope);
+                    }
+                }
+                "variable_declarator" => {
+                    if let Some(pattern) = node.child_by_field_name("name")
+                        && let Some(scope) = variable_binding_scope(node)
+                    {
+                        index.insert_pattern(pattern, source, scope);
+                    }
+                }
+                "function_declaration" | "generator_function_declaration" | "class_declaration" => {
+                    if let Some(name) = node.child_by_field_name("name")
+                        && let Some(scope) = enclosing_lexical_scope(node)
+                    {
+                        index.insert_pattern(name, source, scope);
+                    }
+                    index.insert_parameters(node, source);
+                }
+                "function_expression"
+                | "generator_function"
+                | "arrow_function"
+                | "method_definition" => {
+                    if matches!(node.kind(), "function_expression" | "generator_function")
+                        && let Some(name) = node.child_by_field_name("name")
+                    {
+                        index.insert_pattern(name, source, node_scope(node));
+                    }
+                    index.insert_parameters(node, source);
+                }
+                "class" => {
+                    if let Some(name) = node.child_by_field_name("name") {
+                        index.insert_pattern(name, source, node_scope(node));
+                    }
+                }
+                "catch_clause" => {
+                    if let Some(parameter) = node.child_by_field_name("parameter") {
+                        index.insert_pattern(parameter, source, node_scope(node));
+                    }
+                }
+                _ => {}
+            }
+
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+        index
+    }
+
+    pub(crate) fn is_bound_at(&self, name: &str, byte: usize) -> bool {
+        self.scopes_by_name.get(name).is_some_and(|scopes| {
+            scopes
+                .iter()
+                .any(|scope| scope.start_byte <= byte && byte < scope.end_byte)
+        })
+    }
+
+    fn insert_parameters(&mut self, function: Node<'_>, source: &str) {
+        let Some(parameters) = function.child_by_field_name("parameters") else {
+            return;
+        };
+        self.insert_pattern(parameters, source, node_scope(function));
+    }
+
+    fn insert_pattern(&mut self, pattern: Node<'_>, source: &str, scope: LexicalBindingScope) {
+        let mut stack = vec![pattern];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "identifier" | "shorthand_property_identifier_pattern" => {
+                    let name = slice(node, source);
+                    if !name.is_empty() {
+                        self.insert(name, scope);
+                    }
+                }
+                "required_parameter" | "optional_parameter" => {
+                    if let Some(pattern) = node
+                        .child_by_field_name("pattern")
+                        .or_else(|| node.child_by_field_name("name"))
+                    {
+                        stack.push(pattern);
+                    }
+                }
+                "assignment_pattern" | "object_assignment_pattern" => {
+                    if let Some(left) = node.child_by_field_name("left") {
+                        stack.push(left);
+                    }
+                }
+                "pair_pattern" => {
+                    if let Some(value) = node.child_by_field_name("value") {
+                        stack.push(value);
+                    }
+                }
+                "formal_parameters" | "object_pattern" | "array_pattern" | "rest_pattern" => {
+                    let mut cursor = node.walk();
+                    for child in node.named_children(&mut cursor) {
+                        stack.push(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn insert(&mut self, name: &str, scope: LexicalBindingScope) {
+        let scopes = self.scopes_by_name.entry(name.to_string()).or_default();
+        if !scopes.contains(&scope) {
+            scopes.push(scope);
+        }
+    }
+}
+
+fn node_scope(node: Node<'_>) -> LexicalBindingScope {
+    LexicalBindingScope {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+    }
+}
+
+fn variable_binding_scope(node: Node<'_>) -> Option<LexicalBindingScope> {
+    let is_var = node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "variable_declaration");
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        let is_scope = if is_var {
+            matches!(
+                parent.kind(),
+                "program"
+                    | "function_declaration"
+                    | "generator_function_declaration"
+                    | "function_expression"
+                    | "generator_function"
+                    | "arrow_function"
+                    | "method_definition"
+            )
+        } else {
+            matches!(
+                parent.kind(),
+                "program"
+                    | "statement_block"
+                    | "for_statement"
+                    | "for_in_statement"
+                    | "switch_body"
+                    | "catch_clause"
+            )
+        };
+        if is_scope {
+            return Some(node_scope(parent));
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn enclosing_lexical_scope(node: Node<'_>) -> Option<LexicalBindingScope> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(parent.kind(), "program" | "statement_block") {
+            return Some(node_scope(parent));
+        }
+        current = parent.parent();
+    }
+    None
+}
 
 pub(crate) fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source.get(node.start_byte()..node.end_byte()).unwrap_or("")
