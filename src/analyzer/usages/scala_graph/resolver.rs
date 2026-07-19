@@ -826,6 +826,20 @@ impl Visibility {
         }) {
             visibility.type_names.insert(spec.member_name.clone());
         }
+        if resolver
+            .resolve_member(&spec.member_name)
+            .is_some_and(|resolved| {
+                resolved == spec.target.fq_name()
+                    || scala_normalized_fq_name(&resolved) == spec.target_fq_name
+            })
+        {
+            visibility
+                .direct_member_names
+                .insert(spec.member_name.clone());
+        }
+        for visible_name in resolver.visible_member_names_for(&spec.target.fq_name()) {
+            visibility.direct_member_names.insert(visible_name);
+        }
 
         for import in imports {
             visibility.apply_import(scala, resolver, import, spec, active_package);

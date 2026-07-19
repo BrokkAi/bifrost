@@ -4083,6 +4083,136 @@ class Consumer {
 }
 
 #[test]
+fn scala_graph_resolves_transitive_export_selectors_and_routes_original_files() {
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "dotty/tools/tasty/TastyFormat.scala",
+            r#"package dotty.tools.tasty
+object TastyFormat {
+  def astTagToString(tag: Int): String = tag.toString
+  def isModifierTag(tag: Int): Boolean = tag > 0
+  def original(): Int = 1
+}
+"#,
+        ),
+        (
+            "dotty/tools/tasty/besteffort/BestEffortTastyFormat.scala",
+            r#"package dotty.tools.tasty.besteffort
+import dotty.tools.tasty.TastyFormat
+object BestEffortTastyFormat {
+  export TastyFormat.{*, astTagToString as _, original as selected}
+}
+"#,
+        ),
+        (
+            "dotty/tools/dotc/core/tasty/TastyPrinter.scala",
+            r#"package dotty.tools.dotc.core.tasty
+import dotty.tools.tasty.besteffort.BestEffortTastyFormat.*
+object TastyPrinter {
+  def selectedCall(): Int = selected() // positive-renamed-export
+  def print(nextByte: Int): Boolean =
+    while nextByte > 0 && !isModifierTag(nextByte) do () // positive-tasty-export
+    true
+}
+"#,
+        ),
+    ]);
+
+    let tasty_format = project.file("dotty/tools/tasty/TastyFormat.scala");
+    let tasty_printer = project.file("dotty/tools/dotc/core/tasty/TastyPrinter.scala");
+    assert!(
+        analyzer
+            .referencing_files_of(&tasty_format)
+            .contains(&tasty_printer),
+        "transitive export target must participate in import candidate routing"
+    );
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let modifier = definition(&analyzer, "dotty.tools.tasty.TastyFormat$.isModifierTag");
+    let modifier_hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&modifier),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&modifier_hits, "positive-tasty-export");
+
+    let original = definition(&analyzer, "dotty.tools.tasty.TastyFormat$.original");
+    let original_hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&original),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&original_hits, "positive-renamed-export");
+
+    let excluded = definition(&analyzer, "dotty.tools.tasty.TastyFormat$.astTagToString");
+    let excluded_hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&excluded),
+        &candidates,
+        1000,
+    ));
+    assert_no_hit_contains(&excluded_hits, "positive-tasty-export");
+}
+
+#[test]
+fn scala_graph_export_cycles_terminate_and_ambiguous_exports_fail_closed() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "pkg/Exports.scala",
+            r#"package pkg
+object Left { def help(): Int = 1 }
+object Right { def help(): Int = 2 }
+object Ambiguous {
+  export Left.*
+  export Right.*
+}
+object CycleA {
+  def leaf(): Int = 3
+  export CycleB.*
+}
+object CycleB { export CycleA.* }
+"#,
+        ),
+        (
+            "app/Consumer.scala",
+            r#"package app
+object AmbiguousConsumer {
+  import pkg.Ambiguous.*
+  def call(): Int = help() // negative-ambiguous-export
+}
+object CycleConsumer {
+  import pkg.CycleB.*
+  def call(): Int = leaf() // positive-cycle-export
+}
+"#,
+        ),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    for target in ["pkg.Left$.help", "pkg.Right$.help"] {
+        let target = definition(&analyzer, target);
+        let target_hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        assert_no_hit_contains(&target_hits, "negative-ambiguous-export");
+    }
+
+    let leaf = definition(&analyzer, "pkg.CycleA$.leaf");
+    let leaf_hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&leaf),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&leaf_hits, "positive-cycle-export");
+}
+
+#[test]
 fn scala_graph_covers_enums_cases_and_with_inheritance() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (

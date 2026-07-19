@@ -37,8 +37,8 @@ use super::syntax::{
     stable_identifier_reference,
 };
 use crate::analyzer::scala::{
-    ScalaAdapter, ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaSupertypeLookupPath,
-    ScalaWildcardOwnerFacts, resolve_scala_explicit_import_tier,
+    ScalaAdapter, ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaExportSelector,
+    ScalaSupertypeLookupPath, ScalaWildcardOwnerFacts, resolve_scala_explicit_import_tier,
     resolve_scala_wildcard_import_environment, scala_class_parameter_field_keyword,
     scala_import_path, scala_normalize_full_name, scala_simple_type_name,
     scala_type_lookup_segments,
@@ -70,6 +70,15 @@ type CallableAlternativesCell = Arc<OnceLock<CachedCallableAlternatives>>;
 type ExtensionOwnerMemberKey = (String, String);
 type ExtensionMethodEntries = Arc<Vec<ExtensionMethod>>;
 type OverrideTargetEntries = Arc<Vec<String>>;
+
+#[derive(Clone)]
+struct ScalaExportEdge {
+    exporter_fqn: String,
+    source_owner_fqn: String,
+    selectors: Vec<ScalaExportSelector>,
+}
+
+type ExportedMemberBindings = HashMap<String, HashSet<String>>;
 
 pub(super) enum MemberReturnResolution {
     NoMatch,
@@ -124,6 +133,7 @@ pub(crate) struct ProjectTypes {
     extension_methods_by_owner_member:
         Mutex<HashMap<ExtensionOwnerMemberKey, ExtensionMethodEntries>>,
     override_targets_by_method: Mutex<HashMap<String, OverrideTargetEntries>>,
+    exported_member_bindings_by_owner: Mutex<HashMap<String, Vec<(String, String)>>>,
 }
 
 impl ProjectTypes {
@@ -144,6 +154,7 @@ impl ProjectTypes {
             callable_alternatives_by_unit: Mutex::new(HashMap::default()),
             extension_methods_by_owner_member: Mutex::new(HashMap::default()),
             override_targets_by_method: Mutex::new(HashMap::default()),
+            exported_member_bindings_by_owner: Mutex::new(HashMap::default()),
         }
     }
 
@@ -209,6 +220,7 @@ impl ProjectTypes {
             callable_alternatives_by_unit: Mutex::new(HashMap::default()),
             extension_methods_by_owner_member: Mutex::new(HashMap::default()),
             override_targets_by_method: Mutex::new(HashMap::default()),
+            exported_member_bindings_by_owner: Mutex::new(HashMap::default()),
         };
         let direct_ancestors_by_unit = types.resolve_direct_ancestors_from_file_states(
             types
@@ -227,6 +239,224 @@ impl ProjectTypes {
 
     fn bulk_file_state(&self, file: &ProjectFile) -> Option<&FileState> {
         self.bulk_file_states.as_ref()?.get(file)
+    }
+
+    fn export_infos_for_owner(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+    ) -> Vec<crate::analyzer::scala::ScalaExportInfo> {
+        match &self.bulk_file_states {
+            Some(states) => states
+                .get(owner.source())
+                .and_then(|state| state.scala_exports.get(owner))
+                .cloned()
+                .unwrap_or_default(),
+            None => scala.export_infos_for_owner(owner),
+        }
+    }
+
+    fn imports_for_export_owner(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+    ) -> Vec<crate::analyzer::ImportInfo> {
+        match &self.bulk_file_states {
+            Some(states) => states
+                .get(owner.source())
+                .map(|state| state.imports.clone())
+                .unwrap_or_default(),
+            None => scala.import_info_of(owner.source()),
+        }
+    }
+
+    fn direct_member_bindings(&self, owner_fqn: &str) -> ExportedMemberBindings {
+        let mut bindings = ExportedMemberBindings::default();
+        for child in self.index.fqn_direct_children(owner_fqn) {
+            if child.is_function() || child.is_field() {
+                let visible_name = child
+                    .short_name()
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(child.short_name())
+                    .to_string();
+                bindings
+                    .entry(visible_name)
+                    .or_default()
+                    .insert(child.fq_name());
+            }
+        }
+        bindings
+    }
+
+    /// Resolve the original declarations exposed as members of `exporter`.
+    ///
+    /// Export aliases are compiler-generated declarations and therefore do
+    /// not appear in the source declaration index. Build their bindings from
+    /// parser-recorded export facts instead. Discovery is iterative and the
+    /// propagation is a finite monotonic fixed point, so malformed export
+    /// cycles terminate without losing valid aliases on another path.
+    pub(crate) fn exported_member_bindings(
+        &self,
+        scala: &ScalaAnalyzer,
+        exporter: &CodeUnit,
+    ) -> Vec<(String, String)> {
+        let exporter_fqn = exporter.fq_name();
+        if let Some(cached) = self
+            .exported_member_bindings_by_owner
+            .lock()
+            .expect("Scala export binding cache poisoned")
+            .get(&exporter_fqn)
+            .cloned()
+        {
+            return cached;
+        }
+
+        let mut queue = vec![exporter.clone()];
+        let mut visited = HashSet::default();
+        let mut owners = HashMap::<String, CodeUnit>::default();
+        let mut edges = Vec::new();
+        while let Some(current) = queue.pop() {
+            let current_fqn = current.fq_name();
+            if !visited.insert(current_fqn.clone()) {
+                continue;
+            }
+            owners.insert(current_fqn.clone(), current.clone());
+            let imports = self.imports_for_export_owner(scala, &current);
+            for export in self.export_infos_for_owner(scala, &current) {
+                if export.owner_path.is_empty() {
+                    continue;
+                }
+                // Export qualifier paths are elaborated before aliases in the
+                // same owner. Excluding member bindings here enforces that
+                // path-before-alias rule while retaining ordinary import and
+                // package precedence.
+                let visible_imports =
+                    visible_imports_at_byte(&imports, Some(export.declaration_start_byte));
+                let resolver = NameResolver::for_file_with_facts_impl(
+                    scala,
+                    Some(current.source()),
+                    &[current.package_name().to_string()],
+                    &visible_imports,
+                    self,
+                    false,
+                );
+                let Some(source_owner_fqn) = self.resolve_qualified_stable_type_at(
+                    scala,
+                    &resolver,
+                    &export.owner_path,
+                    true,
+                    None,
+                ) else {
+                    continue;
+                };
+                let normalized = scala_normalized_fq_name(&source_owner_fqn);
+                let Some(source_owner) = self.object_by_normalized_fqn(scala, &normalized).cloned()
+                else {
+                    continue;
+                };
+                let source_owner_fqn = source_owner.fq_name();
+                edges.push(ScalaExportEdge {
+                    exporter_fqn: current_fqn.clone(),
+                    source_owner_fqn: source_owner_fqn.clone(),
+                    selectors: export.selectors,
+                });
+                if !visited.contains(&source_owner_fqn) {
+                    queue.push(source_owner);
+                }
+            }
+        }
+
+        let mut bindings_by_owner = owners
+            .keys()
+            .map(|owner_fqn| (owner_fqn.clone(), self.direct_member_bindings(owner_fqn)))
+            .collect::<HashMap<_, _>>();
+        loop {
+            let mut changed = false;
+            for edge in &edges {
+                let Some(source_bindings) = bindings_by_owner.get(&edge.source_owner_fqn).cloned()
+                else {
+                    continue;
+                };
+                let destination = bindings_by_owner
+                    .entry(edge.exporter_fqn.clone())
+                    .or_default();
+                let named_sources = edge
+                    .selectors
+                    .iter()
+                    .filter_map(|selector| match selector {
+                        ScalaExportSelector::Named { source_name, .. } => Some(source_name.clone()),
+                        ScalaExportSelector::Wildcard | ScalaExportSelector::GivenWildcard => None,
+                    })
+                    .collect::<HashSet<_>>();
+                for selector in &edge.selectors {
+                    match selector {
+                        ScalaExportSelector::Named {
+                            source_name,
+                            visible_name,
+                        } => {
+                            let Some(visible_name) = visible_name else {
+                                continue;
+                            };
+                            let Some(candidates) = source_bindings.get(source_name) else {
+                                continue;
+                            };
+                            let target = destination.entry(visible_name.clone()).or_default();
+                            let previous = target.len();
+                            target.extend(candidates.iter().cloned());
+                            changed |= target.len() != previous;
+                        }
+                        ScalaExportSelector::Wildcard => {
+                            for (visible_name, candidates) in &source_bindings {
+                                if named_sources.contains(visible_name) {
+                                    continue;
+                                }
+                                let target = destination.entry(visible_name.clone()).or_default();
+                                let previous = target.len();
+                                target.extend(candidates.iter().cloned());
+                                changed |= target.len() != previous;
+                            }
+                        }
+                        // Given exports have distinct eligibility rules. Do
+                        // not expose them as ordinary term-member bindings.
+                        ScalaExportSelector::GivenWildcard => {}
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let flattened_by_owner = bindings_by_owner
+            .into_iter()
+            .map(|(owner_fqn, bindings)| {
+                let mut flattened = bindings
+                    .into_iter()
+                    .flat_map(|(visible_name, candidates)| {
+                        candidates
+                            .into_iter()
+                            .map(move |candidate| (visible_name.clone(), candidate))
+                    })
+                    .collect::<Vec<_>>();
+                flattened.sort();
+                flattened.dedup();
+                (owner_fqn, flattened)
+            })
+            .collect::<Vec<_>>();
+        let result = flattened_by_owner
+            .iter()
+            .find(|(owner_fqn, _)| owner_fqn == &exporter_fqn)
+            .map(|(_, bindings)| bindings.clone())
+            .unwrap_or_default();
+        let mut cache = self
+            .exported_member_bindings_by_owner
+            .lock()
+            .expect("Scala export binding cache poisoned");
+        for (owner_fqn, bindings) in flattened_by_owner {
+            cache.entry(owner_fqn).or_insert(bindings);
+        }
+        result
     }
 
     pub(crate) fn resolve_direct_ancestors_from_file_states(
@@ -545,6 +775,24 @@ impl ProjectTypes {
                 method_call_shape_matches(facts, alternatives, call_arities, unique_callable)
             })
             .map(|(method, _, _)| (*method).clone())
+            .collect()
+    }
+
+    fn imported_member_targets(
+        &self,
+        scala: &ScalaAnalyzer,
+        member_fqn: &str,
+        call_arities: Option<&[usize]>,
+    ) -> Vec<String> {
+        let members = self
+            .index
+            .by_fqn(member_fqn)
+            .iter()
+            .filter(|unit| unit.is_function())
+            .collect::<Vec<_>>();
+        self.method_declarations_for_members(scala, &members, call_arities)
+            .into_iter()
+            .map(|method| method.fq_name())
             .collect()
     }
 
@@ -2226,7 +2474,7 @@ pub(crate) struct NameResolver {
     package_names: VisibleNameBindings,
     ambiguous_import_priorities: HashMap<String, u8>,
     package_prefixes: Vec<String>,
-    member_names: HashMap<String, String>,
+    member_names: VisibleNameBindings,
     direct_extension_methods: HashMap<String, Vec<ExtensionMethod>>,
     wildcard_extension_owners: Vec<String>,
 }
@@ -2295,6 +2543,22 @@ impl VisibleNameBindings {
 
     fn priority(&self, name: &str) -> Option<u8> {
         self.entries.get(name).map(|binding| binding.priority)
+    }
+
+    fn names_resolving_to(&self, target_fqn: &str) -> Vec<String> {
+        let normalized_target = scala_normalized_fq_name(target_fqn);
+        self.entries
+            .iter()
+            .filter(|(_, binding)| {
+                binding.candidates.len() == 1
+                    && binding.declarations.len() <= 1
+                    && binding.candidates.iter().next().is_some_and(|candidate| {
+                        candidate == target_fqn
+                            || scala_normalized_fq_name(candidate) == normalized_target
+                    })
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 }
 
@@ -2508,7 +2772,7 @@ impl NameResolver {
             package_names,
             ambiguous_import_priorities,
             package_prefixes,
-            member_names: HashMap::default(),
+            member_names: VisibleNameBindings::default(),
             direct_extension_methods: HashMap::default(),
             wildcard_extension_owners: Vec::new(),
         }
@@ -2581,7 +2845,7 @@ impl NameResolver {
         let mut object_names = VisibleNameBindings::default();
         let mut package_names = VisibleNameBindings::default();
         let mut ambiguous_import_priorities = HashMap::default();
-        let mut member_names = HashMap::default();
+        let mut member_names = VisibleNameBindings::default();
         let mut direct_extension_methods: HashMap<String, Vec<ExtensionMethod>> =
             HashMap::default();
         let mut wildcard_extension_owners = Vec::new();
@@ -2643,6 +2907,31 @@ impl NameResolver {
                         object_names.add_declaration(simple.clone(), decl, 128);
                     }
                     if include_members {
+                        if let Some(declaration) =
+                            types.object_by_normalized_fqn(scala, &normalized_owner)
+                        {
+                            for child in types.index.fqn_direct_children(&declaration.fq_name()) {
+                                if child.is_function() || child.is_field() {
+                                    let visible_name = child
+                                        .short_name()
+                                        .rsplit('.')
+                                        .next()
+                                        .unwrap_or(child.short_name())
+                                        .to_string();
+                                    member_names.add_candidate(
+                                        visible_name,
+                                        child.fq_name(),
+                                        None,
+                                        128,
+                                    );
+                                }
+                            }
+                            for (visible_name, member_fqn) in
+                                types.exported_member_bindings(scala, declaration)
+                            {
+                                member_names.add_candidate(visible_name, member_fqn, None, 128);
+                            }
+                        }
                         wildcard_extension_owners.push(normalized_owner);
                     }
                 } else {
@@ -2707,7 +2996,7 @@ impl NameResolver {
             let normalized = scala_normalized_fq_name(&tier.candidate);
             if include_members && let Some(member) = types.member_by_normalized_fqn(&normalized) {
                 let member_fqn = member.fq_name();
-                member_names.insert(local_name.clone(), member_fqn.clone());
+                member_names.add_candidate(local_name.clone(), member_fqn.clone(), None, 192);
                 for method in types.direct_extension_method(scala, &normalized) {
                     direct_extension_methods
                         .entry(local_name.clone())
@@ -2830,7 +3119,15 @@ impl NameResolver {
         if self.import_collision_blocks(simple, None) {
             return None;
         }
-        self.member_names.get(simple).cloned()
+        self.member_names.resolve(simple)
+    }
+
+    pub(crate) fn visible_member_names_for(&self, target_fqn: &str) -> Vec<String> {
+        let mut names = self.member_names.names_resolving_to(target_fqn);
+        names.retain(|name| !self.import_collision_blocks(name, self.member_names.priority(name)));
+        names.sort();
+        names.dedup();
+        names
     }
 
     pub(crate) fn visible_extension_methods(
@@ -3369,6 +3666,19 @@ fn record_reference(
                         for target in targets {
                             ctx.record(target, function);
                         }
+                        return;
+                    }
+                    if let Some(imported) = ctx.resolver.resolve_member(name) {
+                        for target in ctx.types.imported_member_targets(
+                            ctx.scala,
+                            &imported,
+                            call_arities.as_deref(),
+                        ) {
+                            ctx.record(target, function);
+                        }
+                        // A unique imported binding owns this visible name.
+                        // If no overload matches the call shape, fail closed
+                        // instead of reinterpreting it as a type application.
                         return;
                     }
                     record_unqualified_type_application(function, name, ctx, bindings);

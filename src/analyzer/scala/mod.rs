@@ -33,7 +33,7 @@ use std::sync::{Arc, OnceLock};
 pub(crate) use adapter::ScalaAdapter;
 use clones::{build_scala_clone_candidate_data, refine_scala_clone_similarity};
 pub(crate) use declarations::scala_class_parameter_field_keyword;
-pub(crate) use imports::scala_lexical_scope_path_at;
+pub(crate) use imports::{ScalaExportInfo, ScalaExportSelector, scala_lexical_scope_path_at};
 pub(crate) use supertypes::{ScalaSupertypeLookupPath, scala_type_lookup_segments};
 use tests::detect_scala_test_assertion_smells;
 pub(crate) use wildcard_imports::{
@@ -179,6 +179,13 @@ impl ScalaAnalyzer {
             scala_lexical_scope_path_at(root, reference_byte),
             reference_byte,
         ))
+    }
+
+    pub(crate) fn export_infos_for_owner(&self, owner: &CodeUnit) -> Vec<ScalaExportInfo> {
+        self.inner
+            .fetch_file_state(owner.source())
+            .and_then(|state| state.scala_exports.get(owner).cloned())
+            .unwrap_or_default()
     }
 
     pub(crate) fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {

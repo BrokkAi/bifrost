@@ -4,7 +4,7 @@ use crate::analyzer::{
 use crate::hash::HashMap;
 use tree_sitter::{Node, Tree};
 
-use super::imports::scala_import_infos_from_node_with_prefixes;
+use super::imports::{scala_export_info_from_node, scala_import_infos_from_node_with_prefixes};
 use super::supertypes::extract_scala_supertypes;
 use super::wildcard_imports::scala_package_prefixes_at;
 
@@ -508,6 +508,15 @@ impl<'a> ScalaVisitor<'a> {
                     parent,
                     stack,
                 ),
+                "export_declaration" => {
+                    if let Some(info) = scala_export_info_from_node(child, self.source) {
+                        self.parsed
+                            .scala_exports
+                            .entry(parent.clone())
+                            .or_default()
+                            .push(info);
+                    }
+                }
                 "simple_enum_case" => self.visit_enum_case(child, package_name, parent),
                 "enum_case_definitions" | "enum_body" => {
                     stack.push(ScalaWork::TemplateBody {

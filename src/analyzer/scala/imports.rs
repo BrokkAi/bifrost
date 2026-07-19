@@ -4,6 +4,7 @@ use crate::analyzer::{
     StructuredImportPath, StructuredImportScope, build_reverse_file_index,
 };
 use crate::hash::{HashMap, HashSet};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tree_sitter::Node;
 
@@ -14,6 +15,23 @@ use super::wildcard_imports::{
     resolve_scala_explicit_import_tier, resolve_scala_wildcard_import_environment,
     scala_import_path,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ScalaExportSelector {
+    Wildcard,
+    GivenWildcard,
+    Named {
+        source_name: String,
+        visible_name: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ScalaExportInfo {
+    pub(crate) owner_path: Vec<String>,
+    pub(crate) selectors: Vec<ScalaExportSelector>,
+    pub(crate) declaration_start_byte: usize,
+}
 
 impl ScalaAnalyzer {
     fn resolve_import_info(
@@ -88,7 +106,19 @@ impl ScalaAnalyzer {
                             .into_iter()
                             .filter(is_scala_importable_direct_member),
                     );
+                    for (_, target_fqn) in self
+                        .project_types()
+                        .exported_member_bindings(self, &declaration)
+                    {
+                        imported.extend(
+                            self.inner
+                                .definitions(&target_fqn)
+                                .filter(is_scala_importable_direct_member),
+                        );
+                    }
                 }
+                imported.sort();
+                imported.dedup();
                 imported
             }
         }
@@ -306,9 +336,9 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
             .any(|owner| match owner.kind {
                 ScalaWildcardOwnerKind::Package => owner.fqn == target_package,
                 ScalaWildcardOwnerKind::StableSingleton => self
-                    .inner
-                    .definitions(&owner.declaration_fqn())
-                    .any(|declaration| declaration.is_class() && declaration.source() == target),
+                    .resolve_wildcard_owner(owner)
+                    .iter()
+                    .any(|declaration| declaration.source() == target),
             })
         {
             return true;
@@ -418,6 +448,90 @@ pub(crate) fn scala_import_infos_from_node_with_prefixes(
             declaration_start_byte: node.start_byte(),
         }),
     }]
+}
+
+pub(crate) fn scala_export_info_from_node(node: Node<'_>, source: &str) -> Option<ScalaExportInfo> {
+    if node.kind() != "export_declaration" {
+        return None;
+    }
+    let mut path_cursor = node.walk();
+    let mut owner_path = node
+        .children_by_field_name("path", &mut path_cursor)
+        .filter(Node::is_named)
+        .map(|segment| scala_node_text(segment, source).to_string())
+        .collect::<Vec<_>>();
+    if owner_path.is_empty() {
+        return None;
+    }
+
+    let mut selectors = Vec::new();
+    let mut cursor = node.walk();
+    let direct_children = node.named_children(&mut cursor).collect::<Vec<_>>();
+    if let Some(namespace_selectors) = direct_children
+        .iter()
+        .find(|child| child.kind() == "namespace_selectors")
+    {
+        let mut selector_cursor = namespace_selectors.walk();
+        for selector in namespace_selectors.named_children(&mut selector_cursor) {
+            if let Some(selector) = scala_export_selector(selector, source) {
+                selectors.push(selector);
+            }
+        }
+    } else if let Some(selector) = direct_children.iter().find(|child| {
+        matches!(
+            child.kind(),
+            "namespace_wildcard" | "as_renamed_identifier" | "arrow_renamed_identifier"
+        )
+    }) {
+        selectors.push(scala_export_selector(*selector, source)?);
+    } else {
+        let source_name = owner_path.pop()?;
+        selectors.push(ScalaExportSelector::Named {
+            visible_name: Some(source_name.clone()),
+            source_name,
+        });
+    }
+
+    (!selectors.is_empty()).then_some(ScalaExportInfo {
+        owner_path,
+        selectors,
+        declaration_start_byte: node.start_byte(),
+    })
+}
+
+fn scala_export_selector(node: Node<'_>, source: &str) -> Option<ScalaExportSelector> {
+    match node.kind() {
+        "namespace_wildcard" => {
+            let given = (0..node.child_count()).any(|index| {
+                node.child(index)
+                    .is_some_and(|child| !child.is_named() && child.kind() == "given")
+            });
+            Some(if given {
+                ScalaExportSelector::GivenWildcard
+            } else {
+                ScalaExportSelector::Wildcard
+            })
+        }
+        "identifier" | "operator_identifier" => {
+            let source_name = scala_node_text(node, source).to_string();
+            Some(ScalaExportSelector::Named {
+                visible_name: Some(source_name.clone()),
+                source_name,
+            })
+        }
+        "as_renamed_identifier" | "arrow_renamed_identifier" => {
+            let name = node.child_by_field_name("name")?;
+            let alias = node.child_by_field_name("alias")?;
+            let source_name = scala_node_text(name, source).to_string();
+            let visible_name =
+                (alias.kind() != "wildcard").then(|| scala_node_text(alias, source).to_string());
+            Some(ScalaExportSelector::Named {
+                source_name,
+                visible_name,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn scala_import_selector_info(
@@ -543,4 +657,61 @@ fn is_scala_importable_top_level(unit: &CodeUnit) -> bool {
 
 fn is_scala_importable_direct_member(unit: &CodeUnit) -> bool {
     unit.is_class() || unit.is_function() || unit.is_field()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parsed_export(source: &str) -> ScalaExportInfo {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_scala::LANGUAGE.into())
+            .expect("Scala parser");
+        let tree = parser.parse(source, None).expect("Scala syntax tree");
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "export_declaration" {
+                return scala_export_info_from_node(node, source).expect("structured export");
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        panic!("missing export declaration in {source:?}");
+    }
+
+    #[test]
+    fn scala_export_parser_preserves_selector_semantics() {
+        let export = parsed_export(
+            "object Facade { export Core.{dropped as _, original as renamed, kept, *} }",
+        );
+        assert_eq!(export.owner_path, ["Core"]);
+        assert_eq!(
+            export.selectors,
+            [
+                ScalaExportSelector::Named {
+                    source_name: "dropped".to_string(),
+                    visible_name: None,
+                },
+                ScalaExportSelector::Named {
+                    source_name: "original".to_string(),
+                    visible_name: Some("renamed".to_string()),
+                },
+                ScalaExportSelector::Named {
+                    source_name: "kept".to_string(),
+                    visible_name: Some("kept".to_string()),
+                },
+                ScalaExportSelector::Wildcard,
+            ]
+        );
+    }
+
+    #[test]
+    fn scala_export_parser_distinguishes_given_from_ordinary_wildcard() {
+        let given = parsed_export("object Facade { export Core.given }");
+        assert_eq!(given.selectors, [ScalaExportSelector::GivenWildcard]);
+        let ordinary = parsed_export("object Facade { export Core.* }");
+        assert_eq!(ordinary.selectors, [ScalaExportSelector::Wildcard]);
+    }
 }
