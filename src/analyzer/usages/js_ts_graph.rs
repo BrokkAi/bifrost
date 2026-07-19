@@ -44,6 +44,9 @@ pub(in crate::analyzer::usages) use receiver_analysis::{
 pub(crate) use resolver::{
     JsTsUsageIndex, build_jsts_usage_index, build_jsts_usage_index_with_cancellation,
 };
+pub(in crate::analyzer::usages) use resolver::{
+    browser_global_property_shape, unbound_browser_global_property,
+};
 
 use crate::analyzer::usages::common::analyzed_files_for_language;
 use crate::analyzer::usages::js_ts_graph::extractor::scan_files_for_seeds;

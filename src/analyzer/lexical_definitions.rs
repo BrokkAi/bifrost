@@ -482,6 +482,11 @@ fn scope_has_matching_local(
     let mut stack = Vec::new();
     push_named_children(scope, &mut stack);
     while let Some(node) = stack.pop() {
+        // Function declarations are hoisted and class declarations shadow through their TDZ,
+        // so source order does not limit declaration-name visibility.
+        if js_ts_scope_declaration_matches(language, node, source, identifier) {
+            return true;
+        }
         if node.start_byte() > focus_start {
             continue;
         }
@@ -524,6 +529,24 @@ fn scope_has_matching_local(
         push_named_children(node, &mut stack);
     }
     false
+}
+
+fn js_ts_scope_declaration_matches(
+    language: Language,
+    node: Node<'_>,
+    source: &str,
+    identifier: &str,
+) -> bool {
+    if !matches!(language, Language::JavaScript | Language::TypeScript)
+        || !matches!(
+            node.kind(),
+            "function_declaration" | "generator_function_declaration" | "class_declaration"
+        )
+    {
+        return false;
+    }
+    node.child_by_field_name("name")
+        .is_some_and(|name| identifier_matches(language, name, source, identifier))
 }
 
 fn scala_has_value_definition_keyword(node: Node<'_>) -> bool {

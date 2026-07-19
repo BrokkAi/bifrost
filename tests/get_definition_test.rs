@@ -7632,6 +7632,142 @@ bench.start();
 }
 
 #[test]
+fn javascript_bare_function_beats_same_named_member() {
+    let source = r#"const holder = {};
+holder.foo = undefined;
+function foo() {}
+foo();
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", source)
+        .build();
+    let call = source.rfind("foo();").expect("bare foo call");
+    let value = lookup(project.root(), &location_reference("app.js", source, call));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "foo", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 3, "{value}");
+}
+
+#[test]
+fn javascript_recovered_top_level_function_never_resolves_unrelated_member() {
+    let source = r#"var __v_0 = [1, 2, 3];
+__v_0.foo = undefined;
+function foo() {}
+%OptimizeFunctionOnNextCall(foo);
+foo();
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("recovered.js", source)
+        .build();
+    let call = source.rfind("foo();").expect("recovered bare foo call");
+    let value = lookup(
+        project.root(),
+        &location_reference("recovered.js", source, call),
+    );
+
+    let result = &value["results"][0];
+    if result["status"] == "resolved" {
+        assert_eq!(result["definitions"][0]["fqn"], "foo", "{value}");
+    } else {
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert!(result["definitions"].is_null(), "{value}");
+    }
+}
+
+#[test]
+fn javascript_hoisted_declarations_block_member_fallback() {
+    let source = r#"member.pause = function() {};
+member.generator = function() {};
+member.LocalClass = function() {};
+member.unrelated = function() {};
+
+function outer() {
+  pause();
+  generator();
+  LocalClass;
+  function pause() {}
+  function* generator() {}
+  class LocalClass {}
+}
+
+member.pause();
+unrelated();
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", source)
+        .build();
+
+    for marker in ["  pause();", "  generator();", "  LocalClass;"] {
+        let start = source.find(marker).expect("nested declaration reference") + 2;
+        let value = lookup(project.root(), &location_reference("app.js", source, start));
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert_eq!(result["diagnostics"][0]["kind"], "local_binding", "{value}");
+    }
+
+    let qualified = source.rfind("member.pause").expect("qualified member call");
+    let value = lookup(
+        project.root(),
+        &location_reference("app.js", source, qualified + "member.".len()),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "member.pause", "{value}");
+
+    let unrelated = source.rfind("unrelated();").expect("bare unrelated call");
+    let value = lookup(
+        project.root(),
+        &location_reference("app.js", source, unrelated),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn javascript_bare_import_and_browser_global_resolution_remain_exact() {
+    let app = r#"import { helper } from "./util.js";
+window.Promise = function Promise() {};
+
+function imported() { helper(); }
+function globalRead() { return Promise.resolve(); }
+function shadowed(Promise) { return Promise; }
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("util.js", "export function helper() {}\n")
+        .file("app.js", app)
+        .build();
+
+    let helper = app.find("helper();").expect("imported helper call");
+    let value = lookup(project.root(), &location_reference("app.js", app, helper));
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "helper",
+        "{value}"
+    );
+    assert_eq!(
+        value["results"][0]["definitions"][0]["path"], "util.js",
+        "{value}"
+    );
+
+    let promise = app.find("Promise.resolve").expect("bare global Promise");
+    let value = lookup(project.root(), &location_reference("app.js", app, promise));
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "window.Promise",
+        "{value}"
+    );
+
+    let shadow = app.rfind("return Promise").expect("shadowed Promise read") + "return ".len();
+    let value = lookup(project.root(), &location_reference("app.js", app, shadow));
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert!(
+        value["results"][0]["definitions"][0].get("fqn").is_none(),
+        "{value}"
+    );
+}
+
+#[test]
 fn typescript_local_bindings_and_uncontextual_object_keys_block_indexed_fallback() {
     let source = r#"
 class Record { value = 1 }

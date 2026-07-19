@@ -4847,6 +4847,123 @@ fn scan_usages_location_target_selects_js_object_literal_method() {
 }
 
 #[test]
+fn scan_usages_location_recovers_lookup_only_local_assignment_property_reads() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "assignment.js",
+            r#"function selected(other) {
+  const node = {};
+  consume(node.operator);
+  node.operator = "=";
+  consume(node.operator);
+  node.operator = "+";
+  consume(other.operator);
+  {
+    const node = {};
+    consume(node.operator);
+  }
+}
+
+function sibling() {
+  const node = {};
+  consume(node.operator);
+}
+"#,
+        )
+        .file(
+            "other.js",
+            r#"function elsewhere() {
+  const node = {};
+  consume(node.operator);
+}
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"assignment.js","line":4,"column":8,"symbol":"node.operator"}],"include_tests":true}"#,
+        )
+        .expect("location scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let result = only_result(&value);
+
+    assert_eq!("found", result["status"], "payload: {value}");
+    assert_eq!("assignment.js#node.operator", result["symbol"], "{value}");
+    assert_eq!(0, result["unproven_hits"], "payload: {value}");
+    assert_eq!(1, result["total_hits"], "payload: {value}");
+    assert_eq!("assignment.js", result["files"][0]["path"], "{value}");
+    assert_eq!(5, result["files"][0]["hits"][0]["line"], "{value}");
+
+    let unrelated_payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"assignment.js","line":7,"column":17,"symbol":"node.operator"}],"include_tests":true}"#,
+        )
+        .expect("unrelated location scan succeeds");
+    let unrelated: Value = serde_json::from_str(&unrelated_payload).expect("valid response");
+    assert_eq!(
+        "not_found",
+        only_result(&unrelated)["status"],
+        "{unrelated}"
+    );
+}
+
+#[test]
+fn scan_usages_location_recovers_lookup_only_local_object_property_reads() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "object.js",
+            r#"consume(options.enabled);
+export const options = { enabled: true };
+consume(options.enabled);
+options.enabled = false;
+consume(other.enabled);
+
+function shadowed() {
+  const options = {};
+  consume(options.enabled);
+}
+
+function sibling() {
+  const options = {};
+  consume(options.enabled);
+}
+"#,
+        )
+        .file(
+            "other.js",
+            r#"function elsewhere() {
+  const options = {};
+  consume(options.enabled);
+}
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"object.js","line":2,"column":26,"symbol":"options.enabled"}],"include_tests":true}"#,
+        )
+        .expect("location scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let result = only_result(&value);
+
+    assert_eq!("found", result["status"], "payload: {value}");
+    assert_eq!("object.js#options.enabled", result["symbol"], "{value}");
+    assert_eq!(0, result["unproven_hits"], "payload: {value}");
+    assert_eq!(1, result["total_hits"], "payload: {value}");
+    assert_eq!("object.js", result["files"][0]["path"], "{value}");
+    assert_eq!(3, result["files"][0]["hits"][0]["line"], "{value}");
+}
+
+#[test]
 fn scan_usages_location_prefers_scala_class_over_shared_primary_constructor_range() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

@@ -692,7 +692,9 @@ pub(super) fn member_name(target: &CodeUnit) -> Option<String> {
     Some(last.trim_end_matches("$static").to_string())
 }
 
-pub(super) fn browser_global_property_shape(target: &CodeUnit) -> Option<(&str, &str)> {
+pub(in crate::analyzer::usages) fn browser_global_property_shape(
+    target: &CodeUnit,
+) -> Option<(&str, &str)> {
     if !target.is_field() && !target.is_function() {
         return None;
     }
@@ -701,7 +703,7 @@ pub(super) fn browser_global_property_shape(target: &CodeUnit) -> Option<(&str, 
         .then_some((object, property))
 }
 
-pub(super) fn unbound_browser_global_property<'a>(
+pub(in crate::analyzer::usages) fn unbound_browser_global_property<'a>(
     analyzer: &dyn IAnalyzer,
     target: &'a CodeUnit,
     root: Node<'_>,

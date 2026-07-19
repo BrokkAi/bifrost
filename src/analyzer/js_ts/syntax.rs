@@ -7,7 +7,7 @@ use crate::hash::HashMap;
 use tree_sitter::{Node, Tree};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LexicalBindingScope {
+pub(crate) struct JsTsLexicalBindingScope {
     start_byte: usize,
     end_byte: usize,
 }
@@ -17,7 +17,7 @@ struct LexicalBindingScope {
 /// irrelevant: `var` is hoisted and lexical declarations are in the TDZ for
 /// their entire scope.
 pub(crate) struct JsTsLexicalBindingIndex {
-    scopes_by_name: HashMap<String, Vec<LexicalBindingScope>>,
+    scopes_by_name: HashMap<String, Vec<JsTsLexicalBindingScope>>,
 }
 
 impl JsTsLexicalBindingIndex {
@@ -84,11 +84,20 @@ impl JsTsLexicalBindingIndex {
     }
 
     pub(crate) fn is_bound_at(&self, name: &str, byte: usize) -> bool {
-        self.scopes_by_name.get(name).is_some_and(|scopes| {
-            scopes
-                .iter()
-                .any(|scope| scope.start_byte <= byte && byte < scope.end_byte)
-        })
+        self.binding_scope_at(name, byte).is_some()
+    }
+
+    pub(crate) fn binding_scope_at(
+        &self,
+        name: &str,
+        byte: usize,
+    ) -> Option<JsTsLexicalBindingScope> {
+        self.scopes_by_name
+            .get(name)?
+            .iter()
+            .copied()
+            .filter(|scope| scope.start_byte <= byte && byte < scope.end_byte)
+            .min_by_key(|scope| scope.end_byte - scope.start_byte)
     }
 
     fn insert_parameters(&mut self, function: Node<'_>, source: &str) {
@@ -98,7 +107,7 @@ impl JsTsLexicalBindingIndex {
         self.insert_pattern(parameters, source, node_scope(function));
     }
 
-    fn insert_pattern(&mut self, pattern: Node<'_>, source: &str, scope: LexicalBindingScope) {
+    fn insert_pattern(&mut self, pattern: Node<'_>, source: &str, scope: JsTsLexicalBindingScope) {
         let mut stack = vec![pattern];
         while let Some(node) = stack.pop() {
             match node.kind() {
@@ -137,7 +146,7 @@ impl JsTsLexicalBindingIndex {
         }
     }
 
-    fn insert(&mut self, name: &str, scope: LexicalBindingScope) {
+    fn insert(&mut self, name: &str, scope: JsTsLexicalBindingScope) {
         let scopes = self.scopes_by_name.entry(name.to_string()).or_default();
         if !scopes.contains(&scope) {
             scopes.push(scope);
@@ -145,14 +154,14 @@ impl JsTsLexicalBindingIndex {
     }
 }
 
-fn node_scope(node: Node<'_>) -> LexicalBindingScope {
-    LexicalBindingScope {
+fn node_scope(node: Node<'_>) -> JsTsLexicalBindingScope {
+    JsTsLexicalBindingScope {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
     }
 }
 
-fn variable_binding_scope(node: Node<'_>) -> Option<LexicalBindingScope> {
+fn variable_binding_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
     let is_var = node
         .parent()
         .is_some_and(|parent| parent.kind() == "variable_declaration");
@@ -188,7 +197,7 @@ fn variable_binding_scope(node: Node<'_>) -> Option<LexicalBindingScope> {
     None
 }
 
-fn enclosing_lexical_scope(node: Node<'_>) -> Option<LexicalBindingScope> {
+fn enclosing_lexical_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
     let mut current = node.parent();
     while let Some(parent) = current {
         if matches!(parent.kind(), "program" | "statement_block") {
