@@ -1372,13 +1372,36 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 || member_reference_is_proven(node, text, ctx)
         }
         TargetKind::Field => {
-            named_argument_field_is_proven(node, text, ctx)
+            exact_enclosing_field_qualifier_matches(node, text, ctx)
+                || named_argument_field_is_proven(node, text, ctx)
                 || member_reference_is_proven(node, text, ctx)
         }
     };
     if proven {
         add_hit(node, ctx);
     }
+}
+
+/// A root identifier in `field.member` is a reference to `field` independently
+/// of how the terminal member dispatch resolves. Prefer the exact binding's
+/// declaration owner so an assignment refresh can update the value type without
+/// losing the source-backed field identity. A local or parameter binding with no
+/// declaration owner is an authoritative shadow.
+fn exact_enclosing_field_qualifier_matches(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
+    if text != ctx.spec.member_name
+        || !node.parent().is_some_and(|parent| {
+            parent.kind() == "field_expression" && parent.child_by_field_name("value") == Some(node)
+        })
+    {
+        return false;
+    }
+    if let Some(binding) = precise_scala_binding(ctx.bindings, text) {
+        return binding.declaration_owner.as_ref() == ctx.spec.owner.as_ref();
+    }
+    if ctx.bindings.is_shadowed(text) {
+        return false;
+    }
+    enclosing_owner(node, ctx).as_ref() == ctx.spec.owner.as_ref()
 }
 
 fn exact_lexically_visible_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> ScalaTypeNamespaceResolution {
@@ -1588,6 +1611,11 @@ fn seed_value_binding_identifier(node: Node<'_>, text: &str, ctx: &mut ScanCtx<'
             && parent.child_by_field_name("pattern") == Some(node)
     }) {
         return true;
+    }
+    if node.parent().is_some_and(|parent| {
+        parent.kind() == "field_expression" && parent.child_by_field_name("value") == Some(node)
+    }) {
+        return false;
     }
     let before = ctx.source[..node.start_byte()].trim_end();
     let Some(keyword) = previous_word(before) else {
@@ -2202,7 +2230,17 @@ fn stable_identifier_field_owner_fqn(node: Node<'_>, ctx: &ScanCtx<'_>) -> Optio
         return None;
     }
     let root = owner_segments.first()?;
-    if !ctx.bindings.resolve_symbol(root).is_unknown() || ctx.bindings.is_shadowed(root) {
+    if ctx.bindings.is_shadowed(root) {
+        let mut owner = precise_scala_binding(ctx.bindings, root)?.receiver_type?;
+        for segment in &owner_segments[1..] {
+            owner = match ctx.types.field_for_owner_member(ctx.scala, &owner, segment) {
+                FieldResolution::Resolved(field) => field.declared_type?,
+                FieldResolution::NoMatch | FieldResolution::Unresolved => return None,
+            };
+        }
+        return Some(owner);
+    }
+    if !ctx.bindings.resolve_symbol(root).is_unknown() {
         return None;
     }
     resolve_qualified_stable_type_at(node, owner_segments, true, ctx)

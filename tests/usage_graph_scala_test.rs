@@ -1185,6 +1185,99 @@ object Use {
 }
 
 #[test]
+fn scala_inverted_resolves_local_stable_paths_and_reassigned_owner_fields() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Consumer.scala",
+            r#"package app
+
+class Quotes { def render(): Int = 1 }
+class Repr(val qctx: Quotes)
+class OtherQuotes { def render(): Int = 2 }
+class OtherRepr(val qctx: OtherQuotes)
+class Widget { def run(): Unit = () }
+class OtherWidget { def run(): Unit = () }
+
+class Consumer {
+  private var checkbox: Widget = _
+
+  def stablePath(): Any = {
+    val repr = new Repr(new Quotes)
+    val singleton: repr.qctx.type = repr.qctx
+    repr.qctx.render()
+  }
+
+  def reassignedOwnerField(): Unit = {
+    checkbox = new Widget // previous expression ends with var
+    checkbox.run()
+  }
+
+  def parameterShadowsField(checkbox: OtherWidget): Unit = checkbox.run()
+
+  def localShadowsField(): Unit = {
+    val checkbox = new OtherWidget
+    checkbox.run()
+  }
+
+  def unrelatedStablePath(repr: OtherRepr): Int = {
+    val singleton: repr.qctx.type = repr.qctx
+    repr.qctx.render()
+  }
+}
+"#,
+        )
+        .file(
+            "duplicate/First.scala",
+            "package duplicate\nclass Quotes\nclass Repr(val qctx: Quotes)\n",
+        )
+        .file(
+            "duplicate/Second.scala",
+            "package duplicate\nclass Quotes\nclass Repr(val qctx: Quotes)\n",
+        )
+        .file(
+            "duplicate/Use.scala",
+            "package duplicate\nobject Use {\n  val repr = new Repr(new Quotes)\n  val singleton: repr.qctx.type = repr.qctx\n}\n",
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    for (caller, callee) in [
+        ("app.Consumer.stablePath", "app.Quotes.render"),
+        ("app.Consumer.reassignedOwnerField", "app.Widget.run"),
+    ] {
+        assert!(
+            has_edge(&value, caller, callee),
+            "missing structured field edge {caller} -> {callee}: {}",
+            value["edges"]
+        );
+    }
+    for caller in [
+        "app.Consumer.parameterShadowsField",
+        "app.Consumer.localShadowsField",
+    ] {
+        assert!(
+            !has_edge(&value, caller, "app.Widget.run"),
+            "shadowed binding leaked to the enclosing field's value type from {caller}: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        !has_edge(
+            &value,
+            "app.Consumer.unrelatedStablePath",
+            "app.Quotes.render"
+        ),
+        "unrelated stable root leaked to app.Quotes.render: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "duplicate.Use$", "duplicate.Repr.qctx"),
+        "a physically ambiguous stable field path selected an arbitrary replica: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn scoped_usage_graph_skips_unrelated_invalid_scala_callers() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

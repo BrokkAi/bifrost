@@ -1538,6 +1538,130 @@ class Middle(val leaf: Leaf)
 }
 
 #[test]
+fn scala_usage_finder_resolves_local_stable_paths_and_reassigned_owner_fields() {
+    let source = r#"package app
+
+class Quotes
+class Repr(val qctx: Quotes)
+class OtherRepr(val qctx: Quotes)
+class Widget { def run(): Unit = () }
+
+class Consumer {
+  private var checkbox: Widget = _
+
+  def stablePath(): Any = {
+    val repr = new Repr(new Quotes)
+    val singleton: repr.qctx.type = repr.qctx // positive-local-stable-path
+    singleton
+  }
+
+  def reassignedOwnerField(): Unit = {
+    checkbox = new Widget // previous expression ends with var
+    checkbox.run() // positive-reassigned-owner-field
+  }
+
+  def parameterShadowsField(checkbox: Widget): Unit =
+    checkbox.run() // negative-parameter-field-shadow
+
+  def localShadowsField(): Unit = {
+    val checkbox = new Widget
+    checkbox.run() // negative-local-field-shadow
+  }
+
+  def unrelatedStablePath(repr: OtherRepr): Any = {
+    val singleton: repr.qctx.type = repr.qctx // negative-unrelated-stable-path
+    singleton
+  }
+}
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        ("app/Consumer.scala", source),
+        (
+            "duplicate/First.scala",
+            "package duplicate\nclass Quotes\nclass Repr(val qctx: Quotes)\n",
+        ),
+        (
+            "duplicate/Second.scala",
+            "package duplicate\nclass Quotes\nclass Repr(val qctx: Quotes)\n",
+        ),
+        (
+            "duplicate/Use.scala",
+            "package duplicate\nobject Use {\n  val repr = new Repr(new Quotes)\n  val singleton: repr.qctx.type = repr.qctx // negative-physical-stable-path\n}\n",
+        ),
+    ]);
+
+    let qctx = definition(&analyzer, "app.Repr.qctx");
+    let qctx_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&qctx)));
+    assert_hit_contains(&qctx_hits, "positive-local-stable-path");
+    assert_no_hit_contains(&qctx_hits, "negative-unrelated-stable-path");
+    let stable_type_qctx = source.find("repr.qctx.type").expect("stable type qctx") + 5;
+    assert!(
+        qctx_hits.iter().any(|hit| {
+            hit.start_offset == stable_type_qctx && hit.end_offset == stable_type_qctx + 4
+        }),
+        "expected the exact stable-type qctx segment, got {qctx_hits:#?}"
+    );
+
+    let checkbox = definition(&analyzer, "app.Consumer.checkbox");
+    let checkbox_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&checkbox)));
+    assert_hit_contains(&checkbox_hits, "positive-reassigned-owner-field");
+    assert_no_hit_contains(&checkbox_hits, "negative-parameter-field-shadow");
+    assert_no_hit_contains(&checkbox_hits, "negative-local-field-shadow");
+    let checkbox_qualifier = source
+        .find("checkbox.run() // positive-reassigned-owner-field")
+        .expect("field qualifier");
+    assert!(
+        checkbox_hits.iter().any(|hit| {
+            hit.start_offset == checkbox_qualifier
+                && hit.end_offset == checkbox_qualifier + "checkbox".len()
+        }),
+        "expected the exact checkbox qualifier range, got {checkbox_hits:#?}"
+    );
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = ScalaUsageGraphStrategy::new();
+    let inverse_qctx_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&qctx), &candidates, 1000));
+    assert!(
+        inverse_qctx_hits.iter().any(|hit| {
+            hit.start_offset == stable_type_qctx && hit.end_offset == stable_type_qctx + 4
+        }),
+        "whole-workspace inverse pass missed the exact stable-type qctx segment: {inverse_qctx_hits:#?}"
+    );
+    assert_no_hit_contains(&inverse_qctx_hits, "negative-unrelated-stable-path");
+
+    let first = project.file("duplicate/First.scala");
+    let duplicate_qctx = analyzer
+        .get_definitions("duplicate.Repr.qctx")
+        .into_iter()
+        .find(|unit| unit.is_field() && unit.source() == &first)
+        .expect("first physical qctx field");
+    let duplicate_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&duplicate_qctx)),
+    );
+    assert_no_hit_contains(&duplicate_hits, "negative-physical-stable-path");
+
+    let inverse_checkbox_hits = hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&checkbox),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&inverse_checkbox_hits, "positive-reassigned-owner-field");
+    assert!(
+        inverse_checkbox_hits.iter().any(|hit| {
+            hit.start_offset == checkbox_qualifier
+                && hit.end_offset == checkbox_qualifier + "checkbox".len()
+        }),
+        "whole-workspace inverse pass missed the exact checkbox qualifier: {inverse_checkbox_hits:#?}"
+    );
+    assert_no_hit_contains(&inverse_checkbox_hits, "negative-parameter-field-shadow");
+    assert_no_hit_contains(&inverse_checkbox_hits, "negative-local-field-shadow");
+}
+
+#[test]
 fn scala_usage_finder_resolves_lexical_nested_state_field_in_local_function() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (

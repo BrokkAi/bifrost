@@ -851,6 +851,30 @@ impl ProjectTypes {
         FieldResolution::NoMatch
     }
 
+    fn field_for_exact_owner(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+        member: &str,
+    ) -> FieldResolution {
+        let mut fields = self
+            .members_for_exact_owner_unit(scala, owner, member)
+            .into_iter()
+            .filter(|unit| unit.is_field() && !self.is_type_alias(scala, unit))
+            .cloned()
+            .collect::<Vec<_>>();
+        fields.sort();
+        fields.dedup();
+        match fields.as_slice() {
+            [] => FieldResolution::NoMatch,
+            [field] => FieldResolution::Resolved(ResolvedField {
+                declaration: field.clone(),
+                declared_type: self.field_declared_type(scala, field),
+            }),
+            [_, _, ..] => FieldResolution::Unresolved,
+        }
+    }
+
     pub(super) fn stable_type_member_for_owner(
         &self,
         scala: &ScalaAnalyzer,
@@ -5172,14 +5196,17 @@ fn record_reference(
             }
         }
         "identifier" | "operator_identifier" => {
-            if record_qualified_stable_reference(node, ctx, bindings) {
-                return;
-            }
             let name = node_text(node, ctx.source);
             if name.is_empty()
                 || has_ancestor_kind(node, "import_declaration")
                 || is_declaration_name(node)
                 || is_scala_case_pattern_binder(node)
+            {
+                return;
+            }
+            if record_local_stable_field_reference(node, ctx, bindings)
+                || record_enclosing_field_qualifier(node, name, ctx, bindings)
+                || record_qualified_stable_reference(node, ctx, bindings)
             {
                 return;
             }
@@ -5486,6 +5513,102 @@ fn record_qualified_stable_reference(
         ctx.record(callable.fq_name(), node);
     }
     true
+}
+
+/// Record a stable field path rooted in a parser-proven local binding. Namespace
+/// lookup deliberately rejects shadowed roots, so a path such as
+/// `repr.qctx.type` must instead start from `repr`'s inferred receiver type and
+/// traverse the fields carried by the stable identifier AST. Field lookup stays
+/// fail-closed when that logical receiver has multiple physical declarations.
+fn record_local_stable_field_reference(
+    node: Node<'_>,
+    ctx: &mut ScalaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
+) -> bool {
+    let Some(reference) = stable_identifier_reference(node, ctx.source) else {
+        return false;
+    };
+    let Some((member, owner_segments)) = reference.segments.split_last() else {
+        return false;
+    };
+    let Some(root) = owner_segments.first() else {
+        return false;
+    };
+    if !bindings.is_shadowed(root) {
+        return false;
+    }
+    let Some(mut owner) =
+        precise_scala_binding(bindings, root).and_then(|binding| binding.receiver_type)
+    else {
+        return true;
+    };
+    for segment in &owner_segments[1..] {
+        owner = match ctx.types.field_for_owner_member(ctx.scala, &owner, segment) {
+            FieldResolution::Resolved(field) => match field.declared_type {
+                Some(declared_type) => declared_type,
+                None => return true,
+            },
+            FieldResolution::NoMatch | FieldResolution::Unresolved => return true,
+        };
+    }
+    if let FieldResolution::Resolved(field) =
+        ctx.types.field_for_owner_member(ctx.scala, &owner, member)
+    {
+        ctx.record(field.declaration.fq_name(), node);
+    }
+    true
+}
+
+/// A receiver root is itself a field reference even when the terminal member
+/// is a method call. Record that root before terminal dispatch, preserving a
+/// direct field binding across assignment refreshes while failing closed for a
+/// local or parameter shadow of the same spelling.
+fn record_enclosing_field_qualifier(
+    node: Node<'_>,
+    name: &str,
+    ctx: &mut ScalaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
+) -> bool {
+    if !node.parent().is_some_and(|parent| {
+        parent.kind() == "field_expression" && parent.child_by_field_name("value") == Some(node)
+    }) {
+        return false;
+    }
+    if let Some(owner) = exact_owner_field_binding(bindings, name) {
+        match ctx.types.field_for_exact_owner(ctx.scala, &owner, name) {
+            FieldResolution::Resolved(field) => {
+                ctx.record(field.declaration.fq_name(), node);
+            }
+            FieldResolution::NoMatch | FieldResolution::Unresolved => {}
+        }
+        return true;
+    }
+    if bindings.is_shadowed(name) {
+        return true;
+    }
+    let Some(owner) = ctx.enclosing_class_unit(node.start_byte()) else {
+        return false;
+    };
+    match ctx.types.field_for_exact_owner(ctx.scala, owner, name) {
+        FieldResolution::Resolved(field) => {
+            ctx.record(field.declaration.fq_name(), node);
+            true
+        }
+        FieldResolution::Unresolved => true,
+        FieldResolution::NoMatch => {
+            match ctx
+                .types
+                .field_for_owner_member(ctx.scala, &owner.fq_name(), name)
+            {
+                FieldResolution::Resolved(field) => {
+                    ctx.record(field.declaration.fq_name(), node);
+                    true
+                }
+                FieldResolution::Unresolved => true,
+                FieldResolution::NoMatch => false,
+            }
+        }
+    }
 }
 
 fn companion_method_value_context(
