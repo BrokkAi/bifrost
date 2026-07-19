@@ -4,6 +4,7 @@ use brokk_bifrost::usages::{ExplicitCandidateProvider, FuzzyResult, UsageFinder}
 use brokk_bifrost::{CodeUnitType, CppAnalyzer, IAnalyzer, Language, ProjectFile};
 use common::InlineTestProject;
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::Arc;
 
 fn signature_arity(signature: &str) -> usize {
@@ -96,7 +97,7 @@ TSNode extract_cpp_only(TSNode node) {
         .find(|unit| {
             unit.kind() == CodeUnitType::Function
                 && unit.identifier() == "ts_node_child_by_field_name"
-                && unit.source().rel_path().to_string_lossy() == "tree_sitter/api.h"
+                && unit.source().rel_path() == Path::new("tree_sitter/api.h")
         })
         .cloned()
         .expect("included three-parameter declaration");
