@@ -998,6 +998,70 @@ object Factories {
 }
 
 #[test]
+fn scala_forward_named_arguments_do_not_poison_local_receiver_bindings() {
+    let source = r#"package app
+
+class Body { val summary: Int = 1 }
+class Other { val summary: Int = 2 }
+case class Result(body: Int, short: Int)
+class Built(val body: Int, val short: Int)
+
+abstract class Parser {
+  protected def makeBody(seed: Int): Body
+  protected def makeOther(seed: Int): Other
+
+  final def parse(seed: Int): Int =
+    val body = makeBody(seed)
+    val result = Result(
+      body = body.summary,
+      short = body.summary,
+    )
+    val built = new Built(
+      body = body.summary,
+      short = body.summary,
+    )
+    var changing = makeBody(seed)
+    changing = makeOther(seed)
+    result.short + built.short + changing.summary
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/NamedArguments.scala", source)
+        .build();
+    let summary_sites = source
+        .match_indices("body.summary")
+        .map(|(start, _)| start + "body.".len())
+        .collect::<Vec<_>>();
+    let reassigned_summary =
+        source.find("changing.summary").expect("reassigned summary") + "changing.".len();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": [
+            location_in("app/NamedArguments.scala", source, summary_sites[0]),
+            location_in("app/NamedArguments.scala", source, summary_sites[1]),
+            location_in("app/NamedArguments.scala", source, summary_sites[2]),
+            location_in("app/NamedArguments.scala", source, summary_sites[3]),
+            location_in("app/NamedArguments.scala", source, reassigned_summary),
+        ]})
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for result in &results[..4] {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], "app.Body.summary",
+            "{value}"
+        );
+    }
+    assert_eq!(results[4]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[4]["definitions"][0]["fqn"], "app.Other.summary",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_forward_definition_filters_callable_roles_before_overload_shapes() {
     let source = r#"package app
 trait Context

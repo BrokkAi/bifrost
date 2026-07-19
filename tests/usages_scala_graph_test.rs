@@ -3939,6 +3939,113 @@ class UnrelatedFactory {
 }
 
 #[test]
+fn scala_usage_engines_keep_named_arguments_out_of_assignment_inference() {
+    let source = r#"package app
+
+class Body { val summary: Int = 1 }
+class Other { val summary: Int = 2 }
+case class Result(body: Int, short: Int)
+class Built(val body: Int, val short: Int)
+
+abstract class Parser {
+  protected def makeBody(seed: Int): Body
+  protected def makeOther(seed: Int): Other
+
+  final def parse(seed: Int): Int =
+    val body = makeBody(seed)
+    val result = Result(
+      body = body.summary, // positive-first-named-rhs
+      short = body.summary, // positive-second-named-rhs
+    )
+    val built = new Built(
+      body = body.summary, // positive-constructor-first-named-rhs
+      short = body.summary, // positive-constructor-second-named-rhs
+    )
+    var changing = makeBody(seed)
+    changing = makeOther(seed)
+    result.short + built.short + changing.summary // positive-real-reassignment
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/NamedArguments.scala", source)]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    for target_fqn in [
+        "app.Body.summary",
+        "app.Result.body",
+        "app.Built.body",
+        "app.Other.summary",
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let targeted =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        let inverted = hits(ScalaUsageGraphStrategy::new().find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ));
+        match target_fqn {
+            "app.Body.summary" => {
+                for marker in [
+                    "positive-first-named-rhs",
+                    "positive-second-named-rhs",
+                    "positive-constructor-first-named-rhs",
+                    "positive-constructor-second-named-rhs",
+                ] {
+                    assert_hit_contains(&targeted, marker);
+                    assert_hit_contains(&inverted, marker);
+                }
+                assert_no_hit_contains(&targeted, "positive-real-reassignment");
+                assert_no_hit_contains(&inverted, "positive-real-reassignment");
+            }
+            "app.Result.body" => {
+                assert_hit_contains(&targeted, "positive-first-named-rhs");
+                assert_hit_contains(&inverted, "positive-first-named-rhs");
+                let lhs = source
+                    .find("body = body.summary")
+                    .expect("named argument lhs");
+                assert!(
+                    targeted
+                        .iter()
+                        .any(|hit| hit.start_offset == lhs && hit.end_offset == lhs + "body".len()),
+                    "targeted named-argument LHS was not the Result field: {targeted:#?}"
+                );
+                assert!(
+                    inverted
+                        .iter()
+                        .any(|hit| hit.start_offset == lhs && hit.end_offset == lhs + "body".len()),
+                    "inverted named-argument LHS was not the Result field: {inverted:#?}"
+                );
+            }
+            "app.Built.body" => {
+                assert_hit_contains(&targeted, "positive-constructor-first-named-rhs");
+                assert_hit_contains(&inverted, "positive-constructor-first-named-rhs");
+                let lhs = source
+                    .find("body = body.summary, // positive-constructor-first-named-rhs")
+                    .expect("constructor named argument lhs");
+                assert!(
+                    targeted
+                        .iter()
+                        .any(|hit| hit.start_offset == lhs && hit.end_offset == lhs + "body".len()),
+                    "targeted constructor named-argument LHS was not the Built field: {targeted:#?}"
+                );
+                assert!(
+                    inverted
+                        .iter()
+                        .any(|hit| hit.start_offset == lhs && hit.end_offset == lhs + "body".len()),
+                    "inverted constructor named-argument LHS was not the Built field: {inverted:#?}"
+                );
+            }
+            "app.Other.summary" => {
+                assert_hit_contains(&targeted, "positive-real-reassignment");
+                assert_hit_contains(&inverted, "positive-real-reassignment");
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
 fn scala_nested_mixin_factory_receiver_survives_while_reassignment() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (

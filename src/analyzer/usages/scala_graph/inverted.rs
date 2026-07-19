@@ -39,12 +39,13 @@ use super::syntax::{
     call_arities_for_reference, call_site_shape_for_reference, enclosing_template_declarations,
     is_bare_companion_method_value_reference, is_constructor_like_reference, is_declaration_name,
     is_extractor_reference, is_infix_pattern_operator, is_scala_case_pattern_binder,
-    is_scala_class_reference, is_scala_object_reference, is_terminal_stable_field_reference,
-    node_text, parenthesized_arity, qualified_stable_type_reference,
-    resolve_stable_object_expression, scala_callable_alternative_is_candidate,
-    scala_callable_alternative_matches, scala_callable_shape_matches,
-    scala_import_is_visible_at_byte, scala_pattern_binder_names, scala_source_facts,
-    stable_identifier_reference, template_direct_term_member_named, template_self_type,
+    is_scala_class_reference, is_scala_named_argument_assignment, is_scala_object_reference,
+    is_terminal_stable_field_reference, node_text, parenthesized_arity,
+    qualified_stable_type_reference, resolve_stable_object_expression,
+    scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
+    scala_callable_shape_matches, scala_import_is_visible_at_byte, scala_pattern_binder_names,
+    scala_source_facts, stable_identifier_reference, template_direct_term_member_named,
+    template_self_type,
 };
 use crate::analyzer::scala::{
     ScalaAdapter, ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaExportSelector,
@@ -4932,7 +4933,9 @@ fn walk(
                 if enters_scope {
                     stack.push(WalkEvent::ExitScope);
                 }
-                if node.kind() == "assignment_expression" {
+                if node.kind() == "assignment_expression"
+                    && !is_scala_named_argument_assignment(node)
+                {
                     stack.push(WalkEvent::RefreshAssignment(node));
                 }
                 let case_pattern = (node.kind() == "case_clause")

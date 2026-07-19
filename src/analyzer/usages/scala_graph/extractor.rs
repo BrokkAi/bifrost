@@ -33,9 +33,10 @@ use crate::analyzer::usages::scala_graph::syntax::{
     is_bare_companion_method_value_reference, is_call_function_reference,
     is_constructor_like_reference, is_declaration_name, is_extractor_reference, is_identifier_node,
     is_infix_pattern_operator, is_owner_qualified_this, is_scala_case_pattern_binder,
-    is_scala_class_reference, is_scala_object_reference, is_terminal_stable_field_reference,
-    member_qualifier, member_qualifier_node, named_argument_invocation_owner, node_text,
-    parenthesized_arity, qualified_stable_type_reference, resolve_stable_object_expression,
+    is_scala_class_reference, is_scala_named_argument_assignment, is_scala_object_reference,
+    is_terminal_stable_field_reference, member_qualifier, member_qualifier_node,
+    named_argument_invocation_owner, node_text, parenthesized_arity,
+    qualified_stable_type_reference, resolve_stable_object_expression,
     scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
     scala_callable_shape_matches, scala_pattern_binder_names, scala_union_type_alternative_paths,
     stable_identifier_reference, template_direct_term_member_named, template_self_type,
@@ -209,7 +210,9 @@ fn scan_tree(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 stack.extend(children.into_iter().rev().map(ScanEvent::Enter));
             }
             ScanEvent::Exit { node, exits_scope } => {
-                if node.kind() == "assignment_expression" {
+                if node.kind() == "assignment_expression"
+                    && !is_scala_named_argument_assignment(node)
+                {
                     refresh_assignment_binding(node, ctx);
                 }
                 activate_case_pattern_binders(node, ctx);

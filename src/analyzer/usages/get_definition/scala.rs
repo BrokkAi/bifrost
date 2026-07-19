@@ -15,8 +15,9 @@ use crate::analyzer::usages::scala_graph::namespace::{
 use crate::analyzer::usages::scala_graph::syntax::{
     ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableRole, ScalaCallableSiteRole,
     applied_expression_for_reference, call_arities_for_reference, call_site_shape_for_reference,
-    is_scala_case_pattern_binder, scala_callable_alternative_is_candidate,
-    scala_callable_alternative_matches, scala_pattern_binder_names,
+    is_scala_case_pattern_binder, is_scala_named_argument_assignment,
+    scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
+    scala_pattern_binder_names,
 };
 use crate::analyzer::usages::scala_graph::{
     method_signature_arity, resolved_extension_receiver_type,
@@ -3304,7 +3305,9 @@ fn scala_seed_active_path(
             "val_definition" | "var_definition" if node.start_byte() < cutoff_start => {
                 scala_seed_value_definition(ctx, resolver, root, node, cutoff_start, bindings)
             }
-            "assignment_expression" if node.end_byte() <= cutoff_start => {
+            "assignment_expression"
+                if node.end_byte() <= cutoff_start && !is_scala_named_argument_assignment(node) =>
+            {
                 scala_refresh_assignment(ctx, resolver, root, node, bindings)
             }
             _ => {}

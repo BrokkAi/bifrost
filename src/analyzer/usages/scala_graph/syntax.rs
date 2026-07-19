@@ -1442,6 +1442,26 @@ pub(crate) fn named_argument_invocation_owner(node: Node<'_>) -> Option<Node<'_>
     }
 }
 
+/// Whether this assignment-shaped node is a Scala named argument rather than
+/// a mutation of a local binding.
+///
+/// Tree-sitter represents both `call(name = value)` and
+/// `new Type(name = value)` with an `assignment_expression` directly inside
+/// the invocation's `arguments`. Binding inference must not refresh `name`
+/// after visiting that node: the left side names a parameter/member of the
+/// callee, not a value being reassigned in the current lexical scope.
+pub(crate) fn is_scala_named_argument_assignment(node: Node<'_>) -> bool {
+    if node.kind() != "assignment_expression" {
+        return false;
+    }
+    let Some(arguments) = node.parent().filter(|parent| parent.kind() == "arguments") else {
+        return false;
+    };
+    arguments.parent().is_some_and(|invocation| {
+        matches!(invocation.kind(), "call_expression" | "instance_expression")
+    })
+}
+
 pub(crate) fn terminal_invocation_owner_name(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "identifier" | "type_identifier" => Some(node),
