@@ -146,6 +146,12 @@ Cancellation stops the Pi request promptly, though the current Bifrost stdio
 server may finish analyzer work before it reads the MCP cancellation
 notification.
 
+Bifrost results follow Pi's normal two-level output handling. The TUI shows a
+five-visual-line preview and expands the bounded result with Pi's tool-output
+shortcut (`Ctrl+O` by default). The model receives at most the first 2,000 lines
+or 50 KB. When complete text exceeds that limit, the result includes the path
+to a dedicated temporary overflow file containing the full output.
+
 For a real-host smoke from the repository root, build Bifrost and ask Pi to
 exercise navigation plus both supported structural-query inputs:
 

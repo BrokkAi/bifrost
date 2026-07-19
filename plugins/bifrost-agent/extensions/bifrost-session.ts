@@ -12,7 +12,13 @@ import {
   toolBelongsToSelection,
   type BifrostCapability,
 } from "./bifrost-capabilities.ts";
-import { mapToolResult, toolLabel, toolParameters } from "./mcp-adapter.ts";
+import {
+  createBoundedToolError,
+  mapToolResult,
+  renderToolResult,
+  toolLabel,
+  toolParameters,
+} from "./mcp-adapter.ts";
 
 const CONNECT_TIMEOUT_MS = 60_000;
 const CALL_TIMEOUT_MS = 300_000;
@@ -435,10 +441,11 @@ class BifrostSession implements BifrostSessionController {
       this.pi.registerTool({
         name: registeredName,
         label: `Bifrost: ${toolLabel(tool)}`,
-        description: `${tool.description ?? `Bifrost MCP tool ${tool.name}.`} Output is limited to 2,000 lines or 50 KB.`,
+        description: `${tool.description ?? `Bifrost MCP tool ${tool.name}.`} Output is truncated to the first 2,000 lines or 50 KB; full output is saved to a temporary file.`,
         parameters: toolParameters(tool),
         execute: async (_toolCallId, params, signal) =>
           await this.executeTool(tool, registeredName, params, signal),
+        renderResult: renderToolResult,
       });
       this.ownedPiToolNames.add(registeredName);
     }
@@ -467,9 +474,9 @@ class BifrostSession implements BifrostSessionController {
       });
     } catch (cause) {
       const reason = cause instanceof Error ? `: ${cause.message}` : ".";
-      throw new Error(`Bifrost tool ${tool.name} failed${reason}`, { cause });
+      throw await createBoundedToolError(`Bifrost tool ${tool.name} failed${reason}`, cause);
     }
-    return mapToolResult(tool.name, result);
+    return await mapToolResult(tool.name, result);
   }
 
   private closeOnce(client: BifrostSessionClient | undefined): Promise<void> {

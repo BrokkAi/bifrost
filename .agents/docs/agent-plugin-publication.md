@@ -125,7 +125,10 @@ context, but throw before Bifrost starts in modes without one. Pi's post-filter
 active tool set, not the requested names, determines the Bifrost tool count and whether
 the namespace prompt note appears. Route interactive extension failures through
 the current `ExtensionContext` with `ctx.ui.notify(..., "error")`, and throw
-startup errors through Pi's extension runner in modes without a UI context. Never use
+startup errors through Pi's extension runner in modes without a UI context. Render
+Bifrost results with Pi's compact five-visual-line TUI preview and normal expand
+shortcut, independently cap model-visible text at 2,000 lines or 50 KB, and save
+complete oversized text to a dedicated temporary overflow file. Never use
 `console.log` or `console.error` from the Pi extension because direct terminal
 writes corrupt or displace TUI output.
 

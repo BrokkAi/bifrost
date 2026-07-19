@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { readFile, rm } from "node:fs/promises";
+import { dirname } from "node:path";
 import test from "node:test";
+
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
 
 import { BIFROST_CAPABILITIES } from "../extensions/bifrost-capabilities.ts";
 import {
@@ -127,6 +131,9 @@ function fakeClient(options = {}) {
     listTools: options.listTools ?? (async () => symbolTools()),
     async callTool(name, args, requestOptions) {
       calls.push({ name, args, options: requestOptions });
+      if (options.callTool) {
+        return await options.callTool(name, args, requestOptions);
+      }
       return options.result ?? { content: [{ type: "text", text: "found" }] };
     },
     onClose(handler) {
@@ -178,6 +185,7 @@ test("registers a namespaced tool and forwards the canonical MCP name", async ()
   assert.deepEqual(session.status(), connectedStatus("/workspace", ["symbols"], SYMBOL_TOOL_NAMES.length));
   assert.deepEqual(resolved, [{ root: "/workspace", toolset: "symbol" }]);
   assert.equal(pi.registered[0].name, "bifrost_search_symbols");
+  assert.equal(typeof pi.registered[0].renderResult, "function");
   assert.deepEqual(new Set(pi.activeNames), new Set(["read", ...piNames(SYMBOL_TOOL_NAMES)]));
 
   const controller = new AbortController();
@@ -187,6 +195,39 @@ test("registers a namespaced tool and forwards the canonical MCP name", async ()
   assert.deepEqual(client.calls[0].args, { query: "Widget" });
   assert.equal(client.calls[0].options.signal, controller.signal);
   assert.equal(client.calls[0].options.timeout, 300_000);
+});
+
+test("bounds SDK call failures and preserves the complete diagnostic in an overflow file", async (t) => {
+  const oversized = `${"transport failure ".repeat(6)}\n`.repeat(DEFAULT_MAX_LINES + 1000);
+  const cause = new Error(oversized);
+  const client = fakeClient({
+    callTool: async () => {
+      throw cause;
+    },
+  });
+  const pi = fakePi();
+  const session = createBifrostSession(pi, dependencies([client]));
+  assert.equal(await session.start("/workspace", ["symbols"]), true);
+
+  let error;
+  try {
+    await pi.registered[0].execute("failed-call", { query: "Widget" });
+  } catch (caught) {
+    error = caught;
+  }
+
+  assert.ok(error instanceof Error);
+  assert.equal(error.cause, cause);
+  assert.ok(Buffer.byteLength(error.message, "utf8") <= DEFAULT_MAX_BYTES);
+  assert.ok(error.message.split("\n").length <= DEFAULT_MAX_LINES);
+  const pathMatch = error.message.match(/Full output: ([^\]]+)]$/);
+  assert.ok(pathMatch);
+  const fullOutputPath = pathMatch[1];
+  t.after(() => rm(dirname(fullOutputPath), { recursive: true }));
+  assert.equal(
+    await readFile(fullOutputPath, "utf8"),
+    `Bifrost tool search_symbols failed: ${oversized}`,
+  );
 });
 
 test("accepts reference-rendered symbol tools as alternatives to location-rendered tools", async () => {
