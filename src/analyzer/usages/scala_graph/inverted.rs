@@ -28,18 +28,18 @@ use super::resolver::{
 };
 use super::shared::ScalaEdgeGraph;
 use super::syntax::{
-    ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableRole, ScalaCallableUsePolicy,
-    ScalaImportContextIndex, ScalaMethodValueContext, ScalaPackageContextIndex,
-    ScalaQualifiedStableTypeRole, ScalaSourceFacts, call_arities_for_reference,
-    call_site_shape_for_reference, enclosing_template_declarations,
+    ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableRole, ScalaCallableSiteRole,
+    ScalaCallableUsePolicy, ScalaImportContextIndex, ScalaMethodValueContext,
+    ScalaPackageContextIndex, ScalaQualifiedStableTypeRole, ScalaSourceFacts,
+    call_arities_for_reference, call_site_shape_for_reference, enclosing_template_declarations,
     is_bare_companion_method_value_reference, is_constructor_like_reference, is_declaration_name,
     is_extractor_reference, is_infix_pattern_operator, is_scala_case_pattern_binder,
     is_scala_class_reference, is_scala_object_reference, is_terminal_stable_field_reference,
     node_text, parenthesized_arity, qualified_stable_type_reference,
-    resolve_stable_object_expression, scala_callable_shape_is_candidate,
-    scala_callable_shape_matches, scala_import_is_visible_at_byte, scala_pattern_binder_names,
-    scala_source_facts, stable_identifier_reference, template_direct_term_member_named,
-    template_self_type,
+    resolve_stable_object_expression, scala_callable_alternative_is_candidate,
+    scala_callable_alternative_matches, scala_callable_shape_matches,
+    scala_import_is_visible_at_byte, scala_pattern_binder_names, scala_source_facts,
+    stable_identifier_reference, template_direct_term_member_named, template_self_type,
 };
 use crate::analyzer::scala::{
     ScalaAdapter, ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaExportSelector,
@@ -740,17 +740,6 @@ impl ProjectTypes {
         scala.is_scala_trait_declaration(code_unit)
     }
 
-    fn method_declarations_for_owner_member(
-        &self,
-        scala: &ScalaAnalyzer,
-        owner_fqn: &str,
-        member: &str,
-        call_arities: Option<&[usize]>,
-    ) -> Vec<CodeUnit> {
-        let members = self.members_for_exact_owner_name(owner_fqn, member);
-        self.method_declarations_for_members(scala, &members, call_arities)
-    }
-
     fn method_declarations_for_members(
         &self,
         scala: &ScalaAnalyzer,
@@ -761,6 +750,7 @@ impl ProjectTypes {
             scala,
             members,
             ScalaCallMatch::Arities(call_arities),
+            ScalaCallableSiteRole::Ordinary,
         )
     }
 
@@ -774,7 +764,43 @@ impl ProjectTypes {
             scala,
             members,
             ScalaCallMatch::Shape(call_shape),
+            ScalaCallableSiteRole::Ordinary,
         )
+    }
+
+    fn callable_declarations_for_members_with_shape(
+        &self,
+        scala: &ScalaAnalyzer,
+        members: &[&CodeUnit],
+        call_shape: &ScalaCallSiteShape,
+        site_role: ScalaCallableSiteRole,
+    ) -> Vec<CodeUnit> {
+        self.method_declarations_for_members_matching(
+            scala,
+            members,
+            ScalaCallMatch::Shape(call_shape),
+            site_role,
+        )
+    }
+
+    fn callable_declarations_for_members(
+        &self,
+        scala: &ScalaAnalyzer,
+        members: &[&CodeUnit],
+        call_shape: Option<&ScalaCallSiteShape>,
+        site_role: ScalaCallableSiteRole,
+    ) -> Vec<CodeUnit> {
+        match call_shape {
+            Some(shape) => {
+                self.callable_declarations_for_members_with_shape(scala, members, shape, site_role)
+            }
+            None => self.method_declarations_for_members_matching(
+                scala,
+                members,
+                ScalaCallMatch::Arities(None),
+                site_role,
+            ),
+        }
     }
 
     fn method_declarations_for_members_matching(
@@ -782,6 +808,7 @@ impl ProjectTypes {
         scala: &ScalaAnalyzer,
         members: &[&CodeUnit],
         call: ScalaCallMatch<'_>,
+        site_role: ScalaCallableSiteRole,
     ) -> Vec<CodeUnit> {
         let candidates = members
             .iter()
@@ -799,38 +826,62 @@ impl ProjectTypes {
         let callable_count = match call {
             ScalaCallMatch::Arities(_) => candidates
                 .iter()
-                .map(|(_, _, alternatives)| alternatives.len().max(1))
+                .map(|(method, _, alternatives)| {
+                    if alternatives.is_empty() {
+                        usize::from(site_role.accepts(fallback_callable_role(scala, method)))
+                    } else {
+                        alternatives
+                            .iter()
+                            .filter(|alternative| site_role.accepts(alternative.role))
+                            .count()
+                    }
+                })
                 .sum::<usize>(),
             ScalaCallMatch::Shape(shape) => candidates
                 .iter()
-                .map(|(_, facts, alternatives)| {
-                    count_callable_shapes_matching(facts, alternatives, |declared| {
-                        scala_callable_shape_is_candidate(
-                            declared,
-                            shape,
-                            ScalaCallableUsePolicy::OrdinaryMethod,
-                        )
-                    })
+                .map(|(method, facts, alternatives)| {
+                    count_callable_alternatives_matching(
+                        facts,
+                        alternatives,
+                        fallback_callable_role(scala, method),
+                        |alternative_role, declared| {
+                            scala_callable_alternative_is_candidate(
+                                alternative_role,
+                                declared,
+                                shape,
+                                site_role,
+                            )
+                        },
+                    )
                 })
                 .sum::<usize>(),
         };
         let unique_callable = callable_count == 1;
         candidates
             .iter()
-            .filter(|(_, facts, alternatives)| match call {
-                ScalaCallMatch::Arities(call_arities) => {
-                    method_call_shape_matches(facts, alternatives, call_arities, unique_callable)
-                }
-                ScalaCallMatch::Shape(shape) => {
-                    any_callable_shape(facts, alternatives, |declared| {
-                        scala_callable_shape_matches(
+            .filter(|(method, facts, alternatives)| match call {
+                ScalaCallMatch::Arities(call_arities) => callable_call_shape_matches(
+                    facts,
+                    alternatives,
+                    call_arities,
+                    fallback_callable_role(scala, method),
+                    site_role,
+                    unique_callable,
+                ),
+                ScalaCallMatch::Shape(shape) => any_callable_alternative(
+                    facts,
+                    alternatives,
+                    fallback_callable_role(scala, method),
+                    |alternative_role, declared| {
+                        scala_callable_alternative_matches(
+                            alternative_role,
                             declared,
                             Some(shape),
-                            ScalaCallableUsePolicy::OrdinaryMethod,
+                            site_role,
                             unique_callable,
                         )
-                    })
-                }
+                    },
+                ),
             })
             .map(|(method, _, _)| (*method).clone())
             .collect()
@@ -1121,7 +1172,8 @@ impl ProjectTypes {
         let alternatives = self.callable_alternatives_for(scala, method);
         let mut resolved = None;
         for alternative in alternatives.iter().filter(|alternative| {
-            ordinary_callable_shape_matches(&alternative.shape, Some(call_arities), true)
+            alternative.role == ScalaCallableRole::Ordinary
+                && ordinary_callable_shape_matches(&alternative.shape, Some(call_arities), true)
         }) {
             let arity = alternative
                 .parameter_function_arities
@@ -1320,7 +1372,10 @@ impl ProjectTypes {
                 matched = true;
                 continue;
             }
-            for alternative in alternatives.iter() {
+            for alternative in alternatives
+                .iter()
+                .filter(|alternative| alternative.role == ScalaCallableRole::Ordinary)
+            {
                 let return_type = alternative
                     .return_type
                     .as_deref()
@@ -1368,6 +1423,22 @@ impl ProjectTypes {
         members: &[&CodeUnit],
         call_arities: Option<&[usize]>,
     ) -> Option<String> {
+        let call_shape = call_arities.map(ScalaCallSiteShape::ordinary);
+        self.member_return_type_for_members_with_shape(
+            scala,
+            resolver,
+            members,
+            call_shape.as_ref(),
+        )
+    }
+
+    fn member_return_type_for_members_with_shape(
+        &self,
+        scala: &ScalaAnalyzer,
+        resolver: &NameResolver,
+        members: &[&CodeUnit],
+        call_shape: Option<&ScalaCallSiteShape>,
+    ) -> Option<String> {
         let candidates = members
             .iter()
             .filter(|method| method.is_function())
@@ -1383,14 +1454,47 @@ impl ProjectTypes {
             .collect::<Vec<_>>();
         let callable_count = candidates
             .iter()
-            .map(|(_, _, alternatives)| alternatives.len().max(1))
+            .map(|(method, _, alternatives)| {
+                if alternatives.is_empty() {
+                    usize::from(
+                        fallback_callable_role(scala, method) == ScalaCallableRole::Ordinary,
+                    )
+                } else {
+                    alternatives
+                        .iter()
+                        .filter(|alternative| {
+                            alternative.role == ScalaCallableRole::Ordinary
+                                && call_shape.is_none_or(|actual| {
+                                    scala_callable_alternative_is_candidate(
+                                        alternative.role,
+                                        &alternative.shape,
+                                        actual,
+                                        ScalaCallableSiteRole::Ordinary,
+                                    )
+                                })
+                        })
+                        .count()
+                }
+            })
             .sum::<usize>();
         let unique_callable = callable_count == 1;
         let mut resolved_return = None;
         let mut matched = false;
-        for (_, facts, alternatives) in candidates {
+        for (method, facts, alternatives) in candidates {
             if alternatives.is_empty() {
-                if !method_call_shape_matches(facts, &[], call_arities, unique_callable) {
+                let fallback_shape = facts
+                    .callable_arity
+                    .or_else(|| facts.arity.map(CallableArity::exact))
+                    .map(ScalaCallableParameterList::explicit)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                if !scala_callable_alternative_matches(
+                    fallback_callable_role(scala, method),
+                    &fallback_shape,
+                    call_shape,
+                    ScalaCallableSiteRole::Ordinary,
+                    unique_callable,
+                ) {
                     continue;
                 }
                 let return_type = facts.return_type_fqn.clone()?;
@@ -1405,7 +1509,13 @@ impl ProjectTypes {
                 continue;
             }
             for alternative in alternatives.iter().filter(|alternative| {
-                ordinary_callable_shape_matches(&alternative.shape, call_arities, unique_callable)
+                scala_callable_alternative_matches(
+                    alternative.role,
+                    &alternative.shape,
+                    call_shape,
+                    ScalaCallableSiteRole::Ordinary,
+                    unique_callable,
+                )
             }) {
                 let return_type = alternative
                     .return_type
@@ -1529,6 +1639,19 @@ impl ProjectTypes {
             members.retain(|unit| owner_fqn(unit).as_deref() == Some(owner));
         }
         members
+    }
+
+    fn members_for_exact_owner_unit<'a>(
+        &'a self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+        member: &str,
+    ) -> Vec<&'a CodeUnit> {
+        self.members_for_exact_owner_name(&owner.fq_name(), member)
+            .into_iter()
+            .filter(|unit| unit.source() == owner.source())
+            .filter(|unit| scala.structural_parent_of(unit).as_ref() == Some(owner))
+            .collect()
     }
 
     fn package_types_in(&self, package: &str) -> PackageTypeEntries {
@@ -2171,42 +2294,73 @@ impl ProjectTypes {
         (fields.len() == 1).then(|| fields[0].fq_name())
     }
 
-    pub(super) fn constructor_call_shape_matches(
+    pub(super) fn explicit_constructor_call_matches(
         &self,
         scala: &ScalaAnalyzer,
         type_fqn: &str,
-        call_arities: Option<&[usize]>,
+        call_shape: Option<&ScalaCallSiteShape>,
     ) -> bool {
-        let Some(call_arities) = call_arities else {
-            return false;
-        };
         let Some(target) = self.type_by_normalized_fqn(&scala_normalized_fq_name(type_fqn)) else {
             return false;
         };
-        self.constructor_target_call_shape_matches(scala, target, Some(call_arities))
+        self.constructor_target_matches(
+            scala,
+            target,
+            call_shape,
+            ScalaCallableSiteRole::ExplicitConstruction,
+        )
     }
 
-    pub(super) fn constructor_target_call_shape_matches(
+    pub(super) fn explicit_constructor_target_matches(
         &self,
         scala: &ScalaAnalyzer,
         target: &CodeUnit,
-        call_arities: Option<&[usize]>,
+        call_shape: Option<&ScalaCallSiteShape>,
     ) -> bool {
-        let Some(call_arities) = call_arities else {
-            return false;
-        };
+        let members = self.members_for_exact_owner_unit(scala, target, target.identifier());
+        !self
+            .callable_declarations_for_members(
+                scala,
+                &members,
+                call_shape,
+                ScalaCallableSiteRole::ExplicitConstruction,
+            )
+            .is_empty()
+            || self.constructor_target_matches(
+                scala,
+                target,
+                call_shape,
+                ScalaCallableSiteRole::ExplicitConstruction,
+            )
+    }
+
+    fn constructor_target_matches(
+        &self,
+        scala: &ScalaAnalyzer,
+        target: &CodeUnit,
+        call_shape: Option<&ScalaCallSiteShape>,
+        site_role: ScalaCallableSiteRole,
+    ) -> bool {
         let alternatives = self.callable_alternatives_for(scala, target);
         if alternatives.is_empty() {
-            return ordinary_callable_shape_matches(
+            return scala_callable_alternative_matches(
+                ScalaCallableRole::PrimaryConstructor,
                 &[ScalaCallableParameterList::explicit(CallableArity::exact(
                     0,
                 ))],
-                Some(call_arities),
+                call_shape,
+                site_role,
                 false,
             );
         }
         alternatives.iter().any(|alternative| {
-            ordinary_callable_shape_matches(&alternative.shape, Some(call_arities), false)
+            scala_callable_alternative_matches(
+                alternative.role,
+                &alternative.shape,
+                call_shape,
+                site_role,
+                false,
+            )
         })
     }
 
@@ -2411,40 +2565,52 @@ impl ProjectTypes {
                 .iter()
                 .any(|companion| {
                     ["unapply", "unapplySeq"].iter().any(|member| {
-                        self.members_for_exact_owner_name(&companion.fq_name(), member)
+                        self.members_for_exact_owner_unit(scala, companion, member)
                             .iter()
                             .any(|unit| unit.is_function())
                     })
                 })
     }
 
-    pub(super) fn class_application_matches(
+    fn class_application_matches_with_shape(
         &self,
         scala: &ScalaAnalyzer,
         resolver: &NameResolver,
         target: &CodeUnit,
-        call_arities: Option<&[usize]>,
+        call_shape: Option<&ScalaCallSiteShape>,
     ) -> bool {
-        if self.class_companion_apply_call_matches(scala, resolver, target, call_arities) {
+        if self.class_companion_apply_call_matches_with_shape(scala, resolver, target, call_shape) {
             return true;
         }
         if self
             .exact_companion_objects(scala, target)
             .iter()
             .any(|companion| {
-                !self
-                    .method_declarations_for_owner_member(
-                        scala,
-                        &companion.fq_name(),
-                        "apply",
-                        call_arities,
-                    )
-                    .is_empty()
+                self.members_for_exact_owner_unit(scala, companion, "apply")
+                    .iter()
+                    .any(|unit| {
+                        unit.is_function()
+                            && call_shape.is_some_and(|shape| {
+                                !self
+                                    .callable_declarations_for_members_with_shape(
+                                        scala,
+                                        &[*unit],
+                                        shape,
+                                        ScalaCallableSiteRole::Ordinary,
+                                    )
+                                    .is_empty()
+                            })
+                    })
             })
         {
             return false;
         }
-        self.constructor_call_shape_matches(scala, &target.fq_name(), call_arities)
+        self.constructor_target_matches(
+            scala,
+            target,
+            call_shape,
+            ScalaCallableSiteRole::PrimaryConstruction,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2455,10 +2621,11 @@ impl ProjectTypes {
         class_fqn: Option<&str>,
         object_fqn: Option<&str>,
         name: &str,
-        call_arities: Option<&[usize]>,
+        call_shape: Option<&ScalaCallSiteShape>,
         role: TypeApplicationRole,
+        reference_file: Option<&ProjectFile>,
     ) -> TypeApplicationResolution {
-        let type_candidates = class_fqn
+        let mut type_candidates = class_fqn
             .map(|fqn| {
                 self.index
                     .by_fqn(fqn)
@@ -2467,41 +2634,84 @@ impl ProjectTypes {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        if let Some(reference_file) = reference_file {
+            let same_file = type_candidates
+                .iter()
+                .copied()
+                .filter(|unit| unit.source() == reference_file)
+                .collect::<Vec<_>>();
+            if !same_file.is_empty() {
+                type_candidates = same_file;
+            }
+        }
         let type_target = (type_candidates.len() == 1).then(|| type_candidates[0].clone());
         if role == TypeApplicationRole::Extractor {
             let extractor_owners = if !type_candidates.is_empty() {
                 type_candidates
                     .iter()
                     .flat_map(|target| self.exact_companion_objects(scala, target))
-                    .map(|companion| companion.fq_name())
                     .collect::<Vec<_>>()
             } else {
-                object_fqn.into_iter().map(str::to_string).collect()
+                let owners = object_fqn
+                    .into_iter()
+                    .flat_map(|fqn| self.index.by_fqn(fqn).iter())
+                    .filter(|unit| unit.is_class())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let same_file = reference_file
+                    .map(|file| {
+                        owners
+                            .iter()
+                            .filter(|unit| unit.source() == file)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if same_file.is_empty() {
+                    owners
+                } else {
+                    same_file
+                }
             };
-            let mut callable_targets = extractor_owners
+            let unapply_targets = extractor_owners
                 .iter()
                 .flat_map(|companion| {
                     ["unapply", "unapplySeq"]
                         .into_iter()
                         .flat_map(move |member| {
-                            self.method_declarations_for_owner_member(
-                                scala, companion, member, None,
-                            )
+                            let members =
+                                self.members_for_exact_owner_unit(scala, companion, member);
+                            self.method_declarations_for_members(scala, &members, None)
                         })
                 })
                 .collect::<Vec<_>>();
-            for target in &type_candidates {
-                callable_targets.extend(
-                    self.method_declarations_for_owner_member(
-                        scala,
-                        &target.fq_name(),
-                        name,
-                        call_arities,
-                    )
-                    .into_iter()
-                    .filter(CodeUnit::is_synthetic),
-                );
-            }
+            let mut callable_targets = match physical_callable_targets(scala, unapply_targets) {
+                PhysicalCallableTargets::Unique(targets) => targets,
+                PhysicalCallableTargets::Ambiguous => Vec::new(),
+                PhysicalCallableTargets::NoCandidates => {
+                    let primary_targets = type_candidates
+                        .iter()
+                        .flat_map(|target| {
+                            let members = self
+                                .members_for_exact_owner_name(&target.fq_name(), name)
+                                .into_iter()
+                                .filter(|unit| unit.source() == target.source())
+                                .collect::<Vec<_>>();
+                            self.callable_declarations_for_members(
+                                scala,
+                                &members,
+                                call_shape,
+                                ScalaCallableSiteRole::PrimaryConstruction,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    match physical_callable_targets(scala, primary_targets) {
+                        PhysicalCallableTargets::Unique(targets) => targets,
+                        PhysicalCallableTargets::NoCandidates
+                        | PhysicalCallableTargets::Ambiguous => Vec::new(),
+                    }
+                }
+            };
             let mut seen = HashSet::default();
             callable_targets.retain(|target| seen.insert(target.clone()));
             return TypeApplicationResolution {
@@ -2515,18 +2725,42 @@ impl ProjectTypes {
             let callable_targets = type_candidates
                 .iter()
                 .flat_map(|target| {
-                    self.method_declarations_for_owner_member(
+                    let members = self
+                        .members_for_exact_owner_name(&target.fq_name(), name)
+                        .into_iter()
+                        .filter(|unit| unit.source() == target.source())
+                        .collect::<Vec<_>>();
+                    self.callable_declarations_for_members(
                         scala,
-                        &target.fq_name(),
-                        name,
-                        call_arities,
+                        &members,
+                        call_shape,
+                        ScalaCallableSiteRole::ExplicitConstruction,
                     )
                 })
-                .filter(CodeUnit::is_synthetic)
-                .collect();
+                .collect::<Vec<_>>();
+            let callable_targets = physical_callable_targets(scala, callable_targets).into_unique();
             let type_target = type_target.filter(|target| {
-                self.is_scala_trait_declaration(scala, target)
-                    || self.constructor_target_call_shape_matches(scala, target, call_arities)
+                self.is_scala_trait_declaration(scala, target) || {
+                    let members = self
+                        .members_for_exact_owner_name(&target.fq_name(), name)
+                        .into_iter()
+                        .filter(|unit| unit.source() == target.source())
+                        .collect::<Vec<_>>();
+                    !self
+                        .callable_declarations_for_members(
+                            scala,
+                            &members,
+                            call_shape,
+                            ScalaCallableSiteRole::ExplicitConstruction,
+                        )
+                        .is_empty()
+                        || self.constructor_target_matches(
+                            scala,
+                            target,
+                            call_shape,
+                            ScalaCallableSiteRole::ExplicitConstruction,
+                        )
+                }
             });
             return TypeApplicationResolution {
                 type_target,
@@ -2538,60 +2772,85 @@ impl ProjectTypes {
             type_candidates
                 .iter()
                 .flat_map(|target| self.exact_companion_objects(scala, target))
-                .map(|companion| companion.fq_name())
                 .collect::<Vec<_>>()
         } else {
-            object_fqn.into_iter().map(str::to_string).collect()
+            let owners = object_fqn
+                .into_iter()
+                .flat_map(|fqn| self.index.by_fqn(fqn).iter())
+                .filter(|unit| unit.is_class())
+                .cloned()
+                .collect::<Vec<_>>();
+            let same_file = reference_file
+                .map(|file| {
+                    owners
+                        .iter()
+                        .filter(|unit| unit.source() == file)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if same_file.is_empty() {
+                owners
+            } else {
+                same_file
+            }
         };
-        let mut apply_targets = apply_owners
+        let apply_targets = apply_owners
             .iter()
             .flat_map(|owner| {
-                self.method_declarations_for_owner_member(scala, owner, "apply", call_arities)
+                let members = self.members_for_exact_owner_unit(scala, owner, "apply");
+                self.callable_declarations_for_members(
+                    scala,
+                    &members,
+                    call_shape,
+                    ScalaCallableSiteRole::Ordinary,
+                )
             })
             .collect::<Vec<_>>();
-        if !apply_targets.is_empty() {
-            for target in type_candidates.iter().filter(|target| {
-                self.is_case_class(scala, target)
-                    || owner_fqn(target).is_some_and(|owner| owner.ends_with('$'))
-            }) {
-                apply_targets.extend(
-                    self.method_declarations_for_owner_member(
-                        scala,
-                        &target.fq_name(),
-                        name,
-                        call_arities,
-                    )
-                    .into_iter()
-                    .filter(CodeUnit::is_synthetic),
-                );
+        match physical_callable_targets(scala, apply_targets) {
+            PhysicalCallableTargets::Unique(mut apply_targets) => {
+                if !type_candidates.is_empty() {
+                    let mut seen = HashSet::default();
+                    apply_targets.retain(|target| seen.insert(target.clone()));
+                }
+                return TypeApplicationResolution {
+                    type_target: type_target.filter(|target| {
+                        self.class_application_matches_with_shape(
+                            scala, resolver, target, call_shape,
+                        )
+                    }),
+                    callable_targets: apply_targets,
+                };
             }
-            if !type_candidates.is_empty() {
-                let mut seen = HashSet::default();
-                apply_targets.retain(|target| seen.insert(target.clone()));
+            PhysicalCallableTargets::Ambiguous => {
+                return TypeApplicationResolution {
+                    type_target: None,
+                    callable_targets: Vec::new(),
+                };
             }
-            return TypeApplicationResolution {
-                type_target: type_target.filter(|target| {
-                    self.class_application_matches(scala, resolver, target, call_arities)
-                }),
-                callable_targets: apply_targets,
-            };
+            PhysicalCallableTargets::NoCandidates => {}
         }
 
         let callable_targets = type_candidates
             .iter()
             .flat_map(|target| {
-                self.method_declarations_for_owner_member(
+                let members = self
+                    .members_for_exact_owner_name(&target.fq_name(), name)
+                    .into_iter()
+                    .filter(|unit| unit.source() == target.source())
+                    .collect::<Vec<_>>();
+                self.callable_declarations_for_members(
                     scala,
-                    &target.fq_name(),
-                    name,
-                    call_arities,
+                    &members,
+                    call_shape,
+                    ScalaCallableSiteRole::PrimaryConstruction,
                 )
             })
-            .filter(CodeUnit::is_synthetic)
-            .collect();
+            .collect::<Vec<_>>();
+        let callable_targets = physical_callable_targets(scala, callable_targets).into_unique();
         TypeApplicationResolution {
             type_target: type_target.filter(|target| {
-                self.class_application_matches(scala, resolver, target, call_arities)
+                self.class_application_matches_with_shape(scala, resolver, target, call_shape)
             }),
             callable_targets,
         }
@@ -2607,7 +2866,7 @@ impl ProjectTypes {
                 .exact_companion_objects(scala, target)
                 .iter()
                 .any(|companion| {
-                    self.members_for_exact_owner_name(&companion.fq_name(), "apply")
+                    self.members_for_exact_owner_unit(scala, companion, "apply")
                         .iter()
                         .any(|unit| unit.is_function())
                 })
@@ -2620,25 +2879,49 @@ impl ProjectTypes {
         target: &CodeUnit,
         call_arities: Option<&[usize]>,
     ) -> bool {
+        let call_shape = call_arities.map(ScalaCallSiteShape::ordinary);
+        self.class_companion_apply_call_matches_with_shape(
+            scala,
+            resolver,
+            target,
+            call_shape.as_ref(),
+        )
+    }
+
+    fn class_companion_apply_call_matches_with_shape(
+        &self,
+        scala: &ScalaAnalyzer,
+        resolver: &NameResolver,
+        target: &CodeUnit,
+        call_shape: Option<&ScalaCallSiteShape>,
+    ) -> bool {
         if self.is_case_class(scala, target)
-            && self.constructor_call_shape_matches(scala, &target.fq_name(), call_arities)
+            && self.constructor_target_matches(
+                scala,
+                target,
+                call_shape,
+                ScalaCallableSiteRole::PrimaryConstruction,
+            )
         {
             return true;
         }
         self.exact_companion_objects(scala, target)
             .iter()
             .any(|companion| {
-                self.member_return_type_for_owner_member(
-                    scala,
-                    resolver,
-                    &companion.fq_name(),
-                    "apply",
-                    call_arities,
-                )
-                .is_some_and(|return_type| {
-                    scala_normalized_fq_name(&return_type)
-                        == scala_normalized_fq_name(&target.fq_name())
-                })
+                call_shape
+                    .and_then(|shape| {
+                        let members = self.members_for_exact_owner_unit(scala, companion, "apply");
+                        self.member_return_type_for_members_with_shape(
+                            scala,
+                            resolver,
+                            &members,
+                            Some(shape),
+                        )
+                    })
+                    .is_some_and(|return_type| {
+                        scala_normalized_fq_name(&return_type)
+                            == scala_normalized_fq_name(&target.fq_name())
+                    })
             })
     }
 
@@ -2653,13 +2936,18 @@ impl ProjectTypes {
             alternatives.extend(
                 self.callable_alternatives_for(scala, target)
                     .iter()
-                    .cloned(),
+                    .filter(|alternative| alternative.role == ScalaCallableRole::PrimaryConstructor)
+                    .cloned()
+                    .map(|mut alternative| {
+                        alternative.role = ScalaCallableRole::Ordinary;
+                        alternative
+                    }),
             );
         }
         let normalized_target = scala_normalized_fq_name(&target.fq_name());
         for companion in self.exact_companion_objects(scala, target) {
             for apply in self
-                .members_for_exact_owner_name(&companion.fq_name(), "apply")
+                .members_for_exact_owner_unit(scala, &companion, "apply")
                 .iter()
                 .filter(|unit| unit.is_function())
             {
@@ -2667,12 +2955,13 @@ impl ProjectTypes {
                     self.callable_alternatives_for(scala, apply)
                         .iter()
                         .filter(|alternative| {
-                            alternative
-                                .return_type
-                                .as_deref()
-                                .is_some_and(|return_type| {
-                                    scala_normalized_fq_name(return_type) == normalized_target
-                                })
+                            alternative.role == ScalaCallableRole::Ordinary
+                                && alternative
+                                    .return_type
+                                    .as_deref()
+                                    .is_some_and(|return_type| {
+                                        scala_normalized_fq_name(return_type) == normalized_target
+                                    })
                         })
                         .cloned(),
                 );
@@ -2681,9 +2970,10 @@ impl ProjectTypes {
         let matches = alternatives
             .iter()
             .filter(|alternative| {
-                contextual_arities.is_none_or(|arities| {
-                    ordinary_callable_shape_matches(&alternative.shape, Some(arities), false)
-                })
+                alternative.role == ScalaCallableRole::Ordinary
+                    && contextual_arities.is_none_or(|arities| {
+                        ordinary_callable_shape_matches(&alternative.shape, Some(arities), false)
+                    })
             })
             .count();
         matches == 1
@@ -3662,6 +3952,52 @@ fn owner_fqn(unit: &CodeUnit) -> Option<String> {
     })
 }
 
+enum PhysicalCallableTargets {
+    NoCandidates,
+    Unique(Vec<CodeUnit>),
+    Ambiguous,
+}
+
+impl PhysicalCallableTargets {
+    fn into_unique(self) -> Vec<CodeUnit> {
+        match self {
+            Self::Unique(targets) => targets,
+            Self::NoCandidates | Self::Ambiguous => Vec::new(),
+        }
+    }
+}
+
+fn physical_callable_targets(
+    scala: &ScalaAnalyzer,
+    targets: Vec<CodeUnit>,
+) -> PhysicalCallableTargets {
+    if targets.is_empty() {
+        return PhysicalCallableTargets::NoCandidates;
+    }
+    let owners = targets
+        .iter()
+        .filter_map(|target| scala.structural_parent_of(target))
+        .collect::<HashSet<_>>();
+    if owners.len() > 1 {
+        PhysicalCallableTargets::Ambiguous
+    } else {
+        PhysicalCallableTargets::Unique(targets)
+    }
+}
+
+fn fallback_callable_role(scala: &ScalaAnalyzer, unit: &CodeUnit) -> ScalaCallableRole {
+    if unit.is_synthetic() {
+        ScalaCallableRole::PrimaryConstructor
+    } else if scala
+        .structural_parent_of(unit)
+        .is_some_and(|owner| owner.identifier().trim_end_matches('$') == unit.identifier())
+    {
+        ScalaCallableRole::SecondaryConstructor
+    } else {
+        ScalaCallableRole::Ordinary
+    }
+}
+
 pub(super) fn is_package_level_type(unit: &CodeUnit) -> bool {
     !unit.short_name().contains('.')
 }
@@ -3670,59 +4006,70 @@ fn method_arities_compatible(method: Option<usize>, ancestor: Option<usize>) -> 
     method.is_none() || ancestor.is_none() || method == ancestor
 }
 
-fn method_call_shape_matches(
+fn callable_call_shape_matches(
     facts: &CallableFacts,
     alternatives: &[CallableAlternative],
     call_arities: Option<&[usize]>,
+    fallback_role: ScalaCallableRole,
+    site_role: ScalaCallableSiteRole,
     unique_callable: bool,
 ) -> bool {
+    let actual = call_arities.map(ScalaCallSiteShape::ordinary);
     let fallback_shape;
-    let fallback_shapes;
-    let shapes = if alternatives.is_empty() {
+    if alternatives.is_empty() {
         fallback_shape = facts
             .callable_arity
             .or_else(|| facts.arity.map(crate::analyzer::CallableArity::exact))
             .map(|arity| vec![ScalaCallableParameterList::explicit(arity)])
             .unwrap_or_default();
-        fallback_shapes = vec![fallback_shape];
-        fallback_shapes.as_slice()
-    } else {
-        return alternatives.iter().any(|alternative| {
-            ordinary_callable_shape_matches(&alternative.shape, call_arities, unique_callable)
-        });
-    };
-    shapes
-        .iter()
-        .any(|declared| ordinary_callable_shape_matches(declared, call_arities, unique_callable))
+        return scala_callable_alternative_matches(
+            fallback_role,
+            &fallback_shape,
+            actual.as_ref(),
+            site_role,
+            unique_callable,
+        );
+    }
+    alternatives.iter().any(|alternative| {
+        scala_callable_alternative_matches(
+            alternative.role,
+            &alternative.shape,
+            actual.as_ref(),
+            site_role,
+            unique_callable,
+        )
+    })
 }
 
-fn any_callable_shape(
+fn any_callable_alternative(
     facts: &CallableFacts,
     alternatives: &[CallableAlternative],
-    mut predicate: impl FnMut(&[ScalaCallableParameterList]) -> bool,
+    fallback_role: ScalaCallableRole,
+    mut predicate: impl FnMut(ScalaCallableRole, &[ScalaCallableParameterList]) -> bool,
 ) -> bool {
     if !alternatives.is_empty() {
         return alternatives
             .iter()
-            .any(|alternative| predicate(&alternative.shape));
+            .any(|alternative| predicate(alternative.role, &alternative.shape));
     }
     let fallback = facts
         .callable_arity
         .or_else(|| facts.arity.map(crate::analyzer::CallableArity::exact))
         .map(|arity| vec![ScalaCallableParameterList::explicit(arity)])
         .unwrap_or_default();
-    predicate(&fallback)
+    predicate(fallback_role, &fallback)
 }
 
-fn count_callable_shapes_matching(
+fn count_callable_alternatives_matching(
     facts: &CallableFacts,
     alternatives: &[CallableAlternative],
-    mut predicate: impl FnMut(&[ScalaCallableParameterList]) -> bool,
+    fallback_role: ScalaCallableRole,
+    mut predicate: impl FnMut(ScalaCallableRole, &[ScalaCallableParameterList]) -> bool,
 ) -> usize {
     if !alternatives.is_empty() {
         return alternatives
             .iter()
-            .filter(|alternative| predicate(&alternative.shape))
+            .filter(|alternative| predicate(alternative.role, &alternative.shape))
             .count();
     }
     let fallback = facts
@@ -3730,7 +4077,7 @@ fn count_callable_shapes_matching(
         .or_else(|| facts.arity.map(crate::analyzer::CallableArity::exact))
         .map(|arity| vec![ScalaCallableParameterList::explicit(arity)])
         .unwrap_or_default();
-    usize::from(predicate(&fallback))
+    usize::from(predicate(fallback_role, &fallback))
 }
 
 fn ordinary_callable_shape_matches(
@@ -4036,8 +4383,9 @@ fn record_reference(
                         .or_else(|| ctx.resolver.resolve_object(text))
                         .as_deref(),
                     text,
-                    call_arities_for_reference(node).as_deref(),
+                    call_site_shape_for_reference(node).as_ref(),
                     TypeApplicationRole::Extractor,
+                    Some(ctx.source_file),
                 );
                 if let Some(target) = resolution.type_target {
                     ctx.record(target.fq_name(), node);
@@ -4060,7 +4408,6 @@ fn record_reference(
                 None
             };
             if let Some(fqn) = resolved {
-                let call_arities = call_arities_for_reference(node);
                 if is_constructor_like_reference(node, ctx.source) {
                     let resolution = ctx.types.resolve_type_application(
                         ctx.scala,
@@ -4068,8 +4415,9 @@ fn record_reference(
                         Some(&fqn),
                         None,
                         text,
-                        call_arities.as_deref(),
+                        call_site_shape_for_reference(node).as_ref(),
                         TypeApplicationRole::ExplicitConstructor,
+                        Some(ctx.source_file),
                     );
                     if let Some(target) = resolution.type_target {
                         ctx.record(target.fq_name(), node);
@@ -4413,7 +4761,6 @@ fn record_unqualified_type_application(
     if !bindings.resolve_symbol(name).is_unknown() || bindings.is_shadowed(name) {
         return false;
     }
-    let call_arities = call_arities_for_reference(function);
     let class_fqn = ctx
         .lexically_visible_type(function.start_byte(), name)
         .or_else(|| ctx.resolver.resolve(name));
@@ -4429,12 +4776,13 @@ fn record_unqualified_type_application(
         class_fqn.as_deref(),
         object_fqn.as_deref(),
         name,
-        call_arities.as_deref(),
+        call_site_shape_for_reference(function).as_ref(),
         if is_extractor_reference(function) || is_infix_pattern_operator(function) {
             TypeApplicationRole::Extractor
         } else {
             TypeApplicationRole::BareApplication
         },
+        Some(ctx.source_file),
     );
     if let Some(target) = resolution.type_target {
         ctx.record(target.fq_name(), function);
@@ -4524,8 +4872,9 @@ fn record_qualified_stable_reference(
         class_fqn.as_deref(),
         object_fqn.as_deref(),
         name,
-        call_arities_for_reference(reference.expression).as_deref(),
+        call_site_shape_for_reference(reference.expression).as_ref(),
         role,
+        Some(ctx.source_file),
     );
     if let Some(target) = resolution.type_target {
         ctx.record(target.fq_name(), node);
@@ -5210,8 +5559,9 @@ fn constructed_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
             Some(&class_fqn),
             None,
             name,
-            call_arities_for_reference(type_node).as_deref(),
+            call_site_shape_for_reference(type_node).as_ref(),
             TypeApplicationRole::ExplicitConstructor,
+            Some(ctx.source_file),
         )
         .type_target
         .map(|target| target.fq_name())
@@ -5246,8 +5596,9 @@ fn constructed_or_applied_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Optio
                 class_fqn.as_deref(),
                 object_fqn.as_deref(),
                 name,
-                call_arities_for_reference(function).as_deref(),
+                call_site_shape_for_reference(function).as_ref(),
                 TypeApplicationRole::BareApplication,
+                Some(ctx.source_file),
             )
             .type_target
             .map(|target| target.fq_name())
@@ -5415,7 +5766,12 @@ fn visible_extensions(
         .visible_extension_methods(ctx.scala, ctx.types, member)
     {
         if method.alternatives.iter().any(|alternative| {
-            extension_alternative_receiver_matches(&ctx.resolver, alternative, receiver_owner)
+            alternative.role == ScalaCallableRole::Ordinary
+                && extension_alternative_receiver_matches(
+                    &ctx.resolver,
+                    alternative,
+                    receiver_owner,
+                )
         }) {
             matches.push(method);
         }
@@ -5425,11 +5781,17 @@ fn visible_extensions(
     let callable_count = matches
         .iter()
         .flat_map(|method| method.alternatives.iter())
+        .filter(|alternative| alternative.role == ScalaCallableRole::Ordinary)
         .count();
     let unique_callable = callable_count == 1;
     matches.retain(|method| {
         method.alternatives.iter().any(|alternative| {
-            extension_alternative_receiver_matches(&ctx.resolver, alternative, receiver_owner)
+            alternative.role == ScalaCallableRole::Ordinary
+                && extension_alternative_receiver_matches(
+                    &ctx.resolver,
+                    alternative,
+                    receiver_owner,
+                )
                 && ordinary_callable_shape_matches(
                     &alternative.shape,
                     call_arities,

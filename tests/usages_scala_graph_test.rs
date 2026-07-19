@@ -241,7 +241,7 @@ object Use {
 }
 
 #[test]
-fn scala_nested_constructor_role_preserves_exact_duplicate_source_identity() {
+fn scala_nested_companion_apply_preserves_exact_duplicate_source_identity() {
     let (project, analyzer) = scala_analyzer_with_files(&[
         (
             "scala-3/ByteString.scala",
@@ -269,10 +269,10 @@ object ByteString {
         ),
     ]);
     let target = analyzer
-        .get_definitions("akka.util.ByteString$.ByteString1.ByteString1")
+        .get_definitions("akka.util.ByteString$.ByteString1$.apply")
         .into_iter()
         .find(|unit| unit.source() == &project.file("scala-3/ByteString.scala"))
-        .expect("Scala 3 synthetic constructor");
+        .expect("Scala 3 companion apply");
     let provider = ExplicitCandidateProvider::new(Arc::new(
         std::iter::once(project.file("scala-3/ByteString.scala")).collect(),
     ));
@@ -6521,11 +6521,10 @@ object CandidateCollision {
             "root.model.Generator",
             "positive-top-level-generic-trait-new",
         ),
-        // A nested same-name class/object call cannot encode whether forward
-        // selected the companion apply or Scala 3 universal constructor. Keep
-        // both exact callable identities discoverable when their shapes agree.
+        // The ordinary companion-apply tier is resolved before the primary
+        // constructor fallback, even for nested same-name class/object pairs.
         (
-            "root.model.Constructors$.ByteString1.ByteString1",
+            "root.model.Constructors$.ByteString1$.apply",
             "positive-nested-self-constructor",
         ),
         (
@@ -6814,4 +6813,98 @@ trait Outer extends OuterBase { self: SelfBase =>
     let self_hits =
         hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&self_ping)));
     assert_no_hit_contains(&self_hits, "positive-outer-owner-before-outer-self-type");
+}
+
+#[test]
+fn scala_usage_finder_filters_callable_roles_before_shape_and_uniqueness() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Roles.scala",
+        r#"package app
+trait Context
+trait Contains { infix def contains(value: Int): Boolean = true }
+class Roleful(value: Int) extends Contains {
+  def this() = this(0)
+  def this(text: String, flag: Boolean) = this(text.length)
+}
+object Roleful { def apply(using Context): Roleful = new Roleful(0) }
+object Use {
+  given Context = new Context {}
+  val primary = new Roleful(1) // role-primary-new
+  val secondaryZero = new Roleful() // role-secondary-zero-new
+  val secondaryTwo = new Roleful("two", true) // role-secondary-two-new
+  val wrongNew = new Roleful("wrong", false, 3) // role-wrong-new
+  val companion = Roleful() // role-companion-apply
+  val primaryFallback = Roleful(2) // role-primary-bare-fallback
+  val secondaryMustNotBeBare = Roleful("two", true) // role-secondary-bare-negative
+  val inheritedInfix = primary contains 1 // role-inherited-infix
+}
+"#,
+    )]);
+
+    let constructors = analyzer.get_definitions("app.Roleful.Roleful");
+    assert_eq!(
+        constructors.len(),
+        2,
+        "expected primary plus the exact secondary-constructor CodeUnit"
+    );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = UsageFinder::new().find_usages_default(&analyzer, &constructors)
+    else {
+        panic!("expected constructor usage success");
+    };
+    for constructor in &constructors {
+        let signature = analyzer.signatures(constructor).join("\n");
+        let constructor_hits = hits_by_overload
+            .get(constructor)
+            .unwrap_or_else(|| panic!("missing constructor bucket for {signature}"))
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        if signature.contains("def this") {
+            assert_hit_contains(&constructor_hits, "role-secondary-zero-new");
+            assert_hit_contains(&constructor_hits, "role-secondary-two-new");
+        } else {
+            assert_hit_contains(&constructor_hits, "role-primary-new");
+            assert_hit_contains(&constructor_hits, "role-primary-bare-fallback");
+        }
+        for marker in [
+            "role-wrong-new",
+            "role-companion-apply",
+            "role-secondary-bare-negative",
+        ] {
+            assert_no_hit_contains(&constructor_hits, marker);
+        }
+    }
+
+    let roleful = definition(&analyzer, "app.Roleful");
+    let type_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&roleful)));
+    for marker in [
+        "role-primary-new",
+        "role-secondary-zero-new",
+        "role-secondary-two-new",
+    ] {
+        assert_hit_contains(&type_hits, marker);
+    }
+    assert_no_hit_contains(&type_hits, "role-wrong-new");
+
+    let apply = definition(&analyzer, "app.Roleful$.apply");
+    let apply_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&apply)));
+    assert_hit_contains(&apply_hits, "role-companion-apply");
+    for marker in [
+        "role-primary-new",
+        "role-secondary-zero-new",
+        "role-secondary-two-new",
+        "role-primary-bare-fallback",
+        "role-secondary-bare-negative",
+    ] {
+        assert_no_hit_contains(&apply_hits, marker);
+    }
+
+    let contains = definition(&analyzer, "app.Contains.contains");
+    let contains_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&contains)));
+    assert_hit_contains(&contains_hits, "role-inherited-infix");
 }

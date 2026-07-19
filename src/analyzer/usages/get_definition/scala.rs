@@ -8,13 +8,13 @@ use crate::analyzer::usages::scala_graph::local::{
     ScalaLocalBinding, precise_scala_binding, seed_scala_binding,
 };
 use crate::analyzer::usages::scala_graph::syntax::{
-    ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableUsePolicy,
+    ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableRole, ScalaCallableSiteRole,
     applied_expression_for_reference, call_arities_for_reference, call_site_shape_for_reference,
-    is_scala_case_pattern_binder, scala_callable_shape_is_candidate, scala_callable_shape_matches,
-    scala_pattern_binder_names,
+    is_scala_case_pattern_binder, scala_callable_alternative_is_candidate,
+    scala_callable_alternative_matches, scala_pattern_binder_names,
 };
 use crate::analyzer::usages::scala_graph::{
-    method_call_arity_applies, method_signature_arity, resolved_extension_receiver_type,
+    method_signature_arity, resolved_extension_receiver_type,
 };
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{ImportInfo, StructuredImportScope};
@@ -693,6 +693,7 @@ fn resolve_scala_bare_apply_fast_path(
         return Some(scala_apply_or_constructor_outcome(
             scala,
             support,
+            file,
             &owner_fqn,
             name,
             call_shape.as_ref(),
@@ -704,6 +705,7 @@ fn resolve_scala_bare_apply_fast_path(
     Some(scala_apply_or_constructor_outcome(
         scala,
         support,
+        file,
         &owner_fqn,
         name,
         call_shape.as_ref(),
@@ -713,51 +715,85 @@ fn resolve_scala_bare_apply_fast_path(
 fn scala_apply_or_constructor_outcome(
     scala: &ScalaAnalyzer,
     support: &dyn BoundedDefinitionLookup,
+    reference_file: &ProjectFile,
     owner_fqn: &str,
     reference: &str,
     call_shape: Option<&ScalaCallSiteShape>,
 ) -> DefinitionLookupOutcome {
     let class_fqn = owner_fqn.trim_end_matches('$');
     let apply_fqn = format!("{class_fqn}$.apply");
-    let apply_candidates = support
+    let apply_units = support
         .fqn(&apply_fqn)
         .into_iter()
-        .filter(|unit| {
-            unit.is_function()
-                && unit.fq_name() == apply_fqn
-                && scala_member_unit_applies(
-                    scala,
-                    unit,
-                    call_shape,
-                    ScalaCallableUsePolicy::CompleteCall,
-                    false,
-                )
-        })
+        .filter(|unit| unit.is_function() && unit.fq_name() == apply_fqn)
         .collect::<Vec<_>>();
-    if !apply_candidates.is_empty() {
-        return candidates_outcome(apply_candidates);
+    let same_file_apply_units = apply_units
+        .iter()
+        .filter(|unit| unit.source() == reference_file)
+        .cloned()
+        .collect::<Vec<_>>();
+    let apply_candidates = scala_physical_callable_candidates(
+        scala,
+        scala_filter_callable_units(
+            scala,
+            if same_file_apply_units.is_empty() {
+                apply_units
+            } else {
+                same_file_apply_units
+            },
+            call_shape,
+            ScalaCallableSiteRole::Ordinary,
+        ),
+    );
+    match apply_candidates {
+        ScalaPhysicalCallableCandidates::Unique(candidates) => {
+            return candidates_outcome(candidates);
+        }
+        ScalaPhysicalCallableCandidates::Ambiguous => {
+            return no_definition(
+                "ambiguous_scala_callable",
+                format!("`{reference}` has multiple physical companion `apply` owners"),
+            );
+        }
+        ScalaPhysicalCallableCandidates::NoCandidates => {}
     }
 
     let constructor_name = scala_constructor_member_name(class_fqn);
     let constructor_fqn = format!("{class_fqn}.{constructor_name}");
-    let constructor_candidates = support
+    let constructor_units = support
         .fqn(&constructor_fqn)
         .into_iter()
-        .filter(|unit| {
-            unit.is_function()
-                && unit.is_synthetic()
-                && unit.fq_name() == constructor_fqn
-                && scala_member_unit_applies(
-                    scala,
-                    unit,
-                    call_shape,
-                    ScalaCallableUsePolicy::CompleteCall,
-                    false,
-                )
-        })
+        .filter(|unit| unit.is_function() && unit.fq_name() == constructor_fqn)
         .collect::<Vec<_>>();
-    if !constructor_candidates.is_empty() {
-        return candidates_outcome(constructor_candidates);
+    let same_file_constructor_units = constructor_units
+        .iter()
+        .filter(|unit| unit.source() == reference_file)
+        .cloned()
+        .collect::<Vec<_>>();
+    let constructor_candidates = scala_physical_callable_candidates(
+        scala,
+        scala_filter_callable_units(
+            scala,
+            if same_file_constructor_units.is_empty() {
+                constructor_units
+            } else {
+                same_file_constructor_units
+            },
+            call_shape,
+            ScalaCallableSiteRole::PrimaryConstruction,
+        ),
+    );
+    match constructor_candidates {
+        ScalaPhysicalCallableCandidates::Unique(candidates) => {
+            return candidates_outcome(candidates);
+        }
+        ScalaPhysicalCallableCandidates::Ambiguous => {
+            return no_definition(
+                "ambiguous_scala_callable",
+                format!("`{reference}` has multiple physical constructor owners"),
+            );
+        }
+        ScalaPhysicalCallableCandidates::NoCandidates => {}
     }
 
     no_definition(
@@ -1304,7 +1340,7 @@ fn resolve_scala_call(
                 ctx.scala,
                 &unit,
                 scala_call_site_shape(ctx, root, function).as_ref(),
-                ScalaCallableUsePolicy::OrdinaryMethod,
+                ScalaCallableSiteRole::Ordinary,
                 true,
             ) {
                 return candidates_outcome(vec![unit]);
@@ -1339,6 +1375,7 @@ fn resolve_scala_call(
                     return scala_apply_or_constructor_outcome(
                         ctx.scala,
                         ctx.support,
+                        ctx.file,
                         &owner.fqn,
                         name,
                         scala_call_site_shape(ctx, root, function).as_ref(),
@@ -1358,6 +1395,7 @@ fn resolve_scala_call(
                 return scala_apply_or_constructor_outcome(
                     ctx.scala,
                     ctx.support,
+                    ctx.file,
                     &owner_fqn,
                     name,
                     scala_call_site_shape(ctx, root, function).as_ref(),
@@ -1402,16 +1440,33 @@ fn resolve_scala_infix_call(
     if name.is_empty() {
         return no_definition("no_function_name", "Scala infix operator is blank");
     }
+    let call_shape = call_site_shape_for_reference(operator);
     if let Some(owner) =
         scala_receiver_type_fqn(ctx, resolver, root, receiver, operator.start_byte())
     {
-        let candidates = scala_member_candidate_units(ctx, &owner, name, false);
+        let raw_candidates = scala_member_candidate_units(ctx, &owner, name, false);
+        let candidates = scala_filter_callable_units(
+            ctx.scala,
+            raw_candidates.clone(),
+            call_shape.as_ref(),
+            ScalaCallableSiteRole::Ordinary,
+        );
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
         }
-        return scala_extension_candidates(ctx, resolver, name, Some(&owner));
+        if raw_candidates
+            .iter()
+            .any(|unit| scala_unit_has_callable_role(ctx.scala, unit, ScalaCallableRole::Ordinary))
+        {
+            return no_definition(
+                "no_applicable_scala_callable",
+                format!("`{name}` has an ordinary member tier, but no overload matches this call"),
+            );
+        }
+        return scala_extension_candidates(ctx, resolver, name, Some(&owner), call_shape.as_ref());
     }
-    let extension_candidates = scala_extension_candidate_units(ctx, resolver, name, None);
+    let extension_candidates =
+        scala_extension_candidate_units(ctx, resolver, name, None, call_shape.as_ref());
     if !extension_candidates.is_empty() {
         return candidates_outcome(extension_candidates);
     }
@@ -1442,13 +1497,28 @@ fn resolve_scala_postfix_call(
     }
     if let Some(owner) = scala_receiver_type_fqn(ctx, resolver, root, receiver, method.start_byte())
     {
-        let candidates = scala_member_candidate_units(ctx, &owner, name, false);
+        let raw_candidates = scala_member_candidate_units(ctx, &owner, name, false);
+        let candidates = scala_filter_callable_units(
+            ctx.scala,
+            raw_candidates.clone(),
+            None,
+            ScalaCallableSiteRole::Ordinary,
+        );
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
         }
-        return scala_extension_candidates(ctx, resolver, name, Some(&owner));
+        if raw_candidates
+            .iter()
+            .any(|unit| scala_unit_has_callable_role(ctx.scala, unit, ScalaCallableRole::Ordinary))
+        {
+            return no_definition(
+                "no_applicable_scala_callable",
+                format!("`{name}` has an ordinary member tier, but no overload matches this call"),
+            );
+        }
+        return scala_extension_candidates(ctx, resolver, name, Some(&owner), None);
     }
-    let extension_candidates = scala_extension_candidate_units(ctx, resolver, name, None);
+    let extension_candidates = scala_extension_candidate_units(ctx, resolver, name, None, None);
     if !extension_candidates.is_empty() {
         return candidates_outcome(extension_candidates);
     }
@@ -1490,11 +1560,72 @@ fn resolve_scala_constructor(
         );
     };
     let member = scala_constructor_member_name(&owner_fqn);
-    let candidates = ctx.support.fqn(&format!("{owner_fqn}.{member}"));
-    if !candidates.is_empty() {
-        return candidates_outcome(candidates);
+    let owner_units = ctx
+        .support
+        .fqn(&owner_fqn)
+        .into_iter()
+        .filter(CodeUnit::is_class)
+        .filter(|owner| owner.fq_name() == owner_fqn)
+        .collect::<Vec<_>>();
+    let same_file_owner_units = owner_units
+        .iter()
+        .filter(|owner| owner.source() == ctx.file)
+        .cloned()
+        .collect::<Vec<_>>();
+    let selected_owner_units = if same_file_owner_units.is_empty() {
+        owner_units
+    } else {
+        same_file_owner_units
+    };
+    let exact_owner = (selected_owner_units.len() == 1).then(|| selected_owner_units[0].clone());
+    let mut cursor = constructor.walk();
+    let type_node = constructor
+        .named_children(&mut cursor)
+        .find(|child| !matches!(child.kind(), "arguments" | "template_body"));
+    let call_shape = type_node.and_then(call_site_shape_for_reference);
+    let constructor_units = ctx
+        .support
+        .fqn(&format!("{owner_fqn}.{member}"))
+        .into_iter()
+        .filter(CodeUnit::is_function)
+        .filter(|unit| {
+            exact_owner
+                .as_ref()
+                .is_some_and(|owner| ctx.scala.structural_parent_of(unit).as_ref() == Some(owner))
+        })
+        .collect::<Vec<_>>();
+    let candidates = scala_physical_callable_candidates(
+        ctx.scala,
+        scala_filter_callable_units(
+            ctx.scala,
+            constructor_units.clone(),
+            call_shape.as_ref(),
+            ScalaCallableSiteRole::ExplicitConstruction,
+        ),
+    );
+    match candidates {
+        ScalaPhysicalCallableCandidates::Unique(candidates) => {
+            return candidates_outcome(candidates);
+        }
+        ScalaPhysicalCallableCandidates::Ambiguous => {
+            return no_definition(
+                "ambiguous_scala_constructor",
+                format!("`{member}` has multiple physical constructor owners"),
+            );
+        }
+        ScalaPhysicalCallableCandidates::NoCandidates => {}
     }
-    scala_fqn_outcome(ctx.support, &owner_fqn, member)
+    let implicit_parameterless = constructor_units.is_empty()
+        && call_shape
+            .as_ref()
+            .is_some_and(|shape| shape.lists.len() == 1 && shape.lists[0].arity == 0);
+    if implicit_parameterless && let Some(owner) = exact_owner {
+        return candidates_outcome(vec![owner]);
+    }
+    no_definition(
+        "no_applicable_scala_constructor",
+        format!("`{member}` has no indexed primary or secondary constructor matching this call"),
+    )
 }
 
 fn scala_constructor_member_name(owner_fqn: &str) -> &str {
@@ -1518,6 +1649,7 @@ fn resolve_scala_field(
         );
     };
     let member = scala_node_text(field_node, ctx.source).trim();
+    let call_shape = scala_call_site_shape(ctx, root, field_node);
     let Some(receiver) = field.child_by_field_name("value") else {
         return no_definition(
             "no_member_receiver",
@@ -1542,7 +1674,6 @@ fn resolve_scala_field(
                 bindings,
             )
         });
-        let call_shape = scala_call_site_shape(ctx, root, field_node);
         let candidates = scala_applicable_member_candidate_units(
             ctx,
             &owner,
@@ -1553,9 +1684,16 @@ fn resolve_scala_field(
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
         }
-        return scala_extension_candidates(ctx, resolver, member, Some(&owner));
+        return scala_extension_candidates(
+            ctx,
+            resolver,
+            member,
+            Some(&owner),
+            call_shape.as_ref(),
+        );
     }
-    let extension_candidates = scala_extension_candidate_units(ctx, resolver, member, None);
+    let extension_candidates =
+        scala_extension_candidate_units(ctx, resolver, member, None, call_shape.as_ref());
     if !extension_candidates.is_empty() {
         return candidates_outcome(extension_candidates);
     }
@@ -1780,45 +1918,67 @@ fn scala_applicable_callable_candidate_units(
     candidates: Vec<CodeUnit>,
     call_shape: Option<&ScalaCallSiteShape>,
 ) -> Vec<CodeUnit> {
+    scala_filter_callable_units(
+        ctx.scala,
+        candidates,
+        call_shape,
+        ScalaCallableSiteRole::Ordinary,
+    )
+}
+
+fn scala_filter_callable_units(
+    scala: &ScalaAnalyzer,
+    candidates: Vec<CodeUnit>,
+    call_shape: Option<&ScalaCallSiteShape>,
+    site_role: ScalaCallableSiteRole,
+) -> Vec<CodeUnit> {
     let callable_count = candidates
         .iter()
         .filter(|unit| unit.is_function())
         .map(|unit| {
-            let alternatives = ctx
-                .scala
-                .project_types()
-                .callable_alternatives_for(ctx.scala, unit);
+            let alternatives = scala.project_types().callable_alternatives_for(scala, unit);
             if let Some(call_shape) = call_shape {
                 if !alternatives.is_empty() {
                     return alternatives
                         .iter()
                         .filter(|alternative| {
-                            scala_callable_shape_is_candidate(
+                            scala_callable_alternative_is_candidate(
+                                alternative.role,
                                 &alternative.shape,
                                 call_shape,
-                                ScalaCallableUsePolicy::OrdinaryMethod,
+                                site_role,
                             )
                         })
                         .count();
                 }
-                let fallback = method_signature_arity(ctx.scala, unit)
+                let fallback = method_signature_arity(scala, unit)
                     .map(crate::analyzer::CallableArity::exact)
                     .map(ScalaCallableParameterList::explicit)
                     .into_iter()
                     .collect::<Vec<_>>();
-                return usize::from(scala_callable_shape_is_candidate(
+                return usize::from(scala_callable_alternative_is_candidate(
+                    scala_fallback_callable_role(scala, unit),
                     &fallback,
                     call_shape,
-                    ScalaCallableUsePolicy::OrdinaryMethod,
+                    site_role,
                 ));
             }
-            alternatives.len().max(1)
+            if alternatives.is_empty() {
+                usize::from(site_role.accepts(scala_fallback_callable_role(scala, unit)))
+            } else {
+                alternatives
+                    .iter()
+                    .filter(|alternative| site_role.accepts(alternative.role))
+                    .count()
+            }
         })
         .sum::<usize>();
     let unique_callable = callable_count == 1;
     candidates
         .into_iter()
-        .filter(|unit| scala_member_candidate_applies(ctx, unit, call_shape, unique_callable))
+        .filter(|unit| {
+            scala_member_unit_applies(scala, unit, call_shape, site_role, unique_callable)
+        })
         .collect()
 }
 
@@ -1832,7 +1992,7 @@ fn scala_member_candidate_applies(
         ctx.scala,
         unit,
         call_shape,
-        ScalaCallableUsePolicy::OrdinaryMethod,
+        ScalaCallableSiteRole::Ordinary,
         unique_callable,
     )
 }
@@ -1841,7 +2001,7 @@ fn scala_member_unit_applies(
     scala: &ScalaAnalyzer,
     unit: &CodeUnit,
     call_shape: Option<&ScalaCallSiteShape>,
-    policy: ScalaCallableUsePolicy,
+    site_role: ScalaCallableSiteRole,
     unique_callable: bool,
 ) -> bool {
     if unit.is_field() {
@@ -1853,12 +2013,78 @@ fn scala_member_unit_applies(
     let alternatives = scala.project_types().callable_alternatives_for(scala, unit);
     if !alternatives.is_empty() {
         return alternatives.iter().any(|alternative| {
-            scala_callable_shape_matches(&alternative.shape, call_shape, policy, unique_callable)
+            scala_callable_alternative_matches(
+                alternative.role,
+                &alternative.shape,
+                call_shape,
+                site_role,
+                unique_callable,
+            )
         });
     }
-    match call_shape.and_then(|shape| shape.lists.first()) {
-        Some(list) => method_call_arity_applies(scala, unit, list.arity),
-        None => method_signature_arity(scala, unit).is_none_or(|arity| arity == 0),
+    let fallback = method_signature_arity(scala, unit)
+        .map(crate::analyzer::CallableArity::exact)
+        .map(ScalaCallableParameterList::explicit)
+        .into_iter()
+        .collect::<Vec<_>>();
+    scala_callable_alternative_matches(
+        scala_fallback_callable_role(scala, unit),
+        &fallback,
+        call_shape,
+        site_role,
+        unique_callable,
+    )
+}
+
+fn scala_fallback_callable_role(scala: &ScalaAnalyzer, unit: &CodeUnit) -> ScalaCallableRole {
+    if unit.is_synthetic() {
+        ScalaCallableRole::PrimaryConstructor
+    } else if scala
+        .structural_parent_of(unit)
+        .is_some_and(|owner| owner.identifier().trim_end_matches('$') == unit.identifier())
+    {
+        ScalaCallableRole::SecondaryConstructor
+    } else {
+        ScalaCallableRole::Ordinary
+    }
+}
+
+enum ScalaPhysicalCallableCandidates {
+    NoCandidates,
+    Unique(Vec<CodeUnit>),
+    Ambiguous,
+}
+
+fn scala_physical_callable_candidates(
+    scala: &ScalaAnalyzer,
+    candidates: Vec<CodeUnit>,
+) -> ScalaPhysicalCallableCandidates {
+    if candidates.is_empty() {
+        return ScalaPhysicalCallableCandidates::NoCandidates;
+    }
+    let owners = candidates
+        .iter()
+        .filter_map(|candidate| scala.structural_parent_of(candidate))
+        .collect::<HashSet<_>>();
+    if owners.len() > 1 {
+        ScalaPhysicalCallableCandidates::Ambiguous
+    } else {
+        ScalaPhysicalCallableCandidates::Unique(candidates)
+    }
+}
+
+fn scala_unit_has_callable_role(
+    scala: &ScalaAnalyzer,
+    unit: &CodeUnit,
+    role: ScalaCallableRole,
+) -> bool {
+    let alternatives = scala.project_types().callable_alternatives_for(scala, unit);
+    if alternatives.is_empty() {
+        scala_fallback_callable_role(scala, unit) == role
+    } else {
+        alternatives
+            .iter()
+            .any(|alternative| alternative.role == role)
     }
 }
 
@@ -1867,8 +2093,10 @@ fn scala_extension_candidates(
     resolver: &ScalaNameResolver,
     member: &str,
     receiver_owner: Option<&str>,
+    call_shape: Option<&ScalaCallSiteShape>,
 ) -> DefinitionLookupOutcome {
-    let candidates = scala_extension_candidate_units(ctx, resolver, member, receiver_owner);
+    let candidates =
+        scala_extension_candidate_units(ctx, resolver, member, receiver_owner, call_shape);
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
@@ -1883,6 +2111,7 @@ fn scala_extension_candidate_units(
     resolver: &ScalaNameResolver,
     member: &str,
     receiver_owner: Option<&str>,
+    call_shape: Option<&ScalaCallSiteShape>,
 ) -> Vec<CodeUnit> {
     let mut candidates = Vec::new();
     for method in resolver.visible_extension_methods(member) {
@@ -1895,6 +2124,12 @@ fn scala_extension_candidate_units(
         }
         candidates.extend(ctx.support.fqn(&method.fqn));
     }
+    candidates = scala_filter_callable_units(
+        ctx.scala,
+        candidates,
+        call_shape,
+        ScalaCallableSiteRole::Ordinary,
+    );
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
@@ -2866,7 +3101,7 @@ fn scala_imported_member_shadows_bare_call(
                         scala,
                         &unit,
                         call_shape,
-                        ScalaCallableUsePolicy::OrdinaryMethod,
+                        ScalaCallableSiteRole::Ordinary,
                         false,
                     )
                 })

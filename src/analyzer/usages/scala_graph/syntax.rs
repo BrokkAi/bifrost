@@ -88,6 +88,43 @@ pub(crate) enum ScalaCallableUsePolicy {
     CompleteCall,
 }
 
+/// The callable namespace selected by Scala syntax before overload shapes are
+/// considered.
+///
+/// A source-backed constructor `CodeUnit` may carry the primary constructor
+/// and one or more `def this` alternatives.  Conversely, a class and its
+/// companion `apply` share a source-visible name.  Keeping the site role
+/// separate from call shape prevents either family from making an unrelated
+/// alternative look unique merely because its arity happens to fit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScalaCallableSiteRole {
+    Ordinary,
+    ExplicitConstruction,
+    PrimaryConstruction,
+}
+
+impl ScalaCallableSiteRole {
+    pub(crate) fn accepts(self, declared: ScalaCallableRole) -> bool {
+        match self {
+            Self::Ordinary => declared == ScalaCallableRole::Ordinary,
+            Self::ExplicitConstruction => matches!(
+                declared,
+                ScalaCallableRole::PrimaryConstructor | ScalaCallableRole::SecondaryConstructor
+            ),
+            Self::PrimaryConstruction => declared == ScalaCallableRole::PrimaryConstructor,
+        }
+    }
+
+    pub(crate) fn use_policy(self) -> ScalaCallableUsePolicy {
+        match self {
+            Self::Ordinary => ScalaCallableUsePolicy::OrdinaryMethod,
+            Self::ExplicitConstruction | Self::PrimaryConstruction => {
+                ScalaCallableUsePolicy::CompleteCall
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScalaCallShapeRelation {
     Incompatible,
@@ -175,23 +212,26 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
             }
             "class_definition" | "full_enum_case" => {
                 let mut cursor = node.walk();
-                let lists = node
+                let mut lists = node
                     .named_children(&mut cursor)
                     .filter(|child| child.kind() == "class_parameters")
                     .map(callable_parameter_list)
                     .collect::<Vec<_>>();
-                if !lists.is_empty() {
-                    facts.callable_alternatives_by_range.insert(
-                        (node.start_byte(), node.end_byte()),
-                        ScalaCallableSourceAlternative {
-                            role: ScalaCallableRole::PrimaryConstructor,
-                            shape: lists,
-                            parameter_function_arities: Vec::new(),
-                            extension_receiver_type_path: None,
-                            return_type_path: None,
-                        },
-                    );
+                if lists.is_empty() {
+                    lists.push(ScalaCallableParameterList::explicit(CallableArity::exact(
+                        0,
+                    )));
                 }
+                facts.callable_alternatives_by_range.insert(
+                    (node.start_byte(), node.end_byte()),
+                    ScalaCallableSourceAlternative {
+                        role: ScalaCallableRole::PrimaryConstructor,
+                        shape: lists,
+                        parameter_function_arities: Vec::new(),
+                        extension_receiver_type_path: None,
+                        return_type_path: None,
+                    },
+                );
                 let is_case_class = if node.kind() == "full_enum_case" {
                     true
                 } else {
@@ -1103,6 +1143,16 @@ pub(crate) fn call_arities_for_reference(node: Node<'_>) -> Option<Vec<usize>> {
 
 pub(crate) fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallSiteShape> {
     let parent = node.parent()?;
+    if parent.kind() == "case_class_pattern" && parent.named_child(0) == Some(node) {
+        let mut cursor = parent.walk();
+        let arity = parent
+            .children_by_field_name("pattern", &mut cursor)
+            .count();
+        return Some(ScalaCallSiteShape::ordinary(&[arity]));
+    }
+    if parent.kind() == "infix_pattern" && parent.child_by_field_name("operator") == Some(node) {
+        return Some(ScalaCallSiteShape::ordinary(&[1]));
+    }
     if parent.kind() == "infix_expression" && parent.child_by_field_name("operator") == Some(node) {
         return Some(ScalaCallSiteShape {
             lists: vec![ScalaCallArgumentList {
@@ -1304,6 +1354,32 @@ pub(crate) fn scala_callable_shape_matches(
         ScalaCallShapeRelation::Complete => true,
         ScalaCallShapeRelation::Partial { .. } => unique_callable,
     }
+}
+
+pub(crate) fn scala_callable_alternative_matches(
+    declared_role: ScalaCallableRole,
+    declared_shape: &[ScalaCallableParameterList],
+    actual: Option<&ScalaCallSiteShape>,
+    site_role: ScalaCallableSiteRole,
+    unique_callable: bool,
+) -> bool {
+    site_role.accepts(declared_role)
+        && scala_callable_shape_matches(
+            declared_shape,
+            actual,
+            site_role.use_policy(),
+            unique_callable,
+        )
+}
+
+pub(crate) fn scala_callable_alternative_is_candidate(
+    declared_role: ScalaCallableRole,
+    declared_shape: &[ScalaCallableParameterList],
+    actual: &ScalaCallSiteShape,
+    site_role: ScalaCallableSiteRole,
+) -> bool {
+    site_role.accepts(declared_role)
+        && scala_callable_shape_is_candidate(declared_shape, actual, site_role.use_policy())
 }
 
 pub(crate) fn scala_callable_shape_is_candidate(
@@ -1748,6 +1824,65 @@ enum Event:
         assert!(callable.shape[0].arity.accepts(2));
         assert!(!callable.shape[0].arity.accepts(0));
         assert!(facts.case_class_ranges.contains(&range));
+    }
+
+    #[test]
+    fn callable_roles_precede_shape_matching_for_primary_and_secondary_construction() {
+        let source = r#"class Roleful(value: Int) {
+  def this() = this(0)
+  def this(text: String, flag: Boolean) = this(text.length)
+}
+object Roleful { def apply(using String): Roleful = new Roleful(0) }
+"#;
+        let facts = scala_source_facts(source).expect("Scala source facts");
+        let mut roles = facts
+            .callable_alternatives_by_range
+            .values()
+            .map(|alternative| (alternative.role, alternative.shape.len()))
+            .collect::<Vec<_>>();
+        roles.sort_by_key(|(role, lists)| {
+            let role = match role {
+                ScalaCallableRole::Ordinary => 0,
+                ScalaCallableRole::PrimaryConstructor => 1,
+                ScalaCallableRole::SecondaryConstructor => 2,
+            };
+            (role, *lists)
+        });
+        assert_eq!(
+            roles,
+            vec![
+                (ScalaCallableRole::Ordinary, 1),
+                (ScalaCallableRole::PrimaryConstructor, 1),
+                (ScalaCallableRole::SecondaryConstructor, 1),
+                (ScalaCallableRole::SecondaryConstructor, 1),
+            ]
+        );
+
+        let zero = ScalaCallSiteShape::ordinary(&[0]);
+        let declared = [ScalaCallableParameterList::explicit(CallableArity::exact(
+            0,
+        ))];
+        assert!(scala_callable_alternative_matches(
+            ScalaCallableRole::SecondaryConstructor,
+            &declared,
+            Some(&zero),
+            ScalaCallableSiteRole::ExplicitConstruction,
+            false,
+        ));
+        assert!(!scala_callable_alternative_matches(
+            ScalaCallableRole::SecondaryConstructor,
+            &declared,
+            Some(&zero),
+            ScalaCallableSiteRole::PrimaryConstruction,
+            false,
+        ));
+        assert!(!scala_callable_alternative_matches(
+            ScalaCallableRole::SecondaryConstructor,
+            &declared,
+            Some(&zero),
+            ScalaCallableSiteRole::Ordinary,
+            false,
+        ));
     }
 
     #[test]

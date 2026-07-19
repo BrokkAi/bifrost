@@ -849,3 +849,79 @@ object Factories {
     }
     assert_eq!(results[5]["status"], "no_definition", "{value}");
 }
+
+#[test]
+fn scala_forward_definition_filters_callable_roles_before_overload_shapes() {
+    let source = r#"package app
+trait Context
+trait Marker
+trait Contains { infix def contains(value: Int): Boolean = true }
+class Roleful(value: Int) extends Contains {
+  def this() = this(0)
+  def this(text: String, flag: Boolean) = this(text.length)
+}
+object Roleful { def apply(using Context): Roleful = new Roleful(0) }
+object Use {
+  given Context = new Context {}
+  val primary = new Roleful(1)
+  val secondaryZero = new Roleful()
+  val secondaryTwo = new Roleful("two", true)
+  val wrongNew = new Roleful("wrong", false, 3)
+  val companion = Roleful()
+  val primaryFallback = Roleful(2)
+  val secondaryMustNotBeBare = Roleful("two", true)
+  val anonymous = new Marker {}
+  val inheritedInfix = primary contains 1
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/App.scala", source)
+        .build();
+    let at = |line: &str, member: &str| {
+        let start = source.find(line).expect("unique reference line");
+        location_at(source, start + line.find(member).expect("member on line"))
+    };
+    let mut references = [
+        ("val primary = new Roleful(1)", "Roleful"),
+        ("val secondaryZero = new Roleful()", "Roleful"),
+        ("val secondaryTwo = new Roleful(\"two\", true)", "Roleful"),
+        ("val wrongNew = new Roleful(\"wrong\", false, 3)", "Roleful"),
+        ("val companion = Roleful()", "Roleful"),
+        ("val primaryFallback = Roleful(2)", "Roleful"),
+        (
+            "val secondaryMustNotBeBare = Roleful(\"two\", true)",
+            "Roleful",
+        ),
+        ("val anonymous = new Marker {}", "Marker"),
+    ]
+    .into_iter()
+    .map(|(line, member)| at(line, member))
+    .collect::<Vec<_>>();
+    let infix = source.find("contains 1").expect("unique infix reference");
+    references.push(location_at(source, infix));
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for index in [0, 1, 2, 5] {
+        assert_eq!(results[index]["status"], "resolved", "{value}");
+        assert_eq!(
+            results[index]["definitions"][0]["fqn"], "app.Roleful.Roleful",
+            "{value}"
+        );
+    }
+    for index in [3, 6] {
+        assert_eq!(results[index]["status"], "no_definition", "{value}");
+    }
+    assert_eq!(
+        results[4]["definitions"][0]["fqn"], "app.Roleful$.apply",
+        "{value}"
+    );
+    assert_eq!(results[7]["definitions"][0]["fqn"], "app.Marker", "{value}");
+    assert_eq!(
+        results[8]["definitions"][0]["fqn"], "app.Contains.contains",
+        "{value}"
+    );
+}

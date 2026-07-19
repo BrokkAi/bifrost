@@ -147,6 +147,119 @@ object ImportedFactories {
 }
 
 #[test]
+fn scala_inverted_graph_filters_callable_roles_before_shape() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Roles.scala",
+            r#"package app
+trait Context
+trait Contains { infix def contains(value: Int): Boolean = true }
+class Roleful(value: Int) extends Contains {
+  def this() = this(0)
+  def this(text: String, flag: Boolean) = this(text.length)
+}
+object Roleful { def apply(using Context): Roleful = new Roleful(0) }
+object Use {
+  given Context = new Context {}
+  def primary = new Roleful(1)
+  def secondaryZero = new Roleful()
+  def secondaryTwo = new Roleful("two", true)
+  def wrongNew = new Roleful("wrong", false, 3)
+  def companion = Roleful()
+  def primaryFallback = Roleful(2)
+  def secondaryMustNotBeBare = Roleful("two", true)
+  def inheritedInfix(value: Roleful) = value contains 1
+}
+"#,
+        )
+        .file(
+            "jvm/Same.scala",
+            r#"package duplicate
+class Same(value: Int)
+object Same {
+  def apply(value: Int): Same = new Same(value)
+  def unapply(value: Any): Option[Int] = None
+}
+"#,
+        )
+        .file(
+            "js/Same.scala",
+            r#"package duplicate
+class Same(value: Int)
+object Same {
+  def apply(value: Int): Same = new Same(value)
+  def unapply(value: Any): Option[Int] = None
+}
+"#,
+        )
+        .file(
+            "external/Ambiguous.scala",
+            r#"package external
+object Ambiguous {
+  def value = new duplicate.Same(1)
+  def bare = duplicate.Same(1)
+  def pattern(value: Any): Int = value match {
+    case duplicate.Same(found) => found
+    case _ => 0
+  }
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+    for caller in [
+        "app.Use$.primary",
+        "app.Use$.secondaryZero",
+        "app.Use$.secondaryTwo",
+        "app.Use$.primaryFallback",
+    ] {
+        assert!(
+            has_edge(&value, caller, "app.Roleful.Roleful"),
+            "missing construction edge for {caller}: {}",
+            value["edges"]
+        );
+    }
+    for caller in ["app.Use$.wrongNew", "app.Use$.secondaryMustNotBeBare"] {
+        assert!(
+            !has_edge(&value, caller, "app.Roleful.Roleful"),
+            "role-incompatible constructor leaked for {caller}: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        has_edge(&value, "app.Use$.companion", "app.Roleful$.apply"),
+        "companion apply was not selected: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$.companion", "app.Roleful.Roleful"),
+        "secondary constructor participated in ordinary companion lookup: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "app.Use$.inheritedInfix", "app.Contains.contains"),
+        "inherited ordinary infix call was lost: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "external.Ambiguous$.value", "duplicate.Same.Same"),
+        "same-role/same-shape external physical owners must remain ambiguous: {}",
+        value["edges"]
+    );
+    for (caller, higher_tier) in [
+        ("external.Ambiguous$.bare", "duplicate.Same$.apply"),
+        ("external.Ambiguous$.pattern", "duplicate.Same$.unapply"),
+    ] {
+        assert!(
+            !has_edge(&value, caller, higher_tier)
+                && !has_edge(&value, caller, "duplicate.Same.Same"),
+            "an ambiguous ordinary callable tier must not fall through to the primary constructor: {}",
+            value["edges"]
+        );
+    }
+}
+
+#[test]
 fn scala_inverted_typed_pattern_binders_activate_for_guard_and_body_only() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

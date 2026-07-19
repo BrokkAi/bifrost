@@ -1,6 +1,6 @@
 use super::inverted::{CachedCallableAlternatives, NameResolver, is_package_level_type};
 use crate::analyzer::scala::scala_import_path;
-use crate::analyzer::usages::scala_graph::syntax::parenthesized_arity;
+use crate::analyzer::usages::scala_graph::syntax::{ScalaCallableRole, parenthesized_arity};
 use crate::analyzer::{
     CallableArity, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile,
     ScalaAnalyzer, TypeHierarchyProvider,
@@ -90,13 +90,6 @@ impl TargetSpec {
 
         let owner = owner_of(scala, target);
         let owner_name = owner.as_ref().map(scala_display_name);
-        let kind = if target.is_field() {
-            TargetKind::Field
-        } else if target.is_synthetic() || owner_name.as_deref() == Some(target.identifier()) {
-            TargetKind::Constructor
-        } else {
-            TargetKind::Method
-        };
         let arity = target.signature().and_then(signature_arity).or_else(|| {
             scala
                 .signatures(target)
@@ -108,13 +101,32 @@ impl TargetSpec {
             .iter()
             .find_map(|metadata| metadata.callable_arity())
             .or_else(|| arity.map(CallableArity::exact));
-        let callable_alternatives = matches!(kind, TargetKind::Method | TargetKind::Constructor)
-            .then(|| {
-                scala
-                    .project_types()
-                    .callable_alternatives_for(scala, target)
-            })
-            .unwrap_or_else(|| Arc::new(Vec::new()));
+        let callable_alternatives = if !target.is_field() && target.is_function() {
+            scala
+                .project_types()
+                .callable_alternatives_for(scala, target)
+        } else {
+            Arc::new(Vec::new())
+        };
+        let has_constructor_role = callable_alternatives.iter().any(|alternative| {
+            matches!(
+                alternative.role,
+                ScalaCallableRole::PrimaryConstructor | ScalaCallableRole::SecondaryConstructor
+            )
+        });
+        let has_ordinary_role = callable_alternatives
+            .iter()
+            .any(|alternative| alternative.role == ScalaCallableRole::Ordinary);
+        let kind = if target.is_field() {
+            TargetKind::Field
+        } else if target.is_synthetic()
+            || owner_name.as_deref() == Some(target.identifier())
+            || has_constructor_role && !has_ordinary_role
+        {
+            TargetKind::Constructor
+        } else {
+            TargetKind::Method
+        };
         let is_extension_method = callable_alternatives
             .iter()
             .any(|alternative| alternative.extension_receiver_type.is_some());
@@ -128,11 +140,17 @@ impl TargetSpec {
                 .definitions(&target.fq_name())
                 .filter(CodeUnit::is_function)
                 .map(|candidate| {
-                    scala
+                    let alternatives = scala
                         .project_types()
-                        .callable_alternatives_for(scala, &candidate)
-                        .len()
-                        .max(1)
+                        .callable_alternatives_for(scala, &candidate);
+                    if alternatives.is_empty() {
+                        1
+                    } else {
+                        alternatives
+                            .iter()
+                            .filter(|alternative| alternative.role == ScalaCallableRole::Ordinary)
+                            .count()
+                    }
                 })
                 .sum::<usize>()
                 == 1;

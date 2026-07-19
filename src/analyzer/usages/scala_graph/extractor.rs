@@ -2,6 +2,7 @@ use super::inverted::{
     BareMemberResolution, FieldResolution, MemberReturnResolution, NameResolver, ProjectTypes,
     TypeApplicationResolution, TypeApplicationRole,
 };
+use super::method_call_arity_applies;
 use crate::analyzer::scala::imports::scala_import_infos_from_node;
 use crate::analyzer::scala::{scala_supertype_lookup_nodes, scala_type_lookup_segments};
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
@@ -15,25 +16,26 @@ use crate::analyzer::usages::scala_graph::local::{
     ScalaLocalBinding, precise_scala_binding, seed_scala_binding,
 };
 use crate::analyzer::usages::scala_graph::resolver::{
-    TargetKind, TargetSpec, Visibility, method_call_arity_applies, method_signature_arity,
-    package_name_of, scala_builtin_type_name, scala_extension_receiver_matches_resolved,
-    scala_literal_type_name, scala_normalized_fq_name, scala_resolve_declared_type,
+    TargetKind, TargetSpec, Visibility, method_signature_arity, package_name_of,
+    scala_builtin_type_name, scala_extension_receiver_matches_resolved, scala_literal_type_name,
+    scala_normalized_fq_name, scala_resolve_declared_type,
 };
 use crate::analyzer::usages::scala_graph::syntax::{
-    ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableUsePolicy,
-    ScalaImportContextIndex, ScalaMethodValueContext, ScalaPackageContextIndex,
-    ScalaQualifiedStableTypeRole, applied_expression_for_reference, call_arities_for_reference,
-    call_site_shape_for_reference, enclosing_template_declarations, has_ancestor_kind,
-    has_member_qualifier, infix_receiver_for_operator, is_bare_companion_method_value_reference,
-    is_call_function_reference, is_constructor_like_reference, is_declaration_name,
-    is_extractor_reference, is_identifier_node, is_infix_pattern_operator, is_owner_qualified_this,
-    is_scala_case_pattern_binder, is_scala_class_reference, is_scala_object_reference,
-    is_terminal_stable_field_reference, member_qualifier, member_qualifier_node,
-    named_argument_invocation_owner, node_text, parenthesized_arity,
-    qualified_stable_type_reference, resolve_stable_object_expression,
-    scala_callable_shape_is_candidate, scala_callable_shape_matches, scala_pattern_binder_names,
-    scala_union_type_alternative_paths, stable_identifier_reference,
-    template_direct_term_member_named, template_self_type, terminal_invocation_owner_name,
+    ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableRole, ScalaCallableSiteRole,
+    ScalaCallableUsePolicy, ScalaImportContextIndex, ScalaMethodValueContext,
+    ScalaPackageContextIndex, ScalaQualifiedStableTypeRole, applied_expression_for_reference,
+    call_arities_for_reference, call_site_shape_for_reference, enclosing_template_declarations,
+    has_ancestor_kind, has_member_qualifier, infix_receiver_for_operator,
+    is_bare_companion_method_value_reference, is_call_function_reference,
+    is_constructor_like_reference, is_declaration_name, is_extractor_reference, is_identifier_node,
+    is_infix_pattern_operator, is_owner_qualified_this, is_scala_case_pattern_binder,
+    is_scala_class_reference, is_scala_object_reference, is_terminal_stable_field_reference,
+    member_qualifier, member_qualifier_node, named_argument_invocation_owner, node_text,
+    parenthesized_arity, qualified_stable_type_reference, resolve_stable_object_expression,
+    scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
+    scala_callable_shape_matches, scala_pattern_binder_names, scala_union_type_alternative_paths,
+    stable_identifier_reference, template_direct_term_member_named, template_self_type,
+    terminal_invocation_owner_name,
 };
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile, Range, ScalaAnalyzer,
@@ -407,17 +409,8 @@ fn resolve_unqualified_type_application(
     {
         return None;
     }
-    let exact_source_class = match ctx.spec.kind {
-        TargetKind::Constructor => ctx.spec.owner.as_ref().filter(|owner| {
-            owner.source() == ctx.file && ctx.spec.owner_name.as_deref() == Some(name)
-        }),
-        TargetKind::Type => (ctx.spec.target.source() == ctx.file && ctx.spec.member_name == name)
-            .then_some(&ctx.spec.target),
-        TargetKind::Method | TargetKind::Field => None,
-    };
-    let class_fqn = lexically_visible_nested_type(node, name, ctx)
-        .or_else(|| exact_source_class.map(CodeUnit::fq_name))
-        .or_else(|| ctx.name_resolver.resolve(name));
+    let class_fqn =
+        lexically_visible_nested_type(node, name, ctx).or_else(|| ctx.name_resolver.resolve(name));
     let object_fqn = lexically_visible_nested_object(node, name, ctx)
         .or_else(|| ctx.name_resolver.resolve_object(name));
     (class_fqn.is_some() || object_fqn.is_some()).then(|| {
@@ -427,8 +420,9 @@ fn resolve_unqualified_type_application(
             class_fqn.as_deref(),
             object_fqn.as_deref(),
             name,
-            call_arities_for_reference(node).as_deref(),
+            call_site_shape_for_reference(node).as_ref(),
             role,
+            Some(ctx.file),
         )
     })
 }
@@ -832,8 +826,9 @@ fn constructed_receiver_type_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<
             Some(&class_fqn),
             None,
             name,
-            call_arities_for_reference(type_node).as_deref(),
+            call_site_shape_for_reference(type_node).as_ref(),
             TypeApplicationRole::ExplicitConstructor,
+            Some(ctx.file),
         )
         .type_target
         .map(|target| target.fq_name())
@@ -1170,6 +1165,7 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             });
             let qualified_role_matches = qualified.as_ref().is_some_and(|reference| {
                 let call_arities = call_arities_for_reference(reference.expression);
+                let call_shape = call_site_shape_for_reference(reference.expression);
                 match reference.role {
                     ScalaQualifiedStableTypeRole::Type => qualified_class_matches,
                     ScalaQualifiedStableTypeRole::Constructor => {
@@ -1178,10 +1174,10 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                                 .types
                                 .is_scala_trait_declaration(ctx.scala, &ctx.spec.target)
                                 || qualified_class_target.as_deref().is_some_and(|fqn| {
-                                    ctx.types.constructor_call_shape_matches(
+                                    ctx.types.explicit_constructor_call_matches(
                                         ctx.scala,
                                         fqn,
-                                        call_arities.as_deref(),
+                                        call_shape.as_ref(),
                                     )
                                 }))
                     }
@@ -1221,10 +1217,10 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 || ctx
                     .types
                     .is_scala_trait_declaration(ctx.scala, &ctx.spec.target)
-                || ctx.types.constructor_target_call_shape_matches(
+                || ctx.types.explicit_constructor_target_matches(
                     ctx.scala,
                     &ctx.spec.target,
-                    call_arities_for_reference(node).as_deref(),
+                    call_site_shape_for_reference(node).as_ref(),
                 );
             let class_reference = qualified.is_none()
                 && is_scala_class_reference(node, ctx.source)
@@ -1473,8 +1469,9 @@ fn resolve_qualified_type_application(
         class_fqn.as_deref(),
         object_fqn.as_deref(),
         name,
-        call_arities_for_reference(reference.expression).as_deref(),
+        call_site_shape_for_reference(reference.expression).as_ref(),
         role,
+        Some(ctx.file),
     ))
 }
 
@@ -1657,7 +1654,7 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
         && let Some(owner_fq_name) = structured_receiver_type(qualifier_node, ctx)
     {
         let call_shape = call_site_shape_with_method_value_context(node, ctx);
-        if !member_call_shape_matches(call_shape.as_ref(), ctx) {
+        if !member_call_shape_matches(call_shape.as_ref(), ScalaCallableSiteRole::Ordinary, ctx) {
             return false;
         }
         return call_shape.as_ref().map_or_else(
@@ -1754,7 +1751,7 @@ fn bare_member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>
             .map(|list| list.arity)
             .collect::<Vec<_>>()
     });
-    if !member_call_shape_matches(call_shape.as_ref(), ctx) {
+    if !member_call_shape_matches(call_shape.as_ref(), ScalaCallableSiteRole::Ordinary, ctx) {
         return false;
     }
     let templates = enclosing_template_declarations(node);
@@ -2213,20 +2210,22 @@ fn extension_receiver_matches(
         .callable_alternatives
         .iter()
         .filter(|alternative| {
-            scala_extension_receiver_matches_resolved(
-                alternative.extension_receiver_type.as_deref(),
-                Some(&receiver_owner),
-                |type_text| {
-                    ctx.name_resolver
-                        .resolve(type_text)
-                        .or_else(|| scala_builtin_type_name(type_text).map(str::to_string))
-                },
-            )
+            alternative.role == ScalaCallableRole::Ordinary
+                && scala_extension_receiver_matches_resolved(
+                    alternative.extension_receiver_type.as_deref(),
+                    Some(&receiver_owner),
+                    |type_text| {
+                        ctx.name_resolver
+                            .resolve(type_text)
+                            .or_else(|| scala_builtin_type_name(type_text).map(str::to_string))
+                    },
+                )
         })
         .collect::<Vec<_>>();
     let unique_callable = ctx.spec.unapplied_reference_is_unambiguous;
     if !matching_alternatives.iter().any(|alternative| {
-        ordinary_callable_shape_matches(&alternative.shape, call_arities, unique_callable)
+        alternative.role == ScalaCallableRole::Ordinary
+            && ordinary_callable_shape_matches(&alternative.shape, call_arities, unique_callable)
     }) {
         return false;
     }
@@ -2522,7 +2521,7 @@ fn enclosing_owner_fq_name(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> 
 
 fn member_call_arity_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     let shape = call_site_shape_with_method_value_context(node, ctx);
-    member_call_shape_matches(shape.as_ref(), ctx)
+    member_call_shape_matches(shape.as_ref(), ScalaCallableSiteRole::Ordinary, ctx)
 }
 
 fn call_site_shape_with_method_value_context(
@@ -2547,61 +2546,62 @@ fn call_site_shape_with_method_value_context(
     }
 }
 
-fn member_call_shape_matches(call_shape: Option<&ScalaCallSiteShape>, ctx: &ScanCtx<'_>) -> bool {
+fn member_call_shape_matches(
+    call_shape: Option<&ScalaCallSiteShape>,
+    site_role: ScalaCallableSiteRole,
+    ctx: &ScanCtx<'_>,
+) -> bool {
     if !matches!(ctx.spec.kind, TargetKind::Method | TargetKind::Constructor) {
         return true;
     }
-    let fallback_shape;
-    let fallback_shapes;
-    let shapes = if ctx.spec.callable_alternatives.is_empty() {
-        fallback_shape = ctx
-            .spec
-            .callable_arity
-            .map(|arity| vec![ScalaCallableParameterList::explicit(arity)])
-            .unwrap_or_default();
-        fallback_shapes = vec![fallback_shape];
-        fallback_shapes.as_slice()
-    } else {
+    if !ctx.spec.callable_alternatives.is_empty() {
         let unique_callable =
             call_shape.map_or(ctx.spec.unapplied_reference_is_unambiguous, |shape| {
                 ctx.spec
                     .callable_alternatives
                     .iter()
                     .filter(|alternative| {
-                        scala_callable_shape_is_candidate(
+                        scala_callable_alternative_is_candidate(
+                            alternative.role,
                             &alternative.shape,
                             shape,
-                            ScalaCallableUsePolicy::OrdinaryMethod,
+                            site_role,
                         )
                     })
                     .count()
                     == 1
             });
         return ctx.spec.callable_alternatives.iter().any(|alternative| {
-            scala_callable_shape_matches(
+            scala_callable_alternative_matches(
+                alternative.role,
                 &alternative.shape,
                 call_shape,
-                if ctx.spec.kind == TargetKind::Method {
-                    ScalaCallableUsePolicy::OrdinaryMethod
-                } else {
-                    ScalaCallableUsePolicy::CompleteCall
-                },
+                site_role,
                 unique_callable,
             )
         });
+    }
+    let fallback_shape = ctx
+        .spec
+        .callable_arity
+        .map(|arity| vec![ScalaCallableParameterList::explicit(arity)])
+        .unwrap_or_default();
+    let fallback_role = if ctx.spec.kind == TargetKind::Constructor {
+        if ctx.spec.target.is_synthetic() {
+            ScalaCallableRole::PrimaryConstructor
+        } else {
+            ScalaCallableRole::SecondaryConstructor
+        }
+    } else {
+        ScalaCallableRole::Ordinary
     };
-    shapes.iter().any(|declared| {
-        scala_callable_shape_matches(
-            declared,
-            call_shape,
-            if ctx.spec.kind == TargetKind::Method {
-                ScalaCallableUsePolicy::OrdinaryMethod
-            } else {
-                ScalaCallableUsePolicy::CompleteCall
-            },
-            ctx.spec.unapplied_reference_is_unambiguous,
-        )
-    })
+    scala_callable_alternative_matches(
+        fallback_role,
+        &fallback_shape,
+        call_shape,
+        site_role,
+        ctx.spec.unapplied_reference_is_unambiguous,
+    )
 }
 
 fn ordinary_callable_shape_matches(
