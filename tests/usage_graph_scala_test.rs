@@ -46,6 +46,107 @@ object Use {
 }
 
 #[test]
+fn scala_inverted_local_inference_keeps_field_identity_and_value_type_distinct() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Runtime.scala",
+            r#"package model
+class EntityRef { def ask(): String = "ok" }
+class ClusterSharding { def entityRefFor(): EntityRef = new EntityRef }
+object ClusterSharding { def apply(system: String): ClusterSharding = new ClusterSharding }
+class Graph { def buildTargets(): Int = 1 }
+object Graph { def apply(nodes: Set[Int])(edge: (Int, Int) => Boolean): Graph = new Graph }
+object Factories {
+  def make(): Graph = new Graph
+  def make(value: Int): EntityRef = new EntityRef
+  def ambiguous(value: Int): EntityRef = new EntityRef
+  def ambiguous(value: String): Graph = new Graph
+}
+"#,
+        )
+        .file(
+            "app/WeatherRoutes.scala",
+            r#"package app
+import model.*
+class WeatherRoutes(system: String) {
+  private var sharding = ClusterSharding(system)
+  def route(): String = {
+    val ref = sharding.entityRefFor()
+    ref.ask()
+  }
+  def reset(): EntityRef = {
+    sharding = ClusterSharding(system)
+    sharding.entityRefFor()
+  }
+}
+"#,
+        )
+        .file(
+            "app/LayerMacros.scala",
+            r#"package app
+import model.Graph
+object LayerMacros {
+  def build(nodes: List[Int]): Int = {
+    val graph = Graph(nodes.toSet)(_ < _)
+    graph.buildTargets()
+  }
+}
+"#,
+        )
+        .file(
+            "app/ImportedFactories.scala",
+            r#"package app
+import model.Factories.{ambiguous, make}
+import model.Graph
+object ImportedFactories {
+  def positive(): Int = {
+    val graph = make()
+    graph.buildTargets()
+  }
+  def negative(): Int = {
+    val uncertain = ambiguous(1)
+    uncertain.buildTargets()
+  }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    for (caller, callee) in [
+        (
+            "app.WeatherRoutes.route",
+            "model.ClusterSharding.entityRefFor",
+        ),
+        ("app.WeatherRoutes.route", "model.EntityRef.ask"),
+        (
+            "app.WeatherRoutes.reset",
+            "model.ClusterSharding.entityRefFor",
+        ),
+        ("app.LayerMacros$.build", "model.Graph.buildTargets"),
+        (
+            "app.ImportedFactories$.positive",
+            "model.Graph.buildTargets",
+        ),
+    ] {
+        assert!(
+            has_edge(&value, caller, callee),
+            "missing local-inference edge {caller} -> {callee}: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        !has_edge(
+            &value,
+            "app.ImportedFactories$.negative",
+            "model.Graph.buildTargets"
+        ),
+        "same-shape imported overload returns must fail closed: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn scala_inverted_typed_pattern_binders_activate_for_guard_and_body_only() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

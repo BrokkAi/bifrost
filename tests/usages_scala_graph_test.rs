@@ -68,6 +68,110 @@ object Use {
 }
 
 #[test]
+fn scala_usage_finder_routes_field_factory_and_nested_curried_receivers() {
+    let weather_source = r#"package app
+import model.*
+class WeatherRoutes(system: String) {
+  private var sharding = ClusterSharding(system)
+  def route(): String = {
+    val ref = sharding.entityRefFor()
+    ref.ask() // exact-ask
+  }
+  def reset(): EntityRef = {
+    sharding = ClusterSharding(system)
+    sharding.entityRefFor() // exact-field-after-assignment
+  }
+}
+"#;
+    let layer_source = r#"package app
+import model.Graph
+object LayerMacros {
+  def build(nodes: List[Int]): Int = {
+    val graph = Graph(nodes.toSet)(_ < _)
+    graph.buildTargets() // exact-build-targets
+  }
+}
+"#;
+    let imported_source = r#"package app
+import model.Factories.{ambiguous, make}
+import model.Graph
+object ImportedFactories {
+  def positive(): Int = {
+    val graph = make()
+    graph.buildTargets() // positive-imported-arity
+  }
+  def negative(): Int = {
+    val uncertain = ambiguous(1)
+    uncertain.buildTargets() // negative-imported-same-shape
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Runtime.scala",
+            r#"package model
+class EntityRef { def ask(): String = "ok" }
+class ClusterSharding { def entityRefFor(): EntityRef = new EntityRef }
+object ClusterSharding { def apply(system: String): ClusterSharding = new ClusterSharding }
+class Graph { def buildTargets(): Int = 1 }
+object Graph { def apply(nodes: Set[Int])(edge: (Int, Int) => Boolean): Graph = new Graph }
+object Factories {
+  def make(): Graph = new Graph
+  def make(value: Int): EntityRef = new EntityRef
+  def ambiguous(value: Int): EntityRef = new EntityRef
+  def ambiguous(value: String): Graph = new Graph
+}
+"#,
+        ),
+        ("app/WeatherRoutes.scala", weather_source),
+        ("app/LayerMacros.scala", layer_source),
+        ("app/ImportedFactories.scala", imported_source),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = ScalaUsageGraphStrategy::new();
+
+    for (fqn, source, marker) in [
+        ("model.EntityRef.ask", weather_source, "ref.ask()"),
+        (
+            "app.WeatherRoutes.sharding",
+            weather_source,
+            "sharding.entityRefFor() // exact-field-after-assignment",
+        ),
+        (
+            "model.ClusterSharding.entityRefFor",
+            weather_source,
+            "sharding.entityRefFor() // exact-field-after-assignment",
+        ),
+        (
+            "model.Graph.buildTargets",
+            layer_source,
+            "graph.buildTargets()",
+        ),
+    ] {
+        let target = definition(&analyzer, fqn);
+        let target_hits =
+            hits(strategy.find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 100));
+        assert_hit_line(&target_hits, line_of(source, marker));
+    }
+
+    let build_targets = definition(&analyzer, "model.Graph.buildTargets");
+    let build_hits = hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&build_targets),
+        &candidates,
+        100,
+    ));
+    assert_hit_line(
+        &build_hits,
+        line_of(imported_source, "positive-imported-arity"),
+    );
+    assert_no_hit_line(
+        &build_hits,
+        line_of(imported_source, "negative-imported-same-shape"),
+    );
+}
+
+#[test]
 fn scala_imported_bare_helper_return_seeds_local_receiver_type() {
     let (project, analyzer) = scala_analyzer_with_files(&[
         (

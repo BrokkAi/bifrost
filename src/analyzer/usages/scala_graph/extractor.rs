@@ -11,6 +11,9 @@ use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::scala_graph::hits::{
     add_hit, add_import_hit, add_override_declaration_hit,
 };
+use crate::analyzer::usages::scala_graph::local::{
+    ScalaLocalBinding, precise_scala_binding, seed_scala_binding,
+};
 use crate::analyzer::usages::scala_graph::resolver::{
     TargetKind, TargetSpec, Visibility, method_call_arity_applies, method_signature_arity,
     package_name_of, scala_builtin_type_name, scala_extension_receiver_matches_resolved,
@@ -140,7 +143,7 @@ pub(super) struct ScanCtx<'a> {
     package_context_cursor: usize,
     active_resolver_key: Option<ResolverContextKey>,
     resolver_contexts: HashMap<ResolverContextKey, ResolverContext>,
-    pub(super) bindings: &'a mut LocalInferenceEngine<String>,
+    pub(super) bindings: &'a mut LocalInferenceEngine<ScalaLocalBinding>,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
     pub(super) max_usages: usize,
     pub(super) limit_exceeded: &'a mut bool,
@@ -546,9 +549,6 @@ fn seed_inline_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn seed_owner_field_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if ctx.spec.owner.is_none() {
-        return;
-    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if matches!(child.kind(), "template_body" | "enum_body") {
@@ -558,9 +558,6 @@ fn seed_owner_field_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn seed_enclosing_owner_field_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if ctx.spec.owner.is_none() {
-        return;
-    }
     let mut current = node.parent();
     while let Some(ancestor) = current {
         match ancestor.kind() {
@@ -605,24 +602,27 @@ fn seed_direct_field_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn seed_owner_field_definition(node: Node<'_>, owner_fq_name: &str, ctx: &mut ScanCtx<'_>) {
+fn seed_owner_field_definition(node: Node<'_>, owner: &CodeUnit, ctx: &mut ScanCtx<'_>) {
     let Some(pattern) = node.child_by_field_name("pattern") else {
         return;
     };
+    let receiver_type = value_definition_receiver_type(node, ctx);
     for name in scala_pattern_binder_names(pattern, ctx.source) {
-        ctx.bindings
-            .seed_symbol(name.to_string(), owner_fq_name.to_string());
+        seed_scala_binding(
+            name,
+            receiver_type.clone(),
+            Some(owner.clone()),
+            ctx.bindings,
+        );
     }
 }
 
-fn direct_template_field_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
+fn direct_template_field_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
     let mut current = node.parent();
     while let Some(ancestor) = current {
         match ancestor.kind() {
             "template_body" | "enum_body" => {
-                let owner = enclosing_owner_fq_name(node, ctx)?;
-                return (ctx.spec.owner_fq_name.as_deref() == Some(owner.as_str()))
-                    .then_some(owner);
+                return enclosing_owner(node, ctx);
             }
             "function_definition"
             | "function_declaration"
@@ -655,7 +655,7 @@ fn seed_parameter_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 fn seed_class_parameter_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let enclosing_owner = node
         .child_by_field_name("name")
-        .and_then(|name| enclosing_owner_fq_name(name, ctx));
+        .and_then(|name| enclosing_owner(name, ctx));
     let mut cursor = node.walk();
     for parameters in node
         .named_children(&mut cursor)
@@ -674,11 +674,12 @@ fn seed_class_parameter_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 continue;
             }
             if class_parameter_is_field(parameter)
-                && name == ctx.spec.member_name
-                && let Some(owner) = enclosing_owner.as_deref()
+                && let Some(owner) = enclosing_owner.as_ref()
             {
-                ctx.bindings
-                    .seed_symbol(name.to_string(), scala_normalized_fq_name(owner));
+                let receiver_type = parameter
+                    .child_by_field_name("type")
+                    .and_then(|type_node| resolve_type_node(type_node, ctx));
+                seed_scala_binding(name, receiver_type, Some(owner.clone()), ctx.bindings);
             } else {
                 seed_parameter(parameter, ctx);
             }
@@ -722,14 +723,20 @@ fn seed_parameter(parameter: Node<'_>, ctx: &mut ScanCtx<'_>) {
             })
             .collect::<Option<Vec<_>>>();
         if let Some(owners) = owners {
-            ctx.bindings.seed_symbol_many(name.to_string(), owners);
+            ctx.bindings.seed_symbol_many(
+                name.to_string(),
+                owners.into_iter().map(|receiver_type| ScalaLocalBinding {
+                    receiver_type: Some(receiver_type),
+                    declaration_owner: None,
+                }),
+            );
         } else {
             ctx.bindings.declare_shadow(name.to_string());
         }
         return;
     }
     if let Some(owner) = type_node.and_then(|type_node| resolve_type_node(type_node, ctx)) {
-        ctx.bindings.seed_symbol(name.to_string(), owner);
+        seed_scala_binding(name, Some(owner), None, ctx.bindings);
         return;
     }
     let type_name = type_node.map(|type_node| node_text(type_node, ctx.source).trim());
@@ -741,39 +748,33 @@ fn seed_value_definition(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         seed_value_definition_from_text(node_text(node, ctx.source), ctx);
         return;
     };
-    let type_name = node
-        .child_by_field_name("type")
-        .map(|type_node| node_text(type_node, ctx.source).trim());
-    let value = node.child_by_field_name("value");
-    let resolved_type_owner = node
-        .child_by_field_name("type")
-        .and_then(|type_node| resolve_type_node(type_node, ctx));
-    let resolved_constructed_owner =
-        value.and_then(|value| constructed_or_applied_type_owner(value, ctx));
-    let value_name =
-        value.and_then(|value_node| constructor_type_name(node_text(value_node, ctx.source)));
-    let resolved_value_owner = value.and_then(|value| call_initializer_return_owner(value, ctx));
-    if resolved_type_owner.is_none()
-        && resolved_constructed_owner.is_none()
-        && type_name.is_none()
-        && value_name.is_none()
-        && resolved_value_owner.is_none()
-    {
+    let receiver_type = value_definition_receiver_type(node, ctx);
+    if receiver_type.is_none() {
         seed_value_definition_from_text(node_text(node, ctx.source), ctx);
         return;
     }
     for name in scala_pattern_binder_names(pattern, ctx.source) {
-        if let Some(owner) = resolved_type_owner
-            .as_deref()
-            .or(resolved_constructed_owner.as_deref())
-            .or(resolved_value_owner.as_deref())
-        {
-            ctx.bindings
-                .seed_symbol(name.to_string(), owner.to_string());
-        } else {
-            seed_or_shadow_typed_symbol(name, type_name, value_name, ctx);
-        }
+        seed_scala_binding(name, receiver_type.clone(), None, ctx.bindings);
     }
+}
+
+fn value_definition_receiver_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
+    let value = node.child_by_field_name("value");
+    node.child_by_field_name("type")
+        .and_then(|type_node| resolve_type_node(type_node, ctx))
+        .or_else(|| value.and_then(|value| constructed_or_applied_type_owner(value, ctx)))
+        .or_else(|| value.and_then(|value| call_initializer_return_owner(value, ctx)))
+        .or_else(|| {
+            let type_name = node
+                .child_by_field_name("type")
+                .map(|type_node| node_text(type_node, ctx.source).trim());
+            let value_name = value
+                .and_then(|value_node| constructor_type_name(node_text(value_node, ctx.source)));
+            type_name
+                .or(value_name)
+                .and_then(|name| ctx.visibility.receiver_type_fq_name_for(name))
+                .map(str::to_string)
+        })
 }
 
 fn constructed_type_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
@@ -791,7 +792,10 @@ fn constructed_or_applied_type_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Optio
         if node.kind() != "call_expression" {
             return None;
         }
-        let function = node.child_by_field_name("function")?;
+        let mut function = node.child_by_field_name("function")?;
+        while function.kind() == "call_expression" {
+            function = function.child_by_field_name("function")?;
+        }
         if !matches!(function.kind(), "identifier" | "type_identifier") {
             return None;
         }
@@ -889,41 +893,28 @@ fn refresh_assignment_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let name = node_text(left, ctx.source).trim();
-    if name.is_empty()
-        || !ctx.bindings.is_shadowed(name)
-        || assignment_updates_target_owner_field(name, ctx)
-    {
+    if name.is_empty() || !ctx.bindings.is_shadowed(name) {
         return;
     }
 
-    if let Some(owner) = call_initializer_return_owner(right, ctx) {
-        ctx.bindings.seed_symbol(name.to_string(), owner);
+    let declaration_owner =
+        precise_scala_binding(ctx.bindings, name).and_then(|binding| binding.declaration_owner);
+    if let Some(receiver_type) = call_initializer_return_owner(right, ctx)
+        .or_else(|| constructed_or_applied_type_owner(right, ctx))
+    {
+        seed_scala_binding(name, Some(receiver_type), declaration_owner, ctx.bindings);
         return;
     }
     if matches!(right.kind(), "identifier" | "operator_identifier") {
         let source_name = node_text(right, ctx.source).trim();
         if !source_name.is_empty()
-            && let Some(targets) = ctx
-                .bindings
-                .resolve_symbol(source_name)
-                .as_precise()
-                .cloned()
+            && let Some(source) = precise_scala_binding(ctx.bindings, source_name)
         {
-            ctx.bindings.seed_symbol_many(name.to_string(), targets);
+            seed_scala_binding(name, source.receiver_type, declaration_owner, ctx.bindings);
             return;
         }
     }
-    ctx.bindings.declare_shadow(name.to_string());
-}
-
-fn assignment_updates_target_owner_field(name: &str, ctx: &ScanCtx<'_>) -> bool {
-    ctx.spec.kind == TargetKind::Field
-        && name == ctx.spec.member_name
-        && ctx
-            .bindings
-            .resolve_symbol(name)
-            .as_precise()
-            .is_some_and(|owners| owners.iter().any(|owner| ctx.spec.owner_fq_matches(owner)))
+    seed_scala_binding(name, None, declaration_owner, ctx.bindings);
 }
 
 fn call_initializer_return_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
@@ -943,10 +934,8 @@ fn call_initializer_return_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<St
                 stable_object_expression_fqn(owner_node, ctx)
             } else if matches!(owner_node.kind(), "identifier" | "type_identifier") {
                 let owner_name = node_text(owner_node, ctx.source).trim();
-                ctx.bindings
-                    .resolve_symbol(owner_name)
-                    .as_precise()
-                    .and_then(single_precise_target)
+                precise_scala_binding(ctx.bindings, owner_name)
+                    .and_then(|binding| binding.receiver_type)
                     .or_else(|| ctx.name_resolver.resolve_object(owner_name))
                     .or_else(|| ctx.name_resolver.resolve(owner_name))
             } else {
@@ -980,8 +969,12 @@ fn call_initializer_return_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<St
             ctx.name_resolver
                 .resolve_member(member_name)
                 .and_then(|member| {
-                    ctx.types
-                        .member_return_type(ctx.scala, &ctx.name_resolver, &member)
+                    ctx.types.member_return_type_for_fqn_call(
+                        ctx.scala,
+                        &ctx.name_resolver,
+                        &member,
+                        call_arities.as_deref(),
+                    )
                 })
         }
         _ => None,
@@ -1088,23 +1081,20 @@ fn seed_or_shadow_typed_symbol(
         .or(value_name)
         .and_then(|name| ctx.visibility.receiver_type_fq_name_for(name));
     if let Some(owner_fq_name) = visible_owner {
-        ctx.bindings
-            .seed_symbol(name.to_string(), owner_fq_name.to_string());
+        seed_scala_binding(name, Some(owner_fq_name.to_string()), None, ctx.bindings);
         return;
     }
     if let Some(type_name) = type_name
         && let Some(owner_fq_name) =
             scala_resolve_declared_type(ctx.scala, ctx.file, &ctx.active_package, type_name)
     {
-        ctx.bindings
-            .seed_symbol(name.to_string(), owner_fq_name.to_string());
+        seed_scala_binding(name, Some(owner_fq_name), None, ctx.bindings);
         return;
     }
     if let Some(type_name) = type_name
         && let Some(builtin) = scala_builtin_type_name(type_name)
     {
-        ctx.bindings
-            .seed_symbol(name.to_string(), builtin.to_string());
+        seed_scala_binding(name, Some(builtin.to_string()), None, ctx.bindings);
         return;
     }
     ctx.bindings.declare_shadow(name.to_string());
@@ -2255,10 +2245,8 @@ fn extension_receiver_type(receiver: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Stri
             if name == "this" {
                 return enclosing_owner_fq_name(receiver, ctx);
             }
-            ctx.bindings
-                .resolve_symbol(name)
-                .as_precise()
-                .and_then(single_precise_target)
+            precise_scala_binding(ctx.bindings, name)
+                .and_then(|binding| binding.receiver_type)
                 .or_else(|| {
                     (!ctx.bindings.is_shadowed(name))
                         .then(|| ctx.visibility.owner_fq_name_for(name).map(str::to_string))
@@ -2285,10 +2273,8 @@ fn structured_receiver_type(receiver: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Str
             if name == "this" {
                 return enclosing_owner_fq_name(receiver, ctx);
             }
-            ctx.bindings
-                .resolve_symbol(name)
-                .as_precise()
-                .and_then(single_precise_target)
+            precise_scala_binding(ctx.bindings, name)
+                .and_then(|binding| binding.receiver_type)
                 .or_else(|| {
                     if ctx.bindings.is_shadowed(name) {
                         return None;
@@ -2325,12 +2311,6 @@ fn structured_receiver_type(receiver: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Str
         "call_expression" => call_initializer_return_owner(receiver, ctx),
         kind => scala_literal_type_name(kind).map(str::to_string),
     }
-}
-
-fn single_precise_target(targets: &HashSet<String>) -> Option<String> {
-    (targets.len() == 1)
-        .then(|| targets.iter().next().cloned())
-        .flatten()
 }
 
 fn receiver_has_member(
@@ -2388,9 +2368,12 @@ fn is_locally_shadowed(ctx: &ScanCtx<'_>, name: &str) -> bool {
         .resolve_symbol(name)
         .as_precise()
         .is_some_and(|targets| {
-            targets
-                .iter()
-                .any(|target| ctx.spec.owner_fq_matches(target))
+            targets.iter().any(|binding| {
+                binding
+                    .declaration_owner
+                    .as_ref()
+                    .is_some_and(|owner| ctx.spec.owner.as_ref() == Some(owner))
+            })
         })
 }
 
@@ -2414,14 +2397,19 @@ fn receiver_binding_matches(node: Node<'_>, qualifier: &str, ctx: &ScanCtx<'_>) 
         // selects a member shared by every alternative through their common ancestor; a
         // compatible field override on one alternative does not erase that inherited family.
         if targets.len() > 1 {
-            return targets
-                .iter()
-                .all(|target| receiver_owner_inherits_target_family(target, ctx));
+            return targets.iter().all(|binding| {
+                binding
+                    .receiver_type
+                    .as_deref()
+                    .is_some_and(|target| receiver_owner_inherits_target_family(target, ctx))
+            });
         }
-        if targets
-            .iter()
-            .all(|target| receiver_owner_matches_target_family(target, ctx))
-        {
+        if targets.iter().all(|binding| {
+            binding
+                .receiver_type
+                .as_deref()
+                .is_some_and(|target| receiver_owner_matches_target_family(target, ctx))
+        }) {
             return true;
         }
     }

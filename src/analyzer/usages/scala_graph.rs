@@ -1,6 +1,7 @@
 mod extractor;
 mod hits;
 mod inverted;
+pub(in crate::analyzer::usages) mod local;
 mod resolver;
 mod shared;
 pub(super) mod syntax;

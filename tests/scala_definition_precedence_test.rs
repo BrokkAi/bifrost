@@ -28,7 +28,6 @@ object App {
   def less(left: Int): Boolean = left < 2
 }
 "#;
-
 fn location(source: &str, needle: &str) -> Value {
     let start = source.rfind(needle).expect("reference text");
     location_at(source, start)
@@ -745,4 +744,108 @@ object Use {
     for result in &results[5..] {
         assert_eq!(result["status"], "no_definition", "{value}");
     }
+}
+
+#[test]
+fn scala_forward_definition_chains_through_field_factories_and_curried_construction() {
+    let weather_source = r#"package app
+import model.*
+class WeatherRoutes(system: String) {
+  private var sharding = ClusterSharding(system)
+  def route(): String = {
+    val ref = sharding.entityRefFor()
+    ref.ask()
+  }
+  def reset(): EntityRef = {
+    sharding = ClusterSharding(system)
+    sharding.entityRefFor()
+  }
+}
+"#;
+    let layer_source = r#"package app
+import model.Graph
+object LayerMacros {
+  def build(nodes: List[Int]): Int = {
+    val graph = Graph(nodes.toSet)(_ < _)
+    graph.buildTargets()
+  }
+}
+"#;
+    let factory_source = r#"package app
+import model.Factories.{ambiguous, make}
+import model.Graph
+object ImportedFactories {
+  def positive(): Int = {
+    val graph = make()
+    graph.buildTargets()
+  }
+  def negative(): Int = {
+    val uncertain = ambiguous(1)
+    uncertain.buildTargets()
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Runtime.scala",
+            r#"package model
+class EntityRef { def ask(): String = "ok" }
+class ClusterSharding { def entityRefFor(): EntityRef = new EntityRef }
+object ClusterSharding { def apply(system: String): ClusterSharding = new ClusterSharding }
+class Graph { def buildTargets(): Int = 1 }
+object Graph { def apply(nodes: Set[Int])(edge: (Int, Int) => Boolean): Graph = new Graph }
+object Factories {
+  def make(): Graph = new Graph
+  def make(value: Int): EntityRef = new EntityRef
+  def ambiguous(value: Int): EntityRef = new EntityRef
+  def ambiguous(value: String): Graph = new Graph
+}
+"#,
+        )
+        .file("app/WeatherRoutes.scala", weather_source)
+        .file("app/LayerMacros.scala", layer_source)
+        .file("app/ImportedFactories.scala", factory_source)
+        .build();
+    let reference = |path: &str, source: &str, needle: &str| {
+        location_in(path, source, source.find(needle).expect("reference needle"))
+    };
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": [
+            reference("app/WeatherRoutes.scala", weather_source, "entityRefFor"),
+            reference("app/WeatherRoutes.scala", weather_source, "ask()"),
+            reference(
+                "app/WeatherRoutes.scala",
+                weather_source,
+                "entityRefFor()\n  }\n}",
+            ),
+            reference("app/LayerMacros.scala", layer_source, "buildTargets"),
+            reference(
+                "app/ImportedFactories.scala",
+                factory_source,
+                "buildTargets()\n  }\n  def negative",
+            ),
+            location_in(
+                "app/ImportedFactories.scala",
+                factory_source,
+                factory_source
+                    .rfind("buildTargets")
+                    .expect("negative buildTargets reference"),
+            ),
+        ]})
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for (result, fqn) in results.iter().zip([
+        "model.ClusterSharding.entityRefFor",
+        "model.EntityRef.ask",
+        "model.ClusterSharding.entityRefFor",
+        "model.Graph.buildTargets",
+        "model.Graph.buildTargets",
+    ]) {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], fqn, "{value}");
+    }
+    assert_eq!(results[5]["status"], "no_definition", "{value}");
 }

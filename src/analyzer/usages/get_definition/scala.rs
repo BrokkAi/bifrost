@@ -4,6 +4,9 @@ use crate::analyzer::scala::{
     resolve_scala_wildcard_import_environment, scala_import_path, scala_import_visible_at,
     scala_lexical_scope_path_at, scala_package_prefixes_at, scala_type_lookup_segments,
 };
+use crate::analyzer::usages::scala_graph::local::{
+    ScalaLocalBinding, precise_scala_binding, seed_scala_binding,
+};
 use crate::analyzer::usages::scala_graph::syntax::{
     ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableUsePolicy,
     applied_expression_for_reference, call_arities_for_reference, call_site_shape_for_reference,
@@ -823,10 +826,12 @@ fn scala_type_lookup_node_fqn(
 
     let name = scala_node_text(node, ctx.source).trim();
     let bindings = scala_bindings_before(ctx, resolver, root, node.start_byte());
-    first_precise(&bindings, name).map(|fqn| ScalaTypeLookupResolution::Type {
-        fqn,
-        target_kind: TypeLookupTargetKind::ValueExpression,
-    })
+    precise_scala_binding(&bindings, name)
+        .and_then(|binding| binding.receiver_type)
+        .map(|fqn| ScalaTypeLookupResolution::Type {
+            fqn,
+            target_kind: TypeLookupTargetKind::ValueExpression,
+        })
 }
 
 fn scala_declaration_name_type_fqn(
@@ -860,7 +865,7 @@ fn scala_declaration_name_type_fqn(
         _ => {
             let name_text = scala_node_text(name, ctx.source).trim();
             let bindings = scala_bindings_before(ctx, resolver, root, name.end_byte());
-            first_precise(&bindings, name_text)
+            precise_scala_binding(&bindings, name_text).and_then(|binding| binding.receiver_type)
         }
     }
 }
@@ -1567,7 +1572,7 @@ fn scala_receiver_allows_companion_lookup_with_bindings(
     receiver: Node<'_>,
     cutoff_start: usize,
     owner_fqn: &str,
-    bindings: &LocalInferenceEngine<String>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> bool {
     if !matches!(receiver.kind(), "identifier" | "type_identifier") {
         return false;
@@ -1576,7 +1581,7 @@ fn scala_receiver_allows_companion_lookup_with_bindings(
     if name == "this" {
         return false;
     }
-    if first_precise(bindings, name).is_some()
+    if precise_scala_binding(bindings, name).is_some()
         || bindings.is_shadowed(name)
         || scala_lexical_binding_declares_name_before(root, ctx.source, name, cutoff_start)
         || scala_enclosing_class_parameter_type(ctx, receiver, name, resolver).is_some()
@@ -1607,7 +1612,8 @@ fn resolve_scala_stable_identifier(
     let text = scala_node_text(identifier, ctx.source).trim();
     let root_name = owner_segments.first().expect("non-empty stable owner path");
     let bindings = scala_bindings_before(ctx, resolver, root, identifier.start_byte());
-    let bound_owner = first_precise(&bindings, root_name)
+    let bound_owner = precise_scala_binding(&bindings, root_name)
+        .and_then(|binding| binding.receiver_type)
         .or_else(|| scala_enclosing_class_parameter_type(ctx, identifier, root_name, resolver));
     let owner = bound_owner
         .and_then(|owner| scala_resolve_stable_owner_tail(ctx.support, owner, &owner_segments[1..]))
@@ -1766,6 +1772,14 @@ fn scala_applicable_member_candidate_units(
     call_shape: Option<&ScalaCallSiteShape>,
 ) -> Vec<CodeUnit> {
     let candidates = scala_member_candidate_units(ctx, owner_fqn, member, include_companion);
+    scala_applicable_callable_candidate_units(ctx, candidates, call_shape)
+}
+
+fn scala_applicable_callable_candidate_units(
+    ctx: ScalaLookupCtx<'_>,
+    candidates: Vec<CodeUnit>,
+    call_shape: Option<&ScalaCallSiteShape>,
+) -> Vec<CodeUnit> {
     let callable_count = candidates
         .iter()
         .filter(|unit| unit.is_function())
@@ -2165,7 +2179,7 @@ fn scala_receiver_type_fqn_with_bindings(
     ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
     receiver: Node<'_>,
-    bindings: &LocalInferenceEngine<String>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> Option<String> {
     if !matches!(receiver.kind(), "identifier" | "type_identifier") {
         return scala_non_identifier_receiver_type_fqn(ctx, resolver, receiver);
@@ -2176,24 +2190,26 @@ fn scala_receiver_type_fqn_with_bindings(
             .enclosing(receiver.start_byte())
             .map(str::to_string);
     }
-    first_precise(bindings, name).or_else(|| {
-        scala_enclosing_class_parameter_type(ctx, receiver, name, resolver).or_else(|| {
-            if !bindings.is_shadowed(name)
-                && let Some(imported_member) = resolver.resolve_member(name)
-                && let Some(return_type) =
-                    scala_imported_member_return_type(ctx, resolver, &imported_member)
-            {
-                return Some(return_type);
-            }
-            (!bindings.is_shadowed(name))
-                .then(|| {
-                    resolver
-                        .resolve_singleton(name)
-                        .or_else(|| resolver.resolve(name))
-                })
-                .flatten()
+    precise_scala_binding(bindings, name)
+        .and_then(|binding| binding.receiver_type)
+        .or_else(|| {
+            scala_enclosing_class_parameter_type(ctx, receiver, name, resolver).or_else(|| {
+                if !bindings.is_shadowed(name)
+                    && let Some(imported_member) = resolver.resolve_member(name)
+                    && let Some(return_type) =
+                        scala_imported_member_return_type(ctx, resolver, &imported_member)
+                {
+                    return Some(return_type);
+                }
+                (!bindings.is_shadowed(name))
+                    .then(|| {
+                        resolver
+                            .resolve_singleton(name)
+                            .or_else(|| resolver.resolve(name))
+                    })
+                    .flatten()
+            })
         })
-    })
 }
 
 fn scala_non_identifier_receiver_type_fqn(
@@ -2213,21 +2229,7 @@ fn scala_imported_member_return_type(
     _resolver: &ScalaNameResolver,
     member_fqn: &str,
 ) -> Option<String> {
-    let unit = ctx
-        .support
-        .fqn(member_fqn)
-        .into_iter()
-        .find(|unit| unit.is_function())?;
-    let signature = unit
-        .signature()
-        .map(str::to_string)
-        .or_else(|| ctx.scala.signatures(&unit).into_iter().next())?;
-    let return_type = scala_signature_return_type(&signature)?;
-    let factory_resolver = scala_name_resolver_for_unit(ctx.scala, ctx.support, &unit);
-    scala_resolve_type_annotation(&factory_resolver, return_type).or_else(|| {
-        scala_package_type_fqn(unit.package_name(), return_type)
-            .filter(|fqn| !ctx.support.fqn(fqn).is_empty())
-    })
+    scala_coherent_function_return_type(ctx, ctx.support.fqn(member_fqn))
 }
 
 fn scala_signature_return_type(signature: &str) -> Option<&str> {
@@ -2744,7 +2746,7 @@ fn scala_resolve_visible_term_owner(
 ) -> Option<String> {
     let bindings = scala_bindings_before(ctx, resolver, root, node.start_byte());
     if bindings.is_shadowed(name) {
-        return first_precise(&bindings, name);
+        return precise_scala_binding(&bindings, name).and_then(|binding| binding.receiver_type);
     }
     scala_resolve_visible_term(ctx, resolver, node, name)
 }
@@ -2914,7 +2916,7 @@ fn scala_bindings_before(
     resolver: &ScalaNameResolver,
     root: Node<'_>,
     cutoff_start: usize,
-) -> LocalInferenceEngine<String> {
+) -> LocalInferenceEngine<ScalaLocalBinding> {
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     scala_seed_active_path(ctx, resolver, root, cutoff_start, &mut bindings);
     bindings
@@ -2925,7 +2927,7 @@ fn scala_seed_active_path(
     resolver: &ScalaNameResolver,
     node: Node<'_>,
     cutoff_start: usize,
-    bindings: &mut LocalInferenceEngine<String>,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
     let root = node;
     let mut stack = vec![node];
@@ -2986,6 +2988,9 @@ fn scala_seed_active_path(
             "val_definition" | "var_definition" if node.start_byte() < cutoff_start => {
                 scala_seed_value_definition(ctx, resolver, root, node, cutoff_start, bindings)
             }
+            "assignment_expression" if node.end_byte() <= cutoff_start => {
+                scala_refresh_assignment(ctx, resolver, root, node, bindings)
+            }
             _ => {}
         }
 
@@ -2999,12 +3004,49 @@ fn scala_seed_active_path(
     }
 }
 
+fn scala_refresh_assignment(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    root: Node<'_>,
+    node: Node<'_>,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
+) {
+    let (Some(left), Some(right)) = (
+        node.child_by_field_name("left"),
+        node.child_by_field_name("right"),
+    ) else {
+        return;
+    };
+    if !matches!(left.kind(), "identifier" | "operator_identifier") {
+        return;
+    }
+    let name = scala_node_text(left, ctx.source).trim();
+    if name.is_empty() || !bindings.is_shadowed(name) {
+        return;
+    }
+    let declaration_owner =
+        precise_scala_binding(bindings, name).and_then(|binding| binding.declaration_owner);
+    let receiver_type = scala_constructed_type(ctx, right, resolver)
+        .or_else(|| {
+            scala_call_result_type(ctx, resolver, root, right, right.start_byte(), bindings)
+        })
+        .or_else(|| {
+            matches!(right.kind(), "identifier" | "operator_identifier")
+                .then(|| {
+                    precise_scala_binding(bindings, scala_node_text(right, ctx.source).trim())
+                        .and_then(|binding| binding.receiver_type)
+                })
+                .flatten()
+        });
+    seed_scala_binding(name, receiver_type, declaration_owner, bindings);
+}
+
 fn scala_seed_parameters(
     ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
     node: Node<'_>,
     cutoff_start: usize,
-    bindings: &mut LocalInferenceEngine<String>,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -3029,7 +3071,7 @@ fn scala_seed_parameter(
     resolver: &ScalaNameResolver,
     parameter: Node<'_>,
     cutoff_start: usize,
-    bindings: &mut LocalInferenceEngine<String>,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
     let Some(name) = parameter.child_by_field_name("name") else {
         return;
@@ -3057,7 +3099,7 @@ fn scala_seed_value_definition(
     root: Node<'_>,
     node: Node<'_>,
     cutoff_start: usize,
-    bindings: &mut LocalInferenceEngine<String>,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
     let resolved = node
         .child_by_field_name("type")
@@ -3111,9 +3153,15 @@ fn scala_seed_value_definition(
     if pattern.start_byte() >= cutoff_start {
         return;
     }
-    let is_direct_member = scala_is_direct_member_value_definition(node);
+    let declaration_owner = scala_is_direct_member_value_definition(node)
+        .then(|| {
+            ClassRangeIndex::build(ctx.analyzer, ctx.file)
+                .enclosing_unit(node.start_byte())
+                .cloned()
+        })
+        .flatten();
     for name in scala_pattern_binder_names(pattern, ctx.source) {
-        scala_seed_typed(name, resolved.clone(), is_direct_member, bindings);
+        seed_scala_binding(name, resolved.clone(), declaration_owner.clone(), bindings);
     }
 }
 
@@ -3123,7 +3171,7 @@ fn scala_call_result_type(
     root: Node<'_>,
     value: Node<'_>,
     cutoff_start: usize,
-    bindings: &LocalInferenceEngine<String>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> Option<String> {
     if value.kind() != "call_expression" {
         return None;
@@ -3147,21 +3195,32 @@ fn scala_call_result_type(
                 &owner,
                 bindings,
             );
-            scala_member_candidate_units(ctx, &owner, member, include_companion)
-                .into_iter()
-                .filter(|unit| unit.is_function())
-                .find_map(|unit| scala_function_return_type(ctx, &unit))
+            let call_shape = scala_call_site_shape(ctx, root, field);
+            let candidates = scala_applicable_member_candidate_units(
+                ctx,
+                &owner,
+                member,
+                include_companion,
+                call_shape.as_ref(),
+            );
+            scala_coherent_function_return_type(ctx, candidates)
         }
         "identifier" => {
             let name = scala_node_text(function, ctx.source).trim();
             if name.is_empty() {
                 return None;
             }
-            if let Some(member_fqn) = resolver.resolve_member(name)
-                && let Some(return_type) =
-                    scala_imported_member_return_type(ctx, resolver, &member_fqn)
-            {
-                return Some(return_type);
+            if let Some(member_fqn) = resolver.resolve_member(name) {
+                let call_shape = scala_call_site_shape(ctx, root, function);
+                let candidates = scala_applicable_callable_candidate_units(
+                    ctx,
+                    ctx.support.fqn(&member_fqn),
+                    call_shape.as_ref(),
+                );
+                // An explicit/direct imported member is an authoritative tier.
+                // If its applicable overloads do not have one coherent return
+                // type, do not fall through to an enclosing same-name member.
+                return scala_coherent_function_return_type(ctx, candidates);
             }
             if let Some(unit) = resolve_in_enclosing_scopes(
                 ctx.analyzer,
@@ -3170,25 +3229,61 @@ fn scala_call_result_type(
                 function.start_byte(),
                 |unit| unit.is_function(),
             ) {
-                return scala_function_return_type(ctx, &unit);
+                let call_shape = scala_call_site_shape(ctx, root, function);
+                let candidates = scala_applicable_callable_candidate_units(
+                    ctx,
+                    ctx.support.fqn(&unit.fq_name()),
+                    call_shape.as_ref(),
+                );
+                return scala_coherent_function_return_type(ctx, candidates);
             }
             let owner =
                 scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, function.start_byte())?;
-            scala_member_candidate_units(ctx, &owner.fq_name(), name, false)
-                .into_iter()
-                .filter(|unit| unit.is_function())
-                .find_map(|unit| scala_function_return_type(ctx, &unit))
+            let call_shape = scala_call_site_shape(ctx, root, function);
+            let candidates = scala_applicable_member_candidate_units(
+                ctx,
+                &owner.fq_name(),
+                name,
+                false,
+                call_shape.as_ref(),
+            );
+            scala_coherent_function_return_type(ctx, candidates)
         }
         _ => None,
     }
 }
 
 fn scala_function_return_type(ctx: ScalaLookupCtx<'_>, unit: &CodeUnit) -> Option<String> {
-    scala_imported_member_return_type(
-        ctx,
-        &scala_name_resolver_for_unit(ctx.scala, ctx.support, unit),
-        &unit.fq_name(),
-    )
+    let signature = unit
+        .signature()
+        .map(str::to_string)
+        .or_else(|| ctx.scala.signatures(unit).into_iter().next())?;
+    let return_type = scala_signature_return_type(&signature)?;
+    let resolver = scala_name_resolver_for_unit(ctx.scala, ctx.support, unit);
+    scala_resolve_type_annotation(&resolver, return_type).or_else(|| {
+        scala_package_type_fqn(unit.package_name(), return_type)
+            .filter(|fqn| !ctx.support.fqn(fqn).is_empty())
+    })
+}
+
+fn scala_coherent_function_return_type(
+    ctx: ScalaLookupCtx<'_>,
+    candidates: Vec<CodeUnit>,
+) -> Option<String> {
+    let mut resolved = None;
+    let mut matched = false;
+    for unit in candidates.into_iter().filter(CodeUnit::is_function) {
+        let return_type = scala_function_return_type(ctx, &unit)?;
+        if resolved
+            .as_ref()
+            .is_some_and(|current| current != &return_type)
+        {
+            return None;
+        }
+        resolved = Some(return_type);
+        matched = true;
+    }
+    matched.then_some(resolved).flatten()
 }
 
 fn scala_constructed_type(
@@ -3277,14 +3372,10 @@ fn scala_constructor_type_text(value_text: &str) -> Option<&str> {
 fn scala_seed_typed(
     name: &str,
     resolved: Option<String>,
-    is_direct_member: bool,
-    bindings: &mut LocalInferenceEngine<String>,
+    _is_direct_member: bool,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
-    match resolved {
-        Some(fqn) => bindings.seed_symbol(name.to_string(), fqn),
-        None if !is_direct_member => bindings.declare_shadow(name.to_string()),
-        None => {}
-    }
+    seed_scala_binding(name, resolved, None, bindings);
 }
 
 fn scala_is_direct_member_definition(node: Node<'_>) -> bool {

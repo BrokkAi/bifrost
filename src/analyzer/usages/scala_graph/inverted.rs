@@ -21,6 +21,7 @@
 //! `$`-encoded object). Receivers needing return-type inference (method chains)
 //! are an unhandled recall gap, not a wrong edge.
 
+use super::local::{ScalaLocalBinding, precise_scala_binding, seed_scala_binding};
 use super::resolver::{
     preferred_scala_type, scala_builtin_type_name, scala_extension_receiver_matches_resolved,
     scala_literal_type_name, scala_normalized_fq_name,
@@ -51,7 +52,7 @@ use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usage_facts::CallableFacts;
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
-    build_file_declarations_from_state, classify_reference_node, first_precise,
+    build_file_declarations_from_state, classify_reference_node,
     parse_source_and_collect_with_declarations,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
@@ -1346,6 +1347,17 @@ impl ProjectTypes {
         call_arities: Option<&[usize]>,
     ) -> Option<String> {
         let members = self.members_for_exact_owner_name(owner_fqn, member);
+        self.member_return_type_for_members(scala, resolver, &members, call_arities)
+    }
+
+    pub(super) fn member_return_type_for_fqn_call(
+        &self,
+        scala: &ScalaAnalyzer,
+        resolver: &NameResolver,
+        member_fqn: &str,
+        call_arities: Option<&[usize]>,
+    ) -> Option<String> {
+        let members = self.index.by_fqn(member_fqn).iter().collect::<Vec<_>>();
         self.member_return_type_for_members(scala, resolver, &members, call_arities)
     }
 
@@ -3829,12 +3841,6 @@ struct ScalaScan<'a, 'b> {
     collector: &'a mut EdgeCollector<'b>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct ScalaBinding {
-    receiver_type: Option<String>,
-    declaration_owner: Option<String>,
-}
-
 impl ScalaScan<'_, '_> {
     fn activate_import_context(&mut self, node: Node<'_>) {
         let visible_imports = self
@@ -3939,11 +3945,12 @@ const SCOPE_NODES: &[&str] = &[
 fn walk(
     node: Node<'_>,
     ctx: &mut ScalaScan<'_, '_>,
-    bindings: &mut LocalInferenceEngine<ScalaBinding>,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
     enum WalkEvent<'tree> {
         Enter(Node<'tree>),
         ActivateCaseBinders(Node<'tree>),
+        RefreshAssignment(Node<'tree>),
         ExitScope,
     }
 
@@ -3954,6 +3961,9 @@ fn walk(
                 let enters_scope = walk_enter(node, ctx, bindings);
                 if enters_scope {
                     stack.push(WalkEvent::ExitScope);
+                }
+                if node.kind() == "assignment_expression" {
+                    stack.push(WalkEvent::RefreshAssignment(node));
                 }
                 let case_pattern = (node.kind() == "case_clause")
                     .then(|| node.child_by_field_name("pattern"))
@@ -3972,6 +3982,9 @@ fn walk(
                     bindings.declare_shadow(name.to_string());
                 }
             }
+            WalkEvent::RefreshAssignment(assignment) => {
+                refresh_assignment_binding(assignment, ctx, bindings);
+            }
             WalkEvent::ExitScope => bindings.exit_scope(),
         }
     }
@@ -3980,7 +3993,7 @@ fn walk(
 fn walk_enter(
     node: Node<'_>,
     ctx: &mut ScalaScan<'_, '_>,
-    bindings: &mut LocalInferenceEngine<ScalaBinding>,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) -> bool {
     ctx.activate_import_context(node);
     let enters_scope = SCOPE_NODES.contains(&node.kind());
@@ -3996,7 +4009,7 @@ fn walk_enter(
 fn record_reference(
     node: Node<'_>,
     ctx: &mut ScalaScan<'_, '_>,
-    bindings: &LocalInferenceEngine<ScalaBinding>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) {
     match node.kind() {
         // A type reference in any type position: param/return types, `extends`,
@@ -4253,7 +4266,10 @@ fn record_reference(
                 return;
             }
             if let Some(owner) = exact_owner_field_binding(bindings, name) {
-                match ctx.types.field_for_owner_member(ctx.scala, &owner, name) {
+                match ctx
+                    .types
+                    .field_for_owner_member(ctx.scala, &owner.fq_name(), name)
+                {
                     FieldResolution::Resolved(field) => {
                         ctx.record(field.declaration.fq_name(), node);
                         return;
@@ -4392,7 +4408,7 @@ fn record_unqualified_type_application(
     function: Node<'_>,
     name: &str,
     ctx: &mut ScalaScan<'_, '_>,
-    bindings: &LocalInferenceEngine<ScalaBinding>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> bool {
     if !bindings.resolve_symbol(name).is_unknown() || bindings.is_shadowed(name) {
         return false;
@@ -4432,7 +4448,7 @@ fn record_unqualified_type_application(
 fn record_qualified_stable_reference(
     node: Node<'_>,
     ctx: &mut ScalaScan<'_, '_>,
-    bindings: &LocalInferenceEngine<ScalaBinding>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> bool {
     let Some(reference) = qualified_stable_type_reference(node, ctx.source) else {
         return false;
@@ -4525,7 +4541,7 @@ fn record_qualified_stable_reference(
 fn companion_method_value_context(
     node: Node<'_>,
     ctx: &ScalaScan<'_, '_>,
-    bindings: &LocalInferenceEngine<ScalaBinding>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> ScalaMethodValueContext {
     if let Some(expected_type) = node
         .parent()
@@ -4558,7 +4574,7 @@ fn companion_method_value_context(
 fn call_parameter_method_value_context(
     node: Node<'_>,
     ctx: &ScalaScan<'_, '_>,
-    bindings: &LocalInferenceEngine<ScalaBinding>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> ScalaMethodValueContext {
     let Some(arguments) = node.parent() else {
         return ScalaMethodValueContext::Unknown;
@@ -4849,7 +4865,7 @@ fn template_supertype_owners(
 fn receiver_type_fqn(
     receiver: Node<'_>,
     ctx: &ScalaScan<'_, '_>,
-    bindings: &LocalInferenceEngine<ScalaBinding>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> Option<String> {
     match receiver.kind() {
         // `this` is a plain `identifier` in tree-sitter-scala (not its own node).
@@ -4862,7 +4878,7 @@ fn receiver_type_fqn(
             }
             // A typed local resolves to its type; otherwise the name may be an
             // object/type, unless it is a known (shadowed) untyped local.
-            first_precise(bindings, name)
+            precise_scala_binding(bindings, name)
                 .and_then(|binding| binding.receiver_type)
                 .or_else(|| {
                     if bindings.is_shadowed(name) {
@@ -4912,7 +4928,7 @@ fn receiver_type_fqn(
 fn stable_object_expression_fqn(
     node: Node<'_>,
     ctx: &ScalaScan<'_, '_>,
-    bindings: &LocalInferenceEngine<ScalaBinding>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> Option<String> {
     resolve_stable_object_expression(
         node,
@@ -4929,7 +4945,7 @@ fn stable_object_expression_fqn(
 fn seed_declaration(
     node: Node<'_>,
     ctx: &ScalaScan<'_, '_>,
-    bindings: &mut LocalInferenceEngine<ScalaBinding>,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
     match node.kind() {
         "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
@@ -4940,6 +4956,39 @@ fn seed_declaration(
         "val_definition" | "var_definition" => seed_value_definition(node, ctx, bindings),
         _ => {}
     }
+}
+
+fn refresh_assignment_binding(
+    node: Node<'_>,
+    ctx: &ScalaScan<'_, '_>,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
+) {
+    let (Some(left), Some(right)) = (
+        node.child_by_field_name("left"),
+        node.child_by_field_name("right"),
+    ) else {
+        return;
+    };
+    if !matches!(left.kind(), "identifier" | "operator_identifier") {
+        return;
+    }
+    let name = node_text(left, ctx.source).trim();
+    if name.is_empty() || !bindings.is_shadowed(name) {
+        return;
+    }
+    let declaration_owner =
+        precise_scala_binding(bindings, name).and_then(|binding| binding.declaration_owner);
+    let receiver_type = constructed_or_applied_type(right, ctx)
+        .or_else(|| call_result_type(right, ctx, bindings))
+        .or_else(|| {
+            matches!(right.kind(), "identifier" | "operator_identifier")
+                .then(|| {
+                    precise_scala_binding(bindings, node_text(right, ctx.source).trim())
+                        .and_then(|binding| binding.receiver_type)
+                })
+                .flatten()
+        });
+    seed_scala_binding(name, receiver_type, declaration_owner, bindings);
 }
 
 fn record_override_declaration(node: Node<'_>, ctx: &mut ScalaScan<'_, '_>) {
@@ -4980,7 +5029,7 @@ fn function_definition_arity(node: Node<'_>, source: &str) -> Option<usize> {
 fn seed_parameters(
     node: Node<'_>,
     ctx: &ScalaScan<'_, '_>,
-    bindings: &mut LocalInferenceEngine<ScalaBinding>,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -4999,9 +5048,9 @@ fn seed_parameters(
 fn seed_class_parameters(
     node: Node<'_>,
     ctx: &ScalaScan<'_, '_>,
-    bindings: &mut LocalInferenceEngine<ScalaBinding>,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
-    let owner = ctx.enclosing_class(node.start_byte()).map(str::to_string);
+    let owner = ctx.enclosing_class_unit(node.start_byte()).cloned();
     let mut cursor = node.walk();
     for parameters in node
         .named_children(&mut cursor)
@@ -5023,8 +5072,8 @@ fn seed_class_parameters(
 fn seed_parameter(
     parameter: Node<'_>,
     ctx: &ScalaScan<'_, '_>,
-    declaration_owner: Option<String>,
-    bindings: &mut LocalInferenceEngine<ScalaBinding>,
+    declaration_owner: Option<CodeUnit>,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
     let Some(name) = parameter.child_by_field_name("name") else {
         return;
@@ -5042,9 +5091,9 @@ fn seed_parameter(
 fn preseed_direct_owner_fields(
     node: Node<'_>,
     ctx: &ScalaScan<'_, '_>,
-    bindings: &mut LocalInferenceEngine<ScalaBinding>,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
-    let Some(owner) = ctx.enclosing_class(node.start_byte()).map(str::to_string) else {
+    let Some(owner) = ctx.enclosing_class_unit(node.start_byte()).cloned() else {
         return;
     };
     let mut cursor = node.walk();
@@ -5059,15 +5108,15 @@ fn preseed_direct_owner_fields(
 fn preseed_owner_fields_in(
     node: Node<'_>,
     ctx: &ScalaScan<'_, '_>,
-    owner: &str,
-    bindings: &mut LocalInferenceEngine<ScalaBinding>,
+    owner: &CodeUnit,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
             "val_definition" | "var_definition" => {
-                if direct_owner_field_owner(child, ctx).as_deref() == Some(owner) {
-                    seed_value_definition_with_owner(child, ctx, Some(owner.to_string()), bindings);
+                if direct_owner_field_owner(child, ctx).as_ref() == Some(owner) {
+                    seed_value_definition_with_owner(child, ctx, Some(owner.clone()), bindings);
                 }
             }
             "function_definition"
@@ -5088,7 +5137,7 @@ fn preseed_owner_fields_in(
 fn seed_value_definition(
     node: Node<'_>,
     ctx: &ScalaScan<'_, '_>,
-    bindings: &mut LocalInferenceEngine<ScalaBinding>,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
     let declaration_owner = direct_owner_field_owner(node, ctx);
     seed_value_definition_with_owner(node, ctx, declaration_owner, bindings);
@@ -5097,8 +5146,8 @@ fn seed_value_definition(
 fn seed_value_definition_with_owner(
     node: Node<'_>,
     ctx: &ScalaScan<'_, '_>,
-    declaration_owner: Option<String>,
-    bindings: &mut LocalInferenceEngine<ScalaBinding>,
+    declaration_owner: Option<CodeUnit>,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
     // Prefer the declared type; otherwise infer from a `new Foo()` initializer
     // or a call with a declared factory return.
@@ -5121,8 +5170,8 @@ fn seed_value_definition_with_owner(
     }
 }
 
-fn direct_owner_field_owner(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
-    let owner = ctx.enclosing_class(node.start_byte())?.to_string();
+fn direct_owner_field_owner(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<CodeUnit> {
+    let owner = ctx.enclosing_class_unit(node.start_byte())?.clone();
     let mut current = node.parent();
     while let Some(ancestor) = current {
         match ancestor.kind() {
@@ -5173,7 +5222,10 @@ fn constructed_or_applied_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Optio
         if node.kind() != "call_expression" {
             return None;
         }
-        let function = node.child_by_field_name("function")?;
+        let mut function = node.child_by_field_name("function")?;
+        while function.kind() == "call_expression" {
+            function = function.child_by_field_name("function")?;
+        }
         if !matches!(function.kind(), "identifier" | "type_identifier") {
             return None;
         }
@@ -5205,7 +5257,7 @@ fn constructed_or_applied_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Optio
 fn call_result_type(
     node: Node<'_>,
     ctx: &ScalaScan<'_, '_>,
-    bindings: &LocalInferenceEngine<ScalaBinding>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> Option<String> {
     if node.kind() != "call_expression" {
         return None;
@@ -5238,8 +5290,12 @@ fn call_result_type(
                 MemberReturnResolution::Resolved(return_type) => Some(return_type),
                 MemberReturnResolution::NoMatch => {
                     ctx.resolver.resolve_member(method).and_then(|member| {
-                        ctx.types
-                            .member_return_type(ctx.scala, &ctx.resolver, &member)
+                        ctx.types.member_return_type_for_fqn_call(
+                            ctx.scala,
+                            &ctx.resolver,
+                            &member,
+                            call_arities.as_deref(),
+                        )
                     })
                 }
                 MemberReturnResolution::Unresolved => None,
@@ -5317,27 +5373,17 @@ fn lexically_visible_unqualified_member_return_type(
 fn seed_binding(
     name: &str,
     receiver_type: Option<String>,
-    declaration_owner: Option<String>,
-    bindings: &mut LocalInferenceEngine<ScalaBinding>,
+    declaration_owner: Option<CodeUnit>,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
-    if receiver_type.is_none() && declaration_owner.is_none() {
-        bindings.declare_shadow(name.to_string());
-        return;
-    }
-    bindings.seed_symbol(
-        name.to_string(),
-        ScalaBinding {
-            receiver_type,
-            declaration_owner,
-        },
-    );
+    seed_scala_binding(name, receiver_type, declaration_owner, bindings);
 }
 
 fn exact_owner_field_binding(
-    bindings: &LocalInferenceEngine<ScalaBinding>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
     name: &str,
-) -> Option<String> {
-    first_precise(bindings, name).and_then(|binding| binding.declaration_owner)
+) -> Option<CodeUnit> {
+    precise_scala_binding(bindings, name).and_then(|binding| binding.declaration_owner)
 }
 
 fn resolve_receiver_type_node(type_node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
