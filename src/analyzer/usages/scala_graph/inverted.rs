@@ -27,12 +27,13 @@ use super::resolver::{
 };
 use super::shared::ScalaEdgeGraph;
 use super::syntax::{
-    ScalaCallableParameterList, ScalaImportContextIndex, ScalaMethodValueContext,
-    ScalaPackageContextIndex, ScalaParameterListKind, ScalaQualifiedStableTypeRole,
-    ScalaSourceFacts, call_arities_for_reference, enclosing_template_declarations,
-    is_bare_companion_method_value_reference, is_constructor_like_reference, is_declaration_name,
-    is_extractor_reference, is_infix_pattern_operator, is_scala_class_reference,
-    is_scala_object_reference, is_terminal_stable_field_reference, node_text, parenthesized_arity,
+    ScalaCallableParameterList, ScalaCallableRole, ScalaImportContextIndex,
+    ScalaMethodValueContext, ScalaPackageContextIndex, ScalaParameterListKind,
+    ScalaQualifiedStableTypeRole, ScalaSourceFacts, call_arities_for_reference,
+    enclosing_template_declarations, is_bare_companion_method_value_reference,
+    is_constructor_like_reference, is_declaration_name, is_extractor_reference,
+    is_infix_pattern_operator, is_scala_class_reference, is_scala_object_reference,
+    is_terminal_stable_field_reference, node_text, parenthesized_arity,
     qualified_stable_type_reference, resolve_stable_object_expression,
     scala_import_is_visible_at_byte, scala_source_facts, stable_identifier_reference,
     template_direct_term_member_named, template_self_type,
@@ -2011,6 +2012,7 @@ impl ProjectTypes {
                         .callable_alternatives_by_range
                         .get(&(range.start_byte, range.end_byte))
                         .map(|facts| CallableAlternative {
+                            role: facts.role,
                             shape: facts.shape.clone(),
                             parameter_function_arities: facts.parameter_function_arities.clone(),
                             extension_receiver_type: facts
@@ -2044,6 +2046,7 @@ impl ProjectTypes {
                         continue;
                     }
                     let mut synthetic = constructor.clone();
+                    synthetic.role = ScalaCallableRole::Ordinary;
                     synthetic.extension_receiver_type = None;
                     synthetic.return_type = Some(case_class.fq_name());
                     exact.push(synthetic);
@@ -2057,6 +2060,11 @@ impl ProjectTypes {
                 .into_iter()
                 .filter_map(|metadata| {
                     metadata.callable_arity().map(|arity| CallableAlternative {
+                        role: if target.is_synthetic() {
+                            ScalaCallableRole::PrimaryConstructor
+                        } else {
+                            ScalaCallableRole::Ordinary
+                        },
                         shape: vec![ScalaCallableParameterList::explicit(arity)],
                         parameter_function_arities: Vec::new(),
                         extension_receiver_type: None,
@@ -2072,6 +2080,11 @@ impl ProjectTypes {
                 })
             {
                 fallback.push(CallableAlternative {
+                    role: if target.is_synthetic() {
+                        ScalaCallableRole::PrimaryConstructor
+                    } else {
+                        ScalaCallableRole::Ordinary
+                    },
                     shape: vec![ScalaCallableParameterList::explicit(arity)],
                     parameter_function_arities: Vec::new(),
                     extension_receiver_type: None,
@@ -2686,6 +2699,7 @@ impl ProjectTypes {
 
 #[derive(Clone)]
 pub(crate) struct CallableAlternative {
+    pub(crate) role: ScalaCallableRole,
     pub(crate) shape: Vec<ScalaCallableParameterList>,
     pub(crate) parameter_function_arities: Vec<Vec<Option<usize>>>,
     pub(crate) extension_receiver_type: Option<String>,

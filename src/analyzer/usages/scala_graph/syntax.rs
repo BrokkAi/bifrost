@@ -15,10 +15,18 @@ pub(crate) struct ScalaSourceFacts {
 
 #[derive(Clone)]
 pub(crate) struct ScalaCallableSourceAlternative {
+    pub(crate) role: ScalaCallableRole,
     pub(crate) shape: Vec<ScalaCallableParameterList>,
     pub(crate) parameter_function_arities: Vec<Vec<Option<usize>>>,
     pub(crate) extension_receiver_type_path: Option<Vec<String>>,
     pub(crate) return_type_path: Option<Vec<String>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScalaCallableRole {
+    Ordinary,
+    PrimaryConstructor,
+    SecondaryConstructor,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,6 +102,12 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                 facts.callable_alternatives_by_range.insert(
                     (node.start_byte(), node.end_byte()),
                     ScalaCallableSourceAlternative {
+                        role: node
+                            .child_by_field_name("name")
+                            .filter(|name| node_text(*name, source).trim() == "this")
+                            .map_or(ScalaCallableRole::Ordinary, |_| {
+                                ScalaCallableRole::SecondaryConstructor
+                            }),
                         shape,
                         parameter_function_arities,
                         extension_receiver_type_path: enclosing_extension_receiver_type_path(
@@ -106,7 +120,7 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                     },
                 );
             }
-            "class_definition" => {
+            "class_definition" | "full_enum_case" => {
                 let mut cursor = node.walk();
                 let lists = node
                     .named_children(&mut cursor)
@@ -117,6 +131,7 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                     facts.callable_alternatives_by_range.insert(
                         (node.start_byte(), node.end_byte()),
                         ScalaCallableSourceAlternative {
+                            role: ScalaCallableRole::PrimaryConstructor,
                             shape: lists,
                             parameter_function_arities: Vec::new(),
                             extension_receiver_type_path: None,
@@ -124,11 +139,14 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                         },
                     );
                 }
-                let mut children = node.walk();
-                if node
-                    .children(&mut children)
-                    .any(|child| child.kind() == "case")
-                {
+                let is_case_class = if node.kind() == "full_enum_case" {
+                    true
+                } else {
+                    let mut children = node.walk();
+                    node.children(&mut children)
+                        .any(|child| child.kind() == "case")
+                };
+                if is_case_class {
                     facts
                         .case_class_ranges
                         .insert((node.start_byte(), node.end_byte()));
@@ -1161,6 +1179,60 @@ pub(crate) fn is_declaration_name(node: Node<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parameterized_enum_case_records_primary_constructor_source_facts() {
+        let source = r#"trait Tagged
+enum Event:
+  case Idle extends Tagged
+  case Data(id: Int, label: String = "default")
+"#;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_scala::LANGUAGE.into())
+            .expect("Scala grammar");
+        let tree = parser.parse(source, None).expect("Scala tree");
+        let mut simple_case = None;
+        let mut full_case = None;
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "simple_enum_case" => simple_case = Some(node),
+                "full_enum_case" => full_case = Some(node),
+                _ => {}
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        let simple_case = simple_case.expect("simple enum case");
+        let full_case = full_case.expect("full enum case");
+
+        let facts = scala_source_facts(source).expect("Scala source facts");
+        let simple_range = (simple_case.start_byte(), simple_case.end_byte());
+        assert_eq!(node_text(simple_case, source), "Idle extends Tagged");
+        assert!(
+            !facts
+                .callable_alternatives_by_range
+                .contains_key(&simple_range)
+        );
+        assert!(!facts.case_class_ranges.contains(&simple_range));
+
+        let range = (full_case.start_byte(), full_case.end_byte());
+        assert_eq!(
+            node_text(full_case, source),
+            "Data(id: Int, label: String = \"default\")"
+        );
+        let callable = facts
+            .callable_alternatives_by_range
+            .get(&range)
+            .expect("enum case constructor facts");
+        assert_eq!(callable.role, ScalaCallableRole::PrimaryConstructor);
+        assert_eq!(callable.shape.len(), 1);
+        assert!(callable.shape[0].arity.accepts(1));
+        assert!(callable.shape[0].arity.accepts(2));
+        assert!(!callable.shape[0].arity.accepts(0));
+        assert!(facts.case_class_ranges.contains(&range));
+    }
 
     #[test]
     fn package_context_index_preserves_only_parser_active_prefixes() {

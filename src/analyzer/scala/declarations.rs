@@ -5,7 +5,7 @@ use crate::hash::HashMap;
 use tree_sitter::{Node, Tree};
 
 use super::imports::{scala_export_info_from_node, scala_import_infos_from_node_with_prefixes};
-use super::supertypes::extract_scala_supertypes;
+use super::supertypes::{extract_scala_supertypes, scala_full_enum_case_owner_supertype};
 use super::wildcard_imports::scala_package_prefixes_at;
 
 pub(super) fn parse_scala_file(
@@ -374,7 +374,11 @@ impl<'a> ScalaVisitor<'a> {
             .add_code_unit(code_unit.clone(), node, self.source, parent.clone(), None);
         self.parsed
             .add_signature(code_unit.clone(), scala_type_signature(node, self.source));
-        let raw_supertypes = extract_scala_supertypes(node, self.source);
+        let mut raw_supertypes = Vec::new();
+        if let Some(enum_owner) = scala_full_enum_case_owner_supertype(node, self.source) {
+            raw_supertypes.push(enum_owner);
+        }
+        raw_supertypes.extend(extract_scala_supertypes(node, self.source));
         if !raw_supertypes.is_empty() {
             self.parsed.set_raw_supertypes(
                 code_unit.clone(),
@@ -392,7 +396,9 @@ impl<'a> ScalaVisitor<'a> {
             self.parsed.set_scala_trait(code_unit.clone());
         }
 
-        if node.kind() == "class_definition" && !scala_class_parameter_lists(node).is_empty() {
+        if matches!(node.kind(), "class_definition" | "full_enum_case")
+            && !scala_class_parameter_lists(node).is_empty()
+        {
             let constructor = CodeUnit::new(
                 self.file.clone(),
                 CodeUnitType::Function,
@@ -432,7 +438,8 @@ impl<'a> ScalaVisitor<'a> {
         package_name: &str,
         parent: &CodeUnit,
     ) {
-        let is_case_class = scala_is_case_class_definition(node, self.source);
+        let is_case_class =
+            node.kind() == "full_enum_case" || scala_is_case_class_definition(node, self.source);
         for parameters in scala_class_parameter_lists(node) {
             let mut cursor = parameters.walk();
             for parameter in parameters.named_children(&mut cursor) {
@@ -518,6 +525,15 @@ impl<'a> ScalaVisitor<'a> {
                     }
                 }
                 "simple_enum_case" => self.visit_enum_case(child, package_name, parent),
+                "full_enum_case" => {
+                    self.visit_type_declaration(
+                        child,
+                        package_name,
+                        package_prefixes,
+                        Some(parent.clone()),
+                        stack,
+                    );
+                }
                 "enum_case_definitions" | "enum_body" => {
                     stack.push(ScalaWork::TemplateBody {
                         node: child,
@@ -851,6 +867,7 @@ fn scala_type_signature(node: Node<'_>, source: &str) -> String {
         "object_definition" => "object",
         "trait_definition" => "trait",
         "enum_definition" => "enum",
+        "full_enum_case" => "case",
         _ => "class",
     };
     let name = node

@@ -45,6 +45,44 @@ pub(super) fn extract_scala_supertypes(
         .collect()
 }
 
+/// Return the owner-qualified parser-local path of the enum declaration that a
+/// parameterized enum case implicitly extends. The `case` token belongs to
+/// `enum_case_definitions`, outside the `full_enum_case` node, so derive this
+/// relationship from the parser-owned ancestor chain instead of reconstructing
+/// it from source text.
+pub(super) fn scala_full_enum_case_owner_supertype(
+    declaration: Node<'_>,
+    source: &str,
+) -> Option<ScalaSupertypeFact> {
+    if declaration.kind() != "full_enum_case" {
+        return None;
+    }
+    let mut segments = Vec::new();
+    let mut ancestor = declaration.parent();
+    while let Some(node) = ancestor {
+        if matches!(
+            node.kind(),
+            "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
+        ) {
+            let name = node.child_by_field_name("name")?;
+            let name = node_text(name, source).trim();
+            if name.is_empty() {
+                return None;
+            }
+            segments.push(name.to_string());
+        }
+        ancestor = node.parent();
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    segments.reverse();
+    Some(ScalaSupertypeFact {
+        raw: segments.join("."),
+        lookup_path: ScalaSupertypeLookupPath { segments },
+    })
+}
+
 /// Direct parser-owned supertype roots and their lookup nodes for a Scala
 /// template declaration. Local classes and objects are intentionally absent
 /// from the declaration index, so usage analysis needs the same structured AST
