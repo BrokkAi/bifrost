@@ -731,7 +731,7 @@ fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>)
     }
 }
 
-pub(super) enum BareCallTargetResolution {
+pub(in crate::analyzer::usages) enum BareCallTargetResolution {
     Type(CodeUnit),
     FreeFunctions(Vec<CodeUnit>),
     CallableShadow,
@@ -739,8 +739,136 @@ pub(super) enum BareCallTargetResolution {
     Missing,
 }
 
+fn binding_free_function_candidates(
+    binding: &OrdinaryTypeImport,
+    active_bindings: &[&OrdinaryTypeImport],
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    name: &str,
+    reference_byte: usize,
+) -> Vec<CodeUnit> {
+    let Some(qualified) = binding.resolved_target_components.as_ref() else {
+        return Vec::new();
+    };
+    let mut targets = Vec::new();
+    match binding.target {
+        EffectiveUsingTarget::Ordinary { .. } => targets.push(qualified.clone()),
+        EffectiveUsingTarget::Namespace { .. } => {
+            let mut stack = vec![qualified.clone()];
+            let mut visited = HashSet::default();
+            while let Some(namespace) = stack.pop() {
+                if !visited.insert(namespace.clone()) {
+                    continue;
+                }
+                let mut target = namespace.clone();
+                target.push(name.to_string());
+                targets.push(target);
+                stack.extend(active_bindings.iter().filter_map(|candidate| {
+                    (matches!(candidate.target, EffectiveUsingTarget::Namespace { .. })
+                        && candidate.namespace_scope.as_deref() == Some(namespace.as_slice()))
+                    .then(|| candidate.resolved_target_components.clone())
+                    .flatten()
+                }));
+            }
+        }
+    }
+    targets
+        .into_iter()
+        .flat_map(|target| {
+            let qualified_name = target.join("::");
+            visibility
+                .visible_identifier_candidates(file, name)
+                .filter(move |candidate| {
+                    candidate.is_function()
+                        && type_owner_of(analyzer, candidate).is_none()
+                        && cpp_name_for(candidate) == qualified_name
+                        && visibility.declaration_visible_at(
+                            analyzer,
+                            file,
+                            candidate,
+                            reference_byte,
+                        )
+                })
+                .cloned()
+        })
+        .collect()
+}
+
+fn dedupe_callable_candidates(candidates: &mut Vec<CodeUnit>) {
+    let mut deduped = Vec::with_capacity(candidates.len());
+    for candidate in candidates.drain(..) {
+        if !deduped
+            .iter()
+            .any(|existing| same_logical_symbol(existing, &candidate))
+        {
+            deduped.push(candidate);
+        }
+    }
+    *candidates = deduped;
+}
+
+fn resolve_callable_candidates(
+    candidates: Vec<CodeUnit>,
+    call_arity: usize,
+    reference_byte: usize,
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+) -> BareCallTargetResolution {
+    let mut candidates = candidates;
+    dedupe_callable_candidates(&mut candidates);
+    if candidates.is_empty() {
+        return BareCallTargetResolution::Missing;
+    }
+    let applicable = candidates
+        .into_iter()
+        .filter(|candidate| {
+            visibility
+                .callable_arity_at_reference(analyzer, file, candidate, reference_byte)
+                .is_some_and(|arity| arity.accepts(call_arity))
+        })
+        .collect::<Vec<_>>();
+    if applicable.is_empty() {
+        BareCallTargetResolution::CallableShadow
+    } else {
+        BareCallTargetResolution::FreeFunctions(applicable)
+    }
+}
+
+fn resolve_direct_type_candidates(
+    candidates: Vec<(CodeUnit, Vec<String>)>,
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+) -> BareCallTargetResolution {
+    let mut logical = Vec::<(CodeUnit, Vec<String>)>::new();
+    for candidate in candidates {
+        if !logical
+            .iter()
+            .any(|(existing, _)| same_logical_symbol(existing, &candidate.0))
+        {
+            logical.push(candidate);
+        }
+    }
+    let [(target, components)] = logical.as_slice() else {
+        return if logical.is_empty() {
+            BareCallTargetResolution::Missing
+        } else {
+            BareCallTargetResolution::Ambiguous
+        };
+    };
+    match visibility
+        .resolve_imported_type_candidate(analyzer, file, target, components, None, false)
+    {
+        LexicalTypeResolution::Resolved { unit, .. } => BareCallTargetResolution::Type(unit),
+        LexicalTypeResolution::Ambiguous => BareCallTargetResolution::Ambiguous,
+        LexicalTypeResolution::Missing => BareCallTargetResolution::Missing,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-pub(super) fn resolve_bare_call_target(
+pub(in crate::analyzer::usages) fn resolve_bare_call_target(
     call: Node<'_>,
     function: Node<'_>,
     analyzer: &dyn IAnalyzer,
@@ -778,10 +906,114 @@ pub(super) fn resolve_bare_call_target(
         LexicalTypeResolution::Resolved { components, .. } => Some(components.as_slice()),
         LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => None,
     };
+    let direct_type_resolution = visibility.resolve_type_components_lexically(
+        analyzer,
+        file,
+        &[name.to_string()],
+        false,
+        &lexical_scope,
+    );
+    let direct_type_components = match &direct_type_resolution {
+        LexicalTypeResolution::Resolved { components, .. } => Some(components.as_slice()),
+        LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => None,
+    };
+    let bindings = effective_using_bindings_for_name(
+        visibility,
+        ordinary_type_imports,
+        file,
+        root_node(function),
+        source,
+        name,
+    );
+    let active_bindings = bindings
+        .iter()
+        .filter(|binding| effective_using_binding_active(binding, function, &lexical_scope))
+        .collect::<Vec<_>>();
+    let transitive_bindings = bindings
+        .iter()
+        .filter(|binding| {
+            binding.declaration_byte <= function.start_byte()
+                && (binding.namespace_scope.is_some()
+                    || (binding.scope_start <= function.start_byte()
+                        && function.end_byte() <= binding.scope_end))
+        })
+        .collect::<Vec<_>>();
+    let mut concrete_depths = active_bindings
+        .iter()
+        .filter(|binding| binding.namespace_scope.is_none())
+        .map(|binding| binding.scope_depth)
+        .collect::<Vec<_>>();
+    concrete_depths.sort_unstable();
+    concrete_depths.dedup();
+    for depth in concrete_depths.into_iter().rev() {
+        let at_tier = active_bindings
+            .iter()
+            .copied()
+            .filter(|binding| binding.namespace_scope.is_none() && binding.scope_depth == depth);
+        let direct = at_tier
+            .clone()
+            .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Ordinary { .. }))
+            .flat_map(|binding| {
+                binding_free_function_candidates(
+                    binding,
+                    &transitive_bindings,
+                    analyzer,
+                    visibility,
+                    file,
+                    name,
+                    call.start_byte(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if !direct.is_empty() {
+            return resolve_callable_candidates(
+                direct,
+                call_arity,
+                call.start_byte(),
+                analyzer,
+                visibility,
+                file,
+            );
+        }
+        let direct_types = at_tier
+            .clone()
+            .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Ordinary { .. }))
+            .flat_map(|binding| {
+                binding_type_candidates(binding, &transitive_bindings, visibility, file, name)
+            })
+            .collect::<Vec<_>>();
+        if !direct_types.is_empty() {
+            return resolve_direct_type_candidates(direct_types, analyzer, visibility, file);
+        }
+        let directives = at_tier
+            .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Namespace { .. }))
+            .flat_map(|binding| {
+                binding_free_function_candidates(
+                    binding,
+                    &transitive_bindings,
+                    analyzer,
+                    visibility,
+                    file,
+                    name,
+                    call.start_byte(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if !directives.is_empty() {
+            return resolve_callable_candidates(
+                directives,
+                call_arity,
+                call.start_byte(),
+                analyzer,
+                visibility,
+                file,
+            );
+        }
+    }
     for prefix_len in (0..=lexical_scope.len()).rev() {
         let mut qualified = lexical_scope[..prefix_len].to_vec();
         qualified.push(name.to_string());
-        let candidates = visibility
+        let mut direct = visibility
             .visible_identifier_candidates(file, name)
             .filter(|candidate| {
                 candidate.is_function()
@@ -796,15 +1028,75 @@ pub(super) fn resolve_bare_call_target(
             })
             .cloned()
             .collect::<Vec<_>>();
-        if !candidates.is_empty() {
-            let applicable = candidates
-                .into_iter()
-                .filter(|candidate| cpp_callable_arity(analyzer, candidate).accepts(call_arity))
-                .collect::<Vec<_>>();
-            if applicable.is_empty() {
-                return BareCallTargetResolution::CallableShadow;
-            }
-            return BareCallTargetResolution::FreeFunctions(applicable);
+        let at_tier = active_bindings.iter().copied().filter(|binding| {
+            binding.namespace_scope.as_deref() == Some(&lexical_scope[..prefix_len])
+        });
+        direct.extend(
+            at_tier
+                .clone()
+                .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Ordinary { .. }))
+                .flat_map(|binding| {
+                    binding_free_function_candidates(
+                        binding,
+                        &transitive_bindings,
+                        analyzer,
+                        visibility,
+                        file,
+                        name,
+                        call.start_byte(),
+                    )
+                }),
+        );
+        if !direct.is_empty() {
+            return resolve_callable_candidates(
+                direct,
+                call_arity,
+                call.start_byte(),
+                analyzer,
+                visibility,
+                file,
+            );
+        }
+        let mut direct_types = at_tier
+            .clone()
+            .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Ordinary { .. }))
+            .flat_map(|binding| {
+                binding_type_candidates(binding, &transitive_bindings, visibility, file, name)
+            })
+            .collect::<Vec<_>>();
+        if direct_type_components.is_some_and(|components| components == qualified.as_slice())
+            && let LexicalTypeResolution::Resolved {
+                unit, components, ..
+            } = &direct_type_resolution
+        {
+            direct_types.push((unit.clone(), components.clone()));
+        }
+        if !direct_types.is_empty() {
+            return resolve_direct_type_candidates(direct_types, analyzer, visibility, file);
+        }
+        let directives = at_tier
+            .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Namespace { .. }))
+            .flat_map(|binding| {
+                binding_free_function_candidates(
+                    binding,
+                    &transitive_bindings,
+                    analyzer,
+                    visibility,
+                    file,
+                    name,
+                    call.start_byte(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if !directives.is_empty() {
+            return resolve_callable_candidates(
+                directives,
+                call_arity,
+                call.start_byte(),
+                analyzer,
+                visibility,
+                file,
+            );
         }
         if type_components.is_some_and(|components| components == qualified.as_slice()) {
             return match type_resolution {
@@ -2552,24 +2844,30 @@ fn qualified_owner_resolution(node: Node<'_>, ctx: &ScanCtx<'_>) -> QualifiedOwn
     let Some((components, global)) = qualified_callable_owner_components(node, ctx.source) else {
         return QualifiedOwnerResolution::Unresolved;
     };
-    let lexical_scope = match enclosing_lexical_scope_components(
+    if !global
+        && !matches!(
+            enclosing_lexical_scope_components(
+                node,
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+            ),
+            LexicalScopeResolution::Resolved(_)
+        )
+    {
+        return QualifiedOwnerResolution::Unresolved;
+    }
+    match resolve_type_components_lexically_at_for_target(
         node,
-        ctx.analyzer,
-        ctx.visibility,
-        ctx.file,
-        ctx.source,
-    ) {
-        LexicalScopeResolution::Resolved(scope) => scope,
-        LexicalScopeResolution::Ambiguous | LexicalScopeResolution::Missing => {
-            return QualifiedOwnerResolution::Unresolved;
-        }
-    };
-    match ctx.visibility.resolve_type_components_lexically(
-        ctx.analyzer,
-        ctx.file,
         &components,
         global,
-        &lexical_scope,
+        ctx.analyzer,
+        ctx.visibility,
+        &ctx.ordinary_type_imports,
+        ctx.file,
+        ctx.source,
+        target_owner,
     ) {
         LexicalTypeResolution::Resolved { unit: owner, .. }
             if receiver_owner_matches_target(&owner, target_owner, ctx) =>
@@ -2768,7 +3066,7 @@ fn indexed_enclosing_class_components(
     Some(classes)
 }
 
-pub(super) fn resolve_type_node_lexically(
+pub(in crate::analyzer::usages) fn resolve_type_node_lexically(
     node: Node<'_>,
     analyzer: &dyn IAnalyzer,
     visibility: &VisibilityIndex,
@@ -2914,9 +3212,47 @@ pub(super) fn using_enum_declaration_type_node(node: Node<'_>) -> Option<Node<'_
 }
 
 pub(super) fn ordinary_using_declaration_type_node(node: Node<'_>) -> Option<Node<'_>> {
-    (node.kind() == "using_declaration" && using_enum_declaration_type_node(node).is_none())
-        .then(|| node.named_child(0))
-        .flatten()
+    (node.kind() == "using_declaration"
+        && using_enum_declaration_type_node(node).is_none()
+        && using_namespace_directive_name_node(node).is_none())
+    .then(|| node.named_child(0))
+    .flatten()
+}
+
+fn using_namespace_directive_name_node(node: Node<'_>) -> Option<Node<'_>> {
+    let is_directive = node.kind() == "using_directive"
+        || (node.kind() == "using_declaration"
+            && (0..node.child_count()).any(|index| {
+                node.child(index)
+                    .is_some_and(|child| child.kind() == "namespace")
+            }));
+    if !is_directive {
+        return None;
+    }
+    node.child_by_field_name("name")
+        .or_else(|| node.named_child(node.named_child_count().checked_sub(1)?))
+}
+
+fn using_named_scope(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "compound_statement"
+                | "function_definition"
+                | "lambda_expression"
+                | "for_statement"
+                | "while_statement"
+                | "if_statement"
+                | "class_specifier"
+                | "struct_specifier"
+                | "union_specifier"
+        ) {
+            return None;
+        }
+        current = parent.parent();
+    }
+    Some(enclosing_namespace_components(node, source))
 }
 
 fn ordinary_using_scope(node: Node<'_>) -> Option<(usize, usize, usize)> {
@@ -2942,56 +3278,274 @@ fn ordinary_using_scope(node: Node<'_>) -> Option<(usize, usize, usize)> {
     None
 }
 
-fn collect_ordinary_type_imports(
+fn collect_source_using_index(
+    source_file: &ProjectFile,
     root: Node<'_>,
-    analyzer: &dyn IAnalyzer,
-    visibility: &VisibilityIndex,
-    file: &ProjectFile,
     source: &str,
-) -> Box<[OrdinaryTypeImport]> {
-    let mut imports = Vec::new();
+) -> SourceUsingIndex {
+    let mut index = SourceUsingIndex::default();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if let Some(type_node) = ordinary_using_declaration_type_node(node) {
+        if !callable_preprocessor_context_is_visible(node, source) {
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
+            continue;
+        }
+        let target = if let Some(namespace_node) = using_namespace_directive_name_node(node) {
+            let mut namespace_components = Vec::new();
+            append_cpp_name_components(namespace_node, source, &mut namespace_components).map(
+                |_| EffectiveUsingTarget::Namespace {
+                    namespace_components,
+                    global: is_globally_qualified_cpp_name(namespace_node),
+                },
+            )
+        } else if let Some(type_node) = ordinary_using_declaration_type_node(node) {
             let mut target_components = Vec::new();
-            if append_cpp_name_components(type_node, source, &mut target_components).is_some()
-                && target_components.len() >= 2
-                && let LexicalScopeResolution::Resolved(lexical_scope) =
-                    enclosing_lexical_scope_components(
-                        type_node, analyzer, visibility, file, source,
-                    )
-                && let LexicalTypeResolution::Resolved { unit: target, .. } = visibility
-                    .resolve_type_components_lexically_for_forward(
-                        analyzer,
-                        file,
-                        &target_components,
-                        is_globally_qualified_cpp_name(type_node),
-                        &lexical_scope,
-                    )
-                && let Some((scope_start, scope_end, scope_depth)) = ordinary_using_scope(node)
-            {
-                imports.push(OrdinaryTypeImport {
+            (append_cpp_name_components(type_node, source, &mut target_components).is_some()
+                && target_components.len() >= 2)
+                .then(|| EffectiveUsingTarget::Ordinary {
                     name: target_components
                         .last()
                         .expect("ordinary using has a terminal component")
                         .clone(),
-                    target,
                     target_components,
-                    declaration_byte: node.end_byte(),
-                    scope_start,
-                    scope_end,
-                    scope_depth,
-                    lexical_depth: lexical_scope.len(),
-                });
+                    global: is_globally_qualified_cpp_name(type_node),
+                })
+        } else {
+            None
+        };
+        if let Some(target) = target
+            && let Some((scope_start, scope_end, scope_depth)) = ordinary_using_scope(node)
+        {
+            let declaration_namespace = enclosing_namespace_components(node, source);
+            let namespace_scope = using_named_scope(node, source);
+            let lexical_depth = declaration_namespace.len();
+            let binding = OrdinaryTypeImport {
+                target,
+                source: source_file.clone(),
+                declaration_byte: node.end_byte(),
+                scope_start,
+                scope_end,
+                scope_depth,
+                lexical_depth,
+                declaration_namespace,
+                namespace_scope,
+                resolved_target_components: None,
+            };
+            match &binding.target {
+                EffectiveUsingTarget::Ordinary { name, .. } => index
+                    .ordinary_by_name
+                    .entry(name.clone())
+                    .or_default()
+                    .push(binding),
+                EffectiveUsingTarget::Namespace { .. } => index.directives.push(binding),
             }
         }
         let mut cursor = node.walk();
         stack.extend(node.children(&mut cursor));
     }
-    imports.into_boxed_slice()
+    index
 }
 
-pub(super) fn initialized_ordinary_type_imports(
+fn build_project_using_index(visibility: &VisibilityIndex) -> ProjectUsingIndex {
+    let mut project = ProjectUsingIndex::default();
+    for source_file in visibility.all_visible_source_files() {
+        visibility.note_using_source_index_walk_for_test();
+        let Some(prepared) = visibility.cpp().prepared_syntax(&source_file) else {
+            continue;
+        };
+        let source_index = collect_source_using_index(
+            &source_file,
+            prepared.tree().root_node(),
+            prepared.source(),
+        );
+        for (name, bindings) in source_index.ordinary_by_name {
+            project
+                .ordinary_by_name
+                .entry(name)
+                .or_default()
+                .extend(bindings);
+        }
+        project.directives.extend(source_index.directives);
+    }
+    project
+}
+
+fn effective_using_target_tiers(binding: &OrdinaryTypeImport) -> Vec<Vec<String>> {
+    let (components, global) = match &binding.target {
+        EffectiveUsingTarget::Ordinary {
+            target_components,
+            global,
+            ..
+        } => (target_components, *global),
+        EffectiveUsingTarget::Namespace {
+            namespace_components,
+            global,
+        } => (namespace_components, *global),
+    };
+    lexical_component_tiers(components, global, &binding.declaration_namespace).collect()
+}
+
+fn using_binding_target_components_for_name(
+    binding: &OrdinaryTypeImport,
+    project: &ProjectUsingIndex,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    name: &str,
+) -> Option<Vec<String>> {
+    let visible_candidates = visibility
+        .visible_identifier_candidates(file, name)
+        .filter(|candidate| {
+            candidate.is_class()
+                || is_type_alias(candidate)
+                || (candidate.is_function() && type_owner_of(visibility.cpp(), candidate).is_none())
+        })
+        .collect::<Vec<_>>();
+    if visible_candidates.is_empty() {
+        return None;
+    }
+    match &binding.target {
+        EffectiveUsingTarget::Ordinary {
+            name: imported_name,
+            ..
+        } if imported_name == name => {
+            effective_using_target_tiers(binding)
+                .into_iter()
+                .find(|qualified| {
+                    let qualified_name = qualified.join("::");
+                    visible_candidates
+                        .iter()
+                        .any(|candidate| cpp_name_for(candidate) == qualified_name)
+                })
+        }
+        EffectiveUsingTarget::Namespace { .. } => {
+            visibility.note_using_namespace_lookup_for_test();
+            effective_using_target_tiers(binding)
+                .into_iter()
+                .find(|namespace_components| {
+                    let namespace = namespace_components.join("::");
+                    visible_candidates.iter().any(|candidate| {
+                        visibility.note_using_name_candidate_inspection_for_test();
+                        cpp_namespace_for(candidate).is_some_and(|candidate_namespace| {
+                            candidate_namespace == namespace
+                                || candidate_namespace.starts_with(&format!("{namespace}::"))
+                        })
+                    }) || project.directives.iter().any(|candidate| {
+                        candidate.namespace_scope.as_deref()
+                            == Some(namespace_components.as_slice())
+                    }) || project
+                        .ordinary_by_name
+                        .values()
+                        .flatten()
+                        .any(|candidate| {
+                            candidate.namespace_scope.as_deref()
+                                == Some(namespace_components.as_slice())
+                        })
+                })
+        }
+        EffectiveUsingTarget::Ordinary { .. } => None,
+    }
+}
+
+fn include_node_for_activation(root: Node<'_>, activation: usize) -> Option<Node<'_>> {
+    let start = activation.checked_sub(1)?;
+    let mut node = root.descendant_for_byte_range(start, activation)?;
+    while node.kind() != "preproc_include" {
+        node = node.parent()?;
+    }
+    Some(node)
+}
+
+fn project_using_binding(
+    mut binding: OrdinaryTypeImport,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    root: Node<'_>,
+    source: &str,
+) -> Option<OrdinaryTypeImport> {
+    if binding.source == *file {
+        return Some(binding);
+    }
+    if !visibility.source_is_visible(file, &binding.source) || binding.namespace_scope.is_none() {
+        return None;
+    }
+    visibility.note_using_donor_activation_for_test();
+    let prepared = visibility.cpp().prepared_syntax(file)?;
+    let activation = visibility.include_activation_for_source(
+        visibility.cpp(),
+        file,
+        prepared.as_ref(),
+        &binding.source,
+    )?;
+    let include = include_node_for_activation(root, activation)?;
+    let include_namespace = enclosing_namespace_components(include, source);
+    let mut declaration_namespace = include_namespace.clone();
+    declaration_namespace.extend(binding.declaration_namespace);
+    binding.declaration_namespace = declaration_namespace;
+    binding.declaration_byte = activation;
+    if let Some(prefix) = using_named_scope(include, source) {
+        let mut projected = prefix;
+        projected.extend(binding.namespace_scope.take().unwrap_or_default());
+        binding.scope_depth = projected.len();
+        binding.lexical_depth = projected.len();
+        binding.namespace_scope = Some(projected);
+        binding.scope_start = 0;
+        binding.scope_end = usize::MAX;
+        Some(binding)
+    } else if let Some((start, end, depth)) = ordinary_using_scope(include) {
+        binding.namespace_scope = None;
+        binding.scope_start = start;
+        binding.scope_end = end;
+        binding.scope_depth = depth;
+        binding.lexical_depth = include_namespace.len();
+        Some(binding)
+    } else {
+        None
+    }
+}
+
+fn effective_using_bindings_for_name(
+    visibility: &VisibilityIndex,
+    imports: &OrdinaryTypeImportCell,
+    file: &ProjectFile,
+    root: Node<'_>,
+    source: &str,
+    name: &str,
+) -> Arc<[OrdinaryTypeImport]> {
+    imports
+        .projection_cell(name)
+        .get_or_init(|| {
+            let project = visibility.project_using_index(|| build_project_using_index(visibility));
+            let mut projected = Vec::new();
+            for binding in project
+                .ordinary_by_name
+                .get(name)
+                .into_iter()
+                .flatten()
+                .chain(project.directives.iter())
+            {
+                if !visibility.source_is_visible(file, &binding.source) {
+                    continue;
+                }
+                let Some(target_components) = using_binding_target_components_for_name(
+                    binding, project, visibility, file, name,
+                ) else {
+                    continue;
+                };
+                let mut binding = binding.clone();
+                binding.resolved_target_components = Some(target_components);
+                if let Some(binding) =
+                    project_using_binding(binding, visibility, file, root, source)
+                {
+                    projected.push(binding);
+                }
+            }
+            Arc::from(projected)
+        })
+        .clone()
+}
+
+pub(in crate::analyzer::usages) fn initialized_ordinary_type_imports(
     root: Node<'_>,
     analyzer: &dyn IAnalyzer,
     visibility: &VisibilityIndex,
@@ -2999,27 +3553,198 @@ pub(super) fn initialized_ordinary_type_imports(
     source: &str,
 ) -> OrdinaryTypeImportCell {
     let cell = visibility.ordinary_type_import_cell(file);
-    cell.get_or_init(|| collect_ordinary_type_imports(root, analyzer, visibility, file, source));
+    let _ = (root, analyzer, source);
     cell
 }
 
-fn ordinary_type_import_resolution<'a>(
-    node: Node<'_>,
-    components: &[String],
-    global: bool,
-    imports: &'a OrdinaryTypeImportCell,
-) -> OrdinaryTypeImportResolution<'a> {
-    if global || components.len() != 1 {
-        return OrdinaryTypeImportResolution::Missing;
+fn root_node(mut node: Node<'_>) -> Node<'_> {
+    while let Some(parent) = node.parent() {
+        node = parent;
     }
-    let imports = imports
-        .get()
-        .expect("ordinary type imports initialized when constructing the scan context");
-    resolve_ordinary_type_import(imports, node, &components[0])
+    node
+}
+
+fn effective_using_binding_active(
+    binding: &OrdinaryTypeImport,
+    node: Node<'_>,
+    lexical_scope: &[String],
+) -> bool {
+    binding.declaration_byte <= node.start_byte()
+        && binding.namespace_scope.as_ref().map_or_else(
+            || binding.scope_start <= node.start_byte() && node.end_byte() <= binding.scope_end,
+            |namespace| lexical_scope.starts_with(namespace),
+        )
+}
+
+fn binding_type_candidates(
+    binding: &OrdinaryTypeImport,
+    active_bindings: &[&OrdinaryTypeImport],
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    name: &str,
+) -> Vec<(CodeUnit, Vec<String>)> {
+    let Some(qualified) = binding.resolved_target_components.clone() else {
+        return Vec::new();
+    };
+    let mut targets = Vec::new();
+    match binding.target {
+        EffectiveUsingTarget::Ordinary { .. } => targets.push(qualified),
+        EffectiveUsingTarget::Namespace { .. } => {
+            let mut stack = vec![qualified];
+            let mut visited = HashSet::default();
+            while let Some(namespace) = stack.pop() {
+                if !visited.insert(namespace.clone()) {
+                    continue;
+                }
+                let mut target = namespace.clone();
+                target.push(name.to_string());
+                targets.push(target);
+                stack.extend(active_bindings.iter().filter_map(|candidate| {
+                    (matches!(candidate.target, EffectiveUsingTarget::Namespace { .. })
+                        && candidate.namespace_scope.as_deref() == Some(namespace.as_slice()))
+                    .then(|| candidate.resolved_target_components.clone())
+                    .flatten()
+                }));
+            }
+        }
+    }
+    targets
+        .into_iter()
+        .flat_map(|target| {
+            let qualified_name = target.join("::");
+            visibility
+                .visible_identifier_candidates(file, name)
+                .filter(move |candidate| {
+                    (candidate.is_class() || is_type_alias(candidate))
+                        && cpp_name_for(candidate) == qualified_name
+                })
+                .cloned()
+                .map(move |candidate| (candidate, target.clone()))
+        })
+        .collect()
+}
+
+fn resolved_type_import(
+    candidates: Vec<(CodeUnit, Vec<String>)>,
+    lexical_depth: usize,
+    is_direct: bool,
+) -> OrdinaryTypeImportResolution {
+    let mut logical = Vec::<(CodeUnit, Vec<String>)>::new();
+    for candidate in candidates {
+        if !logical
+            .iter()
+            .any(|(existing, _)| same_logical_symbol(existing, &candidate.0))
+        {
+            logical.push(candidate);
+        }
+    }
+    match logical.as_slice() {
+        [] => OrdinaryTypeImportResolution::Missing,
+        [(target, target_components)] => OrdinaryTypeImportResolution::Resolved {
+            target: target.clone(),
+            target_components: target_components.clone(),
+            lexical_depth,
+            is_direct,
+        },
+        _ => OrdinaryTypeImportResolution::Ambiguous { lexical_depth },
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_type_components_lexically_at(
+fn ordinary_type_import_resolution(
+    node: Node<'_>,
+    components: &[String],
+    global: bool,
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    imports: &OrdinaryTypeImportCell,
+    file: &ProjectFile,
+    source: &str,
+    lexical_scope: &[String],
+) -> OrdinaryTypeImportResolution {
+    if global || components.len() != 1 {
+        return OrdinaryTypeImportResolution::Missing;
+    }
+    let _ = analyzer;
+    let name = &components[0];
+    let bindings =
+        effective_using_bindings_for_name(visibility, imports, file, root_node(node), source, name);
+    let active = bindings
+        .iter()
+        .filter(|binding| effective_using_binding_active(binding, node, lexical_scope))
+        .collect::<Vec<_>>();
+    let transitive = bindings
+        .iter()
+        .filter(|binding| {
+            binding.declaration_byte <= node.start_byte()
+                && (binding.namespace_scope.is_some()
+                    || (binding.scope_start <= node.start_byte()
+                        && node.end_byte() <= binding.scope_end))
+        })
+        .collect::<Vec<_>>();
+    let mut concrete_depths = active
+        .iter()
+        .filter(|binding| binding.namespace_scope.is_none())
+        .map(|binding| binding.scope_depth)
+        .collect::<Vec<_>>();
+    concrete_depths.sort_unstable();
+    concrete_depths.dedup();
+    for depth in concrete_depths.into_iter().rev() {
+        let at_tier = active
+            .iter()
+            .copied()
+            .filter(|binding| binding.namespace_scope.is_none() && binding.scope_depth == depth);
+        let direct = at_tier
+            .clone()
+            .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Ordinary { .. }))
+            .flat_map(|binding| {
+                binding_type_candidates(binding, &transitive, visibility, file, name)
+            })
+            .collect::<Vec<_>>();
+        if !direct.is_empty() {
+            return resolved_type_import(direct, lexical_scope.len(), true);
+        }
+        let directives = at_tier
+            .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Namespace { .. }))
+            .flat_map(|binding| {
+                binding_type_candidates(binding, &transitive, visibility, file, name)
+            })
+            .collect::<Vec<_>>();
+        if !directives.is_empty() {
+            return resolved_type_import(directives, lexical_scope.len(), false);
+        }
+    }
+    for prefix_len in (0..=lexical_scope.len()).rev() {
+        let tier = &lexical_scope[..prefix_len];
+        let at_tier = active
+            .iter()
+            .copied()
+            .filter(|binding| binding.namespace_scope.as_deref() == Some(tier));
+        let direct = at_tier
+            .clone()
+            .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Ordinary { .. }))
+            .flat_map(|binding| {
+                binding_type_candidates(binding, &transitive, visibility, file, name)
+            })
+            .collect::<Vec<_>>();
+        if !direct.is_empty() {
+            return resolved_type_import(direct, prefix_len, true);
+        }
+        let directives = at_tier
+            .filter(|binding| matches!(binding.target, EffectiveUsingTarget::Namespace { .. }))
+            .flat_map(|binding| {
+                binding_type_candidates(binding, &transitive, visibility, file, name)
+            })
+            .collect::<Vec<_>>();
+        if !directives.is_empty() {
+            return resolved_type_import(directives, prefix_len, false);
+        }
+    }
+    OrdinaryTypeImportResolution::Missing
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resolve_type_components_lexically_at(
     node: Node<'_>,
     components: &[String],
     global: bool,
@@ -3155,6 +3880,14 @@ fn resolve_type_components_lexically_at_inner(
             },
         )
     };
+    let normal = match normal {
+        LexicalTypeResolution::Resolved { ref unit, .. }
+            if !visibility.external_type_candidate_visible_at(file, unit, node.start_byte()) =>
+        {
+            LexicalTypeResolution::Missing
+        }
+        resolution => resolution,
+    };
     let normal_depth = match &normal {
         LexicalTypeResolution::Resolved { components, .. } => {
             Some(components.len().saturating_sub(1))
@@ -3166,16 +3899,41 @@ fn resolve_type_components_lexically_at_inner(
     // fallback at the same or a shallower depth. A declaration in a more deeply
     // nested named scope is the closer lexical result and remains authoritative.
     // Ambiguous imports fail closed unless such a closer declaration exists.
-    match ordinary_type_import_resolution(node, components, global, ordinary_type_imports) {
+    match ordinary_type_import_resolution(
+        node,
+        components,
+        global,
+        analyzer,
+        visibility,
+        ordinary_type_imports,
+        file,
+        source,
+        &lexical_scope,
+    ) {
         OrdinaryTypeImportResolution::Missing => normal,
-        OrdinaryTypeImportResolution::Resolved(import)
-            if matches!(&normal, LexicalTypeResolution::Ambiguous)
-                || normal_depth.is_some_and(|depth| depth > import.lexical_depth) =>
+        OrdinaryTypeImportResolution::Resolved {
+            lexical_depth,
+            is_direct,
+            ..
+        } if matches!(&normal, LexicalTypeResolution::Ambiguous)
+            || normal_depth.is_some_and(|depth| {
+                depth > lexical_depth || (!is_direct && depth == lexical_depth)
+            }) =>
         {
             normal
         }
-        OrdinaryTypeImportResolution::Resolved(import) => visibility
-            .resolve_imported_type_candidate(analyzer, file, import, direct_target, preserve_alias),
+        OrdinaryTypeImportResolution::Resolved {
+            target,
+            target_components,
+            ..
+        } => visibility.resolve_imported_type_candidate(
+            analyzer,
+            file,
+            &target,
+            &target_components,
+            direct_target,
+            preserve_alias,
+        ),
         OrdinaryTypeImportResolution::Ambiguous { lexical_depth }
             if normal_depth.is_some_and(|depth| depth > lexical_depth) =>
         {
@@ -3197,6 +3955,161 @@ fn known_non_target_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         structured_owner_context_resolution(node, ctx),
         StructuredOwnerContextResolution::NonTarget
     )
+}
+
+#[cfg(test)]
+mod effective_using_scale_tests {
+    use super::*;
+    use crate::analyzer::{
+        AnalyzerConfig, AnalyzerQueryScope, Language, TestProject, WorkspaceAnalyzer,
+        resolve_analyzer,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn effective_using_projection_and_callable_metadata_are_cached_at_scale() {
+        const HEADER_COUNT: usize = 24;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let mut includes = String::new();
+        for index in 0..HEADER_COUNT {
+            let header = ProjectFile::new(root.clone(), format!("api_{index}.h"));
+            let mut header_source = format!(
+                "#pragma once\nnamespace api_{index} {{\nint Call_{index}(int value = 0);\n"
+            );
+            for unrelated in 0..64 {
+                header_source.push_str(&format!("struct Noise_{index}_{unrelated} {{}};\n"));
+            }
+            header_source.push_str(&format!("}}\nusing namespace api_{index};\n"));
+            header.write(header_source).expect("write scale header");
+            includes.push_str(&format!("#include \"api_{index}.h\"\n"));
+        }
+        let left = ProjectFile::new(root.clone(), "left.cc");
+        let right = ProjectFile::new(root.clone(), "right.cc");
+        left.write(format!("{includes}int left() {{ return Call_0(); }}\n"))
+            .expect("write left consumer");
+        right
+            .write(format!("{includes}int right() {{ return Call_0(); }}\n"))
+            .expect("write right consumer");
+
+        let project = Arc::new(TestProject::new(&root, Language::Cpp));
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
+        let _scope = AnalyzerQueryScope::new(analyzer);
+        let roots = HashSet::from_iter([left.clone(), right]);
+        let visibility = VisibilityIndex::build(cpp, analyzer, &roots);
+        let prepared = cpp.prepared_syntax(&left).expect("prepared left consumer");
+        let root_node = prepared.tree().root_node();
+        let imports = initialized_ordinary_type_imports(
+            root_node,
+            analyzer,
+            &visibility,
+            &left,
+            prepared.source(),
+        );
+
+        for _ in 0..1_000 {
+            assert!(
+                effective_using_bindings_for_name(
+                    &visibility,
+                    &imports,
+                    &left,
+                    root_node,
+                    prepared.source(),
+                    "Absent",
+                )
+                .is_empty()
+            );
+        }
+        let after_absent = visibility.using_work_counts_for_test();
+        assert_eq!(
+            after_absent.0,
+            visibility.all_visible_source_files().len(),
+            "the union source index must walk each physical source once"
+        );
+        assert_eq!(
+            (
+                after_absent.1,
+                after_absent.2,
+                after_absent.3,
+                after_absent.4
+            ),
+            (0, 0, 0, 0),
+            "an absent name must not activate donors, expand namespaces, hydrate callables, or inspect unrelated declarations"
+        );
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let imports = Arc::clone(&imports);
+                let left = left.clone();
+                let visibility = &visibility;
+                scope.spawn(move || {
+                    let prepared = visibility
+                        .cpp()
+                        .prepared_syntax(&left)
+                        .expect("prepared concurrent consumer");
+                    for _ in 0..100 {
+                        let _ = effective_using_bindings_for_name(
+                            visibility,
+                            &imports,
+                            &left,
+                            prepared.tree().root_node(),
+                            prepared.source(),
+                            "Call_0",
+                        );
+                    }
+                });
+            }
+        });
+        let after_projection = visibility.using_work_counts_for_test();
+        assert!(
+            after_projection.4 <= HEADER_COUNT,
+            "namespace validation must inspect only requested-name candidates, not the unrelated declaration population: {after_projection:?}"
+        );
+        let _ = effective_using_bindings_for_name(
+            &visibility,
+            &imports,
+            &left,
+            root_node,
+            prepared.source(),
+            "Call_0",
+        );
+        assert_eq!(
+            visibility.using_work_counts_for_test(),
+            after_projection,
+            "repeated name lookup must reuse donor projection and namespace expansion"
+        );
+
+        let callable = cpp
+            .get_all_declarations()
+            .into_iter()
+            .find(|candidate| candidate.fq_name() == "api_0.Call_0" && candidate.is_function())
+            .expect("scale callable");
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let callable = callable.clone();
+                let left = left.clone();
+                let visibility = &visibility;
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        assert!(visibility
+                            .callable_arity_at_reference(
+                                analyzer,
+                                &left,
+                                &callable,
+                                usize::MAX,
+                            )
+                            .is_some());
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            visibility.using_work_counts_for_test().3,
+            1,
+            "repeated logical callable lookup must hydrate default metadata once"
+        );
+    }
 }
 
 #[derive(Clone, Copy)]

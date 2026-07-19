@@ -19,8 +19,11 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
 
 pub(in crate::analyzer::usages) use extractor::{
+    BareCallTargetResolution as CppBareCallTargetResolution,
     LexicalScopeResolution as CppLexicalScopeResolution,
     enclosing_lexical_scope_components as cpp_enclosing_lexical_scope_components,
+    initialized_ordinary_type_imports as cpp_initialized_effective_using_imports,
+    resolve_bare_call_target as cpp_resolve_bare_call_target,
 };
 pub(in crate::analyzer::usages) use resolver::{
     CallArityEvidence, DesignatedInitializerOwner as CppDesignatedInitializerOwner,

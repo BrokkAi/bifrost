@@ -13799,3 +13799,432 @@ void wrong_namespace() {
         "a direct temporary in another namespace must not hit model.Widget"
     );
 }
+#[test]
+fn authoritative_cpp_effective_using_environment_obeys_lookup_tiers_on_every_surface() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "defs.h",
+            r#"#pragma once
+namespace alpha {
+struct Imported {};
+struct Callable { static int Make(int); };
+int Build(int);
+int Pick(int);
+int Clash(int);
+}
+namespace beta { int Build(); int Clash(); }
+namespace n { int Transitive(int); }
+namespace empty { struct Marker {}; }
+namespace defaults { int Defaulted(int required, int optional); }
+"#,
+        )
+        .file(
+            "directive.h",
+            r#"#pragma once
+#include "defs.h"
+using namespace alpha;
+"#,
+        )
+        .file(
+            "defs.cc",
+            r#"#include "defs.h"
+int alpha::Callable::Make(int value) { return value; }
+"#,
+        )
+        .file(
+            "ordinary.h",
+            r#"#pragma once
+#include "defs.h"
+using alpha::Imported;
+using alpha::Callable;
+"#,
+        )
+        .file(
+            "defaults.h",
+            r#"#pragma once
+#include "defs.h"
+namespace defaults { int Defaulted(int required, int optional = 0); }
+using namespace defaults;
+"#,
+        )
+        .file(
+            "logical_forward.h",
+            r#"#pragma once
+namespace logical { struct Split; }
+"#,
+        )
+        .file(
+            "logical_definition.h",
+            r#"#pragma once
+namespace logical { struct Split {}; }
+"#,
+        )
+        .file(
+            "conditional.h",
+            r#"#pragma once
+#include "defs.h"
+#if MAYBE_ALPHA
+using namespace alpha;
+#endif
+"#,
+        )
+        .file(
+            "directive.cc",
+            r#"#include "defs.h"
+using namespace alpha;
+int value = Build(1); // positive-directive
+"#,
+        )
+        .file(
+            "direct_hide.cc",
+            r#"#include "defs.h"
+int Build(int, int);
+using namespace alpha;
+int wrong = Build(1); // negative-direct-hides-directive
+int value = Build(1, 2); // positive-direct-declaration
+"#,
+        )
+        .file(
+            "ordinary_overload.cc",
+            r#"#include "defs.h"
+int Pick(int, int);
+using alpha::Pick;
+int imported = Pick(1); // positive-ordinary-overload
+int direct = Pick(1, 2); // positive-direct-overload
+"#,
+        )
+        .file(
+            "ordinary_hides_directive.cc",
+            r#"#include "defs.h"
+using namespace beta;
+using alpha::Clash;
+int value = Clash(); // negative-ordinary-hides-directive
+"#,
+        )
+        .file(
+            "multiple_directives.cc",
+            r#"#include "defs.h"
+using namespace alpha;
+using namespace beta;
+int one = Build(1); // positive-alpha-directive-overload
+int zero = Build(); // positive-beta-directive-overload
+"#,
+        )
+        .file(
+            "parent.cc",
+            r#"#include "defs.h"
+int Parent(int);
+namespace inner {
+using namespace empty;
+int value = Parent(1); // positive-parent-after-empty-tier
+}
+"#,
+        )
+        .file(
+            "transitive.cc",
+            r#"#include "defs.h"
+namespace facade { using namespace n; }
+namespace cycle_a {}
+namespace cycle_b { using namespace cycle_a; }
+namespace cycle_a { using namespace cycle_b; }
+using namespace facade;
+using namespace cycle_a;
+int value = Transitive(1); // positive-transitive-directive
+"#,
+        )
+        .file(
+            "direct_type.cc",
+            r#"#include "defs.h"
+struct Build {};
+using namespace alpha;
+auto value = Build(); // positive-direct-type-hides-directive
+"#,
+        )
+        .file(
+            "header.cc",
+            r#"Imported before; // negative-before-include
+alpha::Imported direct_before; // negative-qualified-before-include
+#include "directive.h"
+Imported after; // positive-header-directive
+alpha::Imported direct_after; // positive-qualified-after-include
+int value = Build(1); // positive-header-callable
+"#,
+        )
+        .file(
+            "ordinary_owner.cc",
+            r#"#include "ordinary.h"
+Imported imported; // positive-header-ordinary
+int value = Callable::Make(1); // positive-imported-owner
+"#,
+        )
+        .file(
+            "conditional.cc",
+            r#"#include "conditional.h"
+int value = Build(1); // negative-conditional-directive
+"#,
+        )
+        .file(
+            "alias.cc",
+            r#"#include "defs.h"
+namespace alpha_alias = alpha;
+using namespace alpha_alias;
+int value = Build(1); // negative-namespace-alias-unresolved
+"#,
+        )
+        .file(
+            "defaults.cc",
+            r#"#include "defaults.h"
+int value = Defaulted(1); // positive-visible-default
+"#,
+        )
+        .file(
+            "logical_activation.cc",
+            r#"#include "logical_forward.h"
+logical::Split* between; // positive-forward-peer-before-definition
+#include "logical_definition.h"
+logical::Split after; // positive-definition-after-include
+"#,
+        )
+        .file(
+            "local_same.cc",
+            r#"namespace local_scope {
+struct Imported {};
+Imported before_external; // positive-local-before-external-donor
+}
+#include "defs.h"
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let definition = |fq_name: &str, arity: Option<usize>| {
+        definition_by(&analyzer, |unit| {
+            unit.fq_name() == fq_name
+                && arity.is_none_or(|arity| signature_arity(unit.signature()) == arity)
+                && !unit.is_synthetic()
+        })
+    };
+    let alpha_build = definition("alpha.Build", Some(1));
+    let global_build = definition("Build", Some(2));
+    let alpha_pick = definition("alpha.Pick", Some(1));
+    let global_pick = definition("Pick", Some(2));
+    let beta_build = definition("beta.Build", Some(0));
+    let beta_clash = definition("beta.Clash", Some(0));
+    let parent = definition("Parent", Some(1));
+    let transitive = definition("n.Transitive", Some(1));
+    let direct_type = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "Build"
+            && slash_path(unit.source()) == "direct_type.cc"
+    });
+    let imported = definition("alpha.Imported", None);
+    let make = definition("alpha.Callable.Make", Some(1));
+    let defaulted = definition("defaults.Defaulted", Some(2));
+    let logical_split = definition("logical.Split", None);
+    let local_imported = definition("local_scope.Imported", None);
+
+    let surface_match = |target: &CodeUnit, path: &str, line_text: &str, token: &str| {
+        let file = project.file(path);
+        let source = file.read_to_string().expect("matrix source");
+        let range = fixture_token_range(&source, line_text, token);
+        let focus_start = range.0 + token.rfind("::").map_or(0, |separator| separator + 2);
+        let line_start = source[..focus_start]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: path.to_string(),
+                    line: Some(
+                        source[..focus_start]
+                            .bytes()
+                            .filter(|byte| *byte == b'\n')
+                            .count()
+                            + 1,
+                    ),
+                    column: Some(source[line_start..focus_start].chars().count() + 1),
+                }],
+            },
+        );
+        let forward_match = forward.results[0]
+            .definitions
+            .iter()
+            .any(|definition| definition.fqn.as_deref() == Some(target.fq_name().as_str()));
+        let targeted = authoritative_exact_ranges(&analyzer, std::slice::from_ref(target), &file)
+            .contains(&range);
+        let whole = UsageFinder::new()
+            .find_usages_default(&analyzer, std::slice::from_ref(target))
+            .all_hits_including_imports()
+            .into_iter()
+            .any(|hit| hit.file == file && (hit.start_offset, hit.end_offset) == range);
+        (forward_match, targeted, whole)
+    };
+
+    for (target, path, line, token) in [
+        (
+            &alpha_build,
+            "directive.cc",
+            "int value = Build(1); // positive-directive",
+            "Build",
+        ),
+        (
+            &global_build,
+            "direct_hide.cc",
+            "int value = Build(1, 2); // positive-direct-declaration",
+            "Build",
+        ),
+        (
+            &alpha_pick,
+            "ordinary_overload.cc",
+            "int imported = Pick(1); // positive-ordinary-overload",
+            "Pick",
+        ),
+        (
+            &global_pick,
+            "ordinary_overload.cc",
+            "int direct = Pick(1, 2); // positive-direct-overload",
+            "Pick",
+        ),
+        (
+            &alpha_build,
+            "multiple_directives.cc",
+            "int one = Build(1); // positive-alpha-directive-overload",
+            "Build",
+        ),
+        (
+            &beta_build,
+            "multiple_directives.cc",
+            "int zero = Build(); // positive-beta-directive-overload",
+            "Build",
+        ),
+        (
+            &parent,
+            "parent.cc",
+            "int value = Parent(1); // positive-parent-after-empty-tier",
+            "Parent",
+        ),
+        (
+            &transitive,
+            "transitive.cc",
+            "int value = Transitive(1); // positive-transitive-directive",
+            "Transitive",
+        ),
+        (
+            &direct_type,
+            "direct_type.cc",
+            "auto value = Build(); // positive-direct-type-hides-directive",
+            "Build",
+        ),
+        (
+            &imported,
+            "header.cc",
+            "Imported after; // positive-header-directive",
+            "Imported",
+        ),
+        (
+            &imported,
+            "header.cc",
+            "alpha::Imported direct_after; // positive-qualified-after-include",
+            "alpha::Imported",
+        ),
+        (
+            &alpha_build,
+            "header.cc",
+            "int value = Build(1); // positive-header-callable",
+            "Build",
+        ),
+        (
+            &imported,
+            "ordinary_owner.cc",
+            "Imported imported; // positive-header-ordinary",
+            "Imported",
+        ),
+        (
+            &make,
+            "ordinary_owner.cc",
+            "int value = Callable::Make(1); // positive-imported-owner",
+            "Make",
+        ),
+        (
+            &defaulted,
+            "defaults.cc",
+            "int value = Defaulted(1); // positive-visible-default",
+            "Defaulted",
+        ),
+        (
+            &logical_split,
+            "logical_activation.cc",
+            "logical::Split* between; // positive-forward-peer-before-definition",
+            "logical::Split",
+        ),
+        (
+            &local_imported,
+            "local_same.cc",
+            "Imported before_external; // positive-local-before-external-donor",
+            "Imported",
+        ),
+        (
+            &logical_split,
+            "logical_activation.cc",
+            "logical::Split after; // positive-definition-after-include",
+            "logical::Split",
+        ),
+    ] {
+        assert_eq!(
+            surface_match(target, path, line, token),
+            (true, true, true),
+            "positive effective-using mismatch for {path}: {line} target={target:#?}"
+        );
+    }
+
+    for (target, path, line, token) in [
+        (
+            &alpha_build,
+            "direct_hide.cc",
+            "int wrong = Build(1); // negative-direct-hides-directive",
+            "Build",
+        ),
+        (
+            &beta_clash,
+            "ordinary_hides_directive.cc",
+            "int value = Clash(); // negative-ordinary-hides-directive",
+            "Clash",
+        ),
+        (
+            &alpha_build,
+            "direct_type.cc",
+            "auto value = Build(); // positive-direct-type-hides-directive",
+            "Build",
+        ),
+        (
+            &imported,
+            "header.cc",
+            "Imported before; // negative-before-include",
+            "Imported",
+        ),
+        (
+            &imported,
+            "header.cc",
+            "alpha::Imported direct_before; // negative-qualified-before-include",
+            "alpha::Imported",
+        ),
+        (
+            &alpha_build,
+            "conditional.cc",
+            "int value = Build(1); // negative-conditional-directive",
+            "Build",
+        ),
+        (
+            &alpha_build,
+            "alias.cc",
+            "int value = Build(1); // negative-namespace-alias-unresolved",
+            "Build",
+        ),
+    ] {
+        assert_eq!(
+            surface_match(target, path, line, token),
+            (false, false, false),
+            "negative effective-using mismatch for {path}: {line} target={target:#?}"
+        );
+    }
+}

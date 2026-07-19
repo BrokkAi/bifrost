@@ -26,8 +26,8 @@ use super::extractor::{
     BareCallTargetResolution, LexicalScopeResolution, enclosing_lexical_scope_components,
     initialized_ordinary_type_imports, ordinary_using_declaration_type_node,
     resolve_bare_call_target, resolve_ordinary_using_declaration_owner,
-    resolve_type_node_lexically, resolve_using_enum_declaration_owner,
-    using_enum_declaration_type_node,
+    resolve_type_components_lexically_at, resolve_type_node_lexically,
+    resolve_using_enum_declaration_owner, using_enum_declaration_type_node,
 };
 use super::resolver::{
     DesignatedInitializerOwner, EnclosingMemberOwnerResolution, LexicalCallableValueResolution,
@@ -384,10 +384,26 @@ fn record_qualified_callable_value(
             ctx.record(function.fq_name(), member_node);
             return;
         }
-        LexicalCallableValueResolution::Ambiguous | LexicalCallableValueResolution::Missing => {
+        LexicalCallableValueResolution::Ambiguous => {
             ctx.record_unproven(member_name, member_node);
             return;
         }
+        LexicalCallableValueResolution::Missing => match resolve_type_components_lexically_at(
+            qualified,
+            &owner_components,
+            global,
+            ctx.analyzer,
+            ctx.visibility,
+            &ctx.ordinary_type_imports,
+            ctx.file,
+            ctx.source,
+        ) {
+            LexicalTypeResolution::Resolved { unit, .. } => unit,
+            LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => {
+                ctx.record_unproven(member_name, member_node);
+                return;
+            }
+        },
     };
     match ctx
         .visibility

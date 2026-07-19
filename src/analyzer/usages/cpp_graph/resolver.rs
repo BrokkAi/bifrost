@@ -293,7 +293,7 @@ pub(super) struct TypeScanKey {
     member_name: String,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct LogicalSymbolKey {
     kind: CodeUnitType,
     fq_name: String,
@@ -518,7 +518,7 @@ impl CppScanBinding {
 }
 
 type AliasCell = Arc<OnceLock<Box<[CppAlias]>>>;
-pub(super) type OrdinaryTypeImportCell = Arc<OnceLock<Box<[OrdinaryTypeImport]>>>;
+pub(in crate::analyzer::usages) type OrdinaryTypeImportCell = Arc<EffectiveUsingIndex>;
 type MacroEventCell = Arc<OnceLock<Box<[MacroEvent]>>>;
 type MacroIncludeProtectionCell = Arc<OnceLock<MacroIncludeProtection>>;
 type MacroEnvironmentCursorCell = Arc<Mutex<MacroEnvironmentCursor>>;
@@ -563,71 +563,82 @@ impl MacroEnvironment {
     }
 }
 
+#[derive(Clone)]
+pub(super) enum EffectiveUsingTarget {
+    Ordinary {
+        name: String,
+        target_components: Vec<String>,
+        global: bool,
+    },
+    Namespace {
+        namespace_components: Vec<String>,
+        global: bool,
+    },
+}
+
+#[derive(Clone)]
 pub(super) struct OrdinaryTypeImport {
-    pub(super) name: String,
-    pub(super) target: CodeUnit,
-    pub(super) target_components: Vec<String>,
+    pub(super) target: EffectiveUsingTarget,
+    pub(super) source: ProjectFile,
     pub(super) declaration_byte: usize,
     pub(super) scope_start: usize,
     pub(super) scope_end: usize,
     pub(super) scope_depth: usize,
     pub(super) lexical_depth: usize,
+    pub(super) declaration_namespace: Vec<String>,
+    pub(super) namespace_scope: Option<Vec<String>>,
+    pub(super) resolved_target_components: Option<Vec<String>>,
 }
 
-pub(super) enum OrdinaryTypeImportResolution<'a> {
-    Resolved(&'a OrdinaryTypeImport),
-    Ambiguous { lexical_depth: usize },
+#[derive(Default)]
+pub(super) struct SourceUsingIndex {
+    pub(super) ordinary_by_name: HashMap<String, Vec<OrdinaryTypeImport>>,
+    pub(super) directives: Vec<OrdinaryTypeImport>,
+}
+
+#[derive(Default)]
+pub(super) struct ProjectUsingIndex {
+    pub(super) ordinary_by_name: HashMap<String, Vec<OrdinaryTypeImport>>,
+    pub(super) directives: Vec<OrdinaryTypeImport>,
+}
+
+type EffectiveUsingProjectionCell = Arc<OnceLock<Arc<[OrdinaryTypeImport]>>>;
+
+pub(in crate::analyzer::usages) struct EffectiveUsingIndex {
+    projected_by_name: Mutex<HashMap<String, EffectiveUsingProjectionCell>>,
+}
+
+impl EffectiveUsingIndex {
+    fn new(_root: ProjectFile) -> Self {
+        Self {
+            projected_by_name: Mutex::new(HashMap::default()),
+        }
+    }
+
+    pub(super) fn projection_cell(&self, name: &str) -> EffectiveUsingProjectionCell {
+        self.projected_by_name
+            .lock()
+            .expect("C++ effective-using projection cache poisoned")
+            .entry(name.to_string())
+            .or_default()
+            .clone()
+    }
+}
+
+pub(super) enum OrdinaryTypeImportResolution {
+    Resolved {
+        target: CodeUnit,
+        target_components: Vec<String>,
+        lexical_depth: usize,
+        is_direct: bool,
+    },
+    Ambiguous {
+        lexical_depth: usize,
+    },
     Missing,
 }
 
-pub(super) fn resolve_ordinary_type_import<'a>(
-    imports: &'a [OrdinaryTypeImport],
-    node: Node<'_>,
-    name: &str,
-) -> OrdinaryTypeImportResolution<'a> {
-    // Source order and the AST scope range establish which imports are active;
-    // the deepest active AST scope hides imports from enclosing scopes.
-    let active = |import: &&OrdinaryTypeImport| {
-        import.name == name
-            && import.declaration_byte <= node.start_byte()
-            && import.scope_start <= node.start_byte()
-            && node.end_byte() <= import.scope_end
-    };
-    let Some(nearest_depth) = imports
-        .iter()
-        .filter(active)
-        .map(|import| import.scope_depth)
-        .max()
-    else {
-        return OrdinaryTypeImportResolution::Missing;
-    };
-    let mut first: Option<&OrdinaryTypeImport> = None;
-    let mut lexical_depth = 0;
-    let mut ambiguous = false;
-    for import in imports
-        .iter()
-        .filter(active)
-        .filter(|import| import.scope_depth == nearest_depth)
-    {
-        lexical_depth = lexical_depth.max(import.lexical_depth);
-        // Header duplication can yield multiple physical declarations for the
-        // same logical type. Collapse those by the public type identity, while
-        // distinct identities imported into one scope remain ambiguous.
-        if let Some(existing) = first {
-            ambiguous |= existing.target.kind() != import.target.kind()
-                || existing.target.fq_name() != import.target.fq_name();
-        } else {
-            first = Some(import);
-        }
-    }
-    if ambiguous {
-        OrdinaryTypeImportResolution::Ambiguous { lexical_depth }
-    } else {
-        first
-            .map(OrdinaryTypeImportResolution::Resolved)
-            .unwrap_or(OrdinaryTypeImportResolution::Missing)
-    }
-}
+type CallableReferenceSpecCell = Arc<OnceLock<Option<TargetSpec>>>;
 
 pub(in crate::analyzer::usages) struct VisibilityIndex {
     cpp: CppAnalyzer,
@@ -636,9 +647,22 @@ pub(in crate::analyzer::usages) struct VisibilityIndex {
     visible_source_files_by_root: HashMap<ProjectFile, HashSet<ProjectFile>>,
     alias_cells: Mutex<HashMap<ProjectFile, AliasCell>>,
     ordinary_type_import_cells: Mutex<HashMap<ProjectFile, OrdinaryTypeImportCell>>,
+    project_using_index: OnceLock<ProjectUsingIndex>,
+    callable_reference_specs:
+        Mutex<HashMap<(ProjectFile, LogicalSymbolKey), CallableReferenceSpecCell>>,
     include_activation_cells: Mutex<HashMap<(ProjectFile, ProjectFile), Option<usize>>>,
     #[cfg(test)]
     include_activation_build_count: AtomicUsize,
+    #[cfg(test)]
+    using_donor_activation_count: AtomicUsize,
+    #[cfg(test)]
+    using_namespace_lookup_count: AtomicUsize,
+    #[cfg(test)]
+    using_name_candidate_inspection_count: AtomicUsize,
+    #[cfg(test)]
+    using_source_index_walk_count: AtomicUsize,
+    #[cfg(test)]
+    callable_reference_spec_build_count: AtomicUsize,
     #[cfg(test)]
     alias_source_parse_counts: Mutex<HashMap<ProjectFile, usize>>,
     field_type_facts: Mutex<HashMap<CodeUnit, Option<DeclaredFieldTypeFact>>>,
@@ -785,6 +809,10 @@ struct CppAlias {
 type ReceiverResolver<'a> = dyn for<'tree> Fn(Node<'tree>, &str) -> Vec<CodeUnit> + 'a;
 
 impl VisibilityIndex {
+    pub(super) fn cpp(&self) -> &CppAnalyzer {
+        &self.cpp
+    }
+
     pub(in crate::analyzer::usages) fn build(
         cpp: &CppAnalyzer,
         analyzer: &dyn IAnalyzer,
@@ -845,9 +873,21 @@ impl VisibilityIndex {
             visible_source_files_by_root,
             alias_cells: Mutex::new(HashMap::default()),
             ordinary_type_import_cells: Mutex::new(HashMap::default()),
+            project_using_index: OnceLock::new(),
+            callable_reference_specs: Mutex::new(HashMap::default()),
             include_activation_cells: Mutex::new(HashMap::default()),
             #[cfg(test)]
             include_activation_build_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            using_donor_activation_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            using_namespace_lookup_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            using_name_candidate_inspection_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            using_source_index_walk_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            callable_reference_spec_build_count: AtomicUsize::new(0),
             #[cfg(test)]
             alias_source_parse_counts: Mutex::new(HashMap::default()),
             field_type_facts: Mutex::new(HashMap::default()),
@@ -1517,8 +1557,34 @@ impl VisibilityIndex {
             .lock()
             .expect("C++ ordinary type import cache poisoned")
             .entry(file.clone())
-            .or_default()
+            .or_insert_with(|| Arc::new(EffectiveUsingIndex::new(file.clone())))
             .clone()
+    }
+
+    pub(super) fn project_using_index(
+        &self,
+        build: impl FnOnce() -> ProjectUsingIndex,
+    ) -> &ProjectUsingIndex {
+        self.project_using_index.get_or_init(build)
+    }
+
+    pub(super) fn all_visible_source_files(&self) -> Vec<ProjectFile> {
+        let mut files = self
+            .visible_source_files_by_root
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.rel_path().cmp(right.rel_path()));
+        files
+    }
+
+    pub(super) fn source_is_visible(&self, root: &ProjectFile, source: &ProjectFile) -> bool {
+        self.visible_source_files_by_root
+            .get(root)
+            .is_some_and(|files| files.contains(source))
     }
 
     fn callable_arities_for_target(
@@ -1585,7 +1651,7 @@ impl VisibilityIndex {
         arities
     }
 
-    fn include_activation_for_source(
+    pub(super) fn include_activation_for_source(
         &self,
         cpp: &CppAnalyzer,
         file: &ProjectFile,
@@ -1618,6 +1684,55 @@ impl VisibilityIndex {
         self.include_activation_build_count.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(super) fn note_using_donor_activation_for_test(&self) {
+        self.using_donor_activation_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(not(test))]
+    pub(super) fn note_using_donor_activation_for_test(&self) {}
+
+    #[cfg(test)]
+    pub(super) fn note_using_namespace_lookup_for_test(&self) {
+        self.using_namespace_lookup_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(not(test))]
+    pub(super) fn note_using_namespace_lookup_for_test(&self) {}
+
+    #[cfg(test)]
+    pub(super) fn note_using_name_candidate_inspection_for_test(&self) {
+        self.using_name_candidate_inspection_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(not(test))]
+    pub(super) fn note_using_name_candidate_inspection_for_test(&self) {}
+
+    #[cfg(test)]
+    pub(super) fn note_using_source_index_walk_for_test(&self) {
+        self.using_source_index_walk_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(not(test))]
+    pub(super) fn note_using_source_index_walk_for_test(&self) {}
+
+    #[cfg(test)]
+    pub(super) fn using_work_counts_for_test(&self) -> (usize, usize, usize, usize, usize) {
+        (
+            self.using_source_index_walk_count.load(Ordering::Relaxed),
+            self.using_donor_activation_count.load(Ordering::Relaxed),
+            self.using_namespace_lookup_count.load(Ordering::Relaxed),
+            self.callable_reference_spec_build_count
+                .load(Ordering::Relaxed),
+            self.using_name_candidate_inspection_count
+                .load(Ordering::Relaxed),
+        )
+    }
+
     pub(super) fn is_physically_visible(&self, file: &ProjectFile, target: &CodeUnit) -> bool {
         file == target.source()
             || self
@@ -1638,6 +1753,35 @@ impl VisibilityIndex {
             .any(|candidate| {
                 self.physical_declaration_visible_at(analyzer, file, candidate, reference_byte)
             })
+    }
+
+    pub(super) fn callable_arity_at_reference(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        candidate: &CodeUnit,
+        reference_byte: usize,
+    ) -> Option<CallableArity> {
+        let key = (file.clone(), logical_symbol_key(candidate));
+        let cell = self
+            .callable_reference_specs
+            .lock()
+            .expect("C++ callable reference-spec cache poisoned")
+            .entry(key)
+            .or_default()
+            .clone();
+        let spec = cell.get_or_init(|| {
+            let prepared = self.cpp.prepared_syntax(file)?;
+            let spec = TargetSpec::from_target(analyzer, candidate)?;
+            let spec = spec
+                .with_visible_callable_arities(analyzer, &self.cpp, self, file, prepared.as_ref())
+                .into_owned();
+            #[cfg(test)]
+            self.callable_reference_spec_build_count
+                .fetch_add(1, Ordering::Relaxed);
+            Some(spec)
+        });
+        spec.as_ref()?.callable_arity_at(reference_byte)
     }
 
     fn physical_declaration_visible_at(
@@ -1668,6 +1812,33 @@ impl VisibilityIndex {
         }
         self.include_activation_for_source(&self.cpp, file, prepared.as_ref(), declaration.source())
             .is_some_and(|activation| activation < reference_byte)
+    }
+
+    pub(in crate::analyzer::usages) fn external_type_candidate_visible_at(
+        &self,
+        file: &ProjectFile,
+        candidate: &CodeUnit,
+        reference_byte: usize,
+    ) -> bool {
+        if candidate.source() == file {
+            return true;
+        }
+        let Some(prepared) = self.cpp.prepared_syntax(file) else {
+            return false;
+        };
+        self.visible_identifier_candidates(file, candidate.identifier())
+            .filter(|peer| same_logical_symbol(candidate, peer))
+            .any(|peer| {
+                peer.source() == file
+                    || self
+                        .include_activation_for_source(
+                            &self.cpp,
+                            file,
+                            prepared.as_ref(),
+                            peer.source(),
+                        )
+                        .is_some_and(|activation| activation <= reference_byte)
+            })
     }
 
     pub(in crate::analyzer::usages) fn resolve_type(
@@ -1909,11 +2080,12 @@ impl VisibilityIndex {
         &self,
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
-        import: &OrdinaryTypeImport,
+        target: &CodeUnit,
+        target_components: &[String],
         direct_target: Option<&CodeUnit>,
         preserve_alias: bool,
     ) -> LexicalTypeResolution {
-        let candidates = [&import.target];
+        let candidates = [target];
         let resolution = if preserve_alias {
             TypeCandidateResolution::PreserveAlias
         } else {
@@ -1928,8 +2100,8 @@ impl VisibilityIndex {
         };
         LexicalTypeResolution::Resolved {
             unit,
-            components: import.target_components.clone(),
-            candidates: vec![import.target.clone()],
+            components: target_components.to_vec(),
+            candidates: vec![target.clone()],
         }
     }
 
@@ -2927,7 +3099,7 @@ pub(super) fn resolve_declaring_member_owner(
     }
 }
 
-fn lexical_component_tiers<'a>(
+pub(super) fn lexical_component_tiers<'a>(
     components: &'a [String],
     global: bool,
     lexical_scope: &'a [String],
@@ -3537,7 +3709,7 @@ fn callable_declaration_activation_in_file(
         .min()
 }
 
-fn callable_preprocessor_context_is_visible(node: Node<'_>, source: &str) -> bool {
+pub(super) fn callable_preprocessor_context_is_visible(node: Node<'_>, source: &str) -> bool {
     let mut ancestor = node.parent();
     while let Some(parent) = ancestor {
         if is_preprocessor_conditional(parent) && !is_file_covering_include_guard(parent, source) {
@@ -6254,8 +6426,15 @@ mod tests {
             visible_source_files_by_root: HashMap::default(),
             alias_cells: Mutex::new(HashMap::default()),
             ordinary_type_import_cells: Mutex::new(HashMap::default()),
+            project_using_index: OnceLock::new(),
+            callable_reference_specs: Mutex::new(HashMap::default()),
             include_activation_cells: Mutex::new(HashMap::default()),
             include_activation_build_count: AtomicUsize::new(0),
+            using_donor_activation_count: AtomicUsize::new(0),
+            using_namespace_lookup_count: AtomicUsize::new(0),
+            using_name_candidate_inspection_count: AtomicUsize::new(0),
+            using_source_index_walk_count: AtomicUsize::new(0),
+            callable_reference_spec_build_count: AtomicUsize::new(0),
             alias_source_parse_counts: Mutex::new(HashMap::default()),
             field_type_facts: Mutex::new(HashMap::default()),
             structured_alias_targets: Mutex::new(HashMap::default()),
