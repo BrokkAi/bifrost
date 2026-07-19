@@ -1626,6 +1626,50 @@ impl VisibilityIndex {
                 .is_some_and(|visible| visible.contains(target))
     }
 
+    pub(in crate::analyzer::usages) fn declaration_visible_at(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        declaration: &CodeUnit,
+        reference_byte: usize,
+    ) -> bool {
+        self.visible_identifier_candidates(file, declaration.identifier())
+            .filter(|candidate| same_logical_symbol(candidate, declaration))
+            .any(|candidate| {
+                self.physical_declaration_visible_at(analyzer, file, candidate, reference_byte)
+            })
+    }
+
+    fn physical_declaration_visible_at(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        declaration: &CodeUnit,
+        reference_byte: usize,
+    ) -> bool {
+        let Some(prepared) = self.cpp.prepared_syntax(file) else {
+            return false;
+        };
+        if declaration.source() == file {
+            return callable_declaration_activation_in_file(
+                analyzer,
+                prepared.as_ref(),
+                declaration,
+            )
+            .is_some_and(|activation| activation < reference_byte);
+        }
+        let Some(donor_syntax) = self.cpp.prepared_syntax(declaration.source()) else {
+            return false;
+        };
+        if callable_declaration_activation_in_file(analyzer, donor_syntax.as_ref(), declaration)
+            .is_none()
+        {
+            return false;
+        }
+        self.include_activation_for_source(&self.cpp, file, prepared.as_ref(), declaration.source())
+            .is_some_and(|activation| activation < reference_byte)
+    }
+
     pub(in crate::analyzer::usages) fn resolve_type(
         &self,
         file: &ProjectFile,
@@ -4864,7 +4908,7 @@ pub(super) fn cpp_template_reference_arguments(
 ) -> Option<Vec<CppTemplateExpression>> {
     loop {
         match node.kind() {
-            "template_type" => {
+            "template_type" | "template_function" => {
                 let arguments = node.child_by_field_name("arguments")?;
                 let mut cursor = arguments.walk();
                 return Some(

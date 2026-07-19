@@ -13062,3 +13062,740 @@ int exact_seventh() { return ambiguous(1, 2); }
         assert_eq!((&targeted, &whole), (&expected, &expected), "{target:#?}");
     }
 }
+#[test]
+fn cpp_class_inverse_matches_forward_direct_temporary_resolution() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"#pragma once
+namespace model {
+struct Widget { int value = 0; };
+template <typename T> struct Box { T value{}; };
+struct FunctionWins {};
+void FunctionWins();
+struct ArityClash {};
+void ArityClash(int value);
+struct Overloaded {};
+void Overloaded();
+void Overloaded(int value);
+struct Constructed { Constructed(); };
+struct NamespaceName {};
+void NamespaceName();
+struct Base { void NamespaceName(); };
+struct Derived : Base { void test(); };
+struct IncludeEarly {};
+struct IncludeLate {};
+struct Conditional {};
+struct Guarded {};
+struct BlockScoped {};
+}
+namespace unrelated { void Widget(); }
+namespace alpha { void Widget(int value); }
+namespace beta { void Widget(); }
+"#,
+        )
+        .file(
+            "early_function.h",
+            r#"#pragma once
+namespace model { void IncludeEarly(); }
+"#,
+        )
+        .file(
+            "late_function.h",
+            r#"#pragma once
+namespace model { void IncludeLate(); }
+"#,
+        )
+        .file(
+            "conditional_function.h",
+            r#"#pragma once
+namespace model { void Conditional(); }
+"#,
+        )
+        .file(
+            "guarded_function.h",
+            r#"#pragma once
+namespace model { void Guarded(); }
+"#,
+        )
+        .file(
+            "other.h",
+            r#"#pragma once
+namespace other { struct Widget {}; }
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "types.h"
+#include <memory>
+#include "early_function.h"
+#if ENABLE_CONDITIONAL_FUNCTION
+#include "conditional_function.h"
+#endif
+using WidgetAlias = model::Widget;
+template <typename T> using BoxAlias = model::Box<T>;
+
+namespace model {
+void accepted() {
+    Widget(); // positive-unqualified
+    model::Widget(); // positive-qualified
+    WidgetAlias(); // positive-alias
+    model::Box<int>(); // positive-qualified-template
+    BoxAlias<int>(); // positive-alias-template
+    auto heap = new Widget; // positive-new
+    auto smart = std::make_unique<Widget>(); // positive-make-unique
+}
+
+void shadowed() {
+    auto Widget = [] {};
+    Widget(); // negative-local-value
+}
+
+void free_function_wins() {
+    FunctionWins(); // negative-visible-free-function
+    ArityClash(); // negative-wrong-arity-function-shadow
+    Overloaded(); // negative-applicable-overload
+}
+
+void explicit_constructor_wins() {
+    Constructed(); // positive-constructor-function-only
+    model::Constructed(); // positive-qualified-constructor-function-only
+}
+
+struct Late {};
+void before_late_declaration() {
+    Late(); // positive-before-later-function
+}
+void Late();
+void after_late_declaration() {
+    Late(); // negative-after-function-declaration
+}
+void before_late_include() {
+    IncludeLate(); // positive-before-later-include
+}
+
+void conditional_include() {
+    Conditional(); // positive-class-under-conditional-include
+}
+
+void block_scope() {
+    {
+        void BlockScoped();
+        BlockScoped(); // negative-block-local-function
+    }
+    BlockScoped(); // positive-after-block-local-function
+}
+}
+
+#include "late_function.h"
+namespace model {
+void include_order() {
+    IncludeEarly(); // negative-function-included-before
+    IncludeLate(); // negative-function-included-before-this-call
+}
+}
+"#,
+        )
+        .file(
+            "guarded_consumer.cc",
+            r#"#ifndef GUARDED_CONSUMER_CC
+#define GUARDED_CONSUMER_CC
+#include "types.h"
+#include "guarded_function.h"
+namespace model {
+void guarded_call() {
+    Guarded(); // negative-function-under-whole-file-guard
+}
+}
+#endif
+"#,
+        )
+        .file(
+            "member.cc",
+            r#"#include "types.h"
+void model::Derived::test() {
+    NamespaceName(); // positive-inherited-member-precedence
+}
+"#,
+        )
+        .file(
+            "unknown.cc",
+            r#"#include "types.h"
+#define UNKNOWN_ARGS
+namespace model {
+void unknown_arity() {
+    Widget(UNKNOWN_ARGS); // unproven-unknown-class-arity
+    FunctionWins(UNKNOWN_ARGS); // unproven-unknown-free-arity
+}
+}
+"#,
+        )
+        .file(
+            "wrong.cc",
+            r#"#include "types.h"
+#include "other.h"
+void wrong_namespace() {
+    other::Widget(); // negative-wrong-namespace
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let class = |fq_name: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Class && unit.fq_name() == fq_name
+        })
+    };
+    let widget = class("model.Widget");
+    let box_type = class("model.Box");
+    let function_wins_class = class("model.FunctionWins");
+    let arity_clash = class("model.ArityClash");
+    let overloaded_class = class("model.Overloaded");
+    let constructed = class("model.Constructed");
+    let namespace_name = class("model.NamespaceName");
+    let late = class("model.Late");
+    let include_early_class = class("model.IncludeEarly");
+    let include_late_class = class("model.IncludeLate");
+    let conditional_class = class("model.Conditional");
+    let guarded_class = class("model.Guarded");
+    let block_scoped_class = class("model.BlockScoped");
+    let function_wins =
+        function_definition_in_package_with_arity(&analyzer, "model", "FunctionWins", 0);
+    let overloaded = function_definition_in_package_with_arity(&analyzer, "model", "Overloaded", 0);
+    let constructor = member_function_definition(&analyzer, "Constructed", "Constructed");
+    let late_function = function_definition_in_package_with_arity(&analyzer, "model", "Late", 0);
+    let inherited_member = member_function_definition(&analyzer, "Base", "NamespaceName");
+    let include_early =
+        function_definition_in_package_with_arity(&analyzer, "model", "IncludeEarly", 0);
+    let include_late =
+        function_definition_in_package_with_arity(&analyzer, "model", "IncludeLate", 0);
+    let conditional_function =
+        function_definition_in_package_with_arity(&analyzer, "model", "Conditional", 0);
+    let guarded_function =
+        function_definition_in_package_with_arity(&analyzer, "model", "Guarded", 0);
+    let range = |line: &str, token: &str| fixture_token_range(&source, line, token);
+    let widget_ranges = BTreeSet::from([
+        range("using WidgetAlias = model::Widget;", "model::Widget"),
+        range("    Widget(); // positive-unqualified", "Widget"),
+        range(
+            "    model::Widget(); // positive-qualified",
+            "model::Widget",
+        ),
+        range("    WidgetAlias(); // positive-alias", "WidgetAlias"),
+        range("    auto heap = new Widget; // positive-new", "Widget"),
+        range(
+            "    auto smart = std::make_unique<Widget>(); // positive-make-unique",
+            "Widget",
+        ),
+    ]);
+    let box_ranges = BTreeSet::from([
+        range(
+            "template <typename T> using BoxAlias = model::Box<T>;",
+            "model::Box<T>",
+        ),
+        range(
+            "    model::Box<int>(); // positive-qualified-template",
+            "model::Box<int>",
+        ),
+        range(
+            "    BoxAlias<int>(); // positive-alias-template",
+            "BoxAlias<int>",
+        ),
+    ]);
+
+    let forward_in = |path: &str, file_source: &str, line: &str, token: &str| {
+        let start = fixture_token_range(file_source, line, token).0;
+        let line_start = file_source[..start]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: path.to_string(),
+                    line: Some(
+                        file_source[..start]
+                            .bytes()
+                            .filter(|byte| *byte == b'\n')
+                            .count()
+                            + 1,
+                    ),
+                    column: Some(file_source[line_start..start].chars().count() + 1),
+                }],
+            },
+        )
+        .results
+        .into_iter()
+        .next()
+        .expect("one forward result")
+    };
+    let forward = |line: &str, token: &str| forward_in("consumer.cc", &source, line, token);
+    for (line, token, expected_fqn) in [
+        (
+            "    Widget(); // positive-unqualified",
+            "Widget",
+            widget.fq_name(),
+        ),
+        (
+            "    WidgetAlias(); // positive-alias",
+            "WidgetAlias",
+            widget.fq_name(),
+        ),
+        (
+            "    BoxAlias<int>(); // positive-alias-template",
+            "BoxAlias",
+            box_type.fq_name(),
+        ),
+        (
+            "    model::Widget(); // positive-qualified",
+            "Widget",
+            widget.fq_name(),
+        ),
+        (
+            "    model::Box<int>(); // positive-qualified-template",
+            "Box",
+            box_type.fq_name(),
+        ),
+        (
+            "    FunctionWins(); // negative-visible-free-function",
+            "FunctionWins",
+            function_wins.fq_name(),
+        ),
+        (
+            "    Overloaded(); // negative-applicable-overload",
+            "Overloaded",
+            overloaded.fq_name(),
+        ),
+        (
+            "    Constructed(); // positive-constructor-function-only",
+            "Constructed",
+            constructor.fq_name(),
+        ),
+        (
+            "    model::Constructed(); // positive-qualified-constructor-function-only",
+            "Constructed",
+            constructor.fq_name(),
+        ),
+        (
+            "    Late(); // positive-before-later-function",
+            "Late",
+            late.fq_name(),
+        ),
+        (
+            "    Late(); // negative-after-function-declaration",
+            "Late",
+            late_function.fq_name(),
+        ),
+        (
+            "    IncludeLate(); // positive-before-later-include",
+            "IncludeLate",
+            include_late_class.fq_name(),
+        ),
+        (
+            "    Conditional(); // positive-class-under-conditional-include",
+            "Conditional",
+            conditional_class.fq_name(),
+        ),
+        (
+            "    BlockScoped(); // positive-after-block-local-function",
+            "BlockScoped",
+            block_scoped_class.fq_name(),
+        ),
+        (
+            "    IncludeEarly(); // negative-function-included-before",
+            "IncludeEarly",
+            include_early.fq_name(),
+        ),
+        (
+            "    IncludeLate(); // negative-function-included-before-this-call",
+            "IncludeLate",
+            include_late.fq_name(),
+        ),
+    ] {
+        let result = forward(line, token);
+        assert_eq!("resolved", result.status, "{line}: {result:#?}");
+        assert!(
+            result
+                .definitions
+                .iter()
+                .any(|definition| definition.fqn.as_deref() == Some(expected_fqn.as_str())),
+            "{line} should resolve to {expected_fqn}: {result:#?}"
+        );
+    }
+
+    let inverse_ranges = |target: &CodeUnit| {
+        let provider =
+            ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+        let targeted_query = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(target),
+                Some(&provider),
+                1,
+                1000,
+            );
+        let FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } = targeted_query.result
+        else {
+            panic!("expected authoritative direct-temporary query success for {target:#?}");
+        };
+        assert!(
+            unproven_total_by_overload.values().all(|count| *count == 0),
+            "negative controls must be proven non-targets for {target:#?}: {unproven_total_by_overload:#?}"
+        );
+        let targeted = hits_by_overload
+            .values()
+            .flatten()
+            .filter(|hit| hit.file == consumer)
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect::<BTreeSet<_>>();
+        let whole = UsageFinder::new()
+            .find_usages_default(&analyzer, std::slice::from_ref(target))
+            .all_hits_including_imports()
+            .into_iter()
+            .filter(|hit| hit.file == consumer)
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect::<BTreeSet<_>>();
+        (targeted, whole)
+    };
+
+    assert_eq!(
+        inverse_ranges(&widget),
+        (widget_ranges.clone(), widget_ranges)
+    );
+    assert_eq!(inverse_ranges(&box_type), (box_ranges.clone(), box_ranges));
+    let function_call = range(
+        "    FunctionWins(); // negative-visible-free-function",
+        "FunctionWins",
+    );
+    for hits in [
+        inverse_ranges(&function_wins_class).0,
+        inverse_ranges(&function_wins_class).1,
+    ] {
+        assert!(
+            !hits.contains(&function_call),
+            "visible free function must take precedence over the same-named class: {hits:#?}"
+        );
+    }
+    let (function_targeted, function_whole) = inverse_ranges(&function_wins);
+    assert!(function_targeted.contains(&function_call));
+    assert!(function_whole.contains(&function_call));
+    let arity_call = range(
+        "    ArityClash(); // negative-wrong-arity-function-shadow",
+        "ArityClash",
+    );
+    assert!(!inverse_ranges(&arity_clash).0.contains(&arity_call));
+    assert!(!inverse_ranges(&arity_clash).1.contains(&arity_call));
+    let overloaded_call = range(
+        "    Overloaded(); // negative-applicable-overload",
+        "Overloaded",
+    );
+    assert!(
+        !inverse_ranges(&overloaded_class)
+            .0
+            .contains(&overloaded_call)
+    );
+    assert!(
+        !inverse_ranges(&overloaded_class)
+            .1
+            .contains(&overloaded_call)
+    );
+    assert!(inverse_ranges(&overloaded).0.contains(&overloaded_call));
+    assert!(inverse_ranges(&overloaded).1.contains(&overloaded_call));
+    let constructed_call = range(
+        "    Constructed(); // positive-constructor-function-only",
+        "Constructed",
+    );
+    let qualified_constructed_call = range(
+        "    model::Constructed(); // positive-qualified-constructor-function-only",
+        "model::Constructed",
+    );
+    let (constructed_targeted, constructed_whole) = inverse_ranges(&constructed);
+    assert!(!constructed_targeted.contains(&constructed_call));
+    assert!(!constructed_whole.contains(&constructed_call));
+    assert!(!constructed_targeted.contains(&qualified_constructed_call));
+    assert!(!constructed_whole.contains(&qualified_constructed_call));
+    let (constructor_targeted, constructor_whole) = inverse_ranges(&constructor);
+    assert!(constructor_targeted.contains(&constructed_call));
+    assert!(constructor_whole.contains(&constructed_call));
+    assert!(constructor_targeted.contains(&qualified_constructed_call));
+    assert!(constructor_whole.contains(&qualified_constructed_call));
+
+    let before_late = range("    Late(); // positive-before-later-function", "Late");
+    let after_late = range("    Late(); // negative-after-function-declaration", "Late");
+    let (late_targeted, late_whole) = inverse_ranges(&late);
+    assert!(late_targeted.contains(&before_late));
+    assert!(late_whole.contains(&before_late));
+    assert!(!late_targeted.contains(&after_late));
+    assert!(!late_whole.contains(&after_late));
+    assert!(inverse_ranges(&late_function).0.contains(&after_late));
+    assert!(inverse_ranges(&late_function).1.contains(&after_late));
+
+    let before_include = range(
+        "    IncludeLate(); // positive-before-later-include",
+        "IncludeLate",
+    );
+    let early_included = range(
+        "    IncludeEarly(); // negative-function-included-before",
+        "IncludeEarly",
+    );
+    let late_included = range(
+        "    IncludeLate(); // negative-function-included-before-this-call",
+        "IncludeLate",
+    );
+    let (include_late_targeted, include_late_whole) = inverse_ranges(&include_late_class);
+    assert!(include_late_targeted.contains(&before_include));
+    assert!(include_late_whole.contains(&before_include));
+    assert!(!include_late_targeted.contains(&late_included));
+    assert!(!include_late_whole.contains(&late_included));
+    assert!(
+        !inverse_ranges(&include_early_class)
+            .0
+            .contains(&early_included)
+    );
+    assert!(
+        !inverse_ranges(&include_early_class)
+            .1
+            .contains(&early_included)
+    );
+    assert!(inverse_ranges(&include_early).0.contains(&early_included));
+    assert!(inverse_ranges(&include_early).1.contains(&early_included));
+    assert!(inverse_ranges(&include_late).0.contains(&late_included));
+    assert!(inverse_ranges(&include_late).1.contains(&late_included));
+    assert!(!inverse_ranges(&include_late).0.contains(&before_include));
+    assert!(!inverse_ranges(&include_late).1.contains(&before_include));
+
+    let conditional_call = range(
+        "    Conditional(); // positive-class-under-conditional-include",
+        "Conditional",
+    );
+    assert!(
+        inverse_ranges(&conditional_class)
+            .0
+            .contains(&conditional_call)
+    );
+    assert!(
+        inverse_ranges(&conditional_class)
+            .1
+            .contains(&conditional_call)
+    );
+    assert!(
+        !inverse_ranges(&conditional_function)
+            .0
+            .contains(&conditional_call)
+    );
+    assert!(
+        !inverse_ranges(&conditional_function)
+            .1
+            .contains(&conditional_call)
+    );
+
+    let block_local_call = range(
+        "        BlockScoped(); // negative-block-local-function",
+        "BlockScoped",
+    );
+    let after_block_call = range(
+        "    BlockScoped(); // positive-after-block-local-function",
+        "BlockScoped",
+    );
+    let (block_class_targeted, block_class_whole) = inverse_ranges(&block_scoped_class);
+    assert!(!block_class_targeted.contains(&block_local_call));
+    assert!(!block_class_whole.contains(&block_local_call));
+    assert!(block_class_targeted.contains(&after_block_call));
+    assert!(block_class_whole.contains(&after_block_call));
+    let block_local_forward = forward(
+        "        BlockScoped(); // negative-block-local-function",
+        "BlockScoped",
+    );
+    assert!(
+        block_local_forward
+            .definitions
+            .iter()
+            .all(|definition| definition.fqn.as_deref()
+                != Some(block_scoped_class.fq_name().as_str())),
+        "the declaration inside the inner block must shadow the class: {block_local_forward:#?}"
+    );
+
+    let guarded_file = project.file("guarded_consumer.cc");
+    let guarded_source = guarded_file
+        .read_to_string()
+        .expect("guarded consumer source");
+    let guarded_line = "    Guarded(); // negative-function-under-whole-file-guard";
+    let guarded_call = fixture_token_range(&guarded_source, guarded_line, "Guarded");
+    let guarded_forward = forward_in(
+        "guarded_consumer.cc",
+        &guarded_source,
+        guarded_line,
+        "Guarded",
+    );
+    assert_eq!("resolved", guarded_forward.status, "{guarded_forward:#?}");
+    assert!(guarded_forward.definitions.iter().any(|definition| {
+        definition.fqn.as_deref() == Some(guarded_function.fq_name().as_str())
+    }));
+    assert!(
+        !authoritative_exact_ranges(
+            &analyzer,
+            std::slice::from_ref(&guarded_class),
+            &guarded_file,
+        )
+        .contains(&guarded_call)
+    );
+    assert!(
+        authoritative_exact_ranges(
+            &analyzer,
+            std::slice::from_ref(&guarded_function),
+            &guarded_file,
+        )
+        .contains(&guarded_call)
+    );
+    let guarded_class_whole = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&guarded_class))
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == guarded_file)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    let guarded_function_whole = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&guarded_function))
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == guarded_file)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert!(!guarded_class_whole.contains(&guarded_call));
+    assert!(guarded_function_whole.contains(&guarded_call));
+
+    let member_file = project.file("member.cc");
+    let member_source = member_file.read_to_string().expect("member source");
+    let member_line = "    NamespaceName(); // positive-inherited-member-precedence";
+    let member_call = fixture_token_range(&member_source, member_line, "NamespaceName");
+    let member_forward = forward_in("member.cc", &member_source, member_line, "NamespaceName");
+    assert_eq!("resolved", member_forward.status, "{member_forward:#?}");
+    assert!(member_forward.definitions.iter().any(|definition| {
+        definition.fqn.as_deref() == Some(inherited_member.fq_name().as_str())
+    }));
+    assert!(
+        !authoritative_exact_ranges(
+            &analyzer,
+            std::slice::from_ref(&namespace_name),
+            &member_file,
+        )
+        .contains(&member_call)
+    );
+    assert!(
+        authoritative_exact_ranges(
+            &analyzer,
+            std::slice::from_ref(&inherited_member),
+            &member_file,
+        )
+        .contains(&member_call)
+    );
+    let whole_namespace_name = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&namespace_name))
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == member_file)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    let whole_inherited_member = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&inherited_member))
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == member_file)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert!(!whole_namespace_name.contains(&member_call));
+    assert!(whole_inherited_member.contains(&member_call));
+
+    let unknown_file = project.file("unknown.cc");
+    let unknown_source = unknown_file.read_to_string().expect("unknown source");
+    for (target, line, expected_fqn) in [
+        (
+            &widget,
+            "    Widget(UNKNOWN_ARGS); // unproven-unknown-class-arity",
+            widget.fq_name(),
+        ),
+        (
+            &function_wins,
+            "    FunctionWins(UNKNOWN_ARGS); // unproven-unknown-free-arity",
+            function_wins.fq_name(),
+        ),
+    ] {
+        let call = fixture_token_range(&unknown_source, line, target.identifier());
+        let forward = forward_in("unknown.cc", &unknown_source, line, target.identifier());
+        assert_ne!("resolved", forward.status, "{line}: {forward:#?}");
+        assert!(
+            forward
+                .definitions
+                .iter()
+                .all(|definition| definition.fqn.as_deref() != Some(expected_fqn.as_str())),
+            "unknown arity must not produce an exact forward target: {forward:#?}"
+        );
+
+        let provider = ExplicitCandidateProvider::new(Arc::new(
+            std::iter::once(unknown_file.clone()).collect(),
+        ));
+        let targeted = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(target),
+                Some(&provider),
+                1,
+                1000,
+            )
+            .result;
+        let FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } = targeted
+        else {
+            panic!("expected targeted unknown-arity success: {targeted:#?}");
+        };
+        assert!(
+            hits_by_overload
+                .values()
+                .flatten()
+                .all(|hit| (hit.start_offset, hit.end_offset) != call)
+        );
+        assert!(unproven_total_by_overload.values().sum::<usize>() > 0);
+
+        let whole = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(target));
+        let FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } = whole
+        else {
+            panic!("expected whole unknown-arity success: {whole:#?}");
+        };
+        assert!(
+            hits_by_overload
+                .values()
+                .flatten()
+                .filter(|hit| hit.file == unknown_file)
+                .all(|hit| (hit.start_offset, hit.end_offset) != call)
+        );
+        assert!(unproven_total_by_overload.values().sum::<usize>() > 0);
+    }
+
+    let wrong = project.file("wrong.cc");
+    assert!(
+        authoritative_exact_ranges(&analyzer, std::slice::from_ref(&widget), &wrong).is_empty()
+    );
+    assert!(
+        UsageFinder::new()
+            .find_usages_default(&analyzer, std::slice::from_ref(&widget))
+            .all_hits_including_imports()
+            .into_iter()
+            .all(|hit| hit.file != wrong),
+        "a direct temporary in another namespace must not hit model.Widget"
+    );
+}

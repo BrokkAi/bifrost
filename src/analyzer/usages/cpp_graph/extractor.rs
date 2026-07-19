@@ -323,6 +323,12 @@ fn seed_variable_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 &ctx.bindings,
             )
         {
+            if node.kind() == "declaration"
+                && has_function_scope_ancestor(node)
+                && let Some(name) = extract_variable_name(declarator, ctx.source)
+            {
+                ctx.local_shadows.declare_shadow(name);
+            }
             continue;
         }
         let Some(name) = extract_variable_name(declarator, ctx.source) else {
@@ -467,6 +473,15 @@ fn maybe_record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if node.kind() == "call_expression" {
+        maybe_record_direct_temporary_type_hit(node, ctx);
+        return;
+    }
+    if matches!(node.kind(), "identifier" | "template_function")
+        && call_for_function_node(node).is_some()
+    {
+        return;
+    }
     if node.kind() == "using_declaration" {
         let (resolution, type_node) =
             if let Some(type_node) = using_enum_declaration_type_node(node) {
@@ -532,6 +547,30 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if !recovered_type && is_nested_type_node(node) {
+        return;
+    }
+    if !recovered_type
+        && let Some(call) = call_for_function_node(node)
+        && let LexicalTypeResolution::Resolved {
+            unit, candidates, ..
+        } = resolve_type_node_lexically_for_target(
+            node,
+            ctx.analyzer,
+            ctx.visibility,
+            &ctx.ordinary_type_imports,
+            ctx.file,
+            ctx.source,
+            &ctx.spec.target,
+        )
+        && (same_visible_symbol(&unit, &ctx.spec.target)
+            || candidates
+                .iter()
+                .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target)))
+    {
+        if !direct_temporary_resolves_to_explicit_constructor(call, &unit, ctx) {
+            *ctx.raw_match_count += 1;
+            push_type_hit(node, ctx);
+        }
         return;
     }
     if !recovered_type && is_declaration_name(node) {
@@ -612,6 +651,198 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             push_unproven_hit(hit_node, ctx);
         }
     }
+}
+
+fn call_for_function_node(node: Node<'_>) -> Option<Node<'_>> {
+    let parent = node.parent()?;
+    (parent.kind() == "call_expression" && parent.child_by_field_name("function") == Some(node))
+        .then_some(parent)
+}
+
+fn maybe_record_direct_temporary_type_hit(call: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(function) = call.child_by_field_name("function") else {
+        return;
+    };
+    if !matches!(function.kind(), "identifier" | "template_function") {
+        return;
+    }
+    let terminal = function_terminal_node(function);
+    let name = node_text(terminal, ctx.source);
+    if name.is_empty() || ctx.local_shadows.is_shadowed(name) {
+        return;
+    }
+    if let Some(enclosing_owner) = structured_enclosing_owner(function, ctx)
+        && !matches!(
+            resolve_declaring_member_owner(
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+                &enclosing_owner,
+                name,
+            ),
+            EnclosingMemberOwnerResolution::Missing
+        )
+    {
+        return;
+    }
+    match resolve_bare_call_target(
+        call,
+        function,
+        ctx.analyzer,
+        ctx.visibility,
+        &ctx.ordinary_type_imports,
+        ctx.file,
+        ctx.source,
+    ) {
+        BareCallTargetResolution::Type(_) => {}
+        BareCallTargetResolution::Ambiguous => {
+            push_unproven_hit(function, ctx);
+            return;
+        }
+        BareCallTargetResolution::FreeFunctions(_)
+        | BareCallTargetResolution::CallableShadow
+        | BareCallTargetResolution::Missing => return,
+    }
+    match resolve_type_node_lexically_for_target(
+        function,
+        ctx.analyzer,
+        ctx.visibility,
+        &ctx.ordinary_type_imports,
+        ctx.file,
+        ctx.source,
+        &ctx.spec.target,
+    ) {
+        LexicalTypeResolution::Resolved {
+            unit, candidates, ..
+        } if same_visible_symbol(&unit, &ctx.spec.target)
+            || candidates
+                .iter()
+                .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target)) =>
+        {
+            if direct_temporary_resolves_to_explicit_constructor(call, &unit, ctx) {
+                return;
+            }
+            *ctx.raw_match_count += 1;
+            push_type_hit(function, ctx);
+        }
+        LexicalTypeResolution::Resolved { .. }
+        | LexicalTypeResolution::Ambiguous
+        | LexicalTypeResolution::Missing => {}
+    }
+}
+
+pub(super) enum BareCallTargetResolution {
+    Type(CodeUnit),
+    FreeFunctions(Vec<CodeUnit>),
+    CallableShadow,
+    Ambiguous,
+    Missing,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn resolve_bare_call_target(
+    call: Node<'_>,
+    function: Node<'_>,
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    ordinary_type_imports: &OrdinaryTypeImportCell,
+    file: &ProjectFile,
+    source: &str,
+) -> BareCallTargetResolution {
+    if !matches!(function.kind(), "identifier" | "template_function") {
+        return BareCallTargetResolution::Missing;
+    }
+    let terminal = function_terminal_node(function);
+    let name = node_text(terminal, source);
+    if name.is_empty() {
+        return BareCallTargetResolution::Missing;
+    }
+    let Some(call_arity) = visibility.call_arity_evidence(file, call, source).exact() else {
+        return BareCallTargetResolution::Ambiguous;
+    };
+    let lexical_scope =
+        match enclosing_lexical_scope_components(function, analyzer, visibility, file, source) {
+            LexicalScopeResolution::Resolved(scope) => scope,
+            LexicalScopeResolution::Ambiguous => return BareCallTargetResolution::Ambiguous,
+            LexicalScopeResolution::Missing => return BareCallTargetResolution::Missing,
+        };
+    let type_resolution = resolve_type_node_lexically(
+        function,
+        analyzer,
+        visibility,
+        ordinary_type_imports,
+        file,
+        source,
+    );
+    let type_components = match &type_resolution {
+        LexicalTypeResolution::Resolved { components, .. } => Some(components.as_slice()),
+        LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => None,
+    };
+    for prefix_len in (0..=lexical_scope.len()).rev() {
+        let mut qualified = lexical_scope[..prefix_len].to_vec();
+        qualified.push(name.to_string());
+        let candidates = visibility
+            .visible_identifier_candidates(file, name)
+            .filter(|candidate| {
+                candidate.is_function()
+                    && type_owner_of(analyzer, candidate).is_none()
+                    && cpp_name_for(candidate) == qualified.join("::")
+                    && visibility.declaration_visible_at(
+                        analyzer,
+                        file,
+                        candidate,
+                        call.start_byte(),
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !candidates.is_empty() {
+            let applicable = candidates
+                .into_iter()
+                .filter(|candidate| cpp_callable_arity(analyzer, candidate).accepts(call_arity))
+                .collect::<Vec<_>>();
+            if applicable.is_empty() {
+                return BareCallTargetResolution::CallableShadow;
+            }
+            return BareCallTargetResolution::FreeFunctions(applicable);
+        }
+        if type_components.is_some_and(|components| components == qualified.as_slice()) {
+            return match type_resolution {
+                LexicalTypeResolution::Resolved { unit, .. } => {
+                    BareCallTargetResolution::Type(unit)
+                }
+                LexicalTypeResolution::Ambiguous => BareCallTargetResolution::Ambiguous,
+                LexicalTypeResolution::Missing => BareCallTargetResolution::Missing,
+            };
+        }
+    }
+    match type_resolution {
+        LexicalTypeResolution::Resolved { unit, .. } => BareCallTargetResolution::Type(unit),
+        LexicalTypeResolution::Ambiguous => BareCallTargetResolution::Ambiguous,
+        LexicalTypeResolution::Missing => BareCallTargetResolution::Missing,
+    }
+}
+
+fn direct_temporary_resolves_to_explicit_constructor(
+    call: Node<'_>,
+    owner: &CodeUnit,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    let Some(call_arity) = ctx
+        .visibility
+        .call_arity_evidence(ctx.file, call, ctx.source)
+        .exact()
+    else {
+        return false;
+    };
+    matches!(
+        ctx.visibility
+            .visible_member_for_owner_name(ctx.file, owner, owner.identifier()),
+        VisibleMemberResolution::Callable(constructors)
+            if constructors.iter().any(|constructor| {
+                cpp_callable_arity(ctx.analyzer, constructor).accepts(call_arity)
+            })
+    )
 }
 
 fn static_qualifier_type_scopes<'tree>(
@@ -826,6 +1057,53 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 return;
             }
         }
+    }
+    if matches!(function.kind(), "identifier" | "template_function") {
+        let terminal = function_terminal_node(function);
+        let name = node_text(terminal, ctx.source);
+        if ctx.local_shadows.is_shadowed(name) {
+            return;
+        }
+        if let Some(enclosing_owner) = structured_enclosing_owner(function, ctx)
+            && !matches!(
+                resolve_declaring_member_owner(
+                    ctx.analyzer,
+                    ctx.visibility,
+                    ctx.file,
+                    &enclosing_owner,
+                    name,
+                ),
+                EnclosingMemberOwnerResolution::Missing
+            )
+        {
+            return;
+        }
+        match resolve_bare_call_target(
+            node,
+            function,
+            ctx.analyzer,
+            ctx.visibility,
+            &ctx.ordinary_type_imports,
+            ctx.file,
+            ctx.source,
+        ) {
+            BareCallTargetResolution::FreeFunctions(units)
+                if units
+                    .iter()
+                    .any(|unit| same_visible_symbol(unit, &ctx.spec.target)) =>
+            {
+                if free_function_call_may_target(node, text, ctx) {
+                    push_hit(terminal, ctx);
+                }
+            }
+            BareCallTargetResolution::FreeFunctions(_)
+            | BareCallTargetResolution::Type(_)
+            | BareCallTargetResolution::CallableShadow => {}
+            BareCallTargetResolution::Ambiguous | BareCallTargetResolution::Missing => {
+                push_unproven_hit(terminal, ctx);
+            }
+        }
+        return;
     }
     if !free_function_call_may_target(node, text, ctx) {
         return;
@@ -2327,11 +2605,13 @@ fn qualified_callable_owner_components(
 fn type_reference_components(node: Node<'_>, source: &str) -> Option<(Vec<String>, bool)> {
     if !matches!(
         node.kind(),
-        "type_identifier"
+        "identifier"
+            | "type_identifier"
             | "namespace_identifier"
             | "qualified_identifier"
             | "scoped_type_identifier"
             | "template_type"
+            | "template_function"
     ) {
         return None;
     }

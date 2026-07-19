@@ -23,8 +23,9 @@
 //! re-deriving the namespace. Ambiguous receiver or return identities fail closed.
 
 use super::extractor::{
-    LexicalScopeResolution, enclosing_lexical_scope_components, initialized_ordinary_type_imports,
-    ordinary_using_declaration_type_node, resolve_ordinary_using_declaration_owner,
+    BareCallTargetResolution, LexicalScopeResolution, enclosing_lexical_scope_components,
+    initialized_ordinary_type_imports, ordinary_using_declaration_type_node,
+    resolve_bare_call_target, resolve_ordinary_using_declaration_owner,
     resolve_type_node_lexically, resolve_using_enum_declaration_owner,
     using_enum_declaration_type_node,
 };
@@ -37,7 +38,6 @@ use super::resolver::{
     is_declarator_node, is_nested_type_node, normalize_type_text,
     out_of_line_member_definition_owner, recovered_macro_function_return_type,
     recovered_qualified_declarator_type, resolve_declaring_member_owner, same_visible_symbol,
-    type_owner_of,
 };
 use super::syntax::explicit_qualified_callable_value;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
@@ -278,6 +278,38 @@ fn record_reference(
                 ctx.record(function.fq_name(), node);
                 return;
             }
+            if let Some(call) = node.parent().filter(|parent| {
+                parent.kind() == "call_expression"
+                    && parent.child_by_field_name("function") == Some(node)
+            }) && let LexicalTypeResolution::Resolved { unit, .. } = resolve_type_node_lexically(
+                node,
+                ctx.analyzer,
+                ctx.visibility,
+                &ctx.ordinary_type_imports,
+                ctx.file,
+                ctx.source,
+            ) {
+                let Some(call_arity) = ctx
+                    .visibility
+                    .call_arity_evidence(ctx.file, call, ctx.source)
+                    .exact()
+                else {
+                    ctx.record_unproven(node_text(node, ctx.source), node);
+                    return;
+                };
+                if let VisibleMemberResolution::Callable(constructors) = ctx
+                    .visibility
+                    .visible_member_for_owner_name(ctx.file, &unit, unit.identifier())
+                    && let Some(constructor) = constructors.iter().find(|constructor| {
+                        cpp_callable_arity(ctx.analyzer, constructor).accepts(call_arity)
+                    })
+                {
+                    ctx.record(constructor.fq_name(), node);
+                } else {
+                    ctx.record(unit.fq_name(), node);
+                }
+                return;
+            }
             if let Some(owner) = scoped_call_owner(node, ctx) {
                 let member = scoped_call_member(node, ctx.source);
                 if !member.is_empty() {
@@ -451,8 +483,9 @@ fn record_call(
         // A bare `m(..)` is either a free function or an unqualified member call on
         // the enclosing class (`this`). `qualified_identifier` (`X::m`) is handled
         // by the type-reference case above.
-        "identifier" => {
-            let name = node_text(function, ctx.source);
+        "identifier" | "template_function" => {
+            let terminal = super::resolver::function_terminal_node(function);
+            let name = node_text(terminal, ctx.source);
             if name.is_empty() {
                 return;
             }
@@ -489,15 +522,40 @@ fn record_call(
                     EnclosingMemberOwnerResolution::Missing => {}
                 }
             }
-            // Free function in the visible set.
-            if let Some(unit) =
-                ctx.visibility
-                    .resolve_named(ctx.file, name, TargetKind::FreeFunction)
-            {
-                if type_owner_of(ctx.analyzer, &unit).is_some() {
-                    return;
+            let resolution = resolve_bare_call_target(
+                node,
+                function,
+                ctx.analyzer,
+                ctx.visibility,
+                &ctx.ordinary_type_imports,
+                ctx.file,
+                ctx.source,
+            );
+            match resolution {
+                BareCallTargetResolution::FreeFunctions(units) => {
+                    let mut recorded = HashSet::default();
+                    for unit in units {
+                        let fq_name = unit.fq_name();
+                        if recorded.insert(fq_name.clone()) {
+                            ctx.record(fq_name, terminal);
+                        }
+                    }
                 }
-                ctx.record(unit.fq_name(), function);
+                BareCallTargetResolution::Type(unit) => {
+                    if let VisibleMemberResolution::Callable(constructors) = ctx
+                        .visibility
+                        .visible_member_for_owner_name(ctx.file, &unit, unit.identifier())
+                        && let Some(constructor) = constructors.iter().find(|constructor| {
+                            cpp_callable_arity(ctx.analyzer, constructor).accepts(call_arity)
+                        })
+                    {
+                        ctx.record(constructor.fq_name(), terminal);
+                    } else {
+                        ctx.record(unit.fq_name(), function);
+                    }
+                }
+                BareCallTargetResolution::CallableShadow | BareCallTargetResolution::Ambiguous => {}
+                BareCallTargetResolution::Missing => {}
             }
             // Direct/self member calls are intentionally omitted above; unique inherited
             // callable owners are recorded, while an unresolved bare name adds no edge.
@@ -720,6 +778,12 @@ fn seed_variable_declaration(
                 bindings,
             )
         {
+            if node.kind() == "declaration"
+                && has_function_scope_ancestor(node)
+                && let Some(name) = extract_variable_name(declarator, ctx.source)
+            {
+                bindings.declare_shadow(name);
+            }
             continue;
         }
         let Some(name) = extract_variable_name(declarator, ctx.source) else {
@@ -728,6 +792,16 @@ fn seed_variable_declaration(
         let value = child.child_by_field_name("value");
         seed_binding(&name, type_node, value, ctx, bindings);
     }
+}
+
+fn has_function_scope_ancestor(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if matches!(parent.kind(), "function_definition" | "lambda_expression") {
+            return true;
+        }
+        node = parent;
+    }
+    false
 }
 
 fn seed_binding(

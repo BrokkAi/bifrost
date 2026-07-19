@@ -774,6 +774,14 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 Some(CppTargetKind::FreeFunction),
                 cpp_lexical_namespace(function, ctx.source).as_deref(),
             );
+            candidates.retain(|candidate| {
+                ctx.visibility.declaration_visible_at(
+                    ctx.analyzer,
+                    ctx.file,
+                    candidate,
+                    call.start_byte(),
+                )
+            });
             if !candidates.is_empty() {
                 candidates = cpp_filter_candidates_by_call_lazy(
                     candidates,
@@ -794,6 +802,10 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                     ctx.file,
                 );
                 return candidates_outcome(candidates);
+            }
+            let constructor = resolve_cpp_constructor(ctx, call);
+            if constructor.status != DefinitionLookupStatus::NoDefinition {
+                return constructor;
             }
             if let Some(scope) = function.child_by_field_name("scope")
                 && let Some(name) = function
@@ -847,6 +859,36 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                     format!("`{name}` is a local C++ value"),
                 );
             }
+            if call_arity.is_none() {
+                return ambiguous_definition(format!(
+                    "the argument count for C++ call `{name}` is unknown after macro expansion"
+                ));
+            }
+            if let Some(owner) = cpp_enclosing_class(
+                ctx.analyzer,
+                ctx.support,
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+                ctx.root,
+                name_node.start_byte(),
+            ) {
+                let member_candidates =
+                    cpp_member_candidates_lazy(ctx, vec![owner], name, call_arity, || {
+                        cpp_call_argument_types(
+                            ctx.analyzer,
+                            ctx.support,
+                            ctx.visibility,
+                            ctx.file,
+                            ctx.source,
+                            ctx.root,
+                            call,
+                        )
+                    });
+                if !member_candidates.is_empty() {
+                    return candidates_outcome(member_candidates);
+                }
+            }
             let mut candidates = cpp_visible_name_candidates(
                 ctx.analyzer,
                 ctx.visibility,
@@ -854,6 +896,18 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 ctx.support,
                 name,
                 Some(CppTargetKind::FreeFunction),
+                cpp_lexical_namespace(name_node, ctx.source).as_deref(),
+            );
+            candidates.retain(|candidate| {
+                ctx.visibility.declaration_visible_at(
+                    ctx.analyzer,
+                    ctx.file,
+                    candidate,
+                    call.start_byte(),
+                )
+            });
+            candidates = cpp_closest_bare_free_function_tier(
+                candidates,
                 cpp_lexical_namespace(name_node, ctx.source).as_deref(),
             );
             if !candidates.is_empty() {
@@ -880,31 +934,6 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
             let constructor = resolve_cpp_constructor(ctx, call);
             if constructor.status != DefinitionLookupStatus::NoDefinition {
                 return constructor;
-            }
-            if let Some(owner) = cpp_enclosing_class(
-                ctx.analyzer,
-                ctx.support,
-                ctx.visibility,
-                ctx.file,
-                ctx.source,
-                ctx.root,
-                name_node.start_byte(),
-            ) {
-                let member_candidates =
-                    cpp_member_candidates_lazy(ctx, vec![owner], name, call_arity, || {
-                        cpp_call_argument_types(
-                            ctx.analyzer,
-                            ctx.support,
-                            ctx.visibility,
-                            ctx.file,
-                            ctx.source,
-                            ctx.root,
-                            call,
-                        )
-                    });
-                if !member_candidates.is_empty() {
-                    return candidates_outcome(member_candidates);
-                }
             }
             no_definition(
                 "no_indexed_definition",
@@ -972,6 +1001,19 @@ fn resolve_cpp_constructor(
         Some(CppTargetKind::Type),
         cpp_lexical_namespace(type_node, ctx.source).as_deref(),
     ));
+    owners = owners
+        .into_iter()
+        .flat_map(|unit| {
+            cpp_type_definition_candidates(
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+                ctx.support,
+                unit,
+            )
+        })
+        .filter(|unit| cpp_unit_matches_kind(ctx.analyzer, ctx.support, unit, CppTargetKind::Type))
+        .collect();
     sort_units(&mut owners);
     owners.dedup();
 
@@ -1148,6 +1190,30 @@ fn cpp_visible_name_candidates(
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
+}
+
+fn cpp_closest_bare_free_function_tier(
+    candidates: Vec<CodeUnit>,
+    lexical_namespace: Option<&str>,
+) -> Vec<CodeUnit> {
+    if let Some(namespace) = lexical_namespace.filter(|namespace| !namespace.is_empty()) {
+        for prefix in std::iter::successors(Some(namespace), |current| {
+            current.rsplit_once("::").map(|(parent, _)| parent)
+        }) {
+            let scoped = candidates
+                .iter()
+                .filter(|candidate| candidate.package_name() == prefix)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !scoped.is_empty() {
+                return scoped;
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .filter(|candidate| candidate.package_name().is_empty())
+        .collect()
 }
 
 fn cpp_unit_matches_kind(
@@ -2173,6 +2239,11 @@ fn cpp_seed_variable_declaration(
                 bindings,
             )
         {
+            if cpp_enclosing_local_scope(node).is_some()
+                && let Some(name) = extract_variable_name(declarator, ctx.source)
+            {
+                bindings.declare_shadow(name);
+            }
             continue;
         }
         if let Some(name) = extract_variable_name(declarator, ctx.source) {
