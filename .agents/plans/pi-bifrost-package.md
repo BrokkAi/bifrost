@@ -37,8 +37,8 @@ After this change, a Pi user can install the existing Bifrost agent package and 
 - Observation: The repository's feature-complete Rust suite has three environment-sensitive baseline failures unrelated to this TypeScript/package-only change.
   Evidence: `cargo test --features nlp,python` passed 1030 tests and failed `tool_reports_cached_duplicate_blob_at_each_path`, `tool_reports_current_and_history_findings_and_excludes_tests`, and `get_commit_diff_handles_merge_commit`. Their fixtures report or request `master`, while command output shows temporary repositories initialized with `main`; the changed-file set contains no Rust source.
 
-- Observation: Running npm installation inside the shared package initially made dependency files visible to jj and would also have put `node_modules` into the broad release archive.
-  Evidence: `.gitignore` now ignores nested `node_modules` and `.brokk` analyzer caches; release tar creation excludes and asserts the absence of `node_modules`; `jj st` now contains only 22 intended files.
+- Observation: Running npm installation inside the shared package makes nested dependency files visible unless they are ignored.
+  Evidence: `.gitignore` now ignores nested `node_modules`. Release CI installs Pi dependencies in a dedicated job, separate from the existing VS Code job that creates the broad agent archive, so that archive never sees the Pi job's `node_modules`. The repository-level `.brokk` cache remains outside this change.
 
 ## Decision Log
 

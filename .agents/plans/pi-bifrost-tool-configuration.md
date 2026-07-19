@@ -142,4 +142,4 @@ Revision note (2026-07-17 21:50Z): Added real interactive Pi evidence after repr
 
 Revision note (2026-07-17 22:20Z): Corrected extension error presentation after reviewing Pi's current extension UI guidance. Session errors now flow through the active context's native error notifications instead of direct console writes.
 
-Revision note (2026-07-18): Applied final review hardening. Removed the unavailable Semantic Search setting, replaced hand-written settings guards with TypeBox parsing, preserved structured error causes, closed shutdown/reconnect races, refreshed schemas on reconnect, and added installed-package and release-gating validation.
+Revision note (2026-07-18): Applied final review hardening. Removed the unavailable Semantic Search setting, replaced hand-written settings guards with TypeBox parsing, preserved structured error causes, closed shutdown/reconnect races, refreshed schemas on reconnect, and added installed-package and Pi release-package validation.

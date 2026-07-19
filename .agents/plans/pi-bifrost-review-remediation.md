@@ -4,7 +4,7 @@ This ExecPlan is a living document. Maintain `Progress`, `Surprises & Discoverie
 
 ## Purpose / Big Picture
 
-After this work, the Pi package will not start a Bifrost child after its session has shut down, report successful reconfiguration only while the replacement connection remains live, and surface startup failures through Pi in both interactive and noninteractive modes. Persisted settings will be parsed through a schema rather than a hand-written object predicate. The package artifact will contain its license, be install-tested from the actual npm tarball, stay aligned with Cargo version bumps, and be built before the GitHub release becomes public.
+After this work, the Pi package will not start a Bifrost child after its session has shut down, report successful reconfiguration only while the replacement connection remains live, and surface startup failures through Pi in both interactive and noninteractive modes. Persisted settings will be parsed through a schema rather than a hand-written object predicate. The package artifact will contain its license, be install-tested from the actual npm tarball, stay aligned with Cargo version bumps, and be attached by a dedicated Pi release job without changing the existing VS Code release sequence.
 
 ## Progress
 
@@ -13,7 +13,8 @@ After this work, the Pi package will not start a Bifrost child after its session
 - [x] (2026-07-18 01:05Z) Refactored the Pi session lifecycle around explicit state and structured errors; shutdown and replacement revalidation tests now pass.
 - [x] (2026-07-18 01:05Z) Replaced hand-written settings shape checks with TypeBox parsing and removed unsupported Semantic Search configuration.
 - [x] (2026-07-18 01:05Z) Adopted MCP SDK protocol types, refreshed schemas on reconnect, and required complete capability tool sets while accepting the server's location/reference render alternatives.
-- [x] (2026-07-18 01:40Z) Repaired version synchronization, licensing, packed-install validation, and release job sequencing.
+- [x] (2026-07-18 01:40Z) Repaired version synchronization, licensing, packed-install validation, and Pi release packaging.
+- [x] (2026-07-18) Restored the pre-existing VS Code and GitHub release sequence after a scope audit identified that broader workflow redesign as unrelated to Pi.
 - [x] (2026-07-18 03:45Z) Updated public and maintainer documentation, removed the standalone HTML explainer, retained all ExecPlans, and completed comprehensive package, workflow, AST-rule, and real-Pi validation.
 
 ## Surprises & Discoveries
@@ -24,8 +25,8 @@ After this work, the Pi package will not start a Bifrost child after its session
 - Observation: The pinned MCP SDK exports `Tool` and `CallToolResult`, so local protocol interface copies are unnecessary.
   Evidence: `plugins/bifrost-agent/node_modules/@modelcontextprotocol/sdk/dist/esm/types.d.ts` exports both inferred types.
 
-- Observation: The previous release workflow published binary assets before downstream editor and Pi package checks.
-  Evidence: Before remediation, `.github/workflows/release.yml` made the combined `vscode` job depend on `release`. The final workflow makes `release` depend on separate `vscode-package` and `agent-package` jobs.
+- Observation: Gating the existing GitHub and VS Code release sequence on the new Pi package was an unrelated release-policy change.
+  Evidence: The final scoped workflow leaves the existing `release` and `vscode` jobs unchanged and adds a dedicated `pi-package` job that validates and attaches only the npm artifact after release creation.
 
 - Observation: Pi's `registerTool` replaces an existing same-name registration, which lets reconnect discovery refresh MCP descriptions and schemas without a parallel registry.
   Evidence: The focused reconnect test records two registrations of `bifrost_search_symbols` and observes the second description through Pi's current tool map.
@@ -62,7 +63,7 @@ After this work, the Pi package will not start a Bifrost child after its session
 
 The remediation is complete. Session shutdown clears workspace authority before awaiting cleanup, waits for every child close already in flight, invalidates stale selections, and reports replacement success only while that client remains live. Operation failures have one reporting owner, retain structured causes, and use Pi-native UI or headless extension paths. Settings use TypeBox parsing, discovered MCP schemas refresh on reconnect, and capability validation requires complete server-supported tool variants without advertising unavailable semantic search.
 
-The npm artifact now contains exact license/source notices and passes a clean installed-package discovery smoke. Version synchronization covers the Pi manifest, lockfile, and pinned README command. Separate VS Code and agent package jobs gate one final GitHub release, with marketplace publication afterward. Fresh validation passed 68 Node tests, TypeScript/package checks, clean `npm ci`, packed install, `npm audit`, pack/publish dry runs, workflow lint, shared manifest/version checks, the user's AST rules, and a real Pi `bifrost_get_summaries` call returning `src/mcp_common.rs`. No Bifrost child from the smoke remained alive.
+The npm artifact now contains exact license/source notices and passes a clean installed-package discovery smoke. Version synchronization covers the Pi manifest, lockfile, and pinned README command. A dedicated Pi package job validates and attaches the npm tarball without changing the existing GitHub or VS Code release sequence. Fresh validation passed TypeScript/package checks, clean `npm ci`, packed install, `npm audit`, pack/publish dry runs, workflow lint, shared manifest/version checks, the user's AST rules, and a real Pi `bifrost_get_summaries` call returning `src/mcp_common.rs`. No Bifrost child from the smoke remained alive.
 
 ## Context and Orientation
 
@@ -78,7 +79,7 @@ Second, define a TypeBox schema for the persisted settings envelope and parse un
 
 Third, import MCP `Tool` and `CallToolResult` types from the SDK. Keep the adapter because it performs real protocol-to-host translation. Remove duplicated namespace prose, host-internal full-result claims, and full descriptions as prompt snippets. Capability validation will list every missing requirement from the selected groups while treating location- and reference-rendered symbol tools as declared alternatives.
 
-Fourth, add the npm package and lockfile to `scripts/sync-release-version.mjs`, include LGPL/source notice files in the npm tarball, and extend package checks to assert them. Add a CI smoke that packs the package, installs the tarball in a clean temporary package, and asks Pi to discover the extension and skills without launching Bifrost. Split release preparation into validation/package jobs that depend on binary builds, then make the final release job depend on those packaged artifacts so no public release is created before Pi and VS Code checks pass.
+Fourth, add the npm package and lockfile to `scripts/sync-release-version.mjs`, include LGPL/source notice files in the npm tarball, and extend package checks to assert them. Add a CI smoke that packs the package, installs the tarball in a clean temporary package, and asks Pi to discover the extension and skills without launching Bifrost. Add a dedicated post-release Pi job that prepares its checksum sidecar, validates the package, and attaches the npm tarball without changing the existing VS Code job.
 
 Finally, update README and maintainer documentation, remove only the standalone implementation explainer, retain all three Pi ExecPlans, run TypeScript checks and Node tests, run package and manifest checks, inspect the final diff, and ask independent reviewers to check lifecycle and release seams.
 
@@ -99,11 +100,11 @@ The session tests must prove that shutdown clears the workspace and prevents a l
 
 Settings tests must reject arrays, null, malformed JSON, incorrect versions, extra fields, wrong workspaces, and unknown capability IDs through the schema boundary. Capability tests must no longer advertise Semantic Search and must require every declared tool requirement for a selected capability, including coverage for location/reference alternatives.
 
-The npm package must include `LICENSE.md`, `GPL-3.0.md`, and `SOURCE.md`. CI and local validation must install the produced `.tgz` into a clean temporary package and prove Pi can load the extension and exactly the three canonical skills. The release workflow must have no publication step upstream of Pi and VS Code package validation.
+The npm package must include `LICENSE.md`, `GPL-3.0.md`, and `SOURCE.md`. CI and local validation must install the produced `.tgz` into a clean temporary package and prove Pi can load the extension and exactly the three canonical skills. The Pi release job must complete its package validation before attaching the npm tarball.
 
 ## Idempotence and Recovery
 
-All code and metadata edits are ordinary source changes. Session cleanup remains idempotent through `closeOnce`. Package smoke tests must use an operating-system temporary directory and remove temporary files through tracked process cleanup and a `finally` block. If release workflow restructuring fails validation, retain artifact names and restore only dependency edges rather than changing public artifact naming.
+All code and metadata edits are ordinary source changes. Session cleanup remains idempotent through `closeOnce`. Package smoke tests must use an operating-system temporary directory and remove temporary files through tracked process cleanup and a `finally` block. If Pi release packaging fails validation, leave the existing release dependency edges and public artifact naming unchanged.
 
 ## Artifacts and Notes
 
@@ -118,3 +119,5 @@ The final review-ready diff does not include `.agents/docs/pi-bifrost-implementa
 `parseSettingsDocument(source, expectedWorkspace?)` continues returning the internal `BifrostSettingsDocument`, but raw `JSON.parse` output passes through a TypeBox schema before field access.
 
 Revision note (2026-07-18): Completed review remediation and updated this living plan with final lifecycle, package, publication, documentation, and validation evidence. The user chose to retain all ExecPlans as implementation history while removing only the standalone HTML explainer.
+
+Revision note (2026-07-18): A later scope audit identified the GitHub and VS Code release reordering as unrelated to Pi. Restored the pre-existing sequence and retained only the dedicated Pi package job.

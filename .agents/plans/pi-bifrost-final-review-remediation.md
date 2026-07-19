@@ -4,7 +4,7 @@ This ExecPlan is a living document. Maintain `Progress`, `Surprises & Discoverie
 
 ## Purpose / Big Picture
 
-After this change, Pi users can keep their intended Bifrost capability settings through startup failures, trust `/bifrost` to show the live connection state, and rely on Pi command-line tool filters without receiving prompts for unavailable Bifrost tools. Session replacement and shutdown will move through consistent states owned by one session object, including all child-process ledgers and Pi tool effects. Headless settings failures will stop startup with a diagnostic rather than silently enabling defaults. A future release can project newly built checksums into both host manifests without the agent package job failing its version check.
+After this change, Pi users can keep their intended Bifrost capability settings through startup failures, trust `/bifrost` to show the live connection state, and rely on Pi command-line tool filters without receiving prompts for unavailable Bifrost tools. Session replacement and shutdown will move through consistent states owned by one session object, including all child-process ledgers and Pi tool effects. Headless settings failures will stop startup with a diagnostic rather than silently enabling defaults. A future release can prepare and attach the Pi npm package without changing the existing GitHub or VS Code release sequence.
 
 ## Progress
 
@@ -12,7 +12,8 @@ After this change, Pi users can keep their intended Bifrost capability settings 
 - [x] (2026-07-18 05:35Z) Replaced the passive lifecycle record and captured orchestration closures with one transition-owning session implementation.
 - [x] (2026-07-18 06:20Z) Added lifecycle, desired-selection, host-filter, same-toolset, stale-error, restart-midpoint, candidate-ownership, and cleanup-retry regression tests.
 - [x] (2026-07-18 06:05Z) Made settings startup failures fail closed in modes without a UI context and kept the `/bifrost` header live on every render and asynchronous outcome.
-- [x] (2026-07-18 05:45Z) Repaired release checksum projection and added a synthetic future-checksum regression test using the real preparation script.
+- [x] (2026-07-18 05:45Z) Repaired release checksum projection for the Pi package.
+- [x] (2026-07-18) Removed the synthetic cross-host workflow regression and restored the pre-existing GitHub and VS Code release sequence after a scope audit.
 - [x] (2026-07-18 06:35Z) Completed package, repository, artifact, real-Pi, process-leak, AST-rule, workflow, and independent-review validation.
 
 ## Surprises & Discoveries
@@ -20,8 +21,8 @@ After this change, Pi users can keep their intended Bifrost capability settings 
 - Observation: Pi filters dynamically registered tools in its internal registry, and `setActiveTools` silently ignores names absent from that registry.
   Evidence: the pinned Pi `AgentSession._refreshToolRegistry` filters registered tools before rebuilding `_toolRegistry`, while `setActiveToolsByName` retains only names found in that registry. The extension must read `getActiveTools()` after setting the requested list.
 
-- Observation: A release job can prepare both the Pi checksum sidecar and the VS Code checksum projection in one invocation.
-  Evidence: `scripts/prepare-vscode-extension-manifest.mjs` already accepts `--manifest` and `--plugin-release` together, so no new compatibility mode or duplicate checksum logic is needed.
+- Observation: Preparing both Pi and VS Code projections in the Pi package job couples an otherwise Pi-only change to editor release policy.
+  Evidence: `scripts/prepare-vscode-extension-manifest.mjs` accepts `--plugin-release` independently, so the dedicated Pi job can prepare only its package sidecar while the existing VS Code job retains its previous behavior.
 
 - Observation: Same-server capability changes still need discovery validation.
   Evidence: query, files, Git, and transforms share the `extended` server expression. A regression now starts a query-only advertised surface, attempts to enable transforms, and observes failure because `jq` is absent without reconnecting or changing the saved selection.
@@ -49,9 +50,9 @@ After this change, Pi users can keep their intended Bifrost capability settings 
   Rationale: Headless startup must throw through Pi’s extension path, and interactive startup must notify and leave Bifrost disabled rather than silently broadening a user’s configured tool surface.
   Date/Author: 2026-07-18 / Pi agent.
 
-- Decision: Prepare both release checksum projections in the agent package job.
-  Rationale: The existing preparation script supports this end state directly. It keeps the subsequent comprehensive projection check valid without introducing a special check mode.
-  Date/Author: 2026-07-18 / Pi agent.
+- Decision: Keep Pi release packaging independent from the existing VS Code and GitHub release sequence.
+  Rationale: The Pi job needs only its own checksum sidecar, package gates, npm tarball, and release attachment. Reordering existing host publication is unrelated to issue #835.
+  Date/Author: 2026-07-18 / user and Pi agent.
 
 ## Outcomes & Retrospective
 
@@ -59,7 +60,7 @@ The final remediation is complete. `BifrostSession` now owns desired configurati
 
 Startup failure retains the saved desired capabilities; ordinary failed changes retain the prior selection. Same-toolset changes validate discovery. Status and execution read Pi’s current accepted tools, so later host-tool changes also suppress the prompt and calls. Malformed settings notify and start disabled with a UI context, or throw through Pi’s extension error path before Bifrost starts without one. `/bifrost` reads status on every render and refreshes every success, failure, and rollback path.
 
-Release preparation now writes Pi and VS Code checksum projections together before the comprehensive version check. A synthetic future-hash test executes the real preparation script and verifies identical projections. Fresh validation passed 87 Node tests, TypeScript/package checks, clean `npm ci`, packed installation, audit, pack and publish dry runs, version/manifest checks, changed-workflow `actionlint`, `cargo fmt --check`, and the personal AST rules. Full-repository `actionlint` also surfaced only pre-existing shellcheck findings in `.github/workflows/benchmark.yml`; the changed release and CI workflows pass directly. The real Pi smoke returned a source symbol through `bifrost_get_summaries`, exited zero, and added no surviving Bifrost process.
+Release preparation now has a dedicated Pi job that writes only the Pi checksum sidecar, validates the package, and attaches the npm tarball after the existing GitHub release. The pre-existing VS Code packaging and Marketplace sequence remains unchanged. Fresh validation passed the Node tests, TypeScript/package checks, clean `npm ci`, packed installation, audit, pack and publish dry runs, version/manifest checks, changed-workflow `actionlint`, `cargo fmt --check`, and the personal AST rules. Full-repository `actionlint` also surfaced only pre-existing shellcheck findings in `.github/workflows/benchmark.yml`; the changed release and CI workflows pass directly. The real Pi smoke returned a source symbol through `bifrost_get_summaries`, exited zero, and added no surviving Bifrost process.
 
 ## Context and Orientation
 
@@ -67,7 +68,7 @@ Release preparation now writes Pi and VS Code checksum projections together befo
 
 `plugins/bifrost-agent/extensions/bifrost.ts` connects that controller to Pi lifecycle events and implements the `/bifrost` settings dialog. `plugins/bifrost-agent/extensions/bifrost-settings.ts` persists one settings document per canonical workspace. `.github/workflows/release.yml` builds release-specific package artifacts. `scripts/prepare-vscode-extension-manifest.mjs` reads built checksum sidecars and writes trusted hashes to the VS Code manifest or Pi release sidecar. `scripts/sync-release-version.mjs` verifies committed host projections.
 
-The existing implementation has a mutable `SessionLifecycle` record but leaves starting clients, close promises, and registered-tool ownership in sibling closure variables. Desired settings and connected settings share one field, so initial failure erases the settings the user intended to retry. Pi tool reconciliation records requested names before Pi applies host filters. Restart clears parts of connection state without atomically removing old Pi tools. The settings dialog’s header is built once. The release agent job updates only one checksum projection before checking both.
+The existing implementation has a mutable `SessionLifecycle` record but leaves starting clients, close promises, and registered-tool ownership in sibling closure variables. Desired settings and connected settings share one field, so initial failure erases the settings the user intended to retry. Pi tool reconciliation records requested names before Pi applies host filters. Restart clears parts of connection state without atomically removing old Pi tools. The settings dialog’s header is built once.
 
 ## Plan of Work
 
@@ -79,7 +80,7 @@ Make Pi reconciliation compute requested MCP names with a pure helper and apply 
 
 Second, change `plugins/bifrost-agent/extensions/bifrost.ts` so malformed persisted settings fail closed. Interactive sessions notify and start with no capabilities, allowing `/bifrost` to repair the file; headless sessions throw the structured settings error before starting Bifrost. Rename the status error field to `lastOperationError`. Build the dialog header through a helper and update its `Text` after each successful, failed, or rolled-back operation.
 
-Third, update `.github/workflows/release.yml` to pass both the VS Code manifest and Pi release sidecar to the existing checksum preparation command. Add a Node regression that feeds synthetic future hashes through the preparation script and proves both projections are identical, while also checking the agent workflow invokes both outputs.
+Third, add a dedicated Pi release job that prepares only the Pi release sidecar, runs the package gates, and attaches the npm tarball. Preserve the existing GitHub release and VS Code publication sequence.
 
 Finally, update this plan as evidence arrives. Run focused tests first, then all package checks, clean install, packed install, audit, pack and publish dry runs, workflow lint, shared manifest checks, relevant repository gates, and a real Pi call using the namespaced Bifrost tool. Track the child PID or inspect only the process launched by the smoke; never kill processes by pattern.
 
@@ -96,7 +97,7 @@ Run commands from `/home/josh/projects/BrokkAi/bifrost` unless a command changes
 
        cd plugins/bifrost-agent && npm test
 
-3. Edit `.github/workflows/release.yml` and add the future-checksum regression under `plugins/bifrost-agent/test/`, then rerun package tests and:
+3. Edit `.github/workflows/release.yml` to add only the Pi package job, then rerun package tests and:
 
        node scripts/sync-release-version.mjs --check
        node scripts/check-codex-plugin-manifest.mjs
@@ -110,7 +111,7 @@ Behavior-focused session tests must pause restart cleanup and observe a connecti
 
 Extension tests must show malformed settings notify and start disabled in TUI mode, throw the same structured error without calling `start` in headless mode, and never say defaults were enabled. Rendering after the last capability is disabled must show `disconnected`; rendering after recovery must show `connected`.
 
-The release regression must use hashes different from committed release hashes, run the real preparation script against temporary projections, and prove the Pi and VS Code outputs have the same future hashes. The workflow must pass both outputs in the agent package job, after which `sync-release-version.mjs --check` remains meaningful.
+The release workflow must prepare the Pi sidecar from built checksum assets, complete the Pi package tests, and attach only the npm tarball. It must not change the existing GitHub release or VS Code dependency edges.
 
 Run and require fresh success from:
 
@@ -151,3 +152,5 @@ The session implementation uses Pi’s dependency-native `ExtensionAPI` and MCP 
 Revision note (2026-07-18): Created this follow-up ExecPlan from the final review findings because the prior remediation plan is completed implementation history and does not describe this remaining work.
 
 Revision note (2026-07-18): Recorded the completed lifecycle owner, race and cleanup discoveries, release projection fix, documentation behavior, and fresh acceptance evidence after independent reviewers returned no lifecycle blockers.
+
+Revision note (2026-07-18): A later scope audit found that reordering GitHub and VS Code publication was unrelated to the Pi issue. Restored the existing sequence, removed its cross-host workflow regression, and retained only a dedicated Pi package job.

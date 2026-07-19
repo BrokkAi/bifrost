@@ -2,7 +2,6 @@
 /docs/dist
 /docs/.astro
 **/node_modules/
-/.brokk/
 /benchmark/.cache/
 /benchmark/benchmark-output/
 __pycache__/

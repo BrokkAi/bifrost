@@ -129,13 +129,14 @@ startup errors through Pi's extension runner in modes without a UI context. Neve
 `console.log` or `console.error` from the Pi extension because direct terminal
 writes corrupt or displace TUI output.
 
-Release CI runs `npm ci`, `npm test`, `npm run check`, and the packed-install
-smoke in `plugins/bifrost-agent`, then places the npm tarball in the GitHub
-release next to the shared agent archive. The GitHub release is published only
-after the Pi and VS Code artifacts pass their package gates. Publishing `@brokk/bifrost-agent` to npm remains a
-separate credentialed action until the repository has an approved npm trusted
-publisher or token. Do not document npm installation as available until that
-publication is configured and the matching version exists in the registry.
+Release CI publishes the existing GitHub release first, then a dedicated Pi
+job runs `npm ci`, `npm test`, `npm run check`, and the packed-install smoke in
+`plugins/bifrost-agent` before attaching the npm tarball. The Pi job does not
+change the existing VS Code packaging or Marketplace publication sequence.
+Publishing `@brokk/bifrost-agent` to npm remains a separate credentialed action
+until the repository has an approved npm trusted publisher or token. Do not
+document npm installation as available until that publication is configured
+and the matching version exists in the registry.
 Local validation and pre-publication inspection use:
 
 ```bash

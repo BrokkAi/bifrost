@@ -125,10 +125,10 @@ Those checksum-bearing files must match the actual release archives.
 when that release metadata is already on the same version as `Cargo.toml`. The
 `release.yml` workflow prepares checksum metadata from the built `.sha256`
 sidecars with `scripts/prepare-vscode-extension-manifest.mjs`, regenerates the
-Amp skill bundle, validates the plugin manifests, and packages the VSIX,
-`bifrost-agent-<tag>.tar.gz`, and Pi npm tarball. Only after those package gates
-pass does it publish the GitHub Release; VS Code Marketplace publication follows
-the successful GitHub release. If you perform those
+Amp skill bundle, validates the plugin manifests, packages
+`bifrost-agent-<tag>.tar.gz`, and publishes the VSIX. A separate Pi package job
+prepares the same release metadata for the npm tarball, validates the packed
+package, and attaches it to the existing GitHub Release. If you perform those
 packaging steps manually, run the same script against the release `dist/`
 directory instead of hand-editing checksums.
 
@@ -162,10 +162,9 @@ To cut a release:
 
 A single `vX.Y.Z` tag fans out to three workflows:
 
-- `release.yml` — builds platform archives + SHA-256 checksums, prepares and
-  validates the VS Code, shared-agent, and Pi package artifacts, publishes them
-  together in a GitHub Release, then publishes the validated VSIX to the VS Code
-  Marketplace.
+- `release.yml` — builds platform archives + SHA-256 checksums and publishes a
+  GitHub Release, then prepares and publishes the VS Code, bundled-agent, and Pi
+  package artifacts.
 - `publish-crate.yml` — publishes the crate to crates.io.
 - `publish-wheels.yml` — builds all platform wheels + sdist and publishes to PyPI.
 
