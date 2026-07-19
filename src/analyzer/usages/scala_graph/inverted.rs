@@ -29,19 +29,20 @@ use super::shared::ScalaEdgeGraph;
 use super::syntax::{
     ScalaCallableParameterList, ScalaImportContextIndex, ScalaMethodValueContext,
     ScalaPackageContextIndex, ScalaParameterListKind, ScalaQualifiedStableTypeRole,
-    ScalaSourceFacts, call_arities_for_reference, is_bare_companion_method_value_reference,
-    is_constructor_like_reference, is_extractor_reference, is_infix_pattern_operator,
-    is_scala_class_reference, is_scala_object_reference, is_terminal_stable_field_reference,
-    node_text, parenthesized_arity, qualified_stable_type_reference,
-    resolve_stable_object_expression, scala_import_is_visible_at_byte, scala_source_facts,
-    stable_identifier_reference,
+    ScalaSourceFacts, call_arities_for_reference, enclosing_template_declarations,
+    is_bare_companion_method_value_reference, is_constructor_like_reference, is_declaration_name,
+    is_extractor_reference, is_infix_pattern_operator, is_scala_class_reference,
+    is_scala_object_reference, is_terminal_stable_field_reference, node_text, parenthesized_arity,
+    qualified_stable_type_reference, resolve_stable_object_expression,
+    scala_import_is_visible_at_byte, scala_source_facts, stable_identifier_reference,
+    template_direct_term_member_named, template_self_type,
 };
 use crate::analyzer::scala::{
     ScalaAdapter, ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaExportSelector,
     ScalaSupertypeLookupPath, ScalaWildcardOwnerFacts, resolve_scala_explicit_import_tier,
     resolve_scala_wildcard_import_environment, scala_class_parameter_field_keyword,
     scala_import_path, scala_normalize_full_name, scala_simple_type_name,
-    scala_type_lookup_segments,
+    scala_supertype_lookup_nodes, scala_type_lookup_segments,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usage_facts::CallableFacts;
@@ -558,7 +559,7 @@ impl ProjectTypes {
         scala
             .definitions(owner_fqn)
             .find(|unit| unit.is_class())
-            .map(|owner| scala.get_ancestors(&owner))
+            .map(|owner| scala.get_direct_ancestors(&owner))
             .unwrap_or_default()
     }
 
@@ -570,7 +571,7 @@ impl ProjectTypes {
         if let Some(ancestors_by_unit) = &self.direct_ancestors_by_unit {
             return ancestors_by_unit.get(owner).cloned().unwrap_or_default();
         }
-        scala.get_ancestors(owner)
+        scala.get_direct_ancestors(owner)
     }
 
     fn direct_field_ancestors_for_owner(
@@ -721,19 +722,6 @@ impl ProjectTypes {
         scala.is_scala_trait_declaration(code_unit)
     }
 
-    fn method_targets_for_owner_member(
-        &self,
-        scala: &ScalaAnalyzer,
-        owner_fqn: &str,
-        member: &str,
-        call_arities: Option<&[usize]>,
-    ) -> Vec<String> {
-        self.method_declarations_for_owner_member(scala, owner_fqn, member, call_arities)
-            .into_iter()
-            .map(|method| method.fq_name())
-            .collect()
-    }
-
     fn method_declarations_for_owner_member(
         &self,
         scala: &ScalaAnalyzer,
@@ -820,7 +808,10 @@ impl ProjectTypes {
                     .into_iter()
                     .filter(|unit| unit.source() == owner.source())
                     .collect::<Vec<_>>();
-                if members.iter().any(|member| member.is_field()) {
+                if members
+                    .iter()
+                    .any(|member| self.member_blocks_callable_lookup(scala, member))
+                {
                     return BareMemberResolution::Unresolved;
                 }
                 matched.extend(self.method_declarations_for_members(scala, &members, call_arities));
@@ -834,6 +825,115 @@ impl ProjectTypes {
             owners = next;
         }
         BareMemberResolution::NoMatch
+    }
+
+    /// Resolve only ordinary methods declared by a class or object owner.
+    ///
+    /// This intentionally does not broaden trait-default or extension-method
+    /// handling.  Each breadth level is one semantic tier: fields, trait
+    /// declarations, or methods from multiple class owners make that tier
+    /// unresolved instead of allowing traversal order to choose a target.
+    pub(super) fn ordinary_class_member_declarations_for_owner(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+        member: &str,
+        call_arities: Option<&[usize]>,
+    ) -> BareMemberResolution {
+        if !owner.is_class() {
+            return BareMemberResolution::NoMatch;
+        }
+        self.ordinary_class_member_declarations_for_owners(
+            scala,
+            std::slice::from_ref(owner),
+            member,
+            call_arities,
+        )
+    }
+
+    pub(super) fn ordinary_class_member_declarations_for_owners(
+        &self,
+        scala: &ScalaAnalyzer,
+        direct_owners: &[CodeUnit],
+        member: &str,
+        call_arities: Option<&[usize]>,
+    ) -> BareMemberResolution {
+        let mut owners = direct_owners.to_vec();
+        let mut seen = HashSet::default();
+        while !owners.is_empty() {
+            let mut matched = Vec::new();
+            let mut declaring_owners = HashSet::default();
+            let mut blocked = false;
+            let mut next = Vec::new();
+            for owner in owners {
+                if !seen.insert(owner.clone()) {
+                    continue;
+                }
+                if call_arities.is_none()
+                    && self
+                        .exact_nested_object(scala, &owner.fq_name(), member)
+                        .is_some()
+                {
+                    blocked = true;
+                }
+                let members = self
+                    .members_for_exact_owner_name(&owner.fq_name(), member)
+                    .into_iter()
+                    .filter(|unit| unit.source() == owner.source())
+                    .collect::<Vec<_>>();
+                if members
+                    .iter()
+                    .any(|member| self.member_blocks_callable_lookup(scala, member))
+                {
+                    blocked = true;
+                }
+                let methods = self.method_declarations_for_members(scala, &members, call_arities);
+                if !methods.is_empty() {
+                    if self.is_scala_trait_declaration(scala, &owner) {
+                        if methods
+                            .iter()
+                            .any(|method| !self.is_abstract_scala_method(scala, method))
+                        {
+                            blocked = true;
+                        }
+                    } else if methods
+                        .iter()
+                        .any(|method| self.extension_method_for_unit(scala, method).is_some())
+                    {
+                        blocked = true;
+                    } else {
+                        declaring_owners.insert(owner.clone());
+                        matched.extend(methods);
+                    }
+                }
+                next.extend(self.direct_ancestors_for_declaration(scala, &owner));
+            }
+            if blocked || declaring_owners.len() > 1 {
+                return BareMemberResolution::Unresolved;
+            }
+            if !matched.is_empty() {
+                let mut unique = HashSet::default();
+                matched.retain(|method| unique.insert(method.clone()));
+                return BareMemberResolution::Resolved(matched);
+            }
+            owners = next;
+        }
+        BareMemberResolution::NoMatch
+    }
+
+    fn is_abstract_scala_method(&self, scala: &ScalaAnalyzer, method: &CodeUnit) -> bool {
+        let ranges = self.declaration_ranges_for(scala, method);
+        !ranges.is_empty()
+            && ranges.iter().all(|range| {
+                self.source_facts_for_file(scala, method.source())
+                    .abstract_callable_ranges
+                    .contains(&(range.start_byte, range.end_byte))
+            })
+    }
+
+    fn member_blocks_callable_lookup(&self, scala: &ScalaAnalyzer, member: &CodeUnit) -> bool {
+        member.is_field() && !scala.is_type_alias(member)
+            || member.is_class() && self.type_is_stable_owner(scala, member)
     }
 
     pub(super) fn callable_parameter_function_arity(
@@ -863,25 +963,120 @@ impl ProjectTypes {
         resolved
     }
 
-    fn inherited_method_targets_for_owner_member(
+    /// Resolve the callable selected for a receiver's static owner.
+    ///
+    /// Scala mixin linearization gives the rightmost parent and its ancestry
+    /// precedence over parents to its left. Abstract inherited trait contracts
+    /// remain a fallback only when the linearization supplies no concrete
+    /// implementation.
+    fn effective_method_declarations_for_owner(
         &self,
         scala: &ScalaAnalyzer,
         owner_fqn: &str,
         member: &str,
         call_arities: Option<&[usize]>,
-    ) -> Vec<String> {
-        for ancestor in self.direct_ancestors_for_owner(scala, owner_fqn) {
-            let targets = self.method_targets_for_owner_member(
-                scala,
-                &ancestor.fq_name(),
-                member,
-                call_arities,
-            );
-            if !targets.is_empty() {
-                return targets;
+    ) -> BareMemberResolution {
+        let mut declarations = self
+            .index
+            .by_fqn(owner_fqn)
+            .iter()
+            .filter(|owner| owner.is_class());
+        let Some(owner) = declarations.next() else {
+            return BareMemberResolution::NoMatch;
+        };
+        if declarations.next().is_some() {
+            return BareMemberResolution::Unresolved;
+        }
+
+        let root_owner = owner.clone();
+        let mut abstract_trait_fallback = None;
+        for owner in self.linearized_owners(scala, &root_owner) {
+            if call_arities.is_none()
+                && self
+                    .exact_nested_object(scala, &owner.fq_name(), member)
+                    .is_some()
+            {
+                return BareMemberResolution::Unresolved;
+            }
+            let members = self
+                .members_for_exact_owner_name(&owner.fq_name(), member)
+                .into_iter()
+                .filter(|unit| unit.source() == owner.source())
+                .collect::<Vec<_>>();
+            if members
+                .iter()
+                .any(|member| self.member_blocks_callable_lookup(scala, member))
+            {
+                return BareMemberResolution::Unresolved;
+            }
+            let methods = self.method_declarations_for_members(scala, &members, call_arities);
+            if !methods.is_empty() {
+                let inherited_abstract_trait = owner != root_owner
+                    && self.is_scala_trait_declaration(scala, &owner)
+                    && methods
+                        .iter()
+                        .all(|method| self.is_abstract_scala_method(scala, method));
+                if inherited_abstract_trait {
+                    abstract_trait_fallback.get_or_insert(methods);
+                } else {
+                    return BareMemberResolution::Resolved(methods);
+                }
             }
         }
-        Vec::new()
+        abstract_trait_fallback.map_or(
+            BareMemberResolution::NoMatch,
+            BareMemberResolution::Resolved,
+        )
+    }
+
+    /// Compute Scala's duplicate-eliding parent linearization without Rust
+    /// recursion. For `C extends L with R`, the parent suffix is
+    /// `L(R) ⊕ L(L)`: identities repeated by the later/left linearization are
+    /// removed from the earlier/right one before the lists are joined.
+    fn linearized_owners(&self, scala: &ScalaAnalyzer, root: &CodeUnit) -> Vec<CodeUnit> {
+        let mut completed = HashMap::<CodeUnit, Vec<CodeUnit>>::default();
+        let mut visiting = HashSet::default();
+        let mut stack = vec![(root.clone(), false)];
+
+        while let Some((owner, expanded)) = stack.pop() {
+            if completed.contains_key(&owner) {
+                continue;
+            }
+            if expanded {
+                visiting.remove(&owner);
+                let mut suffix = Vec::new();
+                for parent in self
+                    .direct_ancestors_for_declaration(scala, &owner)
+                    .into_iter()
+                    .rev()
+                {
+                    let Some(parent_linearization) = completed.get(&parent) else {
+                        // A missing entry denotes a cyclic edge that was not
+                        // rescheduled while its owner was already active.
+                        continue;
+                    };
+                    let parent_owners = parent_linearization.iter().collect::<HashSet<_>>();
+                    suffix.retain(|existing| !parent_owners.contains(existing));
+                    suffix.extend(parent_linearization.iter().cloned());
+                }
+                let mut linearization = Vec::with_capacity(1 + suffix.len());
+                linearization.push(owner.clone());
+                linearization.extend(suffix);
+                completed.insert(owner, linearization);
+                continue;
+            }
+            if !visiting.insert(owner.clone()) {
+                continue;
+            }
+            stack.push((owner.clone(), true));
+            for parent in self.direct_ancestors_for_declaration(scala, &owner) {
+                if !completed.contains_key(&parent) && !visiting.contains(&parent) {
+                    stack.push((parent, false));
+                }
+            }
+        }
+
+        completed.remove(root).unwrap_or_else(|| vec![root.clone()])
     }
 
     pub(crate) fn member_return_type(
@@ -1018,7 +1213,24 @@ impl ProjectTypes {
         if !owner.is_class() {
             return MemberReturnResolution::NoMatch;
         }
-        let mut level = vec![owner.clone()];
+        self.unqualified_member_return_type_for_owners(
+            scala,
+            resolver,
+            std::slice::from_ref(owner),
+            member,
+            call_arities,
+        )
+    }
+
+    pub(super) fn unqualified_member_return_type_for_owners(
+        &self,
+        scala: &ScalaAnalyzer,
+        resolver: &NameResolver,
+        direct_owners: &[CodeUnit],
+        member: &str,
+        call_arities: Option<&[usize]>,
+    ) -> MemberReturnResolution {
+        let mut level = direct_owners.to_vec();
 
         let mut seen = HashSet::default();
         let mut saw_member = false;
@@ -1031,13 +1243,23 @@ impl ProjectTypes {
                     continue;
                 }
                 let owner_fqn = owner.fq_name();
+                if call_arities.is_none()
+                    && self
+                        .exact_nested_object(scala, &owner_fqn, member)
+                        .is_some()
+                {
+                    return MemberReturnResolution::Unresolved;
+                }
                 let members = self
                     .members_for_exact_owner_name(&owner_fqn, member)
                     .into_iter()
                     .filter(|unit| unit.source() == owner.source())
                     .collect::<Vec<_>>();
                 saw_member |= !members.is_empty();
-                if members.iter().any(|unit| unit.is_field()) {
+                if members
+                    .iter()
+                    .any(|unit| self.member_blocks_callable_lookup(scala, unit))
+                {
                     return MemberReturnResolution::Unresolved;
                 }
                 if !self
@@ -2410,35 +2632,45 @@ impl ProjectTypes {
             return targets;
         }
 
+        let mut level = self.direct_ancestors_for_owner(scala, owner_fqn);
+        let mut seen = HashSet::default();
         let mut targets = Vec::new();
-        for ancestor in self.direct_ancestors_for_owner(scala, owner_fqn) {
-            if !self.is_scala_trait_declaration(scala, &ancestor) {
-                continue;
+        while !level.is_empty() {
+            let mut next = Vec::new();
+            for ancestor in level {
+                if !seen.insert(ancestor.clone()) {
+                    continue;
+                }
+                next.extend(self.direct_ancestors_for_declaration(scala, &ancestor));
+                if !self.is_scala_trait_declaration(scala, &ancestor) {
+                    continue;
+                }
+                let ancestor_owner = ancestor.fq_name();
+                let normalized_ancestor_owner = scala_normalized_fq_name(&ancestor_owner);
+                targets.extend(
+                    self.index
+                        .members_for_owner_name(
+                            &ancestor_owner,
+                            &normalized_ancestor_owner,
+                            method_name,
+                        )
+                        .iter()
+                        .filter(|ancestor_method| {
+                            ancestor_method.is_function()
+                                && method_arities_compatible(
+                                    method_arity,
+                                    self.facts
+                                        .fact_for_declaration(ancestor_method)
+                                        .and_then(|facts| facts.arity),
+                                )
+                        })
+                        .map(|ancestor_method| ancestor_method.fq_name()),
+                );
             }
             if !targets.is_empty() {
                 break;
             }
-            let ancestor_owner = ancestor.fq_name();
-            let normalized_ancestor_owner = scala_normalized_fq_name(&ancestor_owner);
-            targets.extend(
-                self.index
-                    .members_for_owner_name(
-                        &ancestor_owner,
-                        &normalized_ancestor_owner,
-                        method_name,
-                    )
-                    .iter()
-                    .filter(|ancestor_method| {
-                        ancestor_method.is_function()
-                            && method_arities_compatible(
-                                method_arity,
-                                self.facts
-                                    .fact_for_declaration(ancestor_method)
-                                    .and_then(|facts| facts.arity),
-                            )
-                    })
-                    .map(|ancestor_method| ancestor_method.fq_name()),
-            );
+            level = next;
         }
         targets.sort();
         targets.dedup();
@@ -2896,54 +3128,52 @@ impl NameResolver {
                     .is_some(),
             },
         );
-        if !wildcard_environment.ambiguous {
-            for owner in &wildcard_environment.owners {
-                if owner.is_singleton() {
-                    let normalized_owner = scala_normalized_fq_name(&owner.declaration_fqn());
-                    for (simple, decl) in types.nested_types_in(scala, &normalized_owner).iter() {
-                        names.add_declaration(simple.clone(), decl, 128);
-                    }
-                    for (simple, decl) in types.nested_objects_in(scala, &normalized_owner).iter() {
-                        object_names.add_declaration(simple.clone(), decl, 128);
-                    }
-                    if include_members {
-                        if let Some(declaration) =
-                            types.object_by_normalized_fqn(scala, &normalized_owner)
-                        {
-                            for child in types.index.fqn_direct_children(&declaration.fq_name()) {
-                                if child.is_function() || child.is_field() {
-                                    let visible_name = child
-                                        .short_name()
-                                        .rsplit('.')
-                                        .next()
-                                        .unwrap_or(child.short_name())
-                                        .to_string();
-                                    member_names.add_candidate(
-                                        visible_name,
-                                        child.fq_name(),
-                                        None,
-                                        128,
-                                    );
-                                }
-                            }
-                            for (visible_name, member_fqn) in
-                                types.exported_member_bindings(scala, declaration)
-                            {
-                                member_names.add_candidate(visible_name, member_fqn, None, 128);
+        for owner in &wildcard_environment.owners {
+            if owner.is_singleton() {
+                let normalized_owner = scala_normalized_fq_name(&owner.declaration_fqn());
+                for (simple, decl) in types.nested_types_in(scala, &normalized_owner).iter() {
+                    names.add_declaration(simple.clone(), decl, 128);
+                }
+                for (simple, decl) in types.nested_objects_in(scala, &normalized_owner).iter() {
+                    object_names.add_declaration(simple.clone(), decl, 128);
+                }
+                if include_members && !wildcard_environment.ambiguous {
+                    if let Some(declaration) =
+                        types.object_by_normalized_fqn(scala, &normalized_owner)
+                    {
+                        for child in types.index.fqn_direct_children(&declaration.fq_name()) {
+                            if child.is_function() || child.is_field() {
+                                let visible_name = child
+                                    .short_name()
+                                    .rsplit('.')
+                                    .next()
+                                    .unwrap_or(child.short_name())
+                                    .to_string();
+                                member_names.add_candidate(
+                                    visible_name,
+                                    child.fq_name(),
+                                    None,
+                                    128,
+                                );
                             }
                         }
-                        wildcard_extension_owners.push(normalized_owner);
+                        for (visible_name, member_fqn) in
+                            types.exported_member_bindings(scala, declaration)
+                        {
+                            member_names.add_candidate(visible_name, member_fqn, None, 128);
+                        }
                     }
-                } else {
-                    for (simple, decl) in types.package_types_in(&owner.fqn).iter() {
-                        names.add_declaration(simple.clone(), decl, 128);
-                    }
-                    for (simple, decl) in types.package_objects_in(scala, &owner.fqn).iter() {
-                        object_names.add_declaration(simple.clone(), decl, 128);
-                    }
-                    if include_members {
-                        wildcard_extension_owners.push(owner.fqn.clone());
-                    }
+                    wildcard_extension_owners.push(normalized_owner);
+                }
+            } else {
+                for (simple, decl) in types.package_types_in(&owner.fqn).iter() {
+                    names.add_declaration(simple.clone(), decl, 128);
+                }
+                for (simple, decl) in types.package_objects_in(scala, &owner.fqn).iter() {
+                    object_names.add_declaration(simple.clone(), decl, 128);
+                }
+                if include_members && !wildcard_environment.ambiguous {
+                    wildcard_extension_owners.push(owner.fqn.clone());
                 }
             }
         }
@@ -3587,20 +3817,19 @@ fn record_reference(
                     }
                     if let Some(owner) = receiver_type_fqn(receiver, ctx, bindings) {
                         let call_arities = call_arities_for_reference(field);
-                        let targets = ctx.types.method_targets_for_owner_member(
+                        match ctx.types.effective_method_declarations_for_owner(
                             ctx.scala,
                             &owner,
                             name,
                             call_arities.as_deref(),
-                        );
-                        if targets.is_empty() {
-                            let inherited = ctx.types.inherited_method_targets_for_owner_member(
-                                ctx.scala,
-                                &owner,
-                                name,
-                                call_arities.as_deref(),
-                            );
-                            if inherited.is_empty() {
+                        ) {
+                            BareMemberResolution::Resolved(methods) => {
+                                for method in methods {
+                                    ctx.record(method.fq_name(), field);
+                                }
+                            }
+                            BareMemberResolution::Unresolved => {}
+                            BareMemberResolution::NoMatch => {
                                 for extension in visible_extensions(
                                     ctx,
                                     name,
@@ -3609,14 +3838,6 @@ fn record_reference(
                                 ) {
                                     ctx.record(extension.fqn, field);
                                 }
-                            } else {
-                                for target in inherited {
-                                    ctx.record(target, field);
-                                }
-                            }
-                        } else {
-                            for target in targets {
-                                ctx.record(target, field);
                             }
                         }
                     } else {
@@ -3643,29 +3864,7 @@ fn record_reference(
                         return;
                     }
                     let call_arities = call_arities_for_reference(function);
-                    if let Some(targets) =
-                        ctx.class_ranges
-                            .find_in_enclosing_units(function.start_byte(), |owner| {
-                                let mut targets = ctx.types.method_targets_for_owner_member(
-                                    ctx.scala,
-                                    &owner.fq_name(),
-                                    name,
-                                    call_arities.as_deref(),
-                                );
-                                if targets.is_empty() {
-                                    targets = ctx.types.inherited_method_targets_for_owner_member(
-                                        ctx.scala,
-                                        &owner.fq_name(),
-                                        name,
-                                        call_arities.as_deref(),
-                                    );
-                                }
-                                (!targets.is_empty()).then_some(targets)
-                            })
-                    {
-                        for target in targets {
-                            ctx.record(target, function);
-                        }
+                    if record_lexically_visible_call(function, name, call_arities.as_deref(), ctx) {
                         return;
                     }
                     if let Some(imported) = ctx.resolver.resolve_member(name) {
@@ -3701,24 +3900,16 @@ fn record_reference(
                 return;
             };
             let call_arities = call_arities_for_reference(operator);
-            let direct = ctx.types.method_targets_for_owner_member(
-                ctx.scala,
-                &owner,
-                member,
-                call_arities.as_deref(),
-            );
-            if direct.is_empty() {
-                for target in ctx.types.inherited_method_targets_for_owner_member(
+            if let BareMemberResolution::Resolved(methods) =
+                ctx.types.effective_method_declarations_for_owner(
                     ctx.scala,
                     &owner,
                     member,
                     call_arities.as_deref(),
-                ) {
-                    ctx.record(target, operator);
-                }
-            } else {
-                for target in direct {
-                    ctx.record(target, operator);
+                )
+            {
+                for method in methods {
+                    ctx.record(method.fq_name(), operator);
                 }
             }
         }
@@ -3852,6 +4043,9 @@ fn record_reference(
                         }
                         FieldResolution::Unresolved => return,
                         FieldResolution::NoMatch => {
+                            if record_ordinary_class_methods(&owner, name, None, node, ctx) {
+                                return;
+                            }
                             if let Some(object) =
                                 ctx.types.exact_nested_object(ctx.scala, &owner, name)
                             {
@@ -3871,6 +4065,9 @@ fn record_reference(
                     FieldResolution::Unresolved => return,
                     FieldResolution::NoMatch => {}
                 }
+            }
+            if record_lexically_visible_parameterless_method(node, name, ctx) {
+                return;
             }
             if is_scala_object_reference(node)
                 && bindings.resolve_symbol(name).is_unknown()
@@ -4152,6 +4349,183 @@ fn call_parameter_method_value_context(
     )
 }
 
+fn record_ordinary_class_methods(
+    owner_fq_name: &str,
+    member: &str,
+    call_arities: Option<&[usize]>,
+    node: Node<'_>,
+    ctx: &mut ScalaScan<'_, '_>,
+) -> bool {
+    let mut owners = ctx
+        .types
+        .index
+        .by_fqn(owner_fq_name)
+        .iter()
+        .filter(|owner| owner.is_class());
+    let Some(owner) = owners.next() else {
+        return false;
+    };
+    if owners.next().is_some() {
+        return true;
+    }
+    match ctx.types.ordinary_class_member_declarations_for_owner(
+        ctx.scala,
+        owner,
+        member,
+        call_arities,
+    ) {
+        BareMemberResolution::Resolved(methods) => {
+            for method in methods {
+                ctx.record(method.fq_name(), node);
+            }
+            true
+        }
+        BareMemberResolution::Unresolved => true,
+        BareMemberResolution::NoMatch => false,
+    }
+}
+
+fn record_lexically_visible_call(
+    node: Node<'_>,
+    member: &str,
+    call_arities: Option<&[usize]>,
+    ctx: &mut ScalaScan<'_, '_>,
+) -> bool {
+    for declaration in enclosing_template_declarations(node) {
+        if let Some(owner) = ctx
+            .class_ranges
+            .unit_for_exact_span(declaration.start_byte(), declaration.end_byte())
+        {
+            match ctx.types.effective_method_declarations_for_owner(
+                ctx.scala,
+                &owner.fq_name(),
+                member,
+                call_arities,
+            ) {
+                BareMemberResolution::Resolved(methods) => {
+                    for method in methods {
+                        ctx.record(method.fq_name(), node);
+                    }
+                    return true;
+                }
+                BareMemberResolution::Unresolved => return true,
+                BareMemberResolution::NoMatch => {}
+            }
+        }
+        match ordinary_class_member_declarations_for_template(
+            declaration,
+            member,
+            call_arities,
+            ctx,
+        ) {
+            BareMemberResolution::Resolved(methods) => {
+                for method in methods {
+                    ctx.record(method.fq_name(), node);
+                }
+                return true;
+            }
+            BareMemberResolution::Unresolved => return true,
+            BareMemberResolution::NoMatch => {}
+        }
+        if let Some(self_owner) = template_self_type(declaration)
+            .and_then(|type_node| resolve_receiver_type_node(type_node, ctx))
+            && record_ordinary_class_methods(&self_owner, member, call_arities, node, ctx)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn record_lexically_visible_parameterless_method(
+    node: Node<'_>,
+    member: &str,
+    ctx: &mut ScalaScan<'_, '_>,
+) -> bool {
+    if ctx
+        .lexically_visible_object(node.start_byte(), member)
+        .is_some()
+    {
+        return false;
+    }
+    for declaration in enclosing_template_declarations(node) {
+        match ordinary_class_member_declarations_for_template(declaration, member, None, ctx) {
+            BareMemberResolution::Resolved(methods) => {
+                for method in methods {
+                    ctx.record(method.fq_name(), node);
+                }
+                return true;
+            }
+            BareMemberResolution::Unresolved => return true,
+            BareMemberResolution::NoMatch => {}
+        }
+        if let Some(self_owner) = template_self_type(declaration)
+            .and_then(|type_node| resolve_receiver_type_node(type_node, ctx))
+            && record_ordinary_class_methods(&self_owner, member, None, node, ctx)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn ordinary_class_member_declarations_for_template(
+    declaration: Node<'_>,
+    member: &str,
+    call_arities: Option<&[usize]>,
+    ctx: &ScalaScan<'_, '_>,
+) -> BareMemberResolution {
+    if let Some(owner) = ctx
+        .class_ranges
+        .unit_for_exact_span(declaration.start_byte(), declaration.end_byte())
+    {
+        return ctx.types.ordinary_class_member_declarations_for_owner(
+            ctx.scala,
+            owner,
+            member,
+            call_arities,
+        );
+    }
+    if template_direct_term_member_named(declaration, member, ctx.source) {
+        return BareMemberResolution::Unresolved;
+    }
+    let Some(owners) = template_supertype_owners(declaration, ctx) else {
+        return BareMemberResolution::Unresolved;
+    };
+    if owners.is_empty() {
+        BareMemberResolution::NoMatch
+    } else {
+        ctx.types.ordinary_class_member_declarations_for_owners(
+            ctx.scala,
+            &owners,
+            member,
+            call_arities,
+        )
+    }
+}
+
+fn template_supertype_owners(
+    declaration: Node<'_>,
+    ctx: &ScalaScan<'_, '_>,
+) -> Option<Vec<CodeUnit>> {
+    let mut owners = Vec::new();
+    for (_, lookup_node) in scala_supertype_lookup_nodes(declaration) {
+        let fqn = resolve_receiver_type_node(lookup_node, ctx)?;
+        let mut declarations = ctx
+            .types
+            .index
+            .by_fqn(&fqn)
+            .iter()
+            .filter(|unit| unit.is_class());
+        let owner = declarations.next()?;
+        if declarations.next().is_some() {
+            return None;
+        }
+        owners.push(owner.clone());
+    }
+    Some(owners)
+}
+
 /// The fqn of a receiver expression's type, for the shapes that resolve without
 /// return-type inference.
 fn receiver_type_fqn(
@@ -4415,7 +4789,7 @@ fn seed_value_definition_with_owner(
         .and_then(|type_node| resolve_receiver_type_node(type_node, ctx))
         .or_else(|| {
             node.child_by_field_name("value")
-                .and_then(|value| constructed_type(value, ctx))
+                .and_then(|value| constructed_or_applied_type(value, ctx))
         })
         .or_else(|| {
             node.child_by_field_name("value")
@@ -4476,6 +4850,40 @@ fn constructed_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
         .map(|target| target.fq_name())
 }
 
+fn constructed_or_applied_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
+    constructed_type(node, ctx).or_else(|| {
+        if node.kind() != "call_expression" {
+            return None;
+        }
+        let function = node.child_by_field_name("function")?;
+        if !matches!(function.kind(), "identifier" | "type_identifier") {
+            return None;
+        }
+        let name = node_text(function, ctx.source).trim();
+        if name.is_empty() {
+            return None;
+        }
+        let class_fqn = ctx
+            .lexically_visible_type(function.start_byte(), name)
+            .or_else(|| ctx.resolver.resolve(name));
+        let object_fqn = ctx
+            .lexically_visible_object(function.start_byte(), name)
+            .or_else(|| ctx.resolver.resolve_object(name));
+        ctx.types
+            .resolve_type_application(
+                ctx.scala,
+                &ctx.resolver,
+                class_fqn.as_deref(),
+                object_fqn.as_deref(),
+                name,
+                call_arities_for_reference(function).as_deref(),
+                TypeApplicationRole::BareApplication,
+            )
+            .type_target
+            .map(|target| target.fq_name())
+    })
+}
+
 fn call_result_type(
     node: Node<'_>,
     ctx: &ScalaScan<'_, '_>,
@@ -4502,14 +4910,12 @@ fn call_result_type(
         }
         "identifier" => {
             let method = node_text(function, ctx.source);
-            let owner = ctx.enclosing_class_unit(function.start_byte())?;
             let call_arities = call_arities_for_reference(function);
-            match ctx.types.unqualified_member_return_type(
-                ctx.scala,
-                &ctx.resolver,
-                owner,
+            match lexically_visible_unqualified_member_return_type(
+                function,
                 method,
                 call_arities.as_deref(),
+                ctx,
             ) {
                 MemberReturnResolution::Resolved(return_type) => Some(return_type),
                 MemberReturnResolution::NoMatch => {
@@ -4523,6 +4929,71 @@ fn call_result_type(
         }
         _ => None,
     }
+}
+
+fn lexically_visible_unqualified_member_return_type(
+    node: Node<'_>,
+    member: &str,
+    call_arities: Option<&[usize]>,
+    ctx: &ScalaScan<'_, '_>,
+) -> MemberReturnResolution {
+    for declaration in enclosing_template_declarations(node) {
+        let resolution = if let Some(owner) = ctx
+            .class_ranges
+            .unit_for_exact_span(declaration.start_byte(), declaration.end_byte())
+        {
+            ctx.types.unqualified_member_return_type(
+                ctx.scala,
+                &ctx.resolver,
+                owner,
+                member,
+                call_arities,
+            )
+        } else if template_direct_term_member_named(declaration, member, ctx.source) {
+            MemberReturnResolution::Unresolved
+        } else {
+            let Some(owners) = template_supertype_owners(declaration, ctx) else {
+                return MemberReturnResolution::Unresolved;
+            };
+            ctx.types.unqualified_member_return_type_for_owners(
+                ctx.scala,
+                &ctx.resolver,
+                &owners,
+                member,
+                call_arities,
+            )
+        };
+        match resolution {
+            MemberReturnResolution::NoMatch => {}
+            resolution => return resolution,
+        }
+        let Some(self_owner) = template_self_type(declaration)
+            .and_then(|type_node| resolve_receiver_type_node(type_node, ctx))
+        else {
+            continue;
+        };
+        let mut declarations = ctx
+            .scala
+            .definitions(&self_owner)
+            .filter(CodeUnit::is_class);
+        let Some(declaration) = declarations.next() else {
+            continue;
+        };
+        if declarations.next().is_some() {
+            return MemberReturnResolution::Unresolved;
+        }
+        match ctx.types.unqualified_member_return_type(
+            ctx.scala,
+            &ctx.resolver,
+            &declaration,
+            member,
+            call_arities,
+        ) {
+            MemberReturnResolution::NoMatch => {}
+            resolution => return resolution,
+        }
+    }
+    MemberReturnResolution::NoMatch
 }
 
 fn pattern_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
@@ -4650,20 +5121,4 @@ fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
         parent = current.parent();
     }
     false
-}
-
-fn is_declaration_name(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        matches!(
-            parent.kind(),
-            "class_definition"
-                | "object_definition"
-                | "trait_definition"
-                | "enum_definition"
-                | "function_definition"
-                | "function_declaration"
-                | "parameter"
-                | "class_parameter"
-        ) && parent.child_by_field_name("name") == Some(node)
-    })
 }

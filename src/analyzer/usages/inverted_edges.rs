@@ -110,6 +110,16 @@ impl ClassRangeIndex {
             .map(|(_, _, unit, _)| unit)
     }
 
+    /// The indexed class-like declaration whose parser span is exactly
+    /// `[start, end)`. Local templates have no entry and are resolved from
+    /// their parser-recorded supertypes by the Scala usage scanners.
+    pub(crate) fn unit_for_exact_span(&self, start: usize, end: usize) -> Option<&CodeUnit> {
+        self.ranges
+            .iter()
+            .find(|(range_start, range_end, _, _)| *range_start == start && *range_end == end)
+            .map(|(_, _, unit, _)| unit)
+    }
+
     /// Apply `resolve` to class/object declarations containing `byte`, choosing
     /// the successful result from the innermost owner. This preserves exact
     /// analyzer identities without allocating or reconstructing lexical parents

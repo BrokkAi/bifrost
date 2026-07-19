@@ -6352,3 +6352,224 @@ object CandidateCollision {
         assert_no_hit_contains(&target_hits, "positive-relative-object-import");
     }
 }
+
+#[test]
+fn scala_owned_class_methods_cover_hierarchy_parameterless_and_stable_objects() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Methods.scala",
+            r#"package model
+
+trait DeepReady {
+  def ready: Boolean = false
+}
+
+class Base extends DeepReady {
+  def inherited(value: Int): Int = value
+  override def ready: Boolean = true
+  def fresh(): Base = new Base
+}
+
+trait TraitDecoy {
+  def inherited(value: Int): Int = value + 1
+  def ready: Boolean = false
+}
+
+trait AbstractReady {
+  def ready: Boolean
+}
+
+object Helpers {
+  def stable(value: Int): Int = value
+}
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+
+import model.*
+
+class Child extends Base {
+  def applied: Int = inherited(1) // positive-inherited-class
+  def bare: Boolean = ready // positive-unqualified-parameterless
+  def chained: String = ready.toString // positive-unqualified-parameterless-chain
+}
+
+class Qualified {
+  def use(base: Base): Boolean = base.ready // positive-qualified-parameterless
+  def stable: Int = Helpers.stable(1) // positive-stable-object
+}
+
+class FactoryScope {
+  def makeBase(): Base = new Base
+  class Nested {
+    def local: Boolean = {
+      val base = makeBase()
+      base.ready // positive-lexical-factory-result
+    }
+  }
+}
+
+class LocalObjectScope {
+  def build: Boolean = {
+    object Logic extends Base {
+      def local: Boolean = ready // positive-local-object-hierarchy
+      def viaFactory: Boolean = {
+        val base = fresh()
+        base.ready // positive-local-object-factory-result
+      }
+    }
+    Logic.local
+  }
+}
+
+class LocalDeclarationBlock {
+  def localVal: Boolean = {
+    abstract class Logic extends Base {
+      val ready: Boolean
+      def read: Boolean = ready // negative-local-val-declaration
+    }
+    true
+  }
+
+  def localVar: Boolean = {
+    abstract class Logic extends Base {
+      var ready: Boolean
+      def read: Boolean = ready // negative-local-var-declaration
+    }
+    true
+  }
+}
+
+class NestedFactory {
+  final class Product() {
+    def available: Boolean = true
+  }
+  def use: Boolean = {
+    val product = Product()
+    product.available // positive-nested-universal-apply-binding
+  }
+}
+
+class Ambiguous extends Base with TraitDecoy {
+  def use: Int = inherited(2) // negative-same-depth-owner
+}
+
+class AbstractContract extends Base with AbstractReady {
+  def use: Boolean = ready // positive-abstract-trait-contract
+}
+
+class FieldBlock extends Base {
+  val ready: Boolean = false
+  def use: Boolean = ready // negative-direct-field-block
+}
+
+class ObjectBlock extends Base {
+  object ready
+  def use: Any = ready // negative-direct-object-block
+}
+
+class AliasDoesNotBlock extends Base {
+  type ready = Int
+  def use: Boolean = ready // positive-type-alias-separate-namespace
+}
+
+trait SelfNoMember
+class OuterCarrier extends Base {
+  trait SelfScope { self: SelfNoMember =>
+    class Inner {
+      def use: Boolean = ready // positive-self-no-match-continues-outer
+    }
+  }
+}
+"#,
+        ),
+    ]);
+
+    for (target, marker) in [
+        ("model.Base.inherited", "positive-inherited-class"),
+        ("model.Base.ready", "positive-unqualified-parameterless"),
+        (
+            "model.Base.ready",
+            "positive-unqualified-parameterless-chain",
+        ),
+        ("model.Base.ready", "positive-qualified-parameterless"),
+        ("model.Base.ready", "positive-lexical-factory-result"),
+        ("model.Base.ready", "positive-local-object-hierarchy"),
+        ("model.Base.ready", "positive-local-object-factory-result"),
+        ("model.Base.ready", "positive-abstract-trait-contract"),
+        ("model.Base.ready", "positive-type-alias-separate-namespace"),
+        ("model.Base.ready", "positive-self-no-match-continues-outer"),
+        (
+            "app.NestedFactory.Product.available",
+            "positive-nested-universal-apply-binding",
+        ),
+        ("model.Helpers$.stable", "positive-stable-object"),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&target_hits, marker);
+        assert_no_hit_contains(&target_hits, "negative-same-depth-owner");
+        assert_no_hit_contains(&target_hits, "negative-direct-field-block");
+        assert_no_hit_contains(&target_hits, "negative-direct-object-block");
+        assert_no_hit_contains(&target_hits, "negative-local-val-declaration");
+        assert_no_hit_contains(&target_hits, "negative-local-var-declaration");
+    }
+}
+
+#[test]
+fn scala_self_type_is_a_class_member_visibility_tier_not_an_ancestor() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Mailbox.scala",
+            r#"package model
+
+class Mailbox {
+  def systemQueueGet: Int = 1
+}
+
+class OuterBase {
+  def ping: Int = 2
+}
+
+class SelfBase {
+  def ping: Int = 3
+}
+"#,
+        ),
+        (
+            "queue/Queues.scala",
+            r#"package queue
+
+import model.{Mailbox => BoundMailbox, OuterBase, SelfBase}
+
+trait DefaultQueue { self: BoundMailbox =>
+  def drain: Int = systemQueueGet // positive-self-type-class-member
+}
+
+trait Outer extends OuterBase { self: SelfBase =>
+  class Inner {
+    def use: Int = ping // positive-outer-owner-before-outer-self-type
+  }
+}
+"#,
+        ),
+    ]);
+
+    let mailbox_get = definition(&analyzer, "model.Mailbox.systemQueueGet");
+    let mailbox_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&mailbox_get)));
+    assert_hit_contains(&mailbox_hits, "positive-self-type-class-member");
+
+    let outer_ping = definition(&analyzer, "model.OuterBase.ping");
+    let outer_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&outer_ping)));
+    assert_hit_contains(&outer_hits, "positive-outer-owner-before-outer-self-type");
+
+    let self_ping = definition(&analyzer, "model.SelfBase.ping");
+    let self_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&self_ping)));
+    assert_no_hit_contains(&self_hits, "positive-outer-owner-before-outer-self-type");
+}

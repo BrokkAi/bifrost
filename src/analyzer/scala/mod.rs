@@ -34,7 +34,9 @@ pub(crate) use adapter::ScalaAdapter;
 use clones::{build_scala_clone_candidate_data, refine_scala_clone_similarity};
 pub(crate) use declarations::scala_class_parameter_field_keyword;
 pub(crate) use imports::{ScalaExportInfo, ScalaExportSelector, scala_lexical_scope_path_at};
-pub(crate) use supertypes::{ScalaSupertypeLookupPath, scala_type_lookup_segments};
+pub(crate) use supertypes::{
+    ScalaSupertypeLookupPath, scala_supertype_lookup_nodes, scala_type_lookup_segments,
+};
 use tests::detect_scala_test_assertion_smells;
 pub(crate) use wildcard_imports::{
     ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaWildcardImportEnvironment,

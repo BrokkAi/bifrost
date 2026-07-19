@@ -3,8 +3,9 @@ use super::inverted::{
     TypeApplicationResolution, TypeApplicationRole,
 };
 use crate::analyzer::scala::imports::scala_import_infos_from_node;
-use crate::analyzer::scala::scala_type_lookup_segments;
+use crate::analyzer::scala::{scala_supertype_lookup_nodes, scala_type_lookup_segments};
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
+use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::scala_graph::hits::{
@@ -18,15 +19,15 @@ use crate::analyzer::usages::scala_graph::resolver::{
 use crate::analyzer::usages::scala_graph::syntax::{
     ScalaCallableParameterList, ScalaImportContextIndex, ScalaMethodValueContext,
     ScalaPackageContextIndex, ScalaParameterListKind, ScalaQualifiedStableTypeRole,
-    call_arities_for_reference, has_ancestor_kind, has_member_qualifier,
-    infix_receiver_for_operator, is_bare_companion_method_value_reference,
-    is_call_function_reference, is_constructor_like_reference, is_extractor_reference,
-    is_identifier_node, is_infix_pattern_operator, is_owner_qualified_this,
+    call_arities_for_reference, enclosing_template_declarations, has_ancestor_kind,
+    has_member_qualifier, infix_receiver_for_operator, is_bare_companion_method_value_reference,
+    is_call_function_reference, is_constructor_like_reference, is_declaration_name,
+    is_extractor_reference, is_identifier_node, is_infix_pattern_operator, is_owner_qualified_this,
     is_scala_class_reference, is_scala_object_reference, is_terminal_stable_field_reference,
     member_qualifier, member_qualifier_node, named_argument_invocation_owner, node_text,
     parenthesized_arity, qualified_stable_type_reference, resolve_stable_object_expression,
     scala_union_type_alternative_paths, stable_identifier_reference,
-    terminal_invocation_owner_name,
+    template_direct_term_member_named, template_self_type, terminal_invocation_owner_name,
 };
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile, Range, ScalaAnalyzer,
@@ -72,6 +73,7 @@ pub(super) fn scan_file(
     let imports = scala.import_info_of(file);
     let import_contexts = ScalaImportContextIndex::new(&imports, tree.root_node().end_byte());
     let package_contexts = ScalaPackageContextIndex::new(tree.root_node(), &source);
+    let class_ranges = ClassRangeIndex::build(analyzer, file);
     let name_resolver = Arc::new(NameResolver::for_file_with_facts(
         scala,
         Some(file),
@@ -103,6 +105,7 @@ pub(super) fn scan_file(
         import_contexts,
         import_context_cursor: 0,
         package_contexts,
+        class_ranges,
         package_context_cursor: 0,
         active_resolver_key: None,
         resolver_contexts: HashMap::default(),
@@ -130,6 +133,7 @@ pub(super) struct ScanCtx<'a> {
     import_contexts: ScalaImportContextIndex,
     import_context_cursor: usize,
     package_contexts: ScalaPackageContextIndex,
+    class_ranges: ClassRangeIndex,
     package_context_cursor: usize,
     active_resolver_key: Option<ResolverContextKey>,
     resolver_contexts: HashMap<ResolverContextKey, ResolverContext>,
@@ -741,7 +745,8 @@ fn seed_value_definition(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let resolved_type_owner = node
         .child_by_field_name("type")
         .and_then(|type_node| resolve_type_node(type_node, ctx));
-    let resolved_constructed_owner = value.and_then(|value| constructed_type_owner(value, ctx));
+    let resolved_constructed_owner =
+        value.and_then(|value| constructed_or_applied_type_owner(value, ctx));
     let value_name =
         value.and_then(|value_node| constructor_type_name(node_text(value_node, ctx.source)));
     let resolved_value_owner = value.and_then(|value| call_initializer_return_owner(value, ctx));
@@ -776,6 +781,30 @@ fn constructed_type_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
     node.named_children(&mut cursor)
         .find(|child| !matches!(child.kind(), "arguments" | "template_body"))
         .and_then(|type_node| resolve_type_node(type_node, ctx))
+}
+
+fn constructed_or_applied_type_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
+    constructed_type_owner(node, ctx).or_else(|| {
+        if node.kind() != "call_expression" {
+            return None;
+        }
+        let function = node.child_by_field_name("function")?;
+        if !matches!(function.kind(), "identifier" | "type_identifier") {
+            return None;
+        }
+        let name = node_text(function, ctx.source).trim();
+        if name.is_empty() {
+            return None;
+        }
+        resolve_unqualified_type_application(
+            function,
+            name,
+            TypeApplicationRole::BareApplication,
+            ctx,
+        )
+        .and_then(|resolution| resolution.type_target)
+        .map(|target| target.fq_name())
+    })
 }
 
 fn constructed_receiver_type_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
@@ -935,18 +964,15 @@ fn call_initializer_return_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<St
                 return None;
             }
             let call_arities = call_arities_for_reference(function);
-            if let Some(owner) = enclosing_owner(function, ctx) {
-                match ctx.types.unqualified_member_return_type(
-                    ctx.scala,
-                    &ctx.name_resolver,
-                    &owner,
-                    member_name,
-                    call_arities.as_deref(),
-                ) {
-                    MemberReturnResolution::Resolved(return_type) => return Some(return_type),
-                    MemberReturnResolution::Unresolved => return None,
-                    MemberReturnResolution::NoMatch => {}
-                }
+            match lexically_visible_unqualified_member_return_type(
+                function,
+                member_name,
+                call_arities.as_deref(),
+                ctx,
+            ) {
+                MemberReturnResolution::Resolved(return_type) => return Some(return_type),
+                MemberReturnResolution::Unresolved => return None,
+                MemberReturnResolution::NoMatch => {}
             }
             ctx.name_resolver
                 .resolve_member(member_name)
@@ -982,6 +1008,71 @@ fn seed_value_definition_from_text(text: &str, ctx: &mut ScanCtx<'_>) {
         .split_once('=')
         .and_then(|(_, value)| constructor_type_name(value));
     seed_or_shadow_typed_symbol(name, type_name, value_name, ctx);
+}
+
+fn lexically_visible_unqualified_member_return_type(
+    node: Node<'_>,
+    member: &str,
+    call_arities: Option<&[usize]>,
+    ctx: &ScanCtx<'_>,
+) -> MemberReturnResolution {
+    for declaration in enclosing_template_declarations(node) {
+        let resolution = if let Some(owner) = ctx
+            .class_ranges
+            .unit_for_exact_span(declaration.start_byte(), declaration.end_byte())
+        {
+            ctx.types.unqualified_member_return_type(
+                ctx.scala,
+                &ctx.name_resolver,
+                owner,
+                member,
+                call_arities,
+            )
+        } else if template_direct_term_member_named(declaration, member, ctx.source) {
+            MemberReturnResolution::Unresolved
+        } else {
+            let Some(owners) = template_supertype_owners(declaration, ctx) else {
+                return MemberReturnResolution::Unresolved;
+            };
+            ctx.types.unqualified_member_return_type_for_owners(
+                ctx.scala,
+                &ctx.name_resolver,
+                &owners,
+                member,
+                call_arities,
+            )
+        };
+        match resolution {
+            MemberReturnResolution::NoMatch => {}
+            resolution => return resolution,
+        }
+        let Some(self_owner) =
+            template_self_type(declaration).and_then(|type_node| resolve_type_node(type_node, ctx))
+        else {
+            continue;
+        };
+        let mut declarations = ctx
+            .scala
+            .definitions(&self_owner)
+            .filter(CodeUnit::is_class);
+        let Some(declaration) = declarations.next() else {
+            continue;
+        };
+        if declarations.next().is_some() {
+            return MemberReturnResolution::Unresolved;
+        }
+        match ctx.types.unqualified_member_return_type(
+            ctx.scala,
+            &ctx.name_resolver,
+            &declaration,
+            member,
+            call_arities,
+        ) {
+            MemberReturnResolution::NoMatch => {}
+            resolution => return resolution,
+        }
+    }
+    MemberReturnResolution::NoMatch
 }
 
 fn seed_or_shadow_typed_symbol(
@@ -1089,7 +1180,7 @@ fn seed_case_pattern_shadow(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if has_ancestor_kind(node, "import_declaration") {
+    if has_ancestor_kind(node, "import_declaration") || is_declaration_name(node) {
         return;
     }
     let text = node_text(node, ctx.source).trim();
@@ -1601,6 +1692,16 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
             }
         };
     };
+    if target_is_owned_ordinary_class_method(ctx)
+        && let Some(owner_fq_name) = structured_receiver_type(qualifier_node, ctx)
+    {
+        return ordinary_class_owner_matches_target(
+            &owner_fq_name,
+            text,
+            call_arities_for_reference(node).as_deref(),
+            ctx,
+        );
+    }
     if ctx.spec.kind == TargetKind::Field
         && let Some(owner_fq_name) = structured_receiver_type(qualifier_node, ctx)
     {
@@ -1685,33 +1786,156 @@ fn bare_member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>
     if !member_call_arities_match(call_arities.as_deref(), ctx) {
         return false;
     }
-    let Some(mut owner) = enclosing_owner(node, ctx) else {
+    let templates = enclosing_template_declarations(node);
+    if templates.is_empty() {
         return false;
-    };
-    loop {
-        match ctx.types.bare_member_declarations_for_owner(
-            ctx.scala,
-            &owner,
-            text,
-            call_arities.as_deref(),
-        ) {
+    }
+    for declaration in templates {
+        let resolution = if target_is_owned_ordinary_class_method(ctx) {
+            ordinary_class_member_declarations_for_template(
+                declaration,
+                text,
+                call_arities.as_deref(),
+                ctx,
+            )
+        } else {
+            let Some(owner) = ctx
+                .class_ranges
+                .unit_for_exact_span(declaration.start_byte(), declaration.end_byte())
+            else {
+                return false;
+            };
+            ctx.types.bare_member_declarations_for_owner(
+                ctx.scala,
+                owner,
+                text,
+                call_arities.as_deref(),
+            )
+        };
+        match resolution {
             BareMemberResolution::Resolved(methods) => {
-                return !methods.is_empty()
-                    && methods.iter().all(|method| {
-                        ctx.scala
-                            .structural_parent_of(method)
-                            .or_else(|| ctx.scala.parent_of(method))
-                            .is_some_and(|owner| ctx.spec.owner_fq_matches(&owner.fq_name()))
-                    });
+                return methods_match_target_owner(&methods, ctx);
             }
             BareMemberResolution::Unresolved => return false,
             BareMemberResolution::NoMatch => {}
         }
-        let Some(parent) = ctx.analyzer.parent_of(&owner) else {
-            return false;
-        };
-        owner = parent;
+        if target_is_owned_ordinary_class_method(ctx)
+            && let Some(self_owner) = template_self_type(declaration)
+                .and_then(|type_node| resolve_type_node(type_node, ctx))
+        {
+            match ordinary_class_owner_resolution(&self_owner, text, call_arities.as_deref(), ctx) {
+                BareMemberResolution::Resolved(methods) => {
+                    return methods_match_target_owner(&methods, ctx);
+                }
+                BareMemberResolution::Unresolved => return false,
+                BareMemberResolution::NoMatch => {}
+            }
+        }
     }
+    false
+}
+
+fn ordinary_class_member_declarations_for_template(
+    declaration: Node<'_>,
+    member: &str,
+    call_arities: Option<&[usize]>,
+    ctx: &ScanCtx<'_>,
+) -> BareMemberResolution {
+    if let Some(owner) = ctx
+        .class_ranges
+        .unit_for_exact_span(declaration.start_byte(), declaration.end_byte())
+    {
+        return ctx.types.ordinary_class_member_declarations_for_owner(
+            ctx.scala,
+            owner,
+            member,
+            call_arities,
+        );
+    }
+    if template_direct_term_member_named(declaration, member, ctx.source) {
+        return BareMemberResolution::Unresolved;
+    }
+    let Some(owners) = template_supertype_owners(declaration, ctx) else {
+        return BareMemberResolution::Unresolved;
+    };
+    if owners.is_empty() {
+        BareMemberResolution::NoMatch
+    } else {
+        ctx.types.ordinary_class_member_declarations_for_owners(
+            ctx.scala,
+            &owners,
+            member,
+            call_arities,
+        )
+    }
+}
+
+fn template_supertype_owners(declaration: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Vec<CodeUnit>> {
+    let mut owners = Vec::new();
+    for (_, lookup_node) in scala_supertype_lookup_nodes(declaration) {
+        let fqn = resolve_type_node(lookup_node, ctx)?;
+        let mut declarations = ctx.scala.definitions(&fqn).filter(CodeUnit::is_class);
+        let owner = declarations.next()?;
+        if declarations.next().is_some() {
+            return None;
+        }
+        owners.push(owner);
+    }
+    Some(owners)
+}
+
+fn target_is_owned_ordinary_class_method(ctx: &ScanCtx<'_>) -> bool {
+    ctx.spec.kind == TargetKind::Method
+        && !ctx.spec.is_extension_method
+        && ctx
+            .spec
+            .owner
+            .as_ref()
+            .is_some_and(|owner| !ctx.types.is_scala_trait_declaration(ctx.scala, owner))
+}
+
+fn methods_match_target_owner(methods: &[CodeUnit], ctx: &ScanCtx<'_>) -> bool {
+    !methods.is_empty()
+        && methods.iter().all(|method| {
+            method == &ctx.spec.target
+                || ctx
+                    .scala
+                    .structural_parent_of(method)
+                    .or_else(|| ctx.scala.parent_of(method))
+                    .is_some_and(|owner| ctx.spec.owner_fq_matches(&owner.fq_name()))
+        })
+}
+
+fn ordinary_class_owner_matches_target(
+    owner_fq_name: &str,
+    member: &str,
+    call_arities: Option<&[usize]>,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    match ordinary_class_owner_resolution(owner_fq_name, member, call_arities, ctx) {
+        BareMemberResolution::Resolved(methods) => methods_match_target_owner(&methods, ctx),
+        BareMemberResolution::NoMatch | BareMemberResolution::Unresolved => false,
+    }
+}
+
+fn ordinary_class_owner_resolution(
+    owner_fq_name: &str,
+    member: &str,
+    call_arities: Option<&[usize]>,
+    ctx: &ScanCtx<'_>,
+) -> BareMemberResolution {
+    let mut owners = ctx
+        .scala
+        .definitions(owner_fq_name)
+        .filter(CodeUnit::is_class);
+    let Some(owner) = owners.next() else {
+        return BareMemberResolution::NoMatch;
+    };
+    if owners.next().is_some() {
+        return BareMemberResolution::Unresolved;
+    }
+    ctx.types
+        .ordinary_class_member_declarations_for_owner(ctx.scala, &owner, member, call_arities)
 }
 
 fn contextual_method_value_call_arities(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Vec<usize>> {
@@ -2226,36 +2450,17 @@ fn receiver_owner_resolves_to_method_family(owner: CodeUnit, ctx: &ScanCtx<'_>) 
 }
 
 fn enclosing_matches_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    let range = Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row,
-        end_line: node.end_position().row,
-    };
-    let mut current = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
-    while let Some(unit) = current {
-        if unit.is_class() && ctx.spec.receiver_owner_fq_matches(&unit.fq_name()) {
-            return true;
-        }
-        current = ctx.analyzer.parent_of(&unit);
-    }
-    false
+    ctx.class_ranges
+        .find_in_enclosing_units(node.start_byte(), |owner| {
+            ctx.spec
+                .receiver_owner_fq_matches(&owner.fq_name())
+                .then_some(())
+        })
+        .is_some()
 }
 
 fn enclosing_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
-    let range = Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row,
-        end_line: node.end_position().row,
-    };
-    let enclosing = ctx.analyzer.enclosing_code_unit(ctx.file, &range)?;
-    if enclosing.is_class() {
-        return Some(enclosing);
-    }
-    ctx.analyzer
-        .parent_of(&enclosing)
-        .filter(|owner| owner.is_class())
+    ctx.class_ranges.enclosing_unit(node.start_byte()).cloned()
 }
 
 fn enclosing_owner_fq_name(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {

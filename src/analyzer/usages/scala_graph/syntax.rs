@@ -10,6 +10,7 @@ pub(crate) struct ScalaSourceFacts {
     pub(crate) field_type_paths_by_range: HashMap<(usize, usize), Vec<String>>,
     pub(crate) stable_owner_ranges: HashSet<(usize, usize)>,
     pub(crate) case_class_ranges: HashSet<(usize, usize)>,
+    pub(crate) abstract_callable_ranges: HashSet<(usize, usize)>,
 }
 
 #[derive(Clone)]
@@ -70,6 +71,11 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                 }
             }
             "function_definition" | "function_declaration" => {
+                if node.kind() == "function_declaration" {
+                    facts
+                        .abstract_callable_ranges
+                        .insert((node.start_byte(), node.end_byte()));
+                }
                 let mut cursor = node.walk();
                 let parameter_lists = node
                     .named_children(&mut cursor)
@@ -1022,8 +1028,134 @@ pub(crate) fn terminal_invocation_owner_name(node: Node<'_>) -> Option<Node<'_>>
     }
 }
 
+/// Enclosing class/object/trait/enum declarations from the innermost template
+/// to the outermost. This includes local templates that the analyzer does not
+/// publish as global declarations.
+pub(crate) fn enclosing_template_declarations(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut declarations = Vec::new();
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if matches!(parent.kind(), "template_body" | "enum_body")
+            && let Some(declaration) = parent.parent()
+            && matches!(
+                declaration.kind(),
+                "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
+            )
+        {
+            declarations.push(declaration);
+        }
+        current = parent;
+    }
+    declarations
+}
+
+pub(crate) fn template_self_type(declaration: Node<'_>) -> Option<Node<'_>> {
+    let mut declaration_cursor = declaration.walk();
+    declaration
+        .named_children(&mut declaration_cursor)
+        .find(|child| matches!(child.kind(), "template_body" | "enum_body"))
+        .and_then(|body| {
+            let mut body_cursor = body.walk();
+            body.named_children(&mut body_cursor)
+                .find(|child| child.kind() == "self_type")
+        })
+        .and_then(|self_type| {
+            let mut self_cursor = self_type.walk();
+            let mut children = self_type.named_children(&mut self_cursor);
+            let _binder = children.next()?;
+            children.next()
+        })
+}
+
+/// Whether a template directly declares a term with `name`. For local
+/// templates, such a declaration must conservatively block inherited-member
+/// resolution because it has no globally indexed CodeUnit/signature.
+pub(crate) fn template_direct_term_member_named(
+    declaration: Node<'_>,
+    name: &str,
+    source: &str,
+) -> bool {
+    let mut declaration_cursor = declaration.walk();
+    let Some(body) = declaration
+        .named_children(&mut declaration_cursor)
+        .find(|child| matches!(child.kind(), "template_body" | "enum_body"))
+    else {
+        return false;
+    };
+    let mut body_cursor = body.walk();
+    body.named_children(&mut body_cursor).any(|child| {
+        if matches!(
+            child.kind(),
+            "function_definition"
+                | "function_declaration"
+                | "object_definition"
+                | "val_definition"
+                | "val_declaration"
+                | "var_definition"
+                | "var_declaration"
+        ) && child
+            .child_by_field_name("name")
+            .is_some_and(|node| node_text(node, source).trim() == name)
+        {
+            return true;
+        }
+        if !matches!(
+            child.kind(),
+            "val_definition" | "val_declaration" | "var_definition" | "var_declaration"
+        ) {
+            return false;
+        }
+        child
+            .child_by_field_name("pattern")
+            .is_some_and(|pattern| pattern_contains_identifier(pattern, name, source))
+    })
+}
+
+fn pattern_contains_identifier(node: Node<'_>, name: &str, source: &str) -> bool {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if matches!(current.kind(), "identifier" | "operator_identifier")
+            && node_text(current, source).trim() == name
+        {
+            return true;
+        }
+        if current.kind() == "stable_identifier" {
+            continue;
+        }
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    false
+}
+
 pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     &source[node.byte_range()]
+}
+
+pub(crate) fn is_declaration_name(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        if parent.kind() == "type_definition" {
+            let mut cursor = parent.walk();
+            return parent
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "identifier")
+                == Some(node);
+        }
+        matches!(
+            parent.kind(),
+            "class_definition"
+                | "object_definition"
+                | "trait_definition"
+                | "enum_definition"
+                | "function_definition"
+                | "function_declaration"
+                | "parameter"
+                | "class_parameter"
+        ) && parent.child_by_field_name("name") == Some(node)
+    })
 }
 
 #[cfg(test)]

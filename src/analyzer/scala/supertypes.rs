@@ -33,21 +33,29 @@ pub(super) fn extract_scala_supertypes(
     declaration: Node<'_>,
     source: &str,
 ) -> Vec<ScalaSupertypeFact> {
+    scala_supertype_lookup_nodes(declaration)
+        .into_iter()
+        .map(|(parent, lookup_node)| ScalaSupertypeFact {
+            raw: node_text(parent, source).to_string(),
+            lookup_path: ScalaSupertypeLookupPath {
+                segments: scala_type_lookup_segments(lookup_node, source),
+            },
+        })
+        .filter(|fact| !fact.lookup_path.segments.is_empty())
+        .collect()
+}
+
+/// Direct parser-owned supertype roots and their lookup nodes for a Scala
+/// template declaration. Local classes and objects are intentionally absent
+/// from the declaration index, so usage analysis needs the same structured AST
+/// facts without inventing a source-text parser.
+pub(crate) fn scala_supertype_lookup_nodes(declaration: Node<'_>) -> Vec<(Node<'_>, Node<'_>)> {
     let Some(extends_clause) = declaration.child_by_field_name("extend") else {
         return Vec::new();
     };
     direct_parent_type_nodes(extends_clause)
         .into_iter()
-        .filter_map(|parent| {
-            let lookup_node = supertype_lookup_node(parent)?;
-            Some(ScalaSupertypeFact {
-                raw: node_text(parent, source).to_string(),
-                lookup_path: ScalaSupertypeLookupPath {
-                    segments: scala_type_lookup_segments(lookup_node, source),
-                },
-            })
-        })
-        .filter(|fact| !fact.lookup_path.segments.is_empty())
+        .filter_map(|parent| supertype_lookup_node(parent).map(|lookup| (parent, lookup)))
         .collect()
 }
 

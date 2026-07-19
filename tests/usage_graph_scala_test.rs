@@ -46,6 +46,269 @@ object Use {
 }
 
 #[test]
+fn scala_inverted_records_owned_class_hierarchy_parameterless_and_self_type_edges() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Members.scala",
+            r#"package app
+
+trait DeepReady { def ready: Boolean = false }
+class Base extends DeepReady {
+  def ready: Boolean = true
+  def run(value: Int): Int = value
+  def execute(value: Int): Int = value
+  def fresh(): Base = new Base
+}
+class Mid extends Base
+class Child extends Mid {
+  def bare: Boolean = ready
+  def applied: Int = run(1)
+}
+class Use {
+  def qualified(base: Base): Boolean = base.ready
+}
+class FactoryScope {
+  def makeBase(): Base = new Base
+  class Nested {
+    def local: Boolean = {
+      val base = makeBase()
+      base.ready
+    }
+  }
+}
+class LocalObjectScope {
+  def build: Boolean = {
+    object Logic extends Base {
+      def local: Boolean = ready
+      def viaFactory: Boolean = {
+        val base = fresh()
+        base.ready
+      }
+    }
+    Logic.local
+  }
+}
+class LocalValDeclarationBlock {
+  def build: Boolean = {
+    abstract class Logic extends Base {
+      val ready: Boolean
+      def local: Boolean = ready
+    }
+    true
+  }
+}
+class LocalVarDeclarationBlock {
+  def build: Boolean = {
+    abstract class Logic extends Base {
+      var ready: Boolean
+      def local: Boolean = ready
+    }
+    true
+  }
+}
+class NestedFactory {
+  final class Product() {
+    def available: Boolean = true
+  }
+  def use: Boolean = {
+    val product = Product()
+    product.available
+  }
+}
+
+class Mailbox { def systemQueueGet: Int = 1 }
+trait Queue { self: Mailbox =>
+  def drain: Int = systemQueueGet
+}
+
+class Shadow extends Base {
+  val ready: Boolean = false
+  def read: Boolean = ready
+}
+class ObjectBlock extends Base {
+  object ready
+  def read: Any = ready
+}
+class AliasDoesNotBlock extends Base {
+  type ready = Int
+  def read: Boolean = ready
+}
+trait TraitReady {
+  def ready: Boolean = false
+  def execute(value: Int): Int = value + 1
+}
+class Ambiguous extends Base with TraitReady {
+  def read: Boolean = ready
+  def applied: Int = execute(1)
+  def qualified(value: Ambiguous): Int = value.execute(2)
+  def infix(value: Ambiguous): Int = value execute 3
+}
+trait LeftExecute { def deep(value: Int): Int = value }
+trait RightRoot extends LeftExecute { override def deep(value: Int): Int = value + 1 }
+trait RightLeaf extends RightRoot
+class DeepMixin extends LeftExecute with RightLeaf {
+  def applied: Int = deep(1)
+  def qualified(value: DeepMixin): Int = value.deep(2)
+  def infix(value: DeepMixin): Int = value deep 3
+}
+trait SharedRoot { def shared(value: Int): Int = value }
+trait SharedLeft extends SharedRoot { override def shared(value: Int): Int = value + 1 }
+trait SharedRight extends SharedRoot
+class SharedMixin extends SharedLeft with SharedRight {
+  def applied: Int = shared(1)
+  def qualified(value: SharedMixin): Int = value.shared(2)
+  def infix(value: SharedMixin): Int = value shared 3
+}
+trait AbstractReady { def ready: Boolean }
+class AbstractContract extends Base with AbstractReady {
+  def read: Boolean = ready
+}
+
+class OuterBase { def token: Int = 1 }
+class SelfBase { def token: Int = 2 }
+trait Outer extends OuterBase { self: SelfBase =>
+  class Inner { def read: Int = token }
+}
+
+trait SelfNoMember
+class OuterCarrier extends Base {
+  trait SelfScope { self: SelfNoMember =>
+    class Inner { def read: Boolean = ready }
+  }
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+
+    for (caller, callee) in [
+        ("app.Child.bare", "app.Base.ready"),
+        ("app.Child.applied", "app.Base.run"),
+        ("app.Use.qualified", "app.Base.ready"),
+        ("app.FactoryScope.Nested.local", "app.Base.ready"),
+        ("app.LocalObjectScope.build", "app.Base.ready"),
+        ("app.AbstractContract.read", "app.Base.ready"),
+        ("app.AliasDoesNotBlock.read", "app.Base.ready"),
+        ("app.OuterCarrier.SelfScope.Inner.read", "app.Base.ready"),
+        (
+            "app.NestedFactory.use",
+            "app.NestedFactory.Product.available",
+        ),
+        ("app.Queue.drain", "app.Mailbox.systemQueueGet"),
+        ("app.Outer.Inner.read", "app.OuterBase.token"),
+    ] {
+        assert!(
+            has_edge(&value, caller, callee),
+            "missing owned-class edge {caller} -> {callee}: {}",
+            value["edges"]
+        );
+    }
+    for caller in [
+        "app.Shadow.read",
+        "app.ObjectBlock.read",
+        "app.Ambiguous.read",
+        "app.Ambiguous.applied",
+        "app.Ambiguous.qualified",
+        "app.Ambiguous.infix",
+        "app.LocalValDeclarationBlock.build",
+        "app.LocalVarDeclarationBlock.build",
+    ] {
+        assert!(
+            !has_edge(
+                &value,
+                caller,
+                if caller.starts_with("app.Ambiguous.") {
+                    "app.Base.execute"
+                } else {
+                    "app.Base.ready"
+                }
+            ),
+            "field/trait ambiguity leaked {caller} -> Base.ready: {}",
+            value["edges"]
+        );
+    }
+    for caller in [
+        "app.DeepMixin.applied",
+        "app.DeepMixin.qualified",
+        "app.DeepMixin.infix",
+    ] {
+        assert!(
+            has_edge(&value, caller, "app.RightRoot.deep"),
+            "right parent chain did not win {caller}: {}",
+            value["edges"]
+        );
+        assert!(
+            !has_edge(&value, caller, "app.LeftExecute.deep"),
+            "nearer left parent leaked into {caller}: {}",
+            value["edges"]
+        );
+    }
+    for caller in [
+        "app.SharedMixin.applied",
+        "app.SharedMixin.qualified",
+        "app.SharedMixin.infix",
+    ] {
+        assert!(
+            has_edge(&value, caller, "app.SharedLeft.shared"),
+            "duplicate-eliding linearization did not reach left override for {caller}: {}",
+            value["edges"]
+        );
+        assert!(
+            !has_edge(&value, caller, "app.SharedRoot.shared"),
+            "shared ancestor outranked left override for {caller}: {}",
+            value["edges"]
+        );
+    }
+    for caller in [
+        "app.Ambiguous.applied",
+        "app.Ambiguous.qualified",
+        "app.Ambiguous.infix",
+    ] {
+        assert!(
+            has_edge(&value, caller, "app.TraitReady.execute"),
+            "concrete rightmost trait did not win {caller}: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        !has_edge(&value, "app.Outer.Inner.read", "app.SelfBase.token"),
+        "outer self type outranked its lexical owner hierarchy: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn scala_wildcard_package_and_package_object_keep_unique_stable_objects_visible() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/package.scala",
+            "package object model { def packageMember: Int = 1 }\n",
+        )
+        .file(
+            "model/BrowserEval.scala",
+            "package model\nobject BrowserEval { def clickAtActionable: Int = 1 }\n",
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+import model.*
+object Use { def click: Int = BrowserEval.clickAtActionable }
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(
+            &value,
+            "app.Use$.click",
+            "model.BrowserEval$.clickAtActionable"
+        ),
+        "package/package-object wildcard hid unique stable object: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn resolves_instance_object_and_unqualified_calls() {
     let value = usage_graph();
 
