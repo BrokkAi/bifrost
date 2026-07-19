@@ -719,7 +719,7 @@ fn seed_parameter(parameter: Node<'_>, ctx: &mut ScanCtx<'_>) {
             .iter()
             .map(|path| {
                 ctx.types
-                    .resolve_type_in_declaration_context(&ctx.name_resolver, path)
+                    .resolve_type_in_declaration_context(ctx.scala, &ctx.name_resolver, path)
             })
             .collect::<Option<Vec<_>>>();
         if let Some(owners) = owners {
@@ -854,7 +854,7 @@ fn resolve_type_node(type_node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
         ScalaTypeNamespaceResolution::NoMatch => {}
     }
     ctx.types
-        .resolve_type_in_declaration_context(&ctx.name_resolver, &path)
+        .resolve_type_in_declaration_context(ctx.scala, &ctx.name_resolver, &path)
         .or_else(|| {
             (path.len() == 1)
                 .then(|| scala_builtin_type_name(&path[0]).map(str::to_string))
@@ -1430,11 +1430,11 @@ fn exact_lexically_visible_type_root(
         .exact_lexical_type_namespace(ctx.scala, owners, root_name, false)
 }
 
-fn lexically_visible_nested_object(
+fn lexically_visible_nested_object_unit(
     node: Node<'_>,
     name: &str,
     ctx: &ScanCtx<'_>,
-) -> Option<String> {
+) -> Option<CodeUnit> {
     let range = Range {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
@@ -1446,13 +1446,21 @@ fn lexically_visible_nested_object(
         if unit.is_class()
             && let Some(nested) = ctx
                 .types
-                .exact_nested_object(ctx.scala, &unit.fq_name(), name)
+                .exact_nested_object_for_owner(ctx.scala, &unit, name)
         {
             return Some(nested);
         }
         current = ctx.analyzer.parent_of(&unit);
     }
     None
+}
+
+fn lexically_visible_nested_object(
+    node: Node<'_>,
+    name: &str,
+    ctx: &ScanCtx<'_>,
+) -> Option<String> {
+    lexically_visible_nested_object_unit(node, name, ctx).map(|unit| unit.fq_name())
 }
 
 fn resolve_qualified_stable_type_at(
@@ -1463,12 +1471,12 @@ fn resolve_qualified_stable_type_at(
 ) -> Option<String> {
     let root = segments.first()?;
     let lexical_root = if terminal_object {
-        lexically_visible_nested_object(node, root, ctx)
+        lexically_visible_nested_object_unit(node, root, ctx)
     } else {
         match exact_lexically_visible_type_root(node, ctx) {
-            ScalaTypeNamespaceResolution::Resolved(declaration) => Some(declaration.fq_name()),
+            ScalaTypeNamespaceResolution::Resolved(declaration) => Some(declaration),
             ScalaTypeNamespaceResolution::NoMatch => {
-                lexically_visible_nested_object(node, root, ctx)
+                lexically_visible_nested_object_unit(node, root, ctx)
             }
             ScalaTypeNamespaceResolution::AuthoritativeMiss
             | ScalaTypeNamespaceResolution::Ambiguous => return None,

@@ -1,8 +1,9 @@
 use super::*;
 use crate::analyzer::scala::{
     ScalaSupertypeLookupPath, ScalaWildcardImportEnvironment, ScalaWildcardOwnerFacts,
-    resolve_scala_wildcard_import_environment, scala_import_path, scala_import_visible_at,
-    scala_lexical_scope_path_at, scala_package_prefixes_at, scala_type_lookup_segments,
+    resolve_scala_wildcard_import_environment, scala_enclosing_package_root_candidates,
+    scala_import_path, scala_import_visible_at, scala_lexical_scope_path_at,
+    scala_package_prefixes_at, scala_type_lookup_segments,
 };
 use crate::analyzer::usages::scala_graph::local::{
     ScalaLocalBinding, precise_scala_binding, seed_scala_binding,
@@ -40,6 +41,7 @@ enum ScalaOwnerKind {
 struct ScalaOwnerIdentity {
     fqn: String,
     kind: ScalaOwnerKind,
+    _declaration: CodeUnit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,6 +258,22 @@ impl<'a> ForwardScalaNameResolver<'a> {
             }
         }
 
+        let package_root = segments.first().expect("non-empty Scala type path");
+        let package_tail = &segments[1..];
+        for package in scala_enclosing_package_root_candidates(&self.package_prefixes, package_root)
+        {
+            if !self.support.package_exists(&package) {
+                continue;
+            }
+            let outcome = self.resolve_candidate_tier(
+                scala_nested_type_candidates(package, package_tail, false),
+                kind,
+            );
+            if outcome != ScalaNameResolution::Unresolved {
+                return outcome;
+            }
+        }
+
         if segments.len() > 1 || self.package_prefixes.iter().all(String::is_empty) {
             return self.resolve_candidate_tier(
                 scala_nested_type_candidates(String::new(), segments, false),
@@ -345,6 +363,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
                     .map(|unit| ScalaOwnerIdentity {
                         fqn: unit.fq_name(),
                         kind,
+                        _declaration: unit,
                     }),
             );
         }

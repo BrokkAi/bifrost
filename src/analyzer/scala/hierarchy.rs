@@ -94,7 +94,8 @@ impl ScalaAnalyzer {
         let mut ancestors = Vec::new();
         let mut seen = HashSet::default();
         for path in facts.supertype_lookup_paths {
-            let Some(fqn) = types.resolve_type_in_declaration_context(&resolver, path.segments())
+            let Some(fqn) =
+                types.resolve_type_in_hierarchy_context(self, &resolver, path.segments())
             else {
                 continue;
             };

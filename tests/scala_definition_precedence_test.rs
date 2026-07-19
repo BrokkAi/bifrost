@@ -1072,3 +1072,156 @@ object Use {
         "{value}"
     );
 }
+
+#[test]
+fn scala_definition_resolves_enclosing_package_and_renamed_object_type_roots() {
+    let compound = r#"package akka.stream.javadsl
+object Compound {
+  def flow: javadsl.Flow[Int, String, Unit] = null
+}
+"#;
+    let sequential = r#"package akka.stream
+package javadsl
+object Sequential {
+  def flow: javadsl.Flow[Int, String, Unit] = null
+}
+"#;
+    let visibility = r#"package akka.stream.javadsl
+object Visibility {
+  def before: javadsl.Flow[Int, String, Unit] = null
+  import decoy.javadsl
+  def after: javadsl.Flow[Int, String, Unit] = null
+}
+"#;
+    let tree_set = r#"package scala.collection.immutable
+import scala.collection.immutable.{RedBlackTree => RB}
+class TreeSet[A] extends RB.SetHelper[A]
+"#;
+    let wildcard = r#"package akka.stream.javadsl
+import decoy.*
+object Collision {
+  def flow: javadsl.Flow[Int, String, Unit] = null
+}
+"#;
+    let ambiguous = r#"package scala.collection.immutable
+import scala.collection.immutable.{RedBlackTree => RB}
+import decoy.{RedBlackTree => RB}
+class Ambiguous[A] extends RB.SetHelper[A]
+"#;
+    let duplicate_terminal = r#"package replica
+import replica.{Root => Alias}
+class Use extends Alias.Tail
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "akka/stream/javadsl/Flow.scala",
+            "package akka.stream.javadsl\nclass Flow[In, Out, Mat]\n",
+        )
+        .file("akka/stream/javadsl/Compound.scala", compound)
+        .file("akka/stream/javadsl/Sequential.scala", sequential)
+        .file("akka/stream/javadsl/Visibility.scala", visibility)
+        .file(
+            "scala/collection/immutable/RedBlackTree.scala",
+            "package scala.collection.immutable\nobject RedBlackTree { trait SetHelper[A] }\n",
+        )
+        .file(
+            "tests/init/crash/rbtree.scala",
+            "package scala.collection.immutable\nobject RedBlackTree { class Tree[A] }\n",
+        )
+        .file("scala/collection/immutable/TreeSet.scala", tree_set)
+        .file(
+            "decoy/Roots.scala",
+            "package decoy\nobject javadsl { class Flow[In, Out, Mat] }\nobject RedBlackTree { trait SetHelper[A] }\n",
+        )
+        .file("akka/stream/javadsl/Collision.scala", wildcard)
+        .file("scala/collection/immutable/Ambiguous.scala", ambiguous)
+        .file(
+            "replica/RootOne.scala",
+            "package replica\nobject Root { trait Tail }\n",
+        )
+        .file(
+            "replica/RootTwo.scala",
+            "package replica\nobject Root { trait Tail }\n",
+        )
+        .file("replica/Use.scala", duplicate_terminal)
+        .build();
+    let terminal = |source: &str, needle: &str| {
+        source.find(needle).expect("qualified type")
+            + needle.rfind('.').expect("qualified root")
+            + 1
+    };
+    let references = [
+        location_in(
+            "akka/stream/javadsl/Compound.scala",
+            compound,
+            terminal(compound, "javadsl.Flow"),
+        ),
+        location_in(
+            "akka/stream/javadsl/Sequential.scala",
+            sequential,
+            terminal(sequential, "javadsl.Flow"),
+        ),
+        location_in(
+            "scala/collection/immutable/TreeSet.scala",
+            tree_set,
+            terminal(tree_set, "RB.SetHelper"),
+        ),
+        location_in(
+            "akka/stream/javadsl/Visibility.scala",
+            visibility,
+            terminal(visibility, "javadsl.Flow"),
+        ),
+        location_in(
+            "akka/stream/javadsl/Visibility.scala",
+            visibility,
+            visibility.rfind("javadsl.Flow").expect("post-import type") + "javadsl.".len(),
+        ),
+        location_in(
+            "akka/stream/javadsl/Collision.scala",
+            wildcard,
+            terminal(wildcard, "javadsl.Flow"),
+        ),
+        location_in(
+            "scala/collection/immutable/Ambiguous.scala",
+            ambiguous,
+            terminal(ambiguous, "RB.SetHelper"),
+        ),
+        location_in(
+            "replica/Use.scala",
+            duplicate_terminal,
+            terminal(duplicate_terminal, "Alias.Tail"),
+        ),
+    ];
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for result in &results[..2] {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], "akka.stream.javadsl.Flow",
+            "{value}"
+        );
+    }
+    assert_eq!(results[2]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[2]["definitions"][0]["fqn"], "scala.collection.immutable.RedBlackTree$.SetHelper",
+        "{value}"
+    );
+    assert_eq!(results[3]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[3]["definitions"][0]["fqn"], "akka.stream.javadsl.Flow",
+        "{value}"
+    );
+    for index in [4, 5] {
+        assert_eq!(results[index]["status"], "resolved", "{value}");
+        assert_eq!(
+            results[index]["definitions"][0]["fqn"], "decoy.javadsl$.Flow",
+            "{value}"
+        );
+    }
+    assert_eq!(results[6]["status"], "no_definition", "{value}");
+    assert_eq!(results[7]["status"], "no_definition", "{value}");
+}

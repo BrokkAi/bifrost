@@ -54,6 +54,26 @@ pub(crate) enum ScalaTypeNamespaceResolution {
     AuthoritativeMiss,
 }
 
+/// Exact root namespace selected for a structured qualified Scala type path.
+///
+/// Stable objects retain their physical declaration identity. Packages have
+/// no declaration `CodeUnit`, so their canonical namespace name is retained
+/// instead. Callers must treat every non-resolved outcome as terminal except
+/// `NoMatch`, which alone permits a lower-precedence tier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScalaQualifiedTypeRootBinding {
+    StableObjects(Vec<CodeUnit>),
+    Package(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScalaQualifiedTypeRootResolution {
+    NoMatch,
+    Resolved(ScalaQualifiedTypeRootBinding),
+    Ambiguous,
+    AuthoritativeMiss,
+}
+
 pub(crate) enum ScalaDirectAncestorResolution {
     Resolved(Vec<CodeUnit>),
     Ambiguous,

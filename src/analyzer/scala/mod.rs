@@ -41,8 +41,8 @@ use tests::detect_scala_test_assertion_smells;
 pub(crate) use wildcard_imports::{
     ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaWildcardImportEnvironment,
     ScalaWildcardOwnerFacts, resolve_scala_explicit_import_tier,
-    resolve_scala_wildcard_import_environment, scala_import_path, scala_import_visible_at,
-    scala_package_prefixes_at,
+    resolve_scala_wildcard_import_environment, scala_enclosing_package_root_candidates,
+    scala_import_path, scala_import_visible_at, scala_package_prefixes_at,
 };
 
 pub(crate) fn scala_normalize_full_name(fq_name: &str) -> String {

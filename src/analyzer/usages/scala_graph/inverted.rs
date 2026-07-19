@@ -23,8 +23,8 @@
 
 use super::local::{ScalaLocalBinding, precise_scala_binding, seed_scala_binding};
 use super::namespace::{
-    ScalaDirectAncestorResolution, ScalaTypeNamespaceResolution,
-    resolve_exact_lexical_type_namespace, scala_qualified_type_root,
+    ScalaDirectAncestorResolution, ScalaQualifiedTypeRootBinding, ScalaQualifiedTypeRootResolution,
+    ScalaTypeNamespaceResolution, resolve_exact_lexical_type_namespace, scala_qualified_type_root,
     scala_type_reference_is_singleton, scala_unindexed_type_binding_shadows,
 };
 use super::resolver::{
@@ -50,8 +50,8 @@ use crate::analyzer::scala::{
     ScalaAdapter, ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaExportSelector,
     ScalaSupertypeLookupPath, ScalaWildcardOwnerFacts, resolve_scala_explicit_import_tier,
     resolve_scala_wildcard_import_environment, scala_class_parameter_field_keyword,
-    scala_import_path, scala_normalize_full_name, scala_simple_type_name,
-    scala_supertype_lookup_nodes, scala_type_lookup_segments,
+    scala_enclosing_package_root_candidates, scala_import_path, scala_normalize_full_name,
+    scala_simple_type_name, scala_supertype_lookup_nodes, scala_type_lookup_segments,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usage_facts::CallableFacts;
@@ -160,6 +160,12 @@ impl ScalaCallMatch<'_> {
             Self::Shape(shape) => shape.lists.is_empty(),
         }
     }
+}
+
+fn sorted_unique_units(mut units: Vec<CodeUnit>) -> Vec<CodeUnit> {
+    units.sort();
+    units.dedup();
+    units
 }
 
 impl ProjectTypes {
@@ -317,16 +323,18 @@ impl ProjectTypes {
         fqn: &str,
         owner: &CodeUnit,
     ) -> ScalaTypeNamespaceResolution {
-        let candidates = self
-            .index
-            .by_fqn(fqn)
-            .iter()
-            .filter(|unit| unit.is_class() && unit.fq_name() == fqn)
-            .collect::<Vec<_>>();
+        let candidates = sorted_unique_units(
+            self.index
+                .by_fqn(fqn)
+                .iter()
+                .filter(|unit| unit.is_class() && unit.fq_name() == fqn)
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
         let same_source = candidates
             .iter()
-            .copied()
             .filter(|unit| unit.source() == owner.source())
+            .cloned()
             .collect::<Vec<_>>();
         match same_source.as_slice() {
             [definition] => {
@@ -339,6 +347,31 @@ impl ProjectTypes {
             [] => ScalaTypeNamespaceResolution::NoMatch,
             [definition] => ScalaTypeNamespaceResolution::Resolved((*definition).clone()),
             _ => ScalaTypeNamespaceResolution::Ambiguous,
+        }
+    }
+
+    fn exact_type_declarations_for_owner_context(
+        &self,
+        fqn: &str,
+        owner: &CodeUnit,
+    ) -> Vec<CodeUnit> {
+        let candidates = sorted_unique_units(
+            self.index
+                .by_fqn(fqn)
+                .iter()
+                .filter(|unit| unit.is_class() && unit.fq_name() == fqn)
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let same_source = candidates
+            .iter()
+            .filter(|unit| unit.source() == owner.source())
+            .cloned()
+            .collect::<Vec<_>>();
+        if same_source.is_empty() {
+            candidates
+        } else {
+            sorted_unique_units(same_source)
         }
     }
 
@@ -566,6 +599,17 @@ impl ProjectTypes {
     ) -> (HashMap<CodeUnit, Vec<CodeUnit>>, HashSet<CodeUnit>) {
         let mut ancestors_by_owner = HashMap::default();
         let mut ambiguous_owners = HashSet::default();
+        let projected_parent_by_unit = file_states
+            .values()
+            .flat_map(|state| {
+                state.children.iter().flat_map(|(parent, children)| {
+                    children
+                        .iter()
+                        .cloned()
+                        .map(|child| (child, parent.clone()))
+                })
+            })
+            .collect::<HashMap<_, _>>();
         for (file, state) in file_states {
             if state.supertype_lookup_paths.is_empty() {
                 continue;
@@ -626,6 +670,7 @@ impl ProjectTypes {
                         &owner,
                         state,
                         &parent_by_child,
+                        &projected_parent_by_unit,
                     ) else {
                         if self.type_lookup_path_is_ambiguous(resolver, path.segments()) {
                             ambiguous_owners.insert(owner.clone());
@@ -637,18 +682,7 @@ impl ProjectTypes {
                     if !seen.insert(fqn.clone()) {
                         continue;
                     }
-                    match self.exact_type_declaration_for_owner_context(&fqn, &owner) {
-                        ScalaTypeNamespaceResolution::Resolved(definition) => {
-                            ancestors.push(definition);
-                        }
-                        ScalaTypeNamespaceResolution::Ambiguous => {
-                            ambiguous_owners.insert(owner.clone());
-                            ancestors.clear();
-                            break;
-                        }
-                        ScalaTypeNamespaceResolution::NoMatch
-                        | ScalaTypeNamespaceResolution::AuthoritativeMiss => {}
-                    }
+                    ancestors.extend(self.exact_type_declarations_for_owner_context(&fqn, &owner));
                 }
                 if !ancestors.is_empty() {
                     ancestors_by_owner.insert(owner.clone(), ancestors);
@@ -712,24 +746,18 @@ impl ProjectTypes {
         let mut ancestors = Vec::new();
         let mut seen = HashSet::default();
         for path in facts.supertype_lookup_paths {
-            let Some(fqn) = self.resolve_type_in_declaration_context(&resolver, path.segments())
+            let Some(fqn) =
+                self.resolve_type_in_hierarchy_context(scala, &resolver, path.segments())
             else {
                 if self.type_lookup_path_is_ambiguous(&resolver, path.segments()) {
                     return ScalaDirectAncestorResolution::Ambiguous;
                 }
                 continue;
             };
-            match self.exact_type_declaration_for_owner_context(&fqn, owner) {
-                ScalaTypeNamespaceResolution::Resolved(declaration) => {
-                    if seen.insert(declaration.clone()) {
-                        ancestors.push(declaration);
-                    }
+            for declaration in self.exact_type_declarations_for_owner_context(&fqn, owner) {
+                if seen.insert(declaration.clone()) {
+                    ancestors.push(declaration);
                 }
-                ScalaTypeNamespaceResolution::Ambiguous => {
-                    return ScalaDirectAncestorResolution::Ambiguous;
-                }
-                ScalaTypeNamespaceResolution::NoMatch
-                | ScalaTypeNamespaceResolution::AuthoritativeMiss => {}
             }
         }
         ScalaDirectAncestorResolution::Resolved(ancestors)
@@ -882,7 +910,8 @@ impl ProjectTypes {
             if let Some(path) = source_facts
                 .field_type_paths_by_range
                 .get(&(range.start_byte, range.end_byte))
-                && let Some(field_type) = self.resolve_type_in_declaration_context(&resolver, path)
+                && let Some(field_type) =
+                    self.resolve_type_in_declaration_context(scala, &resolver, path)
             {
                 resolved.insert(field_type);
             }
@@ -1117,6 +1146,7 @@ impl ProjectTypes {
         let mut seen = HashSet::default();
         while !owners.is_empty() {
             let mut matched = Vec::new();
+            let mut declaring_owners = HashSet::default();
             let mut next = Vec::new();
             for owner in owners {
                 if !seen.insert(owner.clone()) {
@@ -1133,15 +1163,22 @@ impl ProjectTypes {
                 {
                     return BareMemberResolution::Unresolved;
                 }
-                matched.extend(match call {
+                let methods = match call {
                     ScalaCallMatch::Arities(call_arities) => {
                         self.method_declarations_for_members(scala, &members, call_arities)
                     }
                     ScalaCallMatch::Shape(call_shape) => {
                         self.method_declarations_for_members_with_shape(scala, &members, call_shape)
                     }
-                });
+                };
+                if !methods.is_empty() {
+                    declaring_owners.insert(owner.clone());
+                    matched.extend(methods);
+                }
                 next.extend(self.direct_ancestors_for_declaration(scala, &owner));
+            }
+            if declaring_owners.len() > 1 {
+                return BareMemberResolution::Unresolved;
             }
             if !matched.is_empty() {
                 let mut unique = HashSet::default();
@@ -1413,8 +1450,9 @@ impl ProjectTypes {
         }
 
         let root_owner = owner.clone();
+        let linearized = self.linearized_owners(scala, &root_owner);
         let mut abstract_trait_fallback = None;
-        for owner in self.linearized_owners(scala, &root_owner) {
+        for owner in &linearized {
             if call.is_unapplied()
                 && self
                     .exact_nested_object(scala, &owner.fq_name(), member)
@@ -1442,8 +1480,46 @@ impl ProjectTypes {
                 }
             };
             if !methods.is_empty() {
-                let inherited_abstract_trait = owner != root_owner
-                    && self.is_scala_trait_declaration(scala, &owner)
+                let replica_conflict = linearized.iter().any(|replica| {
+                    if replica == owner || replica.fq_name() != owner.fq_name() {
+                        return false;
+                    }
+                    if call.is_unapplied()
+                        && !self
+                            .exact_nested_objects_for_owner(scala, replica, member)
+                            .is_empty()
+                    {
+                        return true;
+                    }
+                    let replica_members = self
+                        .members_for_exact_owner_name(&replica.fq_name(), member)
+                        .into_iter()
+                        .filter(|unit| unit.source() == replica.source())
+                        .collect::<Vec<_>>();
+                    if replica_members
+                        .iter()
+                        .any(|member| self.member_blocks_callable_lookup(scala, member))
+                    {
+                        return true;
+                    }
+                    match call {
+                        ScalaCallMatch::Arities(call_arities) => !self
+                            .method_declarations_for_members(scala, &replica_members, call_arities)
+                            .is_empty(),
+                        ScalaCallMatch::Shape(shape) => !self
+                            .method_declarations_for_members_with_shape(
+                                scala,
+                                &replica_members,
+                                shape,
+                            )
+                            .is_empty(),
+                    }
+                });
+                if replica_conflict {
+                    return BareMemberResolution::Unresolved;
+                }
+                let inherited_abstract_trait = owner != &root_owner
+                    && self.is_scala_trait_declaration(scala, owner)
                     && methods
                         .iter()
                         .all(|method| self.is_abstract_scala_method(scala, method));
@@ -1914,6 +1990,32 @@ impl ProjectTypes {
         Some(*resolved)
     }
 
+    fn logical_type_by_normalized_fqn(&self, normalized_fqn: &str) -> Option<String> {
+        let classes = self
+            .index
+            .by_normalized_fqn(normalized_fqn)
+            .iter()
+            .filter(|unit| unit.is_class())
+            .collect::<Vec<_>>();
+        let ordinary = classes
+            .iter()
+            .copied()
+            .filter(|unit| !unit.short_name().ends_with('$'))
+            .collect::<Vec<_>>();
+        let selected = if ordinary.is_empty() {
+            classes
+        } else {
+            ordinary
+        };
+        let logical = selected
+            .iter()
+            .map(|unit| unit.fq_name())
+            .collect::<HashSet<_>>();
+        (logical.len() == 1)
+            .then(|| logical.into_iter().next())
+            .flatten()
+    }
+
     fn unique_object_by_normalized_fqn(
         &self,
         scala: &ScalaAnalyzer,
@@ -2001,6 +2103,48 @@ impl ProjectTypes {
         matches.next().is_none().then_some(resolved)
     }
 
+    pub(super) fn exact_nested_object_for_owner(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+        member: &str,
+    ) -> Option<CodeUnit> {
+        if self
+            .index
+            .by_fqn(&owner.fq_name())
+            .iter()
+            .filter(|unit| unit.is_class())
+            .take(2)
+            .count()
+            != 1
+        {
+            return None;
+        }
+        let matches = self.exact_nested_objects_for_owner(scala, owner, member);
+        let [resolved] = matches.as_slice() else {
+            return None;
+        };
+        Some(resolved.clone())
+    }
+
+    fn exact_nested_objects_for_owner(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+        member: &str,
+    ) -> Vec<CodeUnit> {
+        let candidate = format!("{}.{member}$", owner.fq_name());
+        sorted_unique_units(
+            self.index
+                .by_fqn(&candidate)
+                .iter()
+                .filter(|unit| unit.is_class() && unit.source() == owner.source())
+                .filter(|unit| self.is_exact_structural_child(scala, owner, unit))
+                .cloned()
+                .collect(),
+        )
+    }
+
     pub(super) fn exact_nested_type(&self, owner_fqn: &str, member: &str) -> Option<String> {
         let candidate = format!("{owner_fqn}.{member}");
         let mut matches = self
@@ -2010,6 +2154,60 @@ impl ProjectTypes {
             .filter(|unit| unit.is_class());
         let resolved = matches.next()?.fq_name();
         matches.next().is_none().then_some(resolved)
+    }
+
+    fn exact_nested_types_for_owner(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+        member: &str,
+    ) -> Vec<CodeUnit> {
+        let candidate = format!("{}.{member}", owner.fq_name());
+        sorted_unique_units(
+            self.index
+                .by_fqn(&candidate)
+                .iter()
+                .filter(|unit| unit.is_class() && unit.source() == owner.source())
+                .filter(|unit| self.is_exact_structural_child(scala, owner, unit))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    fn projected_nested_objects_for_owner(
+        &self,
+        parents: &HashMap<CodeUnit, CodeUnit>,
+        owner: &CodeUnit,
+        member: &str,
+    ) -> Vec<CodeUnit> {
+        let candidate = format!("{}.{member}$", owner.fq_name());
+        sorted_unique_units(
+            self.index
+                .by_fqn(&candidate)
+                .iter()
+                .filter(|unit| unit.is_class() && unit.source() == owner.source())
+                .filter(|unit| parents.get(*unit) == Some(owner))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    fn projected_nested_types_for_owner(
+        &self,
+        parents: &HashMap<CodeUnit, CodeUnit>,
+        owner: &CodeUnit,
+        member: &str,
+    ) -> Vec<CodeUnit> {
+        let candidate = format!("{}.{member}", owner.fq_name());
+        sorted_unique_units(
+            self.index
+                .by_fqn(&candidate)
+                .iter()
+                .filter(|unit| unit.is_class() && unit.source() == owner.source())
+                .filter(|unit| parents.get(*unit) == Some(owner))
+                .cloned()
+                .collect(),
+        )
     }
 
     fn resolve_type_text(&self, resolver: &NameResolver, type_text: &str) -> Option<String> {
@@ -2052,74 +2250,145 @@ impl ProjectTypes {
                 let ordinary = candidates
                     .iter()
                     .filter(|unit| !unit.short_name().ends_with('$'))
-                    .take(2)
-                    .count();
-                if ordinary > 0 {
-                    ordinary > 1
+                    .map(|unit| unit.fq_name())
+                    .collect::<HashSet<_>>();
+                if !ordinary.is_empty() {
+                    ordinary.len() > 1
                 } else {
-                    candidates.len() > 1
+                    candidates
+                        .iter()
+                        .map(|unit| unit.fq_name())
+                        .collect::<HashSet<_>>()
+                        .len()
+                        > 1
                 }
             })
     }
 
     pub(crate) fn resolve_type_in_declaration_context(
         &self,
+        scala: &ScalaAnalyzer,
         resolver: &NameResolver,
         segments: &[String],
     ) -> Option<String> {
+        self.resolve_qualified_type_from_roots(
+            resolver,
+            segments,
+            true,
+            |owner, member| self.exact_nested_objects_for_owner(scala, owner, member),
+            |owner, member| self.exact_nested_types_for_owner(scala, owner, member),
+        )
+    }
+
+    pub(crate) fn resolve_type_in_hierarchy_context(
+        &self,
+        scala: &ScalaAnalyzer,
+        resolver: &NameResolver,
+        segments: &[String],
+    ) -> Option<String> {
+        self.resolve_qualified_type_from_roots(
+            resolver,
+            segments,
+            false,
+            |owner, member| self.exact_nested_objects_for_owner(scala, owner, member),
+            |owner, member| self.exact_nested_types_for_owner(scala, owner, member),
+        )
+    }
+
+    fn resolve_type_in_projected_declaration_context(
+        &self,
+        resolver: &NameResolver,
+        segments: &[String],
+        parents: &HashMap<CodeUnit, CodeUnit>,
+    ) -> Option<String> {
+        self.resolve_qualified_type_from_roots(
+            resolver,
+            segments,
+            false,
+            |owner, member| self.projected_nested_objects_for_owner(parents, owner, member),
+            |owner, member| self.projected_nested_types_for_owner(parents, owner, member),
+        )
+    }
+
+    fn resolve_qualified_type_from_roots<ObjectChildren, TypeChildren>(
+        &self,
+        resolver: &NameResolver,
+        segments: &[String],
+        require_physical_terminal: bool,
+        mut object_children: ObjectChildren,
+        mut type_children: TypeChildren,
+    ) -> Option<String>
+    where
+        ObjectChildren: FnMut(&CodeUnit, &str) -> Vec<CodeUnit>,
+        TypeChildren: FnMut(&CodeUnit, &str) -> Vec<CodeUnit>,
+    {
         let (first, rest) = segments.split_first()?;
         if rest.is_empty() {
-            return resolver
-                .resolve(first)
-                .or_else(|| scala_builtin_type_name(first).map(str::to_string));
+            return (if require_physical_terminal {
+                resolver.resolve(first)
+            } else {
+                resolver.resolve_logical(first)
+            })
+            .or_else(|| scala_builtin_type_name(first).map(str::to_string));
         }
 
-        let mut resolved_roots = HashSet::default();
-        resolved_roots.extend(resolver.resolve(first));
-        resolved_roots.extend(resolver.resolve_object(first));
-        if !resolved_roots.is_empty() {
-            let mut candidates = resolved_roots;
-            for segment in rest {
-                let mut nested_candidates = HashSet::default();
-                for owner in candidates {
-                    let candidate = format!("{owner}.{segment}");
-                    if let Some(nested) = preferred_scala_type(
-                        self.index
-                            .by_fqn(&candidate)
-                            .iter()
-                            .filter(|unit| unit.is_class()),
-                    ) {
-                        nested_candidates.insert(nested.fq_name());
-                        continue;
-                    }
-                    let object_candidate = format!("{candidate}$");
-                    if let Some(nested) = preferred_scala_type(
-                        self.index
-                            .by_fqn(&object_candidate)
-                            .iter()
-                            .filter(|unit| unit.is_class()),
-                    ) {
-                        nested_candidates.insert(nested.fq_name());
-                    }
+        match resolver.resolve_qualified_type_root(self, first, None) {
+            ScalaQualifiedTypeRootResolution::Resolved(
+                ScalaQualifiedTypeRootBinding::StableObjects(mut owners),
+            ) => {
+                for segment in &rest[..rest.len() - 1] {
+                    owners = owners
+                        .iter()
+                        .flat_map(|owner| object_children(owner, segment))
+                        .collect();
+                    let mut seen = HashSet::default();
+                    owners.retain(|owner| seen.insert(owner.clone()));
                 }
-                if nested_candidates.is_empty() {
-                    return None;
+                let terminal = rest.last()?;
+                let mut matches = owners
+                    .iter()
+                    .flat_map(|owner| type_children(owner, terminal))
+                    .collect::<Vec<_>>();
+                if matches.is_empty() {
+                    matches = owners
+                        .iter()
+                        .flat_map(|owner| object_children(owner, terminal))
+                        .collect();
                 }
-                candidates = nested_candidates;
+                let mut seen = HashSet::default();
+                matches.retain(|unit| seen.insert(unit.clone()));
+                if require_physical_terminal {
+                    let [resolved] = matches.as_slice() else {
+                        return None;
+                    };
+                    return Some(resolved.fq_name());
+                }
+                let logical = matches
+                    .iter()
+                    .map(CodeUnit::fq_name)
+                    .collect::<HashSet<_>>();
+                return (logical.len() == 1)
+                    .then(|| logical.into_iter().next())
+                    .flatten();
             }
-            return (candidates.len() == 1)
-                .then(|| candidates.into_iter().next())
-                .flatten();
-        }
-
-        if let Some(package) = resolver.resolve_package(self, first) {
-            let qualified = std::iter::once(package.as_str())
-                .chain(rest.iter().map(String::as_str))
-                .collect::<Vec<_>>()
-                .join(".");
-            return self
-                .unique_type_by_normalized_fqn(&scala_normalized_fq_name(&qualified))
-                .map(CodeUnit::fq_name);
+            ScalaQualifiedTypeRootResolution::Resolved(ScalaQualifiedTypeRootBinding::Package(
+                package,
+            )) => {
+                let qualified = std::iter::once(package.as_str())
+                    .chain(rest.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let normalized = scala_normalized_fq_name(&qualified);
+                if require_physical_terminal {
+                    return self
+                        .unique_type_by_normalized_fqn(&normalized)
+                        .map(CodeUnit::fq_name);
+                }
+                return self.logical_type_by_normalized_fqn(&normalized);
+            }
+            ScalaQualifiedTypeRootResolution::Ambiguous
+            | ScalaQualifiedTypeRootResolution::AuthoritativeMiss => return None,
+            ScalaQualifiedTypeRootResolution::NoMatch => {}
         }
 
         if resolver.has_type_or_object_or_package_binding(first)
@@ -2128,8 +2397,13 @@ impl ProjectTypes {
             return None;
         }
         let qualified = segments.join(".");
-        self.unique_type_by_normalized_fqn(&scala_normalized_fq_name(&qualified))
-            .map(CodeUnit::fq_name)
+        let normalized = scala_normalized_fq_name(&qualified);
+        if require_physical_terminal {
+            self.unique_type_by_normalized_fqn(&normalized)
+                .map(CodeUnit::fq_name)
+        } else {
+            self.logical_type_by_normalized_fqn(&normalized)
+        }
     }
 
     pub(super) fn resolve_qualified_stable_type_at(
@@ -2138,7 +2412,7 @@ impl ProjectTypes {
         resolver: &NameResolver,
         segments: &[String],
         terminal_object: bool,
-        lexical_root: Option<String>,
+        lexical_root: Option<CodeUnit>,
     ) -> Option<String> {
         let (first, rest) = segments.split_first()?;
         if rest.is_empty() {
@@ -2149,31 +2423,60 @@ impl ProjectTypes {
             };
         }
 
-        if let Some(mut owner) = lexical_root.or_else(|| resolver.resolve_stable_object_root(first))
-        {
-            for segment in &rest[..rest.len() - 1] {
-                owner = self.exact_nested_object(scala, &owner, segment)?;
+        match resolver.resolve_qualified_type_root(self, first, lexical_root) {
+            ScalaQualifiedTypeRootResolution::Resolved(
+                ScalaQualifiedTypeRootBinding::StableObjects(mut owners),
+            ) => {
+                for segment in &rest[..rest.len() - 1] {
+                    owners = owners
+                        .iter()
+                        .flat_map(|owner| {
+                            self.exact_nested_objects_for_owner(scala, owner, segment)
+                        })
+                        .collect();
+                    let mut seen = HashSet::default();
+                    owners.retain(|owner| seen.insert(owner.clone()));
+                }
+                let terminal = rest.last()?;
+                let matches = owners
+                    .iter()
+                    .flat_map(|owner| {
+                        if terminal_object {
+                            self.exact_nested_objects_for_owner(scala, owner, terminal)
+                        } else {
+                            self.exact_nested_types_for_owner(scala, owner, terminal)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let mut seen = HashSet::default();
+                let matches = matches
+                    .into_iter()
+                    .filter(|unit| seen.insert(unit.clone()))
+                    .collect::<Vec<_>>();
+                let [resolved] = matches.as_slice() else {
+                    return None;
+                };
+                return Some(resolved.fq_name());
             }
-            let terminal = rest.last()?;
-            if terminal_object {
-                return self.exact_nested_object(scala, &owner, terminal);
+            ScalaQualifiedTypeRootResolution::Resolved(ScalaQualifiedTypeRootBinding::Package(
+                package,
+            )) => {
+                let qualified = std::iter::once(package.as_str())
+                    .chain(rest.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let normalized = scala_normalized_fq_name(&qualified);
+                return if terminal_object {
+                    self.unique_object_by_normalized_fqn(scala, &normalized)
+                        .map(CodeUnit::fq_name)
+                } else {
+                    self.unique_type_by_normalized_fqn(&normalized)
+                        .map(CodeUnit::fq_name)
+                };
             }
-            return self.exact_nested_type(&owner, terminal);
-        }
-
-        if let Some(package) = resolver.resolve_package(self, first) {
-            let qualified = std::iter::once(package.as_str())
-                .chain(rest.iter().map(String::as_str))
-                .collect::<Vec<_>>()
-                .join(".");
-            let normalized = scala_normalized_fq_name(&qualified);
-            return if terminal_object {
-                self.unique_object_by_normalized_fqn(scala, &normalized)
-                    .map(CodeUnit::fq_name)
-            } else {
-                self.unique_type_by_normalized_fqn(&normalized)
-                    .map(CodeUnit::fq_name)
-            };
+            ScalaQualifiedTypeRootResolution::Ambiguous
+            | ScalaQualifiedTypeRootResolution::AuthoritativeMiss => return None,
+            ScalaQualifiedTypeRootResolution::NoMatch => {}
         }
 
         if resolver.has_type_or_object_or_package_binding(first)
@@ -2237,7 +2540,7 @@ impl ProjectTypes {
                 .structural_parent_of(&owner)
                 .or_else(|| scala.parent_of(&owner));
         }
-        self.resolve_type_in_declaration_context(resolver, segments)
+        self.resolve_type_in_declaration_context(scala, resolver, segments)
     }
 
     fn resolve_type_in_owner_context(
@@ -2247,6 +2550,7 @@ impl ProjectTypes {
         owner: &CodeUnit,
         state: &FileState,
         parent_by_child: &HashMap<&CodeUnit, &CodeUnit>,
+        projected_parent_by_unit: &HashMap<CodeUnit, CodeUnit>,
     ) -> Option<String> {
         let (first, rest) = segments.split_first()?;
         let mut scope = parent_by_child.get(owner).copied();
@@ -2277,12 +2581,20 @@ impl ProjectTypes {
             scope = parent_by_child.get(parent).copied();
         }
         if resolver.has_type_or_object_binding(first) {
-            return self.resolve_type_in_declaration_context(resolver, segments);
+            return self.resolve_type_in_projected_declaration_context(
+                resolver,
+                segments,
+                projected_parent_by_unit,
+            );
         }
         if let Some(relative) = self.resolve_package_relative_type(&state.package_name, segments) {
             return Some(relative);
         }
-        self.resolve_type_in_declaration_context(resolver, segments)
+        self.resolve_type_in_projected_declaration_context(
+            resolver,
+            segments,
+            projected_parent_by_unit,
+        )
     }
 
     fn resolve_package_relative_type(
@@ -3502,6 +3814,26 @@ impl VisibleNameBindings {
             .then(|| binding.candidates.iter().next().cloned())?
     }
 
+    fn resolve_logical(&self, name: &str) -> Option<String> {
+        let binding = self.entries.get(name)?;
+        (binding.candidates.len() == 1).then(|| binding.candidates.iter().next().cloned())?
+    }
+
+    fn resolve_declaration(&self, name: &str) -> ScalaQualifiedTypeRootResolution {
+        let Some(binding) = self.entries.get(name) else {
+            return ScalaQualifiedTypeRootResolution::NoMatch;
+        };
+        if binding.candidates.len() == 1 && !binding.declarations.is_empty() {
+            ScalaQualifiedTypeRootResolution::Resolved(
+                ScalaQualifiedTypeRootBinding::StableObjects(sorted_unique_units(
+                    binding.declarations.iter().cloned().collect(),
+                )),
+            )
+        } else {
+            ScalaQualifiedTypeRootResolution::Ambiguous
+        }
+    }
+
     fn contains(&self, name: &str) -> bool {
         self.entries.contains_key(name)
     }
@@ -4003,6 +4335,14 @@ impl NameResolver {
         self.names.resolve(simple)
     }
 
+    fn resolve_logical(&self, raw: &str) -> Option<String> {
+        let simple = simple_type_name(raw)?;
+        if self.import_collision_blocks(simple, self.names.priority(simple)) {
+            return None;
+        }
+        self.names.resolve_logical(simple)
+    }
+
     fn type_binding_is_ambiguous(&self, raw: &str) -> bool {
         let Some(simple) = simple_type_name(raw) else {
             return false;
@@ -4019,27 +4359,58 @@ impl NameResolver {
         self.object_names.resolve(simple)
     }
 
-    fn resolve_stable_object_root(&self, raw: &str) -> Option<String> {
-        let simple = simple_type_name(raw)?;
-        let object_priority = self.object_names.priority(simple)?;
-        let non_package_priority = self
-            .names
-            .priority(simple)
+    fn resolve_qualified_type_root(
+        &self,
+        types: &ProjectTypes,
+        raw: &str,
+        lexical_object: Option<CodeUnit>,
+    ) -> ScalaQualifiedTypeRootResolution {
+        if let Some(object) = lexical_object {
+            return ScalaQualifiedTypeRootResolution::Resolved(
+                ScalaQualifiedTypeRootBinding::StableObjects(vec![object]),
+            );
+        }
+        let Some(simple) = simple_type_name(raw) else {
+            return ScalaQualifiedTypeRootResolution::NoMatch;
+        };
+        let type_priority = self.names.priority(simple);
+        let object_priority = self.object_names.priority(simple);
+        let package_priority = self.package_names.priority(simple);
+        let winner_priority = type_priority
             .into_iter()
-            .chain(Some(object_priority))
-            .max()?;
-        if self.import_collision_blocks(simple, Some(non_package_priority)) {
-            return None;
+            .chain(object_priority)
+            .chain(package_priority)
+            .max();
+        if self.import_collision_blocks(simple, winner_priority) {
+            return ScalaQualifiedTypeRootResolution::Ambiguous;
         }
-        if object_priority != non_package_priority
-            || self
-                .package_names
-                .priority(simple)
-                .is_some_and(|package_priority| package_priority >= non_package_priority)
-        {
-            return None;
+        if let Some(winner) = winner_priority {
+            if package_priority == Some(winner) && object_priority == Some(winner) {
+                return ScalaQualifiedTypeRootResolution::Ambiguous;
+            }
+            if object_priority == Some(winner) {
+                return self.object_names.resolve_declaration(simple);
+            }
+            if package_priority == Some(winner) {
+                return self.package_names.resolve(simple).map_or(
+                    ScalaQualifiedTypeRootResolution::Ambiguous,
+                    |package| {
+                        ScalaQualifiedTypeRootResolution::Resolved(
+                            ScalaQualifiedTypeRootBinding::Package(package),
+                        )
+                    },
+                );
+            }
+            return ScalaQualifiedTypeRootResolution::AuthoritativeMiss;
         }
-        self.object_names.resolve(simple)
+        for candidate in scala_enclosing_package_root_candidates(&self.package_prefixes, simple) {
+            if types.index.package_exists(&candidate) {
+                return ScalaQualifiedTypeRootResolution::Resolved(
+                    ScalaQualifiedTypeRootBinding::Package(candidate),
+                );
+            }
+        }
+        ScalaQualifiedTypeRootResolution::NoMatch
     }
 
     fn has_type_or_object_binding(&self, raw: &str) -> bool {
@@ -4053,41 +4424,6 @@ impl NameResolver {
                 || self.object_names.contains(simple)
                 || self.package_names.contains(simple)
         })
-    }
-
-    fn resolve_package(&self, types: &ProjectTypes, raw: &str) -> Option<String> {
-        let simple = simple_type_name(raw)?;
-        if self.import_collision_blocks(simple, self.package_names.priority(simple)) {
-            return None;
-        }
-        let type_priority = self
-            .names
-            .priority(simple)
-            .into_iter()
-            .chain(self.object_names.priority(simple))
-            .max();
-        if let Some(package_priority) = self.package_names.priority(simple)
-            && type_priority.is_none_or(|priority| package_priority > priority)
-        {
-            return self.package_names.resolve(simple);
-        }
-        if type_priority.is_some() {
-            return None;
-        }
-        for package in self.package_prefixes.iter().rev() {
-            let candidate = if package.is_empty() {
-                simple.to_string()
-            } else {
-                format!("{package}.{simple}")
-            };
-            if types.index.package_exists(&candidate) {
-                return Some(candidate);
-            }
-        }
-        types
-            .index
-            .package_exists(simple)
-            .then(|| simple.to_string())
     }
 
     /// Resolve a source-visible member name imported directly from an owner.
@@ -4509,9 +4845,14 @@ impl ScalaScan<'_, '_> {
     }
 
     fn lexically_visible_object(&self, byte: usize, name: &str) -> Option<String> {
+        self.lexically_visible_object_unit(byte, name)
+            .map(|unit| unit.fq_name())
+    }
+
+    fn lexically_visible_object_unit(&self, byte: usize, name: &str) -> Option<CodeUnit> {
         self.class_ranges.find_in_enclosing_units(byte, |owner| {
             self.types
-                .exact_nested_object(self.scala, &owner.fq_name(), name)
+                .exact_nested_object_for_owner(self.scala, owner, name)
         })
     }
 
@@ -4918,7 +5259,7 @@ fn record_reference(
                     reference.segments.split_last().expect("stable path");
                 let owner_lexical_root = owner_segments
                     .first()
-                    .and_then(|root| ctx.lexically_visible_object(node.start_byte(), root));
+                    .and_then(|root| ctx.lexically_visible_object_unit(node.start_byte(), root));
                 if let Some(owner) = ctx.types.resolve_qualified_stable_type_at(
                     ctx.scala,
                     &ctx.resolver,
@@ -4933,7 +5274,7 @@ fn record_reference(
                 let lexical_root = reference
                     .segments
                     .first()
-                    .and_then(|root| ctx.lexically_visible_object(node.start_byte(), root));
+                    .and_then(|root| ctx.lexically_visible_object_unit(node.start_byte(), root));
                 if let Some(object) = ctx.types.resolve_qualified_stable_type_at(
                     ctx.scala,
                     &ctx.resolver,
@@ -5058,7 +5399,7 @@ fn record_qualified_stable_reference(
     let lexical_root = reference
         .segments
         .first()
-        .and_then(|root| ctx.lexically_visible_object(node.start_byte(), root));
+        .and_then(|root| ctx.lexically_visible_object_unit(node.start_byte(), root));
     let lexical_type_root = ctx.exact_lexically_visible_type_root(node);
     let class_lookup_blocked = matches!(
         lexical_type_root,
@@ -5089,7 +5430,7 @@ fn record_qualified_stable_reference(
     {
         let owner_lexical_root = owner_segments
             .first()
-            .and_then(|root| ctx.lexically_visible_object(node.start_byte(), root));
+            .and_then(|root| ctx.lexically_visible_object_unit(node.start_byte(), root));
         if let Some(owner) = ctx.types.resolve_qualified_stable_type_at(
             ctx.scala,
             &ctx.resolver,
@@ -6009,7 +6350,7 @@ fn resolve_receiver_type_node(type_node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> O
         ScalaTypeNamespaceResolution::NoMatch => {}
     }
     ctx.types
-        .resolve_type_in_declaration_context(&ctx.resolver, &path)
+        .resolve_type_in_declaration_context(ctx.scala, &ctx.resolver, &path)
         .or_else(|| {
             (path.len() == 1)
                 .then(|| scala_builtin_type_name(&path[0]).map(str::to_string))

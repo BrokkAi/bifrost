@@ -228,6 +228,41 @@ pub(crate) fn scala_import_path_candidates(path: &str, package_prefixes: &[Strin
     candidates
 }
 
+/// Candidate package namespaces denoted by a qualified root from an active
+/// Scala package context.
+///
+/// A single dotted package clause establishes only its complete package for
+/// ordinary unqualified lookup. Qualified paths are different: from
+/// `package akka.stream.javadsl`, the root of `javadsl.Flow` may name the
+/// direct child `javadsl` of the enclosing `akka.stream` package. Keep these
+/// candidates separate from [`scala_package_prefixes_at`] so parent packages
+/// do not leak into ordinary lexical lookup.
+pub(crate) fn scala_enclosing_package_root_candidates(
+    package_prefixes: &[String],
+    root: &str,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for package in package_prefixes.iter().rev() {
+        let mut enclosing = package.as_str();
+        loop {
+            let candidate = if enclosing.is_empty() {
+                root.to_string()
+            } else {
+                format!("{enclosing}.{root}")
+            };
+            candidates.push(candidate);
+            let Some((parent, _)) = enclosing.rsplit_once('.') else {
+                break;
+            };
+            enclosing = parent;
+        }
+    }
+    candidates.push(root.to_string());
+    let mut seen = HashSet::default();
+    candidates.retain(|candidate| seen.insert(candidate.clone()));
+    candidates
+}
+
 pub(crate) fn scala_import_path(info: &ImportInfo) -> Option<String> {
     info.path
         .as_ref()

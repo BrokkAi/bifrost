@@ -2657,6 +2657,145 @@ object Use {
 }
 
 #[test]
+fn qualified_type_roots_preserve_package_and_renamed_object_precedence() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "akka/stream/javadsl/Flow.scala",
+            "package akka.stream.javadsl\nclass Flow[In, Out, Mat]\n",
+        )
+        .file(
+            "akka/stream/javadsl/Compound.scala",
+            r#"package akka.stream.javadsl
+object Compound {
+  def flow: javadsl.Flow[Int, String, Unit] = null
+}
+"#,
+        )
+        .file(
+            "akka/stream/javadsl/Sequential.scala",
+            r#"package akka.stream
+package javadsl
+object Sequential {
+  def flow: javadsl.Flow[Int, String, Unit] = null
+}
+"#,
+        )
+        .file(
+            "akka/stream/javadsl/Visibility.scala",
+            r#"package akka.stream.javadsl
+object Visibility {
+  def before: javadsl.Flow[Int, String, Unit] = null
+  import decoy.javadsl
+  def after: javadsl.Flow[Int, String, Unit] = null
+}
+"#,
+        )
+        .file(
+            "scala/collection/immutable/RedBlackTree.scala",
+            "package scala.collection.immutable\nobject RedBlackTree { trait SetHelper[A] }\n",
+        )
+        .file(
+            "tests/init/crash/rbtree.scala",
+            "package scala.collection.immutable\nobject RedBlackTree { class Tree[A] }\n",
+        )
+        .file(
+            "scala/collection/immutable/TreeSet.scala",
+            r#"package scala.collection.immutable
+import scala.collection.immutable.{RedBlackTree => RB}
+class TreeSet[A] extends RB.SetHelper[A]
+"#,
+        )
+        .file(
+            "decoy/Roots.scala",
+            "package decoy\nobject javadsl { class Flow[In, Out, Mat] }\nobject RedBlackTree { trait SetHelper[A] }\n",
+        )
+        .file(
+            "akka/stream/javadsl/Collision.scala",
+            r#"package akka.stream.javadsl
+import decoy.*
+object Collision {
+  def flow: javadsl.Flow[Int, String, Unit] = null
+}
+"#,
+        )
+        .file(
+            "scala/collection/immutable/Ambiguous.scala",
+            r#"package scala.collection.immutable
+import scala.collection.immutable.{RedBlackTree => RB}
+import decoy.{RedBlackTree => RB}
+class Ambiguous[A] extends RB.SetHelper[A]
+"#,
+        )
+        .file(
+            "replica/RootOne.scala",
+            "package replica\nobject Root { trait Tail }\n",
+        )
+        .file(
+            "replica/RootTwo.scala",
+            "package replica\nobject Root { trait Tail }\n",
+        )
+        .file(
+            "replica/Use.scala",
+            "package replica\nimport replica.{Root => Alias}\nclass Use extends Alias.Tail\n",
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    for caller in [
+        "akka.stream.javadsl.Compound$.flow",
+        "akka.stream.javadsl.Sequential$.flow",
+        "akka.stream.javadsl.Visibility$.before",
+    ] {
+        assert!(
+            has_edge(&value, caller, "akka.stream.javadsl.Flow"),
+            "enclosing package root was not retained for {caller}: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        !has_edge(
+            &value,
+            "akka.stream.javadsl.Visibility$.after",
+            "akka.stream.javadsl.Flow",
+        ),
+        "a later explicit import was visible before its declaration: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "scala.collection.immutable.TreeSet",
+            "scala.collection.immutable.RedBlackTree$.SetHelper",
+        ),
+        "renamed stable object root did not resolve in extends role: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(
+            &value,
+            "akka.stream.javadsl.Collision$.flow",
+            "akka.stream.javadsl.Flow",
+        ),
+        "package root leaked through a higher-precedence wildcard: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(
+            &value,
+            "scala.collection.immutable.Ambiguous",
+            "scala.collection.immutable.RedBlackTree$.SetHelper",
+        ),
+        "ambiguous renamed root selected an arbitrary target: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "replica.Use", "replica.Root$.Tail"),
+        "two physical roots completing the same tail selected an arbitrary target: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn scala_inverted_resolves_package_lexical_field_and_application_projections() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

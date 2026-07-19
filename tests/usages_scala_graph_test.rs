@@ -1185,6 +1185,162 @@ fn scala_usage_finder_applies_compilation_unit_import_precedence() {
 }
 
 #[test]
+fn scala_usage_finder_resolves_enclosing_package_and_renamed_object_type_roots() {
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "akka/stream/javadsl/Flow.scala",
+            "package akka.stream.javadsl\nclass Flow[In, Out, Mat]\n",
+        ),
+        (
+            "akka/stream/javadsl/Compound.scala",
+            r#"package akka.stream.javadsl
+object Compound {
+  def flow: javadsl.Flow[Int, String, Unit] = null // positive-compound-package-root
+}
+"#,
+        ),
+        (
+            "akka/stream/javadsl/Sequential.scala",
+            r#"package akka.stream
+package javadsl
+object Sequential {
+  def flow: javadsl.Flow[Int, String, Unit] = null // positive-sequential-package-root
+}
+"#,
+        ),
+        (
+            "akka/stream/javadsl/Visibility.scala",
+            r#"package akka.stream.javadsl
+object Visibility {
+  def before: javadsl.Flow[Int, String, Unit] = null // positive-before-import
+  import decoy.javadsl
+  def after: javadsl.Flow[Int, String, Unit] = null // negative-after-import
+}
+"#,
+        ),
+        (
+            "scala/collection/immutable/RedBlackTree.scala",
+            r#"package scala
+package collection
+package immutable
+private[collection] object RedBlackTree {
+  private[immutable] class SetHelper[A]
+}
+"#,
+        ),
+        (
+            "tests/init/crash/rbtree.scala",
+            r#"package scala
+package collection
+package immutable
+private[collection] object RedBlackTree {
+  class Tree[A]
+}
+"#,
+        ),
+        (
+            "scala/collection/immutable/TreeSet.scala",
+            r#"package scala
+package collection
+package immutable
+import scala.collection.immutable.{RedBlackTree => RB}
+object TreeSet {
+  private class TreeSetBuilder[A]
+    extends RB.SetHelper[A] // positive-renamed-object-root
+}
+"#,
+        ),
+        (
+            "decoy/Roots.scala",
+            "package decoy\nobject javadsl { class Flow[In, Out, Mat] }\nobject RedBlackTree { trait SetHelper[A] }\n",
+        ),
+        (
+            "akka/stream/javadsl/Collision.scala",
+            r#"package akka.stream.javadsl
+import decoy.*
+object Collision {
+  def flow: javadsl.Flow[Int, String, Unit] = null // negative-wildcard-beats-package
+}
+"#,
+        ),
+        (
+            "scala/collection/immutable/Ambiguous.scala",
+            r#"package scala.collection.immutable
+import scala.collection.immutable.{RedBlackTree => RB}
+import decoy.{RedBlackTree => RB}
+class Ambiguous[A] extends RB.SetHelper[A] // negative-ambiguous-renamed-root
+"#,
+        ),
+        (
+            "replica/RootOne.scala",
+            "package replica\nobject Root { trait Tail }\n",
+        ),
+        (
+            "replica/RootTwo.scala",
+            "package replica\nobject Root { trait Tail }\n",
+        ),
+        (
+            "replica/Use.scala",
+            "package replica\nimport replica.{Root => Alias}\nclass Use extends Alias.Tail // negative-physical-terminal-ambiguity\n",
+        ),
+    ]);
+
+    let flow = definition(&analyzer, "akka.stream.javadsl.Flow");
+    let flow_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&flow)));
+    assert_hit_contains(&flow_hits, "positive-compound-package-root");
+    assert_hit_contains(&flow_hits, "positive-sequential-package-root");
+    assert_hit_contains(&flow_hits, "positive-before-import");
+    assert_no_hit_contains(&flow_hits, "negative-after-import");
+    assert_no_hit_contains(&flow_hits, "negative-wildcard-beats-package");
+
+    let helper = definition(
+        &analyzer,
+        "scala.collection.immutable.RedBlackTree$.SetHelper",
+    );
+    let helper_query =
+        UsageFinder::new().query(&analyzer, std::slice::from_ref(&helper), 1000, 1000);
+    assert!(
+        helper_query
+            .candidate_files
+            .iter()
+            .any(|file| file.rel_path() == "scala/collection/immutable/TreeSet.scala"),
+        "renamed-object importer was not routed to the target: {:#?}",
+        helper_query.candidate_files
+    );
+    let helper_hits = hits(helper_query.result);
+    assert_hit_contains(&helper_hits, "positive-renamed-object-root");
+    assert_no_hit_contains(&helper_hits, "negative-ambiguous-renamed-root");
+
+    let replica_tails = analyzer
+        .get_definitions("replica.Root$.Tail")
+        .into_iter()
+        .filter(|unit| unit.is_class())
+        .collect::<Vec<_>>();
+    assert_eq!(replica_tails.len(), 2);
+    for tail in replica_tails {
+        let tail_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&tail)));
+        assert_no_hit_contains(&tail_hits, "negative-physical-terminal-ambiguity");
+    }
+
+    let mcp = call_search_tool_json(
+        project.root(),
+        "scan_usages_by_reference",
+        &json!({
+            "symbols": [
+                "akka.stream.javadsl.Flow",
+                "scala.collection.immutable.RedBlackTree$.SetHelper"
+            ],
+            "include_tests": true,
+        })
+        .to_string(),
+    );
+    assert_eq!(mcp["results"][0]["status"], "found", "{mcp}");
+    assert_eq!(mcp["results"][1]["status"], "found", "{mcp}");
+}
+
+#[test]
 fn scala_usage_finder_keeps_companion_bare_field_owners_exact() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "app/CompanionFields.scala",
