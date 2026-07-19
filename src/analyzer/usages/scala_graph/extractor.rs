@@ -1662,6 +1662,9 @@ fn previous_word(value: &str) -> Option<&str> {
 
 fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
     let field_like_target = ctx.spec.kind == TargetKind::Field || ctx.spec.is_type_alias;
+    if abstract_contract_field_implementation_is_proven(node, text, ctx) {
+        return true;
+    }
     if ctx.visibility.direct_member_names.contains(text)
         && !ctx.visibility.ambiguous_direct_member_names.contains(text)
         && !has_member_qualifier(node)
@@ -1794,6 +1797,33 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
             .is_some_and(|owner_fq_name| ctx.spec.owner_fq_matches(owner_fq_name));
     }
     receiver_binding_matches(node, qualifier, ctx)
+}
+
+fn abstract_contract_field_implementation_is_proven(
+    node: Node<'_>,
+    text: &str,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    if !ctx.spec.accepts_field_implementation
+        || text != ctx.spec.member_name
+        || has_member_qualifier(node)
+        || call_site_shape_for_reference(node).is_some()
+    {
+        return false;
+    }
+    let Some(binding) = precise_scala_binding(ctx.bindings, text) else {
+        return false;
+    };
+    let Some(field_owner) = binding.declaration_owner.as_ref() else {
+        return false;
+    };
+    let Some(contract_owner) = ctx.spec.owner.as_ref() else {
+        return false;
+    };
+    field_owner == contract_owner
+        || ctx
+            .types
+            .exact_owner_inherits(ctx.scala, field_owner, contract_owner)
 }
 
 fn lexically_visible_field(node: Node<'_>, name: &str, ctx: &ScanCtx<'_>) -> FieldResolution {

@@ -7684,3 +7684,94 @@ class External extends Base {
         }
     }
 }
+
+#[test]
+fn scala_abstract_parameterless_contract_accepts_exact_field_implementation_references() {
+    let replica = |platform: &str| {
+        format!(
+            r#"package replica
+abstract class ArrayBuilder {{
+  protected def elems: String | Null
+}}
+object ArrayBuilder {{
+  class Child extends ArrayBuilder {{
+    protected var elems: String | Null = "value"
+    def reset(): Unit = {{
+      val previous = elems // {platform}-abstract-field-read
+      elems = null // {platform}-abstract-field-write
+    }}
+    def local(): String = {{
+      val elems = "local"
+      elems // {platform}-local-shadow-read
+    }}
+  }}
+}}
+class ConcreteBase {{
+  def elems: String | Null = "base"
+}}
+class ConcreteChild extends ConcreteBase {{
+  override var elems: String | Null = "child"
+  def reset(): Unit = {{
+    val previous = elems // {platform}-concrete-field-read
+    elems = null // {platform}-concrete-field-write
+  }}
+}}
+class Unrelated {{
+  var elems: String | Null = "other"
+  def reset(): Unit = elems = null // {platform}-unrelated-field-write
+}}
+"#
+        )
+    };
+    let jvm = replica("jvm");
+    let js = replica("js");
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("jvm/replica/ArrayBuilder.scala", &jvm),
+        ("js/replica/ArrayBuilder.scala", &js),
+    ]);
+
+    for (platform, path) in [
+        ("jvm", "jvm/replica/ArrayBuilder.scala"),
+        ("js", "js/replica/ArrayBuilder.scala"),
+    ] {
+        let target = analyzer
+            .get_definitions("replica.ArrayBuilder.elems")
+            .into_iter()
+            .find(|unit| rel_path_string(unit.source()) == path)
+            .unwrap_or_else(|| panic!("missing {path} abstract elems contract"));
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        for marker in [
+            format!("{platform}-abstract-field-read"),
+            format!("{platform}-abstract-field-write"),
+        ] {
+            assert_hit_contains(&target_hits, &marker);
+        }
+        let other = if platform == "jvm" { "js" } else { "jvm" };
+        for marker in [
+            format!("{other}-abstract-field-read"),
+            format!("{other}-abstract-field-write"),
+            format!("{platform}-concrete-field-read"),
+            format!("{platform}-concrete-field-write"),
+            format!("{platform}-unrelated-field-write"),
+            format!("{platform}-local-shadow-read"),
+        ] {
+            assert_no_hit_contains(&target_hits, &marker);
+        }
+
+        let concrete = analyzer
+            .get_definitions("replica.ConcreteBase.elems")
+            .into_iter()
+            .find(|unit| rel_path_string(unit.source()) == path)
+            .unwrap_or_else(|| panic!("missing {path} concrete elems method"));
+        let concrete_hits = hits(
+            UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&concrete)),
+        );
+        for marker in [
+            format!("{platform}-concrete-field-read"),
+            format!("{platform}-concrete-field-write"),
+        ] {
+            assert_no_hit_contains(&concrete_hits, &marker);
+        }
+    }
+}

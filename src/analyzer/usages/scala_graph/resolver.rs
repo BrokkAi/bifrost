@@ -32,6 +32,7 @@ pub(super) struct TargetSpec {
     pub(super) callable_arity: Option<CallableArity>,
     pub(super) callable_alternatives: CachedCallableAlternatives,
     pub(super) is_extension_method: bool,
+    pub(super) accepts_field_implementation: bool,
     pub(super) is_type_alias: bool,
     pub(super) is_object_type: bool,
     pub(super) accepts_extractor_role: bool,
@@ -86,6 +87,7 @@ impl TargetSpec {
                 callable_arity: None,
                 callable_alternatives: Arc::new(Vec::new()),
                 is_extension_method: false,
+                accepts_field_implementation: false,
                 is_type_alias,
                 is_object_type,
                 accepts_extractor_role,
@@ -140,6 +142,13 @@ impl TargetSpec {
         let is_extension_method = callable_alternatives
             .iter()
             .any(|alternative| alternative.extension_receiver_type.is_some());
+        let accepts_field_implementation = kind == TargetKind::Method
+            && scala
+                .project_types()
+                .is_abstract_scala_method(scala, target)
+            && callable_alternatives.iter().any(|alternative| {
+                alternative.role == ScalaCallableRole::Ordinary && alternative.shape.is_empty()
+            });
         let member_name = if kind == TargetKind::Constructor {
             owner_name.clone()?
         } else {
@@ -194,6 +203,7 @@ impl TargetSpec {
             callable_arity,
             callable_alternatives,
             is_extension_method,
+            accepts_field_implementation,
             is_type_alias: false,
             is_object_type: false,
             accepts_extractor_role: false,

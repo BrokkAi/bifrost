@@ -722,6 +722,35 @@ impl ProjectTypes {
         scala.get_direct_ancestors(owner)
     }
 
+    pub(super) fn exact_owner_inherits(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+        target: &CodeUnit,
+    ) -> bool {
+        let mut pending = vec![owner.clone()];
+        let mut seen = HashSet::default();
+        while let Some(current) = pending.pop() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            if &current == target {
+                return true;
+            }
+            let ancestors = match self.exact_direct_ancestor_resolution(scala, &current) {
+                ScalaDirectAncestorResolution::Resolved(ancestors) if !ancestors.is_empty() => {
+                    ancestors
+                }
+                ScalaDirectAncestorResolution::Resolved(_) => {
+                    self.direct_ancestors_for_declaration(scala, &current)
+                }
+                ScalaDirectAncestorResolution::Ambiguous => return false,
+            };
+            pending.extend(ancestors);
+        }
+        false
+    }
+
     pub(crate) fn exact_direct_ancestor_resolution(
         &self,
         scala: &ScalaAnalyzer,
@@ -1431,7 +1460,11 @@ impl ProjectTypes {
         BareMemberResolution::NoMatch
     }
 
-    fn is_abstract_scala_method(&self, scala: &ScalaAnalyzer, method: &CodeUnit) -> bool {
+    pub(super) fn is_abstract_scala_method(
+        &self,
+        scala: &ScalaAnalyzer,
+        method: &CodeUnit,
+    ) -> bool {
         let ranges = self.declaration_ranges_for(scala, method);
         !ranges.is_empty()
             && ranges.iter().all(|range| {
