@@ -185,12 +185,14 @@ impl CppQueryResolver<'_> {
             |file, prepared, spec| {
                 #[cfg(test)]
                 self.cpp.record_target_spec_scan_for_test();
+                let spec = spec
+                    .with_visible_callable_arities(analyzer, self.cpp, visibility, file, prepared);
                 scan_prepared_file(
                     analyzer,
                     visibility,
                     file,
                     prepared,
-                    spec,
+                    spec.as_ref(),
                     &target_group,
                     &mut state,
                 );

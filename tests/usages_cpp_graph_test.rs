@@ -12110,6 +12110,7 @@ struct Holder {
             .all(|range| !targeted.contains(&range) && !whole.contains(&range))
     );
 }
+
 #[test]
 fn authoritative_cpp_composite_partial_specializations_are_ranked_structurally() {
     let project = InlineTestProject::with_language(Language::Cpp)
@@ -12491,6 +12492,10 @@ struct Owner {
     static constexpr int C = Other::A + 1;
     static constexpr int D = [] { int A = 0; return A; }();
 };
+struct Qualifier {
+    int inspect(int value, int optional);
+    int inspect(int value, int optional = 0) const;
+};
 }"#,
         )
         .build();
@@ -12604,5 +12609,456 @@ struct Owner {
             .map(|hit| (hit.start_offset, hit.end_offset))
             .collect::<BTreeSet<_>>();
         assert_eq!((&targeted, &whole), (expected, expected), "{target:#?}");
+    }
+}
+#[test]
+fn authoritative_cpp_definition_targets_recover_visible_default_argument_metadata() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"namespace demo {
+struct Widget {
+    explicit Widget(int value, int optional = 0);
+    Widget(int first, int second, int third = 0);
+};
+struct Utility {
+    static int build(int value, int optional = 0);
+    static int build(int first, int second, int third = 0);
+};
+struct Other {
+    explicit Other(int value, int optional = 0);
+    static int build(int value, int optional = 0);
+};
+struct Qualifier {
+    int inspect(int value, int optional = 0);
+    int inspect(int value, int optional) const;
+};
+}"#,
+        )
+        .file(
+            "types.cc",
+            r#"#include "types.h"
+namespace demo {
+Widget::Widget(int value, int optional) {}
+Widget::Widget(int first, int second, int third) {}
+int Utility::build(int value, int optional) { return value + optional; }
+int Utility::build(int first, int second, int third) { return first + second + third; }
+Other::Other(int value, int optional) {}
+int Other::build(int value, int optional) { return value + optional; }
+int Qualifier::inspect(int value, int optional) { return value + optional; }
+int Qualifier::inspect(int value, int optional) const { return value + optional; }
+}"#,
+        )
+        .file(
+            "plain.h",
+            r#"namespace hidden {
+struct Gadget { explicit Gadget(int value, int optional); };
+}"#,
+        )
+        .file(
+            "plain.cc",
+            r#"#include "plain.h"
+namespace hidden { Gadget::Gadget(int value, int optional) {} }
+"#,
+        )
+        .file(
+            "unrelated_defaults.h",
+            r#"namespace hidden {
+struct Gadget { explicit Gadget(int value, int optional = 0); };
+}"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "types.h"
+#include "plain.h"
+namespace demo {
+void* construct_default() { return new Widget(1); }
+void* construct_exact() { return new Widget(1, 2); }
+void* construct_under() { return new Widget(); }
+void* construct_other_overload() { return new Widget(1, 2, 3); }
+void* construct_wrong_owner() { return new Other(1); }
+int call_default() { return Utility::build(1); }
+int call_exact() { return Utility::build(1, 2); }
+int call_under() { return Utility::build(); }
+int call_other_overload() { return Utility::build(1, 2, 3); }
+int call_wrong_owner() { return Other::build(1); }
+int call_non_const_default() { Qualifier value; return value.inspect(1); }
+int call_const_without_default() { const Qualifier value{}; return value.inspect(1); }
+int call_const_exact() { const Qualifier value{}; return value.inspect(1, 2); }
+}
+
+namespace hidden {
+void* construct_without_visible_default() { return new Gadget(1); }
+void* construct_without_default_exact() { return new Gadget(1, 2); }
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let file = project.file("consumer.cc");
+    let source = file.read_to_string().expect("source");
+    let forward_at = |start: usize| {
+        let line_start = source[..start].rfind('\n').map_or(0, |newline| newline + 1);
+        brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "consumer.cc".to_string(),
+                    line: Some(
+                        source[..start]
+                            .bytes()
+                            .filter(|byte| *byte == b'\n')
+                            .count()
+                            + 1,
+                    ),
+                    column: Some(source[line_start..start].chars().count() + 1),
+                }],
+            },
+        )
+        .results
+        .into_iter()
+        .next()
+        .expect("one forward lookup result")
+    };
+    for (range, expected_fqn) in [
+        (
+            fixture_token_range(
+                &source,
+                "void* construct_default() { return new Widget(1); }",
+                "Widget",
+            ),
+            "demo.Widget.Widget",
+        ),
+        (
+            fixture_token_range(
+                &source,
+                "int call_default() { return Utility::build(1); }",
+                "build",
+            ),
+            "demo.Utility.build",
+        ),
+    ] {
+        let forward = forward_at(range.0);
+        assert_eq!(forward.status, "resolved", "{forward:#?}");
+        assert!(
+            forward
+                .definitions
+                .iter()
+                .any(|definition| definition.fqn.as_deref() == Some(expected_fqn)),
+            "forward lookup must select the logical callable before its definition-only inverse query: {forward:#?}"
+        );
+    }
+
+    let physical_target = |fq_name: &str, signature: &str, path: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Function
+                && unit.fq_name() == fq_name
+                && unit.signature() == Some(signature)
+                && slash_path(unit.source()) == path
+        })
+    };
+    let constructor_definition = physical_target("demo.Widget.Widget", "(int, int)", "types.cc");
+    let constructor_declaration = physical_target("demo.Widget.Widget", "(int, int)", "types.h");
+    let static_definition = physical_target("demo.Utility.build", "(int, int)", "types.cc");
+    let static_declaration = physical_target("demo.Utility.build", "(int, int)", "types.h");
+    let hidden_definition = physical_target("hidden.Gadget.Gadget", "(int, int)", "plain.cc");
+    let qualified_definition =
+        physical_target("demo.Qualifier.inspect", "(int, int) const", "types.cc");
+
+    let constructor_expected = BTreeSet::from([
+        fixture_token_range(
+            &source,
+            "void* construct_default() { return new Widget(1); }",
+            "Widget",
+        ),
+        fixture_token_range(
+            &source,
+            "void* construct_exact() { return new Widget(1, 2); }",
+            "Widget",
+        ),
+    ]);
+    let static_expected = BTreeSet::from([
+        fixture_token_range(
+            &source,
+            "int call_default() { return Utility::build(1); }",
+            "build",
+        ),
+        fixture_token_range(
+            &source,
+            "int call_exact() { return Utility::build(1, 2); }",
+            "build",
+        ),
+    ]);
+    let hidden_expected = BTreeSet::from([fixture_token_range(
+        &source,
+        "void* construct_without_default_exact() { return new Gadget(1, 2); }",
+        "Gadget",
+    )]);
+    let cases = vec![
+        (
+            vec![constructor_definition.clone()],
+            constructor_expected.clone(),
+        ),
+        (vec![static_definition.clone()], static_expected.clone()),
+        (vec![hidden_definition], hidden_expected),
+        (
+            vec![qualified_definition],
+            BTreeSet::from([fixture_token_range(
+                &source,
+                "int call_const_exact() { const Qualifier value{}; return value.inspect(1, 2); }",
+                "inspect",
+            )]),
+        ),
+        (
+            vec![
+                constructor_definition.clone(),
+                constructor_declaration.clone(),
+            ],
+            constructor_expected.clone(),
+        ),
+        (
+            vec![constructor_declaration, constructor_definition],
+            constructor_expected,
+        ),
+        (
+            vec![static_definition.clone(), static_declaration.clone()],
+            static_expected.clone(),
+        ),
+        (vec![static_declaration, static_definition], static_expected),
+    ];
+    for (targets, expected) in cases {
+        let targeted = authoritative_exact_ranges(&analyzer, &targets, &file);
+        let whole_result = UsageFinder::new().find_usages_default(&analyzer, &targets);
+        let whole = whole_result
+            .all_hits_including_imports()
+            .into_iter()
+            .filter(|hit| hit.file == file)
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect::<BTreeSet<_>>();
+        assert_eq!((&targeted, &whole), (&expected, &expected), "{targets:#?}");
+        let FuzzyResult::Success {
+            unproven_total_by_overload,
+            ..
+        } = whole_result
+        else {
+            panic!("expected whole-workspace C++ success for {targets:#?}");
+        };
+        assert_eq!(
+            unproven_total_by_overload.values().sum::<usize>(),
+            0,
+            "owner and arity negatives must not become unproven hits: {targets:#?}"
+        );
+    }
+}
+
+#[test]
+fn authoritative_cpp_default_metadata_respects_source_and_preprocessor_visibility() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "base.h",
+            r#"#ifndef ORDERING_BASE_H
+#define ORDERING_BASE_H
+namespace ordering {
+int route(int value, int optional);
+int local(int value, int optional);
+int scoped(int value, int optional);
+int conditional(int value, int optional);
+int transitive(int value, int optional);
+int alternative(int value, int optional);
+int ambiguous(int value, int optional);
+}
+#endif
+"#,
+        )
+        .file(
+            "defaults.h",
+            r#"#pragma once
+#ifndef ORDERING_DEFAULTS_H
+#define ORDERING_DEFAULTS_H
+namespace ordering { int route(int value, int optional = 0); }
+#endif
+"#,
+        )
+        .file(
+            "alternative_guard.h",
+            r#"#ifndef ORDERING_ALTERNATIVE_H
+#define ORDERING_ALTERNATIVE_H
+namespace ordering { int alternative(int value, int optional = 0); }
+#else
+namespace ordering { int alternative(int value, int optional); }
+#endif
+"#,
+        )
+        .file(
+            "branch_defaults.h",
+            r#"#if ENABLE_BRANCH_DEFAULTS
+namespace ordering { int conditional(int value, int optional = 0); }
+#endif
+"#,
+        )
+        .file(
+            "transitive_defaults.h",
+            "namespace ordering { int transitive(int value, int optional = 0); }\n",
+        )
+        .file(
+            "conditional_bridge.h",
+            r#"#if ENABLE_TRANSITIVE_DEFAULTS
+#include "transitive_defaults.h"
+#endif
+"#,
+        )
+        .file(
+            "collision_a/shared_defaults.h",
+            "namespace ordering { int ambiguous(int value, int optional = 0); }\n",
+        )
+        .file(
+            "collision_b/shared_defaults.h",
+            "namespace ordering { int ambiguous(int value, int optional = 0); }\n",
+        )
+        .file(
+            "defs.cc",
+            r#"#include "base.h"
+namespace ordering {
+int route(int value, int optional) { return value + optional; }
+int local(int value, int optional) { return value + optional; }
+int scoped(int value, int optional) { return value + optional; }
+int conditional(int value, int optional) { return value + optional; }
+int transitive(int value, int optional) { return value + optional; }
+int alternative(int value, int optional) { return value + optional; }
+int ambiguous(int value, int optional) { return value + optional; }
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "base.h"
+namespace ordering {
+int before_include() { return route(1); }
+}
+#include "defaults.h"
+namespace ordering {
+int after_include() { return route(1); }
+int exact_first() { return route(1, 2); }
+int before_declaration() { return local(1); }
+int local(int value, int optional = 0);
+int after_declaration() { return local(1); }
+int exact_second() { return local(1, 2); }
+void install_block_scope_default() { int scoped(int value, int optional = 0); }
+int after_block() { return scoped(1); }
+int exact_third() { return scoped(1, 2); }
+}
+#include "branch_defaults.h"
+#include "conditional_bridge.h"
+#include "alternative_guard.h"
+#include "shared_defaults.h"
+namespace ordering {
+int branch_only() { return conditional(1); }
+int exact_fourth() { return conditional(1, 2); }
+int branch_fifth() { return transitive(1); }
+int exact_fifth() { return transitive(1, 2); }
+int alternative_branch() { return alternative(1); }
+int exact_sixth() { return alternative(1, 2); }
+int ambiguous_include() { return ambiguous(1); }
+int exact_seventh() { return ambiguous(1, 2); }
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let file = project.file("consumer.cc");
+    let source = file.read_to_string().expect("source");
+    let target = |fq_name: &str| {
+        definition_by(&analyzer, |unit| {
+            unit.kind() == CodeUnitType::Function
+                && unit.fq_name() == fq_name
+                && unit.signature() == Some("(int, int)")
+                && slash_path(unit.source()) == "defs.cc"
+        })
+    };
+    assert!(
+        analyzer.get_all_declarations().iter().all(|unit| {
+            unit.fq_name() != "ordering.scoped" || slash_path(unit.source()) != "consumer.cc"
+        }),
+        "block-scope declarations must remain outside the physical CodeUnit candidate model"
+    );
+
+    let cases = [
+        (
+            target("ordering.route"),
+            BTreeSet::from([
+                fixture_token_range(&source, "int after_include() { return route(1); }", "route"),
+                fixture_token_range(
+                    &source,
+                    "int exact_first() { return route(1, 2); }",
+                    "route",
+                ),
+            ]),
+        ),
+        (
+            target("ordering.local"),
+            BTreeSet::from([
+                fixture_token_range(
+                    &source,
+                    "int after_declaration() { return local(1); }",
+                    "local",
+                ),
+                fixture_token_range(
+                    &source,
+                    "int exact_second() { return local(1, 2); }",
+                    "local",
+                ),
+            ]),
+        ),
+        (
+            target("ordering.scoped"),
+            BTreeSet::from([fixture_token_range(
+                &source,
+                "int exact_third() { return scoped(1, 2); }",
+                "scoped",
+            )]),
+        ),
+        (
+            target("ordering.conditional"),
+            BTreeSet::from([fixture_token_range(
+                &source,
+                "int exact_fourth() { return conditional(1, 2); }",
+                "conditional",
+            )]),
+        ),
+        (
+            target("ordering.transitive"),
+            BTreeSet::from([fixture_token_range(
+                &source,
+                "int exact_fifth() { return transitive(1, 2); }",
+                "transitive",
+            )]),
+        ),
+        (
+            target("ordering.alternative"),
+            BTreeSet::from([fixture_token_range(
+                &source,
+                "int exact_sixth() { return alternative(1, 2); }",
+                "alternative",
+            )]),
+        ),
+        (
+            target("ordering.ambiguous"),
+            BTreeSet::from([fixture_token_range(
+                &source,
+                "int exact_seventh() { return ambiguous(1, 2); }",
+                "ambiguous",
+            )]),
+        ),
+    ];
+    for (target, expected) in cases {
+        let targeted = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &file);
+        let whole = UsageFinder::new()
+            .find_usages_default(&analyzer, std::slice::from_ref(&target))
+            .all_hits_including_imports()
+            .into_iter()
+            .filter(|hit| hit.file == file)
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect::<BTreeSet<_>>();
+        assert_eq!((&targeted, &whole), (&expected, &expected), "{target:#?}");
     }
 }

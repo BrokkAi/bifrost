@@ -1,3 +1,4 @@
+use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::cpp_call_match::{
     CppArgType, cpp_signature_param_types, cpp_split_top_level_commas, normalize_cpp_type_name,
@@ -12,6 +13,7 @@ use crate::analyzer::{
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::hash::Hash;
 #[cfg(test)]
@@ -266,15 +268,23 @@ impl ScopedUsingEnumOwners {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct TargetSpec {
     pub(super) target: CodeUnit,
     pub(super) kind: TargetKind,
     pub(super) owner: Option<CodeUnit>,
     pub(super) member_name: String,
     pub(super) callable_arity: Option<CallableArity>,
+    activated_callable_arities: Vec<ActivatedCallableArity>,
     pub(super) param_types: Option<Vec<String>>,
     pub(super) enum_owner_kind: EnumOwnerKind,
     pub(super) owner_is_forward_declaration: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ActivatedCallableArity {
+    activation_byte: usize,
+    arity: CallableArity,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -383,6 +393,36 @@ impl TargetSpec {
         None
     }
 
+    pub(super) fn with_visible_callable_arities<'a>(
+        &'a self,
+        analyzer: &dyn IAnalyzer,
+        cpp: &CppAnalyzer,
+        visibility: &VisibilityIndex,
+        file: &ProjectFile,
+        prepared: &PreparedSyntaxTree,
+    ) -> Cow<'a, Self> {
+        let activated_callable_arities =
+            visibility.callable_arities_for_target(analyzer, cpp, file, prepared, self);
+        if activated_callable_arities.is_empty() {
+            return Cow::Borrowed(self);
+        }
+        let mut effective = self.clone();
+        effective.activated_callable_arities = activated_callable_arities;
+        Cow::Owned(effective)
+    }
+
+    pub(super) fn callable_arity_at(&self, byte: usize) -> Option<CallableArity> {
+        let base = self.callable_arity?;
+        Some(
+            self.activated_callable_arities
+                .iter()
+                .filter(|candidate| candidate.activation_byte <= byte)
+                .fold(base, |arity, candidate| {
+                    merge_compatible_callable_arities(arity, candidate.arity).unwrap_or(arity)
+                }),
+        )
+    }
+
     pub(super) fn new(
         target: CodeUnit,
         kind: TargetKind,
@@ -397,6 +437,7 @@ impl TargetSpec {
             owner,
             member_name,
             callable_arity,
+            activated_callable_arities: Vec::new(),
             param_types,
             enum_owner_kind: EnumOwnerKind::NonEnum,
             owner_is_forward_declaration: false,
@@ -551,6 +592,9 @@ pub(in crate::analyzer::usages) struct VisibilityIndex {
     visible_source_files_by_root: HashMap<ProjectFile, HashSet<ProjectFile>>,
     alias_cells: Mutex<HashMap<ProjectFile, AliasCell>>,
     ordinary_type_import_cells: Mutex<HashMap<ProjectFile, OrdinaryTypeImportCell>>,
+    include_activation_cells: Mutex<HashMap<(ProjectFile, ProjectFile), Option<usize>>>,
+    #[cfg(test)]
+    include_activation_build_count: AtomicUsize,
     #[cfg(test)]
     alias_source_parse_counts: Mutex<HashMap<ProjectFile, usize>>,
     field_type_facts: Mutex<HashMap<CodeUnit, Option<DeclaredFieldTypeFact>>>,
@@ -646,6 +690,9 @@ impl VisibilityIndex {
             visible_source_files_by_root,
             alias_cells: Mutex::new(HashMap::default()),
             ordinary_type_import_cells: Mutex::new(HashMap::default()),
+            include_activation_cells: Mutex::new(HashMap::default()),
+            #[cfg(test)]
+            include_activation_build_count: AtomicUsize::new(0),
             #[cfg(test)]
             alias_source_parse_counts: Mutex::new(HashMap::default()),
             field_type_facts: Mutex::new(HashMap::default()),
@@ -676,6 +723,103 @@ impl VisibilityIndex {
             .entry(file.clone())
             .or_default()
             .clone()
+    }
+
+    fn callable_arities_for_target(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        cpp: &CppAnalyzer,
+        file: &ProjectFile,
+        prepared: &PreparedSyntaxTree,
+        spec: &TargetSpec,
+    ) -> Vec<ActivatedCallableArity> {
+        let Some(signature) = spec.target.signature() else {
+            return Vec::new();
+        };
+        let Some(candidates) = self
+            .visible_by_identifier
+            .get(file)
+            .and_then(|by_name| by_name.get(&spec.member_name))
+        else {
+            return Vec::new();
+        };
+        let differing_candidates = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.is_function()
+                    && candidate.fq_name() == spec.target.fq_name()
+                    && candidate.signature() == Some(signature)
+            })
+            .filter_map(|candidate| {
+                analyzer
+                    .signature_metadata(candidate)
+                    .into_iter()
+                    .find_map(|metadata| metadata.callable_arity())
+                    .filter(|arity| Some(*arity) != spec.callable_arity)
+                    .map(|arity| (candidate, arity))
+            })
+            .collect::<Vec<_>>();
+        if differing_candidates.is_empty() {
+            return Vec::new();
+        }
+        let mut arities = Vec::with_capacity(differing_candidates.len());
+        for (candidate, candidate_arity) in differing_candidates {
+            let declaration_activation = if candidate.source() == file {
+                callable_declaration_activation_in_file(analyzer, prepared, candidate)
+            } else {
+                cpp.prepared_syntax(candidate.source()).and_then(|syntax| {
+                    callable_declaration_activation_in_file(analyzer, syntax.as_ref(), candidate)
+                })
+            };
+            let Some(declaration_activation) = declaration_activation else {
+                continue;
+            };
+            let activation_byte = if candidate.source() == file {
+                Some(declaration_activation)
+            } else {
+                self.include_activation_for_source(cpp, file, prepared, candidate.source())
+            };
+            if let Some(activation_byte) = activation_byte {
+                arities.push(ActivatedCallableArity {
+                    activation_byte,
+                    arity: candidate_arity,
+                });
+            }
+        }
+        arities
+    }
+
+    fn include_activation_for_source(
+        &self,
+        cpp: &CppAnalyzer,
+        file: &ProjectFile,
+        prepared: &PreparedSyntaxTree,
+        donor_source: &ProjectFile,
+    ) -> Option<usize> {
+        let key = (file.clone(), donor_source.clone());
+        if let Some(cached) = self
+            .include_activation_cells
+            .lock()
+            .expect("C++ include activation cache poisoned")
+            .get(&key)
+            .copied()
+        {
+            return cached;
+        }
+        #[cfg(test)]
+        self.include_activation_build_count
+            .fetch_add(1, Ordering::Relaxed);
+        let activation = find_include_activation(cpp, file, prepared, donor_source);
+        let mut cells = self
+            .include_activation_cells
+            .lock()
+            .expect("C++ include activation cache poisoned");
+        *cells.entry(key).or_insert(activation)
+    }
+
+    #[cfg(test)]
+    fn include_activation_build_count_for_test(&self) -> usize {
+        self.include_activation_build_count.load(Ordering::Relaxed)
     }
 
     pub(super) fn is_physically_visible(&self, file: &ProjectFile, target: &CodeUnit) -> bool {
@@ -2401,6 +2545,217 @@ pub(super) fn cpp_callable_arity(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> C
         .into_iter()
         .find_map(|metadata| metadata.callable_arity())
         .unwrap_or_else(|| CallableArity::exact(signature_arity(unit.signature())))
+}
+
+fn merge_compatible_callable_arities(
+    left: CallableArity,
+    right: CallableArity,
+) -> Option<CallableArity> {
+    let total = left.total();
+    let left_repeated = left.accepts(total.saturating_add(1));
+    let right_repeated = right.accepts(right.total().saturating_add(1));
+    if total != right.total() || left_repeated != right_repeated {
+        return None;
+    }
+    let required = (0..=total).find(|arity| left.accepts(*arity) || right.accepts(*arity))?;
+    Some(CallableArity::new(required, total, left_repeated))
+}
+
+fn find_include_activation(
+    cpp: &CppAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    donor_source: &ProjectFile,
+) -> Option<usize> {
+    let include_targets = cpp.include_target_index();
+    let mut direct_includes = Vec::new();
+    let mut nodes = vec![prepared.tree().root_node()];
+    while let Some(node) = nodes.pop() {
+        if node.kind() == "preproc_include" {
+            if callable_preprocessor_context_is_visible(node, prepared.source()) {
+                let raw = normalize_cpp_whitespace(node_text(node, prepared.source()));
+                for include in cpp_include_paths(std::slice::from_ref(&raw)) {
+                    if let Some(target) = unique_include_target(resolve_include_targets_with_index(
+                        file,
+                        &include,
+                        include_targets,
+                    )) {
+                        direct_includes.push((node.end_byte(), target));
+                    }
+                }
+            }
+            continue;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                nodes.push(child);
+            }
+        }
+    }
+    direct_includes.sort_by_key(|(activation, _)| *activation);
+    let mut known_missing = HashSet::default();
+    direct_includes
+        .into_iter()
+        .find(|(_, direct)| {
+            unconditional_include_reaches(
+                cpp,
+                include_targets,
+                direct,
+                donor_source,
+                &mut known_missing,
+            )
+        })
+        .map(|(activation, _)| activation)
+}
+
+fn unconditional_include_reaches(
+    cpp: &CppAnalyzer,
+    include_targets: &IncludeTargetIndex,
+    first: &ProjectFile,
+    donor_source: &ProjectFile,
+    known_missing: &mut HashSet<ProjectFile>,
+) -> bool {
+    if first == donor_source {
+        return true;
+    }
+    if known_missing.contains(first) {
+        return false;
+    }
+    let mut visited = HashSet::default();
+    let mut files = vec![first.clone()];
+    while let Some(file) = files.pop() {
+        if file == *donor_source {
+            return true;
+        }
+        if known_missing.contains(&file) || !visited.insert(file.clone()) {
+            continue;
+        }
+        let Some(prepared) = cpp.prepared_syntax(&file) else {
+            continue;
+        };
+        let mut nodes = vec![prepared.tree().root_node()];
+        while let Some(node) = nodes.pop() {
+            if node.kind() == "preproc_include" {
+                if callable_preprocessor_context_is_visible(node, prepared.source()) {
+                    let raw = normalize_cpp_whitespace(node_text(node, prepared.source()));
+                    for include in cpp_include_paths(std::slice::from_ref(&raw)) {
+                        if let Some(target) = unique_include_target(
+                            resolve_include_targets_with_index(&file, &include, include_targets),
+                        ) {
+                            files.push(target);
+                        }
+                    }
+                }
+                continue;
+            }
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    nodes.push(child);
+                }
+            }
+        }
+    }
+    known_missing.extend(visited);
+    false
+}
+
+fn unique_include_target(mut targets: Vec<ProjectFile>) -> Option<ProjectFile> {
+    if targets.len() == 1 {
+        targets.pop()
+    } else {
+        None
+    }
+}
+
+fn callable_declaration_activation_in_file(
+    analyzer: &dyn IAnalyzer,
+    prepared: &PreparedSyntaxTree,
+    candidate: &CodeUnit,
+) -> Option<usize> {
+    let root = prepared.tree().root_node();
+    analyzer
+        .ranges(candidate)
+        .into_iter()
+        .filter_map(|range| {
+            let mut declaration =
+                root.descendant_for_byte_range(range.start_byte, range.end_byte)?;
+            while !matches!(
+                declaration.kind(),
+                "declaration" | "field_declaration" | "function_definition"
+            ) {
+                declaration = declaration.parent()?;
+            }
+            let mut ancestor = declaration.parent();
+            while let Some(node) = ancestor {
+                if matches!(
+                    node.kind(),
+                    "compound_statement" | "function_definition" | "lambda_expression"
+                ) {
+                    return None;
+                }
+                ancestor = node.parent();
+            }
+            callable_preprocessor_context_is_visible(declaration, prepared.source())
+                .then_some(declaration.end_byte())
+        })
+        .min()
+}
+
+fn callable_preprocessor_context_is_visible(node: Node<'_>, source: &str) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        if matches!(
+            parent.kind(),
+            "preproc_if" | "preproc_ifdef" | "preproc_ifndef" | "preproc_elif" | "preproc_else"
+        ) && !callable_is_canonical_include_guard(parent, source)
+        {
+            return false;
+        }
+        ancestor = parent.parent();
+    }
+    true
+}
+
+fn callable_is_canonical_include_guard(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "preproc_ifdef"
+        || !node_text(node, source).trim_start().starts_with("#ifndef")
+        || node
+            .parent()
+            .is_none_or(|parent| parent.kind() != "translation_unit")
+    {
+        return false;
+    }
+    let Some(name) = node.child_by_field_name("name") else {
+        return false;
+    };
+    let guard_name = node_text(name, source).trim();
+    if guard_name.is_empty() {
+        return false;
+    }
+    let parent = node
+        .parent()
+        .expect("include guard has translation-unit parent");
+    let mut cursor = parent.walk();
+    if parent.named_children(&mut cursor).any(|sibling| {
+        sibling != node && sibling.kind() != "comment" && !callable_is_pragma_once(sibling, source)
+    }) || node.child_by_field_name("alternative").is_some()
+    {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| *child != name && child.kind() != "comment")
+        .is_some_and(|candidate| {
+            candidate.kind() == "preproc_def"
+                && candidate
+                    .child_by_field_name("name")
+                    .is_some_and(|defined| node_text(defined, source).trim() == guard_name)
+        })
+}
+
+fn callable_is_pragma_once(node: Node<'_>, source: &str) -> bool {
+    matches!(node.kind(), "preproc_call" | "preproc_directive")
+        && normalize_cpp_whitespace(node_text(node, source)) == "#pragma once"
 }
 
 pub(in crate::analyzer::usages) fn call_arity(node: Node<'_>) -> usize {
@@ -4853,6 +5208,8 @@ mod tests {
             visible_source_files_by_root: HashMap::default(),
             alias_cells: Mutex::new(HashMap::default()),
             ordinary_type_import_cells: Mutex::new(HashMap::default()),
+            include_activation_cells: Mutex::new(HashMap::default()),
+            include_activation_build_count: AtomicUsize::new(0),
             alias_source_parse_counts: Mutex::new(HashMap::default()),
             field_type_facts: Mutex::new(HashMap::default()),
             structured_alias_targets: Mutex::new(HashMap::default()),
@@ -5260,5 +5617,115 @@ mod tests {
             1,
             "all candidates must share the request-scoped prepared tree"
         );
+    }
+
+    #[test]
+    fn callable_targets_without_differing_redeclarations_skip_include_activation_work() {
+        const TARGET_COUNT: usize = 128;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let header = ProjectFile::new(root.clone(), "api.h");
+        let consumer = ProjectFile::new(root.clone(), "consumer.cc");
+        let mut declarations = String::from("#pragma once\n");
+        for index in 0..TARGET_COUNT {
+            declarations.push_str(&format!("int candidate_{index}(int value);\n"));
+        }
+        header.write(&declarations).expect("write declarations");
+        consumer
+            .write("#include \"api.h\"\nint consume() { return 0; }\n")
+            .expect("write consumer");
+
+        let project = Arc::new(crate::analyzer::TestProject::new(
+            &root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let workspace = crate::analyzer::WorkspaceAnalyzer::build(
+            project,
+            crate::analyzer::AnalyzerConfig::default(),
+        );
+        let analyzer = workspace.analyzer();
+        let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
+        let roots = HashSet::from_iter([consumer.clone()]);
+        let visibility = VisibilityIndex::build(cpp, analyzer, &roots);
+        let prepared = cpp.prepared_syntax(&consumer).expect("prepared consumer");
+        let targets = cpp
+            .get_all_declarations()
+            .into_iter()
+            .filter(|candidate| {
+                candidate.is_function()
+                    && candidate.source() == &header
+                    && candidate.short_name().starts_with("candidate_")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(targets.len(), TARGET_COUNT, "scale fixture targets");
+        for target in &targets {
+            let spec = TargetSpec::from_target(analyzer, target).expect("target spec");
+            assert!(matches!(
+                spec.with_visible_callable_arities(
+                    analyzer,
+                    cpp,
+                    &visibility,
+                    &consumer,
+                    prepared.as_ref(),
+                ),
+                Cow::Borrowed(_)
+            ));
+        }
+        assert_eq!(
+            visibility.include_activation_build_count_for_test(),
+            0,
+            "zero-donor targets must not inspect the include graph"
+        );
+    }
+
+    #[test]
+    fn callable_arity_keeps_compatible_defaults_independent_of_incompatible_donor_order() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let target = CodeUnit::with_signature(
+            ProjectFile::new(root, "target.cc"),
+            CodeUnitType::Function,
+            "demo",
+            "route",
+            Some("(int, int)".to_string()),
+            false,
+        );
+        for activated_callable_arities in [
+            vec![
+                ActivatedCallableArity {
+                    activation_byte: 1,
+                    arity: CallableArity::new(1, 2, false),
+                },
+                ActivatedCallableArity {
+                    activation_byte: 1,
+                    arity: CallableArity::new(1, 3, false),
+                },
+            ],
+            vec![
+                ActivatedCallableArity {
+                    activation_byte: 1,
+                    arity: CallableArity::new(1, 3, false),
+                },
+                ActivatedCallableArity {
+                    activation_byte: 1,
+                    arity: CallableArity::new(1, 2, false),
+                },
+            ],
+        ] {
+            let mut spec = TargetSpec::new(
+                target.clone(),
+                TargetKind::FreeFunction,
+                None,
+                "route".to_string(),
+                Some(CallableArity::exact(2)),
+                Some(vec!["int".to_string(), "int".to_string()]),
+            );
+            spec.activated_callable_arities = activated_callable_arities;
+            let arity = spec.callable_arity_at(1).expect("callable arity");
+            assert!(arity.accepts(1), "compatible default must remain active");
+            assert!(arity.accepts(2), "full arity must remain active");
+            assert!(!arity.accepts(0), "under-arity must remain rejected");
+            assert!(!arity.accepts(3), "incompatible donor must remain ignored");
+        }
     }
 }

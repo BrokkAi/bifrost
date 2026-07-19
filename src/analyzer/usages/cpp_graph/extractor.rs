@@ -729,7 +729,7 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         if field_initializer_constructs_target(node, ctx, owner)
             && ctx
                 .spec
-                .callable_arity
+                .callable_arity_at(node.start_byte())
                 .is_none_or(|expected| expected.accepts(call_arity(node)))
         {
             push_hit(node, ctx);
@@ -741,7 +741,7 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             && declaration_mentions_type(node, ctx, owner)
             && ctx
                 .spec
-                .callable_arity
+                .callable_arity_at(node.start_byte())
                 .is_none_or(|expected| expected.accepts(declaration_constructor_arity(node, ctx)))
         {
             push_hit(node, ctx);
@@ -756,7 +756,7 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     *ctx.raw_match_count += 1;
-    if let Some(expected) = ctx.spec.callable_arity
+    if let Some(expected) = ctx.spec.callable_arity_at(node.start_byte())
         && !expected.accepts(call_arity(node))
     {
         return;
@@ -794,7 +794,7 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     *ctx.raw_match_count += 1;
-    if let Some(expected) = ctx.spec.callable_arity
+    if let Some(expected) = ctx.spec.callable_arity_at(node.start_byte())
         && !expected.accepts(call_arity(node))
     {
         return;
@@ -1007,7 +1007,7 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             return;
         }
         *ctx.raw_match_count += 1;
-        if let Some(expected) = ctx.spec.callable_arity
+        if let Some(expected) = ctx.spec.callable_arity_at(node.start_byte())
             && !expected.accepts(call_arity(node))
         {
             return;
@@ -1040,7 +1040,7 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     *ctx.raw_match_count += 1;
-    if let Some(expected) = ctx.spec.callable_arity
+    if let Some(expected) = ctx.spec.callable_arity_at(node.start_byte())
         && !expected.accepts(call_arity(node))
     {
         return;
@@ -1323,7 +1323,7 @@ fn function_definition_name_node(node: Node<'_>) -> Option<Node<'_>> {
 
 fn function_definition_signature_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     let definition = node_text(node, ctx.source);
-    let Some(expected) = ctx.spec.callable_arity else {
+    let Some(expected) = ctx.spec.callable_arity_at(node.start_byte()) else {
         return true;
     };
     if !expected.accepts(signature_arity(Some(definition))) {
