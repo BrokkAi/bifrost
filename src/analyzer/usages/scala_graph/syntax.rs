@@ -165,6 +165,112 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
     Some(facts)
 }
 
+/// Return only the value binders introduced by a Scala pattern.
+///
+/// Pattern syntax mixes declaration positions with type paths, extractor
+/// owners, infix operators, and named-pattern labels.  A generic identifier
+/// walk therefore cannot define lexical scope correctly.  This parser-backed
+/// collector follows the grammar's pattern fields and deliberately excludes
+/// every non-binding role.
+pub(crate) fn scala_pattern_binder_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
+    scala_pattern_binder_nodes(node)
+        .into_iter()
+        .filter_map(|node| {
+            let name = node_text(node, source).trim();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect()
+}
+
+fn scala_pattern_binder_nodes(node: Node<'_>) -> Vec<Node<'_>> {
+    let mut binders = Vec::new();
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "identifier" | "operator_identifier" => binders.push(node),
+            "typed_pattern" | "repeat_pattern" => {
+                if let Some(pattern) = node.child_by_field_name("pattern") {
+                    stack.push(pattern);
+                }
+            }
+            "case_class_pattern" => {
+                let mut cursor = node.walk();
+                let mut patterns = node
+                    .children_by_field_name("pattern", &mut cursor)
+                    .collect::<Vec<_>>();
+                patterns.reverse();
+                stack.extend(patterns);
+            }
+            "capture_pattern" => {
+                if let Some(pattern) = node.child_by_field_name("pattern") {
+                    stack.push(pattern);
+                }
+                if let Some(name) = node.child_by_field_name("name") {
+                    stack.push(name);
+                }
+            }
+            "infix_pattern" => {
+                if let Some(right) = node.child_by_field_name("right") {
+                    stack.push(right);
+                }
+                if let Some(left) = node.child_by_field_name("left") {
+                    stack.push(left);
+                }
+            }
+            // Scala 3 named extractor arguments use `label = pattern`; the
+            // leading identifier names the extractor field and is not a new
+            // local.  The grammar does not expose fields for this node, so skip
+            // its first named child and recurse into the value pattern only.
+            "named_pattern" => {
+                let mut cursor = node.walk();
+                let mut children = node.named_children(&mut cursor).skip(1).collect::<Vec<_>>();
+                children.reverse();
+                stack.extend(children);
+            }
+            "stable_identifier"
+            | "stable_type_identifier"
+            | "type_identifier"
+            | "given_pattern"
+            | "literal"
+            | "wildcard" => {}
+            _ => {
+                let mut cursor = node.walk();
+                let mut children = node.named_children(&mut cursor).collect::<Vec<_>>();
+                children.reverse();
+                stack.extend(children);
+            }
+        }
+    }
+    binders
+}
+
+/// Whether this exact identifier node declares a case-pattern value binder.
+/// Comparing node identities matters when a binder intentionally has the same
+/// spelling as a qualifier in its own type annotation.
+pub(crate) fn is_scala_case_pattern_binder(node: Node<'_>) -> bool {
+    if !matches!(node.kind(), "identifier" | "operator_identifier") {
+        return false;
+    }
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "case_clause" {
+            return parent
+                .child_by_field_name("pattern")
+                .filter(|pattern| {
+                    pattern.start_byte() <= node.start_byte()
+                        && node.end_byte() <= pattern.end_byte()
+                })
+                .is_some_and(|pattern| {
+                    scala_pattern_binder_nodes(pattern)
+                        .into_iter()
+                        .any(|binder| binder.id() == node.id())
+                });
+        }
+        current = parent.parent();
+    }
+    false
+}
+
 /// Return the parser-derived lookup paths of every direct alternative in a
 /// Scala 3 union type. Tree-sitter represents `A | B` as an `infix_type`; only
 /// the `|` operator is flattened, so unrelated infix/compound type syntax is
@@ -1179,6 +1285,48 @@ pub(crate) fn is_declaration_name(node: Node<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pattern_binders_exclude_types_extractors_operators_and_named_labels() {
+        let source = r#"object Patterns {
+  def read(value: Any): Any = value match {
+    case owner: owner.Nested if owner != null => owner
+    case captured @ Root.Box(label = nested, pair = (left, right)) => captured
+    case head :: tail => tail
+    case given Root.Context => value
+  }
+}
+"#;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_scala::LANGUAGE.into())
+            .expect("Scala grammar");
+        let tree = parser.parse(source, None).expect("Scala tree");
+        let mut actual = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "case_clause"
+                && let Some(pattern) = node.child_by_field_name("pattern")
+            {
+                actual.push(scala_pattern_binder_names(pattern, source));
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        actual.reverse();
+
+        assert_eq!(
+            actual,
+            vec![
+                vec!["owner"],
+                vec!["captured", "nested", "left", "right"],
+                vec!["head", "tail"],
+                Vec::<&str>::new(),
+            ],
+            "{}",
+            tree.root_node().to_sexp()
+        );
+    }
 
     #[test]
     fn parameterized_enum_case_records_primary_constructor_source_facts() {

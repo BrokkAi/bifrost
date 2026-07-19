@@ -239,6 +239,71 @@ object Consumer {
 }
 
 #[test]
+fn scala_typed_pattern_binding_starts_after_its_type_annotation() {
+    let source = r#"package app
+import model.{Root => owner}
+import model.Other.flag
+
+object Use {
+  def sameRootName(input: Any): Any = input match {
+    case owner: owner.Nested if owner != null => owner
+  }
+
+  def bodyBinding(input: Any): Any = input match {
+    case flag: owner.Nested if flag != null => flag
+  }
+
+  def priorShadow(input: Any): Any = {
+    val owner = new model.Shadow
+    input match { case value: owner.Nested => value }
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Root.scala",
+            r#"package model
+object Root { final class Nested(val id: Int) }
+final class Shadow
+object Other { val flag: Any = new Object }
+"#,
+        )
+        .file("app/Use.scala", source)
+        .build();
+    let type_reference =
+        source.find("owner.Nested").expect("same-name binder type") + "owner.".len();
+    let body_owner =
+        source.find("null => owner").expect("same-name binder body") + "null => ".len();
+    let guard_flag = source.find("if flag").expect("guard binder reference") + "if ".len();
+    let shadowed_type = source.rfind("owner.Nested").expect("prior-shadowed type") + "owner.".len();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": [
+            location_in("app/Use.scala", source, type_reference),
+            location_in("app/Use.scala", source, body_owner),
+            location_in("app/Use.scala", source, guard_flag),
+            location_in("app/Use.scala", source, shadowed_type),
+        ]})
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[0]["definitions"][0]["fqn"], "model.Root$.Nested",
+        "{value}"
+    );
+    for result in &results[1..3] {
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "local_variable_reference",
+            "{value}"
+        );
+    }
+    assert_eq!(results[3]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn scala_for_generator_binding_shadows_import_only_after_its_source_expression() {
     let source = r#"package app
 

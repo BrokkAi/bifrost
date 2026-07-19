@@ -477,6 +477,86 @@ object Ambiguous {
 }
 
 #[test]
+fn scala_typed_pattern_binders_activate_after_the_pattern() {
+    let use_source = r#"package app
+import model.{Root => owner}
+import model.Other.flag
+
+object Use {
+  def qualified(input: Any): Any = input match {
+    case value: owner.Nested => value // positive-qualified-pattern
+  }
+
+  def sameRootName(input: Any): Any = input match {
+    case owner: owner.Nested if owner != null => owner // positive-binder-root-pattern
+  }
+
+  def bodyBinding(input: Any): Any = input match {
+    case flag: owner.Nested if flag != null => flag // positive-body-binding-pattern
+  }
+
+  def priorShadow(input: Any): Any = {
+    val owner = new model.Shadow
+    input match {
+      case value: owner.Nested => value // negative-prior-root-shadow
+    }
+  }
+}
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Root.scala",
+            r#"package model
+object Root { final class Nested(val id: Int) }
+final class Shadow
+object Other { val flag: Any = new Object }
+"#,
+        ),
+        ("app/Use.scala", use_source),
+    ]);
+    let target = definition(&analyzer, "model.Root$.Nested");
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        std::iter::once(project.file("app/Use.scala")).collect(),
+    ));
+    let target_hits = hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1,
+                100,
+            )
+            .result,
+    );
+
+    for marker in [
+        "positive-qualified-pattern",
+        "positive-binder-root-pattern",
+        "positive-body-binding-pattern",
+    ] {
+        assert_hit_contains(&target_hits, marker);
+    }
+    assert_no_hit_contains(&target_hits, "negative-prior-root-shadow");
+
+    let imported_flag = definition(&analyzer, "model.Other$.flag");
+    let flag_hits = hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&imported_flag),
+                Some(&provider),
+                1,
+                100,
+            )
+            .result,
+    );
+    assert_no_hit_contains(&flag_hits, "positive-body-binding-pattern");
+}
+
+#[test]
 fn scala_usage_finder_distinguishes_class_and_object_identity_roles() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (

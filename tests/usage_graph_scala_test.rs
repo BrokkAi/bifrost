@@ -46,6 +46,69 @@ object Use {
 }
 
 #[test]
+fn scala_inverted_typed_pattern_binders_activate_for_guard_and_body_only() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Root.scala",
+            r#"package model
+object Root { final class Nested(val id: Int) }
+final class Shadow
+object Other { val flag: Any = new Object }
+"#,
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+import model.{Root => owner}
+import model.Other.flag
+
+object Use {
+  def qualified(input: Any): Any = input match {
+    case value: owner.Nested => value
+  }
+
+  def sameRootName(input: Any): Any = input match {
+    case owner: owner.Nested if owner != null => owner
+  }
+
+  def bodyBinding(input: Any): Any = input match {
+    case flag: owner.Nested if flag != null => flag
+  }
+
+  def priorShadow(input: Any): Any = {
+    val owner = new model.Shadow
+    input match { case value: owner.Nested => value }
+  }
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+
+    for caller in [
+        "app.Use$.qualified",
+        "app.Use$.sameRootName",
+        "app.Use$.bodyBinding",
+    ] {
+        assert!(
+            has_edge(&value, caller, "model.Root$.Nested"),
+            "typed pattern did not resolve for {caller}: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        !has_edge(&value, "app.Use$.priorShadow", "model.Root$.Nested"),
+        "a real prior local root must block the imported stable path: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$.bodyBinding", "model.Other$.flag"),
+        "the pattern binder must shadow the imported field in guard and body: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn scala_inverted_records_owned_class_hierarchy_parameterless_and_self_type_edges() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

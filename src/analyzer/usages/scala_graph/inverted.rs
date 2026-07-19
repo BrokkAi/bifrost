@@ -32,11 +32,11 @@ use super::syntax::{
     ScalaQualifiedStableTypeRole, ScalaSourceFacts, call_arities_for_reference,
     enclosing_template_declarations, is_bare_companion_method_value_reference,
     is_constructor_like_reference, is_declaration_name, is_extractor_reference,
-    is_infix_pattern_operator, is_scala_class_reference, is_scala_object_reference,
-    is_terminal_stable_field_reference, node_text, parenthesized_arity,
+    is_infix_pattern_operator, is_scala_case_pattern_binder, is_scala_class_reference,
+    is_scala_object_reference, is_terminal_stable_field_reference, node_text, parenthesized_arity,
     qualified_stable_type_reference, resolve_stable_object_expression,
-    scala_import_is_visible_at_byte, scala_source_facts, stable_identifier_reference,
-    template_direct_term_member_named, template_self_type,
+    scala_import_is_visible_at_byte, scala_pattern_binder_names, scala_source_facts,
+    stable_identifier_reference, template_direct_term_member_named, template_self_type,
 };
 use crate::analyzer::scala::{
     ScalaAdapter, ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaExportSelector,
@@ -47,7 +47,6 @@ use crate::analyzer::scala::{
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usage_facts::CallableFacts;
-use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
     build_file_declarations_from_state, classify_reference_node, first_precise,
@@ -3705,19 +3704,40 @@ fn walk(
     ctx: &mut ScalaScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<ScalaBinding>,
 ) {
-    let mut state = (ctx, bindings);
-    walk_tree_iterative(
-        node,
-        &mut state,
-        |node, (ctx, bindings)| {
-            if walk_enter(node, ctx, bindings) {
-                TreeWalkAction::DescendWithExit
-            } else {
-                TreeWalkAction::Descend
+    enum WalkEvent<'tree> {
+        Enter(Node<'tree>),
+        ActivateCaseBinders(Node<'tree>),
+        ExitScope,
+    }
+
+    let mut stack = vec![WalkEvent::Enter(node)];
+    while let Some(event) = stack.pop() {
+        match event {
+            WalkEvent::Enter(node) => {
+                let enters_scope = walk_enter(node, ctx, bindings);
+                if enters_scope {
+                    stack.push(WalkEvent::ExitScope);
+                }
+                let case_pattern = (node.kind() == "case_clause")
+                    .then(|| node.child_by_field_name("pattern"))
+                    .flatten();
+                let mut cursor = node.walk();
+                let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+                for child in children.into_iter().rev() {
+                    if case_pattern == Some(child) {
+                        stack.push(WalkEvent::ActivateCaseBinders(child));
+                    }
+                    stack.push(WalkEvent::Enter(child));
+                }
             }
-        },
-        |(_, bindings)| bindings.exit_scope(),
-    );
+            WalkEvent::ActivateCaseBinders(pattern) => {
+                for name in scala_pattern_binder_names(pattern, ctx.source) {
+                    bindings.declare_shadow(name.to_string());
+                }
+            }
+            WalkEvent::ExitScope => bindings.exit_scope(),
+        }
+    }
 }
 
 fn walk_enter(
@@ -3935,6 +3955,7 @@ fn record_reference(
             if name.is_empty()
                 || has_ancestor_kind(node, "import_declaration")
                 || is_declaration_name(node)
+                || is_scala_case_pattern_binder(node)
             {
                 return;
             }
@@ -4812,7 +4833,7 @@ fn seed_value_definition_with_owner(
     let Some(pattern) = node.child_by_field_name("pattern") else {
         return;
     };
-    for name in pattern_names(pattern, ctx.source) {
+    for name in scala_pattern_binder_names(pattern, ctx.source) {
         seed_binding(name, resolved.clone(), declaration_owner.clone(), bindings);
     }
 }
@@ -5008,30 +5029,6 @@ fn lexically_visible_unqualified_member_return_type(
         }
     }
     MemberReturnResolution::NoMatch
-}
-
-fn pattern_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
-    let mut out = Vec::new();
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "identifier" | "operator_identifier" => {
-                let name = node_text(node, source).trim();
-                if !name.is_empty() {
-                    out.push(name);
-                }
-            }
-            "stable_identifier" => {}
-            _ => {
-                for index in (0..node.named_child_count()).rev() {
-                    if let Some(child) = node.named_child(index) {
-                        stack.push(child);
-                    }
-                }
-            }
-        }
-    }
-    out
 }
 
 fn seed_binding(

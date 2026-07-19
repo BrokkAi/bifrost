@@ -4,7 +4,9 @@ use crate::analyzer::scala::{
     resolve_scala_wildcard_import_environment, scala_import_path, scala_import_visible_at,
     scala_lexical_scope_path_at, scala_package_prefixes_at, scala_type_lookup_segments,
 };
-use crate::analyzer::usages::scala_graph::syntax::call_arity_for_reference;
+use crate::analyzer::usages::scala_graph::syntax::{
+    call_arity_for_reference, is_scala_case_pattern_binder, scala_pattern_binder_names,
+};
 use crate::analyzer::usages::scala_graph::{
     method_call_arity_applies, method_signature_arity, resolved_extension_receiver_type,
 };
@@ -531,7 +533,7 @@ pub(super) fn resolve_scala(
             format!("`{}` is not a Scala reference site", site.text),
         );
     }
-    if scala_is_pattern_binding(node, source) {
+    if is_scala_case_pattern_binder(node) {
         return no_definition(
             "local_variable_reference",
             format!("`{}` is a local Scala pattern binding", site.text),
@@ -983,30 +985,6 @@ fn scala_is_declaration_name(node: Node<'_>) -> bool {
         )
 }
 
-fn scala_is_pattern_binding(node: Node<'_>, source: &str) -> bool {
-    let name = scala_node_text(node, source).trim();
-    if name.is_empty() || !matches!(node.kind(), "identifier" | "operator_identifier") {
-        return false;
-    }
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if parent.kind() == "case_clause" {
-            return parent
-                .child_by_field_name("pattern")
-                .is_some_and(|pattern| {
-                    pattern.start_byte() <= node.start_byte()
-                        && node.end_byte() <= pattern.end_byte()
-                        && scala_pattern_names(pattern, source).contains(&name)
-                });
-        }
-        if SCALA_SCOPE_NODES.contains(&parent.kind()) {
-            return false;
-        }
-        current = parent.parent();
-    }
-    false
-}
-
 fn scala_unindexed_type_binding_shadows(
     source: &str,
     reference: Node<'_>,
@@ -1112,6 +1090,17 @@ fn resolve_scala_type(
             "local_variable_reference",
             format!("`{text}` is a local Scala value"),
         );
+    }
+    if let Some(root_name) = scala_type_lookup_segments(node, ctx.source).first()
+        && root_name != text
+    {
+        let bindings = scala_bindings_before(ctx, resolver, root, node.start_byte());
+        if bindings.is_shadowed(root_name) {
+            return no_definition(
+                "local_variable_reference",
+                format!("`{root_name}` is a local Scala value"),
+            );
+        }
     }
     if let Some(fqn) = scala_resolve_visible_type_node(ctx, resolver, node) {
         return scala_fqn_outcome(ctx.support, &fqn, text);
@@ -2180,7 +2169,7 @@ fn scala_active_path_declares_name_before_mode(
             "case_clause"
                 if node.child_by_field_name("pattern").is_some_and(|pattern| {
                     pattern.end_byte() <= cutoff_start
-                        && scala_pattern_names(pattern, source).contains(&name)
+                        && scala_pattern_binder_names(pattern, source).contains(&name)
                 }) =>
             {
                 return true;
@@ -2275,13 +2264,13 @@ fn scala_node_declares_name_before(
             }
             node.child_by_field_name("pattern").is_some_and(|pattern| {
                 lower_bound <= pattern.start_byte()
-                    && scala_pattern_names(pattern, source).contains(&name)
+                    && scala_pattern_binder_names(pattern, source).contains(&name)
             })
         }
         "enumerator" => {
             scala_enumerator_visible_pattern(node, target_byte).is_some_and(|pattern| {
                 lower_bound <= pattern.start_byte()
-                    && scala_pattern_names(pattern, source).contains(&name)
+                    && scala_pattern_binder_names(pattern, source).contains(&name)
             })
         }
         "function_definition" => node.child_by_field_name("name").is_some_and(|name_node| {
@@ -2808,14 +2797,14 @@ fn scala_seed_active_path(
                     .child_by_field_name("pattern")
                     .filter(|pattern| pattern.end_byte() <= cutoff_start)
                 {
-                    for name in scala_pattern_names(pattern, ctx.source) {
+                    for name in scala_pattern_binder_names(pattern, ctx.source) {
                         bindings.declare_shadow(name.to_string());
                     }
                 }
             }
             "enumerator" => {
                 if let Some(pattern) = scala_enumerator_visible_pattern(node, cutoff_start) {
-                    for name in scala_pattern_names(pattern, ctx.source) {
+                    for name in scala_pattern_binder_names(pattern, ctx.source) {
                         bindings.declare_shadow(name.to_string());
                     }
                 }
@@ -2949,7 +2938,7 @@ fn scala_seed_value_definition(
         return;
     }
     let is_direct_member = scala_is_direct_member_value_definition(node);
-    for name in scala_pattern_names(pattern, ctx.source) {
+    for name in scala_pattern_binder_names(pattern, ctx.source) {
         scala_seed_typed(name, resolved.clone(), is_direct_member, bindings);
     }
 }
@@ -3109,42 +3098,6 @@ fn scala_constructor_type_text(value_text: &str) -> Option<&str> {
         .next()
         .is_some_and(|ch| ch.is_ascii_uppercase())
         .then_some(type_text)
-}
-
-fn scala_pattern_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
-    let mut names = Vec::new();
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "identifier" | "operator_identifier" => {
-                let name = scala_node_text(node, source).trim();
-                if !name.is_empty() {
-                    names.push(name);
-                }
-            }
-            "type_identifier" | "stable_identifier" | "stable_type_identifier" | "literal" => {}
-            "case_class_pattern" | "typed_pattern" | "capture_pattern" | "infix_pattern" => {
-                let excluded_type = node.child_by_field_name("type");
-                let excluded_operator = node.child_by_field_name("operator");
-                let mut cursor = node.walk();
-                let mut children = node
-                    .named_children(&mut cursor)
-                    .filter(|child| {
-                        Some(*child) != excluded_type && Some(*child) != excluded_operator
-                    })
-                    .collect::<Vec<_>>();
-                children.reverse();
-                stack.extend(children);
-            }
-            _ => {
-                let mut cursor = node.walk();
-                let mut children = node.named_children(&mut cursor).collect::<Vec<_>>();
-                children.reverse();
-                stack.extend(children);
-            }
-        }
-    }
-    names
 }
 
 fn scala_seed_typed(

@@ -23,9 +23,10 @@ use crate::analyzer::usages::scala_graph::syntax::{
     has_member_qualifier, infix_receiver_for_operator, is_bare_companion_method_value_reference,
     is_call_function_reference, is_constructor_like_reference, is_declaration_name,
     is_extractor_reference, is_identifier_node, is_infix_pattern_operator, is_owner_qualified_this,
-    is_scala_class_reference, is_scala_object_reference, is_terminal_stable_field_reference,
-    member_qualifier, member_qualifier_node, named_argument_invocation_owner, node_text,
-    parenthesized_arity, qualified_stable_type_reference, resolve_stable_object_expression,
+    is_scala_case_pattern_binder, is_scala_class_reference, is_scala_object_reference,
+    is_terminal_stable_field_reference, member_qualifier, member_qualifier_node,
+    named_argument_invocation_owner, node_text, parenthesized_arity,
+    qualified_stable_type_reference, resolve_stable_object_expression, scala_pattern_binder_names,
     scala_union_type_alternative_paths, stable_identifier_reference,
     template_direct_term_member_named, template_self_type, terminal_invocation_owner_name,
 };
@@ -200,6 +201,7 @@ fn scan_tree(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 if node.kind() == "assignment_expression" {
                     refresh_assignment_binding(node, ctx);
                 }
+                activate_case_pattern_binders(node, ctx);
                 if exits_scope {
                     ctx.bindings.exit_scope();
                 }
@@ -516,7 +518,6 @@ fn seed_scope_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             seed_enclosing_owner_field_bindings(node, ctx);
             seed_parameter_bindings(node, ctx);
         }
-        "case_clause" => seed_case_pattern_shadow(node, ctx),
         _ => {}
     }
 }
@@ -606,7 +607,7 @@ fn seed_owner_field_definition(node: Node<'_>, owner_fq_name: &str, ctx: &mut Sc
     let Some(pattern) = node.child_by_field_name("pattern") else {
         return;
     };
-    for name in pattern_names(pattern, ctx.source) {
+    for name in scala_pattern_binder_names(pattern, ctx.source) {
         ctx.bindings
             .seed_symbol(name.to_string(), owner_fq_name.to_string());
     }
@@ -759,7 +760,7 @@ fn seed_value_definition(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         seed_value_definition_from_text(node_text(node, ctx.source), ctx);
         return;
     }
-    for name in pattern_names(pattern, ctx.source) {
+    for name in scala_pattern_binder_names(pattern, ctx.source) {
         if let Some(owner) = resolved_type_owner
             .as_deref()
             .or(resolved_constructed_owner.as_deref())
@@ -1124,63 +1125,26 @@ fn constructor_type_name(value_text: &str) -> Option<&str> {
     (end > 0).then_some(&trimmed[..end])
 }
 
-fn pattern_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
-    match node.kind() {
-        "identifier" | "operator_identifier" => {
-            if node.parent().is_some_and(|parent| {
-                parent.kind() == "infix_pattern"
-                    && parent.child_by_field_name("operator") == Some(node)
-            }) {
-                return Vec::new();
-            }
-            let name = node_text(node, source).trim();
-            if name.is_empty() {
-                Vec::new()
-            } else {
-                vec![name]
-            }
-        }
-        "case_class_pattern" => {
-            let type_node = node.child_by_field_name("type");
-            let mut names = Vec::new();
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                if Some(child) != type_node {
-                    names.extend(pattern_names(child, source));
-                }
-            }
-            names
-        }
-        "stable_identifier" => Vec::new(),
-        "identifiers" | "tuple_pattern" | "pattern" => {
-            let mut names = Vec::new();
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                names.extend(pattern_names(child, source));
-            }
-            names
-        }
-        _ => {
-            let mut names = Vec::new();
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                names.extend(pattern_names(child, source));
-            }
-            names
-        }
+fn activate_case_pattern_binders(pattern: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(case_clause) = pattern
+        .parent()
+        .filter(|parent| parent.kind() == "case_clause")
+    else {
+        return;
+    };
+    if case_clause.child_by_field_name("pattern") != Some(pattern) {
+        return;
     }
-}
-
-fn seed_case_pattern_shadow(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if let Some(pattern) = node.child_by_field_name("pattern") {
-        for name in pattern_names(pattern, ctx.source) {
-            ctx.bindings.declare_shadow(name.to_string());
-        }
+    for name in scala_pattern_binder_names(pattern, ctx.source) {
+        ctx.bindings.declare_shadow(name.to_string());
     }
 }
 
 fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if has_ancestor_kind(node, "import_declaration") || is_declaration_name(node) {
+    if has_ancestor_kind(node, "import_declaration")
+        || is_declaration_name(node)
+        || is_scala_case_pattern_binder(node)
+    {
         return;
     }
     let text = node_text(node, ctx.source).trim();
