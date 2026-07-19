@@ -520,7 +520,10 @@ fn declared_default_export_local_property_root(
         &target_member,
     )
     .into_iter()
-    .any(|definition| slice(definition.receiver, source.as_str()) == exported_root)
+    .any(|definition| {
+        definition.receiver.members.is_empty()
+            && slice(definition.receiver.root, source.as_str()) == exported_root
+    })
     .then(|| exported_root.clone())
 }
 

@@ -2,7 +2,7 @@ use crate::analyzer::js_ts::imports::require_call_module_specifier;
 use crate::analyzer::js_ts::syntax::{
     JsTsLexicalBindingIndex, JsTsLexicalBindingScope, direct_property_definitions,
     is_commonjs_require_declarator, is_declaration_identifier, is_object_in_member_expression,
-    is_property_key_in_member, slice,
+    is_property_key_in_member, slice, static_member_receiver,
 };
 use crate::analyzer::usages::get_definition::js_ts::{
     ts_resolve_type_text_to_property_owners, ts_type_annotation_text,
@@ -255,7 +255,8 @@ enum LocalBinding {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LocalPropertyDefinition {
-    receiver: String,
+    receiver_root: String,
+    receiver_members: Vec<String>,
     scope: JsTsLexicalBindingScope,
     range: Range,
 }
@@ -271,13 +272,22 @@ fn collect_local_property_definitions(
     direct_property_definitions(root, source, target_ranges, target_member)
         .into_iter()
         .filter_map(|fact| {
-            let receiver = slice(fact.receiver, source);
-            if required_receiver.is_some_and(|required| receiver != required) {
+            let receiver_root = slice(fact.receiver.root, source);
+            if required_receiver.is_some_and(|required| {
+                receiver_root != required || !fact.receiver.members.is_empty()
+            }) {
                 return None;
             }
-            let scope = lexical_bindings.binding_scope_at(receiver, fact.receiver.start_byte())?;
+            let scope = lexical_bindings
+                .binding_scope_at(receiver_root, fact.receiver.root.start_byte())?;
             let definition = LocalPropertyDefinition {
-                receiver: receiver.to_string(),
+                receiver_root: receiver_root.to_string(),
+                receiver_members: fact
+                    .receiver
+                    .members
+                    .into_iter()
+                    .map(|member| slice(member, source).to_string())
+                    .collect(),
                 scope,
                 range: fact.range,
             };
@@ -297,14 +307,22 @@ fn local_property_read_matches(
     lexical_bindings: &JsTsLexicalBindingIndex,
     definitions: &[LocalPropertyDefinition],
 ) -> bool {
-    let Some(receiver) = simple_identifier_text(object, source) else {
+    let Some(receiver) = static_member_receiver(object, source) else {
         return false;
     };
-    let Some(scope) = lexical_bindings.binding_scope_at(receiver, object.start_byte()) else {
+    let receiver_root = slice(receiver.root, source);
+    let Some(scope) = lexical_bindings.binding_scope_at(receiver_root, receiver.root.start_byte())
+    else {
         return false;
     };
     definitions.iter().any(|definition| {
-        definition.receiver == receiver
+        definition.receiver_root == receiver_root
+            && definition.receiver_members.len() == receiver.members.len()
+            && definition
+                .receiver_members
+                .iter()
+                .zip(&receiver.members)
+                .all(|(expected, actual)| expected == slice(*actual, source))
             && definition.scope == scope
             && definition.range.start_byte < property.start_byte()
             && !range_contains_node(&definition.range, property)

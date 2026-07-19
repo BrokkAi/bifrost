@@ -4913,6 +4913,63 @@ function sibling() {
 }
 
 #[test]
+fn scan_usages_location_recovers_nested_local_assignment_property_reads() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "fetch.js",
+            r#"function selected(fetchParams, other) {
+  consume(fetchParams.controller.controller);
+  const stream = {
+    start(controller) {
+      fetchParams.controller.controller = controller;
+      consume(fetchParams.controller.controller);
+    },
+  };
+  consume(fetchParams.controller.controller);
+  consume(other.controller.controller);
+  consume(fetchParams.other.controller);
+  {
+    const fetchParams = {};
+    consume(fetchParams.controller.controller);
+  }
+  return stream;
+}
+
+function sibling(fetchParams) {
+  consume(fetchParams.controller.controller);
+}
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"fetch.js","line":5,"column":30,"symbol":"fetchParams.controller.controller"}],"include_tests":true}"#,
+        )
+        .expect("location scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let result = only_result(&value);
+
+    assert_eq!("found", result["status"], "payload: {value}");
+    assert_eq!(
+        "fetch.js#fetchParams.controller.controller", result["symbol"],
+        "{value}"
+    );
+    assert_eq!(0, result["unproven_hits"], "payload: {value}");
+    assert_eq!(2, result["total_hits"], "payload: {value}");
+    let lines: BTreeSet<u64> = result["files"][0]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["line"].as_u64().expect("hit line"))
+        .collect();
+    assert_eq!(BTreeSet::from([6, 9]), lines, "payload: {value}");
+}
+
+#[test]
 fn scan_usages_location_recovers_lookup_only_local_object_property_reads() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(

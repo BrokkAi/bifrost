@@ -21,10 +21,16 @@ pub(crate) struct JsTsLexicalBindingIndex {
     scopes_by_name: HashMap<String, Vec<JsTsLexicalBindingScope>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct JsTsDirectPropertyDefinition<'tree> {
-    pub(crate) receiver: Node<'tree>,
+    pub(crate) receiver: JsTsStaticMemberReceiver<'tree>,
     pub(crate) range: Range,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct JsTsStaticMemberReceiver<'tree> {
+    pub(crate) root: Node<'tree>,
+    pub(crate) members: Vec<Node<'tree>>,
 }
 
 impl JsTsLexicalBindingIndex {
@@ -202,21 +208,23 @@ fn direct_assignment_receiver<'tree>(
     left: Node<'tree>,
     source: &str,
     target_member: &str,
-) -> Option<(Node<'tree>, Node<'tree>)> {
+) -> Option<(JsTsStaticMemberReceiver<'tree>, Node<'tree>)> {
     if left.kind() != "member_expression" {
         return None;
     }
     let receiver = left.child_by_field_name("object")?;
     let property = left.child_by_field_name("property")?;
-    (direct_identifier_text(receiver, source).is_some() && slice(property, source) == target_member)
-        .then_some((receiver, property))
+    if slice(property, source) != target_member {
+        return None;
+    }
+    static_member_receiver(receiver, source).map(|receiver| (receiver, property))
 }
 
 fn direct_object_pair_receiver<'tree>(
     pair: Node<'tree>,
     source: &str,
     target_member: &str,
-) -> Option<(Node<'tree>, Node<'tree>)> {
+) -> Option<(JsTsStaticMemberReceiver<'tree>, Node<'tree>)> {
     let property = pair.child_by_field_name("key")?;
     if slice(property, source) != target_member {
         return None;
@@ -232,13 +240,32 @@ fn direct_object_pair_receiver<'tree>(
         return None;
     }
     let receiver = declarator.child_by_field_name("name")?;
-    direct_identifier_text(receiver, source).map(|_| (receiver, property))
+    let receiver = static_member_receiver(receiver, source)?;
+    receiver.members.is_empty().then_some((receiver, property))
 }
 
-fn direct_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
-    (node.kind() == "identifier")
-        .then(|| slice(node, source))
-        .filter(|text| !text.is_empty())
+pub(crate) fn static_member_receiver<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<JsTsStaticMemberReceiver<'tree>> {
+    let mut current = node;
+    let mut members = Vec::new();
+    while current.kind() == "member_expression" {
+        let property = current.child_by_field_name("property")?;
+        if property.kind() != "property_identifier" || slice(property, source).is_empty() {
+            return None;
+        }
+        members.push(property);
+        current = current.child_by_field_name("object")?;
+    }
+    if current.kind() != "identifier" || slice(current, source).is_empty() {
+        return None;
+    }
+    members.reverse();
+    Some(JsTsStaticMemberReceiver {
+        root: current,
+        members,
+    })
 }
 
 fn range_contains_node(range: &Range, node: Node<'_>) -> bool {
@@ -533,4 +560,49 @@ fn unquote(text: &str) -> String {
                 .and_then(|value| value.strip_suffix('\''))
         });
     stripped.unwrap_or(trimmed).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse_javascript(source: &str) -> Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_javascript::LANGUAGE.into())
+            .expect("JavaScript grammar");
+        parser.parse(source, None).expect("JavaScript tree")
+    }
+
+    fn find_node<'tree>(root: Node<'tree>, source: &str, text: &str) -> Node<'tree> {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if slice(node, source) == text {
+                return node;
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+        panic!("missing node `{text}`");
+    }
+
+    #[test]
+    fn static_member_receiver_rejects_private_property_segments() {
+        let source = "class Box { #inner; read(other) { return other.#inner.value; } }";
+        let tree = parse_javascript(source);
+        let private_receiver = find_node(tree.root_node(), source, "other.#inner");
+
+        assert_eq!("member_expression", private_receiver.kind());
+        assert_eq!(
+            "private_property_identifier",
+            private_receiver
+                .child_by_field_name("property")
+                .expect("private property")
+                .kind()
+        );
+        assert!(static_member_receiver(private_receiver, source).is_none());
+    }
 }
