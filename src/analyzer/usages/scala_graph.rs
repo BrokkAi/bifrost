@@ -316,6 +316,10 @@ class Child extends Base(new Middle(new Leaf(1))) {
 object Stable { val middle: Middle = new Middle(new Leaf(2)) }
 object Owners { final class State(var maximumHeapSize: Int) }
 object AliasOnly { type Value = Int }
+object Result {
+  opaque type Success[A] = A
+  object Success
+}
 "#,
         );
         write(
@@ -331,9 +335,33 @@ object AliasOnly { type Value = Int }
             "package dup\nclass Owner(val value: Int)\n",
         );
         write(
+            "root/api/Types.scala",
+            "package root.api\nclass ActorContext\n",
+        );
+        write(
+            "decoy/Objects.scala",
+            "package decoy\nobject Api { class ActorContext }\n",
+        );
+        write(
+            "collision/Api.scala",
+            "package collision\nobject Api { class ActorContext }\n",
+        );
+        write(
+            "app/collision/Api.scala",
+            "package app.collision\nobject Api { class ActorContext }\n",
+        );
+        write(
             "app/Use.scala",
             r#"package app
-import model.{AliasOnly, Child, Middle, Owners, Stable}
+import model.*
+import root.{api => mixed}
+import decoy.{Api => mixed}
+import collision.{Api => overlap}
+
+class ImportedChild extends Child {
+  def inheritedBare: Middle = inherited
+}
+
 object Use {
   def typed(middle: Middle): Int = middle.leaf.token
   def inherited(child: Child): Int = child.inherited.leaf.token
@@ -342,6 +370,10 @@ object Use {
   def localShadow(middle: other.Middle): Int = middle.leaf.token
   def ambiguous(owner: dup.Owner): Int = owner.value
   def aliasIsNotATerm: Any = AliasOnly.Value
+  def stableTypeMember: Result.Success[Int] = 1
+  def stableTermMember: Any = Result.Success
+  def ambiguousPackageObject: mixed.ActorContext = null
+  def relativeObjectImport: overlap.ActorContext = null
 }
 "#,
         );
@@ -379,6 +411,14 @@ object Use {
         assert!(has_edge("app.Use$.inherited", "model.Base.inherited"));
         assert!(has_edge("app.Use$.stable", "model.Stable$.middle"));
         assert!(has_edge(
+            "app.ImportedChild.inheritedBare",
+            "model.Base.inherited"
+        ));
+        assert!(has_edge(
+            "app.Use$.stableTypeMember",
+            "model.Result$.Success"
+        ));
+        assert!(has_edge(
             "app.Use$.nested",
             "model.Owners$.State.maximumHeapSize"
         ));
@@ -391,6 +431,21 @@ object Use {
         assert!(!has_edge(
             "app.Use$.aliasIsNotATerm",
             "model.AliasOnly$.Value"
+        ));
+        assert!(!has_edge(
+            "app.Use$.stableTermMember",
+            "model.Result$.Success"
+        ));
+        for callee in ["root.api.ActorContext", "decoy.Api$.ActorContext"] {
+            assert!(!has_edge("app.Use$.ambiguousPackageObject", callee));
+        }
+        assert!(has_edge(
+            "app.Use$.relativeObjectImport",
+            "app.collision.Api$.ActorContext"
+        ));
+        assert!(!has_edge(
+            "app.Use$.relativeObjectImport",
+            "collision.Api$.ActorContext"
         ));
     }
 

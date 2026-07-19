@@ -680,12 +680,30 @@ fn is_stable_type_qualifier(node: Node<'_>) -> bool {
 }
 
 pub(crate) fn is_extractor_reference(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        parent.kind() == "case_class_pattern"
-            && parent
-                .named_child(0)
-                .is_some_and(|constructor| constructor == node)
-    })
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() == "case_class_pattern" {
+        return parent
+            .named_child(0)
+            .is_some_and(|constructor| constructor == node);
+    }
+    if parent.kind() != "call_expression" || parent.child_by_field_name("function") != Some(node) {
+        return false;
+    }
+    let mut current = Some(parent);
+    while let Some(ancestor) = current {
+        if ancestor.kind() == "case_clause" {
+            return ancestor
+                .child_by_field_name("pattern")
+                .is_some_and(|pattern| {
+                    pattern.start_byte() <= node.start_byte()
+                        && node.end_byte() <= pattern.end_byte()
+                });
+        }
+        current = ancestor.parent();
+    }
+    false
 }
 
 pub(crate) fn is_infix_pattern_operator(node: Node<'_>) -> bool {

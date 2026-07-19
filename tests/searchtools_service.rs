@@ -3024,6 +3024,106 @@ object ArraySeq {
 }
 
 #[test]
+fn scan_usages_by_reference_resolves_scala_package_alias_roots_without_ambiguity_leaks() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "root/api/Types.scala",
+            "package root.api\nclass ActorContext\n",
+        )
+        .file(
+            "decoy/api/Types.scala",
+            "package decoy.api\nclass ActorContext\n",
+        )
+        .file(
+            "collision/Api.scala",
+            "package collision\nobject Api { class ActorContext }\n",
+        )
+        .file(
+            "collision/Api/Types.scala",
+            "package collision.Api\nclass ActorContext\n",
+        )
+        .file(
+            "root/consumer/Use.scala",
+            r#"package root.consumer
+import root.{api => classic}
+object Use {
+  val context: classic.ActorContext = null // public-positive-package-alias
+}
+"#,
+        )
+        .file(
+            "root/consumer/Ambiguous.scala",
+            r#"package root.consumer
+import root.{api => clash}
+import decoy.{api => clash}
+object Ambiguous {
+  val context: clash.ActorContext = null // public-negative-conflicting-package-alias
+}
+"#,
+        )
+        .file(
+            "root/consumer/Collision.scala",
+            r#"package root.consumer
+import collision.{Api => mixed}
+object Collision {
+  val context: mixed.ActorContext = null // public-negative-same-tier-package-singleton
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["root.api.ActorContext"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+    assert_eq!(usage["status"], "found", "{value}");
+    let snippets = usage["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+        .filter_map(|hit| hit["snippet"].as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        snippets
+            .iter()
+            .any(|snippet| snippet.contains("public-positive-package-alias")),
+        "{value}"
+    );
+    assert!(
+        snippets
+            .iter()
+            .all(|snippet| !snippet.contains("public-negative-conflicting-package-alias")),
+        "{value}"
+    );
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["collision.Api$.ActorContext"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+    assert_eq!(usage["status"], "verified_absent", "{value}");
+    assert!(
+        usage["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+            .filter_map(|hit| hit["snippet"].as_str())
+            .all(|snippet| !snippet.contains("public-negative-same-tier-package-singleton")),
+        "{value}"
+    );
+}
+
+#[test]
 fn scan_usages_by_reference_finds_unique_scala_companion_method_values() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

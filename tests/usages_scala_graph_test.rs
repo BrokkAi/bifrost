@@ -24,6 +24,175 @@ fn scala_analyzer_with_files(
     (project, analyzer)
 }
 
+#[test]
+fn scala_explicit_package_singleton_collision_fails_closed() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "collision/Api.scala",
+            "package collision\nobject Api { class ActorContext }\n",
+        ),
+        (
+            "collision/Api/Types.scala",
+            "package collision.Api\nclass ActorContext\n",
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+import collision.{Api => mixed}
+object Use {
+  val context: mixed.ActorContext = null // negative-same-tier-package-singleton
+}
+"#,
+        ),
+    ]);
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        analyzer.get_analyzed_files().into_iter().collect(),
+    ));
+
+    for target in ["collision.Api$.ActorContext", "collision.Api.ActorContext"] {
+        let target = definition(&analyzer, target);
+        let target_hits = hits(
+            UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    &analyzer,
+                    std::slice::from_ref(&target),
+                    Some(&provider),
+                    100,
+                    100,
+                )
+                .result,
+        );
+        assert_no_hit_contains(&target_hits, "negative-same-tier-package-singleton");
+    }
+}
+
+#[test]
+fn scala_imported_bare_helper_return_seeds_local_receiver_type() {
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/matchers/MatchResult.scala",
+            r#"package model
+package matchers
+class MatchResult(val matches: Boolean)
+"#,
+        ),
+        (
+            "model/matchers/MatchersHelper.scala",
+            r#"package model
+package matchers
+class OtherResult(val matches: Boolean)
+private[model] object MatchersHelper {
+  def fullyMatchRegexWithGroups(left: String, regex: String, groups: Seq[String]): MatchResult =
+    new MatchResult(true)
+}
+object OtherHelper {
+  def fullyMatchRegexWithGroups(left: String): OtherResult = new OtherResult(false)
+}
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+import model.matchers.MatchersHelper.fullyMatchRegexWithGroups
+object Use {
+  def positive = {
+    val result = fullyMatchRegexWithGroups("", "", Seq.empty)
+    result.matches // positive-imported-helper-return
+  }
+  def shadowed = {
+    def fullyMatchRegexWithGroups(left: String): model.matchers.OtherResult =
+      model.matchers.OtherHelper.fullyMatchRegexWithGroups(left)
+    val result = fullyMatchRegexWithGroups("")
+    result.matches // negative-local-helper-shadow
+  }
+}
+"#,
+        ),
+        (
+            "other/Use.scala",
+            r#"package app
+object Use {
+  def unrelated = 1
+}
+"#,
+        ),
+    ]);
+    let target = definition(&analyzer, "model.matchers.MatchResult.matches");
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        std::iter::once(project.file("app/Use.scala")).collect(),
+    ));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            100,
+        );
+    let target_hits = hits(query.result);
+    assert_hit_contains(&target_hits, "positive-imported-helper-return");
+    assert_no_hit_contains(&target_hits, "negative-local-helper-shadow");
+}
+
+#[test]
+fn scala_nested_constructor_role_preserves_exact_duplicate_source_identity() {
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "scala-3/ByteString.scala",
+            r#"package akka.util
+object ByteString {
+  object ByteString1 {
+    def apply(value: Int): ByteString1 = new ByteString1(value)
+  }
+  final class ByteString1 private (val value: Int) {
+    def copy = ByteString1(value) // positive-exact-nested-constructor
+  }
+}
+"#,
+        ),
+        (
+            "scala-2.13/ByteString.scala",
+            r#"package akka.util
+object ByteString {
+  object ByteString1 {
+    def apply(value: Int): ByteString1 = new ByteString1(value)
+  }
+  final class ByteString1 private (val value: Int)
+}
+"#,
+        ),
+    ]);
+    let target = analyzer
+        .get_definitions("akka.util.ByteString$.ByteString1.ByteString1")
+        .into_iter()
+        .find(|unit| unit.source() == &project.file("scala-3/ByteString.scala"))
+        .expect("Scala 3 synthetic constructor");
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        std::iter::once(project.file("scala-3/ByteString.scala")).collect(),
+    ));
+    let target_hits = hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1,
+                100,
+            )
+            .result,
+    );
+    assert_hit_contains(&target_hits, "positive-exact-nested-constructor");
+    assert!(
+        target_hits
+            .iter()
+            .all(|hit| hit.file == project.file("scala-3/ByteString.scala")),
+        "duplicate physical constructor leaked: {target_hits:#?}"
+    );
+}
+
 fn definition(analyzer: &ScalaAnalyzer, fq_name: &str) -> CodeUnit {
     analyzer
         .get_definitions(fq_name)
@@ -111,6 +280,200 @@ object Consumer {
         0,
         "parameter/local shadows and the other-package object are proven negatives"
     );
+}
+
+#[test]
+fn scala_lexical_nested_singletons_and_typed_patterns_preserve_exact_identity() {
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Outer.scala",
+            r#"package model
+object Outer {
+  object Token
+  class UseRef
+  object internal { object PathToken }
+  object Factory { def apply(value: Int): UseRef = new UseRef }
+  object Pattern { def unapply(value: Any): Option[Int] = None }
+
+  def singleton: Any = Token // positive-lexical-singleton
+  def stablePath(value: Any): Int = value match {
+    case internal.PathToken => 1 // positive-lexical-stable-path
+    case _ => 0
+  }
+  def made = Factory(1) // positive-lexical-object-apply
+  def extracted(value: Any): Int = value match {
+    case Pattern(number) => number // positive-lexical-object-extractor
+    case _ => 0
+  }
+  def shadowedSingleton(Token: Any): Any = Token // negative-term-shadow
+  def typedWithTerm(UseRef: Int, tree: Any): Any = tree match {
+    case value: UseRef => value // positive-typed-pattern-term-namespace
+    case _ => tree
+  }
+  def UseRef(tree: Any): Any = tree match {
+    case value: UseRef => value // positive-typed-pattern-method-name
+    case _ => tree
+  }
+}
+
+object Other {
+  object Token
+  class UseRef
+  def singleton: Any = Token // negative-other-owner-singleton
+  def typed(tree: Any): Any = tree match {
+    case value: UseRef => value // negative-other-owner-type
+    case _ => tree
+  }
+}
+"#,
+        ),
+        (
+            "duplicate/First.scala",
+            r#"package duplicate
+object Outer {
+  object Token
+  def singleton: Any = Token // negative-ambiguous-first
+}
+class PackageType
+object PackageToken
+"#,
+        ),
+        (
+            "duplicate/Second.scala",
+            r#"package duplicate
+object Outer {
+  object Token
+  def singleton: Any = Token // negative-ambiguous-second
+}
+class PackageType
+object PackageToken
+"#,
+        ),
+        (
+            "consumer/Ambiguous.scala",
+            r#"package consumer
+object Ambiguous {
+  def typed: duplicate.PackageType = null // negative-package-type-ambiguity
+  def token(value: Any): Int = value match {
+    case duplicate.PackageToken => 1 // negative-package-object-ambiguity
+    case _ => 0
+  }
+}
+"#,
+        ),
+    ]);
+
+    let outer = project.file("model/Outer.scala");
+    let outer_provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(outer.clone()).collect()));
+    let outer_hits = |target: &CodeUnit| {
+        hits(
+            UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    &analyzer,
+                    std::slice::from_ref(target),
+                    Some(&outer_provider),
+                    1,
+                    100,
+                )
+                .result,
+        )
+    };
+
+    let token = definition(&analyzer, "model.Outer$.Token$");
+    let token_hits = outer_hits(&token);
+    assert_hit_contains(&token_hits, "positive-lexical-singleton");
+    assert_no_hit_contains(&token_hits, "negative-term-shadow");
+    assert_no_hit_contains(&token_hits, "negative-other-owner-singleton");
+
+    for (target_fqn, marker) in [
+        (
+            "model.Outer$.internal$.PathToken$",
+            "positive-lexical-stable-path",
+        ),
+        (
+            "model.Outer$.Factory$.apply",
+            "positive-lexical-object-apply",
+        ),
+        (
+            "model.Outer$.Pattern$.unapply",
+            "positive-lexical-object-extractor",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = outer_hits(&target);
+        assert_hit_contains(&target_hits, marker);
+    }
+
+    let use_ref = analyzer
+        .get_definitions("model.Outer$.UseRef")
+        .into_iter()
+        .find(CodeUnit::is_class)
+        .expect("nested UseRef class");
+    let use_ref_hits = outer_hits(&use_ref);
+    assert_hit_contains(&use_ref_hits, "positive-typed-pattern-term-namespace");
+    assert_hit_contains(&use_ref_hits, "positive-typed-pattern-method-name");
+    assert_no_hit_contains(&use_ref_hits, "negative-other-owner-type");
+
+    let first = project.file("duplicate/First.scala");
+    let ambiguous_token = analyzer
+        .get_definitions("duplicate.Outer$.Token$")
+        .into_iter()
+        .find(|unit| unit.is_class() && unit.source() == &first)
+        .expect("first ambiguous nested Token object");
+    let ambiguous_provider = ExplicitCandidateProvider::new(Arc::new(
+        [
+            project.file("duplicate/First.scala"),
+            project.file("duplicate/Second.scala"),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+    let ambiguous_hits = hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&ambiguous_token),
+                Some(&ambiguous_provider),
+                1,
+                100,
+            )
+            .result,
+    );
+    assert_no_hit_contains(&ambiguous_hits, "negative-ambiguous-first");
+    assert_no_hit_contains(&ambiguous_hits, "negative-ambiguous-second");
+
+    let consumer_provider = ExplicitCandidateProvider::new(Arc::new(
+        std::iter::once(project.file("consumer/Ambiguous.scala")).collect(),
+    ));
+    for (target_fqn, marker) in [
+        ("duplicate.PackageType", "negative-package-type-ambiguity"),
+        (
+            "duplicate.PackageToken$",
+            "negative-package-object-ambiguity",
+        ),
+    ] {
+        let target = analyzer
+            .get_definitions(target_fqn)
+            .into_iter()
+            .find(|unit| unit.is_class() && unit.source() == &first)
+            .unwrap_or_else(|| panic!("first ambiguous declaration for {target_fqn}"));
+        let target_hits = hits(
+            UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    &analyzer,
+                    std::slice::from_ref(&target),
+                    Some(&consumer_provider),
+                    1,
+                    100,
+                )
+                .result,
+        );
+        assert_no_hit_contains(&target_hits, marker);
+    }
 }
 
 #[test]
@@ -1425,8 +1788,8 @@ class LocalFactory
     let constructor = definition(&analyzer, "app.Use$.Generic.Generic");
     let constructor_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &[constructor]));
     assert_hit_contains(&constructor_hits, "new Generic[Int](1)");
+    assert_hit_contains(&constructor_hits, "Generic: LocalFactory");
     assert_no_hit_contains(&constructor_hits, "new Generic[Int]()");
-    assert_no_hit_contains(&constructor_hits, "Generic: LocalFactory");
 
     let enabled = definition(&analyzer, "model.Flags$.Enabled");
     let enabled_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &[enabled]));
@@ -5541,5 +5904,254 @@ class Consumer {
     match result {
         FuzzyResult::TooManyCallsites { limit, .. } => assert_eq!(1, limit),
         other => panic!("expected TooManyCallsites, got {other:?}"),
+    }
+}
+
+#[test]
+fn scala_usage_finder_resolves_package_lexical_field_and_application_projections() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "root/api/Types.scala",
+            "package root.api\nclass ActorContext\n",
+        ),
+        (
+            "root/consumer/sibling/Local.scala",
+            "package root.consumer.sibling\nclass Local\n",
+        ),
+        (
+            "root/model/Model.scala",
+            r#"package root.model
+
+object Result {
+  opaque type Success[A] = A
+  object Success
+}
+class Context { val system: Int = 1 }
+trait Actor { val context: Context = new Context }
+trait Generator[A]
+trait GeneratorMarker[A]
+object Generator {
+  def anonymous[A] = new Generator[List[A]] with GeneratorMarker[List[A]] {} // positive-top-level-generic-trait-new
+}
+case class Good[A](value: A)
+object Good { class GoodType[A] }
+
+object Outer {
+  object internal { class BranchData }
+  class Holder { val branch: internal.BranchData = null } // positive-lexical-object-root
+}
+
+object Constructors {
+  object ByteString1 {
+    def apply(value: Int): ByteString1 = new ByteString1(value)
+  }
+  final class ByteString1 private (val value: Int) {
+    def copy = ByteString1(value) // positive-nested-self-constructor
+  }
+  trait Generator[A]
+  trait Marker[A]
+  abstract class FlowVisitorCollect[A](empty: A, combine: (A, A) => A)
+  class Inside { val bytes = ByteString1(1) } // positive-universal-constructor
+}
+
+object Qualified {
+  final class Applied(val value: Int)
+  object Applied { def apply(value: Int): Applied = new Applied(value) }
+  final class Extracted(val value: Int)
+  object Extracted { def unapply(value: Any): Option[Int] = None }
+  object Factory { def apply(value: Int): Int = value }
+  object Pattern { def unapply(value: Any): Option[Int] = None }
+}
+"#,
+        ),
+        (
+            "root/model/PatternUse.scala",
+            r#"package root.model
+object PatternUse {
+  val constructed = Good(1) // positive-synthetic-constructor-apply
+  def extract(value: Any): Any = value match {
+    case (Good(found), Good(_)) => found // positive-synthetic-constructor-extractor
+    case _ => value
+  }
+}
+"#,
+        ),
+        (
+            "root/consumer/Use.scala",
+            r#"package root.consumer
+
+import root.{api => classic}
+import root.api
+import root.model.*
+import root.model.Constructors.*
+
+class Child extends Actor {
+  val inherited = context // positive-inherited-field
+}
+
+object Use {
+  val aliased: classic.ActorContext = null // positive-package-alias
+  val directlyImported: api.ActorContext = null // positive-direct-package
+  val relative: sibling.Local = null // positive-relative-package
+  val stable: Result.Success[Int] = 1 // positive-stable-type-member
+  val term = Result.Success // negative-term-for-type-member
+  val explicit = new Constructors.FlowVisitorCollect[Int](0, _ + _) {} // positive-generic-new
+  val anonymous = new Constructors.Generator[Int] with Constructors.Marker[Int] {} // positive-generic-trait-new
+  val qualifiedApply = Qualified.Applied(2) // positive-qualified-apply
+  def qualifiedExtract(value: Any): Int = value match {
+    case Qualified.Extracted(found) => found // positive-qualified-extractor
+    case _ => 0
+  }
+  val objectApply = Qualified.Factory(3) // positive-qualified-object-apply
+  def objectExtract(value: Any): Int = value match {
+    case Qualified.Pattern(found) => found // positive-qualified-object-extractor
+    case _ => 0
+  }
+}
+"#,
+        ),
+        (
+            "decoy/api/Types.scala",
+            "package decoy.api\nclass ActorContext\n",
+        ),
+        (
+            "decoy/Objects.scala",
+            "package decoy\nobject Api { class ActorContext }\n",
+        ),
+        (
+            "collision/Api.scala",
+            "package collision\nobject Api { class ActorContext }\n",
+        ),
+        (
+            "root/consumer/collision/Api.scala",
+            "package root.consumer.collision\nobject Api { class ActorContext }\n",
+        ),
+        (
+            "root/consumer/Ambiguous.scala",
+            r#"package root.consumer
+import root.{api => clash}
+import decoy.{api => clash}
+object Ambiguous {
+  val wrong: clash.ActorContext = null // negative-conflicting-package-alias
+}
+"#,
+        ),
+        (
+            "root/consumer/CrossNamespace.scala",
+            r#"package root.consumer
+import root.{api => mixed}
+import decoy.{Api => mixed}
+object CrossNamespace {
+  val wrong: mixed.ActorContext = null // negative-package-object-alias
+}
+"#,
+        ),
+        (
+            "root/consumer/CandidateCollision.scala",
+            r#"package root.consumer
+import collision.{Api => overlap}
+object CandidateCollision {
+  val selected: overlap.ActorContext = null // positive-relative-object-import
+}
+"#,
+        ),
+    ]);
+
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        analyzer.get_analyzed_files().into_iter().collect(),
+    ));
+    for (target, marker) in [
+        ("root.api.ActorContext", "positive-package-alias"),
+        ("root.api.ActorContext", "positive-direct-package"),
+        ("root.consumer.sibling.Local", "positive-relative-package"),
+        ("root.model.Result$.Success", "positive-stable-type-member"),
+        (
+            "root.model.Outer$.internal$.BranchData",
+            "positive-lexical-object-root",
+        ),
+        ("root.model.Actor.context", "positive-inherited-field"),
+        (
+            "root.model.Constructors$.FlowVisitorCollect.FlowVisitorCollect",
+            "positive-generic-new",
+        ),
+        (
+            "root.model.Constructors$.Generator",
+            "positive-generic-trait-new",
+        ),
+        (
+            "root.model.Generator",
+            "positive-top-level-generic-trait-new",
+        ),
+        // A nested same-name class/object call cannot encode whether forward
+        // selected the companion apply or Scala 3 universal constructor. Keep
+        // both exact callable identities discoverable when their shapes agree.
+        (
+            "root.model.Constructors$.ByteString1.ByteString1",
+            "positive-nested-self-constructor",
+        ),
+        (
+            "root.model.Good.Good",
+            "positive-synthetic-constructor-extractor",
+        ),
+        (
+            "root.model.Good.Good",
+            "positive-synthetic-constructor-apply",
+        ),
+        (
+            "root.model.Qualified$.Applied$.apply",
+            "positive-qualified-apply",
+        ),
+        (
+            "root.model.Qualified$.Extracted$.unapply",
+            "positive-qualified-extractor",
+        ),
+        (
+            "root.model.Qualified$.Factory$.apply",
+            "positive-qualified-object-apply",
+        ),
+        (
+            "root.model.Qualified$.Pattern$.unapply",
+            "positive-qualified-object-extractor",
+        ),
+        (
+            "root.consumer.collision.Api$.ActorContext",
+            "positive-relative-object-import",
+        ),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits = hits(
+            UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    &analyzer,
+                    std::slice::from_ref(&target),
+                    Some(&provider),
+                    100,
+                    100,
+                )
+                .result,
+        );
+        assert_hit_contains(&target_hits, marker);
+        assert_no_hit_contains(&target_hits, "negative-conflicting-package-alias");
+        assert_no_hit_contains(&target_hits, "negative-package-object-alias");
+        assert_no_hit_contains(&target_hits, "negative-term-for-type-member");
+    }
+
+    for target in ["decoy.Api$.ActorContext", "collision.Api$.ActorContext"] {
+        let target = definition(&analyzer, target);
+        let target_hits = hits(
+            UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    &analyzer,
+                    std::slice::from_ref(&target),
+                    Some(&provider),
+                    100,
+                    100,
+                )
+                .result,
+        );
+        assert_no_hit_contains(&target_hits, "negative-package-object-alias");
+        assert_no_hit_contains(&target_hits, "positive-relative-object-import");
     }
 }

@@ -15,6 +15,37 @@ fn usage_graph() -> Value {
 }
 
 #[test]
+fn scala_inverted_explicit_package_singleton_collision_fails_closed() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "collision/Api.scala",
+            "package collision\nobject Api { class ActorContext }\n",
+        )
+        .file(
+            "collision/Api/Types.scala",
+            "package collision.Api\nclass ActorContext\n",
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+import collision.{Api => mixed}
+object Use {
+  def context: mixed.ActorContext = null
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+    for target in ["collision.Api$.ActorContext", "collision.Api.ActorContext"] {
+        assert!(
+            !has_edge(&value, "app.Use$.context", target),
+            "same-tier package/singleton import leaked to {target}: {}",
+            value["edges"]
+        );
+    }
+}
+
+#[test]
 fn resolves_instance_object_and_unqualified_calls() {
     let value = usage_graph();
 
@@ -72,6 +103,122 @@ fn type_references_edge_to_the_type_node() {
         "expected viaInstance -> Service (new Service()): {}",
         value["edges"]
     );
+}
+
+#[test]
+fn scala_inverted_resolves_lexical_singletons_and_separates_type_term_namespaces() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Outer.scala",
+            r#"package model
+object Outer {
+  object Token
+  class UseRef
+  object internal { object PathToken }
+  object Factory { def apply(value: Int): UseRef = new UseRef }
+  object Pattern { def unapply(value: Any): Option[Int] = None }
+  def singleton: Any = Token
+  def stablePath(value: Any): Int = value match {
+    case internal.PathToken => 1
+    case _ => 0
+  }
+  def made = Factory(1)
+  def extracted(value: Any): Int = value match {
+    case Pattern(number) => number
+    case _ => 0
+  }
+  def shadowedSingleton(Token: Any): Any = Token
+  def typedWithTerm(UseRef: Int, tree: Any): Any = tree match {
+    case value: UseRef => value
+    case _ => tree
+  }
+}
+object Other {
+  object Token
+  class UseRef
+  def singleton: Any = Token
+  def typed(tree: Any): Any = tree match {
+    case value: UseRef => value
+    case _ => tree
+  }
+}
+"#,
+        )
+        .file(
+            "duplicate/First.scala",
+            r#"package duplicate
+object Outer {
+  object Token
+  def singleton: Any = Token
+}
+class PackageType
+object PackageToken
+"#,
+        )
+        .file(
+            "duplicate/Second.scala",
+            r#"package duplicate
+object Outer {
+  object Token
+  def singleton: Any = Token
+}
+class PackageType
+object PackageToken
+"#,
+        )
+        .file(
+            "consumer/Ambiguous.scala",
+            r#"package consumer
+object Ambiguous {
+  def typed: duplicate.PackageType = null
+  def token(value: Any): Int = value match {
+    case duplicate.PackageToken => 1
+    case _ => 0
+  }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "model.Outer$.singleton", "model.Outer$.Token$"),
+        "{}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "model.Outer$.typedWithTerm", "model.Outer$.UseRef"),
+        "{}",
+        value["edges"]
+    );
+    for (caller, callee) in [
+        (
+            "model.Outer$.stablePath",
+            "model.Outer$.internal$.PathToken$",
+        ),
+        ("model.Outer$.made", "model.Outer$.Factory$.apply"),
+        ("model.Outer$.extracted", "model.Outer$.Pattern$.unapply"),
+    ] {
+        assert!(
+            has_edge(&value, caller, callee),
+            "missing {caller} -> {callee}: {}",
+            value["edges"]
+        );
+    }
+    for (caller, callee) in [
+        ("model.Outer$.shadowedSingleton", "model.Outer$.Token$"),
+        ("model.Other$.singleton", "model.Outer$.Token$"),
+        ("model.Other$.typed", "model.Outer$.UseRef"),
+        ("duplicate.Outer$.singleton", "duplicate.Outer$.Token$"),
+        ("consumer.Ambiguous$.typed", "duplicate.PackageType"),
+        ("consumer.Ambiguous$.token", "duplicate.PackageToken$"),
+    ] {
+        assert!(
+            !has_edge(&value, caller, callee),
+            "unexpected {caller} -> {callee}: {}",
+            value["edges"]
+        );
+    }
 }
 
 #[test]
@@ -1079,7 +1226,7 @@ object Flags {
         value["edges"]
     );
     assert!(
-        !has_edge(&value, "app.Use$.localConstructorRoot", "app.Use$.Generic"),
+        has_edge(&value, "app.Use$.localConstructorRoot", "app.Use$.Generic"),
         "{}",
         value["edges"]
     );
@@ -1704,4 +1851,178 @@ object Use {
             value["edges"]
         );
     }
+}
+
+#[test]
+fn scala_inverted_resolves_package_lexical_field_and_application_projections() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "root/api/Types.scala",
+            "package root.api\nclass ActorContext\n",
+        )
+        .file(
+            "root/consumer/sibling/Local.scala",
+            "package root.consumer.sibling\nclass Local\n",
+        )
+        .file(
+            "root/model/Model.scala",
+            r#"package root.model
+
+object Result {
+  opaque type Success[A] = A
+  object Success
+}
+class Context { val system: Int = 1 }
+trait Actor { val context: Context = new Context }
+trait Generator[A]
+trait GeneratorMarker[A]
+object Generator {
+  def anonymous[A] = new Generator[List[A]] with GeneratorMarker[List[A]] {}
+}
+case class Good[A](value: A)
+object Good { class GoodType[A] }
+
+object Outer {
+  object internal { class BranchData }
+  class Holder { def branch: internal.BranchData = null }
+}
+
+object Constructors {
+  object ByteString1 {
+    def apply(value: Int): ByteString1 = new ByteString1(value)
+  }
+  final class ByteString1 private (val value: Int)
+  trait Generator[A]
+  trait Marker[A]
+  abstract class FlowVisitorCollect[A](empty: A, combine: (A, A) => A)
+  class Inside { def bytes = ByteString1(1) }
+}
+
+object Qualified {
+  final class Applied(val value: Int)
+  object Applied { def apply(value: Int): Applied = new Applied(value) }
+  final class Extracted(val value: Int)
+  object Extracted { def unapply(value: Any): Option[Int] = None }
+  object Factory { def apply(value: Int): Int = value }
+  object Pattern { def unapply(value: Any): Option[Int] = None }
+}
+"#,
+        )
+        .file(
+            "root/model/PatternUse.scala",
+            r#"package root.model
+object PatternUse {
+  val constructed = Good(1)
+  def extract(value: Any): Any = value match {
+    case (Good(found), Good(_)) => found
+    case _ => value
+  }
+}
+"#,
+        )
+        .file(
+            "root/consumer/Use.scala",
+            r#"package root.consumer
+
+import root.{api => classic}
+import root.api
+import root.model.*
+import root.model.Constructors.*
+
+class Child extends Actor { def inherited = context }
+
+object Use {
+  def aliased: classic.ActorContext = null
+  def directlyImported: api.ActorContext = null
+  def relative: sibling.Local = null
+  def stable: Result.Success[Int] = 1
+  def term = Result.Success
+  def explicit = new Constructors.FlowVisitorCollect[Int](0, _ + _) {}
+  def anonymous = new Constructors.Generator[Int] with Constructors.Marker[Int] {}
+  def qualifiedApply = Qualified.Applied(2)
+  def qualifiedExtract(value: Any): Int = value match {
+    case Qualified.Extracted(found) => found
+    case _ => 0
+  }
+  def objectApply = Qualified.Factory(3)
+  def objectExtract(value: Any): Int = value match {
+    case Qualified.Pattern(found) => found
+    case _ => 0
+  }
+}
+"#,
+        )
+        .file(
+            "decoy/api/Types.scala",
+            "package decoy.api\nclass ActorContext\n",
+        )
+        .file(
+            "root/consumer/Ambiguous.scala",
+            r#"package root.consumer
+import root.{api => clash}
+import decoy.{api => clash}
+object Ambiguous {
+  def wrong: clash.ActorContext = null
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    for (caller, callee) in [
+        ("root.consumer.Use$.aliased", "root.api.ActorContext"),
+        (
+            "root.consumer.Use$.directlyImported",
+            "root.api.ActorContext",
+        ),
+        ("root.consumer.Use$.relative", "root.consumer.sibling.Local"),
+        (
+            "root.model.Outer$.Holder.branch",
+            "root.model.Outer$.internal$.BranchData",
+        ),
+        (
+            "root.model.Constructors$.Inside.bytes",
+            "root.model.Constructors$.ByteString1",
+        ),
+        (
+            "root.consumer.Use$.explicit",
+            "root.model.Constructors$.FlowVisitorCollect",
+        ),
+        (
+            "root.consumer.Use$.anonymous",
+            "root.model.Constructors$.Generator",
+        ),
+        ("root.model.Generator$.anonymous", "root.model.Generator"),
+        (
+            "root.consumer.Use$.qualifiedApply",
+            "root.model.Qualified$.Applied$.apply",
+        ),
+        (
+            "root.consumer.Use$.qualifiedExtract",
+            "root.model.Qualified$.Extracted$.unapply",
+        ),
+        (
+            "root.consumer.Use$.objectApply",
+            "root.model.Qualified$.Factory$.apply",
+        ),
+        (
+            "root.consumer.Use$.objectExtract",
+            "root.model.Qualified$.Pattern$.unapply",
+        ),
+    ] {
+        assert!(
+            has_edge(&value, caller, callee),
+            "missing shared Scala resolution edge {caller} -> {callee}: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        !has_edge(
+            &value,
+            "root.consumer.Ambiguous$.wrong",
+            "root.api.ActorContext"
+        ),
+        "ambiguous package alias leaked to root.api.ActorContext: {}",
+        value["edges"]
+    );
 }

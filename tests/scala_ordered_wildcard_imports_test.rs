@@ -82,6 +82,64 @@ package other {
 }
 
 #[test]
+fn package_alias_candidate_routing_selects_relative_namespace_and_descendants() {
+    let consumer = r#"package app
+import api.{v1 => selected}
+object Consumer {
+  val direct: selected.Target = null
+  val nested: selected.deep.Nested = null
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/api/v1/Target.scala",
+            "package app.api.v1\nclass Target\n",
+        )
+        .file(
+            "app/api/V1.scala",
+            "package app.api\nobject v1 { class ObjectSide }\n",
+        )
+        .file(
+            "app/api/v1/deep/Nested.scala",
+            "package app.api.v1.deep\nclass Nested\n",
+        )
+        .file("api/v1/Target.scala", "package api.v1\nclass Target\n")
+        .file("app/Consumer.scala", consumer)
+        .build();
+
+    let analyzer = ScalaAnalyzer::from_project(project.project().clone());
+    let source = project.file("app/Consumer.scala");
+    let singleton = project.file("app/api/V1.scala");
+    let nested = project.file("app/api/v1/deep/Nested.scala");
+    let imports = analyzer.import_info_of(&source);
+    assert!(analyzer.could_import_file(
+        &source,
+        &imports,
+        &project.file("app/api/v1/Target.scala")
+    ));
+    assert!(analyzer.could_import_file(&source, &imports, &singleton));
+    assert!(analyzer.could_import_file(&source, &imports, &nested));
+    assert!(!analyzer.could_import_file(&source, &imports, &project.file("api/v1/Target.scala")));
+    let imported = analyzer.imported_code_units_of(&source);
+    assert!(
+        imported.iter().any(|unit| unit.source() == &singleton),
+        "same-tier singleton declarations should remain reverse-import candidates"
+    );
+    assert!(
+        imported.iter().any(|unit| unit.source() == &nested),
+        "package aliases should import descendant package declarations for reverse routing"
+    );
+    assert!(
+        analyzer.referencing_files_of(&singleton).contains(&source),
+        "same-tier singleton declarations should retain the importer"
+    );
+    assert!(
+        analyzer.referencing_files_of(&nested).contains(&source),
+        "descendant package declarations should retain the package-alias importer"
+    );
+}
+
+#[test]
 fn template_body_chained_wildcards_retain_enclosing_package_context() {
     let consumer = r#"package dotty.tools
 package dotc

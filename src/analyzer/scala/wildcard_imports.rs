@@ -47,6 +47,41 @@ pub(crate) struct ScalaWildcardImportEnvironment {
     pub(crate) ambiguous: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ScalaExplicitImportFacts {
+    pub(crate) declaration: bool,
+    pub(crate) package: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScalaExplicitImportTier {
+    pub(crate) candidate: String,
+    pub(crate) declaration: bool,
+    pub(crate) package: bool,
+}
+
+/// Select the first relative/global candidate tier that denotes either a
+/// declaration or a package. Both namespaces are retained when the same
+/// candidate denotes both so semantic binders can fail closed while candidate
+/// discovery remains conservative.
+pub(crate) fn resolve_scala_explicit_import_tier(
+    path: &str,
+    package_prefixes: &[String],
+    mut facts: impl FnMut(&str) -> ScalaExplicitImportFacts,
+) -> Option<ScalaExplicitImportTier> {
+    for candidate in scala_import_path_candidates(path, package_prefixes) {
+        let facts = facts(&candidate);
+        if facts.declaration || facts.package {
+            return Some(ScalaExplicitImportTier {
+                candidate,
+                declaration: facts.declaration,
+                package: facts.package,
+            });
+        }
+    }
+    None
+}
+
 /// Resolve wildcard owners in source order. A later relative owner may be
 /// exposed by an earlier package wildcard (`core.*; Annotations.*`) or stable
 /// singleton wildcard. Direct lexical/package paths take precedence over such
@@ -179,7 +214,7 @@ fn owners_for_candidate(
     owners
 }
 
-fn scala_import_path_candidates(path: &str, package_prefixes: &[String]) -> Vec<String> {
+pub(crate) fn scala_import_path_candidates(path: &str, package_prefixes: &[String]) -> Vec<String> {
     let mut candidates = Vec::new();
     for prefix in package_prefixes.iter().rev() {
         if prefix.is_empty() || path.starts_with(&format!("{prefix}.")) {

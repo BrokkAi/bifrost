@@ -8,15 +8,17 @@ use std::sync::Arc;
 use tree_sitter::Node;
 
 use super::ScalaAnalyzer;
-use super::declarations::last_segment;
 use super::wildcard_imports::{
-    ScalaWildcardImportEnvironment, ScalaWildcardImportOwner, ScalaWildcardOwnerFacts,
-    ScalaWildcardOwnerKind, resolve_scala_wildcard_import_environment, scala_import_path,
+    ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaWildcardImportEnvironment,
+    ScalaWildcardImportOwner, ScalaWildcardOwnerFacts, ScalaWildcardOwnerKind,
+    resolve_scala_explicit_import_tier, resolve_scala_wildcard_import_environment,
+    scala_import_path,
 };
 
 impl ScalaAnalyzer {
     fn resolve_import_info(
         &self,
+        file: &ProjectFile,
         import_index: usize,
         info: &ImportInfo,
         wildcard_environment: &ScalaWildcardImportEnvironment,
@@ -37,7 +39,33 @@ impl ScalaAnalyzer {
             imported.dedup();
             return imported;
         }
-        self.inner.definitions(&path).collect()
+        let Some(source_package) = self.inner.package_name_of(file) else {
+            return Vec::new();
+        };
+        let Some(tier) =
+            self.explicit_import_tier(info, &path, std::slice::from_ref(&source_package))
+        else {
+            return Vec::new();
+        };
+        let mut imported = Vec::new();
+        if tier.declaration {
+            imported.extend(self.inner.definitions(&tier.candidate));
+        }
+        if tier.package {
+            let descendant_prefix = format!("{}.", tier.candidate);
+            let packages = self.package_namespaces();
+            let start = packages.partition_point(|package| package < &tier.candidate);
+            for package in packages[start..].iter().take_while(|package| {
+                package.as_str() == tier.candidate || package.starts_with(&descendant_prefix)
+            }) {
+                if let Some(declarations) = self.importable_declarations_by_package().get(package) {
+                    imported.extend(declarations.iter().cloned());
+                }
+            }
+        }
+        imported.sort();
+        imported.dedup();
+        imported
     }
 
     fn resolve_wildcard_owner(&self, owner: &ScalaWildcardImportOwner) -> Vec<CodeUnit> {
@@ -113,6 +141,47 @@ impl ScalaAnalyzer {
         })
     }
 
+    fn package_namespaces(&self) -> &[String] {
+        self.package_namespaces.get_or_init(|| {
+            let mut packages = self
+                .importable_declarations_by_package()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            packages.sort_unstable();
+            packages
+        })
+    }
+
+    fn package_namespace_exists(&self, candidate: &str) -> bool {
+        let descendant_prefix = format!("{candidate}.");
+        let packages = self.package_namespaces();
+        let index = packages.partition_point(|package| package.as_str() < candidate);
+        packages
+            .get(index)
+            .is_some_and(|package| package == candidate || package.starts_with(&descendant_prefix))
+    }
+
+    fn explicit_import_tier(
+        &self,
+        info: &ImportInfo,
+        path: &str,
+        fallback_package_prefixes: &[String],
+    ) -> Option<ScalaExplicitImportTier> {
+        let lexical_prefixes = info
+            .path
+            .as_ref()
+            .map(|path| path.lexical_prefixes.as_slice())
+            .filter(|prefixes| !prefixes.is_empty());
+        let package_prefixes = lexical_prefixes.unwrap_or(fallback_package_prefixes);
+        resolve_scala_explicit_import_tier(path, package_prefixes, |candidate| {
+            ScalaExplicitImportFacts {
+                declaration: self.inner.definitions(candidate).next().is_some(),
+                package: self.package_namespace_exists(candidate),
+            }
+        })
+    }
+
     fn same_package_reference_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
         self.same_package_reference_index.get_or_build(
             || self.compute_same_package_reference_index(true),
@@ -166,7 +235,9 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
         let wildcard_environment = self.wildcard_import_environment(file, &imports);
         let mut imported = HashSet::default();
         for (import_index, info) in imports.iter().enumerate() {
-            for code_unit in self.resolve_import_info(import_index, info, &wildcard_environment) {
+            for code_unit in
+                self.resolve_import_info(file, import_index, info, &wildcard_environment)
+            {
                 imported.insert(code_unit);
             }
         }
@@ -243,13 +314,6 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
             return true;
         }
 
-        let target_names: HashSet<String> = self
-            .inner
-            .top_level_declarations(target)
-            .into_iter()
-            .filter(is_scala_importable_top_level)
-            .map(|unit| scala_importable_name(&unit))
-            .collect();
         imports.iter().any(|info| {
             let Some(path) = scala_import_path(info) else {
                 return false;
@@ -257,10 +321,22 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
             if info.is_wildcard {
                 return false;
             }
-            let Some((package, imported)) = path.rsplit_once('.') else {
+            let Some(tier) =
+                self.explicit_import_tier(info, &path, std::slice::from_ref(&source_package))
+            else {
                 return false;
             };
-            package == target_package && target_names.contains(imported)
+            let declaration_reaches = tier.declaration
+                && self
+                    .inner
+                    .definitions(&tier.candidate)
+                    .any(|declaration| declaration.source() == target);
+            let package_reaches = tier.package
+                && (target_package == tier.candidate
+                    || target_package
+                        .strip_prefix(&tier.candidate)
+                        .is_some_and(|suffix| suffix.starts_with('.')));
+            declaration_reaches || package_reaches
         })
     }
 }
@@ -456,12 +532,6 @@ fn render_scala_import(path: &[String], wildcard: bool, alias: Option<&str>) -> 
 
 fn scala_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     &source[node.byte_range()]
-}
-
-fn scala_importable_name(unit: &CodeUnit) -> String {
-    last_segment(unit.short_name())
-        .trim_end_matches('$')
-        .to_string()
 }
 
 fn is_scala_importable_top_level(unit: &CodeUnit) -> bool {

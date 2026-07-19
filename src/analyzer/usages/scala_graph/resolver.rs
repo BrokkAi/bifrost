@@ -887,7 +887,16 @@ impl Visibility {
             self.class_type_names.extend(
                 self.type_names
                     .iter()
-                    .filter(|name| resolver.resolve(name).as_deref() == Some(&class_identity))
+                    .filter(|name| {
+                        resolver
+                            .resolve(name)
+                            .or_else(|| resolver.resolve_object(name))
+                            .is_some_and(|resolved| {
+                                resolved == class_identity
+                                    || scala_normalized_fq_name(&resolved)
+                                        == scala_normalized_fq_name(&class_identity)
+                            })
+                    })
                     .cloned(),
             );
         }

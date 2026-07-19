@@ -1,5 +1,6 @@
 use super::inverted::{
     BareMemberResolution, FieldResolution, MemberReturnResolution, NameResolver, ProjectTypes,
+    TypeApplicationResolution, TypeApplicationRole,
 };
 use crate::analyzer::scala::imports::scala_import_infos_from_node;
 use crate::analyzer::scala::scala_type_lookup_segments;
@@ -320,9 +321,22 @@ fn scan_call_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn companion_apply_call_is_proven(function: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
+    if !ctx.spec.accepts_companion_apply_syntax {
+        return false;
+    }
+    if resolve_unqualified_type_application(
+        function,
+        text,
+        TypeApplicationRole::BareApplication,
+        ctx,
+    )
+    .is_some_and(|resolution| resolution.callable_targets.contains(&ctx.spec.target))
+    {
+        return true;
+    }
+
     let lexical_type = lexically_visible_nested_type(function, text, ctx);
-    ctx.spec.accepts_companion_apply_syntax
-        && ctx.spec.owner_name.as_deref() == Some(text)
+    ctx.spec.owner_name.as_deref() == Some(text)
         && !has_member_qualifier(function)
         && !is_locally_shadowed(ctx, text)
         && !bare_call_is_claimed_by_enclosing_member(function, text, ctx)
@@ -365,6 +379,47 @@ fn nested_target_owner_is_lexically_visible(node: Node<'_>, ctx: &ScanCtx<'_>) -
         current = ctx.analyzer.parent_of(&unit);
     }
     false
+}
+
+fn resolve_unqualified_type_application(
+    node: Node<'_>,
+    name: &str,
+    role: TypeApplicationRole,
+    ctx: &ScanCtx<'_>,
+) -> Option<TypeApplicationResolution> {
+    if name.is_empty()
+        || has_member_qualifier(node)
+        || (role != TypeApplicationRole::ExplicitConstructor
+            && type_reference_is_locally_bound(name, ctx))
+        || (role == TypeApplicationRole::BareApplication
+            && bare_call_is_claimed_by_enclosing_member(node, name, ctx))
+    {
+        return None;
+    }
+    let exact_source_class = match ctx.spec.kind {
+        TargetKind::Constructor => ctx.spec.owner.as_ref().filter(|owner| {
+            owner.source() == ctx.file && ctx.spec.owner_name.as_deref() == Some(name)
+        }),
+        TargetKind::Type => (ctx.spec.target.source() == ctx.file && ctx.spec.member_name == name)
+            .then_some(&ctx.spec.target),
+        TargetKind::Method | TargetKind::Field => None,
+    };
+    let class_fqn = lexically_visible_nested_type(node, name, ctx)
+        .or_else(|| exact_source_class.map(CodeUnit::fq_name))
+        .or_else(|| ctx.name_resolver.resolve(name));
+    let object_fqn = lexically_visible_nested_object(node, name, ctx)
+        .or_else(|| ctx.name_resolver.resolve_object(name));
+    (class_fqn.is_some() || object_fqn.is_some()).then(|| {
+        ctx.types.resolve_type_application(
+            ctx.scala,
+            &ctx.name_resolver,
+            class_fqn.as_deref(),
+            object_fqn.as_deref(),
+            name,
+            call_arities_for_reference(node).as_deref(),
+            role,
+        )
+    })
 }
 
 fn scan_infix_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -855,7 +910,7 @@ fn call_initializer_return_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<St
                 return None;
             }
             let call_arities = call_arities_for_reference(function);
-            if let Some(owner) = enclosing_owner_fq_name(function, ctx) {
+            if let Some(owner) = enclosing_owner(function, ctx) {
                 match ctx.types.unqualified_member_return_type(
                     ctx.scala,
                     &ctx.name_resolver,
@@ -1030,24 +1085,14 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             });
             let object_syntax = is_scala_object_reference(node);
             let qualified_class_target = qualified.as_ref().and_then(|reference| {
-                ctx.types.resolve_qualified_stable_type(
-                    ctx.scala,
-                    &ctx.name_resolver,
-                    &reference.segments,
-                    false,
-                )
+                resolve_qualified_stable_type_at(node, &reference.segments, false, ctx)
             });
             let qualified_object_target = qualified.as_ref().and_then(|reference| {
-                ctx.types.resolve_qualified_stable_type(
-                    ctx.scala,
-                    &ctx.name_resolver,
-                    &reference.segments,
-                    true,
-                )
+                resolve_qualified_stable_type_at(node, &reference.segments, true, ctx)
             });
             let qualified_class_matches = qualified_class_target
                 .as_deref()
-                .is_some_and(|fqn| fqn == ctx.spec.target.fq_name());
+                .is_some_and(|fqn| exact_type_declaration_matches(fqn, &ctx.spec.target, ctx));
             let qualified_object_matches = qualified_object_target.as_deref().is_some_and(|fqn| {
                 fqn == ctx.spec.target.fq_name() || ctx.spec.object_role_fq_matches(fqn)
             });
@@ -1057,13 +1102,16 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     ScalaQualifiedStableTypeRole::Type => qualified_class_matches,
                     ScalaQualifiedStableTypeRole::Constructor => {
                         qualified_class_matches
-                            && qualified_class_target.as_deref().is_some_and(|fqn| {
-                                ctx.types.constructor_call_shape_matches(
-                                    ctx.scala,
-                                    fqn,
-                                    call_arities.as_deref(),
-                                )
-                            })
+                            && (ctx
+                                .types
+                                .is_scala_trait_declaration(ctx.scala, &ctx.spec.target)
+                                || qualified_class_target.as_deref().is_some_and(|fqn| {
+                                    ctx.types.constructor_call_shape_matches(
+                                        ctx.scala,
+                                        fqn,
+                                        call_arities.as_deref(),
+                                    )
+                                }))
                     }
                     ScalaQualifiedStableTypeRole::Apply => {
                         (qualified_class_matches
@@ -1090,12 +1138,20 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             let stable_identifier_object_matches = stable_identifier_object_fqn(node, ctx)
                 .is_some_and(|fqn| fqn == ctx.spec.target.fq_name());
             let lexical_type = lexically_visible_nested_type(node, text, ctx);
-            let lexical_type_matches =
-                lexical_type.as_deref() == Some(ctx.spec.target.fq_name().as_str());
+            let lexical_type_matches = lexical_type
+                .as_deref()
+                .is_some_and(|fqn| exact_type_declaration_matches(fqn, &ctx.spec.target, ctx));
+            let lexical_object = lexically_visible_nested_object(node, text, ctx);
+            let lexical_object_matches = lexical_object.as_deref().is_some_and(|fqn| {
+                fqn == ctx.spec.target.fq_name() || ctx.spec.object_role_fq_matches(fqn)
+            });
             let class_call_shape_matches = !is_constructor_like_reference(node, ctx.source)
-                || ctx.types.constructor_call_shape_matches(
+                || ctx
+                    .types
+                    .is_scala_trait_declaration(ctx.scala, &ctx.spec.target)
+                || ctx.types.constructor_target_call_shape_matches(
                     ctx.scala,
-                    &ctx.spec.target.fq_name(),
+                    &ctx.spec.target,
                     call_arities_for_reference(node).as_deref(),
                 );
             let class_reference = qualified.is_none()
@@ -1108,20 +1164,33 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             let class_application = qualified.is_none()
                 && is_call_function_reference(node)
                 && !ctx.spec.is_object_type
-                && !bare_call_is_claimed_by_enclosing_member(node, text, ctx)
-                && (lexical_type_matches
-                    || lexical_type.is_none() && ctx.visibility.class_type_name_matches(text))
-                && ctx.types.class_application_matches(
-                    ctx.scala,
-                    &ctx.name_resolver,
-                    &ctx.spec.target,
-                    call_arities_for_reference(node).as_deref(),
-                );
+                && resolve_unqualified_type_application(
+                    node,
+                    text,
+                    TypeApplicationRole::BareApplication,
+                    ctx,
+                )
+                .and_then(|resolution| resolution.type_target)
+                .as_ref()
+                    == Some(&ctx.spec.target);
+            let extractor_projection = qualified.is_none()
+                && (is_extractor_reference(node) || is_infix_pattern_operator(node))
+                && resolve_unqualified_type_application(
+                    node,
+                    text,
+                    TypeApplicationRole::Extractor,
+                    ctx,
+                )
+                .and_then(|resolution| resolution.type_target)
+                .as_ref()
+                    == Some(&ctx.spec.target);
             let bare_method_value_context = is_bare_companion_method_value_reference(node)
                 .then(|| companion_method_value_context(node, ctx));
             let object_reference = qualified.is_none()
                 && object_syntax
-                && (ctx.visibility.object_type_name_matches(text) || lexical_type_matches)
+                && !type_reference_is_locally_bound(text, ctx)
+                && (lexical_object_matches
+                    || lexical_object.is_none() && ctx.visibility.object_type_name_matches(text))
                 && if is_call_function_reference(node) {
                     !bare_call_is_claimed_by_enclosing_member(node, text, ctx)
                         && (ctx.spec.is_object_type
@@ -1140,6 +1209,7 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 };
             let incompatible_companion_object_reference = qualified.is_none()
                 && ctx.spec.is_object_type
+                && !type_reference_is_locally_bound(text, ctx)
                 && matches!(
                     bare_method_value_context,
                     Some(ScalaMethodValueContext::Incompatible)
@@ -1169,17 +1239,15 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     }
                     ScalaMethodValueContext::Incompatible => false,
                 };
-            (qualified_role_matches
+            qualified_role_matches
                 || class_reference
                 || class_application
+                || extractor_projection
                 || object_reference
                 || incompatible_companion_object_reference
                 || companion_method_value
                 || terminal_object_matches
-                || stable_identifier_object_matches)
-                && (qualified.is_some()
-                    || stable_identifier_object_matches
-                    || !type_reference_is_locally_bound(text, ctx))
+                || stable_identifier_object_matches
         }
         TargetKind::Constructor => {
             let qualified = qualified_stable_type_reference(node, ctx.source).filter(|reference| {
@@ -1190,41 +1258,50 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             });
             let qualified_owner_matches = qualified.as_ref().is_some_and(|reference| {
                 reference.role == ScalaQualifiedStableTypeRole::Constructor
-                    && ctx
-                        .types
-                        .resolve_qualified_stable_type(
-                            ctx.scala,
-                            &ctx.name_resolver,
-                            &reference.segments,
-                            false,
-                        )
-                        .as_deref()
-                        == ctx.spec.owner.as_ref().map(CodeUnit::fq_name).as_deref()
-                    && member_call_arities_match(
-                        call_arities_for_reference(reference.expression).as_deref(),
-                        ctx,
-                    )
+                    && resolve_qualified_type_application(node, ctx).is_some_and(|resolution| {
+                        resolution.callable_targets.contains(&ctx.spec.target)
+                    })
             });
             let lexical_owner = lexically_visible_nested_type(node, text, ctx);
             let lexical_owner_matches = lexical_owner.as_deref()
                 == ctx.spec.owner.as_ref().map(CodeUnit::fq_name).as_deref();
+            let exact_source_owner_matches = ctx.spec.owner.as_ref().is_some_and(|owner| {
+                owner.source() == ctx.file && ctx.spec.owner_name.as_deref() == Some(text)
+            });
+            let extractor_role = is_extractor_reference(node) || is_infix_pattern_operator(node);
+            let unqualified_role = if extractor_role {
+                TypeApplicationRole::Extractor
+            } else if is_call_function_reference(node) {
+                TypeApplicationRole::BareApplication
+            } else {
+                TypeApplicationRole::ExplicitConstructor
+            };
+            let unqualified_constructor_matches =
+                resolve_unqualified_type_application(node, text, unqualified_role, ctx)
+                    .is_some_and(|resolution| {
+                        resolution.callable_targets.contains(&ctx.spec.target)
+                    });
             qualified_owner_matches
-                || (lexical_owner_matches
+                || ((lexical_owner_matches
+                    || exact_source_owner_matches
                     || lexical_owner.is_none() && ctx.visibility.class_type_name_matches(text))
-                    && !type_reference_is_locally_bound(text, ctx)
-                    && !bare_call_is_claimed_by_enclosing_member(node, text, ctx)
-                    && is_constructor_like_reference(node, ctx.source)
-                    && member_call_arity_matches(node, ctx)
-                    && (!is_call_function_reference(node)
-                        || ctx.spec.owner.as_ref().is_some_and(|owner| {
-                            ctx.types.class_application_uses_constructor(
-                                ctx.scala,
-                                owner,
-                                call_arities_for_reference(node).as_deref(),
-                            )
-                        }))
+                    && (is_constructor_like_reference(node, ctx.source) || extractor_role)
+                    && unqualified_constructor_matches)
         }
-        TargetKind::Method => member_reference_is_proven(node, text, ctx),
+        TargetKind::Method => {
+            ((is_extractor_reference(node) || is_infix_pattern_operator(node))
+                && resolve_unqualified_type_application(
+                    node,
+                    text,
+                    TypeApplicationRole::Extractor,
+                    ctx,
+                )
+                .is_some_and(|resolution| resolution.callable_targets.contains(&ctx.spec.target)))
+                || resolve_qualified_type_application(node, ctx).is_some_and(|resolution| {
+                    resolution.callable_targets.contains(&ctx.spec.target)
+                })
+                || member_reference_is_proven(node, text, ctx)
+        }
         TargetKind::Field => {
             named_argument_field_is_proven(node, text, ctx)
                 || member_reference_is_proven(node, text, ctx)
@@ -1254,6 +1331,87 @@ fn lexically_visible_nested_type(node: Node<'_>, name: &str, ctx: &ScanCtx<'_>) 
     None
 }
 
+fn lexically_visible_nested_object(
+    node: Node<'_>,
+    name: &str,
+    ctx: &ScanCtx<'_>,
+) -> Option<String> {
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    };
+    let mut current = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
+    while let Some(unit) = current {
+        if unit.is_class()
+            && let Some(nested) = ctx
+                .types
+                .exact_nested_object(ctx.scala, &unit.fq_name(), name)
+        {
+            return Some(nested);
+        }
+        current = ctx.analyzer.parent_of(&unit);
+    }
+    None
+}
+
+fn resolve_qualified_stable_type_at(
+    node: Node<'_>,
+    segments: &[String],
+    terminal_object: bool,
+    ctx: &ScanCtx<'_>,
+) -> Option<String> {
+    let lexical_root = segments
+        .first()
+        .and_then(|root| lexically_visible_nested_object(node, root, ctx));
+    ctx.types.resolve_qualified_stable_type_at(
+        ctx.scala,
+        &ctx.name_resolver,
+        segments,
+        terminal_object,
+        lexical_root,
+    )
+}
+
+fn resolve_qualified_type_application(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> Option<TypeApplicationResolution> {
+    let reference = qualified_stable_type_reference(node, ctx.source)?;
+    let role = match reference.role {
+        ScalaQualifiedStableTypeRole::Constructor => TypeApplicationRole::ExplicitConstructor,
+        ScalaQualifiedStableTypeRole::Apply => TypeApplicationRole::BareApplication,
+        ScalaQualifiedStableTypeRole::Extractor => TypeApplicationRole::Extractor,
+        ScalaQualifiedStableTypeRole::Type => return None,
+    };
+    let root = reference.segments.first()?;
+    if ctx.bindings.is_shadowed(root) {
+        return None;
+    }
+    let name = reference.segments.last()?;
+    let class_fqn = resolve_qualified_stable_type_at(node, &reference.segments, false, ctx);
+    let object_fqn = resolve_qualified_stable_type_at(node, &reference.segments, true, ctx);
+    if class_fqn.is_none() && object_fqn.is_none() {
+        return None;
+    }
+    Some(ctx.types.resolve_type_application(
+        ctx.scala,
+        &ctx.name_resolver,
+        class_fqn.as_deref(),
+        object_fqn.as_deref(),
+        name,
+        call_arities_for_reference(reference.expression).as_deref(),
+        role,
+    ))
+}
+
+fn exact_type_declaration_matches(fqn: &str, expected: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
+    let mut declarations = ctx.scala.definitions(fqn).filter(|unit| unit.is_class());
+    let declaration = declarations.next();
+    declarations.next().is_none() && declaration.as_ref() == Some(expected)
+}
+
 fn named_argument_field_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
     if text != ctx.spec.member_name {
         return false;
@@ -1280,10 +1438,10 @@ fn bare_call_is_claimed_by_enclosing_member(node: Node<'_>, text: &str, ctx: &Sc
     if !is_call_function_reference(node) {
         return false;
     }
-    let Some(owner) = enclosing_owner_fq_name(node, ctx) else {
+    let Some(owner) = enclosing_owner(node, ctx) else {
         return false;
     };
-    match ctx.types.bare_member_declarations(
+    match ctx.types.bare_member_declarations_for_owner(
         ctx.scala,
         &owner,
         text,
@@ -1371,7 +1529,32 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
         return false;
     }
 
+    if ctx.spec.kind == TargetKind::Field
+        && let Some(reference) = qualified_stable_type_reference(node, ctx.source)
+        && let Some((member, owner_segments)) = reference.segments.split_last()
+        && member == &ctx.spec.member_name
+        && let Some(owner) = resolve_qualified_stable_type_at(node, owner_segments, true, ctx)
+    {
+        return match ctx
+            .types
+            .stable_type_member_for_owner(ctx.scala, &owner, member)
+        {
+            FieldResolution::Resolved(field) => field.declaration == ctx.spec.target,
+            FieldResolution::NoMatch | FieldResolution::Unresolved => false,
+        };
+    }
+
     if let Some(owner_fq_name) = stable_identifier_field_owner_fqn(node, ctx) {
+        if ctx.spec.kind == TargetKind::Field {
+            return match ctx.types.field_for_owner_member(
+                ctx.scala,
+                &owner_fq_name,
+                &ctx.spec.member_name,
+            ) {
+                FieldResolution::Resolved(field) => field.declaration == ctx.spec.target,
+                FieldResolution::NoMatch | FieldResolution::Unresolved => false,
+            };
+        }
         return ctx.spec.owner_fq_matches(&owner_fq_name);
     }
 
@@ -1384,9 +1567,13 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
         return if ctx.spec.kind == TargetKind::Method {
             bare_member_reference_is_proven(node, text, ctx)
         } else {
-            !is_locally_shadowed(ctx, text)
-                && enclosing_matches_owner(node, ctx)
-                && member_call_arity_matches(node, ctx)
+            if is_locally_shadowed(ctx, text) || !member_call_arity_matches(node, ctx) {
+                return false;
+            }
+            match lexically_visible_field(node, &ctx.spec.member_name, ctx) {
+                FieldResolution::Resolved(field) => field.declaration == ctx.spec.target,
+                FieldResolution::NoMatch | FieldResolution::Unresolved => false,
+            }
         };
     };
     if ctx.spec.kind == TargetKind::Field
@@ -1432,6 +1619,29 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
     receiver_binding_matches(node, qualifier, ctx)
 }
 
+fn lexically_visible_field(node: Node<'_>, name: &str, ctx: &ScanCtx<'_>) -> FieldResolution {
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    };
+    let mut current = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
+    while let Some(unit) = current {
+        if unit.is_class() {
+            match ctx
+                .types
+                .field_for_owner_member(ctx.scala, &unit.fq_name(), name)
+            {
+                FieldResolution::NoMatch => {}
+                resolution => return resolution,
+            }
+        }
+        current = ctx.analyzer.parent_of(&unit);
+    }
+    FieldResolution::NoMatch
+}
+
 fn bare_member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
     if text != ctx.spec.member_name || is_locally_shadowed(ctx, text) {
         return false;
@@ -1441,13 +1651,15 @@ fn bare_member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>
     if !member_call_arities_match(call_arities.as_deref(), ctx) {
         return false;
     }
-    let Some(owner) = enclosing_owner_fq_name(node, ctx) else {
+    let Some(owner) = enclosing_owner(node, ctx) else {
         return false;
     };
-    let BareMemberResolution::Resolved(methods) =
-        ctx.types
-            .bare_member_declarations(ctx.scala, &owner, text, call_arities.as_deref())
-    else {
+    let BareMemberResolution::Resolved(methods) = ctx.types.bare_member_declarations_for_owner(
+        ctx.scala,
+        &owner,
+        text,
+        call_arities.as_deref(),
+    ) else {
         return false;
     };
     !methods.is_empty()
@@ -1546,10 +1758,10 @@ fn call_parameter_method_value_context(
     let Some(call_arities) = call_arities_for_reference(function) else {
         return ScalaMethodValueContext::Unknown;
     };
-    let Some(owner) = enclosing_owner_fq_name(function, ctx) else {
+    let Some(owner) = enclosing_owner(function, ctx) else {
         return ScalaMethodValueContext::Unknown;
     };
-    let methods = match ctx.types.bare_member_declarations(
+    let methods = match ctx.types.bare_member_declarations_for_owner(
         ctx.scala,
         &owner,
         function_name,
@@ -1612,12 +1824,7 @@ fn stable_identifier_object_fqn(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Str
     if !ctx.bindings.resolve_symbol(root).is_unknown() || ctx.bindings.is_shadowed(root) {
         return None;
     }
-    ctx.types.resolve_qualified_stable_type(
-        ctx.scala,
-        &ctx.name_resolver,
-        &reference.segments,
-        true,
-    )
+    resolve_qualified_stable_type_at(node, &reference.segments, true, ctx)
 }
 
 fn stable_identifier_field_owner_fqn(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
@@ -1630,8 +1837,7 @@ fn stable_identifier_field_owner_fqn(node: Node<'_>, ctx: &ScanCtx<'_>) -> Optio
     if !ctx.bindings.resolve_symbol(root).is_unknown() || ctx.bindings.is_shadowed(root) {
         return None;
     }
-    ctx.types
-        .resolve_qualified_stable_type(ctx.scala, &ctx.name_resolver, owner_segments, true)
+    resolve_qualified_stable_type_at(node, owner_segments, true, ctx)
 }
 
 fn owner_qualified_this_matches(qualifier_node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -1993,7 +2199,7 @@ fn enclosing_matches_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     false
 }
 
-fn enclosing_owner_fq_name(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
+fn enclosing_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
     let range = Range {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
@@ -2002,12 +2208,15 @@ fn enclosing_owner_fq_name(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> 
     };
     let enclosing = ctx.analyzer.enclosing_code_unit(ctx.file, &range)?;
     if enclosing.is_class() {
-        return Some(enclosing.fq_name());
+        return Some(enclosing);
     }
     ctx.analyzer
         .parent_of(&enclosing)
         .filter(|owner| owner.is_class())
-        .map(|owner| owner.fq_name())
+}
+
+fn enclosing_owner_fq_name(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
+    enclosing_owner(node, ctx).map(|owner| owner.fq_name())
 }
 
 fn member_call_arity_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {

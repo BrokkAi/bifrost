@@ -501,7 +501,7 @@ object Flags {
     assert!(
         generic
             .iter()
-            .all(|snippet| !snippet.contains("Generic: LocalFactory")),
+            .any(|snippet| snippet.contains("Generic: LocalFactory")),
         "{result:#?}"
     );
 

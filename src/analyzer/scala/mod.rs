@@ -37,7 +37,8 @@ pub(crate) use imports::scala_lexical_scope_path_at;
 pub(crate) use supertypes::{ScalaSupertypeLookupPath, scala_type_lookup_segments};
 use tests::detect_scala_test_assertion_smells;
 pub(crate) use wildcard_imports::{
-    ScalaWildcardImportEnvironment, ScalaWildcardOwnerFacts,
+    ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaWildcardImportEnvironment,
+    ScalaWildcardOwnerFacts, resolve_scala_explicit_import_tier,
     resolve_scala_wildcard_import_environment, scala_import_path, scala_import_visible_at,
     scala_package_prefixes_at,
 };
@@ -139,6 +140,7 @@ pub struct ScalaAnalyzer {
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     importable_declarations_by_package: Arc<OnceLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
+    package_namespaces: Arc<OnceLock<Vec<String>>>,
     same_package_reference_index:
         Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
@@ -240,6 +242,7 @@ impl ScalaAnalyzer {
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             importable_declarations_by_package: Arc::new(OnceLock::new()),
+            package_namespaces: Arc::new(OnceLock::new()),
             same_package_reference_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(OnceLock::new()),
             project_types: Arc::new(OnceLock::new()),
