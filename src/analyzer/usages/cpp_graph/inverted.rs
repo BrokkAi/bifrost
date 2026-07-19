@@ -31,7 +31,7 @@ use super::extractor::{
 use super::resolver::{
     DesignatedInitializerOwner, EnclosingMemberOwnerResolution, LexicalCallableValueResolution,
     LexicalTypeResolution, OrdinaryTypeImportCell, TargetKind, VisibilityIndex,
-    VisibleMemberResolution, call_arity, constructor_style_local_declaration, cpp_callable_arity,
+    VisibleMemberResolution, constructor_style_local_declaration, cpp_callable_arity,
     declarator_name_node, designated_initializer_owner, extract_variable_name, first_type_child,
     infer_cpp_initializer_binding, infer_cpp_initializer_type, is_declaration_name,
     is_declarator_node, is_nested_type_node, normalize_type_text,
@@ -384,6 +384,21 @@ fn record_call(
     let Some(function) = node.child_by_field_name("function") else {
         return;
     };
+    let Some(call_arity) = ctx
+        .visibility
+        .call_arity_evidence(ctx.file, node, ctx.source)
+        .exact()
+    else {
+        let name_node = function
+            .child_by_field_name("field")
+            .or_else(|| function.child_by_field_name("name"))
+            .unwrap_or(function);
+        let name = node_text(name_node, ctx.source);
+        if !name.is_empty() {
+            ctx.record_unproven(name, name_node);
+        }
+        return;
+    };
     match function.kind() {
         // `obj.m()` / `ptr->m()`: type the receiver, emit `Owner.m`.
         "field_expression" => {
@@ -412,8 +427,7 @@ fn record_call(
                         {
                             VisibleMemberResolution::Callable(callables) => {
                                 if let Some(callable) = callables.iter().find(|callable| {
-                                    cpp_callable_arity(ctx.analyzer, callable)
-                                        .accepts(call_arity(node))
+                                    cpp_callable_arity(ctx.analyzer, callable).accepts(call_arity)
                                 }) {
                                     ctx.record(callable.fq_name(), field);
                                 }

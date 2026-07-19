@@ -3,8 +3,8 @@ use crate::analyzer::lexical_definitions::{
     LexicalBindingResolution, LexicalDefinition, resolve_lexical_binding,
 };
 use crate::analyzer::usages::cpp_graph::{
-    CppDesignatedInitializerOwner, CppLexicalScopeResolution, CppLexicalTypeResolution,
-    CppTargetKind, CppVisibilityIndex, cpp_argument_children, cpp_call_arity,
+    CallArityEvidence, CppDesignatedInitializerOwner, CppLexicalScopeResolution,
+    CppLexicalTypeResolution, CppTargetKind, CppVisibilityIndex, cpp_argument_children,
     cpp_constructor_type_node, cpp_designated_initializer_owner,
     cpp_enclosing_lexical_scope_components, cpp_field_declared_type_binding, cpp_first_type_child,
     cpp_function_return_type_text, cpp_is_declaration_name, cpp_is_declarator_node, cpp_name_for,

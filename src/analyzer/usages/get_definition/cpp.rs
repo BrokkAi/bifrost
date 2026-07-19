@@ -743,7 +743,10 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
     let Some(function) = call.child_by_field_name("function") else {
         return no_definition("no_function_name", "C++ call expression has no function");
     };
-    let call_arity = cpp_call_arity(call);
+    let call_arity = ctx
+        .visibility
+        .call_arity_evidence(ctx.file, call, ctx.source)
+        .exact();
     match function.kind() {
         "field_expression" => {
             let call_arg_types = cpp_call_argument_types(
@@ -755,7 +758,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 ctx.root,
                 call,
             );
-            resolve_cpp_field(ctx, function, Some(call_arity), call_arg_types.as_deref())
+            resolve_cpp_field(ctx, function, call_arity, call_arg_types.as_deref())
         }
         "type_identifier" | "template_type" | "scoped_type_identifier" => {
             resolve_cpp_constructor(ctx, call)
@@ -774,7 +777,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
             if !candidates.is_empty() {
                 candidates = cpp_filter_candidates_by_call_lazy(
                     candidates,
-                    Some(call_arity),
+                    call_arity,
                     || {
                         cpp_call_argument_types(
                             ctx.analyzer,
@@ -802,12 +805,8 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                     .visibility
                     .resolve_type(ctx.file, cpp_node_text(scope, ctx.source))
                 {
-                    candidates = cpp_member_candidates_lazy(
-                        ctx,
-                        vec![owner],
-                        member,
-                        Some(call_arity),
-                        || {
+                    candidates =
+                        cpp_member_candidates_lazy(ctx, vec![owner], member, call_arity, || {
                             cpp_call_argument_types(
                                 ctx.analyzer,
                                 ctx.support,
@@ -817,8 +816,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                                 ctx.root,
                                 call,
                             )
-                        },
-                    );
+                        });
                     if !candidates.is_empty() {
                         return candidates_outcome(candidates);
                     }
@@ -861,7 +859,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
             if !candidates.is_empty() {
                 candidates = cpp_filter_candidates_by_call_lazy(
                     candidates,
-                    Some(call_arity),
+                    call_arity,
                     || {
                         cpp_call_argument_types(
                             ctx.analyzer,
@@ -893,7 +891,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 name_node.start_byte(),
             ) {
                 let member_candidates =
-                    cpp_member_candidates_lazy(ctx, vec![owner], name, Some(call_arity), || {
+                    cpp_member_candidates_lazy(ctx, vec![owner], name, call_arity, || {
                         cpp_call_argument_types(
                             ctx.analyzer,
                             ctx.support,
@@ -982,7 +980,9 @@ fn resolve_cpp_constructor(
             ctx,
             vec![owner.clone()],
             owner.identifier(),
-            Some(cpp_call_arity(constructor)),
+            ctx.visibility
+                .call_arity_evidence(ctx.file, constructor, ctx.source)
+                .exact(),
             || {
                 cpp_call_argument_types(
                     ctx.analyzer,
@@ -2972,7 +2972,9 @@ fn cpp_call_return_type(
     call: Node<'_>,
 ) -> Option<CppType> {
     let function = call.child_by_field_name("function")?;
-    let arity = cpp_call_arity(call);
+    let CallArityEvidence::Exact(arity) = visibility.call_arity_evidence(file, call, source) else {
+        return None;
+    };
     let candidates = match function.kind() {
         "qualified_identifier" => {
             let scope = function.child_by_field_name("scope")?;

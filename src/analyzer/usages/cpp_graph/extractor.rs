@@ -726,14 +726,24 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     };
     if node.kind() == "field_initializer" {
-        if field_initializer_constructs_target(node, ctx, owner)
-            && ctx
-                .spec
-                .callable_arity_at(node.start_byte())
-                .is_none_or(|expected| expected.accepts(call_arity(node)))
-        {
-            push_hit(node, ctx);
+        if !field_initializer_constructs_target(node, ctx, owner) {
+            return;
         }
+        if let Some(expected) = ctx.spec.callable_arity_at(node.start_byte()) {
+            match ctx
+                .visibility
+                .call_arity_evidence(ctx.file, node, ctx.source)
+                .accepts(expected)
+            {
+                Some(true) => {}
+                Some(false) => return,
+                None => {
+                    push_unproven_hit(node, ctx);
+                    return;
+                }
+            }
+        }
+        push_hit(node, ctx);
         return;
     }
     if node.kind() == "declaration" {
@@ -756,10 +766,19 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     *ctx.raw_match_count += 1;
-    if let Some(expected) = ctx.spec.callable_arity_at(node.start_byte())
-        && !expected.accepts(call_arity(node))
-    {
-        return;
+    if let Some(expected) = ctx.spec.callable_arity_at(node.start_byte()) {
+        match ctx
+            .visibility
+            .call_arity_evidence(ctx.file, node, ctx.source)
+            .accepts(expected)
+        {
+            Some(true) => {}
+            Some(false) => return,
+            None => {
+                push_unproven_hit(type_node, ctx);
+                return;
+            }
+        }
     }
     if ctx
         .visibility
@@ -794,10 +813,19 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     *ctx.raw_match_count += 1;
-    if let Some(expected) = ctx.spec.callable_arity_at(node.start_byte())
-        && !expected.accepts(call_arity(node))
-    {
-        return;
+    if let Some(expected) = ctx.spec.callable_arity_at(node.start_byte()) {
+        match ctx
+            .visibility
+            .call_arity_evidence(ctx.file, node, ctx.source)
+            .accepts(expected)
+        {
+            Some(true) => {}
+            Some(false) => return,
+            None => {
+                push_unproven_hit(function, ctx);
+                return;
+            }
+        }
     }
     if !free_function_call_may_target(node, text, ctx) {
         return;
@@ -829,7 +857,13 @@ fn free_function_call_may_target(call: Node<'_>, text: &str, ctx: &ScanCtx<'_>) 
     let mut candidates = ctx
         .visibility
         .named_candidates(ctx.file, text, TargetKind::FreeFunction);
-    let arity = call_arity(call);
+    let Some(arity) = ctx
+        .visibility
+        .call_arity_evidence(ctx.file, call, ctx.source)
+        .exact()
+    else {
+        return true;
+    };
     candidates.retain(|unit| cpp_callable_arity(ctx.analyzer, unit).accepts(arity));
     if candidates.is_empty()
         || !candidates
@@ -1007,10 +1041,19 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             return;
         }
         *ctx.raw_match_count += 1;
-        if let Some(expected) = ctx.spec.callable_arity_at(node.start_byte())
-            && !expected.accepts(call_arity(node))
-        {
-            return;
+        if let Some(expected) = ctx.spec.callable_arity_at(node.start_byte()) {
+            match ctx
+                .visibility
+                .call_arity_evidence(ctx.file, node, ctx.source)
+                .accepts(expected)
+            {
+                Some(true) => {}
+                Some(false) => return,
+                None => {
+                    push_unproven_hit(operator, ctx);
+                    return;
+                }
+            }
         }
         match explicit_receiver_target_resolution(receiver, ctx) {
             MethodReceiverTargetResolution::Target if receiver_is_self_like(receiver) => {
@@ -1040,10 +1083,19 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     *ctx.raw_match_count += 1;
-    if let Some(expected) = ctx.spec.callable_arity_at(node.start_byte())
-        && !expected.accepts(call_arity(node))
-    {
-        return;
+    if let Some(expected) = ctx.spec.callable_arity_at(node.start_byte()) {
+        match ctx
+            .visibility
+            .call_arity_evidence(ctx.file, node, ctx.source)
+            .accepts(expected)
+        {
+            Some(true) => {}
+            Some(false) => return,
+            None => {
+                push_unproven_hit(function_terminal_node(function), ctx);
+                return;
+            }
+        }
     }
     if !method_call_may_target(node, ctx) {
         return;
@@ -1216,7 +1268,13 @@ fn method_call_may_target(call: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         .filter(|unit| unit.is_function())
         .cloned()
         .collect::<Vec<_>>();
-    let arity = call_arity(call);
+    let Some(arity) = ctx
+        .visibility
+        .call_arity_evidence(ctx.file, call, ctx.source)
+        .exact()
+    else {
+        return true;
+    };
     candidates.retain(|unit| cpp_callable_arity(ctx.analyzer, unit).accepts(arity));
     if candidates.is_empty()
         || !candidates

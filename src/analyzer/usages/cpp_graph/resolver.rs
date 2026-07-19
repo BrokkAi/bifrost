@@ -19,7 +19,7 @@ use std::hash::Hash;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::analyzer::usages) enum TargetKind {
@@ -519,6 +519,49 @@ impl CppScanBinding {
 
 type AliasCell = Arc<OnceLock<Box<[CppAlias]>>>;
 pub(super) type OrdinaryTypeImportCell = Arc<OnceLock<Box<[OrdinaryTypeImport]>>>;
+type MacroEventCell = Arc<OnceLock<Box<[MacroEvent]>>>;
+type MacroIncludeProtectionCell = Arc<OnceLock<MacroIncludeProtection>>;
+type MacroEnvironmentCursorCell = Arc<Mutex<MacroEnvironmentCursor>>;
+type MacroReplacementCache = HashMap<(ProjectFile, usize), Arc<ParsedMacroReplacement>>;
+
+#[derive(Clone, Default)]
+struct MacroEnvironment {
+    bindings: HashMap<String, MacroBinding>,
+    unknown_names: bool,
+    applied_pragma_once_files: HashSet<ProjectFile>,
+    maybe_applied_pragma_once_files: HashSet<ProjectFile>,
+}
+
+#[derive(Default)]
+struct MacroEnvironmentCursor {
+    frontier: usize,
+    environment: Arc<MacroEnvironment>,
+}
+
+impl MacroEnvironment {
+    fn binding(&self, name: &str) -> Option<&MacroBinding> {
+        self.bindings.get(name)
+    }
+
+    fn may_bind(&self, name: &str) -> bool {
+        self.bindings.contains_key(name) || self.unknown_names
+    }
+
+    fn insert(&mut self, name: String, binding: MacroBinding) {
+        self.bindings.insert(name, binding);
+    }
+
+    fn remove(&mut self, name: &str) {
+        self.bindings.remove(name);
+    }
+
+    fn mark_unknown_names(&mut self, source: &ProjectFile, byte: usize) {
+        for binding in self.bindings.values_mut() {
+            *binding = MacroBinding::ambiguous(source, byte);
+        }
+        self.unknown_names = true;
+    }
+}
 
 pub(super) struct OrdinaryTypeImport {
     pub(super) name: String,
@@ -587,6 +630,7 @@ pub(super) fn resolve_ordinary_type_import<'a>(
 }
 
 pub(in crate::analyzer::usages) struct VisibilityIndex {
+    cpp: CppAnalyzer,
     pub(super) visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
     visible_by_identifier: HashMap<ProjectFile, HashMap<String, Vec<CodeUnit>>>,
     visible_source_files_by_root: HashMap<ProjectFile, HashSet<ProjectFile>>,
@@ -599,10 +643,120 @@ pub(in crate::analyzer::usages) struct VisibilityIndex {
     alias_source_parse_counts: Mutex<HashMap<ProjectFile, usize>>,
     field_type_facts: Mutex<HashMap<CodeUnit, Option<DeclaredFieldTypeFact>>>,
     structured_alias_targets: Mutex<HashMap<CodeUnit, Option<StructuredAliasTarget>>>,
+    macro_event_cells: Mutex<HashMap<ProjectFile, MacroEventCell>>,
+    macro_include_protection_cells: Mutex<HashMap<ProjectFile, MacroIncludeProtectionCell>>,
+    macro_environment_cursors: Mutex<HashMap<ProjectFile, MacroEnvironmentCursorCell>>,
+    macro_replacements: Mutex<MacroReplacementCache>,
+    #[cfg(test)]
+    macro_replacement_parse_count: AtomicUsize,
+    #[cfg(test)]
+    macro_event_application_count: AtomicUsize,
+    #[cfg(test)]
+    macro_environment_copy_count: AtomicUsize,
     cpp_template_metadata: HashMap<CodeUnit, CppTemplateMetadata>,
     cpp_template_families: HashMap<String, Vec<CodeUnit>>,
     #[cfg(test)]
     qualified_candidate_inspections: AtomicUsize,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum MacroDefinition {
+    Object {
+        replacement: String,
+    },
+    Function {
+        parameters: Vec<String>,
+        replacement: String,
+    },
+    Unsupported,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MacroIncludeProtection {
+    MacroGuard(String),
+    PragmaOnce,
+    None,
+}
+
+enum ParsedMacroReplacement {
+    Parsed { source: String, tree: Tree },
+    Unsupported,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct MacroBinding {
+    source: ProjectFile,
+    declaration_byte: usize,
+    definition: MacroDefinition,
+    exact: bool,
+}
+
+impl MacroBinding {
+    fn ambiguous(source: &ProjectFile, declaration_byte: usize) -> Self {
+        Self {
+            source: source.clone(),
+            declaration_byte,
+            definition: MacroDefinition::Unsupported,
+            exact: false,
+        }
+    }
+
+    fn is_exact(&self) -> bool {
+        self.exact
+    }
+}
+
+#[derive(Clone)]
+enum MacroEvent {
+    Define {
+        name: String,
+        binding: MacroBinding,
+        byte: usize,
+        conditional: bool,
+    },
+    Undef {
+        name: String,
+        byte: usize,
+        conditional: bool,
+    },
+    Include {
+        targets: Vec<ProjectFile>,
+        byte: usize,
+        conditional: bool,
+    },
+    Invalidate {
+        byte: usize,
+    },
+}
+
+impl MacroEvent {
+    fn byte(&self) -> usize {
+        match self {
+            Self::Define { byte, .. }
+            | Self::Undef { byte, .. }
+            | Self::Include { byte, .. }
+            | Self::Invalidate { byte } => *byte,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::analyzer::usages) enum CallArityEvidence {
+    Exact(usize),
+    Unknown,
+}
+
+impl CallArityEvidence {
+    pub(in crate::analyzer::usages) fn exact(self) -> Option<usize> {
+        match self {
+            Self::Exact(arity) => Some(arity),
+            Self::Unknown => None,
+        }
+    }
+
+    pub(super) fn accepts(self, expected: CallableArity) -> Option<bool> {
+        self.exact().map(|arity| expected.accepts(arity))
+    }
 }
 
 #[derive(Clone)]
@@ -685,6 +839,7 @@ impl VisibilityIndex {
                 .push(unit.clone());
         }
         Self {
+            cpp: cpp.clone(),
             visible_by_file,
             visible_by_identifier,
             visible_source_files_by_root,
@@ -697,6 +852,16 @@ impl VisibilityIndex {
             alias_source_parse_counts: Mutex::new(HashMap::default()),
             field_type_facts: Mutex::new(HashMap::default()),
             structured_alias_targets: Mutex::new(HashMap::default()),
+            macro_event_cells: Mutex::new(HashMap::default()),
+            macro_include_protection_cells: Mutex::new(HashMap::default()),
+            macro_environment_cursors: Mutex::new(HashMap::default()),
+            macro_replacements: Mutex::new(HashMap::default()),
+            #[cfg(test)]
+            macro_replacement_parse_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            macro_event_application_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            macro_environment_copy_count: AtomicUsize::new(0),
             cpp_template_metadata,
             cpp_template_families,
             #[cfg(test)]
@@ -714,6 +879,637 @@ impl VisibilityIndex {
                 .visible_by_file
                 .get(file)
                 .is_some_and(|visible| visible.iter().any(|unit| same_visible_symbol(unit, target)))
+    }
+
+    pub(in crate::analyzer::usages) fn call_arity_evidence(
+        &self,
+        file: &ProjectFile,
+        call: Node<'_>,
+        source: &str,
+    ) -> CallArityEvidence {
+        let Some(arguments) = call
+            .child_by_field_name("arguments")
+            .or_else(|| call.child_by_field_name("parameters"))
+            .or_else(|| call.child_by_field_name("value"))
+            .or_else(|| first_named_child_of_kind(call, "argument_list"))
+            .or_else(|| first_named_child_of_kind(call, "initializer_list"))
+        else {
+            return CallArityEvidence::Exact(0);
+        };
+        let arguments = argument_children(arguments).collect::<Vec<_>>();
+        if arguments
+            .iter()
+            .all(|argument| !argument_shape_may_change_arity(*argument))
+        {
+            return CallArityEvidence::Exact(arguments.len());
+        }
+        let environment = self.macro_environment(file, call.start_byte());
+        let mut stack = Vec::new();
+        let mut total = 0usize;
+        for argument in arguments {
+            if !macro_expansion_shape_is_safe(argument, source, &[], &environment) {
+                return CallArityEvidence::Unknown;
+            }
+            let CallArityEvidence::Exact(spread) =
+                self.argument_arity_evidence(argument, source, &environment, &mut stack)
+            else {
+                return CallArityEvidence::Unknown;
+            };
+            total += spread;
+        }
+        CallArityEvidence::Exact(total)
+    }
+
+    fn argument_arity_evidence(
+        &self,
+        argument: Node<'_>,
+        source: &str,
+        environment: &MacroEnvironment,
+        stack: &mut Vec<(ProjectFile, usize)>,
+    ) -> CallArityEvidence {
+        let (name, invocation_arguments, function_like) = match argument.kind() {
+            "identifier" => (node_text(argument, source), None, false),
+            "call_expression" => {
+                let Some(function) = argument.child_by_field_name("function") else {
+                    return CallArityEvidence::Exact(1);
+                };
+                if function.kind() != "identifier" {
+                    return CallArityEvidence::Exact(1);
+                }
+                let Some(arguments) = argument.child_by_field_name("arguments") else {
+                    return CallArityEvidence::Exact(1);
+                };
+                (node_text(function, source), Some(arguments), true)
+            }
+            _ => return CallArityEvidence::Exact(1),
+        };
+        let Some(binding) = environment.binding(name) else {
+            return if environment.unknown_names {
+                CallArityEvidence::Unknown
+            } else {
+                CallArityEvidence::Exact(1)
+            };
+        };
+        match (&binding.definition, invocation_arguments, function_like) {
+            (MacroDefinition::Object { replacement }, None, false) => self
+                .replacement_arity_evidence(
+                    replacement,
+                    &[],
+                    &[],
+                    source,
+                    environment,
+                    stack,
+                    binding,
+                ),
+            (
+                MacroDefinition::Function {
+                    parameters,
+                    replacement,
+                },
+                Some(arguments),
+                true,
+            ) => {
+                let actuals = argument_children(arguments).collect::<Vec<_>>();
+                if actuals.len() != parameters.len() {
+                    CallArityEvidence::Unknown
+                } else {
+                    self.replacement_arity_evidence(
+                        replacement,
+                        parameters,
+                        &actuals,
+                        source,
+                        environment,
+                        stack,
+                        binding,
+                    )
+                }
+            }
+            (MacroDefinition::Function { .. }, None, false) => CallArityEvidence::Exact(1),
+            _ => CallArityEvidence::Unknown,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replacement_arity_evidence(
+        &self,
+        replacement: &str,
+        parameters: &[String],
+        actuals: &[Node<'_>],
+        actual_source: &str,
+        environment: &MacroEnvironment,
+        stack: &mut Vec<(ProjectFile, usize)>,
+        binding: &MacroBinding,
+    ) -> CallArityEvidence {
+        let identity = (binding.source.clone(), binding.declaration_byte);
+        if stack.contains(&identity) || replacement.trim().is_empty() {
+            return CallArityEvidence::Unknown;
+        }
+        stack.push(identity);
+        let parsed = self.parsed_macro_replacement(binding, replacement);
+        let evidence = (|| {
+            let ParsedMacroReplacement::Parsed {
+                source: sentinel,
+                tree,
+            } = parsed.as_ref()
+            else {
+                return None;
+            };
+            let call = first_descendant_of_kind(tree.root_node(), "call_expression")?;
+            let arguments = call.child_by_field_name("arguments")?;
+            let mut total = 0usize;
+            for argument in argument_children(arguments) {
+                if !macro_expansion_shape_is_safe(argument, sentinel, parameters, environment) {
+                    return None;
+                }
+                if argument.kind() == "identifier"
+                    && let Some(parameter_index) = parameters
+                        .iter()
+                        .position(|parameter| parameter == node_text(argument, sentinel))
+                {
+                    if !macro_expansion_shape_is_safe(
+                        actuals[parameter_index],
+                        actual_source,
+                        &[],
+                        environment,
+                    ) {
+                        return None;
+                    }
+                    let CallArityEvidence::Exact(spread) = self.argument_arity_evidence(
+                        actuals[parameter_index],
+                        actual_source,
+                        environment,
+                        stack,
+                    ) else {
+                        return None;
+                    };
+                    total += spread;
+                    continue;
+                }
+                let CallArityEvidence::Exact(spread) =
+                    self.argument_arity_evidence(argument, sentinel, environment, stack)
+                else {
+                    return None;
+                };
+                total += spread;
+            }
+            Some(CallArityEvidence::Exact(total))
+        })()
+        .unwrap_or(CallArityEvidence::Unknown);
+        stack.pop();
+        evidence
+    }
+
+    fn parsed_macro_replacement(
+        &self,
+        binding: &MacroBinding,
+        replacement: &str,
+    ) -> Arc<ParsedMacroReplacement> {
+        let key = (binding.source.clone(), binding.declaration_byte);
+        let mut cache = self
+            .macro_replacements
+            .lock()
+            .expect("C++ macro replacement cache poisoned");
+        if let Some(parsed) = cache.get(&key) {
+            return Arc::clone(parsed);
+        }
+        #[cfg(test)]
+        self.macro_replacement_parse_count
+            .fetch_add(1, Ordering::Relaxed);
+        let source =
+            format!("void __bifrost_macro_arity() {{ __bifrost_macro_call({replacement}); }}");
+        let mut parser = Parser::new();
+        let parsed = parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .ok()
+            .and_then(|()| parser.parse(&source, None))
+            .filter(|tree| !tree.root_node().has_error())
+            .map_or(ParsedMacroReplacement::Unsupported, |tree| {
+                ParsedMacroReplacement::Parsed { source, tree }
+            });
+        let parsed = Arc::new(parsed);
+        cache.insert(key, Arc::clone(&parsed));
+        parsed
+    }
+
+    fn decode_macro_definition(node: Node<'_>, source: &str) -> MacroDefinition {
+        let Some(value) = node.child_by_field_name("value") else {
+            return MacroDefinition::Unsupported;
+        };
+        let replacement = node_text(value, source).to_string();
+        if node.kind() == "preproc_def" {
+            return MacroDefinition::Object { replacement };
+        }
+        let Some(parameters) = node.child_by_field_name("parameters") else {
+            return MacroDefinition::Unsupported;
+        };
+        if (0..parameters.child_count()).any(|index| {
+            parameters
+                .child(index)
+                .is_some_and(|child| child.kind() == "...")
+        }) {
+            return MacroDefinition::Unsupported;
+        }
+        let parameters = (0..parameters.named_child_count())
+            .filter_map(|index| parameters.named_child(index))
+            .map(|parameter| node_text(parameter, source).to_string())
+            .collect();
+        MacroDefinition::Function {
+            parameters,
+            replacement,
+        }
+    }
+
+    fn macro_event_cell(&self, file: &ProjectFile) -> MacroEventCell {
+        self.macro_event_cells
+            .lock()
+            .expect("C++ macro event cache poisoned")
+            .entry(file.clone())
+            .or_default()
+            .clone()
+    }
+
+    fn macro_environment(&self, file: &ProjectFile, before_byte: usize) -> Arc<MacroEnvironment> {
+        let cell = self.macro_event_cell(file);
+        let events = cell.get_or_init(|| self.collect_macro_events(file).into_boxed_slice());
+        let frontier = events.partition_point(|event| event.byte() < before_byte);
+        let cursor_cell = self
+            .macro_environment_cursors
+            .lock()
+            .expect("C++ macro environment cursor cache poisoned")
+            .entry(file.clone())
+            .or_default()
+            .clone();
+        let mut cursor = cursor_cell
+            .lock()
+            .expect("C++ macro environment cursor poisoned");
+        if frontier < cursor.frontier {
+            *cursor = MacroEnvironmentCursor::default();
+        }
+        if frontier > cursor.frontier {
+            #[cfg(test)]
+            if Arc::strong_count(&cursor.environment) > 1 {
+                self.macro_environment_copy_count
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            let start = cursor.frontier;
+            let environment = Arc::make_mut(&mut cursor.environment);
+            let mut include_stack = HashSet::from_iter([file.clone()]);
+            for event in &events[start..frontier] {
+                self.apply_macro_event(file, event, environment, &mut include_stack);
+            }
+            cursor.frontier = frontier;
+        }
+        Arc::clone(&cursor.environment)
+    }
+
+    fn apply_macro_events(
+        &self,
+        file: &ProjectFile,
+        before_byte: Option<usize>,
+        environment: &mut MacroEnvironment,
+        include_stack: &mut HashSet<ProjectFile>,
+    ) {
+        if !include_stack.insert(file.clone()) {
+            return;
+        }
+        if self.cpp.prepared_syntax(file).is_none() {
+            environment.mark_unknown_names(file, before_byte.unwrap_or_default());
+            include_stack.remove(file);
+            return;
+        }
+        match self.macro_include_protection(file) {
+            MacroIncludeProtection::MacroGuard(guard) => match environment.binding(&guard) {
+                Some(binding) if binding.is_exact() => {
+                    include_stack.remove(file);
+                    return;
+                }
+                Some(_) | None if environment.unknown_names => {
+                    let mut ambiguous_seen = HashSet::default();
+                    self.mark_macro_events_ambiguous(
+                        file,
+                        environment,
+                        &mut ambiguous_seen,
+                        file,
+                        before_byte.unwrap_or_default(),
+                    );
+                    include_stack.remove(file);
+                    return;
+                }
+                Some(_) => {
+                    let mut ambiguous_seen = HashSet::default();
+                    self.mark_macro_events_ambiguous(
+                        file,
+                        environment,
+                        &mut ambiguous_seen,
+                        file,
+                        before_byte.unwrap_or_default(),
+                    );
+                    include_stack.remove(file);
+                    return;
+                }
+                None => {}
+            },
+            MacroIncludeProtection::PragmaOnce => {
+                if !environment.applied_pragma_once_files.insert(file.clone()) {
+                    include_stack.remove(file);
+                    return;
+                }
+                if environment.maybe_applied_pragma_once_files.remove(file) {
+                    // A prior conditional include may already have consumed the pragma-once
+                    // header. This unconditional include guarantees it is consumed now, but
+                    // cannot prove whether its events occur before or after intervening local
+                    // macro changes, so preserve the union as ambiguous.
+                    let mut ambiguous_seen = HashSet::default();
+                    environment.applied_pragma_once_files.remove(file);
+                    self.mark_macro_events_ambiguous(
+                        file,
+                        environment,
+                        &mut ambiguous_seen,
+                        file,
+                        before_byte.unwrap_or_default(),
+                    );
+                    environment.maybe_applied_pragma_once_files.remove(file);
+                    environment.applied_pragma_once_files.insert(file.clone());
+                    include_stack.remove(file);
+                    return;
+                }
+            }
+            MacroIncludeProtection::None => {}
+        }
+        let cell = self.macro_event_cell(file);
+        let events = cell.get_or_init(|| self.collect_macro_events(file).into_boxed_slice());
+        for event in events {
+            if before_byte.is_some_and(|limit| event.byte() >= limit) {
+                break;
+            }
+            self.apply_macro_event(file, event, environment, include_stack);
+        }
+        include_stack.remove(file);
+    }
+
+    fn apply_macro_event(
+        &self,
+        file: &ProjectFile,
+        event: &MacroEvent,
+        environment: &mut MacroEnvironment,
+        include_stack: &mut HashSet<ProjectFile>,
+    ) {
+        #[cfg(test)]
+        self.macro_event_application_count
+            .fetch_add(1, Ordering::Relaxed);
+        match event {
+            MacroEvent::Define {
+                name,
+                binding,
+                conditional,
+                byte,
+            } => {
+                environment.insert(
+                    name.clone(),
+                    if *conditional {
+                        MacroBinding::ambiguous(file, *byte)
+                    } else {
+                        binding.clone()
+                    },
+                );
+            }
+            MacroEvent::Undef {
+                name,
+                conditional,
+                byte,
+            } => {
+                if *conditional {
+                    if environment.binding(name).is_some() {
+                        environment.insert(name.clone(), MacroBinding::ambiguous(file, *byte));
+                    }
+                } else {
+                    environment.remove(name);
+                }
+            }
+            MacroEvent::Include {
+                targets,
+                conditional,
+                byte,
+            } => {
+                if targets.is_empty() {
+                    environment.mark_unknown_names(file, *byte);
+                    return;
+                }
+                if *conditional || targets.len() > 1 {
+                    let mut ambiguous_seen = HashSet::default();
+                    for target in targets {
+                        self.mark_macro_events_ambiguous(
+                            target,
+                            environment,
+                            &mut ambiguous_seen,
+                            file,
+                            *byte,
+                        );
+                    }
+                } else if let Some(target) = targets.first() {
+                    self.apply_macro_events(target, None, environment, include_stack);
+                }
+            }
+            MacroEvent::Invalidate { byte } => {
+                for binding in environment.bindings.values_mut() {
+                    *binding = MacroBinding::ambiguous(file, *byte);
+                }
+            }
+        }
+    }
+
+    fn mark_macro_events_ambiguous(
+        &self,
+        file: &ProjectFile,
+        environment: &mut MacroEnvironment,
+        include_stack: &mut HashSet<ProjectFile>,
+        conditional_file: &ProjectFile,
+        conditional_byte: usize,
+    ) {
+        if !include_stack.insert(file.clone()) {
+            return;
+        }
+        if self.cpp.prepared_syntax(file).is_none() {
+            environment.mark_unknown_names(conditional_file, conditional_byte);
+            return;
+        }
+        match self.macro_include_protection(file) {
+            MacroIncludeProtection::MacroGuard(guard) => {
+                if environment
+                    .binding(&guard)
+                    .is_some_and(MacroBinding::is_exact)
+                {
+                    return;
+                }
+            }
+            MacroIncludeProtection::PragmaOnce => {
+                if environment.applied_pragma_once_files.contains(file) {
+                    return;
+                }
+                environment
+                    .maybe_applied_pragma_once_files
+                    .insert(file.clone());
+            }
+            MacroIncludeProtection::None => {}
+        }
+        let cell = self.macro_event_cell(file);
+        let events = cell.get_or_init(|| self.collect_macro_events(file).into_boxed_slice());
+        for event in events {
+            #[cfg(test)]
+            self.macro_event_application_count
+                .fetch_add(1, Ordering::Relaxed);
+            match event {
+                MacroEvent::Define { name, .. } => {
+                    environment.insert(
+                        name.clone(),
+                        MacroBinding::ambiguous(conditional_file, conditional_byte),
+                    );
+                }
+                MacroEvent::Undef { name, .. } => {
+                    if environment.binding(name).is_some() {
+                        environment.insert(
+                            name.clone(),
+                            MacroBinding::ambiguous(conditional_file, conditional_byte),
+                        );
+                    }
+                }
+                MacroEvent::Include { targets, .. } => {
+                    if targets.is_empty() {
+                        environment.mark_unknown_names(conditional_file, conditional_byte);
+                        continue;
+                    }
+                    for target in targets {
+                        self.mark_macro_events_ambiguous(
+                            target,
+                            environment,
+                            include_stack,
+                            conditional_file,
+                            conditional_byte,
+                        );
+                    }
+                }
+                MacroEvent::Invalidate { .. } => {
+                    for binding in environment.bindings.values_mut() {
+                        *binding = MacroBinding::ambiguous(conditional_file, conditional_byte);
+                    }
+                }
+            }
+        }
+    }
+
+    fn macro_include_protection(&self, file: &ProjectFile) -> MacroIncludeProtection {
+        let cell = self
+            .macro_include_protection_cells
+            .lock()
+            .expect("C++ include protection cache poisoned")
+            .entry(file.clone())
+            .or_default()
+            .clone();
+        cell.get_or_init(|| {
+            self.cpp
+                .prepared_syntax(file)
+                .map_or(MacroIncludeProtection::None, |prepared| {
+                    top_level_macro_include_protection(
+                        prepared.tree().root_node(),
+                        prepared.source(),
+                    )
+                })
+        })
+        .clone()
+    }
+
+    fn collect_macro_events(&self, file: &ProjectFile) -> Vec<MacroEvent> {
+        let Some(prepared) = self.cpp.prepared_syntax(file) else {
+            return Vec::new();
+        };
+        let source = prepared.source();
+        let mut events = Vec::new();
+        let mut stack = vec![prepared.tree().root_node()];
+        while let Some(node) = stack.pop() {
+            let conditional = has_preprocessor_conditional_ancestor(node, source);
+            match node.kind() {
+                "preproc_def" | "preproc_function_def" => {
+                    let Some(name) = node.child_by_field_name("name") else {
+                        continue;
+                    };
+                    let name = node_text(name, source).to_string();
+                    events.push(MacroEvent::Define {
+                        name,
+                        binding: MacroBinding {
+                            source: file.clone(),
+                            declaration_byte: node.start_byte(),
+                            definition: Self::decode_macro_definition(node, source),
+                            exact: true,
+                        },
+                        byte: node.start_byte(),
+                        conditional,
+                    });
+                    continue;
+                }
+                "preproc_include" => {
+                    let Some(path) = node.child_by_field_name("path") else {
+                        events.push(MacroEvent::Include {
+                            targets: Vec::new(),
+                            byte: node.start_byte(),
+                            conditional,
+                        });
+                        continue;
+                    };
+                    let targets =
+                        structured_include_path(path, source).map_or_else(Vec::new, |path| {
+                            resolve_include_targets_with_index(
+                                file,
+                                path,
+                                self.cpp.include_target_index(),
+                            )
+                        });
+                    // An unresolved angle-bracket include crosses into an external system
+                    // boundary that is absent from the source index. It must not poison all
+                    // later local macro evidence. Quoted/project-local and computed includes,
+                    // by contrast, may hide indexed macro state and therefore fail closed.
+                    if targets.is_empty() && path.kind() == "system_lib_string" {
+                        continue;
+                    }
+                    events.push(MacroEvent::Include {
+                        targets,
+                        byte: node.start_byte(),
+                        conditional,
+                    });
+                    continue;
+                }
+                "preproc_call" => {
+                    let Some(directive) = node.child_by_field_name("directive") else {
+                        continue;
+                    };
+                    if node_text(directive, source) != "#undef" {
+                        continue;
+                    }
+                    let name = node
+                        .child_by_field_name("argument")
+                        .and_then(|argument| parse_preproc_identifier(node_text(argument, source)));
+                    if let Some(name) = name {
+                        events.push(MacroEvent::Undef {
+                            name,
+                            byte: node.start_byte(),
+                            conditional,
+                        });
+                    } else {
+                        events.push(MacroEvent::Invalidate {
+                            byte: node.start_byte(),
+                        });
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+        events.sort_by_key(MacroEvent::byte);
+        events
     }
 
     pub(super) fn ordinary_type_import_cell(&self, file: &ProjectFile) -> OrdinaryTypeImportCell {
@@ -2225,13 +3021,9 @@ pub(super) fn infer_cpp_initializer_binding(
         }
         "call_expression" => node.child_by_field_name("function").and_then(|function| {
             let function_text = node_text(function, source);
+            let arity = visibility.call_arity_evidence(file, node, source).exact()?;
             resolve_static_method_call_return_binding(
-                analyzer,
-                visibility,
-                file,
-                source,
-                function,
-                call_arity(node),
+                analyzer, visibility, file, source, function, arity,
             )
             .or_else(|| {
                 visibility
@@ -2243,7 +3035,7 @@ pub(super) fn infer_cpp_initializer_binding(
                     analyzer,
                     file,
                     function_text,
-                    call_arity(node),
+                    arity,
                     enclosing_namespace_context(node, source).as_deref(),
                 )
             })
@@ -2254,7 +3046,7 @@ pub(super) fn infer_cpp_initializer_binding(
                     file,
                     source,
                     function,
-                    call_arity(node),
+                    arity,
                     receiver_resolver,
                 )
             })
@@ -2704,58 +3496,12 @@ fn callable_declaration_activation_in_file(
 fn callable_preprocessor_context_is_visible(node: Node<'_>, source: &str) -> bool {
     let mut ancestor = node.parent();
     while let Some(parent) = ancestor {
-        if matches!(
-            parent.kind(),
-            "preproc_if" | "preproc_ifdef" | "preproc_ifndef" | "preproc_elif" | "preproc_else"
-        ) && !callable_is_canonical_include_guard(parent, source)
-        {
+        if is_preprocessor_conditional(parent) && !is_file_covering_include_guard(parent, source) {
             return false;
         }
         ancestor = parent.parent();
     }
     true
-}
-
-fn callable_is_canonical_include_guard(node: Node<'_>, source: &str) -> bool {
-    if node.kind() != "preproc_ifdef"
-        || !node_text(node, source).trim_start().starts_with("#ifndef")
-        || node
-            .parent()
-            .is_none_or(|parent| parent.kind() != "translation_unit")
-    {
-        return false;
-    }
-    let Some(name) = node.child_by_field_name("name") else {
-        return false;
-    };
-    let guard_name = node_text(name, source).trim();
-    if guard_name.is_empty() {
-        return false;
-    }
-    let parent = node
-        .parent()
-        .expect("include guard has translation-unit parent");
-    let mut cursor = parent.walk();
-    if parent.named_children(&mut cursor).any(|sibling| {
-        sibling != node && sibling.kind() != "comment" && !callable_is_pragma_once(sibling, source)
-    }) || node.child_by_field_name("alternative").is_some()
-    {
-        return false;
-    }
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| *child != name && child.kind() != "comment")
-        .is_some_and(|candidate| {
-            candidate.kind() == "preproc_def"
-                && candidate
-                    .child_by_field_name("name")
-                    .is_some_and(|defined| node_text(defined, source).trim() == guard_name)
-        })
-}
-
-fn callable_is_pragma_once(node: Node<'_>, source: &str) -> bool {
-    matches!(node.kind(), "preproc_call" | "preproc_directive")
-        && normalize_cpp_whitespace(node_text(node, source)) == "#pragma once"
 }
 
 pub(in crate::analyzer::usages) fn call_arity(node: Node<'_>) -> usize {
@@ -3283,6 +4029,251 @@ fn first_named_child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Nod
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| child.kind() == kind)
+}
+
+fn first_descendant_of_kind<'tree>(root: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == kind {
+            return Some(node);
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    None
+}
+
+fn argument_shape_may_change_arity(node: Node<'_>) -> bool {
+    if node.kind() == "identifier" {
+        return true;
+    }
+    if node.kind() == "parenthesized_expression" {
+        return false;
+    }
+    if node.kind() == "call_expression" {
+        return node
+            .child_by_field_name("function")
+            .is_some_and(|function| function.kind() == "identifier");
+    }
+    let mut stack = vec![node];
+    while let Some(descendant) = stack.pop() {
+        if descendant != node && descendant.kind() == "parenthesized_expression" {
+            continue;
+        }
+        if descendant.kind() == "identifier" {
+            return true;
+        }
+        if descendant.kind() == "call_expression" {
+            if descendant
+                .child_by_field_name("function")
+                .is_some_and(|function| function.kind() == "identifier")
+            {
+                return true;
+            }
+            continue;
+        }
+        for index in (0..descendant.named_child_count()).rev() {
+            if let Some(child) = descendant.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    false
+}
+
+fn macro_expansion_shape_is_safe(
+    node: Node<'_>,
+    source: &str,
+    parameters: &[String],
+    environment: &MacroEnvironment,
+) -> bool {
+    if matches!(node.kind(), "identifier" | "parenthesized_expression") {
+        return true;
+    }
+    if node.kind() == "call_expression" {
+        let Some(function) = node.child_by_field_name("function") else {
+            return true;
+        };
+        if function.kind() != "identifier" {
+            return true;
+        }
+        let function_name = node_text(function, source);
+        if parameters
+            .iter()
+            .any(|parameter| parameter == function_name)
+        {
+            return false;
+        }
+        if !environment.may_bind(function_name) {
+            return true;
+        }
+        let Some(arguments) = node.child_by_field_name("arguments") else {
+            return false;
+        };
+        return argument_children(arguments).all(|argument| {
+            if argument.kind() == "identifier"
+                && parameters
+                    .iter()
+                    .any(|parameter| parameter == node_text(argument, source))
+            {
+                return false;
+            }
+            macro_expansion_shape_is_safe(argument, source, parameters, environment)
+        });
+    }
+    let mut stack = vec![node];
+    while let Some(descendant) = stack.pop() {
+        if descendant != node {
+            if descendant.kind() == "parenthesized_expression" {
+                continue;
+            }
+            if descendant.kind() == "call_expression" {
+                let expands = descendant
+                    .child_by_field_name("function")
+                    .filter(|function| function.kind() == "identifier")
+                    .is_some_and(|function| environment.may_bind(node_text(function, source)));
+                if expands {
+                    return false;
+                }
+                continue;
+            }
+        }
+        if descendant.kind() == "identifier" {
+            let identifier = node_text(descendant, source);
+            if parameters.iter().any(|parameter| parameter == identifier)
+                || environment.may_bind(identifier)
+            {
+                return false;
+            }
+        }
+        for index in (0..descendant.named_child_count()).rev() {
+            if let Some(child) = descendant.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    true
+}
+
+fn structured_include_path<'a>(path: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let text = node_text(path, source);
+    match path.kind() {
+        "string_literal" => text.strip_prefix('"')?.strip_suffix('"'),
+        "system_lib_string" => text.strip_prefix('<')?.strip_suffix('>'),
+        _ => None,
+    }
+}
+
+fn has_preprocessor_conditional_ancestor(mut node: Node<'_>, source: &str) -> bool {
+    while let Some(parent) = node.parent() {
+        if is_preprocessor_conditional(parent) && !is_file_covering_include_guard(parent, source) {
+            return true;
+        }
+        node = parent;
+    }
+    false
+}
+
+fn is_preprocessor_conditional(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "preproc_if"
+            | "preproc_ifdef"
+            | "preproc_ifndef"
+            | "preproc_elif"
+            | "preproc_elifdef"
+            | "preproc_else"
+    )
+}
+
+fn is_file_covering_include_guard(node: Node<'_>, source: &str) -> bool {
+    node.parent()
+        .filter(|parent| parent.kind() == "translation_unit")
+        .is_some_and(|root| top_level_canonical_include_guard_name(root, source).is_some())
+        && is_canonical_include_guard(node, source)
+}
+
+fn is_canonical_include_guard(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "preproc_ifdef"
+        || node
+            .child(0)
+            .is_none_or(|directive| directive.kind() != "#ifndef")
+        || node.child_by_field_name("alternative").is_some()
+    {
+        return false;
+    }
+    let Some(guard_name) = node.child_by_field_name("name") else {
+        return false;
+    };
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| *child != guard_name && child.kind() != "comment")
+        .filter(|child| child.kind() == "preproc_def")
+        .and_then(|definition| definition.child_by_field_name("name"))
+        .is_some_and(|defined_name| {
+            node_text(defined_name, source) == node_text(guard_name, source)
+        })
+}
+
+fn top_level_canonical_include_guard_name(root: Node<'_>, source: &str) -> Option<String> {
+    let mut guard = None;
+    for index in 0..root.named_child_count() {
+        let Some(child) = root.named_child(index) else {
+            continue;
+        };
+        if child.kind() == "comment" || is_pragma_once(child, source) {
+            continue;
+        }
+        if guard.is_none() && is_canonical_include_guard(child, source) {
+            guard = Some(child);
+        } else {
+            return None;
+        }
+    }
+    guard
+        .and_then(|guard: Node<'_>| guard.child_by_field_name("name"))
+        .map(|name| node_text(name, source).to_string())
+}
+
+fn top_level_macro_include_protection(root: Node<'_>, source: &str) -> MacroIncludeProtection {
+    if (0..root.named_child_count())
+        .filter_map(|index| root.named_child(index))
+        .any(|child| is_pragma_once(child, source))
+    {
+        return MacroIncludeProtection::PragmaOnce;
+    }
+    top_level_canonical_include_guard_name(root, source)
+        .map(MacroIncludeProtection::MacroGuard)
+        .unwrap_or(MacroIncludeProtection::None)
+}
+
+fn is_pragma_once(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "preproc_call"
+        && node
+            .child_by_field_name("directive")
+            .is_some_and(|directive| node_text(directive, source) == "#pragma")
+        && node
+            .child_by_field_name("argument")
+            .is_some_and(|argument| node_text(argument, source).trim() == "once")
+}
+
+fn parse_preproc_identifier(argument: &str) -> Option<String> {
+    let sentinel = format!("void __bifrost_undef() {{ {argument}; }}");
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(&sentinel, None)?;
+    if tree.root_node().has_error() {
+        return None;
+    }
+    let statement = first_descendant_of_kind(tree.root_node(), "expression_statement")?;
+    let identifier = statement.named_child(0)?;
+    (identifier.kind() == "identifier" && statement.named_child_count() == 1)
+        .then(|| node_text(identifier, &sentinel).to_string())
 }
 
 pub(in crate::analyzer::usages) fn extract_variable_name(
@@ -5202,7 +6193,18 @@ mod tests {
     fn visibility_index(
         visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
     ) -> VisibilityIndex {
+        let root = visible_by_file
+            .keys()
+            .next()
+            .expect("test visibility needs at least one file")
+            .root()
+            .to_path_buf();
+        let cpp = CppAnalyzer::new(Arc::new(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        )));
         VisibilityIndex {
+            cpp,
             visible_by_identifier: build_visible_identifier_index(&visible_by_file),
             visible_by_file,
             visible_source_files_by_root: HashMap::default(),
@@ -5213,6 +6215,13 @@ mod tests {
             alias_source_parse_counts: Mutex::new(HashMap::default()),
             field_type_facts: Mutex::new(HashMap::default()),
             structured_alias_targets: Mutex::new(HashMap::default()),
+            macro_event_cells: Mutex::new(HashMap::default()),
+            macro_include_protection_cells: Mutex::new(HashMap::default()),
+            macro_environment_cursors: Mutex::new(HashMap::default()),
+            macro_replacements: Mutex::new(HashMap::default()),
+            macro_replacement_parse_count: AtomicUsize::new(0),
+            macro_event_application_count: AtomicUsize::new(0),
+            macro_environment_copy_count: AtomicUsize::new(0),
             cpp_template_metadata: HashMap::default(),
             cpp_template_families: HashMap::default(),
             qualified_candidate_inspections: AtomicUsize::new(0),
@@ -5616,6 +6625,197 @@ mod tests {
             cpp.prepared_syntax_parse_count_for_test(&file),
             1,
             "all candidates must share the request-scoped prepared tree"
+        );
+    }
+
+    #[test]
+    fn macro_environment_cache_scales_with_event_frontiers_not_call_sites() {
+        const REPEATED_CALL_COUNT: usize = 1_000;
+        const EVENT_COUNT: usize = 1_000;
+        const INCLUDED_EVENT_COUNT: usize = 100;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), "many_calls.cpp");
+        let header = ProjectFile::new(root.clone(), "macro_bank.h");
+        let mut header_source = String::new();
+        for index in 0..INCLUDED_EVENT_COUNT {
+            header_source.push_str(&format!("#define BANK_{index} {index}\n"));
+        }
+        header.write(&header_source).expect("write macro bank");
+        let mut source = String::from(
+            "#include \"macro_bank.h\"\n#define PAIR(value) value, value\nint target(int left, int right);\nvoid use() {\n  int value = 0;\n",
+        );
+        source.push_str("  target(PAIR(0));\n  target(value, value);\n}\n");
+        for index in 0..EVENT_COUNT {
+            source.push_str(&format!("#define EVENT_{index} {index}\n"));
+        }
+        file.write(&source).expect("write macro fixture");
+
+        let project = Arc::new(crate::analyzer::TestProject::new(
+            &root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let workspace = crate::analyzer::WorkspaceAnalyzer::build(
+            project,
+            crate::analyzer::AnalyzerConfig::default(),
+        );
+        let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
+        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+        let roots = [file.clone()].into_iter().collect();
+        let visibility = VisibilityIndex::build(cpp, workspace.analyzer(), &roots);
+        let prepared = cpp.prepared_syntax(&file).expect("prepared macro fixture");
+        let mut stack = vec![prepared.tree().root_node()];
+        let mut calls = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "call_expression"
+                && node
+                    .child_by_field_name("function")
+                    .is_some_and(|function| node_text(function, prepared.source()) == "target")
+            {
+                calls.push(node);
+            }
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+
+        calls.sort_by_key(Node::start_byte);
+        assert_eq!(calls.len(), 2);
+        for _ in 0..REPEATED_CALL_COUNT {
+            for call in &calls {
+                assert_eq!(
+                    visibility.call_arity_evidence(&file, *call, prepared.source()),
+                    CallArityEvidence::Exact(2)
+                );
+            }
+        }
+        let event_cell = visibility.macro_event_cell(&file);
+        let events = event_cell.get().expect("prepared macro events");
+        let event_frontiers = events
+            .iter()
+            .filter(|event| event.byte() > calls[1].end_byte())
+            .map(|event| event.byte() + 1)
+            .collect::<Vec<_>>();
+        assert_eq!(event_frontiers.len(), EVENT_COUNT);
+        for frontier in event_frontiers {
+            drop(visibility.macro_environment(&file, frontier));
+        }
+        assert_eq!(
+            visibility
+                .macro_environment_cursors
+                .lock()
+                .expect("C++ macro environment cursor cache poisoned")
+                .len(),
+            1,
+            "one file must retain one bounded forward cursor, not one snapshot per frontier"
+        );
+        assert_eq!(
+            visibility
+                .macro_replacement_parse_count
+                .load(Ordering::Relaxed),
+            1,
+            "repeated uses of one macro binding must share one parsed replacement"
+        );
+        assert_eq!(
+            visibility
+                .macro_event_application_count
+                .load(Ordering::Relaxed),
+            INCLUDED_EVENT_COUNT + EVENT_COUNT + 2,
+            "the include closure must replay once and sequential frontiers once each"
+        );
+        assert_eq!(
+            visibility
+                .macro_environment_copy_count
+                .load(Ordering::Relaxed),
+            0,
+            "sequential calls must mutate the uniquely held cursor environment in place"
+        );
+    }
+
+    #[test]
+    fn include_guard_cache_requires_one_outer_file_covering_guard() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let guarded = ProjectFile::new(root.clone(), "guarded.h");
+        guarded
+            .write("#pragma once\n#ifndef GUARDED_H\n#define GUARDED_H\n#define VALUE 1\n#endif\n")
+            .expect("write guarded header");
+        let macro_guarded = ProjectFile::new(root.clone(), "macro_guarded.h");
+        macro_guarded
+            .write(
+                "#ifndef MACRO_GUARDED_H\n// guard comment\n#define MACRO_GUARDED_H\n#define VALUE 1\n#endif\n",
+            )
+            .expect("write macro-guarded header");
+        let nested = ProjectFile::new(root.clone(), "nested.h");
+        nested
+            .write(
+                "#define BEFORE 1\n#ifndef FEATURE_H\n#define FEATURE_H\n#endif\n#define AFTER 2\n",
+            )
+            .expect("write nested guard header");
+        let pushed = ProjectFile::new(root.clone(), "pushed.h");
+        pushed
+            .write(
+                "#pragma push_macro(\"VALUE\")\n#ifndef PUSHED_H\n#define PUSHED_H\n#define VALUE 3\n#endif\n",
+            )
+            .expect("write push-macro header");
+        let non_once = ProjectFile::new(root.clone(), "non_once.h");
+        non_once
+            .write("#pragma GCC diagnostic push\n#define VALUE 4\n")
+            .expect("write non-once pragma header");
+
+        let project = Arc::new(crate::analyzer::TestProject::new(
+            &root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let workspace = crate::analyzer::WorkspaceAnalyzer::build(
+            project,
+            crate::analyzer::AnalyzerConfig::default(),
+        );
+        let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
+        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+        let roots = [
+            guarded.clone(),
+            macro_guarded.clone(),
+            nested.clone(),
+            pushed.clone(),
+            non_once.clone(),
+        ]
+        .into_iter()
+        .collect();
+        let visibility = VisibilityIndex::build(cpp, workspace.analyzer(), &roots);
+
+        for _ in 0..100 {
+            assert_eq!(
+                visibility.macro_include_protection(&guarded),
+                MacroIncludeProtection::PragmaOnce
+            );
+            assert_eq!(
+                visibility.macro_include_protection(&macro_guarded),
+                MacroIncludeProtection::MacroGuard("MACRO_GUARDED_H".to_string())
+            );
+            assert_eq!(
+                visibility.macro_include_protection(&nested),
+                MacroIncludeProtection::None
+            );
+            assert_eq!(
+                visibility.macro_include_protection(&pushed),
+                MacroIncludeProtection::None
+            );
+            assert_eq!(
+                visibility.macro_include_protection(&non_once),
+                MacroIncludeProtection::None
+            );
+        }
+        assert_eq!(
+            visibility
+                .macro_include_protection_cells
+                .lock()
+                .expect("C++ include protection cache poisoned")
+                .len(),
+            5,
+            "include protection classification must be cached once per file"
         );
     }
 
