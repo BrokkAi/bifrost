@@ -3618,6 +3618,60 @@ namespace System.Reflection.Emit {
 }
 
 #[test]
+fn csharp_tuple_element_type_is_a_usage_but_its_declaration_name_is_not() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Configuration/MapperConfiguration.cs",
+            "namespace Configuration { public class MapperConfiguration { } }\n",
+        ),
+        (
+            "MapperGenerator.cs",
+            r#"
+using Configuration;
+
+namespace Generators;
+
+public class MapperGenerator {
+    private static (MapperConfiguration MapperConfiguration, int Diagnostics) BuildDefaults() {
+        return default;
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = type_definition(&analyzer, "Configuration.MapperConfiguration");
+    let hits = graph_hits(&analyzer, &target);
+    let consumer = project.file("MapperGenerator.cs");
+    let source = consumer.read_to_string().expect("tuple consumer source");
+    let type_start = source
+        .find("(MapperConfiguration")
+        .expect("tuple element type")
+        + 1;
+    let name_start = source
+        .find("MapperConfiguration,")
+        .expect("tuple element declaration name");
+
+    assert_eq!(
+        1,
+        hits.len(),
+        "only the tuple element type should count: {hits:#?}"
+    );
+    let hit = hits.iter().next().expect("tuple type hit");
+    assert_eq!(consumer, hit.file);
+    assert!(
+        hit.start_offset <= type_start
+            && type_start + "MapperConfiguration".len() <= hit.end_offset,
+        "tuple type token should be returned: {hit:#?}"
+    );
+    assert!(
+        !(hit.start_offset <= name_start
+            && name_start + "MapperConfiguration".len() <= hit.end_offset),
+        "tuple element declaration name must stay excluded: {hit:#?}"
+    );
+}
+
+#[test]
 fn csharp_graph_distinguishes_generic_and_nongeneric_constructor_owners() {
     let (_project, analyzer) = csharp_analyzer_with_files(&[
         (
