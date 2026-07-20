@@ -25,7 +25,7 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
 - [x] (2026-07-20 19:21Z) Reran focused and complete validation after the seven-finding repair: 188 LSP, 18 MCP, 538 analyzer navigation, and 17 click tests passed; all 44 Python tests, formatting, isolated all-feature clippy, the complete isolated all-feature Rust suite, doc tests, and diff checks passed.
 - [x] (2026-07-20 19:38Z) Fetched and merged `origin/master` at `c59d6f61`, resolved the two Python public-surface conflicts by retaining both APIs, and passed 188 LSP, 18 MCP, 541 analyzer navigation, 17 click, Python, formatting, isolated clippy, complete all-feature Rust, doc-test, and diff-check gates.
 - [x] (2026-07-20 19:42Z) Merged the five additional master commits that landed during the full-suite run, including the overlapping C++ declarator fix, and passed the affected navigation gates with 188 LSP, 18 MCP, 543 analyzer navigation, and 17 click tests plus 2 ignored stress tests.
-- [ ] Push the synchronized branch and publish a ready-for-review pull request.
+- [x] (2026-07-20 19:45Z) Pushed the synchronized branch and opened ready-for-review PR #999 against `master`: https://github.com/BrokkAi/bifrost/pull/999.
 
 ## Surprises & Discoveries
 
@@ -129,7 +129,7 @@ Final validation passed:
     complete cargo test --features nlp,python after the 61-commit master merge: passed in a privileged isolated target, including 1,471 library tests and 0 doc-test failures
     git diff --check: clean
 
-The final issue diff against synchronized `origin/master` is 37 files, 2,374 insertions, and 247 deletions. No UsageBench files were changed, and no branch switch or rebase was performed.
+Before final publication bookkeeping, the issue diff against synchronized `origin/master` was 37 files, 2,374 insertions, and 247 deletions. No UsageBench files were changed, and no branch switch or rebase was performed. PR #999 is open, targets `master`, and is explicitly non-draft.
 
 ## Context and Orientation
 
@@ -244,3 +244,5 @@ Plan revision note (2026-07-20 19:21Z): Recorded final post-repair validation, i
 Plan revision note (2026-07-20 19:38Z): Recorded the 61-commit final master refresh, the additive Python export/test conflict resolution, updated focused counts, clean post-merge Python, formatting, clippy, complete all-feature Rust and doc-test gates, and the final synchronized issue diff before publication.
 
 Plan revision note (2026-07-20 19:42Z): Recorded the five additional master commits that landed during full validation, the conflict-free overlapping C++ merge, the final 543-test analyzer-navigation count, and passing affected LSP, MCP, and click-around gates at `a86ae862`.
+
+Plan revision note (2026-07-20 19:45Z): Recorded the successful branch push and ready-for-review publication as PR #999 against synchronized `master`.
