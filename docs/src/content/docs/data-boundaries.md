@@ -23,7 +23,7 @@ Workspace-relative query files cannot escape the configured root. Results can st
 
 ## Persistent Repository Cache
 
-Analyzer facts and optional semantic-index data use `.brokk/bifrost_cache.db` at the primary Git repository root. Linked worktrees share that content-addressed database. The cache is local persistent data derived from workspace source and Git objects; protect and retain it according to the same sensitivity policy as the repository.
+Analyzer facts and optional semantic-index data use `.brokk/bifrost_cache.db` at the primary Git repository root. Linked worktrees share that content-addressed database. Set `BIFROST_CACHE_DIR` to use an explicit cache directory for the process, for example when running isolated workers. The cache is local persistent data derived from workspace source and Git objects; protect and retain it according to the same sensitivity policy as the repository.
 
 Removing the database while Bifrost is stopped forces later work to rebuild it. A running process may also hold in-memory source and analysis state. If a test requires a clean cache, stop Bifrost first and record that removal in the evaluation method.
 
