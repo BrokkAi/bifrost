@@ -16052,6 +16052,80 @@ fn cpp_relative_namespace_call_resolves_to_definition() {
 }
 
 #[test]
+fn cpp_flattened_macro_namespace_forward_declaration_activates_qualified_definition() {
+    let base_header = r#"
+#define FMT_API
+FMT_API void vformat_to(int& out, int format, int args, int locale = {});
+}  // namespace detail, flattened after an earlier macro-shaped parse error
+void run() {
+    int out = 0;
+    detail::vformat_to(out, 0, 0, 0);
+}
+#include "format-inl.h"
+"#;
+    let format_inline = r#"
+#define FMT_FUNC
+namespace detail {
+FMT_FUNC void vformat_to(int& out, int format, int args, int locale) {}
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("base.h", base_header)
+        .file("format-inl.h", format_inline)
+        .build();
+
+    let line = "    detail::vformat_to(out, 0, 0, 0);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"base.h","line":7,"column":{}}}]}}"#,
+            column_of(line, "vformat_to")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "detail.vformat_to",
+        "{value}"
+    );
+    assert!(
+        result["definitions"]
+            .as_array()
+            .is_some_and(|definitions| definitions
+                .iter()
+                .any(|definition| definition["path"] == "format-inl.h")),
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_global_macro_forward_declaration_does_not_activate_later_namespace_definition() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            r#"
+#define API
+API void helper(int value);
+void run() { detail::helper(1); }
+namespace detail { void helper(int value) {} }
+"#,
+        )
+        .build();
+
+    let line = "void run() { detail::helper(1); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":4,"column":{}}}]}}"#,
+            column_of(line, "helper")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn cpp_range_for_pointer_binding_resolves_member_field() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

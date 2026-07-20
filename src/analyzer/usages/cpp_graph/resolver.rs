@@ -1749,7 +1749,17 @@ impl VisibilityIndex {
         reference_byte: usize,
     ) -> bool {
         self.visible_identifier_candidates(file, declaration.identifier())
-            .filter(|candidate| same_logical_symbol(candidate, declaration))
+            .filter(|candidate| {
+                same_logical_symbol(candidate, declaration)
+                    || flattened_macro_namespace_declaration_matches(
+                        analyzer,
+                        &self.cpp,
+                        file,
+                        candidate,
+                        declaration,
+                        reference_byte,
+                    )
+            })
             .any(|candidate| {
                 self.physical_declaration_visible_at(analyzer, file, candidate, reference_byte)
             })
@@ -3763,6 +3773,95 @@ fn callable_declaration_activation_in_file(
                 .then_some(declaration.end_byte())
         })
         .min()
+}
+
+fn flattened_macro_namespace_declaration_matches(
+    analyzer: &dyn IAnalyzer,
+    cpp: &CppAnalyzer,
+    reference_file: &ProjectFile,
+    visible_declaration: &CodeUnit,
+    qualified_candidate: &CodeUnit,
+    reference_byte: usize,
+) -> bool {
+    // Namespace-opening macros can leave tree-sitter unable to retain the
+    // namespace owner after a later recovery point. In that shape the forward
+    // declaration is indexed at translation-unit scope, while the definition
+    // still has its qualified owner. Require all surviving structural evidence
+    // before treating the declaration as activation for that definition.
+    if visible_declaration.kind() != qualified_candidate.kind()
+        || visible_declaration.identifier() != qualified_candidate.identifier()
+        || visible_declaration.signature() != qualified_candidate.signature()
+        || !visible_declaration.package_name().is_empty()
+        || qualified_candidate.package_name().is_empty()
+    {
+        return false;
+    }
+
+    let Some(prepared) = cpp.prepared_syntax(visible_declaration.source()) else {
+        return false;
+    };
+    let root = prepared.tree().root_node();
+    let closing_brace_limit = if visible_declaration.source() == reference_file {
+        reference_byte
+    } else {
+        usize::MAX
+    };
+
+    analyzer
+        .ranges(visible_declaration)
+        .into_iter()
+        .any(|range| {
+            let Some(mut declaration) =
+                root.descendant_for_byte_range(range.start_byte, range.end_byte)
+            else {
+                return false;
+            };
+            while !matches!(
+                declaration.kind(),
+                "declaration" | "field_declaration" | "function_definition"
+            ) {
+                let Some(parent) = declaration.parent() else {
+                    return false;
+                };
+                declaration = parent;
+            }
+            if declaration
+                .parent()
+                .is_none_or(|parent| parent.kind() != "translation_unit")
+                || !macro_displaced_cpp_return_type(declaration, prepared.source())
+            {
+                return false;
+            }
+
+            let mut cursor = root.walk();
+            root.named_children(&mut cursor).any(|sibling| {
+                sibling.start_byte() >= declaration.end_byte()
+                    && sibling.start_byte() < closing_brace_limit
+                    && direct_unmatched_closing_brace(sibling)
+            })
+        })
+}
+
+fn macro_displaced_cpp_return_type(declaration: Node<'_>, source: &str) -> bool {
+    let Some(type_node) = declaration.child_by_field_name("type") else {
+        return false;
+    };
+    let type_name = normalize_cpp_whitespace(node_text(type_node, source));
+    !type_name.is_empty()
+        && type_name
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+        && (0..declaration.named_child_count()).any(|index| {
+            declaration
+                .named_child(index)
+                .is_some_and(|child| child.kind() == "ERROR")
+        })
+}
+
+fn direct_unmatched_closing_brace(node: Node<'_>) -> bool {
+    node.kind() == "ERROR"
+        && (0..node.child_count())
+            .any(|index| node.child(index).is_some_and(|child| child.kind() == "}"))
 }
 
 pub(super) fn callable_preprocessor_context_is_visible(node: Node<'_>, source: &str) -> bool {
