@@ -38,7 +38,7 @@ export function buildCodexSkillBundleFiles(repoRoot = process.cwd()) {
 
   return skillDirs.map((skillDir) => {
     const sourcePath = path.join(skillsRoot, skillDir, "SKILL.md");
-    const source = fs.readFileSync(sourcePath, "utf8");
+    const source = normalizeLineEndings(fs.readFileSync(sourcePath, "utf8"));
     const content = codexizeSkill(source, repoRoot);
     return [path.join(skillDir, "SKILL.md"), content];
   });
@@ -115,7 +115,7 @@ function buildAppendix(agentNames, repoRoot) {
   const sections = agentNames.map((agentName) => {
     const displayName = AGENT_DISPLAY_NAMES.get(agentName) ?? `brokk:${agentName}`;
     const agentPath = path.join(repoRoot, SOURCE_AGENTS_ROOT, `${agentName}.md`);
-    const prompt = fs.readFileSync(agentPath, "utf8").trimEnd();
+    const prompt = normalizeLineEndings(fs.readFileSync(agentPath, "utf8")).trimEnd();
     return `### ${displayName}\n\n_Source: \`${SOURCE_AGENTS_ROOT}/${agentName}.md\`._\n\n\`\`\`markdown\n${prompt}\n\`\`\``;
   });
 
@@ -126,6 +126,10 @@ function buildAppendix(agentNames, repoRoot) {
     "",
     ...sections,
   ].join("\n");
+}
+
+function normalizeLineEndings(content) {
+  return content.replace(/\r\n?/g, "\n");
 }
 
 function writeBundle(repoRoot = process.cwd()) {

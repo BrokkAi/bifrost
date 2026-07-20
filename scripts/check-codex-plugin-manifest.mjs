@@ -215,8 +215,8 @@ for (const [relativePath, expected] of buildCodexSkillBundleFiles()) {
   const bundlePath = `${CODEX_SKILL_BUNDLE_ROOT}/${relativePath}`;
   const actual = fs.readFileSync(bundlePath, "utf8");
   assert.equal(
-    actual,
-    expected,
+    normalizeLineEndings(actual),
+    normalizeLineEndings(expected),
     `${bundlePath} is stale; run node scripts/generate-codex-skill-bundle.mjs`,
   );
 }
@@ -232,10 +232,14 @@ for (const [relativePath, expected] of buildAmpSkillBundleFiles()) {
   const bundlePath = `${AMP_SKILL_BUNDLE_ROOT}/${relativePath}`;
   const actual = fs.readFileSync(bundlePath, "utf8");
   assert.equal(
-    actual,
-    expected,
+    normalizeLineEndings(actual),
+    normalizeLineEndings(expected),
     `${bundlePath} is stale; run node scripts/generate-amp-skill-bundle.mjs`,
   );
+}
+
+function normalizeLineEndings(content) {
+  return content.replace(/\r\n?/g, "\n");
 }
 fs.accessSync(`${AMP_SKILL_BUNDLE_ROOT}/bin/bifrost-launcher.mjs`, fsConstants.X_OK);
 const ampSkill = fs.readFileSync(`${AMP_SKILL_BUNDLE_ROOT}/SKILL.md`, "utf8");
