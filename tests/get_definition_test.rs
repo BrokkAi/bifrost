@@ -14833,6 +14833,59 @@ fn csharp_inherited_member_prefers_nearest_declaring_type() {
 }
 
 #[test]
+fn csharp_partial_class_inherits_member_before_same_named_visible_type() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Terminal.Gui/View.cs",
+            r#"namespace Terminal.Gui {
+    public class View {
+        public Input.KeyBindings KeyBindings { get; } = new();
+    }
+
+    public partial class TreeView : View { }
+}
+"#,
+        )
+        .file(
+            "Terminal.Gui/Input/KeyBindings.cs",
+            r#"namespace Terminal.Gui.Input {
+    public sealed class KeyBindings {
+        public bool TryGet(int key) => false;
+    }
+}
+"#,
+        )
+        .file(
+            "Terminal.Gui/TreeView.Navigation.cs",
+            r#"using Terminal.Gui.Input;
+
+namespace Terminal.Gui {
+    public partial class TreeView {
+        public bool Navigate(int key) => KeyBindings.TryGet(key);
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        public bool Navigate(int key) => KeyBindings.TryGet(key);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"Terminal.Gui/TreeView.Navigation.cs","line":5,"column":{}}}]}}"#,
+            column_of(line, "KeyBindings")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Terminal.Gui.View.KeyBindings",
+        "an inherited value member must precede a same-named visible type: {value}"
+    );
+}
+
+#[test]
 fn csharp_this_method_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
