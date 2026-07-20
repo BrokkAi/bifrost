@@ -15,8 +15,8 @@ The scheduled benchmark at GitHub Actions run `29682473599` exposed two independ
 - [x] (2026-07-20 11:29 SAST) Added targeted Python dead-code graph coverage and removed repeated resolution of non-candidate callees without dropping constructor keyword, call-result receiver, typed receiver, namespace, inheritance, or unproven-reference edges.
 - [x] (2026-07-20 11:29 SAST) Validated the complete Python usage-graph suite, Python dead-code tests, and pinned Click probe at 226.1 ms.
 - [x] (2026-07-20 12:12 SAST) Corrected an unsound terminal-name gate for Python namespace re-export aliases, added targeted dead-code coverage, and revalidated Click at 279.4 ms.
-- [ ] Re-run both pinned benchmark probes and the repository-wide formatting, Clippy, and `nlp,python` test gates.
-- [ ] Review the completed diff, update this plan's retrospective, and commit the reviewed final state.
+- [x] (2026-07-20 12:31 SAST) Re-ran both pinned benchmark probes and passed formatting, all-target/all-feature Clippy, and the complete `nlp,python` test gate.
+- [x] (2026-07-20 12:34 SAST) Reviewed the completed branch diff, verified a clean worktree, and recorded the final outcome.
 
 ## Surprises & Discoveries
 
@@ -34,6 +34,10 @@ The scheduled benchmark at GitHub Actions run `29682473599` exposed two independ
   Evidence: the repository-wide gate caught `proto.module()` failing to retain an edge to `proto.modules.define_module`; resolving only structured workspace namespace attributes and filtering the canonical results by exact target restores both whole-graph and targeted dead-code behavior. The corrected pinned Click probe remains fast at 279.4 ms.
 - Observation: The installed structured Bifrost CLI redirects linked-worktree cache storage to the primary checkout, which is read-only in this sandbox.
   Evidence: one-shot `search_symbols` failed opening `/Users/dave/Workspace/BrokkAi/bifrost/.brokk/bifrost_cache.db`; source inspection remains available directly.
+- Observation: The shell's `cargo` and `cargo-clippy` initially resolved through different Rust 1.96 installations whose LLVM patch versions were incompatible.
+  Evidence: ordinary Clippy reported E0514 mixed-compiler artifacts; invoking the rustup 1.96 `cargo-clippy` explicitly in an isolated target passed. On macOS, the combined `python` feature test also needs the repository CI flag `-C link-arg=-undefined -C link-arg=dynamic_lookup` because PyO3 builds an extension module without linking libpython.
+- Observation: Six process-control and temporary-Git unit tests cannot run inside the restricted sandbox.
+  Evidence: the sandboxed all-feature run passed 1,037 library tests but denied three stderr-drain process operations and failed three child-process Git/timeout cases. The same complete command outside the sandbox passed all unit, integration, and doc tests.
 
 ## Decision Log
 
@@ -58,7 +62,9 @@ The scheduled benchmark at GitHub Actions run `29682473599` exposed two independ
 
 ## Outcomes & Retrospective
 
-Both implementation milestones are complete. The pinned fmt query resolves `detail.vformat_to` in 319.3 ms. After the repository-wide gate caught and drove correction of namespace re-export alias handling, the pinned Click dead-code query retains `Candidate symbols analyzed: 1` and improves from 5,286.5 ms to 279.4 ms locally, close to the 183.3 ms pre-regression measurement. All 67 C++ definition tests, the originating C++ direct-temporary parity test, all 92 active Python usage-graph tests, the Python dead-code suite, and both whole-graph and targeted namespace-alias regressions pass. Repository-wide gates and final review remain.
+Both regressions are fixed and the final branch is reviewed. The pinned fmt query resolves `detail.vformat_to` in 319.3 ms. After the repository-wide gate caught and drove correction of namespace re-export alias handling, the pinned Click dead-code query retains `Candidate symbols analyzed: 1` and improves from 5,286.5 ms to 279.4 ms locally, a 94.7% reduction and close to the 183.3 ms pre-regression measurement.
+
+Correctness validation includes all 67 C++ definition tests, the originating C++ direct-temporary parity test, all 92 active Python usage-graph tests, the Python dead-code suite, and both whole-graph and targeted namespace-alias regressions. `cargo fmt --all -- --check`, pinned Rust 1.96 all-target/all-feature Clippy with warnings denied, the complete unrestricted `cargo test --features nlp,python` suite with the macOS CI linker flags, and `git diff --check` all pass. No dependencies or public APIs changed, and no benchmark expectation was weakened.
 
 ## Context and Orientation
 
@@ -129,4 +135,4 @@ Current `master` at `b20da06f` reproduces both. The narrow local Python comparis
 
 Do not add dependencies. Preserve `CppVisibilityIndex::declaration_visible_at` as the source-order/include activation boundary. Preserve the `UsageEdgeBuildOutput` abstraction and the public Python usage APIs. Any new cache should be local to one `build_python_edges` invocation or one parsed-file scan and keyed by structured AST-derived identities, not source substrings.
 
-Revision note (2026-07-20): Created the plan after reproducing run `29682473599`, attributing each regression to an introducing commit, and choosing structured root-cause fixes that retain the correctness intent of those commits.
+Revision note (2026-07-20): Created the plan after reproducing run `29682473599`, attributing each regression to an introducing commit, and choosing structured root-cause fixes that retain the correctness intent of those commits. Updated it after the complete gate exposed an alias-prefilter correctness hole, then recorded the correction, final benchmark measurements, toolchain-specific validation setup, and fully green final gates.
