@@ -730,7 +730,7 @@ fn is_anonymous_instance_mixin_type_reference(node: Node<'_>, source: &str) -> b
 
 /// In `A TypeOperator B`, the grammar exposes `TypeOperator` as the exact
 /// `operator` field of `infix_type`, even when it is an ordinary `identifier`.
-fn is_infix_type_operator_reference(node: Node<'_>) -> bool {
+pub(crate) fn is_infix_type_operator_reference(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         parent.kind() == "infix_type" && parent.child_by_field_name("operator") == Some(node)
     })

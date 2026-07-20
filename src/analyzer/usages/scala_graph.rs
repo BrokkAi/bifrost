@@ -315,12 +315,34 @@ class Child extends Base(new Middle(new Leaf(1))) {
   def inheritedBare: Int = inherited.leaf.token
   def inheritedShadow(inherited: other.Middle): Int = inherited.leaf.token
 }
+type Maybe[A] = Option[A]
+infix type <[A, B] = Either[A, B]
 object Stable { val middle: Middle = new Middle(new Leaf(2)) }
 object Owners { final class State(var maximumHeapSize: Int) }
 object AliasOnly { type Value = Int }
 object Result {
   opaque type Success[A] = A
   object Success
+}
+object SupervisorStrategy {
+  type Decider = Throwable => String
+  trait Strategy { def decider: Decider }
+}
+object ClusterShardingSettings {
+  object PassivationStrategySettings { final class AdmissionSettings }
+  final class Settings(
+    val admission: Option[PassivationStrategySettings.AdmissionSettings]
+  )
+}
+trait FSM {
+  case class EventData(value: Int)
+  val Event = EventData
+}
+final class Manager extends FSM {
+  def receive(value: Any): Int = value match {
+    case Event(number) => number
+    case _ => 0
+  }
 }
 "#,
         );
@@ -365,6 +387,8 @@ class ImportedChild extends Child {
 }
 
 object Use {
+  def packageAlias: Maybe[Int] = None
+  def packageOperator: Int < String = Left(1)
   def typed(middle: Middle): Int = middle.leaf.token
   def inherited(child: Child): Int = child.inherited.leaf.token
   def stable: Int = Stable.middle.leaf.token
@@ -412,6 +436,17 @@ object Use {
         assert!(has_edge("model.Child.inheritedBare", "model.Leaf.token"));
         assert!(has_edge("app.Use$.inherited", "model.Base.inherited"));
         assert!(has_edge("app.Use$.stable", "model.Stable$.middle"));
+        assert!(has_edge("app.Use$.packageAlias", "model.Maybe"));
+        assert!(has_edge("app.Use$.packageOperator", "model.<"));
+        assert!(has_edge(
+            "model.SupervisorStrategy$.Strategy.decider",
+            "model.SupervisorStrategy$.Decider"
+        ));
+        assert!(has_edge(
+            "model.ClusterShardingSettings$.Settings.admission",
+            "model.ClusterShardingSettings$.PassivationStrategySettings$.AdmissionSettings"
+        ));
+        assert!(has_edge("model.Manager.receive", "model.FSM.Event"));
         assert!(has_edge(
             "app.ImportedChild.inheritedBare",
             "model.Base.inherited"

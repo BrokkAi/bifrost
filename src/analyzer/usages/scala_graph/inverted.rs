@@ -125,10 +125,11 @@ pub(super) struct TypeApplicationResolution {
     pub(super) callable_targets: Vec<CodeUnit>,
 }
 
-/// Every class/object/trait/enum the project declares, indexed for the per-file
-/// name->fqn rebuild. Built once and shared across all files' scans.
+/// Every type-namespace declaration the project exposes, indexed for the
+/// per-file name->fqn rebuild. Built once and shared across all files' scans.
 pub(crate) struct ProjectTypes {
     index: Arc<GlobalUsageDefinitionIndex>,
+    type_aliases: Arc<HashSet<CodeUnit>>,
     facts: Arc<UsageFactsIndex>,
     direct_ancestors_by_owner: Option<HashMap<String, Vec<CodeUnit>>>,
     direct_ancestors_by_unit: Option<HashMap<CodeUnit, Vec<CodeUnit>>>,
@@ -172,8 +173,15 @@ fn sorted_unique_units(mut units: Vec<CodeUnit>) -> Vec<CodeUnit> {
 impl ProjectTypes {
     pub(crate) fn build(scala: &ScalaAnalyzer) -> Self {
         let index = scala.global_usage_definition_index_shared();
+        let type_aliases = Arc::new(
+            scala
+                .all_declarations()
+                .filter(|unit| scala.is_type_alias(unit))
+                .collect(),
+        );
         Self {
             index,
+            type_aliases,
             facts: scala.usage_facts_index_shared(),
             direct_ancestors_by_owner: None,
             direct_ancestors_by_unit: None,
@@ -212,6 +220,12 @@ impl ProjectTypes {
             scala_normalize_full_name,
             scala_simple_type_name,
         ));
+        let type_aliases = Arc::new(
+            file_states
+                .values()
+                .flat_map(|state| state.type_aliases.iter().cloned())
+                .collect(),
+        );
         let facts = Arc::new(UsageFactsIndex::build_from_declarations(
             &index,
             declarations.iter(),
@@ -248,6 +262,7 @@ impl ProjectTypes {
             .collect();
         let mut types = Self {
             index,
+            type_aliases,
             facts,
             direct_ancestors_by_owner: Some(HashMap::default()),
             direct_ancestors_by_unit: Some(HashMap::default()),
@@ -291,13 +306,12 @@ impl ProjectTypes {
         self.bulk_file_states.as_ref()?.get(file)
     }
 
-    fn is_type_alias(&self, scala: &ScalaAnalyzer, unit: &CodeUnit) -> bool {
-        match &self.bulk_file_states {
-            Some(states) => states
-                .get(unit.source())
-                .is_some_and(|state| state.type_aliases.contains(unit)),
-            None => scala.is_type_alias(unit),
-        }
+    fn is_type_alias(&self, _scala: &ScalaAnalyzer, unit: &CodeUnit) -> bool {
+        self.type_aliases.contains(unit)
+    }
+
+    fn is_type_namespace_declaration(&self, unit: &CodeUnit) -> bool {
+        unit.is_class() || self.type_aliases.contains(unit)
     }
 
     fn is_exact_structural_child(
@@ -2021,22 +2035,41 @@ impl ProjectTypes {
         {
             return types;
         }
-        let mut values = Vec::new();
+        let mut grouped: HashMap<String, Vec<CodeUnit>> = HashMap::default();
         for ((candidate_package, simple), units) in self.index.package_types() {
             if candidate_package != package {
                 continue;
             }
-            let package_level = units
-                .iter()
-                .filter(|unit| unit.is_class() && is_package_level_type(unit))
-                .collect::<Vec<_>>();
+            grouped.entry(simple.clone()).or_default().extend(
+                units
+                    .iter()
+                    .filter(|unit| is_package_level_type(unit))
+                    .cloned(),
+            );
+        }
+        for alias in self
+            .type_aliases
+            .iter()
+            .filter(|unit| unit.package_name() == package && is_package_level_type(unit))
+        {
+            grouped
+                .entry(scala_simple_type_name(alias))
+                .or_default()
+                .push(alias.clone());
+        }
+
+        let mut values = Vec::new();
+        for (simple, mut package_level) in grouped {
+            package_level.sort();
+            package_level.dedup();
             let ordinary = package_level
                 .iter()
-                .copied()
-                .filter(|unit| !unit.short_name().ends_with('$'))
+                .filter(|unit| {
+                    self.type_aliases.contains(*unit) || !unit.short_name().ends_with('$')
+                })
                 .collect::<Vec<_>>();
             let selected = if ordinary.is_empty() {
-                package_level
+                package_level.iter().collect::<Vec<_>>()
             } else {
                 ordinary
             };
@@ -2057,7 +2090,7 @@ impl ProjectTypes {
             self.index
                 .by_normalized_fqn(normalized_fqn)
                 .iter()
-                .filter(|unit| unit.is_class()),
+                .filter(|unit| self.is_type_namespace_declaration(unit)),
         )
     }
 
@@ -2085,12 +2118,12 @@ impl ProjectTypes {
             .index
             .by_normalized_fqn(normalized_fqn)
             .iter()
-            .filter(|unit| unit.is_class())
+            .filter(|unit| self.is_type_namespace_declaration(unit))
             .collect::<Vec<_>>();
         let ordinary = classes
             .iter()
             .copied()
-            .filter(|unit| !unit.short_name().ends_with('$'))
+            .filter(|unit| self.type_aliases.contains(*unit) || !unit.short_name().ends_with('$'))
             .collect::<Vec<_>>();
         let selected = if ordinary.is_empty() {
             classes
@@ -2108,12 +2141,12 @@ impl ProjectTypes {
             .index
             .by_normalized_fqn(normalized_fqn)
             .iter()
-            .filter(|unit| unit.is_class())
+            .filter(|unit| self.is_type_namespace_declaration(unit))
             .collect::<Vec<_>>();
         let ordinary = classes
             .iter()
             .copied()
-            .filter(|unit| !unit.short_name().ends_with('$'))
+            .filter(|unit| self.type_aliases.contains(*unit) || !unit.short_name().ends_with('$'))
             .collect::<Vec<_>>();
         let selected = if ordinary.is_empty() {
             classes
@@ -2169,21 +2202,18 @@ impl ProjectTypes {
         })
     }
 
-    fn explicit_import_class_declarations(
-        &self,
-        candidate: &str,
-    ) -> (Vec<CodeUnit>, Vec<CodeUnit>) {
+    fn explicit_import_type_declarations(&self, candidate: &str) -> (Vec<CodeUnit>, Vec<CodeUnit>) {
         let normalized = scala_normalized_fq_name(candidate);
         let classes = self
             .index
             .by_normalized_fqn(&normalized)
             .iter()
-            .filter(|unit| unit.is_class())
+            .filter(|unit| self.is_type_namespace_declaration(unit))
             .collect::<Vec<_>>();
         let ordinary = classes
             .iter()
             .copied()
-            .filter(|unit| !unit.short_name().ends_with('$'))
+            .filter(|unit| self.type_aliases.contains(*unit) || !unit.short_name().ends_with('$'))
             .cloned()
             .collect::<Vec<_>>();
         let type_declarations = if ordinary.is_empty() {
@@ -2194,7 +2224,7 @@ impl ProjectTypes {
         let object_declarations = classes
             .iter()
             .copied()
-            .filter(|unit| unit.short_name().ends_with('$'))
+            .filter(|unit| unit.is_class() && unit.short_name().ends_with('$'))
             .cloned()
             .collect::<Vec<_>>();
         (type_declarations, object_declarations)
@@ -2222,17 +2252,6 @@ impl ProjectTypes {
         owner: &CodeUnit,
         member: &str,
     ) -> Option<CodeUnit> {
-        if self
-            .index
-            .by_fqn(&owner.fq_name())
-            .iter()
-            .filter(|unit| unit.is_class())
-            .take(2)
-            .count()
-            != 1
-        {
-            return None;
-        }
         let matches = self.exact_nested_objects_for_owner(scala, owner, member);
         let [resolved] = matches.as_slice() else {
             return None;
@@ -2264,7 +2283,7 @@ impl ProjectTypes {
             .index
             .by_fqn(&candidate)
             .iter()
-            .filter(|unit| unit.is_class());
+            .filter(|unit| self.is_type_namespace_declaration(unit));
         let resolved = matches.next()?.fq_name();
         matches.next().is_none().then_some(resolved)
     }
@@ -2280,7 +2299,9 @@ impl ProjectTypes {
             self.index
                 .by_fqn(&candidate)
                 .iter()
-                .filter(|unit| unit.is_class() && unit.source() == owner.source())
+                .filter(|unit| {
+                    self.is_type_namespace_declaration(unit) && unit.source() == owner.source()
+                })
                 .filter(|unit| self.is_exact_structural_child(scala, owner, unit))
                 .cloned()
                 .collect(),
@@ -2316,7 +2337,9 @@ impl ProjectTypes {
             self.index
                 .by_fqn(&candidate)
                 .iter()
-                .filter(|unit| unit.is_class() && unit.source() == owner.source())
+                .filter(|unit| {
+                    self.is_type_namespace_declaration(unit) && unit.source() == owner.source()
+                })
                 .filter(|unit| parents.get(*unit) == Some(owner))
                 .cloned()
                 .collect(),
@@ -2527,12 +2550,37 @@ impl ProjectTypes {
         terminal_object: bool,
         lexical_root: Option<CodeUnit>,
     ) -> Option<String> {
+        self.resolve_qualified_stable_type_unit_at(
+            scala,
+            resolver,
+            segments,
+            terminal_object,
+            lexical_root,
+        )
+        .map(|unit| unit.fq_name())
+    }
+
+    pub(super) fn resolve_qualified_stable_type_unit_at(
+        &self,
+        scala: &ScalaAnalyzer,
+        resolver: &NameResolver,
+        segments: &[String],
+        terminal_object: bool,
+        lexical_root: Option<CodeUnit>,
+    ) -> Option<CodeUnit> {
         let (first, rest) = segments.split_first()?;
         if rest.is_empty() {
-            return if terminal_object {
+            let fqn = if terminal_object {
                 resolver.resolve_object(first)
             } else {
                 resolver.resolve(first)
+            }?;
+            let normalized = scala_normalized_fq_name(&fqn);
+            return if terminal_object {
+                self.unique_object_by_normalized_fqn(scala, &normalized)
+                    .cloned()
+            } else {
+                self.unique_type_by_normalized_fqn(&normalized).cloned()
             };
         }
 
@@ -2569,7 +2617,7 @@ impl ProjectTypes {
                 let [resolved] = matches.as_slice() else {
                     return None;
                 };
-                return Some(resolved.fq_name());
+                return Some(resolved.clone());
             }
             ScalaQualifiedTypeRootResolution::Resolved(ScalaQualifiedTypeRootBinding::Package(
                 package,
@@ -2581,10 +2629,9 @@ impl ProjectTypes {
                 let normalized = scala_normalized_fq_name(&qualified);
                 return if terminal_object {
                     self.unique_object_by_normalized_fqn(scala, &normalized)
-                        .map(CodeUnit::fq_name)
+                        .cloned()
                 } else {
-                    self.unique_type_by_normalized_fqn(&normalized)
-                        .map(CodeUnit::fq_name)
+                    self.unique_type_by_normalized_fqn(&normalized).cloned()
                 };
             }
             ScalaQualifiedTypeRootResolution::Ambiguous
@@ -2600,11 +2647,10 @@ impl ProjectTypes {
         let normalized = scala_normalized_fq_name(&segments.join("."));
         if terminal_object {
             return self
-                .object_by_normalized_fqn(scala, &normalized)
-                .map(CodeUnit::fq_name);
+                .unique_object_by_normalized_fqn(scala, &normalized)
+                .cloned();
         }
-        self.type_by_normalized_fqn(&normalized)
-            .map(CodeUnit::fq_name)
+        self.unique_type_by_normalized_fqn(&normalized).cloned()
     }
 
     fn resolve_type_in_callable_declaration_context(
@@ -2838,7 +2884,7 @@ impl ProjectTypes {
                 .index
                 .fqn_direct_children(&owner.fq_name())
                 .into_iter()
-                .filter(|unit| unit.is_class())
+                .filter(|unit| self.is_type_namespace_declaration(unit))
             {
                 grouped
                     .entry(scala_simple_type_name(&unit))
@@ -2850,7 +2896,9 @@ impl ProjectTypes {
         for (simple, units) in grouped {
             let ordinary = units
                 .iter()
-                .filter(|unit| !unit.short_name().ends_with('$'))
+                .filter(|unit| {
+                    self.type_aliases.contains(*unit) || !unit.short_name().ends_with('$')
+                })
                 .collect::<Vec<_>>();
             let selected = if ordinary.is_empty() {
                 units.iter().collect::<Vec<_>>()
@@ -3172,7 +3220,7 @@ impl ProjectTypes {
         scala: &ScalaAnalyzer,
         target: &CodeUnit,
     ) -> Vec<CodeUnit> {
-        let target_parent = scala.structural_parent_of(target);
+        let target_parent = self.exact_structural_parent(scala, target);
         self.index
             .by_normalized_fqn(&scala_normalized_fq_name(&target.fq_name()))
             .iter()
@@ -3181,7 +3229,7 @@ impl ProjectTypes {
                     && *candidate != target
                     && candidate.source() == target.source()
                     && candidate.short_name().ends_with('$')
-                    && scala.structural_parent_of(candidate) == target_parent
+                    && self.exact_structural_parent(scala, candidate) == target_parent
             })
             .cloned()
             .collect()
@@ -4165,7 +4213,7 @@ impl NameResolver {
             }
             if tier.declaration {
                 let (type_declarations, object_declarations) =
-                    types.explicit_import_class_declarations(&tier.candidate);
+                    types.explicit_import_type_declarations(&tier.candidate);
                 for declaration in &type_declarations {
                     names.add_declaration(local_name.to_string(), declaration, 2);
                 }
@@ -4381,7 +4429,7 @@ impl NameResolver {
             }
             if tier.declaration {
                 let (type_declarations, mut object_declarations) =
-                    types.explicit_import_class_declarations(&tier.candidate);
+                    types.explicit_import_type_declarations(&tier.candidate);
                 if object_declarations.is_empty() {
                     object_declarations.extend(
                         type_declarations
@@ -4775,7 +4823,7 @@ fn method_key(fqn: &str, arity: Option<usize>) -> String {
 /// The leading simple name of a (possibly generic/qualified) type text.
 fn simple_type_name(type_text: &str) -> Option<&str> {
     type_text
-        .split(['[', '(', '{', '.', ' ', '<'])
+        .split(['[', '(', '{', '.', ' '])
         .next()
         .map(str::trim)
         .filter(|name| !name.is_empty())
@@ -5139,6 +5187,14 @@ fn record_reference(
                     return;
                 }
                 ctx.record(fqn, node);
+            } else if (is_extractor_reference(node) || is_infix_pattern_operator(node))
+                && bindings.resolve_symbol(text).is_unknown()
+                && !bindings.is_shadowed(text)
+                && let Some(owner) = ctx.enclosing_class_unit(node.start_byte())
+                && let FieldResolution::Resolved(field) =
+                    ctx.types.field_for_owner_unit(ctx.scala, owner, text)
+            {
+                ctx.record(field.declaration.fq_name(), node);
             }
         }
         "call_expression" => {
@@ -5573,6 +5629,15 @@ fn record_qualified_stable_reference(
         return true;
     }
     if class_fqn.is_none() && object_fqn.is_none() {
+        if reference.segments.len() == 1
+            && reference.role == ScalaQualifiedStableTypeRole::Extractor
+        {
+            // A bare extractor can be an inherited stable `val` (for example
+            // Akka FSM's `Event`). Type/object lookup owns qualified misses,
+            // but an unqualified miss must continue into exact lexical field
+            // resolution below.
+            return false;
+        }
         return true;
     }
     let role = match reference.role {

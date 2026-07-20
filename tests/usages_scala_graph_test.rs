@@ -436,7 +436,7 @@ object Other {
             r#"package duplicate
 object Outer {
   object Token
-  def singleton: Any = Token // negative-ambiguous-first
+  def singleton: Any = Token // positive-exact-first
 }
 class PackageType
 object PackageToken
@@ -447,7 +447,7 @@ object PackageToken
             r#"package duplicate
 object Outer {
   object Token
-  def singleton: Any = Token // negative-ambiguous-second
+  def singleton: Any = Token // negative-other-physical-second
 }
 class PackageType
 object PackageToken
@@ -546,8 +546,8 @@ object Ambiguous {
             )
             .result,
     );
-    assert_no_hit_contains(&ambiguous_hits, "negative-ambiguous-first");
-    assert_no_hit_contains(&ambiguous_hits, "negative-ambiguous-second");
+    assert_hit_contains(&ambiguous_hits, "positive-exact-first");
+    assert_no_hit_contains(&ambiguous_hits, "negative-other-physical-second");
 
     let consumer_provider = ExplicitCandidateProvider::new(Arc::new(
         std::iter::once(project.file("consumer/Ambiguous.scala")).collect(),
@@ -7044,6 +7044,8 @@ fn scala_usage_finder_preserves_exact_stable_type_alias_identity() {
 class Box[A]
 object Result {
   type BoxAlias[A] = Box[A]
+  type Decider = Int => Int
+  def decider: Decider = identity // positive-unqualified-nested-alias
   opaque type Success[A] = A
   object Success {
     def apply[A](value: A): Success[A] = value
@@ -7153,6 +7155,25 @@ object Ambiguous {
     );
     assert_hit_contains(&box_alias_hits, "positive-alias-constructor-role");
 
+    let decider_alias = analyzer
+        .get_definitions("root.model.Result$.Decider")
+        .into_iter()
+        .find(|candidate| analyzer.is_type_alias(candidate))
+        .expect("exact nested Decider alias target");
+    let decider_hits = hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&decider_alias),
+                Some(&provider),
+                100,
+                100,
+            )
+            .result,
+    );
+    assert_hit_contains(&decider_hits, "positive-unqualified-nested-alias");
+
     let ambiguous_aliases = analyzer
         .get_definitions("dup.Result$.Ambiguous")
         .into_iter()
@@ -7178,6 +7199,268 @@ object Ambiguous {
         );
         assert_no_hit_contains(&alias_hits, "negative-physical-alias-ambiguity");
     }
+}
+
+#[test]
+fn scala_usage_finder_resolves_package_type_aliases_without_term_leakage() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Aliases.scala",
+            "package model\ntype Maybe[A] = Option[A]\ninfix type <[A, B] = Either[A, B]\n",
+        ),
+        (
+            "model/SamePackage.scala",
+            r#"package model
+object SamePackage {
+  val maybe: Maybe[Int] = None // positive-package-alias
+  val effect: Int < String = Left(1) // positive-operator-alias
+  val Maybe = 1
+  val term = Maybe // negative-alias-term
+}
+"#,
+        ),
+        (
+            "app/Wildcard.scala",
+            r#"package app
+import model.*
+object Wildcard {
+  val maybe: Maybe[Int] = None // positive-wildcard-alias
+  val effect: Int < String = Left(1) // positive-wildcard-operator
+}
+"#,
+        ),
+        (
+            "app/Explicit.scala",
+            r#"package app
+import model.{Maybe as Optional}
+object Explicit {
+  val maybe: Optional[Int] = None // positive-renamed-alias
+  val qualified: model.Maybe[Int] = None // positive-qualified-alias
+}
+"#,
+        ),
+        (
+            "left/Collision.scala",
+            "package collision\ntype Duplicate = Int\n",
+        ),
+        (
+            "right/Collision.scala",
+            "package collision\ntype Duplicate = String\n",
+        ),
+        (
+            "app/Ambiguous.scala",
+            r#"package app
+object Ambiguous {
+  val duplicate: collision.Duplicate = 1 // negative-physical-alias-ambiguity
+}
+"#,
+        ),
+    ]);
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        analyzer.get_analyzed_files().into_iter().collect(),
+    ));
+    let alias_hits = |fqn: &str| {
+        let target = analyzer
+            .get_definitions(fqn)
+            .into_iter()
+            .find(|candidate| analyzer.is_type_alias(candidate))
+            .unwrap_or_else(|| panic!("missing exact alias {fqn}"));
+        hits(
+            UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    &analyzer,
+                    std::slice::from_ref(&target),
+                    Some(&provider),
+                    100,
+                    100,
+                )
+                .result,
+        )
+    };
+
+    let maybe_hits = alias_hits("model.Maybe");
+    for marker in [
+        "positive-package-alias",
+        "positive-wildcard-alias",
+        "positive-renamed-alias",
+        "positive-qualified-alias",
+    ] {
+        assert_hit_contains(&maybe_hits, marker);
+    }
+    assert_no_hit_contains(&maybe_hits, "negative-alias-term");
+
+    let operator_hits = alias_hits("model.<");
+    for marker in ["positive-operator-alias", "positive-wildcard-operator"] {
+        assert_hit_contains(&operator_hits, marker);
+    }
+
+    for duplicate in analyzer
+        .get_definitions("collision.Duplicate")
+        .into_iter()
+        .filter(|candidate| analyzer.is_type_alias(candidate))
+    {
+        let duplicate_hits = hits(
+            UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    &analyzer,
+                    std::slice::from_ref(&duplicate),
+                    Some(&provider),
+                    100,
+                    100,
+                )
+                .result,
+        );
+        assert_no_hit_contains(&duplicate_hits, "negative-physical-alias-ambiguity");
+    }
+}
+
+#[test]
+fn scala_usage_finder_keeps_nested_singleton_types_on_the_exact_physical_owner() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "jvm/Assertions.scala",
+            "package org.scalatest\ntrait Assertions {\n  object UseDefaultAssertions\n  def jvm(use: UseDefaultAssertions.type): Unit = () // positive-jvm-singleton\n}\n",
+        ),
+        (
+            "js/Assertions.scala",
+            "package org.scalatest\ntrait Assertions {\n  object UseDefaultAssertions\n  def js(use: UseDefaultAssertions.type): Unit = () // negative-js-singleton\n}\n",
+        ),
+    ]);
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        analyzer.get_analyzed_files().into_iter().collect(),
+    ));
+    let targets = analyzer
+        .get_definitions("org.scalatest.Assertions.UseDefaultAssertions$")
+        .into_iter()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        targets.len(),
+        2,
+        "expected duplicate physical singleton owners"
+    );
+    let jvm = targets
+        .into_iter()
+        .find(|target| rel_path_string(target.source()) == "jvm/Assertions.scala")
+        .expect("JVM singleton declaration");
+    let jvm_hits = hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&jvm),
+                Some(&provider),
+                100,
+                100,
+            )
+            .result,
+    );
+    assert_hit_contains(&jvm_hits, "positive-jvm-singleton");
+    assert_no_hit_contains(&jvm_hits, "negative-js-singleton");
+}
+
+#[test]
+fn scala_usage_finder_resolves_nested_types_through_the_exact_companion_root() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "jvm/Tasty.scala",
+            r#"package kyo
+object Tasty {
+  sealed trait Symbol
+  object Symbol {
+    sealed trait ClassLike
+    final class Class extends ClassLike
+    final class Field
+  }
+  def classLike: Option[Symbol.ClassLike] = None // positive-jvm-classlike
+  def concrete: Option[Symbol.Class] = None // positive-jvm-class
+  def field: Option[Symbol.Field] = None // positive-jvm-field
+}
+"#,
+        ),
+        (
+            "js/Tasty.scala",
+            r#"package kyo
+object Tasty {
+  sealed trait Symbol
+  object Symbol {
+    sealed trait ClassLike
+    final class Class extends ClassLike
+    final class Field
+  }
+  def classLike: Option[Symbol.ClassLike] = None // negative-js-classlike
+  def concrete: Option[Symbol.Class] = None // negative-js-class
+  def field: Option[Symbol.Field] = None // negative-js-field
+}
+"#,
+        ),
+    ]);
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        analyzer.get_analyzed_files().into_iter().collect(),
+    ));
+    for (fqn, positive, negative) in [
+        (
+            "kyo.Tasty$.Symbol$.ClassLike",
+            "positive-jvm-classlike",
+            "negative-js-classlike",
+        ),
+        (
+            "kyo.Tasty$.Symbol$.Class",
+            "positive-jvm-class",
+            "negative-js-class",
+        ),
+        (
+            "kyo.Tasty$.Symbol$.Field",
+            "positive-jvm-field",
+            "negative-js-field",
+        ),
+    ] {
+        let target = analyzer
+            .get_definitions(fqn)
+            .into_iter()
+            .find(|target| rel_path_string(target.source()) == "jvm/Tasty.scala")
+            .unwrap_or_else(|| panic!("missing exact JVM target {fqn}"));
+        let target_hits = hits(
+            UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    &analyzer,
+                    std::slice::from_ref(&target),
+                    Some(&provider),
+                    100,
+                    100,
+                )
+                .result,
+        );
+        assert_hit_contains(&target_hits, positive);
+        assert_no_hit_contains(&target_hits, negative);
+    }
+}
+
+#[test]
+fn scala_usage_finder_resolves_inherited_stable_extractor_fields() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "akka/Model.scala",
+        r#"package akka
+
+trait FSM {
+  case class EventData(value: Int)
+  val Event = EventData
+}
+
+final class Manager extends FSM {
+  def receive(value: Any): Int = value match {
+    case Event(number) => number // positive-inherited-stable-extractor
+    case _ => 0
+  }
+}
+"#,
+    )]);
+    let event = definition(&analyzer, "akka.FSM.Event");
+    let event_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&event)));
+    assert_hit_contains(&event_hits, "positive-inherited-stable-extractor");
 }
 
 #[test]

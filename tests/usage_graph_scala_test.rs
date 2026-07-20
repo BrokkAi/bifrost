@@ -929,11 +929,19 @@ object Ambiguous {
             value["edges"]
         );
     }
+    assert!(
+        has_edge(
+            &value,
+            "duplicate.Outer$.singleton",
+            "duplicate.Outer$.Token$"
+        ),
+        "each duplicate physical owner should resolve its own nested singleton before logical graph identities collapse: {}",
+        value["edges"]
+    );
     for (caller, callee) in [
         ("model.Outer$.shadowedSingleton", "model.Outer$.Token$"),
         ("model.Other$.singleton", "model.Outer$.Token$"),
         ("model.Other$.typed", "model.Outer$.UseRef"),
-        ("duplicate.Outer$.singleton", "duplicate.Outer$.Token$"),
         ("consumer.Ambiguous$.typed", "duplicate.PackageType"),
         ("consumer.Ambiguous$.token", "duplicate.PackageToken$"),
     ] {
@@ -2744,6 +2752,72 @@ object Use {
         assert!(
             has_edge(&value, caller, leaf),
             "expected {caller} -> {leaf}: {}",
+            value["edges"]
+        );
+    }
+}
+
+#[test]
+fn scala_inverted_type_namespace_uses_exact_companion_roots() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Types.scala",
+            r#"package model
+
+type Maybe[A] = Option[A]
+infix type <[A, B] = Either[A, B]
+
+object Tasty {
+  sealed trait Symbol
+  object Symbol {
+    sealed trait ClassLike
+    final class Class extends ClassLike
+    final class Field
+  }
+
+  def classLike: Maybe[Symbol.ClassLike] = None
+  def concrete: Maybe[Symbol.Class] = None
+  def field: Maybe[Symbol.Field] = None
+}
+"#,
+        )
+        .file(
+            "model/SamePackage.scala",
+            r#"package model
+
+object SamePackage {
+  def maybe: Maybe[Int] = None
+  def effect: Int < String = Left(1)
+  val Maybe = 1
+  def term: Int = Maybe
+}
+"#,
+        )
+        .file(
+            "app/Imported.scala",
+            r#"package app
+
+import model.*
+import model.{Maybe as Optional}
+
+object Imported {
+  def maybe: Optional[Int] = None
+  def effect: Int < String = Left(1)
+  def qualified: model.Maybe[Int] = None
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    for (caller, target) in [
+        ("model.Tasty$.classLike", "model.Tasty$.Symbol$.ClassLike"),
+        ("model.Tasty$.concrete", "model.Tasty$.Symbol$.Class"),
+        ("model.Tasty$.field", "model.Tasty$.Symbol$.Field"),
+    ] {
+        assert!(
+            has_edge(&value, caller, target),
+            "expected exact companion-root edge {caller} -> {target}: {}",
             value["edges"]
         );
     }
