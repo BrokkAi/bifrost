@@ -998,10 +998,11 @@ fn type_qualification_owner_match_status(
     ctx: &ScanCtx<'_>,
 ) -> ReceiverMatchStatus {
     if let Some(module_text) = simple_identifier_text(module, ctx.source) {
-        return ctx
-            .binds_target_type(module_text)
-            .then_some(ReceiverMatchStatus::Proven)
-            .unwrap_or(ReceiverMatchStatus::NoMatch);
+        return if ctx.binds_target_type(module_text) {
+            ReceiverMatchStatus::Proven
+        } else {
+            ReceiverMatchStatus::NoMatch
+        };
     }
 
     ReceiverMatchStatus::NoMatch
