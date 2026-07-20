@@ -1125,21 +1125,21 @@ fn get_summaries_directory_target_stays_narrow_on_service_path() {
     let value: Value = serde_json::from_str(&payload).unwrap();
 
     assert!(
-        value["structured"].get("compact_symbols").is_some(),
-        "{value}"
+        value["structured"]["summaries"]
+            .as_array()
+            .unwrap()
+            .is_empty()
     );
-    assert_eq!(false, value["structured"]["degraded"], "{value}");
-    assert!(value["structured"]["degradation"].is_null(), "{value}");
     assert!(
         value["structured"]["not_found"]
             .as_array()
             .unwrap()
-            .iter()
-            .any(|item| item["input"] == "."),
-        "{value}"
+            .is_empty()
     );
+    assert_eq!("directory", value["structured"]["listings"][0]["kind"]);
+    assert_eq!(".", value["structured"]["listings"][0]["target"]);
     let rendered = value["rendered_text"].as_str().expect("rendered text");
-    assert!(rendered.contains("Not found: `.`"), "{rendered}");
+    assert!(rendered.contains("Directory ."), "{rendered}");
     assert!(rendered.contains("A.java"), "{rendered}");
 }
 
@@ -1160,17 +1160,12 @@ fn get_summaries_mixed_targets_stay_narrow_on_service_path() {
         value["structured"]["not_found"]
             .as_array()
             .unwrap()
-            .iter()
-            .any(|item| item["input"] == "."),
-        "{value}"
+            .is_empty()
     );
-    assert!(
-        value["structured"].get("compact_symbols").is_some(),
-        "{value}"
-    );
+    assert_eq!("directory", value["structured"]["listings"][0]["kind"]);
     let rendered = value["rendered_text"].as_str().expect("rendered text");
     assert!(rendered.contains("A.java"), "{rendered}");
-    assert!(rendered.contains("Not found: `.`"), "{rendered}");
+    assert!(rendered.contains("Directory ."), "{rendered}");
 }
 
 #[test]
