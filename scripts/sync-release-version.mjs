@@ -120,7 +120,9 @@ function updateJson(relativePath, mutate) {
   const original = fs.readFileSync(absolutePath, "utf8");
   const json = JSON.parse(original);
   mutate(json);
-  return updateText(relativePath, () => `${JSON.stringify(json, null, 2)}\n`, original);
+  const lineEnding = original.includes("\r\n") ? "\r\n" : "\n";
+  const serialized = `${JSON.stringify(json, null, 2).replaceAll("\n", lineEnding)}${lineEnding}`;
+  return updateText(relativePath, () => serialized, original);
 }
 
 function updateText(relativePath, mutate, original = undefined) {

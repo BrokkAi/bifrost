@@ -17,6 +17,7 @@ After this change, Pi users can keep their intended Bifrost capability settings 
 - [x] (2026-07-18 06:35Z) Completed package, repository, artifact, real-Pi, process-leak, AST-rule, workflow, and independent-review validation.
 - [x] (2026-07-20) Addressed maintainer review: aligned cross-toolset capability requirements with the Rust registry, made process and package tests portable, and expanded Pi package CI to Linux, macOS, and Windows.
 - [x] (2026-07-20) Sanitized MCP- and model-controlled terminal content before trusted Pi theme styling while preserving raw oversized diagnostics in overflow files.
+- [x] (2026-07-20) Fixed the Windows package CI failure by preserving each JSON projection's existing line endings in the release-version synchronizer and adding CRLF check/update regressions.
 
 ## Surprises & Discoveries
 
@@ -171,3 +172,5 @@ Revision note (2026-07-18): A later scope audit found that reordering GitHub and
 Revision note (2026-07-20): Recorded maintainer-review remediation for the default capability/toolset mismatch, independent registry-boundary fixtures, portable npm subprocesses, canonical temporary paths, and three-platform Pi package CI.
 
 Revision note (2026-07-20): Added terminal-control sanitization and security regressions after review reproduced an OSC 52 sequence surviving call and result rendering.
+
+Revision note (2026-07-20): Recorded the Windows CI remediation after the release-version check treated CRLF serialization differences as stale metadata.
