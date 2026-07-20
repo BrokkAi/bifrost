@@ -927,7 +927,7 @@ fn expand_alias_qualified_type(
         return reference.to_string();
     };
     if alias == "global" {
-        return suffix.to_string();
+        return reference.to_string();
     }
     csharp
         .using_aliases_of(file)

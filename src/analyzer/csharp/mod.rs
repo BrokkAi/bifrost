@@ -554,19 +554,25 @@ impl CSharpAnalyzer {
         }
 
         let mut visible = Vec::new();
-        for namespace in self.using_namespaces_of(file) {
-            visible
-                .extend(self.type_candidates_by_fqn(&format!("{namespace}.{normalized}"), usage));
+        for using_namespace in self.using_namespaces_of(file) {
+            visible.extend(
+                self.type_candidates_by_fqn(&format!("{using_namespace}.{normalized}"), usage),
+            );
+        }
+        if !visible.is_empty() {
+            return visible;
         }
 
         while let Some(separator) = namespace.rfind('.') {
             namespace.truncate(separator);
-            visible
-                .extend(self.type_candidates_by_fqn(&format!("{namespace}.{normalized}"), usage));
+            let candidates =
+                self.type_candidates_by_fqn(&format!("{namespace}.{normalized}"), usage);
+            if !candidates.is_empty() {
+                return candidates;
+            }
         }
 
-        visible.extend(self.type_candidates_by_fqn(&normalized, usage));
-        visible
+        self.type_candidates_by_fqn(&normalized, usage)
     }
 
     fn type_candidates_by_fqn(&self, fqn: &str, usage: bool) -> Vec<CodeUnit> {

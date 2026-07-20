@@ -3798,6 +3798,18 @@ public class List<T> {
 "#,
         )
         .file(
+            "RuntimeTests/Regression/List.cs",
+            r#"
+public class List<T> {}
+"#,
+        )
+        .file(
+            "RuntimeTests/Loader/List.cs",
+            r#"
+public class List<T> {}
+"#,
+        )
+        .file(
             "Reference/NodeFactory.cs",
             r#"
 namespace Runtime;
@@ -3903,6 +3915,192 @@ public class Consumer {
         0,
         analyzer.definition_candidates_query_count_for_test(),
         "inverse receiver resolution must not fall back to persisted candidate SQL"
+    );
+}
+
+#[test]
+fn usage_finder_csharp_persisted_imported_constructor_beats_global_list_collision() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Collections/List.cs",
+            r#"
+namespace System.Collections.Generic;
+
+public class List<T> {
+    public List() {}
+    public List(int capacity) {}
+}
+"#,
+        )
+        .file(
+            "RuntimeTests/GlobalList.cs",
+            r#"
+public class List<T> {
+    public List() {}
+}
+
+public class List {
+    public List() {}
+}
+
+public class Fallback<T> {
+    public Fallback() {}
+}
+"#,
+        )
+        .file(
+            "Xml/Fallback.cs",
+            r#"
+namespace System.Xml;
+
+public class Fallback<T> {
+    public Fallback() {}
+}
+"#,
+        )
+        .file(
+            "Xml/Consumer.cs",
+            r#"
+using System.Collections.Generic;
+
+namespace System.Xml.Serialization {
+    public class Consumer {
+        public void Run() {
+            var importedZero = new List<string>();
+            var importedOne = new List<string>(4);
+            var wrongArity = new List<string>(4, 8);
+            var globalGeneric = new global::List<string>();
+            var globalOrdinary = new global::List();
+            var enclosingFallback = new Fallback<string>();
+            var globalFallback = new global::Fallback<string>();
+        }
+    }
+}
+"#,
+        )
+        .build();
+    {
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+                .expect("persisted constructor precedence project should build");
+        assert!(
+            workspace
+                .analyzer()
+                .get_all_declarations()
+                .iter()
+                .any(|unit| unit.fq_name() == "System.Collections.Generic.List`1.List"),
+            "persisted workspace should contain the imported generic constructors"
+        );
+    }
+
+    let reopened =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("persisted constructor precedence project should reopen");
+    let analyzer = reopened.analyzer();
+    let declarations = analyzer.get_all_declarations();
+    let constructor = |owner: &str, name: &str, arity: usize| {
+        declarations
+            .iter()
+            .find(|unit| {
+                unit.kind() == CodeUnitType::Function
+                    && unit.identifier() == name
+                    && unit.signature().is_some_and(|signature| {
+                        if arity == 0 {
+                            signature == "()"
+                        } else {
+                            count_signature_parameters(signature) == arity
+                        }
+                    })
+                    && analyzer
+                        .parent_of(unit)
+                        .is_some_and(|parent| parent.fq_name() == owner)
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("missing persisted {owner}.{name} constructor with arity {arity}")
+            })
+    };
+    let imported_zero = constructor("System.Collections.Generic.List`1", "List", 0);
+    let imported_one = constructor("System.Collections.Generic.List`1", "List", 1);
+    let global_generic = constructor("List`1", "List", 0);
+    let global_ordinary = constructor("List", "List", 0);
+    let enclosing_fallback = constructor("System.Xml.Fallback`1", "Fallback", 0);
+    let global_fallback = constructor("Fallback`1", "Fallback", 0);
+    let graph_hits = |target: &CodeUnit| {
+        let candidates = analyzer.get_analyzed_files().into_iter().collect();
+        CSharpUsageGraphStrategy::new()
+            .find_usages(analyzer, std::slice::from_ref(target), &candidates, 1000)
+            .into_either()
+            .expect("persisted constructor usage query should resolve")
+    };
+
+    let imported_zero_hits = graph_hits(&imported_zero);
+    assert_eq!(1, imported_zero_hits.len(), "{imported_zero_hits:#?}");
+    assert!(
+        imported_zero_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("new List<string>()")),
+        "the global generic constructor and wrong-arity call must not match: {imported_zero_hits:#?}"
+    );
+    let routed_imported_zero = UsageFinder::new()
+        .find_usages_default(analyzer, std::slice::from_ref(&imported_zero))
+        .into_either()
+        .expect("default imported constructor query should resolve");
+    assert_eq!(
+        imported_zero_hits, routed_imported_zero,
+        "default routing must retain the namespace-imported constructor site"
+    );
+
+    let imported_one_hits = graph_hits(&imported_one);
+    assert_eq!(1, imported_one_hits.len(), "{imported_one_hits:#?}");
+    assert!(
+        imported_one_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("new List<string>(4)")),
+        "only the imported one-argument constructor should match: {imported_one_hits:#?}"
+    );
+
+    let global_generic_hits = graph_hits(&global_generic);
+    assert_eq!(1, global_generic_hits.len(), "{global_generic_hits:#?}");
+    assert!(
+        global_generic_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("new global::List<string>()")),
+        "unqualified generic construction must remain on the imported owner: {global_generic_hits:#?}"
+    );
+
+    let global_ordinary_hits = graph_hits(&global_ordinary);
+    assert_eq!(1, global_ordinary_hits.len(), "{global_ordinary_hits:#?}");
+    assert!(
+        global_ordinary_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("new global::List()")),
+        "generic and nongeneric global constructors must remain distinct: {global_ordinary_hits:#?}"
+    );
+
+    let enclosing_fallback_hits = graph_hits(&enclosing_fallback);
+    assert_eq!(
+        1,
+        enclosing_fallback_hits.len(),
+        "{enclosing_fallback_hits:#?}"
+    );
+    assert!(
+        enclosing_fallback_hits.iter().all(|hit| hit
+            .snippet
+            .lines()
+            .any(|line| { line.trim() == "var enclosingFallback = new Fallback<string>();" })),
+        "the nearest enclosing namespace must beat the global fallback: {enclosing_fallback_hits:#?}"
+    );
+
+    let global_fallback_hits = graph_hits(&global_fallback);
+    assert_eq!(1, global_fallback_hits.len(), "{global_fallback_hits:#?}");
+    assert!(
+        global_fallback_hits
+            .iter()
+            .all(|hit| hit.snippet.lines().any(|line| {
+                line.trim() == "var globalFallback = new global::Fallback<string>();"
+            })),
+        "explicit global qualification must bypass the enclosing namespace: {global_fallback_hits:#?}"
     );
 }
 
