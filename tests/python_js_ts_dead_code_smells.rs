@@ -571,6 +571,47 @@ def run():
 }
 
 #[test]
+fn python_dead_code_targeted_graph_preserves_namespace_reexport_aliases() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "proto/modules.py",
+            "def define_module():\n    return None\n",
+        )
+        .file(
+            "proto/__init__.py",
+            "from .modules import define_module as module\n",
+        )
+        .file(
+            "consumer.py",
+            "import proto\n\ndef build():\n    first = proto.module()\n    return proto.module()\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = python_definition(&analyzer, "proto.modules.define_module");
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec![
+                "proto/modules.py".to_string(),
+                "proto/__init__.py".to_string(),
+                "consumer.py".to_string(),
+            ],
+            fq_names: vec![target.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result
+            .report
+            .contains("No dead code or unused abstraction smells met minScore 8."),
+        "{}",
+        result.report
+    );
+}
+
+#[test]
 fn js_dead_code_smell_reports_unused_export() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(

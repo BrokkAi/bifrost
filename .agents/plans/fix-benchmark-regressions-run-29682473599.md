@@ -14,6 +14,7 @@ The scheduled benchmark at GitHub Actions run `29682473599` exposed two independ
 - [x] (2026-07-20 11:05 SAST) Validated the C++ definition suite, the originating direct-temporary parity test, and the pinned fmt benchmark probe.
 - [x] (2026-07-20 11:29 SAST) Added targeted Python dead-code graph coverage and removed repeated resolution of non-candidate callees without dropping constructor keyword, call-result receiver, typed receiver, namespace, inheritance, or unproven-reference edges.
 - [x] (2026-07-20 11:29 SAST) Validated the complete Python usage-graph suite, Python dead-code tests, and pinned Click probe at 226.1 ms.
+- [x] (2026-07-20 12:12 SAST) Corrected an unsound terminal-name gate for Python namespace re-export aliases, added targeted dead-code coverage, and revalidated Click at 279.4 ms.
 - [ ] Re-run both pinned benchmark probes and the repository-wide formatting, Clippy, and `nlp,python` test gates.
 - [ ] Review the completed diff, update this plan's retrospective, and commit the reviewed final state.
 
@@ -28,7 +29,9 @@ The scheduled benchmark at GitHub Actions run `29682473599` exposed two independ
 - Observation: Dead-code analysis needs every declaration as a possible caller, but it only consumes inbound edges for the bounded candidate list.
   Evidence: `EdgeCollector` rejects callers outside `nodes`, while `incoming_usage_by_callee` is queried only for `candidates`; using the complete node domain as the resolution target set forced expensive Python member resolution for unrelated callees whose edges were immediately discarded.
 - Observation: Separating caller nodes from callee targets removed most of the slowdown, and moving the same terminal-name gate ahead of typed-receiver and namespace-canonicalization resolution removed the remainder.
-  Evidence: the pinned Click probe improved first from 5,286.5 ms to 1,023.2 ms, then to 226.1 ms after all member-resolution paths checked the bounded target terminal set before resolving.
+  Evidence: the pinned Click probe improved first from 5,286.5 ms to 1,023.2 ms, then to 226.1 ms after expensive member-resolution paths checked the bounded target terminal set before resolving.
+- Observation: Terminal-name gating is unsound for namespace re-export aliases because the visible alias and canonical declaration can have different terminal names.
+  Evidence: the repository-wide gate caught `proto.module()` failing to retain an edge to `proto.modules.define_module`; resolving only structured workspace namespace attributes and filtering the canonical results by exact target restores both whole-graph and targeted dead-code behavior. The corrected pinned Click probe remains fast at 279.4 ms.
 - Observation: The installed structured Bifrost CLI redirects linked-worktree cache storage to the primary checkout, which is read-only in this sandbox.
   Evidence: one-shot `search_symbols` failed opening `/Users/dave/Workspace/BrokkAi/bifrost/.brokk/bifrost_cache.db`; source inspection remains available directly.
 
@@ -49,16 +52,19 @@ The scheduled benchmark at GitHub Actions run `29682473599` exposed two independ
 - Decision: Prove the targeted path behaviorally with both constructor-keyword and call-result member edges plus irrelevant resolvable noise, and use the pinned benchmark for elapsed-time proof.
   Rationale: The test asserts the semantics that must survive the optimization without introducing production instrumentation or flaky wall-clock assertions; the exact Click manifest proves the real performance effect.
   Date/Author: 2026-07-20 / Codex
+- Decision: Do not terminal-filter workspace namespace canonicalization; namespace re-export aliases must first resolve canonically, after which the bounded target set filters retained edges.
+  Rationale: Alias terminal names are not declaration identities. Namespace-import attributes are already a structured narrow subset, and retaining this resolution increased the Click probe only from 226.1 ms to 279.4 ms while restoring correctness.
+  Date/Author: 2026-07-20 / Codex
 
 ## Outcomes & Retrospective
 
-Both implementation milestones are complete. The pinned fmt query resolves `detail.vformat_to` in 319.3 ms. The pinned Click dead-code query retains `Candidate symbols analyzed: 1` and improved from 5,286.5 ms to 226.1 ms locally, close to the 183.3 ms pre-regression measurement. All 67 C++ definition tests, the originating C++ direct-temporary parity test, all 92 active Python usage-graph tests, and all 10 Python dead-code tests pass. Repository-wide gates and final review remain.
+Both implementation milestones are complete. The pinned fmt query resolves `detail.vformat_to` in 319.3 ms. After the repository-wide gate caught and drove correction of namespace re-export alias handling, the pinned Click dead-code query retains `Candidate symbols analyzed: 1` and improves from 5,286.5 ms to 279.4 ms locally, close to the 183.3 ms pre-regression measurement. All 67 C++ definition tests, the originating C++ direct-temporary parity test, all 92 active Python usage-graph tests, the Python dead-code suite, and both whole-graph and targeted namespace-alias regressions pass. Repository-wide gates and final review remain.
 
 ## Context and Orientation
 
 `benchmark/targets.toml` pins fmt commit `9afcd929...` and asks `get_definitions_by_location` to resolve `include/fmt/base.h:2798:11` to `detail.vformat_to`. The C++ dispatcher in `src/analyzer/usages/get_definition/cpp.rs` gathers qualified free-function candidates, filters them through `CppVisibilityIndex::declaration_visible_at`, then tries constructor and namespace-member fallbacks. `src/analyzer/usages/cpp_graph/resolver.rs` implements visibility by finding a physically visible declaration with the same kind, fully qualified name, and signature as the selected definition. Tree-sitter indexes fmt's earlier macro-decorated declaration as unqualified `vformat_to` after flattening `namespace detail`, so strict FQN equality discarded the otherwise exact activation proof and the later fallback reported an import boundary.
 
-`benchmark/targets.toml` also pins Click commit `c480210...` and asks `report_dead_code_and_unused_abstraction_smells` about `click.core.Command.main`. `src/code_quality/dead_code_smells.rs` collects all Python declaration names as the caller graph domain and invokes the targeted Python edge builder with only bounded candidates as callees. `src/analyzer/usages/python_graph/inverted.rs` scans every Python AST, but expensive constructor, call-result, typed-receiver, hierarchy, and namespace-canonicalization resolution now runs only when the accessed terminal name belongs to a requested target. Ordinary full usage graphs pass the complete node set as both domains and retain their existing semantics.
+`benchmark/targets.toml` also pins Click commit `c480210...` and asks `report_dead_code_and_unused_abstraction_smells` about `click.core.Command.main`. `src/code_quality/dead_code_smells.rs` collects all Python declaration names as the caller graph domain and invokes the targeted Python edge builder with only bounded candidates as callees. `src/analyzer/usages/python_graph/inverted.rs` scans every Python AST, but expensive constructor, call-result, typed-receiver, and hierarchy resolution now runs only when the accessed terminal name belongs to a requested target. Workspace namespace attributes still resolve canonically before exact target filtering because a re-export alias can change the terminal name. Ordinary full usage graphs pass the complete node set as both domains and retain their existing semantics.
 
 Tests use `InlineTestProject` from `tests/common/inline_project.rs`. C++ location-resolution behavior belongs in `tests/get_definition_test.rs`; Python forward, targeted inverse, and whole-graph parity belongs in `tests/usages_python_graph_test.rs`. Any performance instrumentation added solely for tests must be bounded, resettable, and excluded from production overhead where practical.
 

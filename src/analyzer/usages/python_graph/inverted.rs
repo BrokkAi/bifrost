@@ -406,7 +406,12 @@ fn handle_attribute<'a>(
             ctx.record(direct, attribute);
             return;
         }
-        if workspace_module && ctx.targets_by_terminal.contains_key(attribute_text) {
+        // A re-export alias can change the terminal name (`proto.module` may
+        // canonically resolve to `proto.modules.define_module`), so terminal-name
+        // filtering is not sound here. Namespace imports are already a narrow,
+        // structured subset of attributes; resolve their workspace candidates
+        // and let `record` retain only requested targets.
+        if workspace_module {
             for resolved in ctx.canonical_namespace_candidates(&direct).iter() {
                 ctx.record(resolved.clone(), attribute);
             }
