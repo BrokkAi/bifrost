@@ -13,6 +13,12 @@
 
 Both artifacts report clean Bifrost and repository trees, completed records, the pinned heads above, and no file errors. The full run audited 1,000 of 15,449 eligible files, sampled 10,000 sites, resolved 6,049 forward sites to 2,528 distinct targets, queried the configured 1,000 target groups, and reported 174 missing rows. The run completed in 495.9 seconds. The former two-hour outlier was identified as `Interop` and completed in 63.5 seconds; the other 999 groups completed within 10.4 seconds of inverse start. Issue #945 is closed with this proof.
 
+## Current status addendum
+
+This document preserves the `b645f878` baseline diagnosis below. At clean fixing head `204061c6`, issues #945, #231, #737, #423, #726, and #946 are exact-proved and closed. The three rows originally assigned to #946 became exact consistent hits after the #423/#726 visibility-tier repair, so the baseline overload-return hypothesis was not their production root cause and no type-shape metadata refactor was made.
+
+#701 is the sole known open C# issue from this audit. Its 24 runtime rows are the alias RHS, nested/static owner, and structured type-role families. Current exact profiling separates two defects: missing structured AST roots for aliases, intermediate type receivers, and patterns; and an arity-unsafe normalized inverse fallback that combines nongeneric `ICollection` with `ICollection<T>` in already-recognized ordinary parameter and explicit-interface roles. Runtime exact artifacts are `csharp-runtime-{alias-rhs,nested-qualifier,pattern-type,interface-parameter}-fadbaa91.jsonl`; Mono recurrences are `csharp-mono-{alias-rhs,is-type,explicit-interface}-fadbaa91.jsonl`, all under `/mnt/optane/tmp/reference-differential/` and all clean one-site missing records with zero file errors.
+
 ## Exhaustive disposition
 
 The missing-row indices below refer to:
