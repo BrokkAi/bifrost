@@ -942,10 +942,13 @@ fn analyze_python_candidates_with_usage_graph(
             skipped,
         },
         |unit| unit.is_function() || unit.is_class(),
-        |nodes| {
-            crate::analyzer::usages::python_graph::build_python_usage_edges(analyzer, nodes, |_| {
-                true
-            })
+        |nodes, targets| {
+            crate::analyzer::usages::python_graph::build_python_usage_edges_for_targets(
+                analyzer,
+                nodes,
+                targets,
+                |_| true,
+            )
         },
         |analyzer, declarations_by_fqn, candidate, usage| {
             graph_finding_for_language(
@@ -976,7 +979,7 @@ fn analyze_java_candidates_with_usage_graph(
             skipped,
         },
         |unit| unit.is_function() || unit.is_class(),
-        |nodes| {
+        |nodes, _targets| {
             crate::analyzer::usages::java_graph::build_java_usage_edges(analyzer, nodes, |_| true)
         },
         java_graph_finding,
@@ -1000,7 +1003,7 @@ fn analyze_scala_candidates_with_usage_graph(
             skipped,
         },
         |unit| unit.is_function() || unit.is_class(),
-        |nodes| {
+        |nodes, _targets| {
             crate::analyzer::usages::scala_graph::build_scala_usage_edges(analyzer, nodes, |_| true)
         },
         scala_graph_finding,
@@ -1024,7 +1027,9 @@ fn analyze_go_candidates_with_usage_graph(
             skipped,
         },
         |unit| unit.is_function() || unit.is_class() || go_module_level_field(unit),
-        |nodes| crate::analyzer::usages::go_graph::build_go_usage_edges(analyzer, nodes, |_| true),
+        |nodes, _targets| {
+            crate::analyzer::usages::go_graph::build_go_usage_edges(analyzer, nodes, |_| true)
+        },
         go_graph_finding,
     )
 }
@@ -1046,7 +1051,7 @@ fn analyze_csharp_candidates_with_usage_graph(
             skipped,
         },
         |unit| unit.is_function() || unit.is_class(),
-        |nodes| {
+        |nodes, _targets| {
             crate::analyzer::usages::csharp_graph::build_csharp_usage_edges(analyzer, nodes, |_| {
                 true
             })
@@ -1072,7 +1077,7 @@ fn analyze_cpp_candidates_with_usage_graph(
             skipped,
         },
         |unit| unit.is_function() || unit.is_class() || unit.is_field(),
-        |nodes| {
+        |nodes, _targets| {
             crate::analyzer::usages::cpp_graph::build_cpp_usage_edges(analyzer, nodes, |_| true)
         },
         cpp_graph_finding,
@@ -1096,7 +1101,7 @@ fn analyze_php_candidates_with_usage_graph(
             skipped,
         },
         |unit| unit.is_function() || unit.is_class(),
-        |nodes| {
+        |nodes, _targets| {
             crate::analyzer::usages::php_graph::build_php_usage_edges(analyzer, nodes, |_| true)
         },
         php_graph_finding,
@@ -1120,7 +1125,7 @@ fn analyze_ruby_candidates_with_usage_graph(
             skipped,
         },
         |unit| unit.is_function() || unit.is_class(),
-        |nodes| {
+        |nodes, _targets| {
             crate::analyzer::usages::ruby_graph::build_ruby_usage_edges(analyzer, nodes, |_| true)
         },
         ruby_graph_finding,
@@ -1143,7 +1148,7 @@ fn analyze_fqn_candidates_with_usage_graph<BuildEdges, NodePredicate, BuildFindi
     build_finding: BuildFinding,
 ) -> Vec<DeadCodeFinding>
 where
-    BuildEdges: FnOnce(&HashSet<String>) -> Option<UsageEdges>,
+    BuildEdges: FnOnce(&HashSet<String>, &HashSet<String>) -> Option<UsageEdges>,
     NodePredicate: Fn(&CodeUnit) -> bool,
     BuildFinding: Fn(
         &dyn IAnalyzer,
@@ -1188,8 +1193,9 @@ where
         .map(|unit| unit.fq_name())
         .collect();
     nodes.extend(candidates.iter().map(CodeUnit::fq_name));
+    let targets: HashSet<String> = candidates.iter().map(CodeUnit::fq_name).collect();
 
-    let Some(edges) = build_edges(&nodes) else {
+    let Some(edges) = build_edges(&nodes, &targets) else {
         for candidate in candidates {
             skipped.push(format!(
                 "`{}`: {label} usage graph could not be built; evidence is inconclusive",
