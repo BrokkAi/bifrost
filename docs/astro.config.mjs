@@ -24,7 +24,7 @@ export default defineConfig({
   },
   integrations: [
     starlight({
-      title: 'Bifrost Docs',
+      title: 'Bifrost Documentation',
       description: 'Documentation for Brokk Bifrost, the analyzer behind Brokk code intelligence.',
       head: [
         { tag: 'meta', attrs: { property: 'og:image', content: socialCardUrl } },
@@ -50,6 +50,10 @@ export default defineConfig({
         },
       ],
       customCss: ['./src/styles/brokk.css'],
+      components: {
+        Header: './src/components/BifrostHeader.astro',
+        Hero: './src/components/BifrostHero.astro',
+      },
       favicon: '/favicon.png',
       editLink: {
         baseUrl: 'https://github.com/BrokkAi/bifrost/edit/master/docs/',
