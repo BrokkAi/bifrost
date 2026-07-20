@@ -18,6 +18,7 @@ pub(in crate::analyzer::usages) use resolver::{
     reference_type_text as csharp_reference_type_text,
     resolve_type_fq_name as csharp_resolve_type_fq_name,
     seed_bindings_before as seed_csharp_bindings_before,
+    usage_direct_base as csharp_usage_direct_base,
     visible_extension_method_candidates as csharp_visible_extension_method_candidates,
 };
 

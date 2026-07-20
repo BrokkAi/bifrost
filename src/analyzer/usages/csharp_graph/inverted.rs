@@ -22,13 +22,13 @@ use super::extractor::{
     member_access_receiver,
 };
 use super::resolver::{
-    UnqualifiedMethodGroupResolution, argument_count, class_unit_for_fq_name,
-    extension_visibility_site_key, first_type_child, is_member_variable_declaration,
-    is_type_reference_node, nearest_member_candidates_for_owner, node_text,
-    object_initializer_for_label, object_initializer_owner_type_node, reference_type_text,
-    resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner, same_node,
-    unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
-    usage_class_field_receiver_type, usage_member_declared_type_fq_name,
+    UnqualifiedMethodGroupResolution, applicable_member_candidates_for_owner, argument_count,
+    class_unit_for_fq_name, extension_visibility_site_key, first_type_child,
+    is_member_variable_declaration, is_type_reference_node, nearest_member_candidates_for_owner,
+    node_text, object_initializer_for_label, object_initializer_owner_type_node,
+    reference_type_text, resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner,
+    same_node, unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
+    usage_class_field_receiver_type, usage_direct_base, usage_member_declared_type_fq_name,
     usage_method_return_type_fq_name_for_arity, usage_visible_extension_method_candidates,
 };
 use crate::analyzer::usages::inverted_edges::{
@@ -37,8 +37,8 @@ use crate::analyzer::usages::inverted_edges::{
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{
-    CSharpAnalyzer, CSharpMemberName, CallableArity, CodeUnit, IAnalyzer, ProjectFile,
-    csharp_attribute_type_names, csharp_callable_arity, csharp_conditional_member_access,
+    CSharpAnalyzer, CSharpMemberName, CodeUnit, IAnalyzer, ProjectFile,
+    csharp_attribute_type_names, csharp_conditional_member_access,
     csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver, csharp_member_name,
     csharp_nameof_type_candidates, csharp_type_leftmost_identifier, csharp_type_reference_root,
     csharp_unqualified_invocation_for_name,
@@ -84,17 +84,13 @@ struct CsScan<'a, 'b> {
     source: &'a str,
     class_ranges: ClassRangeIndex,
     method_group_cache: HashMap<(String, String), UnqualifiedMethodGroupResolution>,
-    member_cache: HashMap<(String, String, Option<usize>), Vec<CachedMember>>,
+    member_cache: HashMap<MemberCacheKey, Vec<String>>,
     extension_cache: HashMap<ExtensionCacheKey, Vec<String>>,
     collector: &'a mut EdgeCollector<'b>,
 }
 
 type ExtensionCacheKey = (String, String, usize, Option<usize>, usize, usize);
-
-struct CachedMember {
-    fqn: String,
-    callable_arity: Option<CallableArity>,
-}
+type MemberCacheKey = (String, String, Option<usize>, Option<usize>);
 
 impl CsScan<'_, '_> {
     /// Resolve a type reference's text to its fqn via lexical scope, then visible types.
@@ -145,26 +141,36 @@ impl CsScan<'_, '_> {
             owner_fqn.to_string(),
             name.to_string(),
             explicit_generic_arity,
+            call_arity,
         );
         if !self.member_cache.contains_key(&key) {
             let candidates = class_unit_for_fq_name(self.csharp, owner_fqn)
                 .map(|owner| {
-                    nearest_member_candidates_for_owner(
-                        self.analyzer,
-                        self.csharp,
-                        &owner,
-                        name,
-                        explicit_generic_arity,
+                    call_arity.map_or_else(
+                        || {
+                            nearest_member_candidates_for_owner(
+                                self.analyzer,
+                                self.csharp,
+                                &owner,
+                                name,
+                                explicit_generic_arity,
+                            )
+                        },
+                        |arity| {
+                            applicable_member_candidates_for_owner(
+                                self.analyzer,
+                                self.csharp,
+                                &owner,
+                                name,
+                                explicit_generic_arity,
+                                arity,
+                            )
+                        },
                     )
                 })
                 .unwrap_or_default()
                 .into_iter()
-                .map(|candidate| CachedMember {
-                    fqn: candidate.fq_name(),
-                    callable_arity: candidate
-                        .is_function()
-                        .then(|| csharp_callable_arity(self.analyzer, &candidate)),
-                })
+                .map(|candidate| candidate.fq_name())
                 .collect();
             self.member_cache.insert(key.clone(), candidates);
         }
@@ -172,17 +178,7 @@ impl CsScan<'_, '_> {
             .member_cache
             .get(&key)
             .expect("member cache entry was inserted");
-        let callees = candidates
-            .iter()
-            .filter(|candidate| {
-                !call_arity.is_some_and(|arity| {
-                    candidate
-                        .callable_arity
-                        .is_some_and(|callable| !callable.accepts(arity))
-                })
-            })
-            .map(|candidate| candidate.fqn.clone())
-            .collect::<Vec<_>>();
+        let callees = candidates.clone();
         if !callees.is_empty() {
             for callee in callees {
                 self.record(callee, node);
@@ -508,9 +504,14 @@ fn receiver_type_fqn(
                     .or_else(|| ctx.resolve_type_fqn_at(name, receiver))
             })
         }
-        "this" | "base" => ctx
+        "this" => ctx
             .enclosing_class(receiver.start_byte())
             .map(str::to_string),
+        "base" => ctx
+            .enclosing_class(receiver.start_byte())
+            .and_then(|owner| class_unit_for_fq_name(ctx.csharp, owner))
+            .and_then(|owner| usage_direct_base(ctx.analyzer, ctx.csharp, &owner))
+            .map(|owner| owner.fq_name()),
         "invocation_expression" => invocation_return_type_fqn(receiver, ctx, bindings),
         "parenthesized_expression" | "checked_expression" => receiver
             .named_child(0)
