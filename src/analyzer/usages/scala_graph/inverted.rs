@@ -6936,7 +6936,9 @@ fn record_reference(
                                 }
                             }
                         }
-                    } else if !record_qualified_package_call(field, ctx) {
+                    } else if !record_qualified_stable_reference(field, ctx, bindings)
+                        && !record_qualified_package_call(field, ctx)
+                    {
                         let call_arities = call_arities_for_reference(field);
                         let extensions =
                             visible_extensions(ctx, name, None, call_arities.as_deref());

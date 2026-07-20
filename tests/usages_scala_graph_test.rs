@@ -3779,6 +3779,83 @@ object NumberUse {
 }
 
 #[test]
+fn scala_package_qualified_applications_and_typed_primitive_receivers_resolve_exactly() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "scala/Primitives.scala",
+            r#"
+package scala
+
+class Int {
+  def -(other: Int): Int = this
+  def toLong: Long = ???
+}
+class Boolean {
+  def &&(other: Boolean): Boolean = this
+}
+class Char {
+  def !=(other: Char): Boolean = ???
+}
+class Long
+"#,
+        ),
+        (
+            "kyo/Maybe.scala",
+            r#"
+package kyo
+
+object Maybe {
+  def apply(value: Int): Int = value
+}
+"#,
+        ),
+        (
+            "fansi/Str.scala",
+            r#"
+package fansi
+
+final class Str
+object Str {
+  def apply(value: String): Str = ???
+}
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"
+package app
+
+object Use {
+  val maybe = kyo.Maybe(1) // positive-package-object-apply
+  val rendered = fansi.Str("value") // positive-package-companion-apply
+
+  def primitives(offset: Int, enabled: Boolean, ch: Char): Long = {
+    val previous = offset - 1 // positive-typed-int-infix
+    val active = enabled && true // positive-typed-boolean-infix
+    val different = ch != 'x' // positive-typed-char-infix
+    offset.toLong // positive-typed-int-selection
+  }
+}
+"#,
+        ),
+    ]);
+
+    for (target, marker) in [
+        ("kyo.Maybe$.apply", "positive-package-object-apply"),
+        ("fansi.Str$.apply", "positive-package-companion-apply"),
+        ("scala.Int.-", "positive-typed-int-infix"),
+        ("scala.Boolean.&&", "positive-typed-boolean-infix"),
+        ("scala.Char.!=", "positive-typed-char-infix"),
+        ("scala.Int.toLong", "positive-typed-int-selection"),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&target_hits, marker);
+    }
+}
+
+#[test]
 fn scala_selection_label_stable_and_type_usages_preserve_exact_targets() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (

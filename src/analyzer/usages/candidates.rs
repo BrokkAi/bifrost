@@ -297,7 +297,8 @@ fn find_text_candidates(
     cancellation: Option<&CancellationToken>,
 ) -> HashSet<ProjectFile> {
     let identifier = source_identifier_for_target(target);
-    if identifier.trim().is_empty() {
+    let companion_identifier = scala_companion_syntax_candidate_identifier(target);
+    if identifier.trim().is_empty() && companion_identifier.is_none() {
         return HashSet::default();
     }
 
@@ -344,7 +345,8 @@ fn find_text_candidates(
         if is_cancelled(cancellation) {
             return;
         }
-        if content.contains(identifier)
+        if (content.contains(identifier)
+            || companion_identifier.is_some_and(|owner| content.contains(owner)))
             && let Ok(mut sink) = matches.lock()
         {
             sink.insert(file.clone());
@@ -468,6 +470,23 @@ fn should_union_text_candidates(target: &CodeUnit) -> bool {
         // Text search supplies candidate files only; the structured Scala
         // resolver still enforces lexical/import precedence and exact identity.
         || (language == Language::Scala && target.package_name() == "scala")
+        // Calls and extractors can use companion syntax without spelling the
+        // callable (`pkg.Factory(...)`, `case pkg.Factory(...)`). Scan the
+        // terminal stable owner name to admit those files as candidates; the
+        // Scala graph still proves the exact object and callable role.
+        || scala_companion_syntax_candidate_identifier(target).is_some()
+}
+
+fn scala_companion_syntax_candidate_identifier(target: &CodeUnit) -> Option<&str> {
+    if language_for_target(target) != Language::Scala
+        || !target.is_function()
+        || !matches!(target.identifier(), "apply" | "unapply" | "unapplySeq")
+    {
+        return None;
+    }
+    let (owner, _) = target.short_name().rsplit_once('.')?;
+    let terminal = owner.rsplit('.').next()?;
+    terminal.strip_suffix('$').filter(|name| !name.is_empty())
 }
 
 fn is_scala_symbolic_method_identifier(identifier: &str) -> bool {
