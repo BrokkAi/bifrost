@@ -15274,6 +15274,52 @@ fn cpp_template_type_qualifier_focus_uses_structured_type_names() {
 }
 
 #[test]
+fn cpp_scoped_template_alias_reference_preserves_specialization_arguments() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "choice.h",
+            r#"namespace persist {
+struct Special {};
+struct Shared {};
+template <typename T, typename Tag> class choice {};
+template <typename T> class choice<T, Shared> {};
+template <> class choice<Special, Shared> {};
+template <typename T> using selected = choice<T, Shared>;
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            "#include \"choice.h\"\nusing persist::Special;\npersist::selected<Special> value;\n",
+        )
+        .build();
+    let line = "persist::selected<Special> value;";
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [{
+                "path": "consumer.cc",
+                "line": 3,
+                "column": column_of(line, "selected")
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "the explicit specialization must outrank the partial specialization: {value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["fqn"], "persist.choice<Special, Shared>",
+        "{value}"
+    );
+}
+
+#[test]
 fn cpp_constructor_call_resolves_to_header_constructor_declaration() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

@@ -208,11 +208,13 @@ fn cpp_reference_node(node: Node<'_>) -> Option<CppReferenceNode<'_>> {
             current = parent.parent()?;
             continue;
         }
-        if matches!(
-            parent.kind(),
-            "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
-        ) && qualified_access_focus(current, parent, &["scope"], &["name"])
-            == Some(QualifiedAccessFocus::Member)
+        if current.kind() != "template_type"
+            && matches!(
+                parent.kind(),
+                "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+            )
+            && qualified_access_focus(current, parent, &["scope"], &["name"])
+                == Some(QualifiedAccessFocus::Member)
         {
             current = parent;
             continue;
