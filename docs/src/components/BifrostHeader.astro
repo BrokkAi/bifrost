@@ -37,6 +37,15 @@ const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
 	</nav>
 	<div class="bifrost-header-search sl-flex print:hidden"><Search /></div>
 	<div class="bifrost-header-tools sl-hidden md:sl-flex print:hidden">
+		<a
+			class="license-invite"
+			href={`${root}license-use-cases/`}
+			aria-label="Free to use under LGPL-3.0-or-later. See license and use cases."
+		>
+			<span>Free to use</span>
+			<small>LGPL-3</small>
+			<i aria-hidden="true">↗</i>
+		</a>
 		<div class="sl-flex social-icons"><SocialIcons /></div>
 		<ThemeSelect />
 		<LanguageSelect />
@@ -164,6 +173,72 @@ const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
 			gap: 0.72rem;
 		}
 
+		.license-invite {
+			display: none;
+			align-items: center;
+			gap: 0.42rem;
+			padding: 0.38rem 0.52rem;
+			border: 1px solid rgb(235 63 51 / 0.36);
+			border-radius: 0.3rem;
+			background: rgb(235 63 51 / 0.065);
+			box-shadow: inset 0 1px rgb(255 255 255 / 0.035);
+			font-family: var(--sl-font-mono);
+			line-height: 1;
+			text-decoration: none;
+			white-space: nowrap;
+			transition:
+				background-color 150ms ease,
+				border-color 150ms ease,
+				box-shadow 150ms ease,
+				transform 150ms ease;
+		}
+
+		.license-invite::before {
+			width: 0.36rem;
+			height: 0.36rem;
+			background: #eb3f33;
+			box-shadow: 0 0 9px rgb(235 63 51 / 0.72);
+			content: '';
+			transform: rotate(45deg);
+		}
+
+		.license-invite span {
+			color: #f4f1ec;
+			font-size: 0.65rem;
+			font-weight: 600;
+			letter-spacing: 0.035em;
+		}
+
+		.license-invite small {
+			padding-inline-start: 0.42rem;
+			border-inline-start: 1px solid rgb(255 255 255 / 0.14);
+			color: #948b7e;
+			font-size: 0.58rem;
+			letter-spacing: 0.045em;
+		}
+
+		.license-invite i {
+			color: #ff6a5f;
+			font-size: 0.7rem;
+			font-style: normal;
+			transition: transform 150ms ease;
+		}
+
+		.license-invite:hover,
+		.license-invite:focus-visible {
+			border-color: rgb(255 106 95 / 0.72);
+			background: rgb(235 63 51 / 0.15);
+			box-shadow:
+				0 0 0 1px rgb(235 63 51 / 0.08),
+				0 8px 24px rgb(235 63 51 / 0.13);
+			transform: translateY(-1px);
+		}
+
+		.license-invite:hover i,
+		.license-invite:focus-visible i {
+			transform: translate(1px, -1px);
+		}
+
 		.social-icons {
 			align-items: center;
 			gap: 0.65rem;
@@ -184,17 +259,35 @@ const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
 
 		@media (min-width: 72rem) {
 			.bifrost-header-shell {
-				grid-template-columns: minmax(11rem, auto) 1fr minmax(10rem, 20rem) auto;
+				grid-template-columns: minmax(11rem, auto) minmax(0, 1fr) auto auto;
 			}
 
 			.bifrost-primary-nav {
 				display: flex;
+			}
+
+			.license-invite {
+				display: inline-flex;
 			}
 		}
 
 		@media (max-width: 49.99rem) {
 			.bifrost-header-shell {
 				grid-template-columns: minmax(0, 1fr) auto;
+			}
+		}
+
+		@media (prefers-reduced-motion: reduce) {
+			.license-invite,
+			.license-invite i {
+				transition: none;
+			}
+
+			.license-invite:hover,
+			.license-invite:focus-visible,
+			.license-invite:hover i,
+			.license-invite:focus-visible i {
+				transform: none;
 			}
 		}
 	}

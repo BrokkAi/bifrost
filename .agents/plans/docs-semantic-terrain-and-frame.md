@@ -144,3 +144,13 @@ Revision note (2026-07-20 12:05Z): Recorded the measured medium-width collision 
 Revision note (2026-07-20 12:09Z): Recorded the linked Brokk byline requested during browser review.
 
 Revision note (2026-07-20 12:15Z): Replaced the illustrative pseudo-query and fabricated latency with valid RQL and result labels that match the structural call-query domain.
+
+Revision note (2026-07-20 14:29Z): Added a reviewable directed-symbol-graph treatment to the semantic terrain: route arrowheads, restrained relation labels, three symbol labels, a secondary reference edge, and an explicit symbol/usage-graph caption.
+
+Revision note (2026-07-20 14:41Z): Simplified the graph after review: removed the explanatory caption and secondary branch, then made the single route a typed pipeline using the schema-owned RQL spellings `enclosing-decl`, `callees`, and `references-of` with result-domain-appropriate node labels.
+
+Revision note (2026-07-20 12:42Z): Added an accessible spotlight interaction to the hero actions: the active button gains a distinct red or warm-white surface while its sibling recedes, keyboard focus receives the same treatment, and reduced-motion users keep the contrast change without movement.
+
+Revision note (2026-07-20 12:55Z): Added a compact wide-header license invitation linking to the existing license guidance, with concise free-to-use messaging, the LGPL-3 identifier, and responsive/reduced-motion behavior that avoids crowding smaller navigation states.
+
+Revision note (2026-07-20 13:08Z): Removed the desktop search column's reserved width so the primary navigation spans all available space between the brand and content-sized search control, centering the links within their actual neighboring controls.
