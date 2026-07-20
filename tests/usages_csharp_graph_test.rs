@@ -2931,6 +2931,70 @@ fn csharp_default_candidates_keep_generic_reference_arity() {
 }
 
 #[test]
+fn csharp_default_candidates_cover_each_namespace_declared_in_one_file() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Targets/First.cs",
+            "namespace First { public class FirstTarget {} }\n",
+        )
+        .file(
+            "Targets/Second.cs",
+            "namespace Second { public class SecondTarget {} }\n",
+        )
+        .file(
+            "Consumers/MultiNamespace.cs",
+            r#"
+namespace First {
+    public class FirstConsumer {
+        FirstTarget value;
+    }
+}
+
+namespace Second {
+    public class SecondConsumer {
+        SecondTarget value;
+    }
+}
+"#,
+        )
+        .build();
+    let workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("persisted multi-namespace C# project should build");
+    let analyzer = workspace.analyzer();
+    let target = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .find(|unit| unit.is_class() && unit.fq_name() == "Second.SecondTarget")
+        .expect("second namespace target declaration");
+    let consumer = project.file("Consumers/MultiNamespace.cs");
+
+    let referencing = analyzer
+        .import_analysis_provider()
+        .expect("C# import analysis")
+        .referencing_files_of(target.source());
+    assert!(
+        referencing.contains(&consumer),
+        "multi-namespace reverse index omitted the second namespace: {referencing:#?}"
+    );
+
+    let query = UsageFinder::new().query(analyzer, &[target], 1000, 1000);
+    assert!(
+        query.candidate_files.contains(&consumer),
+        "default routing omitted the second namespace: {:#?}",
+        query.candidate_files
+    );
+    let hits = query
+        .result
+        .into_either()
+        .expect("multi-namespace type query should resolve");
+    assert_eq!(1, hits.len(), "{hits:#?}");
+    let hit = hits.iter().next().expect("one multi-namespace usage");
+    assert_eq!(consumer, hit.file);
+    assert!(hit.snippet.contains("SecondTarget value"), "{hit:#?}");
+}
+
+#[test]
 fn csharp_issue701_persisted_inverse_fallback_preserves_arity_and_physical_types() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
