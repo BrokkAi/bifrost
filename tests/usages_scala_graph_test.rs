@@ -5087,6 +5087,208 @@ object Consumer {
 }
 
 #[test]
+fn scala_inverse_uses_default_and_absolute_type_namespaces_with_exact_precedence() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "library/scala/Core.scala",
+            r#"package scala
+class Int
+object Int { val MinValue: Int = null }
+class Option[A]
+object None
+class deprecated extends scala.annotation.StaticAnnotation
+class Any
+class Null
+"#,
+        ),
+        (
+            "other/Other.scala",
+            r#"package other
+class Option[A]
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+object Use {
+  val number: Int = null // positive-default-type
+  val option: Option[Int] = null // positive-default-generic
+  val none = None // positive-default-object
+  val minimum = Int.MinValue // positive-default-stable-member
+  @deprecated class Old // positive-default-annotation
+}
+"#,
+        ),
+        (
+            "shadow/Use.scala",
+            r#"package shadow
+import other.*
+object Use {
+  val option: Option[Int] = null // negative-wildcard-over-default
+}
+"#,
+        ),
+        (
+            "rooted/Use.scala",
+            r#"package rooted
+object scala { class Option[A] }
+object Use {
+  val absolute: _root_.scala.Option[Int] = null // positive-absolute-root
+  val relative: scala.Option[Int] = null // negative-local-scala-root
+}
+"#,
+        ),
+        (
+            "intrinsic/Use.scala",
+            r#"package intrinsic
+object Use {
+  val any: Any = null // negative-intrinsic-any
+  val nothing: Null = null // negative-intrinsic-null
+}
+"#,
+        ),
+    ]);
+
+    for (target_fqn, marker) in [
+        ("scala.Int", "positive-default-type"),
+        ("scala.Option", "positive-default-generic"),
+        ("scala.None$", "positive-default-object"),
+        ("scala.Int$.MinValue", "positive-default-stable-member"),
+        ("scala.deprecated", "positive-default-annotation"),
+        ("scala.Option", "positive-absolute-root"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, marker);
+    }
+
+    let option = definition(&analyzer, "scala.Option");
+    let option_hits = authoritative_scala_hits(&analyzer, &option);
+    assert_no_hit_contains(&option_hits, "negative-wildcard-over-default");
+    assert_no_hit_contains(&option_hits, "negative-local-scala-root");
+    let default_query =
+        UsageFinder::new().query(&analyzer, std::slice::from_ref(&option), 1000, 100);
+    assert!(
+        default_query
+            .candidate_files
+            .iter()
+            .any(|file| file.rel_path() == std::path::Path::new("app/Use.scala")),
+        "implicit scala consumers must enter the production candidate scope: {:#?}",
+        default_query.candidate_files
+    );
+    assert_hit_contains(&hits(default_query.result), "positive-default-generic");
+
+    for (target_fqn, marker) in [
+        ("scala.Any", "negative-intrinsic-any"),
+        ("scala.Null", "negative-intrinsic-null"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_no_hit_contains(&target_hits, marker);
+    }
+}
+
+#[test]
+fn scala_default_namespace_keeps_same_file_identity_and_global_duplicates_ambiguous() {
+    let replica = |marker: &str| {
+        format!(
+            r#"package scala
+class Int {{
+  val self: Int = null // {marker}-same-file
+}}
+class Option[A]
+"#
+        )
+    };
+    let jvm = replica("jvm");
+    let js = replica("js");
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("jvm/scala/Core.scala", &jvm),
+        ("js/scala/Core.scala", &js),
+        (
+            "app/Use.scala",
+            r#"package app
+object Use {
+  val option: Option[Int] = null // negative-ambiguous-default
+}
+"#,
+        ),
+    ]);
+
+    for (platform, path) in [
+        ("jvm", "jvm/scala/Core.scala"),
+        ("js", "js/scala/Core.scala"),
+    ] {
+        let target = analyzer
+            .get_definitions("scala.Int")
+            .into_iter()
+            .find(|unit| rel_path_string(unit.source()) == path)
+            .unwrap_or_else(|| panic!("missing exact scala.Int in {path}"));
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, &format!("{platform}-same-file"));
+        assert_no_hit_contains(&target_hits, "negative-ambiguous-default");
+        let other = if platform == "jvm" { "js" } else { "jvm" };
+        assert_no_hit_contains(&target_hits, &format!("{other}-same-file"));
+    }
+}
+
+#[test]
+fn scala_inverse_resolves_exported_owner_this_and_intermediate_stable_types_exactly() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "kyo/Types.scala",
+            r#"package kyo
+object Fields {
+  object Pin { opaque type Pin = Int }
+  export Pin.*
+}
+class Schema {
+  type Focused = Int
+  class Inner {
+    val focused: Schema.this.Focused = 1 // positive-owner-this
+  }
+}
+object Use {
+  val pin: Fields.Pin = null // positive-exported-alias
+}
+"#,
+        ),
+        (
+            "akka/stream/scaladsl/Sink.scala",
+            r#"package akka.stream.scaladsl
+object Sink { def foreachAsync(value: Int): Int = value }
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+import akka.stream.scaladsl
+object Use {
+  val selected = scaladsl.Sink.foreachAsync(1) // positive-intermediate-object
+}
+object Shadow {
+  final class LocalSink { def foreachAsync(value: Int): Int = value }
+  final class LocalApi { val Sink: LocalSink = new LocalSink }
+  val scaladsl: LocalApi = new LocalApi
+  val local = scaladsl.Sink.foreachAsync(2) // negative-shadowed-intermediate
+}
+"#,
+        ),
+    ]);
+
+    for (target_fqn, marker) in [
+        ("kyo.Fields$.Pin$.Pin", "positive-exported-alias"),
+        ("kyo.Schema.Focused", "positive-owner-this"),
+        ("akka.stream.scaladsl.Sink$", "positive-intermediate-object"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, marker);
+        assert_no_hit_contains(&target_hits, "negative-shadowed-intermediate");
+    }
+}
+
+#[test]
 fn scala_file_major_scan_preserves_forward_roles_across_namespace_and_inheritance_shapes() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (
@@ -5312,6 +5514,24 @@ fn hits(result: FuzzyResult) -> Vec<UsageHit> {
         .expect("expected usage graph success")
         .into_iter()
         .collect()
+}
+
+fn authoritative_scala_hits(analyzer: &ScalaAnalyzer, target: &CodeUnit) -> Vec<UsageHit> {
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        analyzer.get_analyzed_files().into_iter().collect(),
+    ));
+    hits(
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                analyzer,
+                std::slice::from_ref(target),
+                Some(&provider),
+                1000,
+                100,
+            )
+            .result,
+    )
 }
 
 fn assert_hit_contains(hits: &[UsageHit], needle: &str) {

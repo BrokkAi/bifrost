@@ -41,17 +41,18 @@ use super::syntax::{
     ScalaImportContextIndex, ScalaMethodValueContext, ScalaPackageContextIndex,
     ScalaParameterTypeIdentity, ScalaQualifiedStableTypeRole, ScalaSourceFacts,
     ScalaTypeExpressionPath, call_arities_for_reference, call_site_shape_for_reference,
-    enclosing_template_declarations, invocation_function_reference,
-    is_bare_companion_method_value_reference, is_call_function_reference,
-    is_constructor_like_reference, is_declaration_name, is_extractor_reference,
-    is_field_expression_value, is_identifier_node, is_infix_pattern_operator,
-    is_owner_qualified_this, is_scala_case_pattern_binder, is_scala_class_reference,
-    is_scala_named_argument_assignment, is_scala_object_reference, is_semantic_call_argument,
-    is_terminal_stable_field_reference, named_argument_invocation_owner, node_text,
-    parenthesized_arity, qualified_stable_type_reference, resolve_stable_object_expression,
-    scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
-    scala_callable_shape_matches, scala_import_is_visible_at_byte, scala_pattern_binder_names,
-    scala_source_facts, scala_union_type_alternative_paths, stable_identifier_prefix_reference,
+    enclosing_template_declarations, intermediate_field_qualifier_reference,
+    invocation_function_reference, is_bare_companion_method_value_reference,
+    is_call_function_reference, is_constructor_like_reference, is_declaration_name,
+    is_extractor_reference, is_field_expression_value, is_identifier_node,
+    is_infix_pattern_operator, is_owner_qualified_this, is_scala_case_pattern_binder,
+    is_scala_class_reference, is_scala_named_argument_assignment, is_scala_object_reference,
+    is_semantic_call_argument, is_terminal_stable_field_reference, named_argument_invocation_owner,
+    node_text, parenthesized_arity, qualified_stable_type_reference,
+    resolve_stable_object_expression, scala_callable_alternative_is_candidate,
+    scala_callable_alternative_matches, scala_callable_shape_matches,
+    scala_import_is_visible_at_byte, scala_pattern_binder_names, scala_source_facts,
+    scala_union_type_alternative_paths, stable_identifier_prefix_reference,
     stable_identifier_reference, template_direct_term_member_named, template_self_type,
     terminal_invocation_owner_name,
 };
@@ -552,7 +553,7 @@ impl ProjectTypes {
     fn direct_member_bindings(&self, owner_fqn: &str) -> ExportedMemberBindings {
         let mut bindings = ExportedMemberBindings::default();
         for child in self.index.fqn_direct_children(owner_fqn) {
-            if child.is_function() || child.is_field() {
+            if child.is_function() || child.is_field() || self.type_aliases.contains(&child) {
                 let visible_name = child
                     .short_name()
                     .rsplit('.')
@@ -620,12 +621,16 @@ impl ProjectTypes {
                     self,
                     false,
                 );
+                let lexical_root = export
+                    .owner_path
+                    .first()
+                    .and_then(|root| self.exact_nested_object_for_owner(scala, &current, root));
                 let Some(source_owner_fqn) = self.resolve_qualified_stable_type_at(
                     scala,
                     &resolver,
                     &export.owner_path,
                     true,
-                    None,
+                    lexical_root,
                 ) else {
                     continue;
                 };
@@ -1104,13 +1109,13 @@ impl ProjectTypes {
         FieldResolution::NoMatch
     }
 
-    pub(super) fn stable_type_member_for_owner(
+    pub(super) fn stable_type_member_for_owner_unit(
         &self,
         scala: &ScalaAnalyzer,
-        owner_fqn: &str,
+        owner: &CodeUnit,
         member: &str,
     ) -> FieldResolution {
-        let mut level = vec![owner_fqn.to_string()];
+        let mut level = vec![owner.clone()];
         let mut seen = HashSet::default();
         while !level.is_empty() {
             let mut matches = Vec::new();
@@ -1120,16 +1125,52 @@ impl ProjectTypes {
                     continue;
                 }
                 matches.extend(
-                    self.members_for_exact_owner_name(&owner, member)
+                    self.members_for_exact_owner_unit(scala, &owner, member)
                         .into_iter()
-                        .filter(|unit| unit.is_field())
+                        .filter(|unit| unit.is_field() || self.is_type_alias(scala, unit))
                         .cloned(),
                 );
-                next.extend(
-                    self.direct_field_ancestors_for_owner(scala, &owner)
-                        .into_iter()
-                        .map(|ancestor| ancestor.fq_name()),
-                );
+                // Export aliases do not have a declaration under the exporter.
+                // Consult parser-recorded export bindings only for a physically
+                // unique exporter and require one physical target for every
+                // selected binding.
+                let exported_bindings = self
+                    .exported_member_bindings(scala, &owner)
+                    .into_iter()
+                    .filter(|(visible_name, _)| visible_name == member)
+                    .collect::<Vec<_>>();
+                if !exported_bindings.is_empty() {
+                    let physical_owners = self
+                        .index
+                        .by_fqn(&owner.fq_name())
+                        .iter()
+                        .filter(|candidate| candidate.is_class())
+                        .collect::<Vec<_>>();
+                    if physical_owners.len() != 1 || physical_owners[0] != &owner {
+                        return FieldResolution::Unresolved;
+                    }
+                }
+                for (_, target_fqn) in exported_bindings {
+                    let exported = self
+                        .index
+                        .by_fqn(&target_fqn)
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.is_field() || self.is_type_alias(scala, candidate)
+                        })
+                        .collect::<Vec<_>>();
+                    let [exported] = exported.as_slice() else {
+                        return FieldResolution::Unresolved;
+                    };
+                    matches.push((*exported).clone());
+                }
+                let ancestors = match self.exact_direct_ancestor_resolution(scala, &owner) {
+                    ScalaDirectAncestorResolution::Resolved(ancestors) => ancestors,
+                    ScalaDirectAncestorResolution::Ambiguous => {
+                        return FieldResolution::Unresolved;
+                    }
+                };
+                next.extend(ancestors);
             }
             if !matches.is_empty() {
                 let type_members = matches
@@ -2947,6 +2988,18 @@ impl ProjectTypes {
         TypeChildren: FnMut(&CodeUnit, &str) -> Vec<CodeUnit>,
     {
         let (first, rest) = segments.split_first()?;
+        if first == "_root_" {
+            if rest.is_empty() {
+                return None;
+            }
+            let normalized = scala_normalized_fq_name(&rest.join("."));
+            return if require_physical_terminal {
+                self.unique_type_by_normalized_fqn(&normalized)
+                    .map(CodeUnit::fq_name)
+            } else {
+                self.logical_type_by_normalized_fqn(&normalized)
+            };
+        }
         if rest.is_empty() {
             return (if require_physical_terminal {
                 resolver.resolve(first)
@@ -3074,7 +3127,38 @@ impl ProjectTypes {
         lexical_roots: Vec<CodeUnit>,
     ) -> Option<CodeUnit> {
         let (first, rest) = segments.split_first()?;
+        if first == "_root_" {
+            if rest.is_empty() {
+                return None;
+            }
+            let normalized = scala_normalized_fq_name(&rest.join("."));
+            return if terminal_object {
+                self.unique_object_by_normalized_fqn(scala, &normalized)
+                    .cloned()
+            } else {
+                self.unique_type_by_normalized_fqn(&normalized).cloned()
+            };
+        }
         if rest.is_empty() {
+            let mut lexical_matches = lexical_roots
+                .into_iter()
+                .filter(|candidate| scala_simple_type_name(candidate) == *first)
+                .filter(|candidate| {
+                    if terminal_object {
+                        self.type_accepts_object_roles(scala, candidate)
+                    } else {
+                        candidate.is_class() || self.is_type_alias(scala, candidate)
+                    }
+                })
+                .collect::<Vec<_>>();
+            lexical_matches.sort();
+            lexical_matches.dedup();
+            if let [resolved] = lexical_matches.as_slice() {
+                return Some(resolved.clone());
+            }
+            if !lexical_matches.is_empty() {
+                return None;
+            }
             let fqn = if terminal_object {
                 resolver.resolve_object(first)
             } else {
@@ -5156,6 +5240,16 @@ fn add_hierarchy_package_object_bindings<F>(
     }
 }
 
+fn scala_default_namespace_is_source_backed(name: &str) -> bool {
+    !matches!(
+        name,
+        // These are compiler-provided lattice types. A source declaration with
+        // the same spelling (notably in negative compiler tests) must not turn
+        // an intrinsic reference into a physical inverse edge.
+        "Any" | "AnyRef" | "Nothing" | "Null" | "Singleton" | "Matchable"
+    )
+}
+
 impl NameResolver {
     pub(super) fn resolve_unit(&self, name: &str) -> Option<CodeUnit> {
         self.names.resolve_exact(name)
@@ -5217,19 +5311,41 @@ impl NameResolver {
         let file_package = package.unwrap_or_default();
         let package_prefixes = package.into_iter().map(str::to_string).collect::<Vec<_>>();
         for required in required_names {
+            if scala_default_namespace_is_source_backed(required) {
+                add_hierarchy_package_type_bindings(&mut names, types, "scala", required, |_| 0);
+                add_hierarchy_package_object_bindings(
+                    &mut object_names,
+                    types,
+                    "scala",
+                    required,
+                    |_| 0,
+                );
+            }
             add_hierarchy_package_type_bindings(
                 &mut names,
                 types,
                 file_package,
                 required,
-                |decl| u8::from(source_file == Some(decl.source())) * 3,
+                |decl| {
+                    if source_file == Some(decl.source()) {
+                        4
+                    } else {
+                        1
+                    }
+                },
             );
             add_hierarchy_package_object_bindings(
                 &mut object_names,
                 types,
                 file_package,
                 required,
-                |decl| u8::from(source_file == Some(decl.source())) * 3,
+                |decl| {
+                    if source_file == Some(decl.source()) {
+                        4
+                    } else {
+                        1
+                    }
+                },
             );
         }
 
@@ -5261,16 +5377,16 @@ impl NameResolver {
                             })
                             .collect::<Vec<_>>();
                         for declaration in ordinary {
-                            names.add_declaration(required.clone(), declaration, 1);
+                            names.add_declaration(required.clone(), declaration, 2);
                         }
                         for declaration in children.iter().filter(|unit| {
                             unit.is_class()
                                 && unit.short_name().ends_with('$')
                                 && scala_simple_type_name(unit) == *required
                         }) {
-                            object_names.add_declaration(required.clone(), declaration, 1);
+                            object_names.add_declaration(required.clone(), declaration, 2);
                             if !names.contains(required) {
-                                names.add_declaration(required.clone(), declaration, 1);
+                                names.add_declaration(required.clone(), declaration, 2);
                             }
                         }
                     }
@@ -5281,14 +5397,14 @@ impl NameResolver {
                             types,
                             &owner.fqn,
                             required,
-                            |_| 1,
+                            |_| 2,
                         );
                         add_hierarchy_package_object_bindings(
                             &mut object_names,
                             types,
                             &owner.fqn,
                             required,
-                            |_| 1,
+                            |_| 2,
                         );
                     }
                 }
@@ -5313,16 +5429,16 @@ impl NameResolver {
                 continue;
             };
             if tier.declaration && tier.package {
-                ambiguous_import_priorities.insert(local_name.to_string(), 2);
+                ambiguous_import_priorities.insert(local_name.to_string(), 3);
             }
             if tier.declaration {
                 let (type_declarations, object_declarations) =
                     types.explicit_import_type_declarations(&tier.candidate);
                 for declaration in &type_declarations {
-                    names.add_declaration(local_name.to_string(), declaration, 2);
+                    names.add_declaration(local_name.to_string(), declaration, 3);
                 }
                 for declaration in &object_declarations {
-                    object_names.add_declaration(local_name.to_string(), declaration, 2);
+                    object_names.add_declaration(local_name.to_string(), declaration, 3);
                 }
             }
             if tier.package {
@@ -5330,7 +5446,7 @@ impl NameResolver {
                     local_name.to_string(),
                     scala_normalized_fq_name(&tier.candidate),
                     None,
-                    2,
+                    3,
                 );
             }
         }
@@ -5424,6 +5540,20 @@ impl NameResolver {
         } else {
             package_prefixes
         };
+        // Every Scala compilation unit implicitly imports `scala.*`. Keep it
+        // below the active package and every explicit/wildcard import, and bind
+        // only physical source declarations so duplicate library replicas fail
+        // closed in the same way as ordinary imports.
+        for (simple, declaration) in types.package_types_in("scala").iter() {
+            if scala_default_namespace_is_source_backed(simple) {
+                names.add_declaration(simple.clone(), declaration, 0);
+            }
+        }
+        for (simple, declaration) in types.package_objects_in(scala, "scala").iter() {
+            if scala_default_namespace_is_source_backed(simple) {
+                object_names.add_declaration(simple.clone(), declaration, 0);
+            }
+        }
         // Parser-established package scopes are visible from innermost to
         // outermost. A dotted package clause contributes only its complete
         // package; it does not invent parent-package bindings.
@@ -5434,7 +5564,7 @@ impl NameResolver {
             // in this compilation unit beat imports. Within the package
             // scopes established by nested/sequential package clauses, the
             // innermost package wins over its enclosing package.
-            let package_priority = index.min(63) as u8;
+            let package_priority = 64u8.saturating_add(index.min(63) as u8);
             for (simple, decl) in types.package_types_in(package).iter() {
                 let priority = if source_file == Some(decl.source()) {
                     224u8.saturating_add(index.min(30) as u8)
@@ -6993,6 +7123,7 @@ fn record_reference(
             }
             if record_local_stable_field_reference(node, ctx, bindings)
                 || record_enclosing_field_qualifier(node, name, ctx, bindings)
+                || record_intermediate_stable_object_reference(node, ctx, bindings)
                 || (!is_terminal_stable_field_reference(node)
                     && record_qualified_stable_reference(node, ctx, bindings))
             {
@@ -7586,6 +7717,32 @@ fn record_qualified_stable_reference(
     if reference.segments.is_empty() {
         return true;
     }
+    if reference.role == ScalaQualifiedStableTypeRole::Type
+        && let [owner_name, this_segment, member] = reference.segments.as_slice()
+        && this_segment == "this"
+    {
+        let mut matches = Vec::new();
+        let mut enclosing = ctx.enclosing_class_unit(node.start_byte()).cloned();
+        while let Some(owner) = enclosing {
+            enclosing = ctx.types.exact_structural_parent(ctx.scala, &owner);
+            if owner.is_class() && scala_simple_type_name(&owner) == *owner_name {
+                matches.push(owner);
+            }
+        }
+        if let [owner] = matches.as_slice()
+            && let FieldResolution::Resolved(field) = ctx
+                .types
+                .stable_type_member_for_owner_unit(ctx.scala, owner, member)
+        {
+            let role = if ctx.types.is_type_alias(ctx.scala, &field.declaration) {
+                ScalaReferenceRole::Type
+            } else {
+                ScalaReferenceRole::Field
+            };
+            ctx.record_exact(field.declaration, role, node);
+        }
+        return true;
+    }
     if reference
         .segments
         .first()
@@ -7660,7 +7817,7 @@ fn record_qualified_stable_reference(
         let owner_lexical_root = owner_segments
             .first()
             .and_then(|root| ctx.lexically_visible_object_unit(node.start_byte(), root));
-        if let Some(owner) = ctx.types.resolve_qualified_stable_type_at(
+        if let Some(owner) = ctx.types.resolve_qualified_stable_type_unit_at(
             ctx.scala,
             &ctx.resolver,
             owner_segments,
@@ -7668,9 +7825,14 @@ fn record_qualified_stable_reference(
             owner_lexical_root,
         ) && let FieldResolution::Resolved(field) = ctx
             .types
-            .stable_type_member_for_owner(ctx.scala, &owner, member)
+            .stable_type_member_for_owner_unit(ctx.scala, &owner, member)
         {
-            ctx.record_exact(field.declaration, ScalaReferenceRole::Field, node);
+            let role = if ctx.types.is_type_alias(ctx.scala, &field.declaration) {
+                ScalaReferenceRole::Type
+            } else {
+                ScalaReferenceRole::Field
+            };
+            ctx.record_exact(field.declaration, role, node);
         }
         return true;
     }
@@ -7742,6 +7904,40 @@ fn record_qualified_stable_reference(
         }
     }
     true
+}
+
+fn record_intermediate_stable_object_reference(
+    node: Node<'_>,
+    ctx: &mut ScalaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
+) -> bool {
+    let Some(reference) = intermediate_field_qualifier_reference(node, ctx.source) else {
+        return false;
+    };
+    let Some(root) = reference.segments.first() else {
+        return false;
+    };
+    if !bindings.resolve_symbol(root).is_unknown() || bindings.is_shadowed(root) {
+        // Local and parameter roots belong to the established structured
+        // receiver-chain paths below, not to namespace-rooted stable objects.
+        return false;
+    }
+    let lexical_root = ctx.lexically_visible_object_unit(node.start_byte(), root);
+    if let Some(target) = ctx.types.resolve_qualified_stable_type_unit_at(
+        ctx.scala,
+        &ctx.resolver,
+        &reference.segments,
+        true,
+        lexical_root,
+    ) {
+        ctx.record_exact(target, ScalaReferenceRole::StableObject, node);
+        return true;
+    }
+    // This parser shape also covers ordinary field chains such as
+    // `Owner.this.service.run` and `state.payload.value`. An unresolved object
+    // prefix is therefore not authoritative; let the exact receiver/field
+    // paths below retain ownership.
+    false
 }
 
 /// Record a stable field path rooted in a parser-proven local binding. Namespace

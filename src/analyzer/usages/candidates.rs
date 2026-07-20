@@ -463,6 +463,11 @@ fn should_union_text_candidates(target: &CodeUnit) -> bool {
         || (language == Language::Scala
             && target.is_function()
             && is_scala_symbolic_method_identifier(target.identifier()))
+        // `scala.*` is imported implicitly, so ordinary import-graph
+        // candidates contain the declaration file but not its consumers.
+        // Text search supplies candidate files only; the structured Scala
+        // resolver still enforces lexical/import precedence and exact identity.
+        || (language == Language::Scala && target.package_name() == "scala")
 }
 
 fn is_scala_symbolic_method_identifier(identifier: &str) -> bool {

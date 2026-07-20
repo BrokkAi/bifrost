@@ -1361,6 +1361,45 @@ pub(crate) fn stable_identifier_prefix_reference<'tree>(
     }
 }
 
+/// Return the parser-backed stable field path whose terminal leaf is an
+/// intermediate qualifier of a longer selection. For example, visiting `Sink`
+/// in `scaladsl.Sink.foreachAsync` yields `[scaladsl, Sink]`. Requiring the
+/// enclosing field expression to be the value of another field expression
+/// keeps ordinary terminal selections under their existing receiver/member
+/// dispatch.
+pub(crate) fn intermediate_field_qualifier_reference<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<ScalaStableIdentifierReference> {
+    let expression = node.parent().filter(|parent| {
+        parent.kind() == "field_expression" && parent.child_by_field_name("field") == Some(node)
+    })?;
+    if !expression.parent().is_some_and(|parent| {
+        parent.kind() == "field_expression"
+            && parent.child_by_field_name("value") == Some(expression)
+    }) {
+        return None;
+    }
+
+    let mut fields = Vec::new();
+    let mut path = expression;
+    while path.kind() == "field_expression" {
+        fields.push(path.child_by_field_name("field")?);
+        path = path.child_by_field_name("value")?;
+    }
+    if !matches!(path.kind(), "identifier" | "type_identifier") {
+        return None;
+    }
+    fields.push(path);
+    fields.reverse();
+    let segments = fields
+        .into_iter()
+        .map(|segment| node_text(segment, source).trim().to_string())
+        .collect::<Vec<_>>();
+    (segments.len() >= 2 && segments.iter().all(|segment| !segment.is_empty()))
+        .then_some(ScalaStableIdentifierReference { segments })
+}
+
 fn is_bare_term_reference(node: Node<'_>) -> bool {
     if node.kind() != "identifier" {
         return false;
