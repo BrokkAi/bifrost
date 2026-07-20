@@ -414,6 +414,19 @@ impl ProjectTypes {
         self.type_aliases.contains(unit)
     }
 
+    /// Whether this field-shaped declaration identity also has a term-level
+    /// declaration. Scala permits a type alias and a `val` with the same name
+    /// in one owner; the analyzer intentionally coalesces those declarations
+    /// into one CodeUnit while retaining both parser-recorded signatures.
+    pub(super) fn has_term_field_declaration(&self, unit: &CodeUnit) -> bool {
+        unit.is_field()
+            && (!self.type_aliases.contains(unit)
+                || self
+                    .bulk_file_state(unit.source())
+                    .and_then(|state| state.signatures.get(unit))
+                    .is_some_and(|signatures| signatures.len() > 1))
+    }
+
     fn is_type_namespace_declaration(&self, unit: &CodeUnit) -> bool {
         unit.is_class() || self.type_aliases.contains(unit)
     }
@@ -972,7 +985,7 @@ impl ProjectTypes {
                 matches.extend(
                     self.members_for_exact_owner_name(&owner, member)
                         .into_iter()
-                        .filter(|unit| unit.is_field() && !self.is_type_alias(scala, unit))
+                        .filter(|unit| self.has_term_field_declaration(unit))
                         .map(|ancestor_method| (*ancestor_method).clone()),
                 );
                 next.extend(
@@ -1008,7 +1021,7 @@ impl ProjectTypes {
         let mut fields = self
             .members_for_exact_owner_unit(scala, owner, member)
             .into_iter()
-            .filter(|unit| unit.is_field() && !self.is_type_alias(scala, unit))
+            .filter(|unit| self.has_term_field_declaration(unit))
             .cloned()
             .collect::<Vec<_>>();
         fields.sort();
@@ -1041,7 +1054,7 @@ impl ProjectTypes {
                 matches.extend(
                     self.members_for_exact_owner_unit(scala, &owner, member)
                         .into_iter()
-                        .filter(|unit| unit.is_field() && !self.is_type_alias(scala, unit))
+                        .filter(|unit| self.has_term_field_declaration(unit))
                         .cloned(),
                 );
                 let ancestors = match self.exact_direct_ancestor_resolution(scala, &owner) {
@@ -1571,7 +1584,7 @@ impl ProjectTypes {
     }
 
     fn member_blocks_callable_lookup(&self, scala: &ScalaAnalyzer, member: &CodeUnit) -> bool {
-        member.is_field() && !self.is_type_alias(scala, member)
+        self.has_term_field_declaration(member)
             || member.is_class() && self.type_is_stable_owner(scala, member)
     }
 
@@ -3445,7 +3458,7 @@ impl ProjectTypes {
 
     fn exact_field(
         &self,
-        scala: &ScalaAnalyzer,
+        _scala: &ScalaAnalyzer,
         owner_fqn: &str,
         member: &str,
     ) -> Option<CodeUnit> {
@@ -3454,7 +3467,7 @@ impl ProjectTypes {
             .index
             .by_fqn(&field_fqn)
             .iter()
-            .filter(|unit| unit.is_field() && !self.is_type_alias(scala, unit))
+            .filter(|unit| self.has_term_field_declaration(unit))
             .collect::<Vec<_>>();
         (fields.len() == 1).then(|| fields[0].clone())
     }
@@ -6529,6 +6542,18 @@ fn record_reference(
                 && bindings.resolve_symbol(text).is_unknown()
                 && !bindings.is_shadowed(text)
             {
+                // Extractors live in Scala's term namespace. An inherited
+                // stable field therefore wins even when a same-named type
+                // alias is visible (for example `FSM.Event`, where the trait
+                // exposes both `type Event` and `val Event`). Resolve that
+                // exact field before consulting type/application candidates.
+                if let Some(owner) = ctx.enclosing_class_unit(node.start_byte())
+                    && let FieldResolution::Resolved(field) =
+                        ctx.types.field_for_owner_unit(ctx.scala, owner, text)
+                {
+                    ctx.record_exact(field.declaration, ScalaReferenceRole::Field, node);
+                    return;
+                }
                 let class_fqn = ctx.visible_type(node, text);
                 let resolution = ctx.types.resolve_type_application(
                     ctx.scala,
@@ -6600,14 +6625,6 @@ fn record_reference(
                     },
                     node,
                 );
-            } else if (is_extractor_reference(node) || is_infix_pattern_operator(node))
-                && bindings.resolve_symbol(text).is_unknown()
-                && !bindings.is_shadowed(text)
-                && let Some(owner) = ctx.enclosing_class_unit(node.start_byte())
-                && let FieldResolution::Resolved(field) =
-                    ctx.types.field_for_owner_unit(ctx.scala, owner, text)
-            {
-                ctx.record_exact(field.declaration, ScalaReferenceRole::Field, node);
             }
         }
         "call_expression" => {

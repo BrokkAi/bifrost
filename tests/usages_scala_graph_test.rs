@@ -8007,27 +8007,41 @@ object Tasty {
 
 #[test]
 fn scala_usage_finder_resolves_inherited_stable_extractor_fields() {
-    let (_project, analyzer) = scala_analyzer_with_files(&[(
-        "akka/Model.scala",
-        r#"package akka
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "akka/FSM.scala",
+            r#"package akka
 
-trait FSM {
-  case class EventData(value: Int)
-  val Event = EventData
+object FSM {
+  final case class Event[D](event: D)
 }
 
-final class Manager extends FSM {
+trait FSM[D] {
+  import FSM._
+  type Event = FSM.Event[D]
+  val Event: FSM.Event.type = FSM.Event
+}
+"#,
+        ),
+        (
+            "akka/Manager.scala",
+            r#"package akka
+
+final class Manager extends FSM[Int] {
+  def keep(event: Event): Event = event // positive-inherited-event-type
   def receive(value: Any): Int = value match {
     case Event(number) => number // positive-inherited-stable-extractor
     case _ => 0
   }
 }
 "#,
-    )]);
+        ),
+    ]);
     let event = definition(&analyzer, "akka.FSM.Event");
     let event_hits =
         hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&event)));
     assert_hit_contains(&event_hits, "positive-inherited-stable-extractor");
+    assert_hit_contains(&event_hits, "positive-inherited-event-type");
 }
 
 #[test]
