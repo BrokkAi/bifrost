@@ -380,6 +380,85 @@ fn csharp_graph_resolves_nested_partial_type_references_in_sibling_file() {
 }
 
 #[test]
+fn usage_finder_csharp_resolves_sibling_nested_constructor_in_enclosing_type() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "Demo/Nested.cs",
+        r#"namespace Demo;
+
+public class Outer {
+    public class Consumer {
+        public object Build() => new Target(42);
+    }
+
+    public class Target(int value) {}
+}
+
+public class OtherOuter {
+    public class Target(int value) {}
+    public object Build() => new Target(7);
+}
+"#,
+    )]);
+
+    let consumer = project.file("Demo/Nested.cs");
+    let source = consumer.read_to_string().expect("nested source");
+    let outer_call = source
+        .find("Target(42)")
+        .expect("outer target construction");
+    let other_call = source.find("Target(7)").expect("other target construction");
+    let outer_target = type_definition(&analyzer, "Demo.Outer$Target");
+    let other_target = type_definition(&analyzer, "Demo.OtherOuter$Target");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    let forward = definition_lookup(
+        project.root(),
+        "Demo/Nested.cs",
+        outer_call,
+        outer_call + "Target".len(),
+    );
+    assert_eq!(forward["results"][0]["status"], "resolved", "{forward}");
+    assert_eq!(
+        forward["results"][0]["definitions"][0]["fqn"], "Demo.Outer$Target",
+        "{forward}"
+    );
+
+    let targeted = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&outer_target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result
+        .into_either()
+        .expect("targeted sibling-nested query should resolve");
+    let whole_workspace = UsageFinder::new()
+        .query(&analyzer, std::slice::from_ref(&outer_target), 1000, 1000)
+        .result
+        .into_either()
+        .expect("whole-workspace sibling-nested query should resolve");
+    for hits in [&targeted, &whole_workspace] {
+        assert_eq!(hits.len(), 1, "{hits:#?}");
+        assert!(hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= outer_call
+                && outer_call + "Target".len() <= hit.end_offset
+        }));
+    }
+
+    let unrelated_hits = graph_hits(&analyzer, &other_target);
+    assert_eq!(unrelated_hits.len(), 1, "{unrelated_hits:#?}");
+    assert!(unrelated_hits.iter().any(|hit| {
+        hit.file == consumer
+            && hit.start_offset <= other_call
+            && other_call + "Target".len() <= hit.end_offset
+    }));
+}
+
+#[test]
 fn csharp_graph_nested_type_reference_respects_type_parameter_shadow() {
     let (project, analyzer) = csharp_analyzer_with_files(&[
         (

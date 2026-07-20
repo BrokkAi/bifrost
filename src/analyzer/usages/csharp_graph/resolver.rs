@@ -869,7 +869,7 @@ pub(super) fn resolve_type_fq_name_at(
     if let Some(canonical) = canonical_builtin_type_identity(&normalized) {
         return Some(canonical.to_string());
     }
-    resolve_in_enclosing_class_ranges(csharp, class_ranges, &normalized, node.start_byte())
+    resolve_in_enclosing_type_scopes(csharp, class_ranges, &normalized, node.start_byte())
         .map(|unit| unit.fq_name())
         .or_else(|| resolve_usage_visible_type_fq_name(csharp, file, &normalized))
         .or_else(|| class_unit_for_fq_name(csharp, &normalized).map(|unit| unit.fq_name()))
@@ -964,7 +964,7 @@ fn resolve_usage_visible_type_fq_name(
         .flatten()
 }
 
-fn resolve_in_enclosing_class_ranges(
+fn resolve_in_enclosing_type_scopes(
     csharp: &CSharpAnalyzer,
     class_ranges: &ClassRangeIndex,
     name: &str,
@@ -973,19 +973,49 @@ fn resolve_in_enclosing_class_ranges(
     if name.is_empty() || name.contains('.') {
         return None;
     }
-    let mut scope = class_ranges.enclosing(byte)?.to_string();
+
+    let mut scope = class_ranges.enclosing_unit(byte)?.clone();
     loop {
-        if scope.is_empty() {
-            return None;
+        let mut parts = csharp.usage_partial_type_parts(&scope);
+        if parts.is_empty() {
+            parts.push(scope.clone());
         }
-        let child_fqn = format!("{scope}.{name}");
-        if let Some(child) = class_unit_for_fq_name(csharp, &child_fqn) {
-            return Some(child);
+        let mut candidates = parts
+            .into_iter()
+            .flat_map(|part| csharp.direct_children(&part))
+            .filter(|child| child.is_class() && csharp_source_identifier(child) == name)
+            .collect::<Vec<_>>();
+        if !candidates.is_empty() {
+            csharp.sort_dedup_type_candidates(&mut candidates);
+            return (csharp.logical_type_count(&candidates) == 1)
+                .then(|| candidates.into_iter().next())
+                .flatten();
         }
-        match scope.rfind('.') {
-            Some(idx) => scope.truncate(idx),
-            None => return None,
+
+        let Some(parent) = csharp.parent_of(&scope) else {
+            return resolve_in_enclosing_namespace(csharp, scope.package_name(), name);
+        };
+        scope = parent;
+    }
+}
+
+fn resolve_in_enclosing_namespace(
+    csharp: &CSharpAnalyzer,
+    namespace: &str,
+    name: &str,
+) -> Option<CodeUnit> {
+    let mut namespace = namespace.to_string();
+    loop {
+        let candidate_fqn = if namespace.is_empty() {
+            name.to_string()
+        } else {
+            format!("{namespace}.{name}")
+        };
+        if let Some(candidate) = class_unit_for_fq_name(csharp, &candidate_fqn) {
+            return Some(candidate);
         }
+        let separator = namespace.rfind('.')?;
+        namespace.truncate(separator);
     }
 }
 
