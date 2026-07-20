@@ -152,10 +152,18 @@ const nodes = [
 			<span></span> Bifrost by <a href="https://brokk.ai" rel="external">Brokk</a>
 			<b>Analyzer online</b>
 		</p>
-		<h1 id="_top" data-page-title>Code intelligence <em>for AI.</em></h1>
+		<h1
+			id="_top"
+			data-page-title
+			aria-label="Code intelligence for AI, developers, researchers, security teams, and tool builders."
+		>
+			Code intelligence
+			<em><span class="hero-audience" data-hero-audience aria-hidden="true">for AI.</span></em>
+		</h1>
 		<p class="hero-tagline">
-			Give coding agents a structured model of the repository instead of another pile of text. Query
-			symbols, trace usage graphs, and analyze large multi-language codebases locally.
+			Give agents and teams a structured model of the repository instead of another pile of text.
+			Query symbols, trace usage graphs, enforce structural policies, and analyze large multi-language
+			codebases locally.
 		</p>
 		{
 			actions.length > 0 && (
@@ -192,6 +200,50 @@ const nodes = [
 	</div>
 </section>
 
+<script>
+	const audiences = [
+		{ text: 'for AI.', scale: '1' },
+		{ text: 'for developers.', scale: '0.78' },
+		{ text: 'for researchers.', scale: '0.74' },
+		{ text: 'for security teams.', scale: '0.6' },
+		{ text: 'for tool builders.', scale: '0.67' },
+	];
+
+	function startAudienceRotation() {
+		const audience = document.querySelector<HTMLElement>('[data-hero-audience]');
+		if (
+			!audience ||
+			audience.dataset.rotationStarted ||
+			window.matchMedia('(prefers-reduced-motion: reduce)').matches
+		) {
+			return;
+		}
+
+		audience.dataset.rotationStarted = 'true';
+		let audienceIndex = 0;
+		const interval = window.setInterval(() => {
+			if (!audience.isConnected) {
+				window.clearInterval(interval);
+				return;
+			}
+			if (document.hidden) return;
+
+			audience.classList.add('is-changing');
+			window.setTimeout(() => {
+				if (!audience.isConnected) return;
+				audienceIndex = (audienceIndex + 1) % audiences.length;
+				const nextAudience = audiences[audienceIndex];
+				audience.textContent = nextAudience.text;
+				audience.style.setProperty('--audience-scale', nextAudience.scale);
+				audience.classList.remove('is-changing');
+			}, 180);
+		}, 3600);
+	}
+
+	startAudienceRotation();
+	document.addEventListener('astro:page-load', startAudienceRotation);
+</script>
+
 <style>
 	@layer starlight.user {
 		.bifrost-hero {
@@ -200,7 +252,7 @@ const nodes = [
 			min-height: min(43rem, calc(100vh - var(--sl-nav-height) - 3rem));
 			display: grid;
 			align-items: center;
-			padding: clamp(3.5rem, 8vw, 7.5rem) clamp(0rem, 2vw, 1.5rem) clamp(6rem, 13vw, 11rem);
+			padding: clamp(2rem, 4.5vw, 4.5rem) clamp(0rem, 2vw, 1.5rem) clamp(6rem, 13vw, 11rem);
 			overflow: hidden;
 		}
 
@@ -280,6 +332,19 @@ const nodes = [
 			color: #eb3f33;
 			font-style: normal;
 			text-shadow: 0 0 38px rgb(235 63 51 / 0.22);
+		}
+
+		.hero-audience {
+			display: inline-block;
+			white-space: nowrap;
+			transform: translateY(0) scale(var(--audience-scale, 1));
+			transform-origin: left center;
+			transition: opacity 180ms ease, transform 180ms ease;
+		}
+
+		.hero-audience.is-changing {
+			opacity: 0;
+			transform: translateY(0.08em) scale(var(--audience-scale, 1));
 		}
 
 		.hero-tagline {
@@ -706,6 +771,10 @@ const nodes = [
 		}
 
 		@media (prefers-reduced-motion: reduce) {
+			.hero-audience {
+				transition: none;
+			}
+
 			.hero-actions :global(a),
 			.hero-actions :global(a svg) {
 				transition: none;
