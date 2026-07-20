@@ -1,8 +1,11 @@
 mod common;
 
-use brokk_bifrost::usages::{UsageFinder, UsageHit};
+use brokk_bifrost::hash::HashSet;
+use brokk_bifrost::usages::{ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit};
 use brokk_bifrost::{CodeUnit, IAnalyzer, Language, RustAnalyzer};
 use common::InlineTestProject;
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 fn analyzer_for(source: &str) -> (common::BuiltInlineTestProject, RustAnalyzer) {
     let project = InlineTestProject::with_language(Language::Rust)
@@ -152,19 +155,52 @@ fn decoy() -> Decoy {
 #[test]
 fn inverse_rust_usages_keep_both_nested_same_file_calls() {
     let source = r#"
-fn filter_as_usize(value: usize) -> usize { value }
+pub struct Level(usize);
+pub struct LevelFilter(Option<Level>);
 
-fn compare(left: usize, right: usize) -> std::cmp::Ordering {
-    filter_as_usize(left).cmp(&filter_as_usize(right))
+fn filter_as_usize(value: &Option<Level>) -> usize { value.is_some() as usize }
+
+impl Ord for LevelFilter {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        filter_as_usize(&other.0).cmp(&filter_as_usize(&self.0))
+    }
 }
 
-fn shadowed(filter_as_usize: fn(usize) -> usize) -> usize {
-    filter_as_usize(0)
+fn shadowed(filter_as_usize: fn(&Option<Level>) -> usize) -> usize {
+    filter_as_usize(&None)
 }
 "#;
-    let (_project, analyzer) = analyzer_for(source);
-    let target = definition(&analyzer, "filter_as_usize");
-    let found = hits(&analyzer, target);
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"tracing-core\"]\nresolver = \"2\"\n",
+        )
+        .file(
+            "tracing-core/Cargo.toml",
+            "[package]\nname = \"tracing-core\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "tracing-core/src/lib.rs",
+            "#[macro_export]\nmacro_rules! metadata { () => {} }\npub mod metadata;\n",
+        )
+        .file("tracing-core/src/metadata.rs", source)
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "tracing-core.src.metadata.filter_as_usize");
+    let candidates: HashSet<_> = [project.file("tracing-core/src/metadata.rs")]
+        .into_iter()
+        .collect();
+    let provider = ExplicitCandidateProvider::new(Arc::new(candidates));
+    let found: BTreeSet<_> = match UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(&analyzer, &[target], Some(&provider), 1, 100)
+        .result
+    {
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => hits_by_overload.into_values().flatten().collect(),
+        other => panic!("expected authoritative Rust usage success, got {other:#?}"),
+    };
     let expected: Vec<_> = source
         .match_indices("filter_as_usize")
         .skip(1)

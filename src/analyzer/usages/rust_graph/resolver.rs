@@ -211,12 +211,16 @@ fn rust_token_call_arguments(node: &Node<'_>) -> bool {
 
 pub(super) fn is_member_target(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
     // A member is referenced through a value of its owning type (`receiver.member`).
-    // A function or field whose parent is a module is a free item referenced by name,
-    // so it belongs on the top-level scan path, not the member-receiver path.
+    // Free items belong on the top-level scan path even if a same-FQN module/macro
+    // collision gives one a non-module hierarchy parent.
     (target.is_function() || target.is_field())
-        && analyzer
-            .parent_of(target)
-            .is_some_and(|parent| !parent.is_module())
+        && analyzer.parent_of(target).is_some_and(|parent| {
+            // Rust members are owned by structs, enums, traits, or impl target
+            // types. A same-FQN module/macro collision can otherwise attach a
+            // free item to a macro CodeUnit and incorrectly route it through
+            // receiver-based member scanning.
+            parent.is_class()
+        })
 }
 
 pub(super) fn is_trait_owner(rust: &RustAnalyzer, owner: &CodeUnit) -> bool {
