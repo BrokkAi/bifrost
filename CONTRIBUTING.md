@@ -71,13 +71,22 @@ plugin release metadata are versioned **together** and cut from a **single tag**
 `scripts/sync-release-version.mjs` copies it into the plugin and editor metadata
 that require literal JSON versions.
 
+Rust third-party license HTML is generated rather than committed. Release
+workflows generate it automatically. To inspect or package it locally, install
+`cargo-about` 0.9.1 and run:
+
+```bash
+scripts/generate-rust-third-party-notices.sh licenses/THIRD_PARTY_LICENSES.html
+```
+
+The generated path is ignored by Git.
+
 The agent and editor plugin manifests also carry release metadata and must be
 checked during release prep. Before tagging a release, edit only `Cargo.toml`,
 then run:
 
 ```bash
 node scripts/sync-release-version.mjs
-cargo about generate --offline --config licenses/about.toml --features python --locked --fail licenses/about.hbs -o licenses/THIRD_PARTY_LICENSES.html
 ```
 
 That script updates these committed version fields:
@@ -118,8 +127,9 @@ directory instead of hand-editing checksums.
 
 To cut a release:
 
-1. Bump `version` in `Cargo.toml`, run the version-sync and `cargo about`
-   commands above, review the generated metadata and notice diff, and merge.
+1. Bump `version` in `Cargo.toml`, run the version-sync command above, review
+   the generated metadata, and merge. Release workflows generate the Rust
+   dependency report from the tagged `Cargo.lock`; it is not committed.
 2. If skills, agents, launcher files, MCP config, or plugin manifests changed,
    regenerate and validate the generated plugin bundles:
 

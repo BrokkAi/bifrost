@@ -26,11 +26,12 @@ release archive instead of embedding its executable. The downloaded archive
 therefore carries its own Rust dependency report in addition to the notice files
 inside the extension or plugin.
 
-The source-controlled [Rust dependency
-report](https://github.com/BrokkAi/bifrost/blob/master/licenses/THIRD_PARTY_LICENSES.html)
-is generated from `Cargo.lock`, the default plus `python` feature graph, and the
-union of targets used by the binary and wheel release workflows. It is not a
-hand-maintained package list.
+The Rust dependency report shipped in each binary archive and Python package is
+generated during release from the tagged `Cargo.lock`, the default plus
+`python` feature graph, and the union of targets used by the binary and wheel
+release workflows. A single generated report is shared by every packaging job
+in a workflow run; it is not a hand-maintained or source-controlled package
+list.
 
 Cargo metadata describes the Rust wrapper crates, but does not expose separate
 `NOTICE` files or every license inside native source trees compiled by `*-sys`
@@ -92,9 +93,10 @@ delivered bytes and regenerate notices for that distribution.
 ## Maintaining The Reports
 
 Dependency updates must pass the repository's deny-by-default Cargo license
-policy. Release validation regenerates the Rust crate, supplemental, and VSIX
-reports from their lockfiles so an unreviewed license or missing notice cannot
-silently enter an artifact.
+policy. CI verifies that the Rust report can be generated, and release workflows
+generate and package it from the tagged lockfile. Supplemental and VSIX reports
+are also generated from their lockfiles so an unreviewed license or missing
+notice cannot silently enter an artifact.
 
 For Bifrost's own copyleft and integration obligations, return to [License and
 Use Cases](/license-use-cases/). The GNU LGPLv3 text is in
