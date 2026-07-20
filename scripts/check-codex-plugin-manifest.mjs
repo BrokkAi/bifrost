@@ -3,7 +3,10 @@
 import fs from "node:fs";
 import assert from "node:assert/strict";
 import { constants as fsConstants } from "node:fs";
-import { SUPPORTED_TARGETS } from "../plugins/bifrost-agent/bin/bifrost-launcher.mjs";
+import {
+  MINIMUM_MCP_STARTUP_TIMEOUT_MS,
+  SUPPORTED_TARGETS,
+} from "../plugins/bifrost-agent/bin/bifrost-launcher.mjs";
 import {
   AMP_SKILL_BUNDLE_ROOT,
   AMP_SKILL_NAME,
@@ -139,6 +142,30 @@ assert.deepStrictEqual(
   cursorMcpConfig.mcpServers?.bifrost?.args?.slice(0, 2),
   ["--mcp", "symbol|extended"],
   `${cursorMcpPath} should use the default Bifrost MCP toolset`,
+);
+const sharedMcpServer = mcpConfig.mcpServers?.bifrost;
+const cursorMcpServer = cursorMcpConfig.mcpServers?.bifrost;
+assert.deepStrictEqual(
+  cursorMcpServer?.startup_timeout_sec,
+  sharedMcpServer?.startup_timeout_sec,
+  `${cursorMcpPath} and ${mcpPath} should use the same startup timeout`,
+);
+assert.deepStrictEqual(
+  cursorMcpServer?.tool_timeout_sec,
+  sharedMcpServer?.tool_timeout_sec,
+  `${cursorMcpPath} and ${mcpPath} should use the same tool timeout`,
+);
+const minimumStartupTimeoutSec = Math.ceil(MINIMUM_MCP_STARTUP_TIMEOUT_MS / 1000);
+if ((sharedMcpServer?.startup_timeout_sec ?? 0) < minimumStartupTimeoutSec) {
+  throw new Error(
+    `${mcpPath} startup_timeout_sec must be at least ${minimumStartupTimeoutSec} seconds ` +
+    "to cover download, extraction, version probing, and startup margin",
+  );
+}
+assert.deepStrictEqual(
+  sharedMcpServer?.tool_timeout_sec,
+  300,
+  `${mcpPath} should retain the 300-second analyzer tool timeout`,
 );
 fs.accessSync("plugins/bifrost-agent/bin/bifrost-launcher.mjs", fsConstants.X_OK);
 

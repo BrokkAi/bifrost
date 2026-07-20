@@ -40,6 +40,24 @@ location. `BIFROST_BINARY_PATH` is the preferred local development override
 because it bypasses ambient `PATH` lookup. Launcher diagnostics go to stderr so
 stdio MCP traffic stays on stdin/stdout.
 
+The launcher also has commands that do not require a workspace. `doctor`
+checks the pinned version and configured binary candidates without modifying
+the cache or downloading anything. Compatibility checks execute each selected
+candidate with `--version`, so use `doctor` only with binary locations you
+trust. `prepare` follows the normal resolution order and,
+when automatic installation is enabled, downloads and verifies the pinned
+release without starting MCP. Both accept `--json` for stable machine-readable
+output:
+
+```bash
+plugins/bifrost-agent/bin/bifrost-launcher.mjs doctor
+plugins/bifrost-agent/bin/bifrost-launcher.mjs prepare
+```
+
+After `prepare` succeeds, start a fresh host task so it negotiates the restored
+Bifrost tool surface. `prepare` respects `BIFROST_LAUNCHER_AUTO_INSTALL=0`; unset
+that variable before explicitly preparing a missing release.
+
 For local development, build this checkout and point the launcher at the debug
 binary:
 
@@ -78,9 +96,10 @@ MCP server starts a separate stdio Bifrost process with:
 bifrost --root <resolved-workspace-root> --mcp "symbol|extended"
 ```
 
-The plugin gives Bifrost up to 60 seconds to start and up to 300 seconds for
-individual analyzer tool calls. Large workspaces may need that budget because
-Bifrost can build its persisted analyzer on the first real tool call.
+The plugin gives Bifrost up to 180 seconds to download, verify, extract, and
+start a missing pinned release, and up to 300 seconds for individual analyzer
+tool calls. Large workspaces may need the tool-call budget because Bifrost can
+build its persisted analyzer on the first real tool call.
 
 The default plugin toolset intentionally omits Bifrost's `workspace` and `text`
 MCP toolsets. That keeps local plugin installs focused on analyzer navigation
@@ -329,6 +348,12 @@ directories, or `BIFROST_AGENT_SKILL_DIR`. Start Amp from the workspace root, or
 set `BIFROST_WORKSPACE_ROOT=/path/to/workspace`. For local checkout testing, set
 `BIFROST_BINARY_PATH` so the launcher uses this build instead of downloading the
 pinned release.
+
+Amp does not expose the same configurable MCP startup budget as the shared
+Claude/Codex and Cursor manifests. After updating the Amp bundle, run the
+installed launcher's `doctor` command and, when needed, `prepare` before opening
+a fresh Amp task. The commands are available through the bundled
+`bifrost-code-intelligence/bin/bifrost-launcher.mjs` file.
 
 Validate with a prompt that requires an analyzer MCP tool on source code, not a
 README or docs file:

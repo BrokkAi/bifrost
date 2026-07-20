@@ -7,7 +7,7 @@
         "--mcp",
         "symbol|extended"
       ],
-      "startup_timeout_sec": 60,
+      "startup_timeout_sec": 180,
       "tool_timeout_sec": 300
     }
   }
