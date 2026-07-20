@@ -15,6 +15,7 @@ pub struct GlobalUsageDefinitionIndex {
     direct_children_by_fqn: HashMap<String, Vec<CodeUnit>>,
     direct_children_by_normalized_fqn: HashMap<String, Vec<CodeUnit>>,
     by_file_identifier: HashMap<(ProjectFile, String), Vec<CodeUnit>>,
+    by_identifier: HashMap<String, Vec<CodeUnit>>,
     packages: HashSet<String>,
     files_by_package: HashMap<String, Vec<ProjectFile>>,
     package_languages: HashMap<String, HashSet<Language>>,
@@ -369,6 +370,10 @@ impl GlobalUsageDefinitionIndex {
             .entry((unit.source().clone(), unit.identifier().to_string()))
             .or_default()
             .push(unit.clone());
+        self.by_identifier
+            .entry(unit.identifier().to_string())
+            .or_default()
+            .push(unit.clone());
     }
 
     pub(crate) fn sort_entries(&mut self) {
@@ -377,6 +382,10 @@ impl GlobalUsageDefinitionIndex {
         }
         for units in self.by_file_identifier.values_mut() {
             sort_units(units);
+        }
+        for units in self.by_identifier.values_mut() {
+            sort_units(units);
+            units.dedup();
         }
         for units in self.by_normalized_fqn.values_mut() {
             sort_units(units);
@@ -435,6 +444,13 @@ impl GlobalUsageDefinitionIndex {
             .get(&(file.clone(), ident.to_string()))
             .cloned()
             .unwrap_or_default()
+    }
+
+    pub(crate) fn identifier(&self, ident: &str) -> &[CodeUnit] {
+        self.by_identifier
+            .get(ident)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     #[doc(hidden)]

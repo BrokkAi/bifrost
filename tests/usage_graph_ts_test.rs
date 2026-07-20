@@ -82,6 +82,102 @@ fn namespace_imports_resolve_member_calls() {
 }
 
 #[test]
+fn qualified_type_references_create_exact_workspace_edges() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "options.ts",
+            "export interface PageOptions { enabled: boolean }\n",
+        )
+        .file(
+            "consumer.ts",
+            r#"
+import * as helper from "./options";
+
+enum EntityType { SECURITY_SERVICE }
+enum OtherEntityType { SECURITY_SERVICE }
+
+export function select(value: EntityType.SECURITY_SERVICE): helper.PageOptions {
+  return { enabled: true };
+}
+
+export function otherType(value: OtherEntityType.SECURITY_SERVICE): void {}
+export function runtime(helper: { PageOptions: number }, value: OtherEntityType) {
+  return helper.PageOptions + value.SECURITY_SERVICE;
+}
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&graph, "select", "EntityType"),
+        "same-file enum-member discriminants must resolve to their observable enum owner: {}",
+        graph["edges"]
+    );
+    assert!(
+        has_edge(&graph, "select", "PageOptions"),
+        "namespace-qualified imported types must resolve through the namespace binding: {}",
+        graph["edges"]
+    );
+    assert!(
+        !has_edge(&graph, "otherType", "EntityType"),
+        "a same-spelled discriminant on another enum must not match: {}",
+        graph["edges"]
+    );
+    assert!(
+        !has_edge(&graph, "runtime", "EntityType") && !has_edge(&graph, "runtime", "PageOptions"),
+        "ordinary member expressions must keep receiver-based resolution: {}",
+        graph["edges"]
+    );
+}
+
+#[test]
+fn ambient_companion_preserves_merged_workspace_type_edges() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "ambient.d.ts",
+            r#"
+declare namespace interop { interface StructType<T> {} }
+interface Packet { value: number }
+declare var Packet: interop.StructType<Packet>;
+declare var PacketConstructor: { prototype: Packet };
+
+function consume(value: Packet): Packet { return value; }
+
+function valueShadow() {
+  const Packet = 1;
+  let value: Packet;
+  return value;
+}
+
+function typeShadow() {
+  type Packet = { local: true };
+  let value: Packet;
+  return value;
+}
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&graph, "consume", "Packet"),
+        "ambient companions must preserve later function type edges: {}",
+        graph["edges"]
+    );
+    assert!(
+        has_edge(&graph, "valueShadow", "Packet"),
+        "a value-space shadow must not suppress the outer type-space Packet: {}",
+        graph["edges"]
+    );
+    assert!(
+        !has_edge(&graph, "typeShadow", "Packet"),
+        "a genuine nested type alias must suppress the outer Packet type: {}",
+        graph["edges"]
+    );
+}
+
+#[test]
 fn this_receiver_call_does_not_create_usage_graph_edge() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
@@ -347,6 +443,123 @@ export function caller() {
         "JS factory-produced receiver must not resolve by same member name: {}",
         graph["edges"]
     );
+}
+
+#[test]
+fn js_window_global_property_edges_from_bare_global_only() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "polyfills.js",
+            r#"
+window.Promise = function Promise() {};
+function readGlobal() { return typeof Promise; }
+function readExplicit() { return window.Promise; }
+function shadowed(Promise) { return typeof Promise; }
+function readOther() { return other.Promise; }
+other.Promise = makeOtherPromise();
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&graph, "readGlobal", "window.Promise"),
+        "bare browser global should resolve to the exact modeled window property: {}",
+        graph["edges"]
+    );
+    assert!(
+        has_edge(&graph, "readExplicit", "window.Promise"),
+        "explicit browser-global member reads should share the exact edge: {}",
+        graph["edges"]
+    );
+    assert!(
+        !has_edge(&graph, "shadowed", "window.Promise"),
+        "parameter shadows must not resolve to the browser global: {}",
+        graph["edges"]
+    );
+    assert!(
+        !has_edge(&graph, "readOther", "window.Promise"),
+        "same-name properties on unrelated objects must not resolve to the browser global: {}",
+        graph["edges"]
+    );
+}
+
+#[test]
+fn js_window_global_property_edges_reject_bound_declaration_receiver() {
+    for (source, extra_file) in [
+        (
+            r#"const window = makeLocalWindow();
+window.Promise = function Promise() {};
+function readGlobal() { return typeof Promise; }
+"#,
+            None,
+        ),
+        (
+            r#"import window from "./shim.js";
+window.Promise = function Promise() {};
+function readGlobal() { return typeof Promise; }
+"#,
+            Some("export default {};"),
+        ),
+        (
+            r#"const holder = function* window() {
+  window.Promise = function Promise() {};
+  function readGlobal() { return typeof Promise; }
+  return readGlobal();
+};
+"#,
+            None,
+        ),
+    ] {
+        let project =
+            InlineTestProject::with_language(Language::JavaScript).file("polyfills.js", source);
+        let project = if let Some(contents) = extra_file {
+            project.file("shim.js", contents)
+        } else {
+            project
+        }
+        .build();
+        let graph = usage_graph_at(project.root(), "{}");
+        assert!(
+            !has_edge(&graph, "readGlobal", "window.Promise"),
+            "a locally or import-bound window receiver is not the browser global: {}",
+            graph["edges"]
+        );
+    }
+}
+
+#[test]
+fn js_window_global_property_edges_respect_later_lexical_bindings() {
+    for (caller, body) in [
+        (
+            "readBeforeFileBinding",
+            r#"function readBeforeFileBinding() { return typeof Promise; }
+const Promise = makeLocalPromise();
+"#,
+        ),
+        (
+            "readBeforeFunctionBinding",
+            r#"function readBeforeFunctionBinding() {
+    const before = typeof Promise;
+    var Promise;
+    return before;
+}
+"#,
+        ),
+    ] {
+        let project = InlineTestProject::with_language(Language::JavaScript)
+            .file(
+                "polyfills.js",
+                format!("window.Promise = function Promise() {{}};\n{body}"),
+            )
+            .build();
+        let graph = usage_graph_at(project.root(), "{}");
+        assert!(
+            !has_edge(&graph, caller, "window.Promise"),
+            "TDZ and var-hoisted bindings must shadow earlier reads: {}",
+            graph["edges"]
+        );
+    }
 }
 
 #[test]

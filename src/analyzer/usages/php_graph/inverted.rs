@@ -31,13 +31,13 @@
 
 use super::resolver::node_text;
 use super::syntax::{
-    assignment_parts, declared_callable_return_type_fq_name, declared_field_type_fq_name,
-    is_local_scope, object_creation_type, seed_parameter_types, static_member_parts,
-    variable_identifier,
+    assignment_parts, declared_callable_return_type_fq_name, declared_instance_callable,
+    declared_instance_field, instance_receiver_type_fq_name, is_local_scope, object_creation_type,
+    seed_parameter_types, static_member_parts, static_scope_type_fq_name, variable_identifier,
 };
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
-    classify_reference_node, first_precise, parse_and_collect,
+    classify_reference_node, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{
@@ -92,6 +92,16 @@ impl PhpScan<'_, '_> {
         resolve_php_type(text, &self.ctx)
     }
 
+    fn resolve_type_reference_fqn(&self, node: Node<'_>) -> Option<String> {
+        static_scope_type_fq_name(
+            self.php,
+            self.analyzer,
+            node_text(node, self.source),
+            &self.ctx,
+            self.enclosing_class(node.start_byte()),
+        )
+    }
+
     /// The fqn of the smallest class declaration containing `byte`.
     fn enclosing_class(&self, byte: usize) -> Option<&str> {
         self.class_ranges.enclosing(byte)
@@ -113,13 +123,17 @@ fn walk(node: Node<'_>, scan: &mut PhpScan<'_, '_>, bindings: &mut LocalInferenc
         bindings.enter_scope();
         seed_parameters(node, scan, bindings);
     }
-    seed_assignment(node, scan, bindings);
     record_reference(node, scan, bindings);
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         walk(child, scan, bindings);
     }
+
+    // Assignment RHS expressions are evaluated against the incoming binding.
+    // Mutate the LHS only after every RHS reference has been recorded, so
+    // `$x = $x->method()` can still prove the receiver of `method`.
+    seed_assignment(node, scan, bindings);
 
     if enters_scope {
         bindings.exit_scope();
@@ -136,7 +150,7 @@ fn record_reference(
         // via the generic type-reference case below) so a construction counts once.
         "object_creation_expression" => {
             if let Some(type_node) = object_creation_type(node)
-                && let Some(fqn) = scan.resolve_type_fqn(node_text(type_node, scan.source))
+                && let Some(fqn) = scan.resolve_type_reference_fqn(type_node)
             {
                 scan.record(fqn, type_node);
             }
@@ -147,7 +161,7 @@ fn record_reference(
         // above, so skip it here to avoid double counting.
         "named_type" => {
             if !is_in_object_creation(node)
-                && let Some(fqn) = scan.resolve_type_fqn(node_text(node, scan.source))
+                && let Some(fqn) = scan.resolve_type_reference_fqn(node)
             {
                 scan.record(fqn, node);
             }
@@ -172,6 +186,7 @@ fn record_reference(
                 return;
             }
             if let Some(owner) = scope_class_fqn(scope, scan) {
+                scan.record(owner.clone(), scope);
                 scan.record(format!("{owner}.{method}"), name_node);
             }
         }
@@ -185,11 +200,22 @@ fn record_reference(
                 return;
             }
             if let Some(owner) = scope_class_fqn(scope, scan) {
+                scan.record(owner.clone(), scope);
                 scan.record(format!("{owner}.{property}"), name_node);
             }
         }
+        // `X::CONST`: the scope is also a type reference, independently of the
+        // member-constant edge. Relative scopes resolve from the enclosing owner.
+        "class_constant_access_expression" => {
+            let Some((scope, _)) = static_member_parts(node) else {
+                return;
+            };
+            if let Some(owner) = scope_class_fqn(scope, scan) {
+                scan.record(owner, scope);
+            }
+        }
         // `$obj->method(..)` instance call: type the receiver, giving `Owner.method`.
-        "member_call_expression" => {
+        "member_call_expression" | "nullsafe_member_call_expression" => {
             let (Some(object), Some(name_node)) = (
                 node.child_by_field_name("object"),
                 node.child_by_field_name("name"),
@@ -201,7 +227,11 @@ fn record_reference(
                 return;
             }
             if let Some(owner) = receiver_type_fqn(object, scan, bindings) {
-                scan.record(format!("{owner}.{method}"), name_node);
+                if let Some(callable) =
+                    declared_instance_callable(scan.php, scan.analyzer, &owner, method)
+                {
+                    scan.record(callable.fq_name(), name_node);
+                }
             } else {
                 scan.collector.record_unproven_name(
                     method,
@@ -210,10 +240,34 @@ fn record_reference(
                 );
             }
         }
+        // `$obj->field` and `$obj?->field`: type the receiver and record the
+        // declared member owner just as targeted usage search does.
+        "member_access_expression" | "nullsafe_member_access_expression" => {
+            let (Some(object), Some(name_node)) = (
+                node.child_by_field_name("object"),
+                node.child_by_field_name("name"),
+            ) else {
+                return;
+            };
+            let member = node_text(name_node, scan.source);
+            if member.is_empty() {
+                return;
+            }
+            if let Some(owner) = receiver_type_fqn(object, scan, bindings)
+                && let Some(field) =
+                    declared_instance_field(scan.php, scan.analyzer, &owner, member)
+            {
+                scan.record(field.fq_name(), name_node);
+            }
+        }
         // A bare constant name in reference position (`LIMIT`): not a call, not a
         // member, not a declaration. Resolves to the namespace constant fqn.
-        "name" => {
-            if is_bare_constant_reference(node)
+        "name" | "relative_scope" => {
+            if is_instanceof_type_name(node)
+                && let Some(fqn) = scan.resolve_type_reference_fqn(node)
+            {
+                scan.record(fqn, node);
+            } else if is_bare_constant_reference(node)
                 && let Some(fqn) = resolve_php_constant(node_text(node, scan.source), &scan.ctx)
             {
                 scan.record(fqn, node);
@@ -227,12 +281,13 @@ fn record_reference(
 /// type, or `self`/`static`/`parent` → the enclosing class.
 fn scope_class_fqn(scope: Node<'_>, scan: &PhpScan<'_, '_>) -> Option<String> {
     let text = node_text(scope, scan.source);
-    match text {
-        "self" | "static" | "parent" => {
-            scan.enclosing_class(scope.start_byte()).map(str::to_string)
-        }
-        _ => scan.resolve_type_fqn(text),
-    }
+    static_scope_type_fq_name(
+        scan.php,
+        scan.analyzer,
+        text,
+        &scan.ctx,
+        scan.enclosing_class(scope.start_byte()),
+    )
 }
 
 /// The fqn of an instance-call receiver's type. `$this` is the enclosing class; a
@@ -243,44 +298,15 @@ fn receiver_type_fqn(
     scan: &PhpScan<'_, '_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> Option<String> {
-    match object.kind() {
-        "variable_name" => {
-            let name = variable_identifier(object, scan.source);
-            if name == "this" {
-                return scan
-                    .enclosing_class(object.start_byte())
-                    .map(str::to_string);
-            }
-            first_precise(bindings, name)
-        }
-        "object_creation_expression" => object_creation_type(object)
-            .and_then(|type_node| scan.resolve_type_fqn(node_text(type_node, scan.source))),
-        "parenthesized_expression" => object
-            .named_child(0)
-            .and_then(|inner| receiver_type_fqn(inner, scan, bindings)),
-        "member_access_expression" => receiver_member_access_type_fqn(object, scan, bindings),
-        _ => None,
-    }
-}
-
-fn receiver_member_access_type_fqn(
-    access: Node<'_>,
-    scan: &PhpScan<'_, '_>,
-    bindings: &LocalInferenceEngine<String>,
-) -> Option<String> {
-    let object = access.child_by_field_name("object")?;
-    let name = access.child_by_field_name("name")?;
-    let owner = receiver_type_fqn(object, scan, bindings)?;
-    let member = node_text(name, scan.source);
-    if member.is_empty() {
-        return None;
-    }
-    let field_fqn = format!("{owner}.{member}");
-    let field = scan
-        .analyzer
-        .definitions(&field_fqn)
-        .find(|unit| unit.is_field())?;
-    declared_field_type_fq_name(scan.php, scan.analyzer, &field)
+    instance_receiver_type_fq_name(
+        scan.php,
+        scan.analyzer,
+        object,
+        scan.source,
+        &scan.ctx,
+        bindings,
+        |start, _end| scan.enclosing_class(start).map(str::to_string),
+    )
 }
 
 /// Seed parameter types into the binding scope: a `simple_parameter` with a type
@@ -371,6 +397,19 @@ fn declared_callable_return_type_fqn(scan: &PhpScan<'_, '_>, callable_fqn: &str)
 fn is_in_object_creation(node: Node<'_>) -> bool {
     node.parent()
         .is_some_and(|parent| parent.kind() == "object_creation_expression")
+}
+
+fn is_instanceof_type_name(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    parent.kind() == "binary_expression"
+        && parent
+            .child_by_field_name("operator")
+            .is_some_and(|operator| operator.kind() == "instanceof")
+        && parent.child_by_field_name("right").is_some_and(|right| {
+            right.start_byte() <= node.start_byte() && node.end_byte() <= right.end_byte()
+        })
 }
 
 /// True when a `name` node is a bare constant reference (not a call target, not a

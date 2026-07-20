@@ -1,7 +1,9 @@
 use crate::analyzer::js_ts::imports::require_call_module_specifier;
 use crate::analyzer::js_ts::syntax::{
-    is_commonjs_require_declarator, is_declaration_identifier, is_object_in_member_expression,
-    is_property_key_in_member, slice,
+    JsTsLexicalBindingIndex, JsTsLexicalBindingScope, direct_property_definitions,
+    is_commonjs_require_declarator, is_declaration_identifier,
+    is_lexically_nested_type_declaration, is_object_in_member_expression,
+    is_property_key_in_member, nested_type_identifier_parts, slice, static_member_receiver,
 };
 use crate::analyzer::usages::get_definition::js_ts::{
     ts_resolve_type_text_to_property_owners, ts_type_annotation_text,
@@ -13,7 +15,8 @@ use crate::analyzer::usages::js_ts_graph::hits::{
     record_unproven_hit,
 };
 use crate::analyzer::usages::js_ts_graph::resolver::{
-    JsTsUsageIndex, is_static_member, member_name,
+    JsTsUsageIndex, browser_global_property_shape, is_static_member, member_name,
+    unbound_browser_global_property,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{ExportEntry, ExportIndex, ImportBinder, UsageHit};
@@ -32,6 +35,7 @@ const TARGET_BINDING: &str = "__target__";
 const TARGET_VALUE_BINDING: &str = "__target_value__";
 const TARGET_OBJECT_BINDING: &str = "__target_object__";
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn scan_files_for_seeds(
     analyzer: &dyn IAnalyzer,
     index: &JsTsUsageIndex,
@@ -39,16 +43,32 @@ pub(super) fn scan_files_for_seeds(
     target: &CodeUnit,
     seeds: &BTreeSet<(ProjectFile, String)>,
     language: Language,
+    exported_local_property_root: Option<&str>,
     cancellation: Option<&CancellationToken>,
 ) -> BTreeSet<UsageHit> {
     let collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
     let unproven_collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
+    let browser_global_shape = (language == Language::JavaScript)
+        .then(|| browser_global_property_shape(target))
+        .flatten();
     let target_owner = analyzer.parent_of(target);
     let target_member = target_owner
         .as_ref()
         .is_none_or(|owner| !owner.is_module() && !owner.is_file_scope())
         .then(|| member_name(target))
         .flatten();
+    let browser_global_object = target_owner
+        .is_none()
+        .then(|| browser_global_shape.map(|(object, _)| object))
+        .flatten();
+    let lookup_only_local_property = language == Language::JavaScript
+        && target_owner.is_none()
+        && target.is_field()
+        && exported_local_property_root.is_none()
+        && !analyzer.declarations(target.source()).contains(target);
+    let direct_local_property =
+        lookup_only_local_property || exported_local_property_root.is_some();
+    let direct_local_property_ranges = direct_local_property.then(|| analyzer.ranges(target));
     let target_short = target_seed_identifier(target, target_owner.as_ref());
     let reference_needle = target_member.as_deref().unwrap_or(&target_short);
     let target_owner_source = target_owner.as_ref().map(|owner| owner.source().clone());
@@ -110,6 +130,26 @@ pub(super) fn scan_files_for_seeds(
         }
 
         let root = tree_ref.root_node();
+        let lexical_bindings = ((browser_global_object.is_some() || direct_local_property)
+            && target_self_file)
+            .then(|| JsTsLexicalBindingIndex::build(root, source_str));
+        let browser_global_object = lexical_bindings.as_ref().and_then(|lexical_bindings| {
+            unbound_browser_global_property(analyzer, target, root, source_str, lexical_bindings)
+                .map(|(object, _)| object)
+        });
+        let local_property_definitions = lexical_bindings.as_ref().and_then(|lexical_bindings| {
+            let target_member = target_member.as_deref()?;
+            let target_ranges = direct_local_property_ranges.as_deref()?;
+            let definitions = collect_local_property_definitions(
+                root,
+                source_str,
+                target_ranges,
+                target_member,
+                lexical_bindings,
+                exported_local_property_root,
+            );
+            (!definitions.is_empty()).then_some(definitions)
+        });
         let receiver_facts = JsTsReceiverFactProvider::new(
             analyzer,
             analyzer.global_usage_definition_index(),
@@ -127,6 +167,9 @@ pub(super) fn scan_files_for_seeds(
             target,
             target_short: &target_short,
             target_member: target_member.as_deref(),
+            browser_global_object,
+            lookup_only_local_property,
+            local_property_definitions,
             edges: &edges,
             seeds,
             target_self_file,
@@ -136,8 +179,10 @@ pub(super) fn scan_files_for_seeds(
             imports,
             aliases,
             receiver_facts,
+            lexical_bindings,
             scope_stack: vec![HashMap::default()],
             binding_engine,
+            type_binding_engine: LocalInferenceEngine::new(LocalInferenceConfig::default()),
             hits: &mut local_hits,
             unproven_hits: &mut local_unproven_hits,
         };
@@ -177,6 +222,12 @@ pub(super) struct ScanCtx<'a> {
     target_short: &'a str,
     /// For members, the member name (e.g. `foo` in `BaseClass.foo`); otherwise None.
     target_member: Option<&'a str>,
+    /// Exact host object for a parentless browser-global property such as `window.Promise`.
+    browser_global_object: Option<&'a str>,
+    /// Parentless JS fields omitted from the declaration catalog remain available for
+    /// exact, same-file definition lookup and targeted usage scans.
+    lookup_only_local_property: bool,
+    local_property_definitions: Option<Vec<LocalPropertyDefinition>>,
     /// Import edges from this file that resolve to the target's seed set.
     edges: &'a [ImportEdge],
     /// Exported names that resolve to the target, including local and re-export aliases.
@@ -190,8 +241,10 @@ pub(super) struct ScanCtx<'a> {
     imports: ImportBinder,
     aliases: AliasResolver,
     receiver_facts: JsTsReceiverFactProvider<'a, 'a>,
+    lexical_bindings: Option<JsTsLexicalBindingIndex>,
     scope_stack: Vec<HashMap<String, LocalBinding>>,
     binding_engine: LocalInferenceEngine<&'static str>,
+    type_binding_engine: LocalInferenceEngine<()>,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
     pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
@@ -201,6 +254,82 @@ enum LocalBinding {
     Other,
     KnownUnrelated,
     TargetReceiver,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalPropertyDefinition {
+    receiver_root: String,
+    receiver_members: Vec<String>,
+    scope: JsTsLexicalBindingScope,
+    range: Range,
+}
+
+fn collect_local_property_definitions(
+    root: Node<'_>,
+    source: &str,
+    target_ranges: &[Range],
+    target_member: &str,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+    required_receiver: Option<&str>,
+) -> Vec<LocalPropertyDefinition> {
+    direct_property_definitions(root, source, target_ranges, target_member)
+        .into_iter()
+        .filter_map(|fact| {
+            let receiver_root = slice(fact.receiver.root, source);
+            if required_receiver.is_some_and(|required| {
+                receiver_root != required || !fact.receiver.members.is_empty()
+            }) {
+                return None;
+            }
+            let scope = lexical_bindings
+                .binding_scope_at(receiver_root, fact.receiver.root.start_byte())?;
+            let definition = LocalPropertyDefinition {
+                receiver_root: receiver_root.to_string(),
+                receiver_members: fact
+                    .receiver
+                    .members
+                    .into_iter()
+                    .map(|member| slice(member, source).to_string())
+                    .collect(),
+                scope,
+                range: fact.range,
+            };
+            Some(definition)
+        })
+        .collect()
+}
+
+fn range_contains_node(range: &Range, node: Node<'_>) -> bool {
+    range.start_byte <= node.start_byte() && node.end_byte() <= range.end_byte
+}
+
+fn local_property_read_matches(
+    object: Node<'_>,
+    property: Node<'_>,
+    source: &str,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+    definitions: &[LocalPropertyDefinition],
+) -> bool {
+    let Some(receiver) = static_member_receiver(object, source) else {
+        return false;
+    };
+    let receiver_root = slice(receiver.root, source);
+    let Some(scope) = lexical_bindings.binding_scope_at(receiver_root, receiver.root.start_byte())
+    else {
+        return false;
+    };
+    definitions.iter().any(|definition| {
+        definition.receiver_root == receiver_root
+            && definition.receiver_members.len() == receiver.members.len()
+            && definition
+                .receiver_members
+                .iter()
+                .zip(&receiver.members)
+                .all(|(expected, actual)| expected == slice(*actual, source))
+            && definition.scope == scope
+            && definition.range.start_byte < property.start_byte()
+            && !range_contains_node(&definition.range, property)
+    })
 }
 
 impl ScanCtx<'_> {
@@ -224,6 +353,20 @@ impl ScanCtx<'_> {
         // In the target's own file, the bare class/function name is itself a reference
         // worth reporting (covers `BaseClass.foo()` and `extends BaseClass` written in
         // the same file).
+        self.target_self_file && ident == self.target_short
+    }
+
+    fn binds_target_type(&self, ident: &str) -> bool {
+        if self.type_binding_engine.is_shadowed(ident) {
+            return false;
+        }
+        if self
+            .edges
+            .iter()
+            .any(|edge| edge.local_name == ident && edge_binds_bare_identifier(edge))
+        {
+            return true;
+        }
         self.target_self_file && ident == self.target_short
     }
 
@@ -263,10 +406,12 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     );
     if introduces_scope {
         ctx.binding_engine.enter_scope();
+        ctx.type_binding_engine.enter_scope();
         register_function_parameters(node, ctx);
         ctx.scope_stack.push(HashMap::default());
         register_scope_parameters(node, ctx);
     }
+    register_lexical_type_shadow(node, ctx);
 
     // Skip import statements outright — bindings declared there are not usages.
     if matches!(
@@ -279,6 +424,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         if introduces_scope {
             ctx.scope_stack.pop();
             ctx.binding_engine.exit_scope();
+            ctx.type_binding_engine.exit_scope();
         }
         return;
     }
@@ -309,6 +455,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 
     match kind {
+        "nested_type_identifier" => handle_nested_type_identifier(node, ctx),
         "identifier" | "type_identifier" | "shorthand_property_identifier" => {
             handle_identifier_candidate(node, ctx);
         }
@@ -326,6 +473,20 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if introduces_scope {
         ctx.scope_stack.pop();
         ctx.binding_engine.exit_scope();
+        ctx.type_binding_engine.exit_scope();
+    }
+}
+
+fn register_lexical_type_shadow(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if !is_lexically_nested_type_declaration(node) {
+        return;
+    }
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    let text = slice(name, ctx.source);
+    if text == ctx.target_short {
+        ctx.type_binding_engine.declare_shadow(text.to_string());
     }
 }
 
@@ -752,14 +913,27 @@ fn collect_pattern_identifiers_into(
 }
 
 fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if ctx.target_member.is_some() {
+    if ctx.target_member.is_some() && ctx.browser_global_object.is_none() {
         return;
     }
     let text = slice(node, ctx.source);
     if text.is_empty() {
         return;
     }
-    if !ctx.binds_target(text) {
+    if ctx.browser_global_object.is_some()
+        && ctx
+            .lexical_bindings
+            .as_ref()
+            .is_some_and(|bindings| bindings.is_bound_at(text, node.start_byte()))
+    {
+        return;
+    }
+    let binds_target = if node.kind() == "type_identifier" {
+        ctx.binds_target_type(text)
+    } else {
+        ctx.binds_target(text)
+    };
+    if !binds_target {
         return;
     }
     if is_declaration_identifier(node) {
@@ -789,21 +963,63 @@ fn handle_export_specifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    // member_expression has `object` (expr) and `property` (property_identifier).
-    let Some(object) = node.child_by_field_name("object") else {
+fn handle_nested_type_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some((module, name)) = nested_type_identifier_parts(node) else {
         return;
     };
-    let Some(property) = node.child_by_field_name("property") else {
+    let name_text = slice(name, ctx.source);
+    if name_text.is_empty() {
         return;
-    };
-    let object_text = slice(object, ctx.source);
-    let property_text = slice(property, ctx.source);
+    }
 
-    // `Namespace.Foo` / `require("./mod").Foo` style access. ESM namespace imports
-    // still key by the target's local name; CommonJS module-object edges carry the
-    // exported property name so aliases such as `module.exports = { Bar: Foo }` work.
-    let namespace_match = ctx.edges.iter().any(|edge| {
+    if ctx
+        .target_member
+        .is_some_and(|target_member| target_member == name_text)
+    {
+        match type_qualification_owner_match_status(module, ctx) {
+            ReceiverMatchStatus::Proven => record_hit(name, ctx),
+            ReceiverMatchStatus::Unproven => record_unproven_hit(name, ctx),
+            ReceiverMatchStatus::NoMatch => {}
+        }
+        return;
+    }
+
+    if ctx.target_member.is_none()
+        && simple_identifier_text(module, ctx.source).is_some_and(|module_text| {
+            namespace_member_matches_target(module, module_text, name_text, ctx)
+        })
+    {
+        record_hit(name, ctx);
+    }
+}
+
+fn type_qualification_owner_match_status(
+    module: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> ReceiverMatchStatus {
+    if let Some(module_text) = simple_identifier_text(module, ctx.source) {
+        return if ctx.binds_target_type(module_text) {
+            ReceiverMatchStatus::Proven
+        } else {
+            ReceiverMatchStatus::NoMatch
+        };
+    }
+
+    ReceiverMatchStatus::NoMatch
+}
+
+fn namespace_member_matches_target(
+    object: Node<'_>,
+    object_text: &str,
+    property_text: &str,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    if simple_identifier_text(object, ctx.source).is_some()
+        && ctx.binding_engine.is_shadowed(object_text)
+    {
+        return false;
+    }
+    ctx.edges.iter().any(|edge| {
         edge.local_name == object_text
             && match &edge.kind {
                 ImportEdgeKind::Namespace => ctx
@@ -823,8 +1039,64 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     false
                 }
             }
-    });
-    if namespace_match {
+    })
+}
+
+fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    // member_expression has `object` (expr) and `property` (property_identifier).
+    let Some(object) = node.child_by_field_name("object") else {
+        return;
+    };
+    let Some(property) = node.child_by_field_name("property") else {
+        return;
+    };
+    let object_text = slice(object, ctx.source);
+    let property_text = slice(property, ctx.source);
+
+    if ctx
+        .target_member
+        .is_some_and(|target_member| property_text == target_member)
+    {
+        if let Some((lexical_bindings, definitions)) = ctx
+            .lexical_bindings
+            .as_ref()
+            .zip(ctx.local_property_definitions.as_deref())
+        {
+            if local_property_read_matches(
+                object,
+                property,
+                ctx.source,
+                lexical_bindings,
+                definitions,
+            ) {
+                record_hit(property, ctx);
+            }
+            return;
+        }
+        if ctx.lookup_only_local_property {
+            return;
+        }
+    }
+
+    if let (Some(global_object), Some(target_member)) =
+        (ctx.browser_global_object, ctx.target_member)
+        && property_text == target_member
+    {
+        if simple_identifier_text(object, ctx.source) == Some(global_object)
+            && !ctx
+                .lexical_bindings
+                .as_ref()
+                .is_some_and(|bindings| bindings.is_bound_at(global_object, object.start_byte()))
+        {
+            record_hit(property, ctx);
+        }
+        return;
+    }
+
+    // `Namespace.Foo` / `require("./mod").Foo` style access. ESM namespace imports
+    // still key by the target's local name; CommonJS module-object edges carry the
+    // exported property name so aliases such as `module.exports = { Bar: Foo }` work.
+    if namespace_member_matches_target(object, object_text, property_text, ctx) {
         record_hit(property, ctx);
         return;
     }

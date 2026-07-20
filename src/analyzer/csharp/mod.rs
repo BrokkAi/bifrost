@@ -54,6 +54,12 @@ pub(crate) fn csharp_using_directive_is_global(node: Node<'_>) -> bool {
 }
 
 pub(crate) fn csharp_using_directive_target(node: Node<'_>, source: &str) -> Option<String> {
+    csharp_using_directive_target_node(node)
+        .map(|target| csharp_type_node_identity(target, source))
+        .filter(|target| !target.is_empty())
+}
+
+pub(crate) fn csharp_using_directive_target_node(node: Node<'_>) -> Option<Node<'_>> {
     if node.kind() != "using_directive" {
         return None;
     }
@@ -61,8 +67,6 @@ pub(crate) fn csharp_using_directive_target(node: Node<'_>, source: &str) -> Opt
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| alias.is_none_or(|alias| child != &alias))
-        .map(|target| csharp_type_node_identity(target, source))
-        .filter(|target| !target.is_empty())
 }
 
 pub(crate) fn csharp_using_directive_namespace(node: Node<'_>, source: &str) -> Option<String> {
@@ -73,6 +77,13 @@ pub(crate) fn csharp_using_directive_namespace(node: Node<'_>, source: &str) -> 
 
 pub(crate) fn csharp_as_expression_type_operand(parent: Node<'_>, node: Node<'_>) -> bool {
     parent.kind() == "as_expression"
+        && parent.child_by_field_name("right").is_some_and(|right| {
+            right.start_byte() == node.start_byte() && right.end_byte() == node.end_byte()
+        })
+}
+
+pub(crate) fn csharp_is_expression_type_operand(parent: Node<'_>, node: Node<'_>) -> bool {
+    parent.kind() == "is_expression"
         && parent.child_by_field_name("right").is_some_and(|right| {
             right.start_byte() == node.start_byte() && right.end_byte() == node.end_byte()
         })
@@ -161,11 +172,31 @@ impl CSharpAnalyzer {
         self.inner.full_hydration_count_for_test()
     }
 
+    #[doc(hidden)]
+    pub fn reset_definition_candidates_query_count_for_test(&self) {
+        self.inner
+            .reset_definition_candidates_query_count_for_test();
+    }
+
+    #[doc(hidden)]
+    pub fn definition_candidates_query_count_for_test(&self) -> usize {
+        self.inner.definition_candidates_query_count_for_test()
+    }
+
     pub(crate) fn declaration_candidates_by_identifier(
         &self,
         identifier: &str,
     ) -> BTreeSet<CodeUnit> {
         self.inner.lookup_declarations_by_identifier(identifier)
+    }
+
+    pub(crate) fn usage_declaration_candidates_by_identifier(
+        &self,
+        identifier: &str,
+    ) -> &[CodeUnit] {
+        self.inner
+            .global_usage_definition_index()
+            .identifier(identifier)
     }
 
     pub(crate) fn declaration_candidates_by_fqn(
@@ -185,20 +216,48 @@ impl CSharpAnalyzer {
         self.inner.lookup_members_for_owner_name(owner_fqn, name)
     }
 
+    pub(crate) fn usage_member_candidates_for_owner(
+        &self,
+        owner_fqn: &str,
+        name: &str,
+    ) -> Vec<CodeUnit> {
+        let normalized = csharp_normalize_full_name(owner_fqn);
+        self.inner
+            .global_usage_definition_index()
+            .members_for_owner_name(owner_fqn, &normalized, name)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn workspace_namespace_exists(&self, namespace: &str) -> bool {
         self.inner.persisted_package_exists(namespace)
     }
 
+    pub(crate) fn usage_workspace_namespace_exists(&self, namespace: &str) -> bool {
+        self.inner
+            .global_usage_definition_index()
+            .package_exists(namespace)
+    }
+
     pub fn namespace_of_file(&self, file: &ProjectFile) -> String {
-        let package = self.inner.package_name_of(file).unwrap_or_default();
-        if !package.is_empty() {
-            return package.to_string();
+        if let Some(cached) = self.memo_caches.namespace_by_file.get(file) {
+            return (*cached).clone();
         }
-        self.declarations(file)
-            .into_iter()
-            .map(|unit| unit.package_name().to_string())
-            .find(|package| !package.is_empty())
-            .unwrap_or_default()
+        let package = self.inner.package_name_of(file).unwrap_or_default();
+        let namespace = if package.is_empty() {
+            self.declarations(file)
+                .into_iter()
+                .map(|unit| unit.package_name().to_string())
+                .find(|package| !package.is_empty())
+                .unwrap_or_default()
+        } else {
+            package
+        };
+        self.memo_caches
+            .namespace_by_file
+            .insert(file.clone(), Arc::new(namespace.clone()));
+        namespace
     }
 
     pub fn external_declaration_index(&self) -> &CSharpExternalDeclarationIndex {
@@ -319,7 +378,7 @@ impl CSharpAnalyzer {
                     let target = normalize_csharp_type_fragment(
                         target.strip_prefix("global::").unwrap_or(target),
                     );
-                    types.extend(self.type_candidates_by_fqn(&target));
+                    types.extend(self.type_candidates_by_fqn(&target, false));
                 }
             }
             types.sort();
@@ -328,8 +387,43 @@ impl CSharpAnalyzer {
         })
     }
 
+    pub(crate) fn usage_global_static_using_types(&self) -> &[CodeUnit] {
+        self.memo_caches
+            .usage_global_static_using_types
+            .get_or_init(|| {
+                let mut types = Vec::new();
+                for file in self.inner.all_files() {
+                    for target in self
+                        .inner
+                        .import_info_of(&file)
+                        .iter()
+                        .filter(|import| {
+                            import.raw_snippet.trim_start().starts_with("global using ")
+                        })
+                        .filter_map(csharp_static_using_from_import)
+                    {
+                        let target = normalize_csharp_type_fragment(
+                            target.strip_prefix("global::").unwrap_or(target),
+                        );
+                        types.extend(self.type_candidates_by_fqn(&target, true));
+                    }
+                }
+                types.sort();
+                types.dedup();
+                types
+            })
+    }
+
     pub fn visible_type_candidates(&self, file: &ProjectFile, name: &str) -> Vec<CodeUnit> {
-        self.visible_type_candidates_inner(file, name, true)
+        self.visible_type_candidates_inner(file, name, true, false)
+    }
+
+    pub(crate) fn usage_visible_type_candidates(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+    ) -> Vec<CodeUnit> {
+        self.visible_type_candidates_inner(file, name, true, true)
     }
 
     pub(crate) fn partial_type_parts(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
@@ -340,6 +434,21 @@ impl CSharpAnalyzer {
         let mut parts: Vec<_> = self
             .inner
             .get_definitions(&owner.fq_name())
+            .into_iter()
+            .filter(|unit| unit.is_class() && self.type_declaration_key(unit) == owner_key)
+            .collect();
+        self.sort_type_candidates(&mut parts);
+        parts.dedup();
+        parts
+    }
+
+    pub(crate) fn usage_partial_type_parts(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
+        if !owner.is_class() {
+            return Vec::new();
+        }
+        let owner_key = self.type_declaration_key(owner);
+        let mut parts: Vec<_> = self
+            .usage_definition_candidates_by_fqn(&owner.fq_name())
             .into_iter()
             .filter(|unit| unit.is_class() && self.type_declaration_key(unit) == owner_key)
             .collect();
@@ -400,11 +509,27 @@ impl CSharpAnalyzer {
             .flatten()
     }
 
+    pub(crate) fn resolve_usage_visible_type(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+    ) -> Option<CodeUnit> {
+        let candidates = self.usage_visible_type_candidates(file, name);
+        (self.logical_type_count(&candidates) == 1)
+            .then(|| {
+                let mut candidates = candidates;
+                self.sort_type_candidates(&mut candidates);
+                candidates.into_iter().next()
+            })
+            .flatten()
+    }
+
     fn visible_type_candidates_inner(
         &self,
         file: &ProjectFile,
         name: &str,
         resolve_aliases: bool,
+        usage: bool,
     ) -> Vec<CodeUnit> {
         let mut normalized = normalize_csharp_type_fragment(name);
         if normalized.is_empty() {
@@ -426,48 +551,103 @@ impl CSharpAnalyzer {
             };
         }
         if global_qualified {
-            return self.type_candidates_by_fqn(&normalized);
+            return self.type_candidates_by_fqn(&normalized, usage);
         }
         if resolve_aliases
             && let Some(target) = self.using_aliases_of(file).get(&normalized)
             && target != &normalized
         {
-            return self.visible_type_candidates_inner(file, target, false);
-        }
-
-        if normalized.contains('.') {
-            return self.type_candidates_by_fqn(&normalized);
+            return self.visible_type_candidates_inner(file, target, false, usage);
         }
 
         let mut namespace = self.namespace_of_file(file);
         if !namespace.is_empty() {
-            let candidates = self.type_candidates_by_fqn(&format!("{namespace}.{normalized}"));
+            let candidates =
+                self.type_candidates_by_fqn(&format!("{namespace}.{normalized}"), usage);
             if !candidates.is_empty() {
                 return candidates;
             }
         }
 
         let mut visible = Vec::new();
-        for namespace in self.using_namespaces_of(file) {
-            visible.extend(self.type_candidates_by_fqn(&format!("{namespace}.{normalized}")));
+        for using_namespace in self.using_namespaces_of(file) {
+            visible.extend(
+                self.type_candidates_by_fqn(&format!("{using_namespace}.{normalized}"), usage)
+                    .into_iter()
+                    .filter(|candidate| candidate.package_name() == using_namespace),
+            );
+        }
+        if !visible.is_empty() {
+            return visible;
         }
 
         while let Some(separator) = namespace.rfind('.') {
             namespace.truncate(separator);
-            visible.extend(self.type_candidates_by_fqn(&format!("{namespace}.{normalized}")));
+            let candidates =
+                self.type_candidates_by_fqn(&format!("{namespace}.{normalized}"), usage);
+            if !candidates.is_empty() {
+                return candidates;
+            }
         }
 
-        visible.extend(self.type_candidates_by_fqn(&normalized));
-        visible
+        self.type_candidates_by_fqn(&normalized, usage)
     }
 
-    fn type_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+    fn type_candidates_by_fqn(&self, fqn: &str, usage: bool) -> Vec<CodeUnit> {
+        if usage {
+            return self.usage_type_candidates_by_fqn(fqn);
+        }
         self.inner
             .forward_definition_fqn(fqn)
             .into_iter()
             .filter(|unit| unit.is_class())
             .collect()
     }
+
+    pub(crate) fn usage_type_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        let index = self.inner.global_usage_definition_index();
+        let exact = index
+            .by_fqn(fqn)
+            .iter()
+            .filter(|unit| unit.is_class())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !exact.is_empty() {
+            return exact;
+        }
+        let arity_key = csharp_arity_preserving_full_name(fqn);
+        index
+            .by_normalized_fqn(&csharp_normalize_full_name(fqn))
+            .iter()
+            .filter(|unit| {
+                unit.is_class() && csharp_arity_preserving_full_name(&unit.fq_name()) == arity_key
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn usage_definition_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        let index = self.inner.global_usage_definition_index();
+        let exact = index.by_fqn(fqn);
+        if !exact.is_empty() {
+            return exact.to_vec();
+        }
+        let arity_key = csharp_arity_preserving_full_name(fqn);
+        index
+            .by_normalized_fqn(&csharp_normalize_full_name(fqn))
+            .iter()
+            .filter(|unit| csharp_arity_preserving_full_name(&unit.fq_name()) == arity_key)
+            .cloned()
+            .collect()
+    }
+}
+
+fn csharp_arity_preserving_full_name(fq_name: &str) -> String {
+    let normalized = fq_name
+        .strip_prefix("global::")
+        .unwrap_or(fq_name)
+        .replace(['$', '+'], ".");
+    normalize_csharp_constructor_name(normalized)
 }
 
 pub(crate) fn csharp_normalize_full_name(fq_name: &str) -> String {
@@ -479,6 +659,10 @@ pub(crate) fn csharp_normalize_full_name(fq_name: &str) -> String {
         .map(strip_csharp_generic_arity)
         .collect::<Vec<_>>()
         .join(".");
+    normalize_csharp_constructor_name(normalized)
+}
+
+fn normalize_csharp_constructor_name(normalized: String) -> String {
     let Some(owner) = normalized.strip_suffix(".#ctor") else {
         return normalized;
     };
@@ -490,6 +674,7 @@ pub(crate) fn csharp_normalize_full_name(fq_name: &str) -> String {
         .rfind('.')
         .map(|separator| &owner[separator + 1..])
         .unwrap_or(owner);
+    let constructor_name = strip_csharp_generic_arity(constructor_name);
     if constructor_name.is_empty() {
         normalized
     } else {
@@ -537,11 +722,12 @@ fn csharp_type_node_identity_with_terminal_suffix(
     let mut alias_qualified = false;
     while let Some(current) = stack.pop() {
         match current.kind() {
-            "qualified_name" | "alias_qualified_name" => {
+            "qualified_name" | "alias_qualified_name" | "member_access_expression" => {
                 alias_qualified |= current.kind() == "alias_qualified_name";
                 let qualifier = current
                     .child_by_field_name("qualifier")
                     .or_else(|| current.child_by_field_name("alias"))
+                    .or_else(|| current.child_by_field_name("expression"))
                     .or_else(|| current.named_child(0));
                 let name = current
                     .child_by_field_name("name")
@@ -619,6 +805,174 @@ fn csharp_type_node_identity_with_terminal_suffix(
     } else {
         segments.join(".")
     }
+}
+
+pub(crate) fn csharp_type_reference_root(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        let parent = node.parent()?;
+        if matches!(
+            parent.kind(),
+            "qualified_name"
+                | "alias_qualified_name"
+                | "generic_name"
+                | "nullable_type"
+                | "array_type"
+                | "pointer_type"
+                | "type"
+                | "simple_base_type"
+                | "primary_constructor_base_type"
+        ) {
+            node = parent;
+            continue;
+        }
+        if parent
+            .child_by_field_name("type")
+            .is_some_and(|type_node| same_csharp_node(type_node, node))
+            || parent
+                .child_by_field_name("return_type")
+                .is_some_and(|type_node| same_csharp_node(type_node, node))
+            || parent
+                .child_by_field_name("returns")
+                .is_some_and(|type_node| same_csharp_node(type_node, node))
+            || csharp_as_expression_type_operand(parent, node)
+            || csharp_is_expression_type_operand(parent, node)
+        {
+            return Some(node);
+        }
+        if matches!(
+            parent.kind(),
+            "type_argument_list" | "base_list" | "explicit_interface_specifier"
+        ) || parent.kind() == "object_creation_expression"
+        {
+            return Some(node);
+        }
+        if parent.kind() == "using_directive"
+            && (parent.child_by_field_name("name").is_some()
+                || csharp_using_directive_is_static(parent))
+            && csharp_using_directive_target_node(parent)
+                .is_some_and(|target| same_csharp_node(target, node))
+        {
+            return Some(node);
+        }
+        if matches!(
+            parent.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "struct_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "record_struct_declaration"
+        ) && !parent
+            .child_by_field_name("name")
+            .is_some_and(|name| same_csharp_node(name, node))
+        {
+            return Some(node);
+        }
+        return None;
+    }
+}
+
+pub(crate) fn csharp_constant_pattern_type_candidate(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "constant_pattern" {
+        return None;
+    }
+    let mut candidate = node.named_child(0)?;
+    while candidate.kind() == "binary_expression" {
+        candidate = candidate
+            .child_by_field_name("left")
+            .or_else(|| candidate.named_child(0))?;
+    }
+    matches!(
+        candidate.kind(),
+        "identifier"
+            | "qualified_name"
+            | "alias_qualified_name"
+            | "generic_name"
+            | "member_access_expression"
+    )
+    .then_some(candidate)
+}
+
+pub(crate) fn csharp_member_access_type_receiver(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "member_access_expression" {
+        return None;
+    }
+    let receiver = node
+        .child_by_field_name("expression")
+        .or_else(|| node.named_child(0))?;
+    matches!(
+        receiver.kind(),
+        "identifier"
+            | "qualified_name"
+            | "alias_qualified_name"
+            | "generic_name"
+            | "member_access_expression"
+    )
+    .then_some(receiver)
+}
+
+pub(crate) fn csharp_type_terminal_identifier(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "identifier" | "predefined_type" => return Some(node),
+            "qualified_name" | "alias_qualified_name" | "member_access_expression" => {
+                node = node
+                    .child_by_field_name("name")
+                    .or_else(|| node.named_child(node.named_child_count().saturating_sub(1)))?;
+            }
+            "generic_name" => {
+                node = node
+                    .child_by_field_name("name")
+                    .or_else(|| node.named_child(0))?;
+            }
+            "nullable_type"
+            | "array_type"
+            | "pointer_type"
+            | "type"
+            | "simple_base_type"
+            | "primary_constructor_base_type" => {
+                node = node
+                    .child_by_field_name("type")
+                    .or_else(|| node.named_child(0))?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+pub(crate) fn csharp_type_leftmost_identifier(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "identifier" | "predefined_type" => return Some(node),
+            "qualified_name" | "alias_qualified_name" | "member_access_expression" => {
+                node = node
+                    .child_by_field_name("qualifier")
+                    .or_else(|| node.child_by_field_name("alias"))
+                    .or_else(|| node.child_by_field_name("expression"))
+                    .or_else(|| node.named_child(0))?;
+            }
+            "generic_name" => {
+                node = node
+                    .child_by_field_name("name")
+                    .or_else(|| node.named_child(0))?;
+            }
+            "nullable_type"
+            | "array_type"
+            | "pointer_type"
+            | "type"
+            | "simple_base_type"
+            | "primary_constructor_base_type" => {
+                node = node
+                    .child_by_field_name("type")
+                    .or_else(|| node.named_child(0))?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn same_csharp_node(left: Node<'_>, right: Node<'_>) -> bool {
+    left.start_byte() == right.start_byte() && left.end_byte() == right.end_byte()
 }
 
 /// Return the structured name node when `node` is inside a C# attribute's name.
@@ -942,6 +1296,15 @@ impl IAnalyzer for CSharpAnalyzer {
     fn global_usage_definition_index_build_count_for_test(&self) -> usize {
         self.inner
             .global_usage_definition_index_build_count_for_test()
+    }
+
+    fn reset_definition_candidates_query_count_for_test(&self) {
+        self.inner
+            .reset_definition_candidates_query_count_for_test();
+    }
+
+    fn definition_candidates_query_count_for_test(&self) -> usize {
+        self.inner.definition_candidates_query_count_for_test()
     }
 
     fn reset_full_declaration_scan_count_for_test(&self) {

@@ -209,6 +209,10 @@ pub enum ReferenceDifferentialProgress {
         total: usize,
         target: String,
     },
+    InverseTargetStarted {
+        total: usize,
+        target: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -936,6 +940,10 @@ fn compare_inverse(
             let _scope = crate::profiling::scope(format!(
                 "reference_differential::inverse_target[{target}]"
             ));
+            progress(ReferenceDifferentialProgress::InverseTargetStarted {
+                total,
+                target: target.clone(),
+            });
             let result =
                 if let Some(batch) =
                     cpp_batch.as_ref().filter(|_| {

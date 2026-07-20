@@ -19,10 +19,14 @@
 
 use super::extractor::rightmost_jsx_identifier;
 use super::receiver_analysis::JsTsReceiverFactProvider;
-use super::resolver::{JsTsUsageIndex, collect_jsts_files, tree_sitter_language_for};
+use super::resolver::{
+    JsTsUsageIndex, browser_global_property_shape, collect_jsts_files, tree_sitter_language_for,
+    unbound_browser_global_property,
+};
 use crate::analyzer::js_ts::syntax::{
-    compute_import_binder, is_declaration_identifier, is_object_in_member_expression,
-    is_property_key_in_member, slice,
+    JsTsLexicalBindingIndex, compute_import_binder, is_declaration_identifier,
+    is_lexically_nested_type_declaration, is_object_in_member_expression,
+    is_property_key_in_member, nested_type_identifier_parts, slice,
 };
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
@@ -35,7 +39,7 @@ use crate::analyzer::usages::parsed_tree::{
     js_ts_tree_sitter_language_for_file, parse_tree_sitter_file,
 };
 use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
-use crate::analyzer::{IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::collections::{BTreeMap, BTreeSet};
 use tree_sitter::Node;
@@ -94,11 +98,14 @@ where
                         ImportKind::Default => {}
                     }
                 }
-                let same_file: HashSet<String> = analyzer
-                    .declarations(file)
-                    .into_iter()
-                    .map(|unit| unit.identifier().to_string())
-                    .collect();
+                let declarations = analyzer.declarations(file);
+                let (same_file, browser_globals, lexical_bindings) = file_declaration_names(
+                    analyzer,
+                    language,
+                    &declarations,
+                    parsed.tree.root_node(),
+                    source,
+                );
 
                 let mut ctx = TsScan {
                     source,
@@ -114,6 +121,9 @@ where
                     named_imports,
                     namespace_locals,
                     same_file,
+                    browser_globals,
+                    lexical_bindings,
+                    type_shadow_scopes: vec![HashSet::default()],
                     nodes,
                     collector,
                 };
@@ -162,7 +172,13 @@ where
         let parser_language = js_ts_tree_sitter_language_for_file(file, language)?;
         let parsed = parse_tree_sitter_file(file, &parser_language)?;
         let imports = imports_by_file.get(file).cloned().unwrap_or_default();
-        let same_file = scoped_same_file_declarations(analyzer, file, language);
+        let (same_file, browser_globals, lexical_bindings) = scoped_same_file_declarations(
+            analyzer,
+            file,
+            language,
+            parsed.tree.root_node(),
+            parsed.source.as_str(),
+        );
         Some(collect_file_edges(
             analyzer,
             file,
@@ -184,6 +200,9 @@ where
                     declarations: &declarations,
                     imports,
                     same_file,
+                    browser_globals,
+                    lexical_bindings,
+                    type_shadow_scopes: vec![HashSet::default()],
                     collector,
                 };
                 let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -207,18 +226,44 @@ struct ScopedTsScan<'a, 'b> {
     declarations: &'a HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
     imports: ScopedImportBindings,
     same_file: HashMap<String, UsageNodeKey>,
+    browser_globals: HashMap<String, UsageNodeKey>,
+    lexical_bindings: Option<JsTsLexicalBindingIndex>,
+    type_shadow_scopes: Vec<HashSet<String>>,
     collector: &'a mut EdgeCollector<'b, UsageNodeKey>,
 }
 
 impl<'a> ScopedTsScan<'a, '_> {
-    fn bare_callee(&self, text: &str) -> Option<UsageNodeKey> {
+    fn bare_callee(&self, text: &str, byte: usize) -> Option<UsageNodeKey> {
         if let Some(key) = self.imports.named.get(text) {
+            return Some(key.clone());
+        }
+        if let Some(key) = self.browser_globals.get(text)
+            && !self
+                .lexical_bindings
+                .as_ref()
+                .is_some_and(|bindings| bindings.is_bound_at(text, byte))
+        {
             return Some(key.clone());
         }
         if let Some(key) = self.same_file.get(text) {
             return Some(key.clone());
         }
         None
+    }
+
+    fn browser_global_member_callee(
+        &self,
+        object: &str,
+        member: &str,
+        byte: usize,
+    ) -> Option<UsageNodeKey> {
+        (object == "window"
+            && !self
+                .lexical_bindings
+                .as_ref()
+                .is_some_and(|bindings| bindings.is_bound_at(object, byte)))
+        .then(|| self.browser_globals.get(member).cloned())
+        .flatten()
     }
 
     fn namespace_member_callee(&self, namespace: &str, member: &str) -> Option<UsageNodeKey> {
@@ -268,6 +313,13 @@ impl<'a> ScopedTsScan<'a, '_> {
             node.end_byte(),
         );
     }
+
+    fn is_type_shadowed(&self, name: &str) -> bool {
+        self.type_shadow_scopes
+            .iter()
+            .rev()
+            .any(|scope| scope.contains(name))
+    }
 }
 
 struct TsScan<'a, 'b> {
@@ -276,6 +328,9 @@ struct TsScan<'a, 'b> {
     named_imports: HashMap<String, String>,
     namespace_locals: HashSet<String>,
     same_file: HashSet<String>,
+    browser_globals: HashMap<String, String>,
+    lexical_bindings: Option<JsTsLexicalBindingIndex>,
+    type_shadow_scopes: Vec<HashSet<String>>,
     nodes: &'a HashSet<String>,
     collector: &'a mut EdgeCollector<'b>,
 }
@@ -293,6 +348,28 @@ impl TsScan<'_, '_> {
         }
 
         Vec::new()
+    }
+
+    fn browser_global_member_callee(
+        &self,
+        object: &str,
+        member: &str,
+        byte: usize,
+    ) -> Option<String> {
+        (object == "window"
+            && !self
+                .lexical_bindings
+                .as_ref()
+                .is_some_and(|bindings| bindings.is_bound_at(object, byte)))
+        .then(|| self.browser_globals.get(member).cloned())
+        .flatten()
+    }
+
+    fn is_type_shadowed(&self, name: &str) -> bool {
+        self.type_shadow_scopes
+            .iter()
+            .rev()
+            .any(|scope| scope.contains(name))
     }
 }
 
@@ -323,23 +400,103 @@ fn scoped_same_file_declarations(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     language: Language,
-) -> HashMap<String, UsageNodeKey> {
-    let mut grouped: HashMap<String, BTreeSet<UsageNodeKey>> = HashMap::default();
-    for declaration in analyzer
+    root: Node<'_>,
+    source: &str,
+) -> (
+    HashMap<String, UsageNodeKey>,
+    HashMap<String, UsageNodeKey>,
+    Option<JsTsLexicalBindingIndex>,
+) {
+    let declarations: BTreeSet<_> = analyzer
         .declarations(file)
         .into_iter()
         .filter(|unit| crate::analyzer::common::language_for_file(unit.source()) == language)
-    {
+        .collect();
+    let mut grouped: HashMap<String, BTreeSet<UsageNodeKey>> = HashMap::default();
+    for declaration in &declarations {
         let key = UsageNodeKey::new(declaration.source().clone(), declaration.fq_name());
         grouped
             .entry(declaration.identifier().to_string())
             .or_default()
             .insert(key);
     }
-    grouped
+    let same_file = grouped
         .into_iter()
         .filter_map(|(name, keys)| single_key(keys).map(|key| (name, key)))
-        .collect()
+        .collect();
+    let (browser_globals, lexical_bindings) =
+        browser_global_declarations(analyzer, language, &declarations, root, source);
+    let browser_globals = browser_globals
+        .into_iter()
+        .map(|(name, fqn)| (name, UsageNodeKey::new(file.clone(), fqn)))
+        .collect();
+    (same_file, browser_globals, lexical_bindings)
+}
+
+fn file_declaration_names(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+    declarations: &BTreeSet<CodeUnit>,
+    root: Node<'_>,
+    source: &str,
+) -> (
+    HashSet<String>,
+    HashMap<String, String>,
+    Option<JsTsLexicalBindingIndex>,
+) {
+    let same_file = declarations
+        .iter()
+        .map(|unit| unit.identifier().to_string())
+        .collect();
+    let (browser_globals, lexical_bindings) =
+        browser_global_declarations(analyzer, language, declarations, root, source);
+    (same_file, browser_globals, lexical_bindings)
+}
+
+fn browser_global_declarations(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+    declarations: &BTreeSet<CodeUnit>,
+    root: Node<'_>,
+    source: &str,
+) -> (HashMap<String, String>, Option<JsTsLexicalBindingIndex>) {
+    if language != Language::JavaScript {
+        return (HashMap::default(), None);
+    }
+
+    let candidates: Vec<_> = declarations
+        .iter()
+        .filter(|declaration| browser_global_property_shape(declaration).is_some())
+        .collect();
+    if candidates.is_empty() {
+        return (HashMap::default(), None);
+    }
+
+    let lexical_bindings = JsTsLexicalBindingIndex::build(root, source);
+    let mut grouped: HashMap<String, BTreeSet<String>> = HashMap::default();
+    for declaration in candidates {
+        if let Some((_, property)) =
+            unbound_browser_global_property(analyzer, declaration, root, source, &lexical_bindings)
+        {
+            grouped
+                .entry(property.to_string())
+                .or_default()
+                .insert(declaration.fq_name());
+        }
+    }
+    let globals: HashMap<String, String> = grouped
+        .into_iter()
+        .filter_map(|(name, fqns)| {
+            let mut iter = fqns.into_iter();
+            let fqn = iter.next()?;
+            iter.next().is_none().then_some((name, fqn))
+        })
+        .collect();
+    if globals.is_empty() {
+        (globals, None)
+    } else {
+        (globals, Some(lexical_bindings))
+    }
 }
 
 fn scoped_import_bindings_by_file(
@@ -588,9 +745,17 @@ fn top_level_name(fqn: &str) -> String {
 impl TsScan<'_, '_> {
     /// The callee fqn a bare name refers to: a named import's exported name, or a
     /// same-file declaration's own name. `None` when the name is neither.
-    fn bare_callee(&self, text: &str) -> Option<String> {
+    fn bare_callee(&self, text: &str, byte: usize) -> Option<String> {
         if let Some(exported) = self.named_imports.get(text) {
             return Some(exported.clone());
+        }
+        if let Some(global) = self.browser_globals.get(text)
+            && !self
+                .lexical_bindings
+                .as_ref()
+                .is_some_and(|bindings| bindings.is_bound_at(text, byte))
+        {
+            return Some(global.clone());
         }
         if self.same_file.contains(text) {
             return Some(text.to_string());
@@ -618,7 +783,10 @@ fn scan_node(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &mut LocalInferen
             Some(false) => TreeWalkAction::Descend,
             None => TreeWalkAction::Skip,
         },
-        |(_, locals)| locals.exit_scope(),
+        |(ctx, locals)| {
+            locals.exit_scope();
+            ctx.type_shadow_scopes.pop();
+        },
     );
 }
 
@@ -631,10 +799,12 @@ fn scan_node_enter(
     let introduces_scope = introduces_js_ts_scope(kind);
     if introduces_scope {
         locals.enter_scope();
+        ctx.type_shadow_scopes.push(HashSet::default());
         if let Some(parameters) = node.child_by_field_name("parameters") {
             declare_pattern_shadows(parameters, ctx.source, locals);
         }
     }
+    register_lexical_type_shadow(node, ctx.source, &mut ctx.type_shadow_scopes);
 
     // Bindings declared in import/export clauses are not usages.
     if matches!(
@@ -648,6 +818,7 @@ fn scan_node_enter(
     ) {
         if introduces_scope {
             locals.exit_scope();
+            ctx.type_shadow_scopes.pop();
         }
         return None;
     }
@@ -659,6 +830,7 @@ fn scan_node_enter(
     }
 
     match kind {
+        "nested_type_identifier" => handle_nested_type_identifier(node, ctx, locals),
         "identifier" | "type_identifier" | "shorthand_property_identifier" => {
             handle_identifier(node, ctx, locals)
         }
@@ -685,7 +857,10 @@ fn scan_scoped_node(
             Some(false) => TreeWalkAction::Descend,
             None => TreeWalkAction::Skip,
         },
-        |(_, locals)| locals.exit_scope(),
+        |(ctx, locals)| {
+            locals.exit_scope();
+            ctx.type_shadow_scopes.pop();
+        },
     );
 }
 
@@ -698,10 +873,12 @@ fn scan_scoped_node_enter(
     let introduces_scope = introduces_js_ts_scope(kind);
     if introduces_scope {
         locals.enter_scope();
+        ctx.type_shadow_scopes.push(HashSet::default());
         if let Some(parameters) = node.child_by_field_name("parameters") {
             declare_pattern_shadows(parameters, ctx.source, locals);
         }
     }
+    register_lexical_type_shadow(node, ctx.source, &mut ctx.type_shadow_scopes);
 
     if matches!(
         kind,
@@ -714,6 +891,7 @@ fn scan_scoped_node_enter(
     ) {
         if introduces_scope {
             locals.exit_scope();
+            ctx.type_shadow_scopes.pop();
         }
         return None;
     }
@@ -725,6 +903,7 @@ fn scan_scoped_node_enter(
     }
 
     match kind {
+        "nested_type_identifier" => handle_scoped_nested_type_identifier(node, ctx, locals),
         "identifier" | "type_identifier" | "shorthand_property_identifier" => {
             handle_scoped_identifier(node, ctx, locals)
         }
@@ -800,7 +979,12 @@ fn handle_identifier(
     locals: &LocalInferenceEngine<String>,
 ) {
     let text = slice(node, ctx.source);
-    if text.is_empty() || locals.is_shadowed(text) {
+    let shadowed = if node.kind() == "type_identifier" {
+        ctx.is_type_shadowed(text)
+    } else {
+        locals.is_shadowed(text)
+    };
+    if text.is_empty() || shadowed {
         return;
     }
     if is_declaration_identifier(node)
@@ -809,7 +993,7 @@ fn handle_identifier(
     {
         return;
     }
-    if let Some(callee) = ctx.bare_callee(text) {
+    if let Some(callee) = ctx.bare_callee(text, node.start_byte()) {
         ctx.record(callee, node);
     }
 }
@@ -820,7 +1004,12 @@ fn handle_scoped_identifier(
     locals: &LocalInferenceEngine<String>,
 ) {
     let text = slice(node, ctx.source);
-    if text.is_empty() || locals.is_shadowed(text) {
+    let shadowed = if node.kind() == "type_identifier" {
+        ctx.is_type_shadowed(text)
+    } else {
+        locals.is_shadowed(text)
+    };
+    if text.is_empty() || shadowed {
         return;
     }
     if is_declaration_identifier(node)
@@ -829,8 +1018,104 @@ fn handle_scoped_identifier(
     {
         return;
     }
-    if let Some(callee) = ctx.bare_callee(text) {
+    if let Some(callee) = ctx.bare_callee(text, node.start_byte()) {
         ctx.record(callee, node);
+    }
+}
+
+fn handle_nested_type_identifier(
+    node: Node<'_>,
+    ctx: &mut TsScan<'_, '_>,
+    _locals: &LocalInferenceEngine<String>,
+) {
+    let Some((module, name)) = nested_type_identifier_parts(node) else {
+        return;
+    };
+    let name_text = slice(name, ctx.source);
+    if name_text.is_empty() {
+        return;
+    }
+
+    if let Some(owner) = type_qualification_owner_callee(module, ctx) {
+        for member in ctx.member_declaration_keys(&owner, name_text) {
+            ctx.record(member, name);
+        }
+    } else if module.kind() == "identifier" {
+        let module_text = slice(module, ctx.source);
+        if !module_text.is_empty()
+            && !ctx.is_type_shadowed(module_text)
+            && ctx.namespace_locals.contains(module_text)
+        {
+            ctx.record(name_text.to_string(), name);
+        }
+    }
+}
+
+fn handle_scoped_nested_type_identifier(
+    node: Node<'_>,
+    ctx: &mut ScopedTsScan<'_, '_>,
+    _locals: &LocalInferenceEngine<String>,
+) {
+    let Some((module, name)) = nested_type_identifier_parts(node) else {
+        return;
+    };
+    let name_text = slice(name, ctx.source);
+    if name_text.is_empty() {
+        return;
+    }
+
+    if let Some(owner) = scoped_type_qualification_owner_callee(module, ctx) {
+        for member in ctx.scoped_member_declaration_keys(&owner, name_text) {
+            ctx.record(member, name);
+        }
+    } else if module.kind() == "identifier" {
+        let module_text = slice(module, ctx.source);
+        if !module_text.is_empty()
+            && !ctx.is_type_shadowed(module_text)
+            && let Some(callee) = ctx.namespace_member_callee(module_text, name_text)
+        {
+            ctx.record(callee, name);
+        }
+    }
+}
+
+fn type_qualification_owner_callee(module: Node<'_>, ctx: &TsScan<'_, '_>) -> Option<String> {
+    if module.kind() == "identifier" {
+        let module_text = slice(module, ctx.source);
+        return (!module_text.is_empty() && !ctx.is_type_shadowed(module_text))
+            .then(|| ctx.bare_callee(module_text, module.start_byte()))
+            .flatten();
+    }
+
+    None
+}
+
+fn scoped_type_qualification_owner_callee(
+    module: Node<'_>,
+    ctx: &ScopedTsScan<'_, '_>,
+) -> Option<UsageNodeKey> {
+    if module.kind() == "identifier" {
+        let module_text = slice(module, ctx.source);
+        return (!module_text.is_empty() && !ctx.is_type_shadowed(module_text))
+            .then(|| ctx.bare_callee(module_text, module.start_byte()))
+            .flatten();
+    }
+
+    None
+}
+
+fn register_lexical_type_shadow(node: Node<'_>, source: &str, scopes: &mut [HashSet<String>]) {
+    if !is_lexically_nested_type_declaration(node) {
+        return;
+    }
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    let text = slice(name, source);
+    if !text.is_empty()
+        && let Some(scope) = scopes.last_mut()
+    {
+        scope.insert(text.to_string());
     }
 }
 
@@ -859,6 +1144,13 @@ fn handle_member(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &LocalInferen
         return;
     }
 
+    if let Some(callee) =
+        ctx.browser_global_member_callee(object_text, property_text, object.start_byte())
+    {
+        ctx.record(callee, property);
+        return;
+    }
+
     // `ns.member` — namespace import access resolves to the exported member.
     if ctx.namespace_locals.contains(object_text) {
         ctx.record(property_text.to_string(), property);
@@ -866,7 +1158,7 @@ fn handle_member(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &LocalInferen
     }
     // `Class.member` — static access on an imported / same-file class resolves to
     // the member's `Owner.member` fqn.
-    if let Some(class) = ctx.bare_callee(object_text) {
+    if let Some(class) = ctx.bare_callee(object_text, object.start_byte()) {
         for member in ctx.member_declaration_keys(&class, property_text) {
             ctx.record(member, property);
         }
@@ -916,11 +1208,18 @@ fn handle_scoped_member(
             return;
         }
 
+        if let Some(callee) =
+            ctx.browser_global_member_callee(object_text, property_text, object.start_byte())
+        {
+            ctx.record(callee, property);
+            return;
+        }
+
         if let Some(callee) = ctx.namespace_member_callee(object_text, property_text) {
             ctx.record(callee, property);
             return;
         }
-        if let Some(class) = ctx.bare_callee(object_text) {
+        if let Some(class) = ctx.bare_callee(object_text, object.start_byte()) {
             for member in ctx.scoped_member_declaration_keys(&class, property_text) {
                 ctx.record(member, property);
             }
@@ -1076,7 +1375,7 @@ fn handle_jsx(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &LocalInferenceE
     if leaf_text.is_empty() || locals.is_shadowed(leaf_text) {
         return;
     }
-    if let Some(callee) = ctx.bare_callee(leaf_text) {
+    if let Some(callee) = ctx.bare_callee(leaf_text, rightmost.start_byte()) {
         ctx.record(callee, rightmost);
     }
 }
@@ -1117,7 +1416,7 @@ fn handle_scoped_jsx(
     if leaf_text.is_empty() || locals.is_shadowed(leaf_text) {
         return;
     }
-    if let Some(callee) = ctx.bare_callee(leaf_text) {
+    if let Some(callee) = ctx.bare_callee(leaf_text, rightmost.start_byte()) {
         ctx.record(callee, rightmost);
     }
 }

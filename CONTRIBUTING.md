@@ -160,9 +160,10 @@ input.
 To announce a published GitHub Release in Discord, set the
 `DISCORD_RELEASE_WEBHOOK_URL` repository Actions secret to the target channel's
 webhook URL. The release workflow reuses GitHub's generated release notes,
-prevents mentions from being parsed, and leaves a failed Discord delivery as a
-warning so it cannot invalidate an already-published release. It uses built-in
-runner tools, so no additional GitHub Actions allowlist entry is needed.
+prevents mentions from being parsed, suppresses automatic link embeds, and
+leaves a failed Discord delivery as a warning so it cannot invalidate an
+already-published release. It uses built-in runner tools, so no additional
+GitHub Actions allowlist entry is needed.
 
 ## Version Policy
 

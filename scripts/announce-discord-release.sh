@@ -33,7 +33,7 @@ if ! jq --arg tag "$RELEASE_TAG" '
     elif (($prefix | length) + ($notes | length)) <= 1900 then $prefix + $notes
     else $prefix + $notes[0:(1900 - ($prefix | length) - ($truncation | length))] + $truncation
     end
-  | {content: ., allowed_mentions: {parse: []}}
+  | {content: ., allowed_mentions: {parse: []}, flags: 4}
 ' "$release_json" > "$payload_json"; then
   echo "::warning::Discord release announcement was not sent; the GitHub Release remains published."
   exit 1

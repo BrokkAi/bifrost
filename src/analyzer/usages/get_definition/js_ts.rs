@@ -1,7 +1,12 @@
 use super::*;
 use crate::analyzer::BoundedDefinitionLookup;
-use crate::analyzer::js_ts::syntax::{is_declaration_identifier, is_explicit_object_literal_key};
+use crate::analyzer::js_ts::syntax::{
+    JsTsLexicalBindingIndex, is_declaration_identifier, is_explicit_object_literal_key,
+};
 use crate::analyzer::typescript::ts_is_global_internal_module;
+use crate::analyzer::usages::js_ts_graph::{
+    browser_global_property_shape, unbound_browser_global_property,
+};
 use std::cell::{Cell, RefCell};
 
 const MAX_TS_RECEIVER_RESOLUTION_DEPTH: usize = 64;
@@ -113,6 +118,22 @@ pub(super) fn resolve_js_ts(
     let aliases = batch.aliases.as_ref();
     let focused =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte);
+
+    if focused.is_some_and(|node| {
+        jsts_is_commonjs_host_export_assignment_object(node, source)
+            && jsts_visible_receiver_binding_scope(
+                tree.root_node(),
+                source,
+                "module",
+                site.focus_start_byte,
+            )
+            .is_none()
+    }) {
+        return no_definition(
+            "commonjs_host_binding",
+            "the CommonJS `module` host binding is provided by the runtime and has no workspace definition",
+        );
+    }
 
     if let Some(targets) = focused.and_then(|node| {
         JsTsReceiverFactProvider::new_with_batch_data(
@@ -405,7 +426,21 @@ pub(super) fn resolve_js_ts(
         }
     }
 
-    let mut same_file = support.file_identifier(file, reference);
+    let same_file_candidates = support.file_identifier(file, reference);
+    let mut same_file: Vec<_> = same_file_candidates
+        .iter()
+        .filter(|candidate| jsts_candidate_is_bare_declaration(file, reference, candidate))
+        .cloned()
+        .collect();
+    if same_file.is_empty() && language == Language::JavaScript {
+        same_file = jsts_exact_browser_global_bare_candidates(
+            analyzer,
+            tree.root_node(),
+            source,
+            reference,
+            &same_file_candidates,
+        );
+    }
     if value_position {
         same_file = jsts_value_space_candidates(analyzer, same_file);
     } else {
@@ -419,6 +454,82 @@ pub(super) fn resolve_js_ts(
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed JS/TS definition"),
     )
+}
+
+fn jsts_candidate_is_bare_declaration(
+    file: &ProjectFile,
+    reference: &str,
+    candidate: &CodeUnit,
+) -> bool {
+    if candidate.short_name() == reference {
+        return true;
+    }
+    let Some(file_name) = file.rel_path().file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    candidate.is_field() && candidate.short_name() == format!("{file_name}.{reference}")
+}
+
+fn jsts_exact_browser_global_bare_candidates(
+    analyzer: &dyn IAnalyzer,
+    root: Node<'_>,
+    source: &str,
+    reference: &str,
+    candidates: &[CodeUnit],
+) -> Vec<CodeUnit> {
+    let shaped: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| {
+            browser_global_property_shape(candidate)
+                .is_some_and(|(object, property)| object == "window" && property == reference)
+        })
+        .collect();
+    if shaped.is_empty() {
+        return Vec::new();
+    }
+
+    let lexical_bindings = JsTsLexicalBindingIndex::build(root, source);
+    shaped
+        .into_iter()
+        .filter(|candidate| {
+            unbound_browser_global_property(analyzer, candidate, root, source, &lexical_bindings)
+                .is_some()
+        })
+        .cloned()
+        .collect()
+}
+
+fn jsts_is_commonjs_host_export_assignment_object(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "identifier" || node_text(node, source) != "module" {
+        return false;
+    }
+    let Some(exports_member) = node.parent().filter(|parent| {
+        parent.kind() == "member_expression"
+            && parent
+                .child_by_field_name("object")
+                .is_some_and(|object| object.id() == node.id())
+            && parent
+                .child_by_field_name("property")
+                .is_some_and(|property| node_text(property, source) == "exports")
+    }) else {
+        return false;
+    };
+
+    let mut assignment_target = exports_member;
+    while let Some(parent) = assignment_target.parent().filter(|parent| {
+        parent.kind() == "member_expression"
+            && parent
+                .child_by_field_name("object")
+                .is_some_and(|object| object.id() == assignment_target.id())
+    }) {
+        assignment_target = parent;
+    }
+
+    assignment_target
+        .parent()
+        .filter(|parent| parent.kind() == "assignment_expression")
+        .and_then(|assignment| assignment.child_by_field_name("left"))
+        .is_some_and(|left| left.id() == assignment_target.id())
 }
 
 #[allow(clippy::too_many_arguments)]

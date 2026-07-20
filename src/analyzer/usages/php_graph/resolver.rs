@@ -263,7 +263,9 @@ pub(super) fn is_member_or_scoped_access_name(node: Node<'_>) -> bool {
         matches!(
             parent.kind(),
             "member_access_expression"
+                | "nullsafe_member_access_expression"
                 | "member_call_expression"
+                | "nullsafe_member_call_expression"
                 | "class_constant_access_expression"
                 | "scoped_call_expression"
         )

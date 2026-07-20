@@ -16,9 +16,10 @@ use std::path::Path;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use tempfile::TempDir;
 
 const DROP_SHUTDOWN_ID: u64 = 999_999;
-const DROP_CLEANUP_GRACE: Duration = Duration::from_millis(500);
+const DROP_CLEANUP_GRACE: Duration = Duration::from_secs(15);
 
 /// Build an LSP-correct `file://` URI for `path`. Delegates to the crate's
 /// `path_to_uri_string`, which handles drive letters, percent-encoding, and the
@@ -46,17 +47,15 @@ pub struct LspServer {
     reader: Option<BufReader<ChildStdout>>,
     stderr: Option<ChildStderr>,
     next_id: u64,
+    _cache_dir: TempDir,
 }
 
 impl LspServer {
     /// Spawn the server rooted at `root` without performing the initialize
     /// handshake.
     pub fn spawn(root: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
-            .arg("--root")
-            .arg(root)
-            .arg("--server")
-            .arg("lsp")
+        let (mut command, cache_dir) = lsp_command(root);
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -72,6 +71,7 @@ impl LspServer {
             reader: Some(BufReader::new(stdout)),
             stderr: Some(stderr),
             next_id: 1,
+            _cache_dir: cache_dir,
         }
     }
 
@@ -87,11 +87,8 @@ impl LspServer {
     /// Spawn the server with explicit `initialize` params (e.g. to exercise
     /// capability negotiation).
     pub fn start_with_params(root: &Path, initialize_params: Value) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
-            .arg("--root")
-            .arg(root)
-            .arg("--server")
-            .arg("lsp")
+        let (mut command, cache_dir) = lsp_command(root);
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -123,6 +120,7 @@ impl LspServer {
             reader: Some(reader),
             stderr: Some(stderr),
             next_id: 2,
+            _cache_dir: cache_dir,
         }
     }
 
@@ -509,6 +507,18 @@ impl LspServer {
             }
         }
     }
+}
+
+fn lsp_command(root: &Path) -> (Command, TempDir) {
+    let cache_dir = TempDir::new().expect("create isolated LSP cache directory");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bifrost"));
+    command
+        .arg("--root")
+        .arg(root)
+        .arg("--server")
+        .arg("lsp")
+        .env(brokk_bifrost::gitblob::CACHE_DIR_ENV, cache_dir.path());
+    (command, cache_dir)
 }
 
 impl Drop for LspServer {
