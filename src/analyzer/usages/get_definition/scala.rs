@@ -50,6 +50,21 @@ struct ScalaOwnerIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum ScalaReceiverOwner {
+    Exact(CodeUnit),
+    Logical(String),
+}
+
+impl ScalaReceiverOwner {
+    fn fq_name(&self) -> String {
+        match self {
+            Self::Exact(owner) => owner.fq_name(),
+            Self::Logical(owner_fqn) => owner_fqn.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ScalaNameResolution {
     Resolved(ScalaOwnerIdentity),
     MissingExplicitImport,
@@ -2452,44 +2467,72 @@ fn resolve_scala_field(
             "Scala field expression has no receiver",
         );
     };
-    if matches!(receiver.kind(), "identifier" | "type_identifier")
-        && scala_node_text(receiver, ctx.source).trim() == "this"
-        && let Some(owner) =
-            scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, receiver.start_byte())
-    {
-        match scala_exact_owner_member_candidate_units(ctx, &owner, member, false) {
-            ScalaExactMemberResolution::Found(candidates) => {
-                let applicable = scala_filter_callable_units(
-                    ctx.scala,
-                    candidates,
-                    call_shape.as_ref(),
-                    ScalaCallableSiteRole::Ordinary,
-                );
-                if applicable.is_empty() {
-                    return no_definition(
-                        "no_applicable_scala_callable",
-                        format!("`{member}` has no member matching this access"),
-                    );
-                } else {
-                    return candidates_outcome(applicable);
-                }
-            }
-            ScalaExactMemberResolution::Ambiguous => {
-                return no_definition(
-                    "ambiguous_scala_enclosing_member",
-                    format!("`{member}` has multiple physical enclosing-owner definitions"),
-                );
-            }
-            ScalaExactMemberResolution::NoMatch => {}
-        }
-    }
     let bindings = matches!(receiver.kind(), "identifier" | "type_identifier")
         .then(|| scala_bindings_before(ctx, resolver, root, field.start_byte()));
     let owner = match bindings.as_ref() {
-        Some(bindings) => scala_receiver_type_fqn_with_bindings(ctx, resolver, receiver, bindings),
-        None => scala_non_identifier_receiver_type_fqn(ctx, resolver, receiver),
+        Some(bindings) => scala_receiver_owner_with_bindings(ctx, resolver, receiver, bindings),
+        None => scala_non_identifier_receiver_type_fqn(ctx, resolver, receiver)
+            .map(ScalaReceiverOwner::Logical),
     };
     if let Some(owner) = owner {
+        let owner_fqn = owner.fq_name();
+        if let ScalaReceiverOwner::Exact(exact_owner) = &owner {
+            match scala_exact_owner_member_candidate_units(ctx, exact_owner, member, false) {
+                ScalaExactMemberResolution::Found(candidates) => {
+                    let applicable = scala_filter_callable_units(
+                        ctx.scala,
+                        candidates,
+                        call_shape.as_ref(),
+                        ScalaCallableSiteRole::Ordinary,
+                    );
+                    if applicable.is_empty() {
+                        let extensions = scala_extension_candidate_units(
+                            ctx,
+                            resolver,
+                            member,
+                            Some(&owner_fqn),
+                            call_shape.as_ref(),
+                        );
+                        if !extensions.is_empty() {
+                            return candidates_outcome(extensions);
+                        }
+                        return no_definition(
+                            "no_applicable_scala_callable",
+                            format!(
+                                "`{member}` has no member matching this access on `{owner_fqn}`"
+                            ),
+                        );
+                    }
+                    return candidates_outcome(applicable);
+                }
+                ScalaExactMemberResolution::Ambiguous => {
+                    return no_definition(
+                        "ambiguous_scala_receiver_member",
+                        format!(
+                            "`{member}` has multiple member definitions in the exact receiver hierarchy of `{owner_fqn}`"
+                        ),
+                    );
+                }
+                ScalaExactMemberResolution::NoMatch => {
+                    let extensions = scala_extension_candidate_units(
+                        ctx,
+                        resolver,
+                        member,
+                        Some(&owner_fqn),
+                        call_shape.as_ref(),
+                    );
+                    if !extensions.is_empty() {
+                        return candidates_outcome(extensions);
+                    }
+                    return no_definition(
+                        SCALA_UNSUPPORTED_RECEIVER,
+                        format!(
+                            "exact Scala receiver `{owner_fqn}` has no indexed member `{member}`"
+                        ),
+                    );
+                }
+            }
+        }
         let include_companion = bindings.as_ref().is_some_and(|bindings| {
             scala_receiver_allows_companion_lookup_with_bindings(
                 ctx,
@@ -2497,13 +2540,13 @@ fn resolve_scala_field(
                 root,
                 receiver,
                 field.start_byte(),
-                &owner,
+                &owner_fqn,
                 bindings,
             )
         });
         let candidates = scala_applicable_member_candidate_units(
             ctx,
-            &owner,
+            &owner_fqn,
             member,
             include_companion,
             call_shape.as_ref(),
@@ -2515,7 +2558,7 @@ fn resolve_scala_field(
             ctx,
             resolver,
             member,
-            Some(&owner),
+            Some(&owner_fqn),
             call_shape.as_ref(),
         );
     }
@@ -3442,34 +3485,54 @@ fn scala_receiver_type_fqn_with_bindings(
     receiver: Node<'_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> Option<String> {
+    scala_receiver_owner_with_bindings(ctx, resolver, receiver, bindings)
+        .map(|owner| owner.fq_name())
+}
+
+fn scala_receiver_owner_with_bindings(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    receiver: Node<'_>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
+) -> Option<ScalaReceiverOwner> {
     if !matches!(receiver.kind(), "identifier" | "type_identifier") {
-        return scala_non_identifier_receiver_type_fqn(ctx, resolver, receiver);
+        return scala_non_identifier_receiver_type_fqn(ctx, resolver, receiver)
+            .map(ScalaReceiverOwner::Logical);
     }
     let name = scala_node_text(receiver, ctx.source).trim();
     if name == "this" {
         return ClassRangeIndex::build(ctx.analyzer, ctx.file)
-            .enclosing(receiver.start_byte())
-            .map(str::to_string);
+            .enclosing_unit(receiver.start_byte())
+            .cloned()
+            .map(ScalaReceiverOwner::Exact);
     }
     precise_scala_binding(bindings, name)
-        .and_then(|binding| binding.receiver_type)
+        .and_then(|binding| {
+            binding
+                .receiver_declaration
+                .map(ScalaReceiverOwner::Exact)
+                .or_else(|| binding.receiver_type.map(ScalaReceiverOwner::Logical))
+        })
         .or_else(|| {
-            scala_enclosing_class_parameter_type(ctx, receiver, name, resolver).or_else(|| {
-                if !bindings.is_shadowed(name)
-                    && let Some(imported_member) = resolver.resolve_member(name)
-                    && let Some(return_type) =
-                        scala_imported_member_return_type(ctx, resolver, &imported_member)
-                {
-                    return Some(return_type);
-                }
-                (!bindings.is_shadowed(name))
-                    .then(|| {
-                        resolver
-                            .resolve_singleton(name)
-                            .or_else(|| resolver.resolve(name))
-                    })
-                    .flatten()
-            })
+            scala_enclosing_class_parameter_type(ctx, receiver, name, resolver)
+                .map(ScalaReceiverOwner::Logical)
+                .or_else(|| {
+                    if !bindings.is_shadowed(name)
+                        && let Some(imported_member) = resolver.resolve_member(name)
+                        && let Some(return_type) =
+                            scala_imported_member_return_type(ctx, resolver, &imported_member)
+                    {
+                        return Some(ScalaReceiverOwner::Logical(return_type));
+                    }
+                    (!bindings.is_shadowed(name))
+                        .then(|| {
+                            resolver
+                                .resolve_singleton(name)
+                                .or_else(|| resolver.resolve(name))
+                                .map(ScalaReceiverOwner::Logical)
+                        })
+                        .flatten()
+                })
         })
 }
 

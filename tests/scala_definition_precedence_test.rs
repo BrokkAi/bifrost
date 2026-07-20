@@ -1994,6 +1994,250 @@ class Use extends Alias.Tail
 }
 
 #[test]
+fn scala_forward_resolves_nested_parameter_receiver_declarations_exactly() {
+    let clock = r#"package kyo
+
+trait Frame
+trait AllowUnsafe
+
+final case class Clock() {
+  def nowMonotonic(using Frame): Long = 0L
+}
+
+object Clock {
+  sealed abstract class Unsafe {
+    def nowMonotonic()(using AllowUnsafe): Long
+  }
+
+  object Stopwatch {
+    final class Unsafe(clock: Clock.Unsafe) {
+      def elapsed()(using AllowUnsafe): Long = clock.nowMonotonic()
+    }
+  }
+}
+"#;
+    let semantic = r#"package dotty.tools.dotc.transform.init
+class Context
+trait Value {
+  def show(using Context): String
+}
+"#;
+    let objects = r#"package dotty.tools.dotc.transform.init
+class Objects {
+  sealed trait Value {
+    def show(using Context): String
+  }
+
+  def select(value: Value)(using Context): String = value.show
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("kyo/Clock.scala", clock)
+        .file("init/Semantic.scala", semantic)
+        .file("init/Objects.scala", objects)
+        .build();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": [
+            location_in(
+                "kyo/Clock.scala",
+                clock,
+                clock.rfind("clock.nowMonotonic").expect("nested unsafe receiver")
+                    + "clock.".len(),
+            ),
+            location_in(
+                "init/Objects.scala",
+                objects,
+                objects.rfind("value.show").expect("nested value receiver")
+                    + "value.".len(),
+            ),
+        ]})
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for (result, fqn, path) in [
+        (
+            &results[0],
+            "kyo.Clock$.Unsafe.nowMonotonic",
+            "kyo/Clock.scala",
+        ),
+        (
+            &results[1],
+            "dotty.tools.dotc.transform.init.Objects.Value.show",
+            "init/Objects.scala",
+        ),
+    ] {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"].as_array().map(Vec::len),
+            Some(1),
+            "{value}"
+        );
+        assert_eq!(result["definitions"][0]["fqn"], fqn, "{value}");
+        assert_eq!(result["definitions"][0]["path"], path, "{value}");
+    }
+}
+
+#[test]
+fn scala_forward_typed_receivers_preserve_physical_identity_and_exact_misses() {
+    let replica = |platform: &str| {
+        format!(
+            r#"package replica
+object Api {{
+  final class Receiver {{
+    def choose(value: Int): Int = value
+    def choose(value: Int, extra: Int): Int = value + extra
+  }}
+  def {platform}Selected(receiver: Receiver): Int = receiver.choose(1)
+  def {platform}WrongShape(receiver: Receiver): Int = receiver.choose()
+}}
+"#
+        )
+    };
+    let jvm = replica("jvm");
+    let js = replica("js");
+    let native = replica("native");
+    let external = r#"package consumer
+import replica.Api.Receiver
+object External {
+  def ambiguous(receiver: Receiver): Int = receiver.choose(1)
+}
+"#;
+    let missing = r#"package missing
+object Api {
+  final class Receiver
+  def probe(receiver: Receiver): Int = receiver.leak(1)
+}
+"#;
+    let sibling = r#"package missing
+object Api {
+  final class Receiver {
+    def leak(value: Int): Int = value
+  }
+}
+"#;
+    let extension_control = r#"package extensioncase
+class Receiver {
+  def choose(value: Int): Int = value
+}
+object Extensions {
+  extension (receiver: Receiver) def choose(): Int = 1
+}
+object Use {
+  import Extensions.*
+  def selected(receiver: Receiver): Int = receiver.choose()
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("jvm/replica/Api.scala", &jvm)
+        .file("js/replica/Api.scala", &js)
+        .file("native/replica/Api.scala", &native)
+        .file("consumer/External.scala", external)
+        .file("jvm/missing/Api.scala", missing)
+        .file("js/missing/Api.scala", sibling)
+        .file("extensioncase/Use.scala", extension_control)
+        .build();
+
+    let mut references = Vec::new();
+    for (path, source) in [
+        ("jvm/replica/Api.scala", jvm.as_str()),
+        ("js/replica/Api.scala", js.as_str()),
+        ("native/replica/Api.scala", native.as_str()),
+    ] {
+        references.push(location_in(
+            path,
+            source,
+            source
+                .find("receiver.choose(1)")
+                .expect("exact receiver call")
+                + "receiver.".len(),
+        ));
+        references.push(location_in(
+            path,
+            source,
+            source
+                .find("receiver.choose()")
+                .expect("wrong-shape exact receiver call")
+                + "receiver.".len(),
+        ));
+    }
+    references.push(location_in(
+        "consumer/External.scala",
+        external,
+        external
+            .find("receiver.choose")
+            .expect("ambiguous logical receiver")
+            + "receiver.".len(),
+    ));
+    references.push(location_in(
+        "jvm/missing/Api.scala",
+        missing,
+        missing.find("receiver.leak").expect("exact missing member") + "receiver.".len(),
+    ));
+    references.push(location_in(
+        "extensioncase/Use.scala",
+        extension_control,
+        extension_control
+            .find("receiver.choose()")
+            .expect("applicable extension after direct shape miss")
+            + "receiver.".len(),
+    ));
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for (index, path) in [
+        "jvm/replica/Api.scala",
+        "js/replica/Api.scala",
+        "native/replica/Api.scala",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let selected = &results[index * 2];
+        assert_eq!(selected["status"], "resolved", "{value}");
+        assert_eq!(
+            selected["definitions"].as_array().map(Vec::len),
+            Some(1),
+            "{value}"
+        );
+        assert_eq!(selected["definitions"][0]["path"], path, "{value}");
+        assert_eq!(
+            selected["definitions"][0]["fqn"], "replica.Api$.Receiver.choose",
+            "{value}"
+        );
+
+        let wrong_shape = &results[index * 2 + 1];
+        assert_eq!(wrong_shape["status"], "no_definition", "{value}");
+        assert_eq!(
+            wrong_shape["diagnostics"][0]["kind"], "no_applicable_scala_callable",
+            "{value}"
+        );
+    }
+    assert_eq!(results[6]["status"], "no_definition", "{value}");
+    assert_eq!(results[7]["status"], "no_definition", "{value}");
+    assert!(
+        results[7]["definitions"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "an exact owner miss leaked the sibling physical replica: {value}"
+    );
+    assert_eq!(results[8]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[8]["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
+    assert_eq!(
+        results[8]["definitions"][0]["fqn"], "extensioncase.Extensions$.choose",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_forward_definition_preserves_physical_enclosing_owner_identity() {
     let replica = |platform: &str| {
         format!(
