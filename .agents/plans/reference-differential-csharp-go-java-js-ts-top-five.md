@@ -4,9 +4,9 @@ This ExecPlan is a living document. Keep `Progress`, `Surprises & Discoveries`, 
 
 ## Purpose / Big Picture
 
-Bifrost's forward-vs-inverse reference differential checks a public symbols invariant: when definition lookup resolves a source reference to a declaration group, the inverse usage query should recover the same source range. This campaign completes that audit for the five largest valid canonical local repositories in C#, Go, Java, JavaScript, and TypeScript.
+Bifrost's forward-vs-inverse reference differential checks a public symbols invariant: when definition lookup resolves a source reference to a declaration group, the inverse usage query should recover the same source range. This campaign completes that audit for the five repositories with the most fully filtered SFT tasks in each of C#, Go, Java, JavaScript, and TypeScript.
 
-The observable result is 25 accepted repository records. Java and Go already have authoritative completed top-five records whose raw findings were exhaustively reviewed and whose legitimate issues were fixed and closed. C#, JavaScript, and TypeScript require new uniform five-repository records. Every new raw `missing` site is checked against live source bytes, the tree-sitter role, forward identity, inverse limits, and an exact-site rerun. A legitimate defect receives a GitHub issue assigned to `jbellis` before implementation; an issue assigned to anybody else is recorded and skipped. Accepted fixes receive structured behavior tests, exact production evidence, formatting, all-target/all-feature Clippy, the complete `cargo test --features nlp,python` gate, direct integration to `origin/master`, and a clean final corpus confirmation. GitHub CI is not a blocking gate after local tests pass.
+The observable result is 25 accepted repository records selected by descending fully filtered task count through `/home/jonathan/Projects/brokkbench/tasks.py`. The selection calls `task_repos(SFT_PREDICATES, langs=[...])` and orders the returned `RepoRef` values by descending `task_count`; `SFT_PREDICATES` excludes `large-repos.csv` members and also enforces the build, testsome, binding, generated-prompt, non-fragile-test, and skip gates. Earlier Java, Go, C#, JavaScript, and TypeScript records selected repositories by code size and remain useful regression evidence, but they do not satisfy this task-ranked campaign. Every new raw `missing` site is checked against live source bytes, the tree-sitter role, forward identity, inverse limits, and an exact-site rerun. A legitimate defect receives a GitHub issue assigned to `jbellis` before implementation; an issue assigned to anybody else is recorded and skipped. Accepted fixes receive structured behavior tests, exact production evidence, formatting, all-target/all-feature Clippy, the complete `cargo test --features nlp,python` gate, direct integration to `origin/master`, and a clean final corpus confirmation. GitHub CI is not a blocking gate after local tests pass.
 
 The acceptance surface is the MCP `symbols` toolset and its associated Rust and Python APIs. LSP shares analyzer implementation and remains covered by the full test suite, but editor-protocol behavior is not the focus.
 
@@ -39,6 +39,10 @@ The acceptance surface is the MCP `symbols` toolset and its associated Rust and 
 - [x] (2026-07-20) Cleanly exact-proved and closed #954 at fixing commit `093b17cd` with runner SHA-256 `9b879fa7d56a25cceee881abb1bdb466783e1d854a11dbcc9d2438cd8446461f`. The runtime witness resolves 1,219 physical `Interop` declarations, completes inverse in 36.8 seconds, recovers the exact requested range, and reports one consistent site with zero missing/unproven rows or file errors. Artifact SHA-256: `aecfcaa16544e17645a9f0f4446757c08bcfceda1145618ce91e8d569a67abc4`.
 - [x] (2026-07-20) Reopened #954 after the raised-ceiling full run exposed a second `Interop` hot path. A live zero-loss 30-second profile attributes 77.29% self time to `memcmp` while graph resolution repeatedly materializes sorted declarations for global-namespace `namespace_of_file` lookups. Added a bounded per-generation namespace cache without changing first-lookup semantics; all 97 C# usage graph tests pass, and a dirty ephemeral exact proof completes the 1,219-target inverse group in 26.9 seconds with one exact consistent hit and zero file errors.
 - [x] (2026-07-20) Committed the residual #954 namespace cache as `cf8e7ff0`, passed formatting, isolated all-target/all-feature Clippy, 97 targeted C# usage tests, 31 whole-workspace graph tests, 11 analyzer tests, six persisted-cache tests, and 505 feature-enabled definition tests, then cleanly exact-proved the runtime witness. The 1,219-target inverse phase completes in 27.9 seconds with one exact consistent hit and zero diagnostics/file errors; artifact SHA-256 `f01e3959814f8190e994aab4e5b8e846828841e408826130775314140169f9b3`.
+- [x] (2026-07-20) Audited the user's explicit selector requirement against `tasks.py` and found that the existing plan and records used the differential runner's code-LOC ranking instead of descending filtered task count. Recomputed all five language sets through `task_repos(SFT_PREDICATES, langs=[...])`, which explicitly filters `large-repos.csv`, and invalidated the prior LOC-ranked records as completion evidence for this objective without discarding their regression value.
+- [x] (2026-07-20) Merged the completed analyzer work from `bifrost-burndown-3` into the current `bifrost-burndown-a1` branch, configured clone-local excludes for generated `.bifrost/` and `.brokk/` state in all 25 newly selected clones, and verified every selected clone and the Bifrost worktree are clean at their pinned heads.
+- [x] (2026-07-20) Passed the publication gate for the accumulated analyzer fixes: `cargo fmt --all -- --check`, the complete `cargo test --features nlp,python` suite outside the restricted process sandbox, and isolated `cargo clippy --all-targets --all-features -- -D warnings`. The sandboxed test attempt's only failures were three process-I/O tests blocked by `EPERM`; the identical escalated suite passed them and all remaining tests.
+- [ ] Run, integrity-check, and exhaustively disposition the five task-ranked repositories for each of C#, Go, Java, JavaScript, and TypeScript using explicit `--repo` filters.
 - [ ] Complete and integrity-check the C# top-five baseline with a 250,000 per-file candidate ceiling and exhaustively classify all final raw rows, including Roslyn.
 - [ ] File/assign, implement, review, test, and exact-prove every legitimate C# root cause not owned by another user.
 - [ ] Complete the same baseline, disposition, issue, implementation, and proof lifecycle for JavaScript. Completed: all five clean `adfa8e0f` records; exhaustive disposition of all 39 final raw rows as 38 non-actionable plus one legitimate nested-receiver extension of assigned #944; clean exact proof for the original #942/#943/#665 witnesses and all four original #944 witnesses; reviewed structured implementation for the final nested receiver with public/syntax controls, 81 targeted usage tests, formatting, and all-target/all-feature Clippy. Remaining: checkpoint and cleanly exact-prove `fetchParams.controller.controller`, rerun the full leg, integrate, and close the four assigned issues.
@@ -243,29 +247,33 @@ The acceptance surface is the MCP `symbols` toolset and its associated Rust and 
 
 ## Outcomes & Retrospective
 
-The evidence audit establishes 15 of the requested 25 accepted repository records before the last #944 confirmation: five Java records at clean head `431f1292`, five Go records at clean head `20fec8af`, and five clean JavaScript records at `adfa8e0f`. The JavaScript artifact SHA-256 is `870635dab01fdf719cea38e47aed008492145f3f9aed16c42d6ec0dde27f5f41`; all records share one fingerprint and have no file errors. Its 39 raw residuals are exhaustively recorded in `.agents/docs/reference-differential/js-adfa8e0f-residual-audit.md`: 38 are non-actionable and one exact nested-receiver read extends assigned #944. The original #942/#943/#665/#944 witnesses are cleanly exact-proven, and the new witness has a diagnostic exact reproduction pending a clean fixing-head rerun. C# additionally has three clean but non-accepting diagnostic envelopes at `08ca4f09`; Azure SDK and Mono residuals are exhaustively dispositioned. #945, #231, #737, #423, #726, #946, and #701 are closed, with all seven #701 production families cleanly exact-proved at `530fb3d1`. A fresh full C# top-five/Roslyn run remains required. TypeScript, the final JavaScript confirmation, remaining full local gates, reports, and master integration remain incomplete.
+The selector correction resets objective completion to zero of 25 accepted records. All earlier LOC-ranked Java, Go, C#, JavaScript, and TypeScript artifacts remain regression evidence for the fixes they exposed, but none contains a repository selected by the authoritative task-ranked matrix. The accumulated fixes and their focused production proofs are locally integrated and have passed the complete publication gate. The next acceptance boundary is a clean pushed `origin/master`, a release runner built from that exact revision, and five new explicit-repository corpus legs.
 
 ## Context and Orientation
 
-Work in `/mnt/optane/tmp/bifrost-burndown-3` on the existing branch `bifrost-burndown-3`. Do not create or switch branches, rebase, or open a pull request. Commit only campaign files on the current branch. At the final publication boundary fetch `origin/master`, merge it with `git merge --no-edit origin/master` if needed, never rebase, and push the integrated `HEAD` directly to `origin/master`.
+Work in `/mnt/optane/tmp/bifrost-burndown-a1` on the existing branch `bifrost-burndown-a1`. Do not create or switch branches, rebase, or open a pull request. Commit only campaign files on the current branch. At each publication boundary fetch `origin/master`, merge it with `git merge --no-edit origin/master` if needed, never rebase, and push the integrated `HEAD` directly to `origin/master`.
 
 The operator runbook is `/home/jonathan/Projects/bifrost/.agents/docs/reference-differential-runbook.md`. The CLI driver is `src/bin/bifrost_reference_differential.rs`; the engine and report schema are `src/reference_differential/mod.rs`. `run-corpus` appends one repository JSON object after a repository finishes. Its completion key includes language, repository slug and head, Bifrost head, and a semantic configuration fingerprint. `--repo-jobs` bounds active repositories and `--jobs` bounds analyzer and forward/inverse work inside each repository.
 
-Canonical corpus metadata lives in `/home/jonathan/Projects/brokkbench/sft-tools-commits`. Language membership comes from `<language>/*.jsonl`; ranking comes from `repos.csv::code_loc`; clone paths under `/home/jonathan/Projects/brokkbench/clones` resolve to `/mnt/T9/repo-clones`. Missing clones and invalid LOC entries are reported and skipped before selecting five valid repositories.
+Canonical corpus metadata lives in `/home/jonathan/Projects/brokkbench/sft-tools-commits`, and the selection API plus prompt metadata live in `/home/jonathan/Projects/brokkbench/tasks.py` and its default `sfttasks` root. Language membership and every large-repo/build/testsome/binding/prompt/non-fragile/skip filter are applied through `tasks.py`; no campaign code reads those stores directly. Clone paths under `/home/jonathan/Projects/brokkbench/clones` resolve to `/mnt/T9/repo-clones`. The differential runner receives explicit selected slugs so its unrelated code-LOC ranking cannot alter membership.
 
-The selected C# repositories are Azure PowerShell at `409b39eb8c26`, Azure SDK for .NET at `a54cb128cf3d`, Mono at `0f53e9e151d9`, .NET runtime at `a0311b3485a8`, and Roslyn at `f219cabdd558`. The selected JavaScript repositories are Node.js at `2f2b81095bdc`, Kubernetes at `d7eae6c8fded`, KubeEdge at `de82fd3ed95c`, Karmada at `ffbade988fc3`, and DevSpace at `8ff6260787ed`. The selected TypeScript repositories are Kibana at `3a186638c45f`, Eliza at `03f8dcdcf9d0`, KEDA at `875675ce5cd1`, NativeScript at `d41dcd7a93b0`, and OpenMetadata at `5e31ae5871a3`.
+The task-ranked selections and filtered primary-task counts are:
 
-The accepted Java record is `/mnt/optane/tmp/reference-differential/java-top5-431f1292.jsonl`; the accepted Go record is `/mnt/optane/tmp/reference-differential/go-top5-20fec8af.jsonl`. Their selection, raw-row review, fixes, tests, and issue closures are documented in `.agents/plans/reference-differential-top-five-jgp.md`. That plan is prior evidence, while this file is the authoritative plan for completing the requested five-language matrix.
+- C#: `granit-fx__granit-dotnet` (110), `riok__mapperly` (85), `ClosedXML__ClosedXML` (68), `tui-cs__Terminal.Gui` (56), and `JoshClose__CsvHelper` (53).
+- Go: `afadesigns__zshellcheck` (499), `cli__cli` (476), `open-telemetry__opentelemetry-collector` (377), `router-for-me__CLIProxyAPI` (242), and `ollama__ollama` (233).
+- Java: `alibaba__fastjson2` (328), `chinabugotech__hutool` (208), `languagetool-org__languagetool` (192), `halo-dev__halo` (163), and `apache__dubbo` (126).
+- JavaScript: `josephfung__curia` (254), `iamkun__dayjs` (109), `Hack23__European-Parliament-MCP-Server` (74), `Stormheg__wagtail` (47), and `angular__angular.js` (41).
+- TypeScript: `code-yeongyu__oh-my-openagent` (272), `storybookjs__storybook` (180), `Yeachan-Heo__oh-my-claudecode` (162), `vuejs__core` (87), and `lerna__lerna` (76).
+
+The earlier LOC-ranked Java record `/mnt/optane/tmp/reference-differential/java-top5-431f1292.jsonl` and Go record `/mnt/optane/tmp/reference-differential/go-top5-20fec8af.jsonl`, plus the C#/JS/TS artifacts documented below, are regression evidence only for this objective. Their historical fixes and issue closures remain valid, but the task-ranked matrix must be run and audited independently.
 
 Open CFG/ICFG issues #886, #887, and #889 are assigned to another user and are outside the symbols scope. Open issue #895 concerns Java outer-type qualifier usages and is currently unassigned; reuse it only if a new matching production witness exists, and assign it to `jbellis` before any implementation.
 
 ## Plan of Work
 
-First commit this plan so the worktree is clean. Add `.brokk/` to the Azure PowerShell clone's local `.git/info/exclude`, verify all selected tracked heads and cleanliness, build the release runner from that exact Bifrost head, and record `sha256sum target/release/bifrost_reference_differential`. Do not mutate Bifrost source or selected clone content while a corpus process is active, because revision and dirtiness metadata are read dynamically.
+Publish the gated accumulated fixes directly to `origin/master`, verify local, tracking, and remote revisions agree, build the release runner from that exact clean Bifrost head, and record `sha256sum target/release/bifrost_reference_differential`. Do not mutate Bifrost source or selected clone content while a corpus process is active, because revision and dirtiness metadata are read dynamically.
 
-Before resuming the C# corpus, implement sole remaining assigned issue #701. Unify C# AST type-root discovery across candidate routing and inverse extraction for using-alias RHS, intermediate nested/generic static receivers, and type patterns, with structured value-shadow controls. Separately make normalized inverse lookup preserve generic arity while retaining dotted/nested separator parity and all physical same-FQN partial declarations. Exact-prove the four runtime and three Mono representatives before closing #701 and restarting the full C# leg.
-
-Then run C#, JavaScript, and TypeScript sequentially as independent resumable corpus processes. Each uses five canonical repositories, one active repository, eight inner workers, persisted cache mode, strict reporting, 1,000 sampled files, 10,000 sites, 4 MiB source files, 1,000 inverse target groups, 1,000 usage files per target, 100,000 hits per target, and seed zero. C# uses the revised 250,000 candidates-per-file ceiling; JavaScript and TypeScript retain 50,000. Preserve head-scoped JSONL and logs under `/mnt/optane/tmp/reference-differential`. A strict exit status of two is expected when raw missing sites exist; accepted evidence requires five completed JSON objects.
+Then run all five languages as independent resumable corpus processes, with languages allowed to proceed concurrently because their selected clones and output files are disjoint. Pass the five task-ranked slugs through repeated explicit `--repo` options; never use `--repos-per-language`, whose code-LOC ranking is a different selection contract. Each language run uses one active repository, eight inner workers, persisted cache mode, strict reporting, 1,000 sampled files, 10,000 sites, 4 MiB source files, 1,000 inverse target groups, 1,000 usage files per target, 100,000 hits per target, and seed zero. C# uses the revised 250,000 candidates-per-file ceiling; the other languages retain 50,000. Preserve head-scoped JSONL and logs under `/mnt/optane/tmp/reference-differential`. A strict exit status of two is expected when raw missing sites exist; accepted evidence requires five completed JSON objects.
 
 After each baseline, verify JSON parsing, exact Bifrost and pinned repository heads, clean flags, one fingerprint, completed status, summary limits, and file errors. Extract every raw `missing` site to a stable ledger keyed by repository, path, byte range, and target declarations. Delegate disjoint read-only source partitions, while root verifies the focused bytes and exact tree-sitter role and adjudicates every disposition.
 
@@ -279,20 +287,23 @@ At final integration, fetch and merge current `origin/master` into the current b
 
 ## Concrete Steps
 
-From `/mnt/optane/tmp/bifrost-burndown-3`, build the frozen runner after the plan checkpoint:
+From `/mnt/optane/tmp/bifrost-burndown-a1`, build the frozen runner after the plan checkpoint:
 
     git status --short
     git rev-parse HEAD
     cargo build --release --bin bifrost_reference_differential
     sha256sum target/release/bifrost_reference_differential
 
-The C# command is:
+The C# command shape is:
 
     set -o pipefail
     /usr/bin/time -v target/release/bifrost_reference_differential run-corpus \
       --clones-root /home/jonathan/Projects/brokkbench/clones \
       --commits-root /home/jonathan/Projects/brokkbench/sft-tools-commits \
-      --language csharp --repos-per-language 5 --repo-jobs 1 --jobs 8 \
+      --language csharp \
+      --repo granit-fx__granit-dotnet --repo riok__mapperly \
+      --repo ClosedXML__ClosedXML --repo tui-cs__Terminal.Gui \
+      --repo JoshClose__CsvHelper --repo-jobs 1 --jobs 8 \
       --cache-mode persisted --strict \
       --max-files 1000 --max-sites 10000 \
       --max-candidates-per-file 250000 --max-source-bytes 4194304 \
@@ -301,7 +312,7 @@ The C# command is:
       --output /mnt/optane/tmp/reference-differential/csharp-top5-BIFROST_HEAD.jsonl \
       2>&1 | tee -a /mnt/optane/tmp/reference-differential/csharp-top5-BIFROST_HEAD.log
 
-Repeat with `--language js`, `--max-candidates-per-file 50000`, and `js-top5-BIFROST_HEAD` for JavaScript, then `--language ts`, the same 50,000 candidate bound, and `ts-top5-BIFROST_HEAD` for TypeScript. Do not use `--include-tests`. Do not use `--force` unless an existing record for the same semantic completion key is proven invalid. Resume an interrupted run by confirming no process owns a selected clone and repeating the identical command without `--force`.
+Repeat with the exact Go, Java, JavaScript, and TypeScript slug sets recorded above, the matching `--language`, `--max-candidates-per-file 50000`, and a task-ranked head-scoped output name. Do not use `--repos-per-language` or `--include-tests`. Do not use `--force` unless an existing record for the same semantic completion key is proven invalid. Resume an interrupted run by confirming no process owns a selected clone and repeating the identical command without `--force`.
 
 Extract structured repository summaries and raw rows with:
 
@@ -381,3 +392,5 @@ Revision note (2026-07-20): Accepted the final seven #701 exact witnesses at cle
 Revision note (2026-07-20): Preserved the three-envelope `f7511c92` C# run as diagnostic after four candidate-ceiling exclusions and a newly pathological runtime `Interop` query, pinned both zero-loss profiles, reduced the shared single-namespace correctness defect, filed assigned #954, implemented all-top-level-namespace indexing, and recorded its complete focused gates plus 34.1-second dirty production proof. Raised the clean C# restart ceiling to 250,000 candidates per file rather than accepting known exclusions.
 
 Revision note (2026-07-20): Accepted and closed #954 after clean `093b17cd` exact proof resolved the 1,219-part runtime `Interop` group in 36.8 seconds with an exact consistent hit and zero file errors, then advanced the C# leg to its raised-ceiling full restart.
+
+Revision note (2026-07-20): Corrected the campaign selection after an explicit `tasks.py` audit proved that the earlier plan used code-LOC ranking. Pinned the five descending fully filtered `SFT_PREDICATES` task-count leaders for C#, Go, Java, JavaScript, and TypeScript, classified all prior LOC-ranked corpus records as regression-only evidence, and required repeated explicit `--repo` filters for the authoritative 25-repository matrix.
