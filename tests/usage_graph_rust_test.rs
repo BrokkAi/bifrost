@@ -467,6 +467,57 @@ pub fn caller(flag: bool) {
 }
 
 #[test]
+fn qualified_macro_free_paths_create_exact_workspace_edges() {
+    let value = inline_usage_graph(&[(
+        "src/lib.rs",
+        r#"
+macro_rules! generated {
+    () => {{
+        $crate::wanted::free();
+        $crate::wanted::Owner::assoc();
+    }};
+}
+
+macro_rules! consume { ($($tokens:tt)*) => {}; }
+
+pub mod wanted {
+    pub struct Owner;
+    pub type Alias = Owner;
+    impl Owner { pub fn assoc() {} }
+    pub fn free() {}
+}
+
+pub mod decoy {
+    pub struct Owner;
+    pub type Alias = Owner;
+    impl Owner { pub fn assoc() {} }
+    pub fn free() {}
+}
+
+pub fn invoke() {
+    consume!({ wanted::free(); });
+    consume!((wanted::Owner::assoc()));
+    consume!((wanted::Alias));
+    consume!({ decoy::free(); });
+    consume!((decoy::Owner::assoc()));
+    consume!((decoy::Alias));
+}
+"#,
+    )]);
+
+    assert!(
+        find_edge(&value, "invoke", "wanted.free").is_some(),
+        "expected invoke -> wanted.free from the nested macro path: {}",
+        value["edges"]
+    );
+    assert!(
+        find_edge(&value, "invoke", "decoy.free").is_some(),
+        "the exact-owner decoy path should retain its own identity: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn every_edge_endpoint_is_a_node() {
     assert_every_edge_endpoint_is_a_node(&usage_graph());
 }

@@ -1204,6 +1204,93 @@ impl Service {
 }
 
 #[test]
+fn authoritative_rust_usage_resolves_every_qualified_macro_path_segment() {
+    let lib_source = r#"
+pub mod wanted;
+pub mod decoy;
+
+macro_rules! define_calls {
+    () => {{
+        $crate::wanted::free();
+        $crate::wanted::Owner::assoc();
+    }};
+}
+
+macro_rules! consume { ($($tokens:tt)*) => {}; }
+
+pub fn invoke() {
+    consume!(wanted::free());
+    consume!({ wanted::Owner::assoc(); });
+    consume!((wanted::Alias));
+    consume!({ decoy::free(); });
+    consume!({ decoy::Owner::assoc(); });
+    consume!((decoy::Alias));
+}
+"#;
+    let owner_source = r#"
+pub struct Owner;
+pub type Alias = Owner;
+impl Owner { pub fn assoc() {} }
+pub fn free() {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", lib_source),
+        ("src/wanted.rs", owner_source),
+        ("src/decoy.rs", owner_source),
+    ]);
+    let file = project.file("src/lib.rs");
+
+    for (target_fqn, expected, required_snippets) in [
+        (
+            "wanted",
+            5,
+            vec!["$crate::wanted::free", "consume!(wanted::free())"],
+        ),
+        (
+            "wanted.Owner",
+            2,
+            vec!["$crate::wanted::Owner::assoc", "wanted::Owner::assoc"],
+        ),
+        ("wanted.Alias", 1, vec!["wanted::Alias"]),
+        (
+            "wanted.free",
+            2,
+            vec!["$crate::wanted::free", "consume!(wanted::free())"],
+        ),
+        (
+            "wanted.Owner.assoc",
+            2,
+            vec!["$crate::wanted::Owner::assoc", "wanted::Owner::assoc"],
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let hits = authoritative_hits(
+            &analyzer,
+            &target,
+            analyzer.get_analyzed_files().into_iter().collect(),
+        );
+        let macro_hits: Vec<_> = hits.iter().filter(|hit| hit.file == file).collect();
+        assert_eq!(expected, macro_hits.len(), "{target_fqn} hits: {hits:#?}");
+        for snippet in required_snippets {
+            assert!(
+                macro_hits.iter().any(|hit| hit.snippet.contains(snippet)),
+                "{target_fqn} should include `{snippet}`: {hits:#?}"
+            );
+        }
+        let expected_segment = target_fqn
+            .rsplit('.')
+            .next()
+            .expect("qualified target terminal");
+        assert!(
+            macro_hits.iter().all(|hit| {
+                lib_source.get(hit.start_offset..hit.end_offset) == Some(expected_segment)
+            }),
+            "{target_fqn} must retain its exact segment ranges: {hits:#?}"
+        );
+    }
+}
+
+#[test]
 fn authoritative_rust_private_members_respect_candidate_scope_and_owner_identity() {
     let (project, analyzer) = rust_analyzer_with_files(&[
         (

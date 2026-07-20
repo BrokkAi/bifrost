@@ -2,23 +2,40 @@ use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, reclassify_import_h
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::rust_graph::extractor::ScanCtx;
 use crate::analyzer::usages::rust_graph::resolve_rust_path_fqn;
+use crate::analyzer::usages::rust_graph::resolver::resolve_rust_token_tree_paths;
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use crate::text_utils::{find_line_index_for_offset, trimmed_snippet_around_range};
 use std::collections::BTreeSet;
 use tree_sitter::Node;
 
 pub(super) fn record_module_qualified_hits(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    record_module_qualified_hits_in(root, ctx);
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "scoped_identifier" | "scoped_type_identifier" => {
+                record_scoped_identifier_hit(node, ctx)
+            }
+            "token_tree" => record_token_tree_qualified_hits(node, ctx),
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        let mut children: Vec<_> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
+    }
 }
 
-fn record_module_qualified_hits_in(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier") {
-        record_scoped_identifier_hit(node, ctx);
+fn record_token_tree_qualified_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if has_ancestor_kind(node, "use_declaration") {
+        return;
     }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        record_module_qualified_hits_in(child, ctx);
+    for segment in
+        resolve_rust_token_tree_paths(ctx.rust, ctx.support, ctx.refs, ctx.file, ctx.source, node)
+    {
+        if segment.fqn == ctx.target_fqn {
+            record_target_segment(segment.node, ctx);
+        }
     }
 }
 

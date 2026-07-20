@@ -23,10 +23,13 @@
 
 use super::extractor::{first_generic_type_argument, type_node_last_segment};
 use crate::analyzer::usages::inverted_edges::{
-    EdgeCollector, UsageEdgeBuildOutput, build_edge_output, classify_reference_node,
-    parse_and_collect,
+    EdgeCollector, UsageEdgeBuildOutput, UsageReferenceKind, build_edge_output,
+    classify_reference_node, parse_and_collect,
 };
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
+use crate::analyzer::usages::rust_graph::resolver::{
+    RustTokenPathRole, resolve_rust_token_tree_paths, rust_token_path_segment_is_qualified,
+};
 use crate::analyzer::{
     GlobalUsageDefinitionIndex, IAnalyzer, ProjectFile, RustAnalyzer, RustReferenceContext,
 };
@@ -163,6 +166,10 @@ fn walk(node: Node<'_>, ctx: &mut RustScan<'_, '_>, scopes: &mut Vec<ScopeFacts>
                     handle_method_call(node, ctx, scopes);
                     push_children(node, &mut stack);
                 }
+                "token_tree" => {
+                    handle_token_tree_paths(node, ctx);
+                    push_children(node, &mut stack);
+                }
                 "identifier" | "type_identifier" => {
                     handle_identifier(node, ctx, scopes);
                     push_children(node, &mut stack);
@@ -206,12 +213,14 @@ fn receiver_type(scopes: &[ScopeFacts], name: &str) -> Option<String> {
 
 fn handle_identifier(node: Node<'_>, ctx: &mut RustScan<'_, '_>, scopes: &[ScopeFacts]) {
     // The path/name parts of a scoped path are resolved by handle_scoped.
-    if node.parent().is_some_and(|parent| {
-        matches!(
-            parent.kind(),
-            "scoped_identifier" | "scoped_type_identifier"
-        )
-    }) {
+    if rust_token_path_segment_is_qualified(node)
+        || node.parent().is_some_and(|parent| {
+            matches!(
+                parent.kind(),
+                "scoped_identifier" | "scoped_type_identifier"
+            )
+        })
+    {
         return;
     }
     let text = slice(node, ctx.source);
@@ -220,6 +229,41 @@ fn handle_identifier(node: Node<'_>, ctx: &mut RustScan<'_, '_>, scopes: &[Scope
     }
     if let Some(callee) = ctx.bare_callee(text) {
         ctx.record(callee, node);
+    }
+}
+
+fn handle_token_tree_paths(node: Node<'_>, ctx: &mut RustScan<'_, '_>) {
+    for segment in
+        resolve_rust_token_tree_paths(ctx.rust, ctx.support, &ctx.refs, ctx.file, ctx.source, node)
+    {
+        let kind = match segment.role {
+            RustTokenPathRole::Call => UsageReferenceKind::Call,
+            RustTokenPathRole::Prefix | RustTokenPathRole::Value => {
+                let candidates = ctx.support.fqn(&segment.fqn);
+                if candidates
+                    .iter()
+                    .any(|candidate| candidate.is_class() || ctx.rust.is_type_alias(candidate))
+                {
+                    UsageReferenceKind::Type
+                } else if segment.role == RustTokenPathRole::Value
+                    && candidates.iter().any(|candidate| {
+                        ctx.rust
+                            .parent_of(candidate)
+                            .is_some_and(|owner| !owner.is_module())
+                    })
+                {
+                    UsageReferenceKind::Member
+                } else {
+                    UsageReferenceKind::Other
+                }
+            }
+        };
+        ctx.collector.record_kind(
+            segment.fqn,
+            kind,
+            segment.node.start_byte(),
+            segment.node.end_byte(),
+        );
     }
 }
 

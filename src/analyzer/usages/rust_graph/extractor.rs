@@ -12,7 +12,7 @@ use crate::analyzer::usages::rust_graph::hits::{
     record_hit, record_import_hit, record_module_qualified_hits,
 };
 use crate::analyzer::usages::rust_graph::resolver::{
-    is_trait_owner, resolve_scoped_associated_item,
+    is_trait_owner, resolve_scoped_associated_item, rust_token_path_segment_is_qualified,
 };
 use crate::analyzer::usages::traits::UsageScanScope;
 use crate::analyzer::{
@@ -231,7 +231,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) analyzer: &'a dyn IAnalyzer,
     pub(super) rust: &'a RustAnalyzer,
     pub(super) refs: &'a RustReferenceContext,
-    support: &'a GlobalUsageDefinitionIndex,
+    pub(super) support: &'a GlobalUsageDefinitionIndex,
     target: &'a CodeUnit,
     pub(super) target_fqn: &'a str,
     pub(super) target_is_class: bool,
@@ -288,12 +288,13 @@ fn scan_node(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn identifier_is_scoped_path_part(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        matches!(
-            parent.kind(),
-            "scoped_identifier" | "scoped_type_identifier"
-        )
-    })
+    rust_token_path_segment_is_qualified(node)
+        || node.parent().is_some_and(|parent| {
+            matches!(
+                parent.kind(),
+                "scoped_identifier" | "scoped_type_identifier"
+            )
+        })
 }
 
 fn self_reference_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
