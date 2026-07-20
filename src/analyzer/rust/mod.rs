@@ -62,6 +62,18 @@ pub struct RustAnalyzer {
 crate::analyzer::impl_forward_query_provider!(RustAnalyzer);
 
 impl RustAnalyzer {
+    pub(crate) fn prepared_syntax(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
+        self.inner.prepared_syntax(file)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepared_syntax_parse_count_for_test(&self, file: &ProjectFile) -> usize {
+        self.inner.prepared_syntax_parse_count_for_test(file)
+    }
+
     fn indexed_sources_unchanged(&self, changed_files: &BTreeSet<ProjectFile>) -> bool {
         changed_files
             .iter()

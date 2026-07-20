@@ -91,6 +91,12 @@ pub(super) fn resolve_rust(
         return outcome;
     }
     if let Some(tree) = tree
+        && let Some(outcome) =
+            rust_exact_reference_role_outcome(analyzer, support, file, source, tree, site)
+    {
+        return outcome;
+    }
+    if let Some(tree) = tree
         && !reference.contains(['.', ':'])
         && let Some(node) = smallest_named_node_covering(
             tree.root_node(),
@@ -386,6 +392,9 @@ enum RustBareReferenceRole {
     Type,
     // Rust struct and enum constructors occupy the value namespace too.
     Value,
+    Callable,
+    Owner,
+    Macro,
 }
 
 enum RustVisibleImportResolution {
@@ -393,6 +402,273 @@ enum RustVisibleImportResolution {
     GlobResolved(Vec<CodeUnit>),
     BoundButUnindexed,
     Unbound,
+}
+
+fn rust_exact_reference_role_outcome(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+) -> Option<DefinitionLookupOutcome> {
+    let focused =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
+    if rust_enclosing_lifetime(focused).is_some() {
+        return Some(no_definition(
+            "local_lifetime",
+            "Rust lifetime parameters are lexical bindings and are not indexed definitions",
+        ));
+    }
+
+    let focused_name = rust_node_text(focused, source).trim();
+    if focused.kind() == "type_identifier"
+        && rust_type_parameter_visible_from(focused, source, focused_name)
+    {
+        return Some(no_definition(
+            "local_type_parameter",
+            format!("`{focused_name}` is a lexical Rust type parameter, which is not indexed"),
+        ));
+    }
+
+    if let Some(type_binding) = rust_enclosing_type_binding_name(focused) {
+        return Some(rust_type_binding_name_outcome(
+            analyzer,
+            support,
+            file,
+            source,
+            type_binding,
+        ));
+    }
+
+    if let Some(macro_invocation) = rust_enclosing_macro_name(focused) {
+        return rust_macro_name_outcome(
+            analyzer,
+            support,
+            file,
+            source,
+            tree,
+            site,
+            macro_invocation,
+            focused,
+        );
+    }
+
+    if focused.kind() == "identifier"
+        && (lexical_scope::is_pattern_binding_identifier(focused)
+            || (lexical_scope::name_shadowed_in_tree(
+                tree.root_node(),
+                source,
+                focused_name,
+                site.focus_start_byte,
+            ) && (rust_identifier_is_explicit_receiver(focused)
+                || !site.text.contains(['.', ':']))))
+    {
+        return Some(no_definition(
+            "local_binding",
+            format!("`{focused_name}` is a local Rust binding, which is not indexed"),
+        ));
+    }
+    None
+}
+
+fn rust_enclosing_lifetime(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        if node.kind() == "lifetime" {
+            return Some(node);
+        }
+        if matches!(
+            node.kind(),
+            "type_identifier" | "scoped_type_identifier" | "identifier"
+        ) && node
+            .parent()
+            .is_some_and(|parent| parent.kind() != "lifetime")
+        {
+            return None;
+        }
+        node = node.parent()?;
+    }
+}
+
+fn rust_type_parameter_visible_from(mut node: Node<'_>, source: &str, name: &str) -> bool {
+    loop {
+        if let Some(parameters) = node.child_by_field_name("type_parameters") {
+            let mut cursor = parameters.walk();
+            if parameters.named_children(&mut cursor).any(|parameter| {
+                parameter.kind() == "type_parameter"
+                    && parameter
+                        .child_by_field_name("name")
+                        .is_some_and(|parameter_name| {
+                            rust_node_text(parameter_name, source).trim() == name
+                        })
+            }) {
+                return true;
+            }
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        node = parent;
+    }
+}
+
+fn rust_enclosing_type_binding_name(focused: Node<'_>) -> Option<Node<'_>> {
+    let mut node = focused;
+    loop {
+        if node.kind() == "type_binding" {
+            return node
+                .child_by_field_name("name")
+                .is_some_and(|name| node_within(name, focused))
+                .then_some(node);
+        }
+        if matches!(node.kind(), "generic_type" | "trait_bounds") {
+            return None;
+        }
+        node = node.parent()?;
+    }
+}
+
+fn rust_type_binding_name_outcome(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    binding: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let Some(name) = binding.child_by_field_name("name") else {
+        return no_definition(
+            "invalid_associated_type_binding",
+            "Rust associated type binding has no name",
+        );
+    };
+    let name = rust_node_text(name, source).trim();
+    let mut owner = binding.parent();
+    while let Some(candidate) = owner {
+        if candidate.kind() == "generic_type" {
+            let Some(type_node) = candidate.child_by_field_name("type") else {
+                break;
+            };
+            let Some(owner_fqn) = rust_resolve_type_node_fqn(
+                analyzer,
+                support,
+                file,
+                source,
+                type_node,
+                Some(type_node.start_byte()),
+            ) else {
+                break;
+            };
+            let candidates: Vec<_> = support
+                .fqn(&format!("{owner_fqn}.{name}"))
+                .into_iter()
+                .filter(CodeUnit::is_field)
+                .collect();
+            if !candidates.is_empty() {
+                return candidates_outcome(candidates);
+            }
+            break;
+        }
+        if matches!(candidate.kind(), "where_predicate" | "function_item") {
+            break;
+        }
+        owner = candidate.parent();
+    }
+    no_definition(
+        "unresolved_associated_type_binding",
+        format!("Rust associated type binding `{name}` did not resolve to an indexed trait item"),
+    )
+}
+
+fn rust_enclosing_macro_name(focused: Node<'_>) -> Option<Node<'_>> {
+    let mut node = focused;
+    loop {
+        if node.kind() == "macro_invocation" {
+            return node
+                .child_by_field_name("macro")
+                .is_some_and(|macro_name| node_within(macro_name, focused))
+                .then_some(node);
+        }
+        if node.kind() == "token_tree" {
+            return None;
+        }
+        node = node.parent()?;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rust_macro_name_outcome(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    invocation: Node<'_>,
+    focused: Node<'_>,
+) -> Option<DefinitionLookupOutcome> {
+    let macro_name = invocation.child_by_field_name("macro")?;
+    if macro_name.kind() == "scoped_identifier"
+        && macro_name
+            .child_by_field_name("path")
+            .is_some_and(|path| node_within(path, focused))
+    {
+        return None;
+    }
+    let rust = resolve_analyzer::<RustAnalyzer>(analyzer)?;
+    let refs = rust.forward_reference_context_of(file);
+    let name_node = macro_name.child_by_field_name("name").unwrap_or(macro_name);
+    let name = rust_node_text(name_node, source).trim();
+    let candidates = if let Some(path) = macro_name.child_by_field_name("path") {
+        let path = rust_node_text(path, source).trim();
+        refs.resolve_scoped(path, name)
+            .into_iter()
+            .flat_map(|fqn| support.fqn(&fqn))
+            .filter(CodeUnit::is_macro)
+            .collect()
+    } else {
+        match rust_visible_import_resolution(
+            rust,
+            support,
+            file,
+            source,
+            site.focus_start_byte,
+            name,
+            RustBareReferenceRole::Macro,
+        ) {
+            RustVisibleImportResolution::Resolved(candidates)
+            | RustVisibleImportResolution::GlobResolved(candidates) => candidates,
+            RustVisibleImportResolution::BoundButUnindexed => {
+                return Some(boundary(format!(
+                    "Rust macro `{name}` is imported across a crate/module boundary that is not indexed"
+                )));
+            }
+            RustVisibleImportResolution::Unbound => rust_current_module_candidates(
+                analyzer,
+                rust,
+                support,
+                file,
+                tree,
+                site,
+                name,
+                RustBareReferenceRole::Macro,
+                &refs,
+            ),
+        }
+    };
+    Some(if candidates.is_empty() {
+        no_definition(
+            "unindexed_macro",
+            format!("Rust macro `{name}` did not resolve to an indexed macro definition"),
+        )
+    } else {
+        candidates_outcome(candidates)
+    })
+}
+
+fn rust_identifier_is_explicit_receiver(node: Node<'_>) -> bool {
+    rust_enclosing_field_expression(node)
+        .and_then(|field| field.child_by_field_name("value"))
+        .is_some_and(|receiver| node_within(receiver, node))
 }
 
 fn rust_bare_reference_role(
@@ -403,9 +679,29 @@ fn rust_bare_reference_role(
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
     match node.kind() {
         "type_identifier" => Some(RustBareReferenceRole::Type),
+        "identifier" if rust_identifier_is_callee(node) => Some(RustBareReferenceRole::Callable),
         "identifier" => Some(RustBareReferenceRole::Value),
         _ => None,
     }
+}
+
+fn rust_identifier_is_callee(node: Node<'_>) -> bool {
+    let mut function = node;
+    while let Some(parent) = function.parent()
+        && matches!(parent.kind(), "generic_function" | "scoped_identifier")
+        && parent
+            .child_by_field_name("function")
+            .or_else(|| parent.child_by_field_name("name"))
+            .is_some_and(|child| node_within(child, function))
+    {
+        function = parent;
+    }
+    function.parent().is_some_and(|parent| {
+        parent.kind() == "call_expression"
+            && parent
+                .child_by_field_name("function")
+                .is_some_and(|callee| node_within(callee, function))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -432,15 +728,16 @@ fn rust_visible_import_resolution(
             }
         }
     }
-    let targets = rust.resolve_imported_export_from_binder_forward(file, &binder, reference);
+    let targets = rust_forward_import_targets(rust, file, &binder, reference);
     let mut candidates = Vec::new();
     for (target_file, target_name) in targets {
-        candidates.extend(
-            support
-                .file_identifier(&target_file, &target_name)
-                .into_iter()
-                .filter(|candidate| rust_role_accepts_imported(rust, role, candidate)),
-        );
+        candidates.extend(rust_import_target_candidates(
+            rust,
+            support,
+            target_file,
+            target_name,
+            role,
+        ));
     }
     if explicitly_bound && !expected_fqns.is_empty() {
         let exact: Vec<_> = candidates
@@ -465,6 +762,67 @@ fn rust_visible_import_resolution(
     } else {
         RustVisibleImportResolution::Unbound
     }
+}
+
+fn rust_import_target_candidates(
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    target_file: ProjectFile,
+    target_name: String,
+    role: RustBareReferenceRole,
+) -> Vec<CodeUnit> {
+    let mut candidates = Vec::new();
+    let mut pending = vec![(target_file, target_name)];
+    let mut visited = HashSet::default();
+    while let Some((file, name)) = pending.pop() {
+        if !visited.insert((file.clone(), name.clone())) {
+            continue;
+        }
+        let direct: Vec<_> = support
+            .file_identifier(&file, &name)
+            .into_iter()
+            .filter(|candidate| rust_role_accepts_imported(rust, role, candidate))
+            .collect();
+        if !direct.is_empty() {
+            candidates.extend(direct);
+            continue;
+        }
+
+        // A child module can import a private name from its parent. Follow the
+        // parent's module-level binder until we reach the physical declaration,
+        // while excluding imports nested in functions or other lexical scopes.
+        let Ok(source) = file.read_to_string() else {
+            continue;
+        };
+        let binder = lexical_scope::visible_import_binder_at(&source, source.len());
+        pending.extend(rust_forward_import_targets(rust, &file, &binder, &name));
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
+fn rust_forward_import_targets(
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    binder: &ImportBinder,
+    reference: &str,
+) -> Vec<(ProjectFile, String)> {
+    let mut targets = rust.resolve_imported_export_from_binder_forward(file, binder, reference);
+    for (local_name, binding) in &binder.bindings {
+        if local_name != reference || binding.kind != ImportKind::Named {
+            continue;
+        }
+        let imported = binding.imported_name.as_deref().unwrap_or(reference);
+        targets.extend(
+            rust.resolve_module_files(file, &binding.module_specifier)
+                .into_iter()
+                .map(|target_file| (target_file, imported.to_string())),
+        );
+    }
+    targets.sort();
+    targets.dedup();
+    targets
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -501,7 +859,7 @@ fn rust_current_module_candidates(
         .file_identifier(file, reference)
         .into_iter()
         .filter(|candidate| candidate.package_name() == package)
-        .filter(|candidate| rust_role_accepts_current_module(analyzer, rust, role, candidate))
+        .filter(|candidate| rust_role_accepts_current_module(rust, role, candidate))
         .filter(|candidate| {
             analyzer
                 .ranges(candidate)
@@ -529,28 +887,109 @@ fn rust_role_accepts_imported(
     candidate: &CodeUnit,
 ) -> bool {
     match role {
-        RustBareReferenceRole::Type => candidate.is_class() || rust.is_type_alias(candidate),
-        RustBareReferenceRole::Value => !candidate.is_module(),
+        RustBareReferenceRole::Type => {
+            candidate.is_class() || rust_declaration_is_module_type_alias(rust, candidate)
+        }
+        RustBareReferenceRole::Value => rust_value_namespace_candidate(rust, candidate),
+        RustBareReferenceRole::Callable => rust_callable_namespace_candidate(rust, candidate),
+        RustBareReferenceRole::Owner => {
+            candidate.is_module()
+                || candidate.is_class()
+                || rust_declaration_is_module_type_alias(rust, candidate)
+        }
+        RustBareReferenceRole::Macro => candidate.is_macro(),
     }
 }
 
 fn rust_role_accepts_current_module(
-    analyzer: &dyn IAnalyzer,
     rust: &RustAnalyzer,
     role: RustBareReferenceRole,
     candidate: &CodeUnit,
 ) -> bool {
     match role {
-        RustBareReferenceRole::Type => candidate.is_class() || rust.is_type_alias(candidate),
-        RustBareReferenceRole::Value => {
-            candidate.is_class()
-                || candidate.is_function()
-                || (candidate.is_field()
-                    && analyzer
-                        .parent_of(candidate)
-                        .is_none_or(|parent| !parent.is_class()))
+        RustBareReferenceRole::Type => {
+            candidate.is_class() || rust_declaration_is_module_type_alias(rust, candidate)
         }
+        RustBareReferenceRole::Value => rust_value_namespace_candidate(rust, candidate),
+        RustBareReferenceRole::Callable => rust_callable_namespace_candidate(rust, candidate),
+        RustBareReferenceRole::Owner => {
+            candidate.is_module()
+                || candidate.is_class()
+                || rust_declaration_is_module_type_alias(rust, candidate)
+        }
+        RustBareReferenceRole::Macro => candidate.is_macro(),
     }
+}
+
+fn rust_value_namespace_candidate(rust: &RustAnalyzer, candidate: &CodeUnit) -> bool {
+    candidate.is_class()
+        || (candidate.is_function() && rust_declaration_is_free_function(rust, candidate))
+        || (candidate.is_field() && rust_declaration_is_value_item(rust, candidate))
+}
+
+fn rust_callable_namespace_candidate(rust: &RustAnalyzer, candidate: &CodeUnit) -> bool {
+    candidate.is_class()
+        || (candidate.is_function() && rust_declaration_is_free_function(rust, candidate))
+        || (candidate.is_field() && rust_declaration_is_enum_variant(rust, candidate))
+}
+
+fn rust_declaration_is_free_function(rust: &RustAnalyzer, candidate: &CodeUnit) -> bool {
+    rust_declaration_matches(rust, candidate, |node| {
+        if node.kind() != "function_item" {
+            return false;
+        }
+        let mut current = node.parent();
+        while let Some(parent) = current {
+            if matches!(parent.kind(), "impl_item" | "trait_item") {
+                return false;
+            }
+            current = parent.parent();
+        }
+        true
+    })
+}
+
+fn rust_declaration_is_module_type_alias(rust: &RustAnalyzer, candidate: &CodeUnit) -> bool {
+    if !rust.is_type_alias(candidate) {
+        return false;
+    }
+    rust_declaration_matches(rust, candidate, |node| {
+        if node.kind() != "type_item" {
+            return false;
+        }
+        let mut current = node.parent();
+        while let Some(parent) = current {
+            if matches!(parent.kind(), "impl_item" | "trait_item") {
+                return false;
+            }
+            current = parent.parent();
+        }
+        true
+    })
+}
+
+fn rust_declaration_is_value_item(rust: &RustAnalyzer, candidate: &CodeUnit) -> bool {
+    rust_declaration_matches(rust, candidate, |node| {
+        matches!(node.kind(), "enum_variant" | "const_item" | "static_item")
+    })
+}
+
+fn rust_declaration_is_enum_variant(rust: &RustAnalyzer, candidate: &CodeUnit) -> bool {
+    rust_declaration_matches(rust, candidate, |node| node.kind() == "enum_variant")
+}
+
+fn rust_declaration_matches(
+    rust: &RustAnalyzer,
+    candidate: &CodeUnit,
+    predicate: impl FnOnce(Node<'_>) -> bool,
+) -> bool {
+    let Ok(source) = candidate.source().read_to_string() else {
+        return false;
+    };
+    let Some(tree) = lexical_scope::parse_rust_tree(&source) else {
+        return false;
+    };
+    rust_code_unit_declaration_node(rust, candidate, tree.root_node()).is_some_and(predicate)
 }
 
 fn rust_impl_associated_type_declaration_outcome(
@@ -772,6 +1211,11 @@ fn rust_focused_use_path_outcome(
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
     let focused_path = rust_focused_use_path(focused, source)?;
     let focused_text = rust_node_text(focused, source).trim();
+    let role = if rust_focused_nonterminal_prefix(focused).is_some() {
+        RustFocusedPathRole::Owner
+    } else {
+        RustFocusedPathRole::Declaration
+    };
     let resolved_fqn = crate::analyzer::usages::rust_graph::resolve_rust_path_fqn(
         rust,
         refs,
@@ -787,6 +1231,8 @@ fn rust_focused_use_path_outcome(
         refs,
         focused_path.root,
         focused_text,
+        &focused_path.full_path,
+        role,
         resolved_fqn.as_deref(),
     ))
 }
@@ -827,6 +1273,8 @@ fn rust_focused_scoped_prefix_outcome(
         refs,
         root,
         focused_text,
+        prefix_text,
+        RustFocusedPathRole::Owner,
         resolved_fqn.as_deref(),
     ))
 }
@@ -883,8 +1331,16 @@ fn rust_focused_token_tree_prefix_outcome(
         refs,
         root,
         focused_text,
+        prefix,
+        RustFocusedPathRole::Owner,
         resolved_fqn.as_deref(),
     ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustFocusedPathRole {
+    Owner,
+    Declaration,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -897,6 +1353,8 @@ fn rust_focused_prefix_resolution_outcome(
     refs: &RustReferenceContext,
     root: Node<'_>,
     focused_text: &str,
+    focused_path: &str,
+    role: RustFocusedPathRole,
     resolved_fqn: Option<&str>,
 ) -> DefinitionLookupOutcome {
     if let Some(fqn) = resolved_fqn {
@@ -904,7 +1362,60 @@ fn rust_focused_prefix_resolution_outcome(
             .fqn(fqn)
             .into_iter()
             .filter(|candidate| language_for_file(candidate.source()) == Language::Rust)
+            .filter(|candidate| {
+                role == RustFocusedPathRole::Declaration
+                    || rust_role_accepts_imported(rust, RustBareReferenceRole::Owner, candidate)
+            })
             .collect();
+        if !candidates.is_empty() {
+            return candidates_outcome(candidates);
+        }
+    }
+
+    if role == RustFocusedPathRole::Owner {
+        let mut candidates = rust
+            .resolve_module_package(file, focused_path)
+            .into_iter()
+            .flat_map(|fqn| support.fqn(&fqn))
+            .filter(|candidate| {
+                rust_role_accepts_imported(rust, RustBareReferenceRole::Owner, candidate)
+            })
+            .collect::<Vec<_>>();
+        if focused_path == focused_text {
+            match rust_visible_import_resolution(
+                rust,
+                support,
+                file,
+                source,
+                site.focus_start_byte,
+                focused_text,
+                RustBareReferenceRole::Owner,
+            ) {
+                RustVisibleImportResolution::Resolved(imported)
+                | RustVisibleImportResolution::GlobResolved(imported) => {
+                    candidates.extend(imported);
+                }
+                RustVisibleImportResolution::BoundButUnindexed => {
+                    return boundary(format!(
+                        "focused Rust owner `{focused_text}` is explicitly imported across a crate/module boundary that is not indexed"
+                    ));
+                }
+                RustVisibleImportResolution::Unbound => candidates.extend(
+                    support
+                        .file_identifier(file, focused_text)
+                        .into_iter()
+                        .filter(|candidate| {
+                            rust_role_accepts_imported(
+                                rust,
+                                RustBareReferenceRole::Owner,
+                                candidate,
+                            )
+                        }),
+                ),
+            }
+        }
+        sort_units(&mut candidates);
+        candidates.dedup();
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
         }
@@ -913,7 +1424,7 @@ fn rust_focused_prefix_resolution_outcome(
     let root_name = rust_node_text(root, source).trim();
     let binder = lexical_scope::visible_import_binder_at(source, site.focus_start_byte);
     if rust_binder_has_external_binding(&binder, root_name)
-        || rust_extern_prelude_root(rust, file, refs, root, root_name)
+        || rust_extern_prelude_root(rust, support, file, refs, root, root_name)
     {
         return boundary(format!(
             "focused Rust path segment `{focused_text}` crosses a crate/module boundary not indexed in this workspace"
@@ -936,13 +1447,18 @@ fn rust_path_segment_node(node: Node<'_>) -> bool {
 
 fn rust_extern_prelude_root(
     rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     refs: &RustReferenceContext,
     root: Node<'_>,
     root_name: &str,
 ) -> bool {
     matches!(root.kind(), "identifier" | "type_identifier")
-        && refs.resolve_bare(root_name).is_none()
+        && refs.resolve_bare(root_name).is_none_or(|fqn| {
+            !support.fqn(fqn).into_iter().any(|candidate| {
+                rust_role_accepts_imported(rust, RustBareReferenceRole::Owner, &candidate)
+            })
+        })
         && rust.resolve_module_files(file, root_name).is_empty()
 }
 
@@ -1850,6 +2366,9 @@ fn rust_type_ref(type_node: Node<'_>, source: &str) -> Option<RustTypeRef> {
 fn rust_named_type_node(type_node: Node<'_>) -> Option<Node<'_>> {
     match type_node.kind() {
         "reference_type" | "pointer_type" | "array_type" | "bracketed_type" => type_node
+            .child_by_field_name("type")
+            .and_then(rust_named_type_node),
+        "higher_ranked_trait_bound" => type_node
             .child_by_field_name("type")
             .and_then(rust_named_type_node),
         "generic_type" | "qualified_type" => Some(type_node),

@@ -22,8 +22,11 @@ from bifrost_searchtools import (
     CodeQueryMatch,
     CodeQueryReferenceSite,
     CodeQueryResult,
+    ContainerKind,
     DeclarationLookupResult,
     DefinitionLookupResult,
+    DirectoryListingEntry,
+    FileSummariesResult,
     MostRelevantFilesRankingMode,
     NavigationOperation,
     SearchToolsClient,
@@ -117,6 +120,35 @@ class CodeQueryModelTest(unittest.TestCase):
         )
         self.assertIs(advisory.completion.kind, CodeQueryCompletionKind.COMPLETE)
         self.assertIn("advisory [broad_query]", advisory.render_text())
+
+    def test_summary_model_parses_typed_container_listings(self) -> None:
+        result = FileSummariesResult.from_dict(
+            {
+                "summaries": [],
+                "listings": [
+                    {
+                        "target": "src",
+                        "kind": "directory",
+                        "entries": [
+                            {
+                                "kind": "directory",
+                                "name": "internal",
+                                "path": "src/internal",
+                            }
+                        ],
+                        "total_entries": 1,
+                        "truncated": False,
+                    }
+                ],
+                "not_found": [],
+                "ambiguous": [],
+            }
+        )
+
+        self.assertEqual(ContainerKind.DIRECTORY, result.listings[0].kind)
+        self.assertIsInstance(result.listings[0].entries[0], DirectoryListingEntry)
+        self.assertEqual(1, result.count)
+        self.assertIn("[directory] src/internal", result.render_text())
 
         incomplete = CodeQueryResult.from_dict(
             {
@@ -634,15 +666,16 @@ class SearchToolsClientTest(unittest.TestCase):
         )
         self.assertEqual(before_a, (self.fixture_root / "A.java").read_text())
 
-    def test_get_summaries_keeps_compact_symbols_for_wrapper_callers(self) -> None:
+    def test_get_summaries_returns_typed_root_listing(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
             summaries = client.get_summaries(["."])
             text = summaries.render_text()
 
         self.assertEqual(0, len(summaries.summaries))
-        self.assertIsNotNone(summaries.compact_symbols)
-        assert summaries.compact_symbols is not None
-        self.assertGreaterEqual(summaries.compact_symbols.count, 1)
+        self.assertIsNone(summaries.compact_symbols)
+        self.assertEqual(1, len(summaries.listings))
+        self.assertEqual(ContainerKind.DIRECTORY, summaries.listings[0].kind)
+        self.assertGreaterEqual(summaries.listings[0].total_entries, 1)
         self.assertIn("A.java", text)
 
     def test_native_errors_are_raised_as_searchtools_error(self) -> None:

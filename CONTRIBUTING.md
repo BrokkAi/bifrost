@@ -71,6 +71,16 @@ plugin release metadata are versioned **together** and cut from a **single tag**
 `scripts/sync-release-version.mjs` copies it into the plugin and editor metadata
 that require literal JSON versions.
 
+Rust third-party license HTML is generated rather than committed. Release
+workflows generate it automatically. To inspect or package it locally, install
+`cargo-about` 0.9.1 and run:
+
+```bash
+scripts/generate-rust-third-party-notices.sh licenses/THIRD_PARTY_LICENSES.html
+```
+
+The generated path is ignored by Git.
+
 The agent and editor plugin manifests also carry release metadata and must be
 checked during release prep. Before tagging a release, edit only `Cargo.toml`,
 then run:
@@ -89,6 +99,7 @@ That script updates these committed version fields:
 - `editors/vscode/package-lock.json`
 - `plugins/bifrost-agent/bifrost-release.json`
 - `plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/bifrost-release.json`
+- `docs/src/content/docs/rust-library.md`
 
 The Codex and Claude marketplace files are also part of the plugin surface, but
 currently do not carry version fields:
@@ -116,8 +127,9 @@ directory instead of hand-editing checksums.
 
 To cut a release:
 
-1. Bump `version` in `Cargo.toml`, run `node scripts/sync-release-version.mjs`,
-   review the generated metadata diff, and merge.
+1. Bump `version` in `Cargo.toml`, run the version-sync command above, review
+   the generated metadata, and merge. Release workflows generate the Rust
+   dependency report from the tagged `Cargo.lock`; it is not committed.
 2. If skills, agents, launcher files, MCP config, or plugin manifests changed,
    regenerate and validate the generated plugin bundles:
 
@@ -160,9 +172,10 @@ input.
 To announce a published GitHub Release in Discord, set the
 `DISCORD_RELEASE_WEBHOOK_URL` repository Actions secret to the target channel's
 webhook URL. The release workflow reuses GitHub's generated release notes,
-prevents mentions from being parsed, and leaves a failed Discord delivery as a
-warning so it cannot invalidate an already-published release. It uses built-in
-runner tools, so no additional GitHub Actions allowlist entry is needed.
+prevents mentions from being parsed, suppresses automatic link embeds, and
+leaves a failed Discord delivery as a warning so it cannot invalidate an
+already-published release. It uses built-in runner tools, so no additional
+GitHub Actions allowlist entry is needed.
 
 ## Version Policy
 

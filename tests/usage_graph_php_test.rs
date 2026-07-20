@@ -66,6 +66,48 @@ fn type_references_edge() {
 }
 
 #[test]
+fn owner_relative_type_references_edge_to_the_structured_owner() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "RelativeTypes.php",
+            r#"<?php
+namespace App;
+class Base {
+    public static function inherited(): void {}
+}
+class Target extends Base {
+    public static function buildSelf(): self { return new self(); }
+    public function buildLate(): static { return new static(); }
+    public function accepts(mixed $value): bool { return $value instanceof self; }
+    public function buildParent(): parent { return new parent(); }
+    public static function callRelative(): void {
+        self::buildSelf();
+        parent::inherited();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    // Edges back to the enclosing class itself are intentionally suppressed by
+    // the graph layer, so the observable graph proof uses `parent`, whose owner
+    // is distinct. Targeted usage coverage above verifies `self` and `static`.
+    for caller in ["App.Target.buildParent", "App.Target.callRelative"] {
+        assert!(
+            has_edge(&value, caller, "App.Base"),
+            "expected {caller} -> Base: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        !has_edge(&value, "App.Target.buildParent", "App.Target"),
+        "parent type references must not edge to Target: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn composer_psr4_project_records_type_reference_edges() {
     let project = InlineTestProject::with_language(Language::Php)
         .file(
@@ -427,4 +469,59 @@ class Factory extends BaseFactory {
         "parent:: must not be attributed to the child owner: {}",
         value["edges"]
     );
+}
+
+#[test]
+fn inverted_graph_follows_call_receiver_types_and_nullsafe_members() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "Chains.php",
+            r#"<?php
+namespace App;
+class Reply {
+    public function finish(): void {}
+}
+class Request {
+    public function reply(): Reply { return new Reply(); }
+}
+class Cache {
+    public function fetch(): Reply { return new Reply(); }
+}
+class BaseController {
+    public function request(): Request { return new Request(); }
+}
+class Controller extends BaseController {
+    public Cache $cache;
+}
+class Consumer {
+    private ?Cache $cache;
+    public function controller(): Controller { return new Controller(); }
+    public function chain(): void {
+        $this->controller()->request()->reply()->finish();
+    }
+    public function fieldChain(): void {
+        $this->controller()->cache->fetch();
+    }
+    public function nullsafe(): void {
+        $this->cache?->fetch();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    for (caller, callee) in [
+        ("App.Consumer.chain", "App.BaseController.request"),
+        ("App.Consumer.chain", "App.Request.reply"),
+        ("App.Consumer.chain", "App.Reply.finish"),
+        ("App.Consumer.fieldChain", "App.Cache.fetch"),
+        ("App.Consumer.nullsafe", "App.Cache.fetch"),
+    ] {
+        assert!(
+            has_edge(&value, caller, callee),
+            "expected {caller} -> {callee}: {}",
+            value["edges"]
+        );
+    }
 }

@@ -24,7 +24,7 @@ pub(crate) struct JsTsLexicalBindingIndex {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct JsTsDirectPropertyDefinition<'tree> {
     pub(crate) receiver: JsTsStaticMemberReceiver<'tree>,
-    pub(crate) range: Range,
+    pub(crate) property_range: Range,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -184,14 +184,18 @@ pub(crate) fn direct_property_definitions<'tree>(
             _ => None,
         };
         if let Some((receiver, property)) = receiver
-            && let Some(range) = target_ranges
+            && target_ranges
                 .iter()
-                .filter(|range| range_contains_node(range, property))
-                .min_by_key(|range| range.end_byte - range.start_byte)
+                .any(|range| range_contains_node(range, property))
         {
             let definition = JsTsDirectPropertyDefinition {
                 receiver,
-                range: *range,
+                property_range: Range {
+                    start_byte: property.start_byte(),
+                    end_byte: property.end_byte(),
+                    start_line: property.start_position().row,
+                    end_line: property.end_position().row,
+                },
             };
             definitions.push(definition);
         }
@@ -328,6 +332,47 @@ fn enclosing_lexical_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
 
 pub(crate) fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source.get(node.start_byte()..node.end_byte()).unwrap_or("")
+}
+
+pub(crate) fn nested_type_identifier_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    (node.kind() == "nested_type_identifier").then_some(())?;
+    Some((
+        node.child_by_field_name("module")?,
+        node.child_by_field_name("name")?,
+    ))
+}
+
+pub(crate) fn is_lexically_nested_type_declaration(node: Node<'_>) -> bool {
+    if !matches!(
+        node.kind(),
+        "class_declaration"
+            | "abstract_class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "type_alias_declaration"
+            | "internal_module"
+    ) {
+        return false;
+    }
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "statement_block"
+                | "function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "arrow_function"
+                | "method_definition"
+        ) {
+            return true;
+        }
+        if parent.kind() == "program" {
+            return false;
+        }
+        current = parent.parent();
+    }
+    false
 }
 
 pub(crate) fn is_declaration_identifier(node: Node<'_>) -> bool {

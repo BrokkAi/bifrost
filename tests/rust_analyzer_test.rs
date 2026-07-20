@@ -25,6 +25,32 @@ fn definition(analyzer: &RustAnalyzer, fq_name: &str) -> CodeUnit {
 }
 
 #[test]
+fn rust_identifier_collection_handles_deep_valid_type_on_small_stack() {
+    let depth = 1_024;
+    let mut source = String::from("struct Wrap<T>(T);\nstruct Leaf;\ntype Deep = ");
+    source.push_str(&"Wrap<".repeat(depth));
+    source.push_str("Leaf");
+    source.push_str(&">".repeat(depth));
+    source.push_str(";\n");
+
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", "struct Marker;\n")
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let identifiers = std::thread::Builder::new()
+        .name("deep-rust-identifier-collection".to_string())
+        .stack_size(256 * 1024)
+        .spawn(move || analyzer.extract_type_identifiers(&source))
+        .expect("spawn deep Rust identifier collector")
+        .join()
+        .expect("deep Rust identifier collector must not overflow");
+
+    assert!(identifiers.contains("Deep"));
+    assert!(identifiers.contains("Wrap"));
+    assert!(identifiers.contains("Leaf"));
+}
+
+#[test]
 fn test_module_class_and_function_code_units() {
     let analyzer = RustAnalyzer::from_project(rust_project(&[(
         "lib.rs",
@@ -134,12 +160,116 @@ fn test_impl_target_extraction_variants() {
 
     assert!(!analyzer.get_definitions("MyStruct").is_empty());
     assert!(!analyzer.get_definitions("MyStruct.do_something").is_empty());
+    assert!(analyzer.get_definitions("T").is_empty());
     assert!(!analyzer.get_definitions("T.do_something").is_empty());
-    assert!(!analyzer.get_definitions("StringLike").is_empty());
-    assert!(!analyzer.get_definitions("StringLike.is_empty").is_empty());
+    assert!(analyzer.get_definitions("StringLike").is_empty());
+    assert!(!analyzer.get_definitions("ast.StringLike").is_empty());
+    assert!(
+        !analyzer
+            .get_definitions("ast.StringLike.is_empty")
+            .is_empty()
+    );
+    assert!(analyzer.get_definitions("Vec").is_empty());
     assert!(!analyzer.get_definitions("Vec.do_something").is_empty());
     assert!(!analyzer.get_definitions("T.deref").is_empty());
     assert!(!analyzer.get_definitions("T.len").is_empty());
+}
+
+#[test]
+fn rust_impl_members_use_real_owner_identity_without_publishing_phantom_types() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/model.rs",
+            r#"
+pub struct Writer;
+"#,
+        )
+        .file(
+            "src/local.rs",
+            r#"
+pub struct Option;
+"#,
+        )
+        .file(
+            "src/impls.rs",
+            r#"
+// Impl owner members stay indexed without nominal stand-ins.
+use crate::model::Writer;
+use crate::model as m;
+use std::option::Option;
+
+trait LocalTrait {
+    fn act(&self);
+    fn act_s(&self);
+    fn act_f(&self);
+    fn act_t(&self);
+}
+
+impl Writer {
+    fn write(&self) {}
+}
+
+impl LocalTrait for m::Writer {
+    fn act(&self) {}
+}
+
+impl LocalTrait for Option<u8> {
+    fn act(&self) {}
+}
+
+impl<S> LocalTrait for S {
+    fn act_s(&self) {}
+}
+
+impl<F> LocalTrait for F {
+    fn act_f(&self) {}
+}
+
+impl<T> LocalTrait for T {
+    fn act_t(&self) {}
+}
+
+impl LocalTrait for Self {
+    fn act(&self) {}
+}
+"#,
+        )
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+
+    let writer = definition(&analyzer, "model.Writer");
+    assert_eq!(writer.source().rel_path().to_string_lossy(), "src/model.rs");
+    let writer_method = definition(&analyzer, "model.Writer.write");
+    assert_eq!(
+        writer_method.source().rel_path().to_string_lossy(),
+        "src/impls.rs"
+    );
+    let namespace_writer_method = definition(&analyzer, "model.Writer.act");
+    assert_eq!(
+        namespace_writer_method
+            .source()
+            .rel_path()
+            .to_string_lossy(),
+        "src/impls.rs"
+    );
+
+    assert!(analyzer.get_definitions("impls.Writer").is_empty());
+    assert!(analyzer.get_definitions("impls.m.Writer").is_empty());
+    assert!(analyzer.get_definitions("m.Writer.act").is_empty());
+    assert!(analyzer.get_definitions("impls.Option").is_empty());
+    assert!(analyzer.get_definitions("impls.S").is_empty());
+    assert!(analyzer.get_definitions("impls.F").is_empty());
+    assert!(analyzer.get_definitions("impls.T").is_empty());
+    assert!(analyzer.get_definitions("impls.Self").is_empty());
+    assert!(analyzer.get_definitions("std.option.Option").is_empty());
+
+    assert!(!analyzer.get_definitions("std.option.Option.act").is_empty());
+    assert!(!analyzer.get_definitions("impls.S.act_s").is_empty());
+    assert!(!analyzer.get_definitions("impls.F.act_f").is_empty());
+    assert!(!analyzer.get_definitions("impls.T.act_t").is_empty());
+    assert!(!analyzer.get_definitions("impls.Self.act").is_empty());
+    assert!(analyzer.get_definitions("local.Option.act").is_empty());
+    assert_eq!(analyzer.get_definitions("local.Option").len(), 1);
 }
 
 #[test]

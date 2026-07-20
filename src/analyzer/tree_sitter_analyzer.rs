@@ -6929,6 +6929,31 @@ mod tests {
         let rust_unit = CodeUnit::new(rust_file.clone(), CodeUnitType::Class, "net", "Client");
         assert_eq!(rust.storage_content_qualifier(&rust_unit, ""), "");
         assert_eq!(rust.hydrate_content_qualifier("", &rust_file), "net");
+        let rust_impl_member = CodeUnit::with_signature(
+            rust_file.clone(),
+            CodeUnitType::Function,
+            "model",
+            "Writer.write",
+            Some("impl Writer::fn write(&self) { ... }".to_string()),
+            false,
+        );
+        assert_eq!(
+            rust.storage_content_qualifier(&rust_impl_member, "net"),
+            "model"
+        );
+        assert_eq!(rust.hydrate_content_qualifier("model", &rust_file), "model");
+        let local_rust_impl_member = CodeUnit::with_signature(
+            rust_file.clone(),
+            CodeUnitType::Function,
+            "net",
+            "Client.connect",
+            Some("impl Client::fn connect(&self) { ... }".to_string()),
+            false,
+        );
+        assert_eq!(
+            rust.storage_content_qualifier(&local_rust_impl_member, "net"),
+            ""
+        );
 
         std::fs::write(root.join("go.mod"), "module example.com/demo\n").unwrap();
         let go_file = temp_file(&root, "internal/service/service.go");

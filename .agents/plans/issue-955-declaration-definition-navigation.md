@@ -23,7 +23,8 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
 - [x] (2026-07-20 15:29Z) Merged the one additional master cache-isolation commit that landed during review, reran all 187 LSP integration tests, and confirmed the reviewed issue diff and seven findings are unchanged against the refreshed base.
 - [x] (2026-07-20 16:18Z) Applied all seven guided-review findings: restored broad LSP ambiguity behavior, isolated physical C++ navigation occurrences from general ranges, centralized physical selection/status/diagnostics, retained later declarations, bounded target expansion, and cached LSP rendering inputs.
 - [x] (2026-07-20 19:21Z) Reran focused and complete validation after the seven-finding repair: 188 LSP, 18 MCP, 538 analyzer navigation, and 17 click tests passed; all 44 Python tests, formatting, isolated all-feature clippy, the complete isolated all-feature Rust suite, doc tests, and diff checks passed.
-- [ ] Refresh and merge current `origin/master`, rerun the affected gates, checkpoint the synchronized result, and publish a ready-for-review pull request.
+- [x] (2026-07-20 19:38Z) Fetched and merged `origin/master` at `c59d6f61`, resolved the two Python public-surface conflicts by retaining both APIs, and passed 188 LSP, 18 MCP, 541 analyzer navigation, 17 click, Python, formatting, isolated clippy, complete all-feature Rust, doc-test, and diff-check gates.
+- [ ] Push the synchronized branch and publish a ready-for-review pull request.
 
 ## Surprises & Discoveries
 
@@ -55,6 +56,8 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
   Evidence: A generated file containing 300 repeated prototypes expanded into 300 navigation targets before this repair. Per-result and per-batch budgets now cap the response at 256 and 1,024 targets respectively and serialize `navigation_targets_truncated`.
 - Observation: Several full-suite tests that spawn subprocesses, invoke the Python sidecar, or create signed Git commits cannot run inside the workspace sandbox even though the implementation is sound.
   Evidence: The first isolated full-suite run passed 1,456 library tests but reported six permission/GPG environment failures. The unchanged privileged rerun passed the library suite (1,462 passed, 4 ignored), every integration suite, and doc tests with exit code 0, then removed its isolated Cargo target.
+- Observation: The final master refresh advanced by 61 commits and overlapped the Python package exports/tests, but not the declaration-navigation semantics.
+  Evidence: Git produced only two content conflicts, in `bifrost_searchtools/__init__.py` and `python_tests/test_searchtools_client.py`. Both were additive export/import conflicts and were resolved by retaining master's new container-listing types alongside `DeclarationLookupResult`, `DefinitionLookupResult`, and `NavigationOperation`; all Rust navigation files merged automatically and the complete gates passed.
 
 ## Decision Log
 
@@ -88,6 +91,9 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
 - Decision: Queue and apply every finding from the synchronized guided review as one architectural repair milestone.
   Rationale: The user explicitly requested all findings be fixed. A separate on-demand C++ physical-occurrence index removes the global range leak and makes the remaining filtering, declaration-order, diagnostic, resource-bound, and duplication findings parts of one coherent selector rather than independent patches.
   Date/Author: 2026-07-20 / Codex
+- Decision: Resolve the final master conflicts by unioning the two additive Python public surfaces.
+  Rationale: Master added container-listing exports while this issue added declaration-navigation exports; neither supersedes the other, and retaining both preserves the intended public API without semantic conflict.
+  Date/Author: 2026-07-20 / Codex
 
 ## Outcomes & Retrospective
 
@@ -109,16 +115,18 @@ The requested guided review completed its security, duplication, senior-engineer
 
 Post-repair focused validation passes with 188 LSP server tests, 18 MCP tests, 538 analyzer navigation tests, and 17 click-around tests plus 2 ignored stress tests. New regressions cover definition-oriented broad range consumers, mixed same/cross-file prototypes, declaration-after-definition ordering for functions and types, per-result and per-batch target budgets, overload ambiguity without a false link-unit diagnostic, and broad LSP ambiguity behavior.
 
+The final refresh merged 61 newer master commits at `c59d6f61`, including Rust associated-item and receiver-resolution work. The merged branch passes 188 LSP server tests, 18 MCP tests, 541 analyzer navigation tests, and 17 click-around tests plus 2 ignored stress tests. The Python suite, formatting, isolated all-target/all-feature clippy, the complete isolated all-feature Rust suite (1,471 library tests plus every integration target), doc tests, and diff checks also pass.
+
 Final validation passed:
 
-    focused all-feature Rust suites: 188 LSP, 18 MCP, 538 analyzer, 17 click tests passed; 2 stress tests ignored
+    focused all-feature Rust suites after final master merge: 188 LSP, 18 MCP, 541 analyzer, 17 click tests passed; 2 stress tests ignored
     scripts/test_python.sh: 44 passed
     cargo fmt --all: clean
     all-target/all-feature clippy: clean in an isolated target
-    complete cargo test --features nlp,python: passed in a privileged isolated target, including 1,462 library tests and 0 doc-test failures
+    complete cargo test --features nlp,python after final master merge: passed in a privileged isolated target, including 1,471 library tests and 0 doc-test failures
     git diff --check: clean
 
-Before the final master refresh, the issue diff from the merge base is 37 files, 2,354 insertions, and 247 deletions. No UsageBench files were changed, and no branch switch or rebase was performed.
+The final issue diff against synchronized `origin/master` is 37 files, 2,369 insertions, and 247 deletions. No UsageBench files were changed, and no branch switch or rebase was performed.
 
 ## Context and Orientation
 
@@ -229,3 +237,5 @@ Plan revision note (2026-07-20 15:42Z): Queued all seven guided-review findings 
 Plan revision note (2026-07-20 16:18Z): Recorded all seven review findings as applied, the request-time physical-occurrence architecture, bounded target and cached LSP rendering behavior, and the passing post-repair focused suites before checkpointing.
 
 Plan revision note (2026-07-20 19:21Z): Recorded final post-repair validation, including the sandbox-only subprocess/GPG failures and clean privileged rerun, current focused counts, formatting, Python, clippy, full-suite, doc-test, and diff-check evidence before the synchronization/publication milestone.
+
+Plan revision note (2026-07-20 19:38Z): Recorded the 61-commit final master refresh, the additive Python export/test conflict resolution, updated focused counts, clean post-merge Python, formatting, clippy, complete all-feature Rust and doc-test gates, and the final synchronized issue diff before publication.

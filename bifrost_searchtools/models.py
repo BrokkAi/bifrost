@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import ClassVar
 
 
 def _render_numbered_block(text: str, start_line: int) -> str:
@@ -1233,9 +1234,141 @@ class SummaryBlock:
         return "\n".join(blocks).strip()
 
 
+class ContainerKind(StrEnum):
+    DIRECTORY = "directory"
+    PACKAGE = "package"
+
+
+@dataclass(frozen=True)
+class DirectoryListingEntry:
+    kind: ClassVar[str] = "directory"
+    name: str
+    path: str
+
+    def render_text(self, _render_line_numbers: bool = True) -> str:
+        return f"[directory] {self.path}"
+
+
+@dataclass(frozen=True)
+class FileListingEntry:
+    kind: ClassVar[str] = "file"
+    name: str
+    path: str
+
+    def render_text(self, _render_line_numbers: bool = True) -> str:
+        return f"[file] {self.path}"
+
+
+@dataclass(frozen=True)
+class PackageListingEntry:
+    kind: ClassVar[str] = "package"
+    name: str
+    qualified_name: str
+    languages: list[str]
+
+    def render_text(self, _render_line_numbers: bool = True) -> str:
+        suffix = f"; {', '.join(self.languages)}" if self.languages else ""
+        return f"[package{suffix}] {self.qualified_name}"
+
+
+@dataclass(frozen=True)
+class TypeListingEntry:
+    kind: ClassVar[str] = "type"
+    name: str
+    symbol: str
+    language: str
+    path: str
+    start_line: int
+    end_line: int
+
+    def render_text(self, render_line_numbers: bool = True) -> str:
+        location = (
+            f"{self.path}:{self.start_line}..{self.end_line}"
+            if render_line_numbers
+            else self.path
+        )
+        return f"[type; {self.language}] {self.symbol}: {location}"
+
+
+ContainerListingEntry = (
+    DirectoryListingEntry
+    | FileListingEntry
+    | PackageListingEntry
+    | TypeListingEntry
+)
+
+
+def _container_listing_entry_from_dict(data: dict) -> ContainerListingEntry:
+    kind = data["kind"]
+    if kind == "directory":
+        return DirectoryListingEntry(name=data["name"], path=data["path"])
+    if kind == "file":
+        return FileListingEntry(name=data["name"], path=data["path"])
+    if kind == "package":
+        return PackageListingEntry(
+            name=data["name"],
+            qualified_name=data["qualified_name"],
+            languages=list(data.get("languages", [])),
+        )
+    if kind == "type":
+        return TypeListingEntry(
+            name=data["name"],
+            symbol=data["symbol"],
+            language=data["language"],
+            path=data["path"],
+            start_line=int(data["start_line"]),
+            end_line=int(data["end_line"]),
+        )
+    raise ValueError(f"unknown container listing entry kind: {kind}")
+
+
+@dataclass(frozen=True)
+class ContainerListing:
+    target: str
+    kind: ContainerKind
+    languages: list[str]
+    entries: list[ContainerListingEntry]
+    total_entries: int
+    truncated: bool
+    render_line_numbers: bool = True
+
+    @classmethod
+    def from_dict(
+        cls, data: dict, render_line_numbers: bool = True
+    ) -> ContainerListing:
+        return cls(
+            target=data["target"],
+            kind=ContainerKind(data["kind"]),
+            languages=list(data.get("languages", [])),
+            entries=[
+                _container_listing_entry_from_dict(item)
+                for item in data.get("entries", [])
+            ],
+            total_entries=int(data.get("total_entries", len(data.get("entries", [])))),
+            truncated=bool(data.get("truncated", False)),
+            render_line_numbers=render_line_numbers,
+        )
+
+    def render_text(self) -> str:
+        label = "Directory" if self.kind is ContainerKind.DIRECTORY else "Package"
+        suffix = f" ({', '.join(self.languages)})" if self.languages else ""
+        lines = [f"{label} {self.target}{suffix}"]
+        lines.extend(
+            entry.render_text(self.render_line_numbers) for entry in self.entries
+        )
+        if not self.entries:
+            lines.append("(empty)")
+        if self.truncated:
+            lines.append(
+                f"[showing {len(self.entries)} of {self.total_entries} entries]"
+            )
+        return "\n".join(lines)
+
+
 @dataclass(frozen=True)
 class SymbolSummariesResult:
     summaries: list[SummaryBlock]
+    listings: list[ContainerListing]
     compact_symbols: SkimFilesResult | None
     not_found: list[str]
     ambiguous: list[AmbiguousSymbol]
@@ -1250,6 +1383,10 @@ class SymbolSummariesResult:
             summaries=[
                 SummaryBlock.from_dict(item, render_line_numbers)
                 for item in data["summaries"]
+            ],
+            listings=[
+                ContainerListing.from_dict(item, render_line_numbers)
+                for item in data.get("listings", [])
             ],
             compact_symbols=(
                 SkimFilesResult.from_dict(data["compact_symbols"], render_line_numbers)
@@ -1267,12 +1404,14 @@ class SymbolSummariesResult:
     @property
     def count(self) -> int:
         compact_count = self.compact_symbols.count if self.compact_symbols is not None else 0
-        return len(self.summaries) + compact_count
+        listing_count = sum(len(listing.entries) for listing in self.listings)
+        return len(self.summaries) + listing_count + compact_count
 
     def render_text(self) -> str:
         if self.rendered_text is not None:
             return self.rendered_text
         blocks = [summary.render_text() for summary in self.summaries]
+        blocks.extend(listing.render_text() for listing in self.listings)
         if self.compact_symbols is not None:
             blocks.append(self.compact_symbols.render_text())
         if self.not_found:

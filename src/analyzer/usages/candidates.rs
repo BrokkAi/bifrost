@@ -522,6 +522,11 @@ pub(crate) fn find_default_candidates_with_cancellation(
             analyzer, target,
         ));
     }
+    if !cancellation.is_cancelled() && language_for_target(target) == Language::Rust {
+        candidates.extend(super::rust_graph::rust_usage_candidate_files(
+            analyzer, target,
+        ));
+    }
     candidates
 }
 

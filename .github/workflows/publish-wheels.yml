@@ -15,6 +15,33 @@ permissions:
   contents: read
 
 jobs:
+  notices:
+    name: generate Rust notices
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Install pinned cargo-about
+        run: cargo install --locked cargo-about --version 0.9.1 --features cli
+
+      - name: Generate Rust notice report
+        run: scripts/generate-rust-third-party-notices.sh dist/THIRD_PARTY_LICENSES.html
+
+      - name: Upload Rust notice report
+        uses: actions/upload-artifact@v6
+        with:
+          name: rust-third-party-licenses
+          path: dist/THIRD_PARTY_LICENSES.html
+          if-no-files-found: error
+
   verify-version:
     name: verify version matches tag
     runs-on: ubuntu-latest
@@ -47,7 +74,7 @@ jobs:
 
   build:
     name: build (${{ matrix.target }})
-    needs: verify-version
+    needs: [verify-version, notices]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -78,6 +105,12 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
 
+      - name: Download Rust notice report
+        uses: actions/download-artifact@v7
+        with:
+          name: rust-third-party-licenses
+          path: licenses
+
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -97,13 +130,19 @@ jobs:
 
   sdist:
     name: build sdist
-    needs: verify-version
+    needs: [verify-version, notices]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v5
         with:
           ref: ${{ inputs.tag || github.ref }}
+
+      - name: Download Rust notice report
+        uses: actions/download-artifact@v7
+        with:
+          name: rust-third-party-licenses
+          path: licenses
 
       - name: Build sdist
         uses: PyO3/maturin-action@v1
@@ -126,11 +165,18 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - name: Download all artifacts
+      - name: Download wheel artifacts
         uses: actions/download-artifact@v7
         with:
+          pattern: wheels-*
           path: dist
           merge-multiple: true
+
+      - name: Download source distribution
+        uses: actions/download-artifact@v7
+        with:
+          name: sdist
+          path: dist
 
       - name: Verify built artifacts carry the tagged version
         shell: bash

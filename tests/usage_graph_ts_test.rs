@@ -82,6 +82,102 @@ fn namespace_imports_resolve_member_calls() {
 }
 
 #[test]
+fn qualified_type_references_create_exact_workspace_edges() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "options.ts",
+            "export interface PageOptions { enabled: boolean }\n",
+        )
+        .file(
+            "consumer.ts",
+            r#"
+import * as helper from "./options";
+
+enum EntityType { SECURITY_SERVICE }
+enum OtherEntityType { SECURITY_SERVICE }
+
+export function select(value: EntityType.SECURITY_SERVICE): helper.PageOptions {
+  return { enabled: true };
+}
+
+export function otherType(value: OtherEntityType.SECURITY_SERVICE): void {}
+export function runtime(helper: { PageOptions: number }, value: OtherEntityType) {
+  return helper.PageOptions + value.SECURITY_SERVICE;
+}
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&graph, "select", "EntityType"),
+        "same-file enum-member discriminants must resolve to their observable enum owner: {}",
+        graph["edges"]
+    );
+    assert!(
+        has_edge(&graph, "select", "PageOptions"),
+        "namespace-qualified imported types must resolve through the namespace binding: {}",
+        graph["edges"]
+    );
+    assert!(
+        !has_edge(&graph, "otherType", "EntityType"),
+        "a same-spelled discriminant on another enum must not match: {}",
+        graph["edges"]
+    );
+    assert!(
+        !has_edge(&graph, "runtime", "EntityType") && !has_edge(&graph, "runtime", "PageOptions"),
+        "ordinary member expressions must keep receiver-based resolution: {}",
+        graph["edges"]
+    );
+}
+
+#[test]
+fn ambient_companion_preserves_merged_workspace_type_edges() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "ambient.d.ts",
+            r#"
+declare namespace interop { interface StructType<T> {} }
+interface Packet { value: number }
+declare var Packet: interop.StructType<Packet>;
+declare var PacketConstructor: { prototype: Packet };
+
+function consume(value: Packet): Packet { return value; }
+
+function valueShadow() {
+  const Packet = 1;
+  let value: Packet;
+  return value;
+}
+
+function typeShadow() {
+  type Packet = { local: true };
+  let value: Packet;
+  return value;
+}
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&graph, "consume", "Packet"),
+        "ambient companions must preserve later function type edges: {}",
+        graph["edges"]
+    );
+    assert!(
+        has_edge(&graph, "valueShadow", "Packet"),
+        "a value-space shadow must not suppress the outer type-space Packet: {}",
+        graph["edges"]
+    );
+    assert!(
+        !has_edge(&graph, "typeShadow", "Packet"),
+        "a genuine nested type alias must suppress the outer Packet type: {}",
+        graph["edges"]
+    );
+}
+
+#[test]
 fn this_receiver_call_does_not_create_usage_graph_edge() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(

@@ -252,8 +252,8 @@ pub fn render(field: StorageField) {
         ),
     ]);
 
-    let target = definition(&analyzer, "utils.language.StorageField");
-    assert_eq!(project.file("src/utils/language.rs"), *target.source());
+    let target = definition(&analyzer, "ast.StorageField");
+    assert_eq!(project.file("src/ast.rs"), *target.source());
 
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let result = brokk_bifrost::usages::RustExportUsageGraphStrategy::new().find_usages(
@@ -1201,6 +1201,93 @@ impl Service {
     assert_eq!(1, hits.len(), "private macro field hits: {hits:#?}");
     assert!(hits.iter().all(|hit| hit.file == file));
     assert!(hits.iter().all(|hit| hit.snippet.contains("self.secret")));
+}
+
+#[test]
+fn authoritative_rust_usage_resolves_every_qualified_macro_path_segment() {
+    let lib_source = r#"
+pub mod wanted;
+pub mod decoy;
+
+macro_rules! define_calls {
+    () => {{
+        $crate::wanted::free();
+        $crate::wanted::Owner::assoc();
+    }};
+}
+
+macro_rules! consume { ($($tokens:tt)*) => {}; }
+
+pub fn invoke() {
+    consume!(wanted::free());
+    consume!({ wanted::Owner::assoc(); });
+    consume!((wanted::Alias));
+    consume!({ decoy::free(); });
+    consume!({ decoy::Owner::assoc(); });
+    consume!((decoy::Alias));
+}
+"#;
+    let owner_source = r#"
+pub struct Owner;
+pub type Alias = Owner;
+impl Owner { pub fn assoc() {} }
+pub fn free() {}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", lib_source),
+        ("src/wanted.rs", owner_source),
+        ("src/decoy.rs", owner_source),
+    ]);
+    let file = project.file("src/lib.rs");
+
+    for (target_fqn, expected, required_snippets) in [
+        (
+            "wanted",
+            5,
+            vec!["$crate::wanted::free", "consume!(wanted::free())"],
+        ),
+        (
+            "wanted.Owner",
+            2,
+            vec!["$crate::wanted::Owner::assoc", "wanted::Owner::assoc"],
+        ),
+        ("wanted.Alias", 1, vec!["wanted::Alias"]),
+        (
+            "wanted.free",
+            2,
+            vec!["$crate::wanted::free", "consume!(wanted::free())"],
+        ),
+        (
+            "wanted.Owner.assoc",
+            2,
+            vec!["$crate::wanted::Owner::assoc", "wanted::Owner::assoc"],
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let hits = authoritative_hits(
+            &analyzer,
+            &target,
+            analyzer.get_analyzed_files().into_iter().collect(),
+        );
+        let macro_hits: Vec<_> = hits.iter().filter(|hit| hit.file == file).collect();
+        assert_eq!(expected, macro_hits.len(), "{target_fqn} hits: {hits:#?}");
+        for snippet in required_snippets {
+            assert!(
+                macro_hits.iter().any(|hit| hit.snippet.contains(snippet)),
+                "{target_fqn} should include `{snippet}`: {hits:#?}"
+            );
+        }
+        let expected_segment = target_fqn
+            .rsplit('.')
+            .next()
+            .expect("qualified target terminal");
+        assert!(
+            macro_hits.iter().all(|hit| {
+                lib_source.get(hit.start_offset..hit.end_offset) == Some(expected_segment)
+            }),
+            "{target_fqn} must retain its exact segment ranges: {hits:#?}"
+        );
+    }
 }
 
 #[test]
@@ -3546,7 +3633,7 @@ fn run(x: Foo) {
 }
 
 #[test]
-fn rust_graph_strategy_does_not_seed_trait_receivers_from_non_concrete_parameter_types() {
+fn rust_graph_strategy_resolves_dyn_and_impl_trait_receivers() {
     let (project, analyzer) = rust_analyzer_with_files(&[
         (
             "src/service.rs",
@@ -3555,15 +3642,22 @@ pub struct Foo;
 pub trait Worker {
     fn work(&self);
 }
+pub trait Other {
+    fn work(&self);
+}
 impl Worker for Foo {
     fn work(&self) {}
+}
+pub struct Inherent;
+impl Inherent {
+    pub fn work(&self) {}
 }
 "#,
         ),
         (
             "src/main.rs",
             r#"
-use crate::service::Worker;
+use crate::service::{Inherent, Other, Worker};
 
 fn generic<T: Worker>(x: T) {
     x.work();
@@ -3576,21 +3670,60 @@ fn opaque(x: impl Worker) {
 fn dynamic(x: &dyn Worker) {
     x.work();
 }
+
+fn bounded_opaque(x: impl Worker + Send) {
+    x.work();
+}
+
+fn bounded_dynamic(x: &dyn Worker + Send) {
+    x.work();
+}
+
+fn higher_ranked_dynamic(x: &dyn for<'a> Worker) {
+    x.work();
+}
+
+fn other_opaque(x: impl Other) {
+    x.work();
+}
+
+fn other_dynamic(x: &dyn Other) {
+    x.work();
+}
+
+fn other_bounded_opaque(x: impl Other + Send) {
+    x.work();
+}
+
+fn other_bounded_dynamic(x: &dyn Other + Send) {
+    x.work();
+}
+
+fn other_higher_ranked_dynamic(x: &dyn for<'a> Other) {
+    x.work();
+}
+
+fn inherent(x: &Inherent) {
+    x.work();
+}
 "#,
         ),
     ]);
 
-    let target = member(&analyzer, &project.file("src/service.rs"), "Worker", "work");
-    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
-        .find_usages(
-            &analyzer,
-            std::slice::from_ref(&target),
-            &analyzer.get_analyzed_files().into_iter().collect(),
-            1000,
-        )
-        .into_either()
-        .expect("non-concrete trait receiver success");
-    assert!(hits.is_empty());
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
+    for (owner, expected) in [("Worker", 5), ("Other", 5), ("Inherent", 1)] {
+        let target = member(&analyzer, &project.file("src/service.rs"), owner, "work");
+        let hits = strategy
+            .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+            .into_either()
+            .expect("structured trait receiver success");
+        assert_eq!(
+            expected,
+            hits.len(),
+            "{owner}.work receiver hits: {hits:#?}"
+        );
+    }
 }
 
 #[test]
@@ -4077,6 +4210,156 @@ fn bar() {
         trait_hits.is_empty() && other_hits.is_empty(),
         "ambiguous trait candidates must not emit partial hits: Trait={trait_hits:?}, OtherTrait={other_hits:?}"
     );
+}
+
+#[test]
+fn rust_graph_strategy_counts_type_aliases_used_as_static_qualifiers() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            r#"
+pub mod left;
+pub mod right;
+
+fn run() {
+    let _ = left::Alias::new();
+    let _ = right::Alias::new();
+}
+"#,
+        ),
+        (
+            "src/left.rs",
+            "pub struct Owner;\nimpl Owner { pub fn new() -> Self { Self } }\npub type Alias = Owner;\n",
+        ),
+        (
+            "src/right.rs",
+            "pub struct Owner;\nimpl Owner { pub fn new() -> Self { Self } }\npub type Alias = Owner;\n",
+        ),
+    ]);
+
+    let hits = rust_graph_hits(&analyzer, "left.Alias");
+    assert_eq!(1, hits.len(), "alias qualifier hits: {hits:?}");
+    assert!(hits[0].snippet.contains("left::Alias::new"));
+}
+
+#[test]
+fn rust_graph_strategy_resolves_bare_module_const_and_turbofish_free_function() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            r#"
+pub mod fixtures;
+pub mod other;
+pub fn is_unpin<T>() {}
+"#,
+        ),
+        ("src/fixtures.rs", "pub const MANIFESTS: &[&str] = &[];\n"),
+        (
+            "src/other.rs",
+            "pub const MANIFESTS: &[&str] = &[];\npub fn is_unpin<T>() {}\n",
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::fixtures::MANIFESTS;
+
+fn run() {
+    let _ = MANIFESTS;
+    let _ = crate::other::MANIFESTS;
+    crate::is_unpin::<u8>();
+    crate::other::is_unpin::<u8>();
+}
+"#,
+        ),
+    ]);
+
+    let constant_hits = rust_graph_hits(&analyzer, "fixtures._module_.MANIFESTS");
+    assert_eq!(
+        1,
+        constant_hits.len(),
+        "module const hits: {constant_hits:?}"
+    );
+    assert!(constant_hits[0].snippet.contains("MANIFESTS"));
+
+    let function_hits = rust_graph_hits(&analyzer, "is_unpin");
+    assert_eq!(1, function_hits.len(), "turbofish hits: {function_hits:?}");
+    assert!(function_hits[0].snippet.contains("is_unpin::<u8>"));
+}
+
+#[test]
+fn rust_graph_strategy_counts_associated_functions_used_as_values() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+pub struct Left;
+impl Left { pub fn new() -> Self { Self } }
+pub struct Right;
+impl Right { pub fn new() -> Self { Self } }
+
+fn run(value: Option<()>) {
+    let _ = value.map(|_| Left::new);
+    let _ = value.map(|_| Right::new);
+}
+"#,
+    )]);
+
+    let hits = rust_graph_hits(&analyzer, "Left.new");
+    assert_eq!(1, hits.len(), "associated function value hits: {hits:?}");
+    assert!(hits[0].snippet.contains("Left::new"));
+}
+
+#[test]
+fn rust_graph_strategy_resolves_self_associated_types_to_the_exact_trait_owner() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+pub trait Left {
+    type Handle;
+    fn consume(_: Self::Handle);
+}
+
+pub trait Right {
+    type Handle;
+    fn consume(_: Self::Handle);
+}
+"#,
+    )]);
+
+    let left_hits = rust_graph_hits(&analyzer, "Left.Handle");
+    let right_hits = rust_graph_hits(&analyzer, "Right.Handle");
+    assert_eq!(
+        1,
+        left_hits.len(),
+        "left associated type hits: {left_hits:?}"
+    );
+    assert_eq!(
+        1,
+        right_hits.len(),
+        "right associated type hits: {right_hits:?}"
+    );
+    assert!(left_hits[0].snippet.contains("Self::Handle"));
+}
+
+#[test]
+fn rust_graph_strategy_resolves_concrete_owner_trait_associated_types() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+pub trait Trait { type Handle; }
+pub struct Owner;
+impl Trait for Owner { type Handle = usize; }
+pub trait OtherTrait { type Handle; }
+pub struct OtherOwner;
+impl OtherTrait for OtherOwner { type Handle = usize; }
+
+fn consume(_: Owner::Handle) {}
+fn consume_other(_: OtherOwner::Handle) {}
+"#,
+    )]);
+
+    let hits = rust_graph_hits(&analyzer, "Trait.Handle");
+    assert_eq!(1, hits.len(), "trait associated type hits: {hits:?}");
+    assert!(hits[0].snippet.contains("Owner::Handle"));
 }
 
 #[test]

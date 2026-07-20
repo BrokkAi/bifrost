@@ -1338,6 +1338,128 @@ fn ts_namespace_import_resolves_member_reference() {
 }
 
 #[test]
+fn ts_qualified_type_references_resolve_exact_owners() {
+    let consumer_source = r#"
+import * as helper from "./options";
+
+enum EntityType { SECURITY_SERVICE }
+enum OtherEntityType { SECURITY_SERVICE }
+
+export function select(value: EntityType.SECURITY_SERVICE): helper.PageOptions {
+  return { enabled: true };
+}
+
+export function otherType(value: OtherEntityType.SECURITY_SERVICE): void {}
+export function runtime(helper: { PageOptions: number }, value: OtherEntityType) {
+  return helper.PageOptions + value.SECURITY_SERVICE;
+}
+"#;
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "options.ts",
+            "export interface PageOptions { enabled: boolean }\n",
+        )
+        .file("consumer.ts", consumer_source)
+        .build()
+    });
+    let consumer = project.file("consumer.ts");
+
+    let enum_member = find_ts_target(&analyzer, &consumer, |cu| {
+        cu.identifier() == "SECURITY_SERVICE"
+            && cu.is_field()
+            && analyzer
+                .parent_of(cu)
+                .is_some_and(|parent| parent.identifier() == "EntityType")
+    });
+    let enum_hits = authoritative_ts_hits(&analyzer, &enum_member, consumer.clone());
+    let enum_start = consumer_source
+        .find("EntityType.SECURITY_SERVICE):")
+        .expect("enum-member discriminant")
+        + "EntityType.".len();
+    assert_eq!(
+        BTreeSet::from([(enum_start, enum_start + "SECURITY_SERVICE".len())]),
+        enum_hits
+            .iter()
+            .filter(|hit| hit.kind == UsageHitKind::Reference)
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect(),
+        "the enum owner must distinguish the discriminant from the other type and ordinary member expression: {enum_hits:#?}"
+    );
+
+    let page_options = find_ts_target(&analyzer, &project.file("options.ts"), |cu| {
+        cu.identifier() == "PageOptions" && cu.is_class()
+    });
+    let option_hits = authoritative_ts_hits(&analyzer, &page_options, consumer);
+    let option_start = consumer_source
+        .find("helper.PageOptions {")
+        .expect("namespace-qualified imported type")
+        + "helper.".len();
+    assert_eq!(
+        BTreeSet::from([(option_start, option_start + "PageOptions".len())]),
+        option_hits
+            .iter()
+            .filter(|hit| hit.kind == UsageHitKind::Reference)
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect(),
+        "a shadowed ordinary member expression must not match the namespace-qualified imported type: {option_hits:#?}"
+    );
+}
+
+#[test]
+fn ts_ambient_companion_preserves_merged_type_references() {
+    let source = r#"
+declare namespace interop { interface StructType<T> {} }
+interface Packet { value: number }
+declare var Packet: interop.StructType<Packet>;
+declare var PacketConstructor: { prototype: Packet };
+
+function consume(value: Packet): Packet { return value; }
+
+function valueShadow() {
+  const Packet = 1;
+  let value: Packet;
+  return value;
+}
+
+function typeShadow() {
+  type Packet = { local: true };
+  let value: Packet;
+  return value;
+}
+"#;
+    let (project, analyzer) = ts_inline_analyzer(|p| p.file("ambient.d.ts", source).build());
+    let file = project.file("ambient.d.ts");
+    let target = find_ts_target(&analyzer, &file, |cu| {
+        cu.identifier() == "Packet" && cu.is_class()
+    });
+
+    let hits = authoritative_ts_hits(&analyzer, &target, file);
+    let range_after = |anchor: &str, prefix: &str| {
+        let start = source.find(anchor).expect("reference anchor") + prefix.len();
+        (start, start + "Packet".len())
+    };
+    let expected = BTreeSet::from([
+        range_after("interop.StructType<Packet>", "interop.StructType<"),
+        range_after("prototype: Packet", "prototype: "),
+        range_after("consume(value: Packet", "consume(value: "),
+        range_after("Packet): Packet", "Packet): "),
+        range_after(
+            "let value: Packet;\n  return value;\n}\n\nfunction typeShadow",
+            "let value: ",
+        ),
+    ]);
+    let actual = hits
+        .iter()
+        .filter(|hit| hit.kind == UsageHitKind::Reference)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect();
+    assert_eq!(
+        expected, actual,
+        "the ambient value companion and an ordinary value shadow must preserve type-space Packet, while the nested type alias must suppress it: {hits:#?}"
+    );
+}
+
+#[test]
 fn ts_local_barrel_reexport_is_followed() {
     let (project, analyzer) = ts_inline_analyzer(|p| {
         p.file("layout.service.ts", "export class LayoutService {}\n")
@@ -1676,6 +1798,74 @@ fn ts_member_receiver_inference_handles_direct_and_aliased_receivers() {
 }
 
 #[test]
+fn ts_intersection_alias_object_receiver_resolves_exact_property_owner() {
+    let consumer_source = r#"
+import type { OtherOutput, SerializableHookOutput, UnrelatedAlias } from "./types";
+
+export function targetRead() {
+  const sanitized: SerializableHookOutput = { message: "ok", serialized: true };
+  return sanitized.message;
+}
+
+export function controls() {
+  const unrelated: UnrelatedAlias = { message: "other", other: true };
+  const untyped = { message: "plain" };
+  return unrelated.message + untyped.message;
+}
+
+export function shadowed(sanitized: OtherOutput) {
+  return sanitized.message;
+}
+"#;
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "types.ts",
+            r#"
+export interface HookOutput { message: string }
+export interface OtherOutput { message: string }
+export type SerializableHookOutput = HookOutput & { serialized: boolean };
+export type UnrelatedAlias = OtherOutput & { other: boolean };
+"#,
+        )
+        .file("consumer.ts", consumer_source)
+        .build()
+    });
+    let target = find_ts_target(&analyzer, &project.file("types.ts"), |unit| {
+        unit.short_name() == "HookOutput.message" && unit.is_field()
+    });
+    let consumer = project.file("consumer.ts");
+    let expected_read = identifier_occurrence_range(consumer_source, "message", 1);
+
+    let targeted = authoritative_ts_hits(&analyzer, &target, consumer.clone());
+    assert!(
+        targeted
+            .iter()
+            .any(|hit| (hit.start_offset, hit.end_offset) == expected_read),
+        "the intersection-alias receiver read must resolve to HookOutput.message: {targeted:#?}"
+    );
+
+    let workspace = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+    assert!(
+        workspace.iter().any(|hit| {
+            hit.file == consumer && (hit.start_offset, hit.end_offset) == expected_read
+        }),
+        "workspace inverse lookup must retain the exact receiver read: {workspace:#?}"
+    );
+
+    for occurrence in [2, 3, 4, 5, 6] {
+        let control = identifier_occurrence_range(consumer_source, "message", occurrence);
+        assert!(
+            workspace.iter().all(|hit| {
+                hit.file != consumer || (hit.start_offset, hit.end_offset) != control
+            }),
+            "unrelated, untyped, and shadowed receivers must not match HookOutput.message: {workspace:#?}"
+        );
+    }
+}
+
+#[test]
 fn tsx_class_method_call_inside_jsx_is_found() {
     let (project, analyzer) = ts_inline_analyzer(|p| {
         p.file(
@@ -1880,6 +2070,111 @@ export function render() {
 }
 
 #[test]
+fn js_anonymous_default_object_binding_has_exact_targeted_and_workspace_usages() {
+    let consumer_source = r#"import selected from "./selected.js";
+import other from "./other.js";
+import { named } from "./named.js";
+
+export function readSelected() {
+  return selected;
+}
+
+export function readSelectedMember() {
+  return selected.value;
+}
+
+export function controls() {
+  return other.value + named;
+}
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file("selected.js", "export default { value: 1 };\n")
+            .file("other.js", "export default { value: 2 };\n")
+            .file("named.js", "export const named = 3;\n")
+            .file("consumer.js", consumer_source)
+            .build()
+    });
+    let target = find_js_target(&analyzer, &project.file("selected.js"), |unit| {
+        unit.short_name() == "default"
+    });
+    let expected = BTreeSet::from([
+        identifier_occurrence_range(consumer_source, "selected", 2),
+        identifier_occurrence_range(consumer_source, "selected", 3),
+    ]);
+
+    let targeted = authoritative_js_hits(&analyzer, &target, project.file("consumer.js"))
+        .into_iter()
+        .filter(|hit| {
+            hit.kind
+                .included_in(brokk_bifrost::usages::UsageHitSurface::ExternalUsages)
+        })
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expected, targeted, "targeted inverse hits must stay exact");
+
+    let workspace = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    )
+    .into_iter()
+    .filter(|hit| hit.file == project.file("consumer.js"))
+    .map(|hit| (hit.start_offset, hit.end_offset))
+    .collect::<BTreeSet<_>>();
+    assert_eq!(
+        expected, workspace,
+        "workspace inverse hits must not widen to another default or named export"
+    );
+}
+
+#[test]
+fn ts_anonymous_default_value_binding_has_exact_targeted_and_workspace_usages() {
+    let consumer_source = r#"import selected from "./selected";
+import other from "./other";
+import { named } from "./named";
+
+export function readSelected() {
+  return selected;
+}
+
+export function controls() {
+  return other + named;
+}
+"#;
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file("selected.ts", "export default (): number => 1;\n")
+            .file("other.ts", "export default (): number => 2;\n")
+            .file("named.ts", "export const named = 3;\n")
+            .file("consumer.ts", consumer_source)
+            .build()
+    });
+    let target = find_ts_target(&analyzer, &project.file("selected.ts"), |unit| {
+        unit.short_name() == "default"
+    });
+    let expected = BTreeSet::from([identifier_occurrence_range(consumer_source, "selected", 2)]);
+
+    let targeted = authoritative_ts_hits(&analyzer, &target, project.file("consumer.ts"))
+        .into_iter()
+        .filter(|hit| {
+            hit.kind
+                .included_in(brokk_bifrost::usages::UsageHitSurface::ExternalUsages)
+        })
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expected, targeted, "targeted inverse hits must stay exact");
+
+    let workspace = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    )
+    .into_iter()
+    .filter(|hit| hit.file == project.file("consumer.ts"))
+    .map(|hit| (hit.start_offset, hit.end_offset))
+    .collect::<BTreeSet<_>>();
+    assert_eq!(
+        expected, workspace,
+        "workspace inverse hits must not widen to another default or named export"
+    );
+}
+
+#[test]
 fn js_commonjs_module_exports_object_literal_member_resolves_required_module_usage() {
     let (project, analyzer) = js_inline_analyzer(|p| {
         p.file(
@@ -1963,6 +2258,73 @@ fn ts_typed_receivers_count_as_member_usages() {
     );
 
     assert_eq!(2, hits.len());
+}
+
+#[test]
+fn ts_intersection_alias_object_receiver_has_exact_targeted_and_workspace_usages() {
+    let consumer_source = r#"import {
+  HookOutput,
+  SerializableHookOutput,
+  SerializableOtherOutput,
+} from './api';
+
+declare const hook: HookOutput;
+const sanitized: SerializableHookOutput = { ...hook, serializable: true };
+export const targetRead = sanitized.message;
+
+const other: SerializableOtherOutput = { message: 'other', serializable: true };
+export const unrelatedAliasRead = other.message;
+
+export function shadow(sanitized: SerializableOtherOutput) {
+  return sanitized.message;
+}
+
+const loose = { message: 'loose' };
+export const untypedRead = loose.message;
+"#;
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "api.ts",
+            r#"export interface HookOutput { message: string; }
+export interface OtherOutput { message: string; }
+interface SerializableMarker { serializable: true; }
+export type SerializableHookOutput = HookOutput & SerializableMarker;
+export type SerializableOtherOutput = OtherOutput & SerializableMarker;
+"#,
+        )
+        .file("consumer.ts", consumer_source)
+        .build()
+    });
+    let target = find_ts_target(&analyzer, &project.file("api.ts"), |unit| {
+        unit.fq_name() == "HookOutput.message" && unit.is_field()
+    });
+    let read_start = consumer_source
+        .find("sanitized.message")
+        .expect("target intersection-alias receiver read")
+        + "sanitized.".len();
+    let expected = BTreeSet::from([(read_start, read_start + "message".len())]);
+
+    let targeted = authoritative_ts_hits(&analyzer, &target, project.file("consumer.ts"))
+        .into_iter()
+        .filter(|hit| hit.kind == UsageHitKind::Reference)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        expected, targeted,
+        "targeted inverse lookup must expand the intersection alias without admitting unrelated aliases, same-named fields, a shadowed receiver, or an untyped object literal"
+    );
+
+    let workspace = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    )
+    .into_iter()
+    .filter(|hit| hit.file == project.file("consumer.ts") && hit.kind == UsageHitKind::Reference)
+    .map(|hit| (hit.start_offset, hit.end_offset))
+    .collect::<BTreeSet<_>>();
+    assert_eq!(
+        expected, workspace,
+        "whole-workspace inverse lookup must preserve the same exact receiver ownership"
+    );
 }
 
 #[test]
