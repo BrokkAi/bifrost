@@ -32,7 +32,7 @@ canonical Bifrost code-intelligence skills.
     "bifrost": {
       "command": "./bin/bifrost-launcher.mjs",
       "args": ["--mcp", "symbol|extended"],
-      "startup_timeout_sec": 60,
+      "startup_timeout_sec": 180,
       "tool_timeout_sec": 300
     }
   }
@@ -67,6 +67,16 @@ stores the pinned version and per-target archive hashes. The launcher uses
 GitHub release download. A compatible `bifrost` on `PATH` is used only when
 `BIFROST_LAUNCHER_ALLOW_PATH=1` is set explicitly. Set
 `BIFROST_LAUNCHER_AUTO_INSTALL=0` to disable downloads.
+
+The 180-second startup budget covers the launcher's bounded 60-second download,
+60-second extraction, and 10-second version probe, plus startup margin. Keep the
+Claude/Codex and Cursor values identical and above the minimum exported by the
+canonical launcher. The package-local `doctor [--json]` command does not
+modify the cache or download assets, but it does execute the selected binary's
+`--version` probe and therefore assumes trusted candidate locations.
+`prepare [--json]` resolves or installs the exact pinned release without
+starting MCP. Run `prepare` before host startup when a host does not support a
+configurable MCP startup timeout, then start a fresh task.
 
 The launcher resolves the workspace root from `BIFROST_WORKSPACE_ROOT`, then a
 host-provided `--root` or `--workspace-root`, then the host session working
@@ -201,6 +211,8 @@ claude plugin validate .
   config, not the Claude/Codex `.mcp.json` wrapper or Cursor root `mcp.json`.
 - Validate that the plugin's MCP server entry launches:
   `bifrost --root <resolved-root> --mcp "symbol|extended"`.
+- Validate a cold package cache with `doctor`, `prepare`, a second successful
+  `doctor`, and a fresh MCP `tools/list` request before publishing.
 - Confirm that plugin installation and VS Code LSP setup use separate Bifrost
   stdio processes, even when they point at the same binary/release.
 

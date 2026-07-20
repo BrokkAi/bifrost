@@ -251,6 +251,9 @@ jobs:
       - name: Generate Amp skill bundle
         run: node scripts/generate-amp-skill-bundle.mjs
 
+      - name: Test agent plugin launcher
+        run: node --test plugins/bifrost-agent/test/launcher.test.mjs
+
       - name: Validate agent plugin manifests
         run: node scripts/check-codex-plugin-manifest.mjs
 
