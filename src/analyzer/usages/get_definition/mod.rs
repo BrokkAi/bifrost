@@ -234,6 +234,11 @@ pub(crate) struct DefinitionLookupDiagnostic {
     pub(crate) message: String,
 }
 
+/// Forward definition evidence stopped at the deepest indexed selector member.
+/// Consumers must not treat the accompanying declaration as the complete target
+/// of the originally requested selector chain.
+pub(crate) const PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND: &str = "partial_selector_chain";
+
 pub(crate) fn resolve_definition_batch(
     analyzer: &dyn IAnalyzer,
     requests: Vec<DefinitionLookupRequest>,

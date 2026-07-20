@@ -562,7 +562,7 @@ fn go_partial_selector_chain_outcome(
 ) -> DefinitionLookupOutcome {
     let mut outcome = candidates_outcome(candidates);
     outcome.diagnostics.push(DefinitionLookupDiagnostic {
-        kind: "partial_selector_chain".to_string(),
+        kind: PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND.to_string(),
         message: format!(
             "resolved the deepest indexed Go workspace field before `{missing_member}`"
         ),
