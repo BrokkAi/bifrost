@@ -26,6 +26,7 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
 - [x] (2026-07-20 19:38Z) Fetched and merged `origin/master` at `c59d6f61`, resolved the two Python public-surface conflicts by retaining both APIs, and passed 188 LSP, 18 MCP, 541 analyzer navigation, 17 click, Python, formatting, isolated clippy, complete all-feature Rust, doc-test, and diff-check gates.
 - [x] (2026-07-20 19:42Z) Merged the five additional master commits that landed during the full-suite run, including the overlapping C++ declarator fix, and passed the affected navigation gates with 188 LSP, 18 MCP, 543 analyzer navigation, and 17 click tests plus 2 ignored stress tests.
 - [x] (2026-07-20 19:45Z) Pushed the synchronized branch and opened ready-for-review PR #999 against `master`: https://github.com/BrokkAi/bifrost/pull/999.
+- [x] (2026-07-20 20:14Z) Diagnosed the Windows PR failure as a hard-coded slash assertion in a Rust analyzer test, merged current `origin/master` containing upstream fix `deb751eb`, and passed the exact formerly failing test plus formatting and diff checks.
 
 ## Surprises & Discoveries
 
@@ -61,6 +62,8 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
   Evidence: Git produced only two content conflicts, in `bifrost_searchtools/__init__.py` and `python_tests/test_searchtools_client.py`. Both were additive export/import conflicts and were resolved by retaining master's new container-listing types alongside `DeclarationLookupResult`, `DefinitionLookupResult`, and `NavigationOperation`; all Rust navigation files merged automatically and the complete gates passed.
 - Observation: Master advanced by another five commits while the complete post-merge suite was running, including a C++ declarator-resolution change in this issue's hotspot.
   Evidence: The second merge at `a86ae862` applied without conflicts. The refreshed C++-aware analyzer navigation suite grew from 541 to 543 tests and passed in full, alongside all 188 LSP, 18 privileged MCP, and 17 non-stress click-around tests.
+- Observation: The first PR run failed only on Windows because a newly merged Rust analyzer regression test compared a native `Path` rendered as `src\\model.rs` with the literal `src/model.rs`.
+  Evidence: CI job 88456706134 passed clippy and reached `tests/rust_analyzer_test.rs`; `rust_impl_members_use_real_owner_identity_without_publishing_phantom_types` failed at line 241 on the separator mismatch. Current master already fixed all three assertions in `deb751eb` by comparing `Path` values built with `Path::join`.
 
 ## Decision Log
 
@@ -130,6 +133,8 @@ Final validation passed:
     git diff --check: clean
 
 Before final publication bookkeeping, the issue diff against synchronized `origin/master` was 37 files, 2,374 insertions, and 247 deletions. No UsageBench files were changed, and no branch switch or rebase was performed. PR #999 is open, targets `master`, and is explicitly non-draft.
+
+The first PR CI run exposed one Windows-only test assertion unrelated to navigation behavior. The branch was resynchronized with current master at `595cb12b`, incorporating upstream fix `deb751eb`; the exact formerly failing Rust analyzer test passes locally, the worktree is clean, and the branch is again zero commits behind master.
 
 ## Context and Orientation
 
@@ -246,3 +251,5 @@ Plan revision note (2026-07-20 19:38Z): Recorded the 61-commit final master refr
 Plan revision note (2026-07-20 19:42Z): Recorded the five additional master commits that landed during full validation, the conflict-free overlapping C++ merge, the final 543-test analyzer-navigation count, and passing affected LSP, MCP, and click-around gates at `a86ae862`.
 
 Plan revision note (2026-07-20 19:45Z): Recorded the successful branch push and ready-for-review publication as PR #999 against synchronized `master`.
+
+Plan revision note (2026-07-20 20:14Z): Recorded the Windows CI root cause, the already-landed upstream path-safe assertion fix, the final master merge, and passing exact-test, formatting, and diff-check evidence before triggering replacement CI.
