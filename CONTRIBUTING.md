@@ -89,6 +89,7 @@ That script updates these committed version fields:
 - `editors/vscode/package-lock.json`
 - `plugins/bifrost-agent/bifrost-release.json`
 - `plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/bifrost-release.json`
+- `docs/src/content/docs/rust-library.md`
 
 The Codex and Claude marketplace files are also part of the plugin surface, but
 currently do not carry version fields:
