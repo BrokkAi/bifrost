@@ -1008,7 +1008,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                         ctx.visibility,
                         ctx.file,
                     );
-                    return candidates_outcome(candidates);
+                    return cpp_callable_candidates_outcome(candidates);
                 }
                 CppBareCallTargetResolution::UnprovenFreeFunctions(units) => {
                     if units.len() < 2 {
@@ -1052,7 +1052,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                                 },
                             ));
                         if !constructors.is_empty() {
-                            return candidates_outcome(constructors);
+                            return cpp_callable_candidates_outcome(constructors);
                         }
                     }
                     return candidates_outcome(owners);
@@ -1102,6 +1102,10 @@ fn cpp_bare_free_function_definition_candidates(
                         ctx.support,
                         candidate,
                         CppTargetKind::FreeFunction,
+                    ) && cpp_callable_definitions_share_identity_evidence(
+                        ctx.analyzer,
+                        &unit,
+                        candidate,
                     )
                 })
                 .collect::<Vec<_>>();
