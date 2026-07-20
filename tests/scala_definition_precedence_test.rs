@@ -2362,3 +2362,201 @@ class External extends Base {
         );
     }
 }
+
+#[test]
+fn scala_identifier_type_roles_precede_same_named_term_namespace() {
+    let source = r#"package app
+class Left
+class Right
+class Or
+object Or
+object Use {
+  type Combined = Left Or Right
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Use.scala", source)
+        .build();
+    let start = source.find(" Or Right").expect("infix type operator") + 1;
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": [location_in("app/Use.scala", source, start)]}).to_string(),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "app.Or",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_enclosing_terms_precede_implicit_companions_but_not_local_imports() {
+    let source = r#"package app
+object Imported { val Short: Int = 2 }
+object StdType {
+  val Short: Int = 1
+  val direct = Short
+  def imported: Int = {
+    import Imported.Short
+    Short
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "scala/Short.scala",
+            "package scala\nclass Short\nobject Short\n",
+        )
+        .file("app/StdType.scala", source)
+        .build();
+    let references = [
+        source.find("direct = Short").expect("direct member") + "direct = ".len(),
+        source.rfind("    Short").expect("local import use") + 4,
+    ]
+    .into_iter()
+    .map(|start| location_in("app/StdType.scala", source, start))
+    .collect::<Vec<_>>();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for (result, expected) in results
+        .iter()
+        .zip(["app.StdType$.Short", "app.Imported$.Short"])
+    {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn scala_mixed_class_object_lexical_paths_and_synthetic_extractors_are_exact() {
+    let source = r#"package app
+object Semantic { class Data }
+import Semantic.*
+
+class Objects {
+  object Cache { class Data }
+  val data: Cache.Data = null
+}
+
+object Trees {
+  case class New(value: Int)
+  def read(value: Any): Int = value match {
+    case New(number) => number
+    case _ => 0
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Shapes.scala", source)
+        .build();
+    let references = [
+        source.find("Cache.Data").expect("mixed lexical path") + "Cache.".len(),
+        source.find("case New(").expect("synthetic extractor") + "case ".len(),
+    ]
+    .into_iter()
+    .map(|start| location_in("app/Shapes.scala", source, start))
+    .collect::<Vec<_>>();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for (result, expected) in results
+        .iter()
+        .zip(["app.Objects.Cache$.Data", "app.Trees$.New.New"])
+    {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn scala_compiler_intrinsics_reject_fixture_declarations_after_legal_shadows() {
+    let intrinsic = r#"package consumer
+object Use {
+  val any: Any = null
+  val nothing: Null = null
+  val qualifiedAny: scala.Any = null
+  val rootedNull: _root_.scala.Null = null
+}
+"#;
+    let shadow = r#"package shadow
+class Any
+object Use { val local: Any = null }
+"#;
+    let explicit = r#"package explicit
+import shadow.Any
+object Use { val imported: Any = null }
+"#;
+    let wildcard = r#"package wildcard
+import shadow.*
+object Use { val imported: Any = null }
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "fixtures/Redefinition.scala",
+            "package scala\nclass Any\nclass Null\n",
+        )
+        .file("consumer/Use.scala", intrinsic)
+        .file("shadow/Use.scala", shadow)
+        .file("explicit/Use.scala", explicit)
+        .file("wildcard/Use.scala", wildcard)
+        .build();
+    let references = [
+        location_in(
+            "consumer/Use.scala",
+            intrinsic,
+            intrinsic.find("Any").unwrap(),
+        ),
+        location_in(
+            "consumer/Use.scala",
+            intrinsic,
+            intrinsic.find("Null").unwrap(),
+        ),
+        location_in(
+            "consumer/Use.scala",
+            intrinsic,
+            intrinsic.find("scala.Any").unwrap() + "scala.".len(),
+        ),
+        location_in(
+            "consumer/Use.scala",
+            intrinsic,
+            intrinsic.find("_root_.scala.Null").unwrap() + "_root_.scala.".len(),
+        ),
+        location_in("shadow/Use.scala", shadow, shadow.rfind("Any").unwrap()),
+        location_in(
+            "explicit/Use.scala",
+            explicit,
+            explicit.rfind("Any").unwrap(),
+        ),
+        location_in(
+            "wildcard/Use.scala",
+            wildcard,
+            wildcard.rfind("Any").unwrap(),
+        ),
+    ];
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for result in &results[..4] {
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "scala_compiler_intrinsic_type",
+            "{value}"
+        );
+    }
+    for result in &results[4..] {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], "shadow.Any", "{value}");
+    }
+}
