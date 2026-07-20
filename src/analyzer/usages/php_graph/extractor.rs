@@ -1,5 +1,5 @@
 use crate::analyzer::usages::common::same_node;
-use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
+use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::php_graph::hits::{push_hit, push_hit_range, push_import_hit};
 use crate::analyzer::usages::php_graph::resolver::{
@@ -9,7 +9,7 @@ use crate::analyzer::usages::php_graph::resolver::{
     qualified_candidate_text, receiver_type_matches, static_receiver_matches,
 };
 use crate::analyzer::usages::php_graph::syntax::{
-    assignment_parts, declared_callable_return_type_fq_name, declared_field_type_fq_name,
+    assignment_parts, declared_callable_return_type_fq_name, instance_receiver_type_fq_name,
     is_local_scope, literal_member_identifier, object_creation_type, seed_parameter_types,
     static_member_parts, static_property_identifier, static_scope_type_fq_name,
     variable_identifier,
@@ -76,6 +76,7 @@ pub(super) fn scan_file(
     }
     if !matches!(spec.kind, TargetKind::Method | TargetKind::Field) {
         scan_node(
+            php,
             tree.root_node(),
             analyzer,
             file,
@@ -90,6 +91,7 @@ pub(super) fn scan_file(
 
 #[allow(clippy::too_many_arguments)]
 fn scan_node(
+    php: &PhpAnalyzer,
     node: Node<'_>,
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -107,18 +109,51 @@ fn scan_node(
         return;
     }
 
-    if matches!(node.kind(), "namespace_name" | "qualified_name") {
-        handle_candidate(node, analyzer, file, source, line_starts, ctx, spec, hits);
+    if matches!(
+        node.kind(),
+        "namespace_name" | "qualified_name" | "relative_scope"
+    ) {
+        handle_candidate(
+            php,
+            node,
+            analyzer,
+            file,
+            source,
+            line_starts,
+            ctx,
+            spec,
+            hits,
+        );
         return;
     }
 
     if matches!(node.kind(), "name" | "variable_name") {
-        handle_candidate(node, analyzer, file, source, line_starts, ctx, spec, hits);
+        handle_candidate(
+            php,
+            node,
+            analyzer,
+            file,
+            source,
+            line_starts,
+            ctx,
+            spec,
+            hits,
+        );
     }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        scan_node(child, analyzer, file, source, line_starts, ctx, spec, hits);
+        scan_node(
+            php,
+            child,
+            analyzer,
+            file,
+            source,
+            line_starts,
+            ctx,
+            spec,
+            hits,
+        );
     }
 }
 
@@ -185,6 +220,7 @@ fn is_local_namespace_use_binding_node(node: Node<'_>) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn handle_candidate(
+    php: &PhpAnalyzer,
     node: Node<'_>,
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -196,7 +232,16 @@ fn handle_candidate(
 ) {
     match spec.kind {
         TargetKind::Type => {
-            if candidate_resolves_to_type(node, source, ctx, &spec.target_fq_name) {
+            if candidate_resolves_to_type(
+                php,
+                analyzer,
+                file,
+                node,
+                source,
+                line_starts,
+                ctx,
+                &spec.target_fq_name,
+            ) {
                 push_hit(node, analyzer, file, source, line_starts, spec, hits);
             }
         }
@@ -219,9 +264,14 @@ fn handle_candidate(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn candidate_resolves_to_type(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
     node: Node<'_>,
     source: &str,
+    line_starts: &[usize],
     ctx: &PhpFileContext,
     target_fq_name: &str,
 ) -> bool {
@@ -229,7 +279,19 @@ fn candidate_resolves_to_type(
         return false;
     }
     let raw = qualified_candidate_text(node, source);
-    resolve_php_type(&raw, ctx).is_some_and(|fq| fq == target_fq_name)
+    let enclosing_owner = matches!(raw.as_str(), "self" | "static" | "parent")
+        .then(|| {
+            enclosing_owner_fq_name_at(
+                analyzer,
+                file,
+                node.start_byte(),
+                node.end_byte(),
+                line_starts,
+            )
+        })
+        .flatten();
+    static_scope_type_fq_name(php, analyzer, &raw, ctx, enclosing_owner.as_deref())
+        .is_some_and(|fq| fq == target_fq_name)
 }
 
 fn is_constructor_reference(
@@ -460,7 +522,10 @@ fn contains_member_reference_candidate(root: Node<'_>, source: &str, spec: &Targ
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         match node.kind() {
-            "member_access_expression" | "member_call_expression" => {
+            "member_access_expression"
+            | "nullsafe_member_access_expression"
+            | "member_call_expression"
+            | "nullsafe_member_call_expression" => {
                 if node
                     .child_by_field_name("name")
                     .and_then(|member| literal_member_identifier(member, source))
@@ -610,7 +675,10 @@ fn record_member_hit(
     hits: &mut BTreeSet<UsageHit>,
 ) {
     match node.kind() {
-        "member_access_expression" | "member_call_expression" => {
+        "member_access_expression"
+        | "nullsafe_member_access_expression"
+        | "member_call_expression"
+        | "nullsafe_member_call_expression" => {
             let (Some(receiver_node), Some(member_node)) = (
                 node.child_by_field_name("object"),
                 node.child_by_field_name("name"),
@@ -678,15 +746,6 @@ fn static_member_identifier<'a>(
     }
 }
 
-fn precise_receiver_type(engine: &LocalInferenceEngine<String>, receiver: &str) -> Option<String> {
-    match engine.resolve_symbol(receiver) {
-        SymbolResolution::Precise(targets) if targets.len() == 1 => targets.into_iter().next(),
-        SymbolResolution::Unknown | SymbolResolution::Ambiguous | SymbolResolution::Precise(_) => {
-            None
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn receiver_expression_type(
     node: Node<'_>,
@@ -698,61 +757,9 @@ fn receiver_expression_type(
     ctx: &PhpFileContext,
     engine: &LocalInferenceEngine<String>,
 ) -> Option<String> {
-    match node.kind() {
-        "variable_name" => {
-            let name = variable_identifier(node, source);
-            if name == "this" {
-                return enclosing_owner_fq_name_at(
-                    analyzer,
-                    file,
-                    node.start_byte(),
-                    node.end_byte(),
-                    line_starts,
-                );
-            }
-            precise_receiver_type(engine, name)
-        }
-        "object_creation_expression" => object_creation_type(node)
-            .and_then(|type_node| resolve_php_type(node_text(type_node, source), ctx)),
-        "parenthesized_expression" => node.named_child(0).and_then(|inner| {
-            receiver_expression_type(inner, php, analyzer, file, source, line_starts, ctx, engine)
-        }),
-        "member_access_expression" => {
-            receiver_member_access_type(node, php, analyzer, file, source, line_starts, ctx, engine)
-        }
-        _ => None,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn receiver_member_access_type(
-    node: Node<'_>,
-    php: &PhpAnalyzer,
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    line_starts: &[usize],
-    ctx: &PhpFileContext,
-    engine: &LocalInferenceEngine<String>,
-) -> Option<String> {
-    let object = node.child_by_field_name("object")?;
-    let member = node.child_by_field_name("name")?;
-    let owner = receiver_expression_type(
-        object,
-        php,
-        analyzer,
-        file,
-        source,
-        line_starts,
-        ctx,
-        engine,
-    )?;
-    let member = literal_member_identifier(member, source)?;
-    let field_fqn = format!("{owner}.{member}");
-    let field = analyzer
-        .definitions(&field_fqn)
-        .find(|unit| unit.is_field())?;
-    declared_field_type_fq_name(php, analyzer, &field)
+    instance_receiver_type_fq_name(php, analyzer, node, source, ctx, engine, |start, end| {
+        enclosing_owner_fq_name_at(analyzer, file, start, end, line_starts)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

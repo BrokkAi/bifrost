@@ -1,8 +1,10 @@
 use super::resolver::node_text;
-use crate::analyzer::usages::local_inference::LocalInferenceEngine;
+use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::{
-    CodeUnit, IAnalyzer, PhpAnalyzer, php_signature_return_type_text, resolve_php_type,
+    CodeUnit, IAnalyzer, PhpAnalyzer, PhpFileContext, TypeHierarchyProvider,
+    php_signature_return_type_text, resolve_php_type,
 };
+use crate::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
 const LOCAL_SCOPE_NODES: &[&str] = &[
@@ -157,6 +159,206 @@ pub(in crate::analyzer::usages) fn declared_callable_return_type_fq_name(
     }
     indexed_declared_type_fq_name(analyzer, callable)
         .or_else(|| signature_declared_type_fq_name(php, analyzer, callable))
+}
+
+/// Resolve the declared object type of a PHP instance receiver without walking
+/// the source tree recursively. Method-call and field-access chains are reduced
+/// from their innermost receiver outward, and every step fails closed unless it
+/// has one structured declaration with a class return/type fact.
+pub(in crate::analyzer::usages) fn instance_receiver_type_fq_name<F>(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    root: Node<'_>,
+    source: &str,
+    ctx: &PhpFileContext,
+    bindings: &LocalInferenceEngine<String>,
+    mut enclosing_owner: F,
+) -> Option<String>
+where
+    F: FnMut(usize, usize) -> Option<String>,
+{
+    enum Visit<'tree> {
+        Resolve(Node<'tree>),
+        Finish(Node<'tree>),
+    }
+
+    let mut resolved = HashMap::default();
+    let mut stack = vec![Visit::Resolve(root)];
+    while let Some(visit) = stack.pop() {
+        let node = match visit {
+            Visit::Resolve(node) => {
+                match node.kind() {
+                    "variable_name" => {
+                        let name = variable_identifier(node, source);
+                        let value = if name == "this" {
+                            enclosing_owner(node.start_byte(), node.end_byte())
+                        } else {
+                            match bindings.resolve_symbol(name) {
+                                SymbolResolution::Precise(targets) if targets.len() == 1 => {
+                                    targets.into_iter().next()
+                                }
+                                SymbolResolution::Unknown
+                                | SymbolResolution::Ambiguous
+                                | SymbolResolution::Precise(_) => None,
+                            }
+                        };
+                        if let Some(value) = value {
+                            resolved.insert(node.id(), value);
+                        }
+                    }
+                    "object_creation_expression" => {
+                        if let Some(type_node) = object_creation_type(node) {
+                            let raw = node_text(type_node, source);
+                            let owner =
+                                enclosing_owner(type_node.start_byte(), type_node.end_byte());
+                            if let Some(value) =
+                                static_scope_type_fq_name(php, analyzer, raw, ctx, owner.as_deref())
+                            {
+                                resolved.insert(node.id(), value);
+                            }
+                        }
+                    }
+                    "parenthesized_expression"
+                    | "member_access_expression"
+                    | "nullsafe_member_access_expression"
+                    | "member_call_expression"
+                    | "nullsafe_member_call_expression" => {
+                        let dependency = if node.kind() == "parenthesized_expression" {
+                            node.named_child(0)
+                        } else {
+                            node.child_by_field_name("object")
+                        };
+                        if let Some(dependency) = dependency {
+                            stack.push(Visit::Finish(node));
+                            stack.push(Visit::Resolve(dependency));
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            Visit::Finish(node) => node,
+        };
+
+        let dependency = if node.kind() == "parenthesized_expression" {
+            node.named_child(0)
+        } else {
+            node.child_by_field_name("object")
+        }?;
+        let owner = resolved.get(&dependency.id())?;
+        let value = match node.kind() {
+            "parenthesized_expression" => Some(owner.clone()),
+            "member_access_expression" | "nullsafe_member_access_expression" => {
+                let member = node.child_by_field_name("name")?;
+                declared_instance_field(
+                    php,
+                    analyzer,
+                    owner,
+                    literal_member_identifier(member, source)?,
+                )
+                .and_then(|field| declared_field_type_fq_name(php, analyzer, &field))
+            }
+            "member_call_expression" | "nullsafe_member_call_expression" => {
+                let member = node.child_by_field_name("name")?;
+                declared_instance_callable(
+                    php,
+                    analyzer,
+                    owner,
+                    literal_member_identifier(member, source)?,
+                )
+                .and_then(|callable| {
+                    declared_callable_return_type_fq_name(php, analyzer, &callable)
+                })
+            }
+            _ => None,
+        };
+        if let Some(value) = value {
+            resolved.insert(node.id(), value);
+        }
+    }
+    resolved.remove(&root.id())
+}
+
+pub(in crate::analyzer::usages) fn declared_instance_callable(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    owner_fq_name: &str,
+    member: &str,
+) -> Option<CodeUnit> {
+    declared_member(php, analyzer, owner_fq_name, member, CodeUnit::is_function)
+}
+
+pub(in crate::analyzer::usages) fn declared_instance_field(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    owner_fq_name: &str,
+    member: &str,
+) -> Option<CodeUnit> {
+    declared_member(php, analyzer, owner_fq_name, member, CodeUnit::is_field)
+}
+
+fn declared_member(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    owner_fq_name: &str,
+    member: &str,
+    wanted: fn(&CodeUnit) -> bool,
+) -> Option<CodeUnit> {
+    if let Some(direct) = unique_member(analyzer, owner_fq_name, member, wanted).ok()? {
+        return Some(direct);
+    }
+
+    let mut owners = analyzer
+        .definitions(owner_fq_name)
+        .filter(CodeUnit::is_class);
+    let owner = owners.next()?;
+    if owners.next().is_some() {
+        return None;
+    }
+
+    let mut seen = HashSet::default();
+    seen.insert(owner_fq_name.to_string());
+    let mut level = php.get_direct_ancestors(&owner);
+    while !level.is_empty() {
+        let mut candidate = None;
+        let mut next_level = Vec::new();
+        for ancestor in level {
+            let ancestor_fq_name = ancestor.fq_name();
+            if !seen.insert(ancestor_fq_name.clone()) {
+                continue;
+            }
+            if let Some(found) = unique_member(analyzer, &ancestor_fq_name, member, wanted).ok()? {
+                if candidate.is_some() {
+                    return None;
+                }
+                candidate = Some(found);
+            }
+            next_level.extend(php.get_direct_ancestors(&ancestor));
+        }
+        if candidate.is_some() {
+            return candidate;
+        }
+        level = next_level;
+    }
+    None
+}
+
+fn unique_member(
+    analyzer: &dyn IAnalyzer,
+    owner_fq_name: &str,
+    member: &str,
+    wanted: fn(&CodeUnit) -> bool,
+) -> Result<Option<CodeUnit>, ()> {
+    let mut definitions = analyzer
+        .definitions(&format!("{owner_fq_name}.{member}"))
+        .filter(wanted);
+    let Some(definition) = definitions.next() else {
+        return Ok(None);
+    };
+    if definitions.next().is_some() {
+        return Err(());
+    }
+    Ok(Some(definition))
 }
 
 fn indexed_declared_type_fq_name(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<String> {

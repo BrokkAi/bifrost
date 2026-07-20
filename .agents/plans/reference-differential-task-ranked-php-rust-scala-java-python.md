@@ -17,8 +17,12 @@ The observable result is twenty-five clean completed repository records, five pe
 - [x] (2026-07-20 09:28-05:00) Recomputed all five language sets through `task_repos(SFT_PREDICATES, langs=[LANG])`, sorted by descending task count with stable selector ordering for ties, and independently confirmed all twenty-five clones exist with clean tracked state.
 - [x] (2026-07-20 09:20-05:00) Transplanted the previously reviewed PHP #904/#905 structured fix and its behavior tests into this current branch as `fdb7ae8d`; 49 targeted PHP usage tests, 16 whole-workspace graph tests, formatting, diff hygiene, and isolated all-target/all-feature Clippy pass. This remains regression/fix evidence until the task-ranked PHP corpus and clean publication proof are complete.
 - [x] (2026-07-20 09:45-05:00) Ran the complete isolated `cargo test --features nlp,python` gate. The sandboxed attempt reached 1,459 passing library tests but denied three benchmark process-I/O tests with `Operation not permitted`; the required unsandboxed rerun then passed the complete unit, integration, and doc-test matrix with zero failures.
-- [ ] Commit this corrected task-ranked plan, rebuild the release runner, and record the head and checksum.
-- [ ] Complete, publish, close owned issues for, and summarize the PHP task-ranked leg.
+- [x] (2026-07-20 09:50-05:00) Committed the corrected task-ranked plan as `c0e01ba9`, forced a release-runner relink so its compile-time manifest path names this worktree, and recorded runner SHA-256 `c98f6b8a649eb0f838942de2de3818f20dcb103bdce7520f29144b53ca2f5682`.
+- [x] (2026-07-20 10:00-05:00) Ran the authoritative PHP baseline over the five explicit task-ranked repositories. All five records completed cleanly at `c0e01ba9`; the JSONL SHA-256 is `0e1fb71713e0fe0d9e6b4ab77da36730f58e15f0e801a5f3b288df8c41652ebd`. Raw missing counts were Snipe-IT 0, Laravel 33, CakePHP 46, CodeIgniter4 31, and PhpSpreadsheet 188.
+- [x] (2026-07-20 10:18-05:00) Delegated the four nonzero PHP repositories as three disjoint Oldskool triage partitions and independently reviewed the result. All 298 rows are legitimate and exhaustively reduce to 96 owner-relative class references, 200 call-return receiver chains, and four nullsafe calls, with two rows requiring both chain and nullsafe support.
+- [x] (2026-07-20 10:22-05:00) Reproduced clean minimal production witnesses and created assigned issues #960, #961, and #962 before implementation. Exact baseline SHA-256 values are `1305e84e...` for Laravel `self`, `4669d644...` for the CakePHP call chain, and `fa77f406...` for the CakePHP nullsafe call.
+- [x] (2026-07-20 10:50-05:00) Integrated and reviewed Oldskool's #960 implementation, then implemented #961/#962 with one shared stack-safe structured receiver evaluator, nearest declaring-owner lookup, and targeted/inverted behavior coverage. All 51 targeted PHP tests, all 18 PHP usage-graph tests, formatting, diff hygiene, and isolated all-target/all-feature Clippy pass.
+- [ ] Complete clean publication proof, close owned issues, and summarize the PHP task-ranked leg.
 - [ ] Complete, publish, close owned issues for, and summarize the Rust task-ranked leg.
 - [ ] Complete, publish, close owned issues for, and summarize the Scala task-ranked leg.
 - [ ] Complete, publish, close owned issues for, and summarize the Java task-ranked leg.
@@ -39,6 +43,9 @@ The observable result is twenty-five clean completed repository records, five pe
 - Observation: The restricted sandbox cannot execute three benchmark stderr-drain process tests, but the code is healthy outside that process sandbox.
   Evidence: The sandboxed full suite failed only `benchmark::mcp_session::{stderr_boundary_waits_for_delayed_marker_consumption,stderr_drain_bounds_an_unterminated_stream,stderr_drain_continuously_consumes_and_keeps_bounded_tail}` with OS error 1. The identical isolated feature-enabled command outside the sandbox passed the complete repository suite.
 
+- Observation: An unrelated concurrent JS/TS campaign began modifying five tracked JS/TS files in this same worktree while the PHP full gate was running.
+  Evidence: The PHP gate passed every library and integration target through the final usage-graph group, including all PHP tests, then failed `usage_graph_ts_test::qualified_type_references_create_exact_workspace_edges`; an isolated rerun reproduced it and exposed warnings in concurrently dirty `js_ts_graph/inverted.rs`. Those files are not part of the PHP change and will not be staged into its checkpoint.
+
 ## Decision Log
 
 - Decision: Treat all previous LOC-ranked language records as regression evidence only and rerun all five requested languages.
@@ -55,6 +62,10 @@ The observable result is twenty-five clean completed repository records, five pe
 
 - Decision: Retain the already-reviewed #904/#905 PHP implementation on the branch but require task-ranked corpus proof before declaring the PHP language complete.
   Rationale: The fixes are structured and independently tested, yet the prior source witnesses came from an invalid membership set for this goal. The new corpus may expose additional roots and must be audited independently.
+  Date/Author: 2026-07-20 / Codex
+
+- Decision: Partition the 298 PHP residuals into three issues with explicit overlap rather than force them into disjoint symptom buckets.
+  Rationale: Nullsafe node dispatch (#962) and call-return receiver inference (#961) are independent structured requirements; two PhpSpreadsheet sites need both. Owner-relative type identity (#960) is separate. The issue ledgers record 96, 200, and 4 affected rows respectively and identify the two-row overlap.
   Date/Author: 2026-07-20 / Codex
 
 ## Outcomes & Retrospective
