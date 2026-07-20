@@ -15,7 +15,10 @@ The observable result is ten accepted repository records selected by exact desce
 - [x] (2026-07-20 14:50Z) Selected the exact C and C++ sets through `task_repos(SFT_PREDICATES, langs=[language])`, sorted by `(-task_count, repo_slug)`, and verified that `SFT_PREDICATES.not_overlarge` reads and filters `large-repos.csv`.
 - [x] (2026-07-20 14:55Z) Verified all ten canonical clones exist at the pinned heads recorded below and have no tracked changes. Their only apparent dirtiness is analyzer cache directories that must be locally excluded before accepted runs.
 - [x] (2026-07-20 15:00Z) Verified GitHub issues #924 through #932 remain open and are each assigned only to `jbellis`; their fixes and local gates are already present in the current history, but clean task-ranked corpus proof and closure remain outstanding.
-- [ ] Publish this campaign-start plan directly to `origin/master`, locally exclude analyzer cache directories in the ten clones, build the exact clean release runner, record its checksum, and validate the explicit selection with `run-corpus --dry-run`.
+- [x] (2026-07-20 15:20Z) Published the campaign-start plan directly to `origin/master` at `6a51a712`, locally excluded analyzer cache directories in all ten clones, built the clean release runner, recorded SHA-256 `fa4d74323afe1e1a4a22beb8ec9008b0f7fa8274a67bec20a086a745c8726cbf`, and dry-ran both explicit selections.
+- [x] (2026-07-20 17:05Z) Sealed the clean Go-Ethereum C discovery record with zero missing rows, then proved its sole candidate-limit exclusion contains 121,349 candidates and that a 250,000 ceiling clears the complete file with zero file errors.
+- [x] (2026-07-20 17:10Z) Re-probed both #932 QGIS witnesses on the frozen clean head: each retained an exact inverse hit as `unproven`; traced this to sound macro uncertainty from the missing generated `qgis_core.h`, not a remaining default-argument defect.
+- [x] (2026-07-20 17:15Z) Diagnosed pathological Libgit2/JerryScript inverse progress as a distinct macro-environment cursor contention/replay defect, created GitHub issue #996, and verified it is assigned only to `jbellis` before delegating implementation.
 - [ ] Complete the five-repository C baseline, integrity-check every record, exhaustively disposition every raw missing row, and give the user the requested C-language summary.
 - [ ] File/assign, implement, review, test, publish, and exact-prove every legitimate C root cause not owned by somebody else; rebuild and rerun the complete C set after any fix.
 - [ ] Complete the five-repository C++ baseline, integrity-check every record, exhaustively disposition every raw missing row, and give the user the requested C++-language summary.
@@ -38,6 +41,15 @@ The observable result is ten accepted repository records selected by exact desce
 
 - Observation: The requested external Oldskool launch is not allowed by the execution environment.
   Evidence: the named role is not exposed through the internal collaboration API, and an attempted equivalent GPT-5.4/medium CLI delegation was denied because it would transmit private workspace contents externally. Internal read-only subagents remain available for parallel research and triage.
+
+- Observation: Go-Ethereum's generated secp256k1 table exceeds the standard 50,000-candidate ceiling without exceeding the 4 MiB source ceiling.
+  Evidence: `crypto/secp256k1/libsecp256k1/src/precomputed_ecmult.c` contributes exactly 121,349 deduplicated structured candidates. A focused inventory at 250,000 reported 153,269 total candidates across the repository and zero file errors, while the 50,000 discovery record reported the file as excluded.
+
+- Observation: The two current-head QGIS #932 sites are exact inverse hits but cannot soundly be promoted from `unproven` with the indexed facts available.
+  Evidence: QGIS omits generated quoted header `qgis_core.h`. The qualified enum argument terminal could therefore be an object-like macro that changes call arity before C++ lookup. Both clean exact probes have the right target and exact range with zero missing rows; inverse resolution correctly retains preprocessor uncertainty.
+
+- Observation: A shared macro-environment forward cursor serializes concurrent inverse targets and thrashes on interleaved source frontiers.
+  Evidence: during the C discovery run, eight workers blocked in `VisibilityIndex::call_arity_evidence` on the same per-file cursor mutex while two workers replayed recursive include events through `mark_macro_events_ambiguous`. The cursor resets whenever a target requests a lower byte frontier, so concurrent target scans repeatedly replay the prefix under lock. This is issue #996 and is distinct from #929's class-strength parse cache.
 
 ## Decision Log
 
@@ -67,6 +79,18 @@ The observable result is ten accepted repository records selected by exact desce
 
 - Decision: Do not wait for GitHub CI after the complete local gate passes.
   Rationale: The user explicitly made local tests the transition boundary. Formatting, all-target/all-feature Clippy, focused tests, and the full `cargo test --features nlp,python` suite remain mandatory.
+  Date/Author: 2026-07-20 / Codex
+
+- Decision: Raise the final C acceptance ceiling to 250,000 structured candidates per file and rerun the complete five-repository language set with one shared fingerprint.
+  Rationale: The measured Go-Ethereum maximum is 121,349 for one 2.4 MiB generated file. A 250,000 probe clears it with more than twofold headroom and remains bounded; mixing one raised-ceiling record with four standard records would violate the single-fingerprint acceptance contract.
+  Date/Author: 2026-07-20 / Codex
+
+- Decision: Treat #932's current exact `unproven` hits as an honest acceptance refinement, not as grounds to weaken macro proof.
+  Rationale: The original false negatives are gone and the exact sites are retained. Claiming `consistent` despite an unresolved generated-header macro boundary would mask structured uncertainty and violate the analyzer's fail-closed contract. Closure evidence must state this explicitly rather than claim literal consistency.
+  Date/Author: 2026-07-20 / Codex
+
+- Decision: Interrupt the discovery corpus after filing and assigning #996, then resume only from a clean fixed runner.
+  Rationale: Libgit2 and JerryScript had no durable records, the live stack proved they were exercising the defect, and continuing would spend hours producing evidence that must be rerun after the fix. The append-only Go-Ethereum record remains intact as discovery evidence.
   Date/Author: 2026-07-20 / Codex
 
 ## Outcomes & Retrospective
@@ -111,7 +135,7 @@ Clone paths are `/home/jonathan/Projects/brokkbench/clones/<slug>`. Durable raw 
 
 First publish this plan from a clean Bifrost checkpoint. Add `.bifrost/` and `.brokk/` to each selected clone's local `.git/info/exclude` when present, without touching tracked clone content or deleting caches. Verify all ten clone heads and tracked cleanliness. Build a fresh release runner from the published clean Bifrost head, record its SHA-256, and run an explicit no-write `run-corpus --dry-run` for each language. Freeze the Bifrost worktree while any accepted corpus process is active.
 
-Run the complete C set first with repeated explicit repositories, persisted cache mode, strict reporting, 1,000 sampled files, 10,000 sampled sites, 50,000 candidates per file, 4 MiB source files, 1,000 inverse target groups, 1,000 usage files per target, 100,000 usages per target, and seed zero. Start at one active repository with eight inner workers. If host measurements show ample memory and I/O headroom, increase only outer repository concurrency while preserving every semantic limit and recording the change. Store append-only head-scoped JSONL and logs. A strict status of two is expected if raw `missing` rows exist; acceptance requires five completed clean records.
+Run the complete C set first with repeated explicit repositories, persisted cache mode, strict reporting, 1,000 sampled files, 10,000 sampled sites, 250,000 candidates per file, 4 MiB source files, 1,000 inverse target groups, 1,000 usage files per target, 100,000 usages per target, and seed zero. The raised candidate ceiling is required by the measured Go-Ethereum generated table and must be shared by all five records. Start at one active repository with eight inner workers. If host measurements show ample memory and I/O headroom, increase only outer repository concurrency while preserving every semantic limit and recording the change. Store append-only head-scoped JSONL and logs. A strict status of two is expected if raw `missing` rows exist; acceptance requires five completed clean records.
 
 Integrity-check heads, clean flags, one semantic fingerprint, completion status, limits, file errors, and truncation. Extract every raw missing row into a stable ledger keyed by repository, path, byte range, and ordered targets. Delegate disjoint repository source review while root verifies every exact token, AST role, forward identity, and inverse completeness. Rerun every suspicious site exactly with ephemeral cache mode. Group legitimate witnesses by root cause, search the GitHub ledger, and inspect assignees. Skip an issue assigned to anybody else. Otherwise create or reuse an issue assigned only to `jbellis` before product edits.
 
@@ -145,7 +169,7 @@ The C command shape is:
       --repo jerryscript-project__jerryscript \
       --repo-jobs 1 --jobs 8 --cache-mode persisted --strict \
       --max-files 1000 --max-sites 10000 \
-      --max-candidates-per-file 50000 --max-source-bytes 4194304 \
+      --max-candidates-per-file 250000 --max-source-bytes 4194304 \
       --max-targets 1000 --max-usage-files 1000 --max-usages 100000 \
       --seed 0 \
       --output /mnt/optane/tmp/reference-differential/c-task-top5-BIFROST_HEAD.jsonl \
@@ -201,3 +225,5 @@ At launch the host has 120 logical processors, 98 GiB RAM with about 58 GiB avai
 No product interface change is assumed. Preserve the differential CLI and report schema, public symbol identity, Rust APIs, Python bindings, and existing MCP tool names unless a reduced defect requires a deliberate change recorded here. C and C++ share the C++ analyzer and persisted metadata; declaration or identity changes may require a C++ analysis epoch bump so warmed caches cannot retain stale facts. Avoid new dependencies and avoid cloning in hot loops unless evidence shows it is the correct tradeoff.
 
 Revision note (2026-07-20 15:00Z): Created this task-ranked C/C++ plan after proving the earlier LOC-ranked campaign did not satisfy the selector contract. Pinned the exact `SFT_PREDICATES` call, descending-count tie break, ten repository heads, zero-overlap discovery, existing issue ownership, frozen-runner discipline, language-summary boundaries, delegation limits, local gates, direct-master workflow, and clean full-language closure requirement before launching analyzers.
+
+Revision note (2026-07-20 17:18Z): Recorded the clean runner and first C discovery record, raised the final C candidate ceiling from measured evidence, documented #932's sound exact-but-unproven boundary, and added assigned issue #996 after a live production stack proved cross-target macro cursor serialization and replay thrash.

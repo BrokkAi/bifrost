@@ -19,6 +19,7 @@ use std::hash::Hash;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::ThreadId;
 use tree_sitter::{Node, Parser, Tree};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -669,7 +670,12 @@ pub(in crate::analyzer::usages) struct VisibilityIndex {
     structured_alias_targets: Mutex<HashMap<CodeUnit, Option<StructuredAliasTarget>>>,
     macro_event_cells: Mutex<HashMap<ProjectFile, MacroEventCell>>,
     macro_include_protection_cells: Mutex<HashMap<ProjectFile, MacroIncludeProtectionCell>>,
-    macro_environment_cursors: Mutex<HashMap<ProjectFile, MacroEnvironmentCursorCell>>,
+    // A forward cursor is useful only while its caller visits one source in byte order. The
+    // authoritative differential shares this index across target workers, whose frontiers can
+    // interleave arbitrarily, so sharing one cursor per file would serialize the include replay
+    // and repeatedly reset it. Keep one bounded cursor per participating worker instead; the
+    // immutable event and parse caches above remain shared.
+    macro_environment_cursors: Mutex<HashMap<(ProjectFile, ThreadId), MacroEnvironmentCursorCell>>,
     macro_replacements: Mutex<MacroReplacementCache>,
     #[cfg(test)]
     macro_replacement_parse_count: AtomicUsize,
@@ -1168,17 +1174,21 @@ impl VisibilityIndex {
             .clone()
     }
 
+    fn macro_environment_cursor_cell(&self, file: &ProjectFile) -> MacroEnvironmentCursorCell {
+        let key = (file.clone(), std::thread::current().id());
+        self.macro_environment_cursors
+            .lock()
+            .expect("C++ macro environment cursor cache poisoned")
+            .entry(key)
+            .or_default()
+            .clone()
+    }
+
     fn macro_environment(&self, file: &ProjectFile, before_byte: usize) -> Arc<MacroEnvironment> {
         let cell = self.macro_event_cell(file);
         let events = cell.get_or_init(|| self.collect_macro_events(file).into_boxed_slice());
         let frontier = events.partition_point(|event| event.byte() < before_byte);
-        let cursor_cell = self
-            .macro_environment_cursors
-            .lock()
-            .expect("C++ macro environment cursor cache poisoned")
-            .entry(file.clone())
-            .or_default()
-            .clone();
+        let cursor_cell = self.macro_environment_cursor_cell(file);
         let mut cursor = cursor_cell
             .lock()
             .expect("C++ macro environment cursor poisoned");
@@ -7155,7 +7165,7 @@ mod tests {
                 .expect("C++ macro environment cursor cache poisoned")
                 .len(),
             1,
-            "one file must retain one bounded forward cursor, not one snapshot per frontier"
+            "one worker must retain one bounded forward cursor, not one snapshot per frontier"
         );
         assert_eq!(
             visibility
@@ -7177,6 +7187,125 @@ mod tests {
                 .load(Ordering::Relaxed),
             0,
             "sequential calls must mutate the uniquely held cursor environment in place"
+        );
+    }
+
+    #[test]
+    fn concurrent_macro_arity_scans_do_not_share_a_locked_forward_cursor() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), "consumer.cpp");
+        let exact_header = ProjectFile::new(root.clone(), "exact.h");
+        exact_header
+            .write("#pragma once\n#define PAIR(value) value, value\n")
+            .expect("write exact macro header");
+        let conditional_header = ProjectFile::new(root.clone(), "conditional.h");
+        conditional_header
+            .write("#pragma once\n#define MAYBE_PAIR(value) value, value\n")
+            .expect("write conditional macro header");
+        file.write(
+            "#include \"exact.h\"\n\
+             #if ENABLE_CONDITIONAL\n\
+             #include \"conditional.h\"\n\
+             #endif\n\
+             int target(int left, int right);\n\
+             void use() {\n\
+               target(PAIR(0));\n\
+               target(MAYBE_PAIR(0));\n\
+             }\n",
+        )
+        .expect("write macro consumer");
+
+        let project = Arc::new(crate::analyzer::TestProject::new(
+            &root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let workspace = crate::analyzer::WorkspaceAnalyzer::build(
+            project,
+            crate::analyzer::AnalyzerConfig::default(),
+        );
+        let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
+        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+        let roots = HashSet::from_iter([file.clone()]);
+        let visibility = VisibilityIndex::build(cpp, workspace.analyzer(), &roots);
+
+        // Hold this thread's cursor across the worker's complete macro/include replay. A
+        // file-global cursor blocks the worker here; a worker-local cursor lets it finish while
+        // all immutable syntax, macro-event, and include-protection cells remain shared.
+        let main_cursor = visibility.macro_environment_cursor_cell(&file);
+        let main_guard = main_cursor
+            .lock()
+            .expect("main macro environment cursor poisoned");
+        let (timely, eventual) = std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let worker_file = &file;
+            let worker_visibility = &visibility;
+            let worker = scope.spawn(move || {
+                let prepared = cpp
+                    .prepared_syntax(worker_file)
+                    .expect("prepared macro consumer");
+                let mut stack = vec![prepared.tree().root_node()];
+                let mut calls = Vec::new();
+                while let Some(node) = stack.pop() {
+                    if node.kind() == "call_expression"
+                        && node
+                            .child_by_field_name("function")
+                            .is_some_and(|function| {
+                                node_text(function, prepared.source()) == "target"
+                            })
+                    {
+                        calls.push(node);
+                    }
+                    for index in (0..node.named_child_count()).rev() {
+                        if let Some(child) = node.named_child(index) {
+                            stack.push(child);
+                        }
+                    }
+                }
+                calls.sort_by_key(Node::start_byte);
+                ready_tx
+                    .send(())
+                    .expect("signal macro worker ready to resolve arity");
+                let evidence = calls
+                    .into_iter()
+                    .map(|call| {
+                        worker_visibility.call_arity_evidence(worker_file, call, prepared.source())
+                    })
+                    .collect::<Vec<_>>();
+                tx.send(evidence.clone()).expect("send macro evidence");
+                evidence
+            });
+            ready_rx.recv().expect("macro worker ready signal");
+            let timely = rx.recv_timeout(std::time::Duration::from_secs(5));
+            drop(main_guard);
+            let eventual = worker.join().expect("macro arity worker");
+            (timely, eventual)
+        });
+
+        let expected = vec![CallArityEvidence::Exact(2), CallArityEvidence::Unknown];
+        assert_eq!(
+            timely.as_ref().ok(),
+            Some(&expected),
+            "another target worker must not wait for this thread's forward cursor: {timely:?}"
+        );
+        assert_eq!(
+            eventual, expected,
+            "removing cross-worker serialization must preserve exact and fail-closed evidence"
+        );
+        assert_eq!(
+            cpp.prepared_syntax_parse_count_for_test(&file),
+            1,
+            "concurrent macro replay must retain the request-scoped prepared tree"
+        );
+        assert_eq!(
+            visibility
+                .macro_environment_cursors
+                .lock()
+                .expect("C++ macro environment cursor cache poisoned")
+                .len(),
+            2,
+            "the participating workers must retain independent bounded cursors"
         );
     }
 
