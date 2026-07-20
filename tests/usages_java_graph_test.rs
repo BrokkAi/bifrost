@@ -4056,3 +4056,111 @@ public class JavaConsumer {
 
     assert_no_hit_contains(&hits, "new ScalaTarget()");
 }
+
+#[test]
+fn java_graph_strategy_maps_lombok_accessor_usages_back_to_fields() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "app/Accessors.java",
+            r#"
+package app;
+
+import lombok.Getter;
+import lombok.Setter;
+
+@Getter
+@Setter
+public class Accessors {
+    String name;
+    boolean ready;
+}
+"#,
+        ),
+        (
+            "app/Shadowed.java",
+            r#"
+package app;
+
+import lombok.Getter;
+
+@Getter
+public class Shadowed {
+    String name;
+
+    public String getName() {
+        return name;
+    }
+}
+"#,
+        ),
+        (
+            "app/Plain.java",
+            r#"
+package app;
+
+public class Plain {
+    String name;
+}
+"#,
+        ),
+        (
+            "app/Consumer.java",
+            r#"
+package app;
+
+public class Consumer {
+    void call(Accessors accessors, Shadowed shadowed, Plain plain) {
+        accessors.getName(); // generated-getter-call
+        accessors.setName("value"); // generated-setter-call
+        accessors.isReady(); // generated-boolean-getter-call
+        java.util.function.Function<Accessors, String> getter = Accessors::getName; // generated-getter-reference
+        java.util.function.BiConsumer<Accessors, String> setter = Accessors::setName; // generated-setter-reference
+        java.util.function.Predicate<Accessors> ready = Accessors::isReady; // generated-boolean-getter-reference
+
+        accessors.isName(); // rejected-non-boolean-is-getter
+        accessors.getName("unexpected"); // rejected-getter-arity
+        accessors.setName(); // rejected-setter-arity
+        shadowed.getName(); // rejected-declared-method-shadow
+        java.util.function.Function<Shadowed, String> shadowedRef = Shadowed::getName; // rejected-declared-method-reference
+        plain.getName(); // rejected-without-lombok
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = JavaUsageGraphStrategy::new();
+
+    let name = definition(&analyzer, "app.Accessors.name");
+    let name_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&name), &candidates, 1000));
+    assert_hit_contains(&name_hits, "generated-getter-call");
+    assert_hit_contains(&name_hits, "generated-setter-call");
+    assert_hit_contains(&name_hits, "generated-getter-reference");
+    assert_hit_contains(&name_hits, "generated-setter-reference");
+    assert_no_hit_contains(&name_hits, "rejected-non-boolean-is-getter");
+    assert_no_hit_contains(&name_hits, "rejected-getter-arity");
+    assert_no_hit_contains(&name_hits, "rejected-setter-arity");
+
+    let ready = definition(&analyzer, "app.Accessors.ready");
+    let ready_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&ready), &candidates, 1000));
+    assert_hit_contains(&ready_hits, "generated-boolean-getter-call");
+    assert_hit_contains(&ready_hits, "generated-boolean-getter-reference");
+
+    let shadowed = definition(&analyzer, "app.Shadowed.name");
+    let shadowed_hits = hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&shadowed),
+        &candidates,
+        1000,
+    ));
+    assert_no_hit_contains(&shadowed_hits, "rejected-declared-method-shadow");
+    assert_no_hit_contains(&shadowed_hits, "rejected-declared-method-reference");
+
+    let plain = definition(&analyzer, "app.Plain.name");
+    let plain_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&plain), &candidates, 1000));
+    assert_no_hit_contains(&plain_hits, "rejected-without-lombok");
+}

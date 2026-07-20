@@ -115,7 +115,8 @@ pub(crate) use go::{
     go_type_lookup_resolution,
 };
 pub(crate) use java::{
-    JavaTypeLookupResolution, java_lombok_accessor_field_candidates, java_type_lookup_resolution,
+    JavaTypeLookupResolution, java_lombok_accessor_field_candidates,
+    java_lombok_generated_accessor_field_candidates, java_type_lookup_resolution,
 };
 pub(crate) use scala::{ScalaTypeLookupResolution, scala_type_lookup_resolution};
 

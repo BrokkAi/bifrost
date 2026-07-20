@@ -1807,8 +1807,9 @@ fn java_member_candidates(
 
     let owner = analyzer.definitions(owner_fqn).next();
     if allow_generated_accessors && let Some(owner) = owner.as_ref() {
-        let generated_accessor_candidates =
-            java_lombok_accessor_field_candidates(analyzer, support, owner, member);
+        let generated_accessor_candidates = java_lombok_accessor_field_candidates_for_arity(
+            analyzer, support, owner, member, arity,
+        );
         if !generated_accessor_candidates.is_empty() {
             return candidates_outcome(generated_accessor_candidates);
         }
@@ -1881,6 +1882,7 @@ struct JavaAccessorProperty {
     kind: JavaAccessorKind,
     field_name: String,
     requires_boolean_field: bool,
+    arity: usize,
 }
 
 pub(crate) fn java_lombok_accessor_field_candidates(
@@ -1889,9 +1891,48 @@ pub(crate) fn java_lombok_accessor_field_candidates(
     owner: &CodeUnit,
     member: &str,
 ) -> Vec<CodeUnit> {
+    java_lombok_accessor_field_candidates_for_arity(analyzer, support, owner, member, None)
+}
+
+pub(crate) fn java_lombok_generated_accessor_field_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    owner: &CodeUnit,
+    member: &str,
+    arity: Option<usize>,
+) -> Vec<CodeUnit> {
+    if java_accessor_property(member).is_none() {
+        return Vec::new();
+    }
+    let declared_methods = java_filter_member_candidates(
+        support.fqn(&format!("{}.{}", owner.fq_name(), member)),
+        JavaMemberLookupKind::Method,
+    );
+    let declared_method_wins = match arity {
+        Some(arity) => declared_methods
+            .iter()
+            .any(|method| java_callable_accepts_arity(analyzer, method, arity)),
+        None => !declared_methods.is_empty(),
+    };
+    if declared_method_wins {
+        return Vec::new();
+    }
+    java_lombok_accessor_field_candidates_for_arity(analyzer, support, owner, member, arity)
+}
+
+fn java_lombok_accessor_field_candidates_for_arity(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    owner: &CodeUnit,
+    member: &str,
+    arity: Option<usize>,
+) -> Vec<CodeUnit> {
     let Some(accessor) = java_accessor_property(member) else {
         return Vec::new();
     };
+    if arity.is_some_and(|arity| arity != accessor.arity) {
+        return Vec::new();
+    }
     let mut fields: Vec<_> = support
         .fqn(&format!("{}.{}", owner.fq_name(), accessor.field_name))
         .into_iter()
@@ -1945,6 +1986,7 @@ fn java_accessor_property(member: &str) -> Option<JavaAccessorProperty> {
         kind,
         field_name: java_bean_decapitalize(suffix),
         requires_boolean_field,
+        arity: usize::from(kind == JavaAccessorKind::Setter),
     })
 }
 

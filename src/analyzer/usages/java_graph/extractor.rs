@@ -1,5 +1,6 @@
 use crate::analyzer::java::structural::expression_name_node;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
+use crate::analyzer::usages::get_definition::java_lombok_generated_accessor_field_candidates;
 use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::java_graph::hits;
 use crate::analyzer::usages::java_graph::resolver::{
@@ -651,6 +652,9 @@ fn maybe_record_method_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn maybe_record_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if maybe_record_lombok_accessor_hit(node, ctx) {
+        return;
+    }
     if node.kind() == "field_access" {
         let Some(field_node) = node.child_by_field_name("field") else {
             return;
@@ -691,6 +695,65 @@ fn maybe_record_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         hits::push_hit(node, ctx);
     }
+}
+
+fn maybe_record_lombok_accessor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
+    let (member, arity) = match node.kind() {
+        "method_invocation" => {
+            let Some(member) = node.child_by_field_name("name") else {
+                return false;
+            };
+            (member, Some(argument_list_arity(node)))
+        }
+        "method_reference" => {
+            let Some((_, member)) = method_reference_parts(node) else {
+                return false;
+            };
+            (member, None)
+        }
+        _ => return false,
+    };
+    let member_name = node_text(member, ctx.source);
+    let candidates = java_lombok_generated_accessor_field_candidates(
+        ctx.analyzer,
+        ctx.java.global_usage_definition_index(),
+        &ctx.spec.owner,
+        member_name,
+        arity,
+    );
+    if !candidates
+        .iter()
+        .any(|candidate| candidate == &ctx.spec.target)
+    {
+        return false;
+    }
+
+    if node.kind() == "method_reference" {
+        let Some((receiver, _)) = method_reference_parts(node) else {
+            return false;
+        };
+        let owners = method_reference_owner_fq_names(receiver, ctx);
+        if owners.len() == 1 && owners[0] == ctx.spec.owner.fq_name() {
+            hits::push_hit(member, ctx);
+        } else if owners
+            .iter()
+            .any(|owner| owner == &ctx.spec.owner.fq_name())
+        {
+            hits::push_unproven_hit(member, ctx);
+        }
+        return true;
+    }
+
+    let receiver_matches = node
+        .child_by_field_name("object")
+        .map(|object| receiver_matches_target(object, ctx))
+        .unwrap_or_else(|| bare_field_context_matches_target(node, ctx));
+    if receiver_matches {
+        hits::push_hit(member, ctx);
+    } else {
+        hits::push_unproven_hit(member, ctx);
+    }
+    true
 }
 
 fn type_reference_node(node: Node<'_>) -> Option<Node<'_>> {
