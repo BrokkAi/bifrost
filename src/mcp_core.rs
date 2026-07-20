@@ -92,6 +92,7 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
         definition_descriptor,
     ];
     if render_line_numbers {
+        descriptors.push(get_declarations_by_location_descriptor());
         descriptors.push(get_type_by_location_descriptor());
     }
     descriptors.push(rename_symbol_descriptor());
@@ -166,6 +167,17 @@ fn get_definitions_by_location_descriptor() -> Value {
     tool_descriptor(
         "get_definitions_by_location",
         "Resolve source reference sites back to workspace definition metadata from exact line/column locations. Use when line numbers are visible and you need usage-to-definition navigation without building the whole usage_graph.",
+        location_references_schema(
+            "Project-relative source file path containing the reference.",
+            Some(crate::searchtools::DEFINITION_LOOKUP_MAX_REFERENCES),
+        ),
+    )
+}
+
+fn get_declarations_by_location_descriptor() -> Value {
+    tool_descriptor(
+        "get_declarations_by_location",
+        "Resolve source reference sites to their workspace declarations or contracts from exact line/column locations. Use this to navigate to a prototype, interface member, trait member, or other declaring location independently of a concrete definition body.",
         location_references_schema(
             "Project-relative source file path containing the reference.",
             Some(crate::searchtools::DEFINITION_LOOKUP_MAX_REFERENCES),

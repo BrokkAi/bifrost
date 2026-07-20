@@ -22,6 +22,7 @@ pub mod mcp_registry;
 pub mod mcp_slopcop;
 pub mod mcp_text;
 mod model_context;
+pub mod navigation;
 #[cfg(feature = "nlp")]
 pub mod nlp;
 mod path_normalization;
@@ -66,6 +67,7 @@ pub use analyzer::{
     WorkspaceAnalyzer, collect_workspace_files,
 };
 pub use cancellation::CancellationToken;
+pub use navigation::NavigationOperation;
 pub use project_watcher::{ChangeDelta, ProjectChangeWatcher};
 pub use searchtools_service::{
     SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode, ToolOutput,

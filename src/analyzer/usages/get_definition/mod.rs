@@ -80,6 +80,7 @@ use crate::analyzer::{
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use crate::navigation::NavigationOperation;
 use crate::path_utils::rel_path_string;
 use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
@@ -243,7 +244,23 @@ pub(crate) fn resolve_definition_batch(
         profiling::note(format!("request_count={}", requests.len()));
     }
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
-    resolve_definition_requests(analyzer, &mut context, requests, None)
+    resolve_definition_requests(analyzer, &mut context, requests, None, None)
+}
+
+pub(crate) fn resolve_navigation_batch(
+    analyzer: &dyn IAnalyzer,
+    requests: Vec<DefinitionLookupRequest>,
+    operation: NavigationOperation,
+) -> Vec<DefinitionLookupOutcome> {
+    let _scope = profiling::scope("get_definition::resolve_navigation_batch");
+    if profiling::enabled() {
+        profiling::note(format!(
+            "request_count={}, operation={operation:?}",
+            requests.len()
+        ));
+    }
+    let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
+    resolve_definition_requests(analyzer, &mut context, requests, None, Some(operation))
 }
 
 fn resolve_definition_requests(
@@ -251,6 +268,7 @@ fn resolve_definition_requests(
     context: &mut DefinitionBatchContext<'_>,
     requests: Vec<DefinitionLookupRequest>,
     cancellation: Option<&CancellationToken>,
+    operation: Option<NavigationOperation>,
 ) -> Vec<DefinitionLookupOutcome> {
     let _query_scope = AnalyzerQueryScope::new(analyzer);
     let mut remaining_python_requests: HashMap<ProjectFile, usize> = HashMap::default();
@@ -268,7 +286,7 @@ fn resolve_definition_requests(
         .map(|request| {
             let is_python = language_for_file(&request.file) == Language::Python;
             let file = request.file.clone();
-            let outcome = resolve_one(analyzer, context, request);
+            let outcome = resolve_one(analyzer, context, request, operation);
             if is_python && let Some(remaining) = remaining_python_requests.get_mut(&file) {
                 *remaining -= 1;
                 if *remaining == 0 {
@@ -288,7 +306,7 @@ pub(crate) fn resolve_definition_batch_with_source(
 ) -> Vec<DefinitionLookupOutcome> {
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
     context.sources.insert(file, Ok(source));
-    resolve_definition_requests(analyzer, &mut context, requests, None)
+    resolve_definition_requests(analyzer, &mut context, requests, None, None)
 }
 
 pub(crate) fn resolve_definition_batch_with_source_and_cancellation(
@@ -300,7 +318,7 @@ pub(crate) fn resolve_definition_batch_with_source_and_cancellation(
 ) -> Vec<DefinitionLookupOutcome> {
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
     context.sources.insert(file, Ok(source));
-    resolve_definition_requests(analyzer, &mut context, requests, Some(cancellation))
+    resolve_definition_requests(analyzer, &mut context, requests, Some(cancellation), None)
 }
 
 pub(crate) fn resolve_call_reference_definition_with_source(
@@ -327,7 +345,7 @@ pub(crate) fn resolve_call_reference_definition_with_source(
         return None;
     }
 
-    Some(resolve_one(analyzer, &mut context, request))
+    Some(resolve_one(analyzer, &mut context, request, None))
 }
 
 #[derive(Clone)]
@@ -601,6 +619,7 @@ fn resolve_one(
     analyzer: &dyn IAnalyzer,
     context: &mut DefinitionBatchContext<'_>,
     request: DefinitionLookupRequest,
+    operation: Option<NavigationOperation>,
 ) -> DefinitionLookupOutcome {
     let _scope = profiling::scope("get_definition::resolve_one");
     let language = language_for_file(&request.file);
@@ -700,6 +719,7 @@ fn resolve_one(
                         tree.as_ref(),
                         &site,
                         rust_type_cache,
+                        operation,
                     )
                 },
             )
@@ -806,6 +826,17 @@ fn resolve_one(
         Language::None => {
             unreachable!("unsupported language handled before source extraction")
         }
+    };
+
+    let resolved = if let Some(operation) = operation {
+        let selected = if language == Language::Cpp {
+            cpp::select_navigation_outcome(analyzer, context, resolved, operation)
+        } else {
+            resolved
+        };
+        finalize_navigation_outcome(selected, operation)
+    } else {
+        resolved
     };
 
     finish_lookup_outcome(resolved, site)
@@ -931,6 +962,42 @@ fn candidates_outcome(mut candidates: Vec<CodeUnit>) -> DefinitionLookupOutcome 
         lexical_definition: None,
         diagnostics,
     }
+}
+
+fn finalize_navigation_outcome(
+    mut outcome: DefinitionLookupOutcome,
+    operation: NavigationOperation,
+) -> DefinitionLookupOutcome {
+    sort_units(&mut outcome.definitions);
+    outcome.definitions.dedup();
+    if outcome.lexical_definition.is_some() {
+        outcome.status = DefinitionLookupStatus::Resolved;
+        return outcome;
+    }
+    if outcome.definitions.is_empty() {
+        return outcome;
+    }
+    outcome.status = if outcome.definitions.len() == 1 {
+        DefinitionLookupStatus::Resolved
+    } else {
+        DefinitionLookupStatus::Ambiguous
+    };
+    outcome
+        .diagnostics
+        .retain(|diagnostic| diagnostic.kind != "ambiguous_definition");
+    if outcome.status == DefinitionLookupStatus::Ambiguous {
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            kind: "ambiguous_definition".to_string(),
+            message: format!(
+                "{} navigation resolved to multiple workspace targets",
+                match operation {
+                    NavigationOperation::Declaration => "declaration",
+                    NavigationOperation::Definition => "definition",
+                }
+            ),
+        });
+    }
+    outcome
 }
 
 fn ambiguous_candidates_outcome(

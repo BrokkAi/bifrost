@@ -7,6 +7,167 @@ use crate::analyzer::usages::cpp_call_match::{
 
 pub(crate) const CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC: &str = "unproven_cpp_link_unit";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CppNavigationKind {
+    DeclarationOnly,
+    Definition,
+    Both,
+}
+
+pub(super) fn select_navigation_outcome(
+    analyzer: &dyn IAnalyzer,
+    context: &mut DefinitionBatchContext<'_>,
+    mut outcome: DefinitionLookupOutcome,
+    operation: NavigationOperation,
+) -> DefinitionLookupOutcome {
+    if outcome.definitions.is_empty() {
+        return outcome;
+    }
+    let classified: Vec<_> = outcome
+        .definitions
+        .into_iter()
+        .map(|candidate| {
+            let kind = cpp_navigation_kind(analyzer, context, &candidate);
+            (candidate, kind)
+        })
+        .collect();
+    let has_declaration_only = classified
+        .iter()
+        .any(|(_, kind)| *kind == CppNavigationKind::DeclarationOnly);
+    outcome.definitions = classified
+        .iter()
+        .filter(|(_, kind)| match operation {
+            NavigationOperation::Declaration => {
+                if has_declaration_only {
+                    *kind == CppNavigationKind::DeclarationOnly
+                } else {
+                    true
+                }
+            }
+            NavigationOperation::Definition => *kind != CppNavigationKind::DeclarationOnly,
+        })
+        .map(|(candidate, _)| candidate.clone())
+        .collect();
+    outcome
+        .diagnostics
+        .retain(|diagnostic| diagnostic.kind != CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC);
+    if operation == NavigationOperation::Definition {
+        let body_sources: HashSet<_> = classified
+            .iter()
+            .filter(|(candidate, kind)| {
+                *kind == CppNavigationKind::Definition && outcome.definitions.contains(candidate)
+            })
+            .map(|(candidate, _)| candidate.source().clone())
+            .collect();
+        if body_sources.len() > 1 {
+            outcome.diagnostics.push(DefinitionLookupDiagnostic {
+                kind: CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC.to_string(),
+                message: "multiple C/C++ definition bodies remain, but no build graph proves one link unit"
+                    .to_string(),
+            });
+        }
+    }
+    if outcome.definitions.is_empty() {
+        outcome.status = DefinitionLookupStatus::NoDefinition;
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            kind: "no_definition".to_string(),
+            message: "C/C++ candidates contain no implementation body".to_string(),
+        });
+    }
+    outcome
+}
+
+fn cpp_navigation_kind(
+    analyzer: &dyn IAnalyzer,
+    context: &mut DefinitionBatchContext<'_>,
+    candidate: &CodeUnit,
+) -> CppNavigationKind {
+    if !candidate.is_callable() && !candidate.is_class() {
+        return CppNavigationKind::Both;
+    }
+    let Some(tree) = context.cpp_indexed_tree(candidate.source()) else {
+        return CppNavigationKind::Both;
+    };
+    let root = tree.root_node();
+    let ranges = analyzer.ranges(candidate);
+    let mut has_split_declaration = false;
+    let mut has_definition = false;
+    for range in ranges {
+        let Some(node) = cpp_declaration_node_for_range(root, &range) else {
+            continue;
+        };
+        if candidate.is_callable() {
+            if cpp_subtree_contains(node, |descendant| {
+                descendant.kind() == "function_definition"
+                    && descendant.child_by_field_name("body").is_some()
+            }) {
+                has_definition = true;
+            } else {
+                has_split_declaration = true;
+            }
+        } else if cpp_subtree_contains(node, |descendant| {
+            matches!(
+                descendant.kind(),
+                "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+            )
+        }) {
+            if cpp_subtree_contains(node, |descendant| {
+                matches!(
+                    descendant.kind(),
+                    "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+                ) && descendant.child_by_field_name("body").is_some()
+            }) {
+                has_definition = true;
+            } else {
+                has_split_declaration = true;
+            }
+        } else {
+            return CppNavigationKind::Both;
+        }
+    }
+    match (has_split_declaration, has_definition) {
+        (true, false) => CppNavigationKind::DeclarationOnly,
+        (false, true) | (true, true) => CppNavigationKind::Definition,
+        (false, false) => CppNavigationKind::Both,
+    }
+}
+
+fn cpp_declaration_node_for_range<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
+    let mut best = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
+            continue;
+        }
+        if node.start_byte() == range.start_byte && node.end_byte() == range.end_byte {
+            best = Some(node);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    best.or_else(|| {
+        root.descendant_for_byte_range(range.start_byte, range.end_byte)
+            .and_then(|mut node| {
+                while node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
+                    node = node.parent()?;
+                }
+                Some(node)
+            })
+    })
+}
+
+fn cpp_subtree_contains(node: Node<'_>, predicate: impl Fn(Node<'_>) -> bool) -> bool {
+    let mut stack = vec![node];
+    while let Some(candidate) = stack.pop() {
+        if predicate(candidate) {
+            return true;
+        }
+        let mut cursor = candidate.walk();
+        stack.extend(candidate.named_children(&mut cursor));
+    }
+    false
+}
+
 pub(super) fn resolve_cpp(
     analyzer: &dyn IAnalyzer,
     context: &mut DefinitionBatchContext<'_>,

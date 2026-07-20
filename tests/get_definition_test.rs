@@ -11,6 +11,10 @@ fn lookup(root: &std::path::Path, args: &str) -> Value {
     call_search_tool_json(root, "get_definitions_by_location", args)
 }
 
+fn lookup_declaration(root: &std::path::Path, args: &str) -> Value {
+    call_search_tool_json(root, "get_declarations_by_location", args)
+}
+
 fn lookup_reference(root: &std::path::Path, args: &str) -> Value {
     call_search_tool_json(root, "get_definitions_by_reference", args)
 }
@@ -1617,6 +1621,87 @@ pub fn run_via_trait() -> String {
     assert_eq!(
         assoc["results"][0]["definitions"][0]["fqn"], "Runner.Output",
         "{assoc}"
+    );
+}
+
+#[test]
+fn rust_associated_type_navigation_distinguishes_contract_and_implementation() {
+    let source = r#"
+pub trait Runner {
+    type Output;
+}
+
+pub struct LocalRunner;
+
+impl Runner for LocalRunner {
+    type Output = String;
+}
+
+pub type Selected = <LocalRunner as Runner>::Output;
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    let impl_item = source.find("type Output =").expect("impl associated type") + 5;
+    let args = location_reference("src/lib.rs", source, impl_item);
+    let declaration = lookup_declaration(project.root(), &args);
+    assert_eq!(declaration["results"][0]["operation"], "declaration");
+    assert_eq!(
+        declaration["results"][0]["status"], "resolved",
+        "{declaration}"
+    );
+    assert_eq!(
+        declaration["results"][0]["declarations"][0]["fqn"], "Runner.Output",
+        "{declaration}"
+    );
+
+    let definition = lookup(project.root(), &args);
+    assert_eq!(definition["results"][0]["operation"], "definition");
+    assert_eq!(
+        definition["results"][0]["status"], "resolved",
+        "{definition}"
+    );
+    assert_eq!(
+        definition["results"][0]["definitions"][0]["fqn"], "LocalRunner.Output",
+        "{definition}"
+    );
+
+    let qualified = source.rfind("Output;").expect("qualified associated type");
+    let definition = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, qualified),
+    );
+    assert_eq!(
+        definition["results"][0]["status"], "resolved",
+        "{definition}"
+    );
+    assert_eq!(
+        definition["results"][0]["definitions"][0]["fqn"], "LocalRunner.Output",
+        "{definition}"
+    );
+}
+
+#[test]
+fn java_declaration_navigation_uses_interface_receiver_contract() {
+    let source = r#"
+interface Runner { void run(); }
+class LocalRunner implements Runner { public void run() {} }
+class App { void invoke(Runner runner) { runner.run(); } }
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("App.java", source)
+        .build();
+    let call = source.rfind("run();").expect("interface-typed call");
+    let value = lookup_declaration(
+        project.root(),
+        &location_reference("App.java", source, call),
+    );
+    assert_eq!(value["results"][0]["operation"], "declaration");
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["declarations"][0]["fqn"], "Runner.run",
+        "{value}"
     );
 }
 
@@ -15411,6 +15496,80 @@ fn cpp_typed_receiver_method_resolves_to_definition() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "ns.Service.run", "{value}");
+}
+
+#[test]
+fn cpp_navigation_distinguishes_header_declaration_and_source_definition() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "service.h",
+            "namespace ns { class Service { public: void run(); }; }\n",
+        )
+        .file(
+            "service.cpp",
+            "#include \"service.h\"\nnamespace ns { void Service::run() {} }\n",
+        )
+        .file(
+            "app.cpp",
+            "#include \"service.h\"\nvoid invoke(ns::Service& service) { service.run(); }\n",
+        )
+        .build();
+    let source = "#include \"service.h\"\nvoid invoke(ns::Service& service) { service.run(); }\n";
+    let call = source.rfind("run").expect("method call");
+    let args = location_reference("app.cpp", source, call);
+
+    let declaration = lookup_declaration(project.root(), &args);
+    assert_eq!(declaration["results"][0]["operation"], "declaration");
+    assert_eq!(
+        declaration["results"][0]["status"], "resolved",
+        "{declaration}"
+    );
+    assert_eq!(
+        declaration["results"][0]["declarations"][0]["path"], "service.h",
+        "{declaration}"
+    );
+
+    let definition = lookup(project.root(), &args);
+    assert_eq!(definition["results"][0]["operation"], "definition");
+    assert_eq!(
+        definition["results"][0]["status"], "resolved",
+        "{definition}"
+    );
+    assert_eq!(
+        definition["results"][0]["definitions"][0]["path"], "service.cpp",
+        "{definition}"
+    );
+}
+
+#[test]
+fn cpp_definition_navigation_keeps_multiple_bodies_ambiguous() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("service.h", "void run();\n")
+        .file("first.cpp", "#include \"service.h\"\nvoid run() {}\n")
+        .file("second.cpp", "#include \"service.h\"\nvoid run() {}\n")
+        .file(
+            "app.cpp",
+            "#include \"service.h\"\nvoid invoke() { run(); }\n",
+        )
+        .build();
+    let source = "#include \"service.h\"\nvoid invoke() { run(); }\n";
+    let call = source.rfind("run").expect("function call");
+    let value = lookup(project.root(), &location_reference("app.cpp", source, call));
+    assert_eq!(value["results"][0]["operation"], "definition");
+    assert_eq!(value["results"][0]["status"], "ambiguous", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"].as_array().map(Vec::len),
+        Some(2),
+        "{value}"
+    );
+    assert!(
+        value["results"][0]["diagnostics"]
+            .as_array()
+            .is_some_and(|diagnostics| diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic["kind"] == "unproven_cpp_link_unit" })),
+        "{value}"
+    );
 }
 
 #[test]
