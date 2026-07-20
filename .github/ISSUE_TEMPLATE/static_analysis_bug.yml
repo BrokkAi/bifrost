@@ -1,6 +1,5 @@
 name: Static-analysis bug
 description: Report an incorrect, missing, inconsistent, or unexpectedly slow analysis result.
-title: ""
 labels:
   - bug
 body:

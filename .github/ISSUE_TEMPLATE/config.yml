@@ -6,6 +6,3 @@ contact_links:
   - name: Ask the community on Discord
     url: https://discord.gg/geYkWUeH
     about: Ask usage and setup questions or discuss an idea before opening an issue.
-  - name: Report a security vulnerability
-    url: https://github.com/BrokkAi/bifrost/security/advisories/new
-    about: Report security vulnerabilities privately instead of opening a public issue.

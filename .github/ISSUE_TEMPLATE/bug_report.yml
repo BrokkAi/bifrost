@@ -1,6 +1,5 @@
 name: Other bug
 description: Report a problem with installation, an interface, an integration, or other non-analysis behavior.
-title: ""
 labels:
   - bug
 body:
