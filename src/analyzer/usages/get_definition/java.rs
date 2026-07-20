@@ -718,21 +718,11 @@ fn resolve_java_bare_identifier(
     if let Some(unit) = java.resolve_type_name_in_file(file, name) {
         return candidates_outcome(vec![unit]);
     }
-    let static_import = java_static_import_candidates(
-        analyzer,
-        support,
-        file,
-        name,
-        JavaMemberLookupKind::Field,
-        None,
-    );
-    if static_import.status != DefinitionLookupStatus::NoDefinition {
-        return static_import;
-    }
     // A bare identifier can be an unqualified field access — resolve it to a
     // field of the enclosing class (or an inherited one), unless the name is
     // bound locally (a local, parameter, or type variable), in which case it is
-    // not this field.
+    // not this field. Java resolves these members before considering static
+    // imports, including on-demand imports with the same simple name.
     if !java_local_binding_before(source, root, name, node.start_byte()) {
         let class_ranges = ClassRangeIndex::build(analyzer, file);
         if let Some(owner_fqn) = class_ranges.enclosing(node.start_byte()) {
@@ -745,10 +735,21 @@ fn resolve_java_bare_identifier(
                 false,
                 None,
             );
-            if outcome.status == DefinitionLookupStatus::Resolved {
+            if outcome.status != DefinitionLookupStatus::NoDefinition {
                 return outcome;
             }
         }
+    }
+    let static_import = java_static_import_candidates(
+        analyzer,
+        support,
+        file,
+        name,
+        JavaMemberLookupKind::Field,
+        None,
+    );
+    if static_import.status != DefinitionLookupStatus::NoDefinition {
+        return static_import;
     }
     if java_import_boundary_for_type(java, support, file, name) {
         return boundary(format!(

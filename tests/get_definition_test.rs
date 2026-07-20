@@ -10625,6 +10625,58 @@ public class UseTarget {
 }
 
 #[test]
+fn java_enclosing_fields_shadow_static_wildcard_imports() {
+    let source = r#"
+package app;
+
+import static pkg.ImportedFields.*;
+
+public class Consumer extends pkg.Base {
+    int collision;
+
+    int read() {
+        return collision + inheritedCollision + importedOnly;
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "pkg/ImportedFields.java",
+            r#"
+package pkg;
+
+public class ImportedFields {
+    public static int collision;
+    public static int inheritedCollision;
+    public static int importedOnly;
+}
+"#,
+        )
+        .file(
+            "pkg/Base.java",
+            "package pkg; public class Base { protected int inheritedCollision; }\n",
+        )
+        .file("app/Consumer.java", source)
+        .build();
+
+    for (name, expected) in [
+        ("collision", "app.Consumer.collision"),
+        ("inheritedCollision", "pkg.Base.inheritedCollision"),
+        ("importedOnly", "pkg.ImportedFields.importedOnly"),
+    ] {
+        let start = source.rfind(name).expect("bare field reference");
+        let value = lookup(
+            project.root(),
+            &location_reference("app/Consumer.java", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{name}: {value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{name}: {value}");
+        assert_eq!(result["definitions"][0]["kind"], "field", "{name}: {value}");
+    }
+}
+
+#[test]
 fn java_typed_receiver_method_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
