@@ -1,5 +1,7 @@
 # Complete the PHP, Rust, and Scala top-five reference differential
 
+Historical status: this plan selected repositories by the differential runner's code-LOC ranking and therefore does not satisfy the later task-ranked objective. Its fixes and production evidence remain valid regression history. The authoritative continuation is `.agents/plans/reference-differential-task-ranked-php-rust-scala-java-python.md`, which selects through `brokkbench/tasks.py` and explicitly excludes `large-repos.csv` members via `SFT_PREDICATES`.
+
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept current as work proceeds. Maintain it in accordance with `.agents/PLANS.md`.
 
 ## Purpose / Big Picture
