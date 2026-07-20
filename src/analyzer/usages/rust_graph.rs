@@ -105,7 +105,8 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                 ));
             }
             let scan_files: HashSet<ProjectFile> = [target.source().clone()].into_iter().collect();
-            let graph = build_rust_graph_for_files(scan_files.clone(), scan_scope.cancellation());
+            let graph =
+                build_rust_graph_for_files(rust, scan_files.clone(), scan_scope.cancellation());
             (
                 scan_files_for_target(
                     analyzer,
@@ -143,7 +144,8 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
             if seed_result.kind == RustGraphSeedKind::LocalDeclaration {
                 scan_files.extend(local_impl_target_importer_files(rust, target));
             }
-            let graph = build_rust_graph_for_files(scan_files.clone(), scan_scope.cancellation());
+            let graph =
+                build_rust_graph_for_files(rust, scan_files.clone(), scan_scope.cancellation());
             let scan_target = trait_member_for_impl_member(rust, target);
             let scan_target = scan_target.as_ref().unwrap_or(target);
             let result = scan_files_for_member_target(
@@ -171,7 +173,8 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
             if seed_result.kind == RustGraphSeedKind::LocalDeclaration {
                 scan_files.extend(local_impl_target_importer_files(rust, target));
             }
-            let graph = build_rust_graph_for_files(scan_files.clone(), scan_scope.cancellation());
+            let graph =
+                build_rust_graph_for_files(rust, scan_files.clone(), scan_scope.cancellation());
             (
                 scan_files_for_target(
                     analyzer,

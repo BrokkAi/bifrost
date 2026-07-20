@@ -1,5 +1,6 @@
 use crate::analyzer::rust::field_roles::rust_struct_field_references;
 use crate::analyzer::rust::lexical_scope::{self, RustLexicalScopeIndex};
+use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::usages::common::{TreeWalkAction, same_node, walk_tree_iterative};
 use crate::analyzer::usages::get_definition::{
     RustTypeLookupCache, rust_expression_type_definition_fqn_cached, rust_resolve_type_node_fqn,
@@ -22,26 +23,21 @@ use crate::analyzer::{
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
-use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use tree_sitter::{Node, Parser, Tree};
 
-struct ParsedFile {
-    source: Arc<String>,
-    tree: Tree,
-}
-
 pub(crate) struct RustProjectGraph {
-    parsed: HashMap<ProjectFile, ParsedFile>,
+    parsed: HashMap<ProjectFile, Arc<PreparedSyntaxTree>>,
 }
 
 pub(super) fn build_rust_graph_for_files(
+    rust: &RustAnalyzer,
     files: impl IntoIterator<Item = ProjectFile>,
     cancellation: Option<&CancellationToken>,
 ) -> RustProjectGraph {
-    let parsed: HashMap<ProjectFile, ParsedFile> = files
+    let parsed: HashMap<ProjectFile, Arc<PreparedSyntaxTree>> = files
         .into_iter()
         .collect::<Vec<_>>()
         .par_iter()
@@ -49,7 +45,9 @@ pub(super) fn build_rust_graph_for_files(
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return None;
             }
-            let parsed = parse_rust_graph_file(file);
+            let parsed = rust
+                .prepared_syntax(file)
+                .map(|prepared| (file.clone(), prepared));
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return None;
             }
@@ -58,22 +56,6 @@ pub(super) fn build_rust_graph_for_files(
         .collect();
 
     RustProjectGraph { parsed }
-}
-
-fn parse_rust_graph_file(file: &ProjectFile) -> Option<(ProjectFile, ParsedFile)> {
-    let source = file.read_to_string().ok()?;
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .ok()?;
-    let tree = parser.parse(source.as_str(), None)?;
-    Some((
-        file.clone(),
-        ParsedFile {
-            source: Arc::new(source),
-            tree,
-        },
-    ))
 }
 
 pub(super) fn effective_scan_files(
@@ -139,7 +121,6 @@ pub(super) fn scan_files_for_target(
     let target_short = target.identifier().to_string();
     let target_fqn = target.fq_name();
     let support = analyzer.global_usage_definition_index();
-    let parser_language = tree_sitter_rust::LANGUAGE.into();
     let hits = Mutex::new(BTreeSet::new());
     let files_vec: Vec<_> = files.into_iter().collect();
 
@@ -147,33 +128,21 @@ pub(super) fn scan_files_for_target(
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
-        let owned_source: Option<Arc<String>>;
-        let owned_tree: Option<Tree>;
-        let (source, tree) = if let Some(parsed) = graph.parsed.get(file) {
-            (parsed.source.as_str(), &parsed.tree)
-        } else {
-            let Ok(source) = file.read_to_string() else {
-                return;
-            };
-            let mut parser = Parser::new();
-            if parser.set_language(&parser_language).is_err() {
-                return;
-            }
-            let Some(tree) = parser.parse(source.as_str(), None) else {
-                return;
-            };
-            owned_source = Some(Arc::new(source));
-            owned_tree = Some(tree);
-            (
-                owned_source.as_deref().expect("owned source").as_str(),
-                owned_tree.as_ref().expect("owned tree"),
-            )
+        let Some(prepared) = graph
+            .parsed
+            .get(file)
+            .cloned()
+            .or_else(|| rust.prepared_syntax(file))
+        else {
+            return;
         };
+        let source = prepared.source();
+        let tree = prepared.tree();
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
 
-        let line_starts = compute_line_starts(source);
+        let line_starts = prepared.line_starts();
         let lexical_scope = RustLexicalScopeIndex::new(tree.root_node(), source);
         let refs = rust.reference_context_of(file);
         let (mut direct_names, _namespace_names) = match seeds {
@@ -198,7 +167,7 @@ pub(super) fn scan_files_for_target(
         let mut ctx = ScanCtx {
             file,
             source,
-            line_starts: &line_starts,
+            line_starts,
             analyzer,
             rust,
             refs: &refs,
@@ -390,7 +359,6 @@ pub(super) fn scan_files_for_member_target(
         return RustMemberScanResult::default();
     };
     let member_name = target.identifier().to_string();
-    let parser_language = tree_sitter_rust::LANGUAGE.into();
     let hits = Mutex::new(BTreeSet::new());
     let unproven_hits = Mutex::new(BTreeSet::new());
     let constructor_returns = self_like_constructor_returns(rust, &owner);
@@ -401,32 +369,20 @@ pub(super) fn scan_files_for_member_target(
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
-        let owned_source: Option<Arc<String>>;
-        let owned_tree: Option<Tree>;
-        let (source, tree) = if let Some(parsed) = graph.parsed.get(file) {
-            (parsed.source.as_str(), &parsed.tree)
-        } else {
-            let Ok(source) = file.read_to_string() else {
-                return;
-            };
-            let mut parser = Parser::new();
-            if parser.set_language(&parser_language).is_err() {
-                return;
-            }
-            let Some(tree) = parser.parse(source.as_str(), None) else {
-                return;
-            };
-            owned_source = Some(Arc::new(source));
-            owned_tree = Some(tree);
-            (
-                owned_source.as_deref().expect("owned source").as_str(),
-                owned_tree.as_ref().expect("owned tree"),
-            )
+        let Some(prepared) = graph
+            .parsed
+            .get(file)
+            .cloned()
+            .or_else(|| rust.prepared_syntax(file))
+        else {
+            return;
         };
+        let source = prepared.source();
+        let tree = prepared.tree();
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
-        let line_starts = compute_line_starts(source);
+        let line_starts = prepared.line_starts();
         let refs = rust.reference_context_of(file);
         let mut owner_local_names: HashSet<String> = if file == target.source() {
             [owner.identifier().to_string()].into_iter().collect()
@@ -480,7 +436,7 @@ pub(super) fn scan_files_for_member_target(
             file,
             source,
             root: tree.root_node(),
-            line_starts: &line_starts,
+            line_starts,
             owner: &owner,
             member_name: &member_name,
             scan_target: target,
@@ -1178,9 +1134,7 @@ fn scoped_static_member_matches_target(
     ) {
         ReceiverAnalysisOutcome::Precise(candidates) => candidates.into_iter().any(|candidate| {
             same_rust_declaration_identity(&candidate, ctx.requested_target)
-                || (ctx
-                    .rust
-                    .is_rust_trait_impl_member_declaration(&candidate)
+                || (ctx.rust.is_rust_trait_impl_member_declaration(&candidate)
                     && trait_member_for_impl_member(ctx.rust, &candidate)
                         .as_ref()
                         .is_some_and(|trait_member| {
@@ -1979,20 +1933,41 @@ fn simple_node_text(node: Node<'_>, source: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::{AnalyzerQueryScope, Language, TestProject};
 
     #[test]
     fn pre_cancelled_graph_build_skips_file_parsing() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join("lib.rs"), "pub fn target() {}\n").unwrap();
-        let file = ProjectFile::new(root, "lib.rs");
+        let file = ProjectFile::new(root.clone(), "lib.rs");
+        let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
+        let _scope = AnalyzerQueryScope::new(&analyzer);
 
-        let live = build_rust_graph_for_files([file.clone()], None);
+        let live = build_rust_graph_for_files(&analyzer, [file.clone()], None);
         assert!(live.parsed.contains_key(&file));
 
         let cancellation = CancellationToken::default();
         cancellation.cancel();
-        let cancelled = build_rust_graph_for_files([file], Some(&cancellation));
+        let cancelled = build_rust_graph_for_files(&analyzer, [file], Some(&cancellation));
         assert!(cancelled.parsed.is_empty());
+    }
+
+    #[test]
+    fn graph_build_reuses_prepared_syntax_within_query_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn target() {}\n").unwrap();
+        let file = ProjectFile::new(root.clone(), "lib.rs");
+        let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
+        let _scope = AnalyzerQueryScope::new(&analyzer);
+
+        let first = build_rust_graph_for_files(&analyzer, [file.clone()], None);
+        let second = build_rust_graph_for_files(&analyzer, [file.clone()], None);
+
+        let first = first.parsed.get(&file).expect("first prepared syntax");
+        let second = second.parsed.get(&file).expect("reused prepared syntax");
+        assert!(Arc::ptr_eq(first, second));
+        assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 1);
     }
 }
