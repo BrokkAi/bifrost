@@ -842,6 +842,34 @@ public class Consumer : Base {
 }
 
 #[test]
+fn csharp_issue701_is_expression_edges_to_logical_partial_type() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "TypeBuilderInstantiation.cs",
+            "namespace System.Reflection.Emit { internal sealed partial class TypeBuilderInstantiation { } }\n",
+        )
+        .file(
+            "TypeBuilderInstantiation.Mono.cs",
+            "namespace System.Reflection.Emit { internal partial class TypeBuilderInstantiation { } }\n",
+        )
+        .file(
+            "RuntimeModuleBuilder.Mono.cs",
+            "namespace System.Reflection.Emit { internal class RuntimeModuleBuilder { internal bool IsTransient(object member) => member is TypeBuilderInstantiation; } }\n",
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(
+            &value,
+            "System.Reflection.Emit.RuntimeModuleBuilder.IsTransient",
+            "System.Reflection.Emit.TypeBuilderInstantiation"
+        ),
+        "an is-expression should edge to its logical partial type: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn attribute_reference_edges_to_attribute_type() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

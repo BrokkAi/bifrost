@@ -3408,6 +3408,73 @@ namespace App {
 }
 
 #[test]
+fn csharp_issue701_constant_pattern_matches_all_physical_partial_type_declarations() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "TypeBuilderInstantiation.cs",
+            "namespace System.Reflection.Emit { internal sealed partial class TypeBuilderInstantiation { } }\n",
+        )
+        .file(
+            "TypeBuilderInstantiation.Mono.cs",
+            "namespace System.Reflection.Emit { internal partial class TypeBuilderInstantiation { } }\n",
+        )
+        .file(
+            "RuntimeModuleBuilder.Mono.cs",
+            r#"
+namespace System.Reflection.Emit {
+    internal class RuntimeModuleBuilder {
+        internal bool IsTransient(object member) {
+            if (member is TypeBuilderInstantiation || member is OtherType)
+                return true;
+            return false;
+        }
+    }
+    internal class OtherType { }
+}
+"#,
+        )
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    let targets = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| {
+            unit.is_class() && unit.fq_name() == "System.Reflection.Emit.TypeBuilderInstantiation"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(2, targets.len(), "{targets:#?}");
+    let consumer = project.file("RuntimeModuleBuilder.Mono.cs");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let hits = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(analyzer, &targets, Some(&provider), 1, 1000)
+        .result
+        .into_either()
+        .expect("partial type pattern query should resolve");
+    assert_eq!(1, hits.len(), "{hits:#?}");
+    assert!(
+        hits.iter()
+            .all(|hit| hit.snippet.contains("member is TypeBuilderInstantiation")),
+        "the constant pattern should resolve to the logical partial type: {hits:#?}"
+    );
+    let default_query = UsageFinder::new().query(analyzer, &targets, 1000, 1000);
+    assert!(
+        default_query.candidate_files.contains(&consumer),
+        "the is-expression type role should route the consumer by default"
+    );
+    assert_eq!(
+        1,
+        default_query
+            .result
+            .into_either()
+            .expect("default partial pattern query should resolve")
+            .len()
+    );
+}
+
+#[test]
 fn csharp_graph_distinguishes_generic_and_nongeneric_constructor_owners() {
     let (_project, analyzer) = csharp_analyzer_with_files(&[
         (

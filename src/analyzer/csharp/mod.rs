@@ -81,6 +81,13 @@ pub(crate) fn csharp_as_expression_type_operand(parent: Node<'_>, node: Node<'_>
         })
 }
 
+pub(crate) fn csharp_is_expression_type_operand(parent: Node<'_>, node: Node<'_>) -> bool {
+    parent.kind() == "is_expression"
+        && parent.child_by_field_name("right").is_some_and(|right| {
+            right.start_byte() == node.start_byte() && right.end_byte() == node.end_byte()
+        })
+}
+
 #[derive(Clone)]
 pub struct CSharpAnalyzer {
     inner: TreeSitterAnalyzer<CSharpAdapter>,
@@ -819,6 +826,7 @@ pub(crate) fn csharp_type_reference_root(mut node: Node<'_>) -> Option<Node<'_>>
                 .child_by_field_name("returns")
                 .is_some_and(|type_node| same_csharp_node(type_node, node))
             || csharp_as_expression_type_operand(parent, node)
+            || csharp_is_expression_type_operand(parent, node)
         {
             return Some(node);
         }
