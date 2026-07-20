@@ -107,6 +107,17 @@ impl RustModuleFiles {
     }
 
     fn resolve(&self, importing_file: &ProjectFile, module_specifier: &str) -> Vec<ProjectFile> {
+        if let Some(root_file) = self
+            .cargo_routes
+            .resolve_crate_root_file(importing_file, module_specifier)
+        {
+            return self
+                .files
+                .iter()
+                .filter(|file| *file == &root_file)
+                .cloned()
+                .collect();
+        }
         let package = rust_package_name(importing_file);
         let crate_package = rust_crate_root_package(importing_file);
         let Some(resolved_module) = self

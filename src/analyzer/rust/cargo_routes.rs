@@ -92,6 +92,7 @@ fn cargo_crate(root: &Path, directory: PathBuf, manifest: toml::Value) -> Option
     Some(CargoCrate {
         directory,
         library_name,
+        root_file: root_file.clone(),
         root_package: rust_package_name(&root_file),
         manifest,
     })
@@ -101,11 +102,13 @@ fn cargo_crate(root: &Path, directory: PathBuf, manifest: toml::Value) -> Option
 pub(crate) struct RustCargoRouteIndex {
     manifest_by_file: HashMap<ProjectFile, PathBuf>,
     package_by_route: HashMap<(PathBuf, String), String>,
+    root_file_by_route: HashMap<(PathBuf, String), ProjectFile>,
 }
 
 struct CargoCrate {
     directory: PathBuf,
     library_name: String,
+    root_file: ProjectFile,
     root_package: String,
     manifest: toml::Value,
 }
@@ -135,14 +138,14 @@ impl RustCargoRouteIndex {
             crate_by_directory.insert(cargo_crate.directory.clone(), index);
         }
         let mut package_by_route = HashMap::default();
+        let mut root_file_by_route = HashMap::default();
         for cargo_crate in &crates {
-            package_by_route.insert(
-                (
-                    cargo_crate.directory.clone(),
-                    cargo_crate.library_name.clone(),
-                ),
-                cargo_crate.root_package.clone(),
+            let own_route = (
+                cargo_crate.directory.clone(),
+                cargo_crate.library_name.clone(),
             );
+            package_by_route.insert(own_route.clone(), cargo_crate.root_package.clone());
+            root_file_by_route.insert(own_route, cargo_crate.root_file.clone());
             for dependencies in cargo_dependency_tables(&cargo_crate.manifest) {
                 for (exposed_name, dependency) in dependencies {
                     let target = dependency
@@ -163,8 +166,12 @@ impl RustCargoRouteIndex {
                             crates[target].library_name.clone()
                         };
                         package_by_route.insert(
-                            (cargo_crate.directory.clone(), exposed_name),
+                            (cargo_crate.directory.clone(), exposed_name.clone()),
                             crates[target].root_package.clone(),
+                        );
+                        root_file_by_route.insert(
+                            (cargo_crate.directory.clone(), exposed_name),
+                            crates[target].root_file.clone(),
                         );
                     }
                 }
@@ -173,6 +180,7 @@ impl RustCargoRouteIndex {
         Self {
             manifest_by_file,
             package_by_route,
+            root_file_by_route,
         }
     }
 
@@ -190,6 +198,21 @@ impl RustCargoRouteIndex {
             Some(nested) => format!("{package}.{nested}"),
             None => package.clone(),
         })
+    }
+
+    pub(super) fn resolve_crate_root_file(
+        &self,
+        importing_file: &ProjectFile,
+        module_specifier: &str,
+    ) -> Option<ProjectFile> {
+        let manifest = self.manifest_by_file.get(importing_file)?;
+        let (root, nested) = rust_external_module_route(module_specifier)?;
+        if nested.is_some() {
+            return None;
+        }
+        self.root_file_by_route
+            .get(&(manifest.clone(), normalize_crate_name(root)))
+            .cloned()
     }
 }
 
