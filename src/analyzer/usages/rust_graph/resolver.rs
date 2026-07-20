@@ -5,7 +5,7 @@ use crate::analyzer::{
 };
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
-use tree_sitter::Parser;
+use tree_sitter::{Node, Parser};
 
 /// Owned, query-shaped declaration access used by Rust forward resolution.
 ///
@@ -54,6 +54,161 @@ pub(crate) fn resolve_rust_path_fqn(
         .or_else(|| rust.resolve_module_package(file, full_path))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RustTokenPathRole {
+    Prefix,
+    Value,
+    Call,
+}
+
+pub(crate) struct ResolvedRustTokenPathSegment<'tree> {
+    pub(crate) node: Node<'tree>,
+    pub(crate) fqn: String,
+    pub(crate) role: RustTokenPathRole,
+}
+
+/// Resolve every segment of each qualified Rust path represented directly by a
+/// macro `token_tree`. Tree-sitter does not wrap these tokens in
+/// `scoped_identifier` nodes, so use the sibling `segment :: segment` structure
+/// and source ranges between those nodes. This deliberately does not interpret
+/// delimiters or split source text.
+pub(crate) fn resolve_rust_token_tree_paths<'tree>(
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    refs: &RustReferenceContext,
+    file: &ProjectFile,
+    source: &str,
+    token_tree: Node<'tree>,
+) -> Vec<ResolvedRustTokenPathSegment<'tree>> {
+    if token_tree.kind() != "token_tree" {
+        return Vec::new();
+    }
+
+    let mut cursor = token_tree.walk();
+    let children: Vec<_> = token_tree.children(&mut cursor).collect();
+    let mut resolved = Vec::new();
+    let mut index = 0;
+    while index + 2 < children.len() {
+        if !rust_token_path_segment(children[index])
+            || children[index + 1].kind() != "::"
+            || !rust_token_path_segment(children[index + 2])
+            || (index >= 2
+                && children[index - 1].kind() == "::"
+                && rust_token_path_segment(children[index - 2]))
+        {
+            index += 1;
+            continue;
+        }
+
+        let root = children[index];
+        let mut segment_index = index;
+        loop {
+            let segment = children[segment_index];
+            let continues = children
+                .get(segment_index + 1..=segment_index + 2)
+                .is_some_and(|next| next[0].kind() == "::" && rust_token_path_segment(next[1]));
+            let role = if continues {
+                RustTokenPathRole::Prefix
+            } else if children
+                .get(segment_index + 1)
+                .is_some_and(rust_token_call_arguments)
+            {
+                RustTokenPathRole::Call
+            } else {
+                RustTokenPathRole::Value
+            };
+
+            if let Some(fqn) = resolve_token_path_segment_fqn(
+                rust,
+                support,
+                refs,
+                file,
+                source,
+                root,
+                segment,
+                (segment_index > index).then(|| children[segment_index - 2]),
+            ) {
+                resolved.push(ResolvedRustTokenPathSegment {
+                    node: segment,
+                    fqn,
+                    role,
+                });
+            }
+
+            if !continues {
+                index = segment_index + 1;
+                break;
+            }
+            segment_index += 2;
+        }
+    }
+    resolved
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_token_path_segment_fqn(
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    refs: &RustReferenceContext,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    segment: Node<'_>,
+    owner_terminal: Option<Node<'_>>,
+) -> Option<String> {
+    let Some(owner_terminal) = owner_terminal else {
+        let path = source.get(root.start_byte()..segment.end_byte())?.trim();
+        return resolve_rust_path_fqn(rust, refs, file, path)
+            .filter(|fqn| !support.fqn(fqn).is_empty());
+    };
+    let owner = source
+        .get(root.start_byte()..owner_terminal.end_byte())?
+        .trim();
+    let name = source.get(segment.start_byte()..segment.end_byte())?.trim();
+    match resolve_scoped_associated_item(rust, support, refs, file, owner, name) {
+        ReceiverAnalysisOutcome::Precise(candidates) => {
+            let mut fqns = candidates.into_iter().map(|candidate| candidate.fq_name());
+            let fqn = fqns.next()?;
+            fqns.all(|candidate| candidate == fqn).then_some(fqn)
+        }
+        ReceiverAnalysisOutcome::Ambiguous(_)
+        | ReceiverAnalysisOutcome::Unknown
+        | ReceiverAnalysisOutcome::Unsupported { .. }
+        | ReceiverAnalysisOutcome::ExceededBudget { .. } => None,
+    }
+}
+
+fn rust_token_path_segment(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "identifier" | "type_identifier" | "crate" | "self" | "super"
+    )
+}
+
+pub(crate) fn rust_token_path_segment_is_qualified(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "token_tree"
+            && ((node
+                .prev_sibling()
+                .is_some_and(|separator| separator.kind() == "::")
+                && node
+                    .prev_sibling()
+                    .and_then(|separator| separator.prev_sibling())
+                    .is_some_and(rust_token_path_segment))
+                || (node
+                    .next_sibling()
+                    .is_some_and(|separator| separator.kind() == "::")
+                    && node
+                        .next_sibling()
+                        .and_then(|separator| separator.next_sibling())
+                        .is_some_and(rust_token_path_segment)))
+    })
+}
+
+fn rust_token_call_arguments(node: &Node<'_>) -> bool {
+    node.kind() == "token_tree" && node.child(0).is_some_and(|open| open.kind() == "(")
+}
+
 pub(super) fn supports_same_file_local_scan(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
     target.is_function()
         && analyzer
@@ -97,7 +252,7 @@ pub(super) fn is_graph_visible_member_target(rust: &RustAnalyzer, target: &CodeU
         return false;
     }
 
-    (rust.is_rust_trait_declaration(&owner) && target.is_function())
+    (rust.is_rust_trait_declaration(&owner) && (target.is_function() || target.is_field()))
         || (rust.is_rust_enum_declaration(&owner) && target.is_field())
         || is_trait_impl_member_target(rust, target, &owner)
 }
@@ -117,7 +272,7 @@ pub(super) fn trait_member_for_impl_member(
 }
 
 fn is_trait_impl_member_target(rust: &RustAnalyzer, target: &CodeUnit, owner: &CodeUnit) -> bool {
-    if !target.is_function() || rust.is_rust_trait_declaration(owner) {
+    if !(target.is_function() || target.is_field()) || rust.is_rust_trait_declaration(owner) {
         return false;
     }
     if rust.is_rust_trait_impl_member_declaration(target) {
@@ -155,7 +310,11 @@ pub(crate) fn resolve_scoped_associated_item(
     method_name: &str,
 ) -> ReceiverAnalysisOutcome<CodeUnit> {
     if let Some(direct) = refs.resolve_scoped(path, method_name) {
-        let candidates = support.fqn(&direct);
+        let candidates: Vec<_> = support
+            .fqn(&direct)
+            .into_iter()
+            .filter(|candidate| candidate.identifier() == method_name)
+            .collect();
         if !candidates.is_empty() {
             return ReceiverAnalysisOutcome::Precise(candidates);
         }
@@ -175,6 +334,54 @@ pub(crate) fn resolve_scoped_associated_item(
     }
 
     resolve_trait_associated_item(rust, support, refs, file, &owner_fqn, method_name)
+}
+
+pub(crate) fn resolve_scoped_associated_item_matching(
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    refs: &RustReferenceContext,
+    file: &ProjectFile,
+    path: &str,
+    item_name: &str,
+    item_matches: fn(&CodeUnit) -> bool,
+) -> ReceiverAnalysisOutcome<CodeUnit> {
+    if let Some(direct) = refs.resolve_scoped(path, item_name) {
+        let candidates: Vec<_> = support
+            .fqn(&direct)
+            .into_iter()
+            .filter(|candidate| item_matches(candidate) && candidate.identifier() == item_name)
+            .collect();
+        if !candidates.is_empty() {
+            return ReceiverAnalysisOutcome::Precise(candidates);
+        }
+    }
+
+    let Some(owner_fqn) = refs.resolve_scoped_owner(path) else {
+        return ReceiverAnalysisOutcome::Unknown;
+    };
+    let direct = if owner_fqn.is_empty() {
+        item_name.to_string()
+    } else {
+        format!("{owner_fqn}.{item_name}")
+    };
+    let candidates: Vec<_> = support
+        .fqn(&direct)
+        .into_iter()
+        .filter(|candidate| item_matches(candidate) && candidate.identifier() == item_name)
+        .collect();
+    if !candidates.is_empty() {
+        return ReceiverAnalysisOutcome::Precise(candidates);
+    }
+
+    resolve_trait_associated_item_matching(
+        rust,
+        support,
+        refs,
+        file,
+        &owner_fqn,
+        item_name,
+        item_matches,
+    )
 }
 
 /// Compiler-style trait-candidate step for an owner type already resolved to
@@ -341,7 +548,12 @@ fn infer_export_graph_seeds(
             .exports_by_name
             .contains_key(target.identifier())
         {
-            seeds.insert((parent.source().clone(), target.identifier().to_string()));
+            let resolved = analyzer.usage_seeds(target.source(), target.identifier());
+            if resolved.is_empty() {
+                seeds.insert((parent.source().clone(), target.identifier().to_string()));
+            } else {
+                seeds.extend(resolved);
+            }
         }
     }
 

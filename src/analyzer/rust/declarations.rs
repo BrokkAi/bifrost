@@ -1,4 +1,5 @@
 use crate::analyzer::tree_sitter_analyzer::ParsedFile;
+use crate::analyzer::usages::{ImportBinder, ImportKind};
 use crate::analyzer::{CodeUnit, ParameterMetadata, ProjectFile, Range, SignatureMetadata};
 use crate::hash::HashSet;
 use std::path::Path;
@@ -15,19 +16,29 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
     let root = tree.root_node();
     collect_rust_type_identifiers(root, source, &mut parsed.type_identifiers);
     let item_passthrough_macros = rust_item_passthrough_macros(root, source);
+    let mut impl_import_binder = ImportBinder::empty();
 
     for index in 0..root.named_child_count() {
         let Some(child) = root.named_child(index) else {
             continue;
         };
-        match child.kind() {
-            "use_declaration" => {
-                let imports = rust_imports_from_use_declaration(child, source);
-                parsed
-                    .import_statements
-                    .extend(imports.iter().map(|import| import.raw_snippet.clone()));
-                parsed.imports.extend(imports);
+        if child.kind() == "use_declaration" {
+            let imports = rust_imports_from_use_declaration(child, source);
+            for import in &imports {
+                super::lexical_scope::insert_rust_import_binding(&mut impl_import_binder, import);
             }
+            parsed
+                .import_statements
+                .extend(imports.iter().map(|import| import.raw_snippet.clone()));
+            parsed.imports.extend(imports);
+        }
+    }
+    for index in 0..root.named_child_count() {
+        let Some(child) = root.named_child(index) else {
+            continue;
+        };
+        match child.kind() {
+            "use_declaration" => {}
             "struct_item" | "enum_item" | "trait_item" => {
                 visit_rust_class_like(
                     file,
@@ -106,6 +117,7 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
                     source,
                     child,
                     &parsed.package_name.clone(),
+                    &impl_import_binder,
                     &mut parsed,
                 );
             }
@@ -730,24 +742,17 @@ fn visit_rust_impl(
     source: &str,
     node: Node<'_>,
     package_name: &str,
+    import_binder: &ImportBinder,
     parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) {
     let Some(type_node) = node.child_by_field_name("type") else {
         return;
     };
-    let Some(target_name) = extract_rust_impl_target_name(type_node, source) else {
+    let Some(parent) =
+        rust_impl_owner(file, source, type_node, package_name, import_binder, parsed)
+    else {
         return;
     };
-    let parent = CodeUnit::new(
-        file.clone(),
-        crate::analyzer::CodeUnitType::Class,
-        package_name.to_string(),
-        target_name,
-    );
-    if !parsed.contains_declaration(&parent) {
-        let top_level = parent.clone();
-        parsed.add_code_unit(parent.clone(), node, source, None, Some(top_level));
-    }
 
     let Some(body) = node.child_by_field_name("body") else {
         return;
@@ -758,17 +763,211 @@ fn visit_rust_impl(
         };
         match child.kind() {
             "function_item" => {
-                visit_rust_function(file, source, child, Some(&parent), package_name, parsed);
+                visit_rust_function(
+                    file,
+                    source,
+                    child,
+                    Some(&parent),
+                    parent.package_name(),
+                    parsed,
+                );
             }
             "const_item" => {
-                visit_rust_field(file, source, child, Some(&parent), package_name, parsed);
+                visit_rust_field(
+                    file,
+                    source,
+                    child,
+                    Some(&parent),
+                    parent.package_name(),
+                    parsed,
+                );
             }
             "type_item" => {
-                visit_rust_alias(file, source, child, Some(&parent), package_name, parsed);
+                visit_rust_alias(
+                    file,
+                    source,
+                    child,
+                    Some(&parent),
+                    parent.package_name(),
+                    parsed,
+                );
             }
             _ => {}
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RustImplOwnerIdentity {
+    package_name: String,
+    short_name: String,
+}
+
+fn rust_impl_owner(
+    file: &ProjectFile,
+    source: &str,
+    type_node: Node<'_>,
+    package_name: &str,
+    import_binder: &ImportBinder,
+    parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) -> Option<CodeUnit> {
+    let target_path = rust_nominal_type_path(type_node, source)?;
+    let local_identity = RustImplOwnerIdentity {
+        package_name: package_name.to_string(),
+        short_name: target_path.join("."),
+    };
+    if let Some(owner) = rust_declared_impl_owner(parsed, &local_identity) {
+        return Some(owner);
+    }
+
+    let identity = if target_path.len() == 1 {
+        let target_name = &target_path[0];
+        if let Some(binding) = import_binder.bindings.get(target_name)
+            && binding.kind == ImportKind::Named
+        {
+            let imported_name = binding.imported_name.as_ref()?;
+            let resolved_package = super::imports::resolve_rust_module_path_with_crate(
+                package_name,
+                &super::imports::rust_crate_root_package(file),
+                &binding.module_specifier,
+            )?;
+            RustImplOwnerIdentity {
+                package_name: resolved_package,
+                short_name: imported_name.clone(),
+            }
+        } else {
+            // Generic parameters and `Self` deliberately remain member namespaces only.
+            // Ordinary unresolved bare names do too: only a source declaration can publish
+            // a nominal workspace type.
+            local_identity
+        }
+    } else {
+        rust_impl_owner_identity_from_path(file, package_name, &target_path, import_binder)?
+    };
+
+    rust_declared_impl_owner(parsed, &identity).or_else(|| {
+        Some(CodeUnit::new(
+            file.clone(),
+            crate::analyzer::CodeUnitType::Class,
+            identity.package_name,
+            identity.short_name,
+        ))
+    })
+}
+
+fn rust_declared_impl_owner(
+    parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
+    identity: &RustImplOwnerIdentity,
+) -> Option<CodeUnit> {
+    parsed
+        .declarations()
+        .iter()
+        .find(|unit| {
+            (unit.kind() == crate::analyzer::CodeUnitType::Class
+                || parsed.type_aliases.contains(*unit))
+                && unit.package_name() == identity.package_name
+                && unit.short_name() == identity.short_name
+        })
+        .cloned()
+}
+
+fn rust_impl_owner_identity_from_path(
+    file: &ProjectFile,
+    package_name: &str,
+    path: &[String],
+    import_binder: &ImportBinder,
+) -> Option<RustImplOwnerIdentity> {
+    let (name, module_path) = path.split_last()?;
+    let crate_package = super::imports::rust_crate_root_package(file);
+    let package_name = if let Some((root, remainder)) = module_path.split_first()
+        && let Some(binding) = import_binder.bindings.get(root)
+        && binding.kind == ImportKind::Namespace
+    {
+        let mut resolved = super::imports::resolve_rust_module_path_with_crate(
+            package_name,
+            &crate_package,
+            &binding.module_specifier,
+        )?;
+        for component in remainder {
+            if !resolved.is_empty() {
+                resolved.push('.');
+            }
+            resolved.push_str(component);
+        }
+        resolved
+    } else {
+        let module_specifier = module_path.join("::");
+        super::imports::resolve_rust_module_path_with_crate(
+            package_name,
+            &crate_package,
+            &module_specifier,
+        )?
+    };
+
+    Some(RustImplOwnerIdentity {
+        package_name,
+        short_name: name.clone(),
+    })
+}
+
+fn rust_nominal_type_path(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    let mut pending = vec![node];
+    while let Some(candidate) = pending.pop() {
+        match candidate.kind() {
+            "type_identifier" | "identifier" => {
+                let name = rust_node_text(candidate, source).trim();
+                if !name.is_empty() {
+                    return Some(vec![name.to_string()]);
+                }
+            }
+            "scoped_type_identifier" => {
+                let path = rust_path_components(candidate, source);
+                if !path.is_empty() {
+                    return Some(path);
+                }
+            }
+            "generic_type" | "reference_type" | "pointer_type" | "array_type" | "slice_type" => {
+                if let Some(inner) = candidate.child_by_field_name("type") {
+                    pending.push(inner);
+                } else {
+                    for index in (0..candidate.named_child_count()).rev() {
+                        if let Some(child) = candidate.named_child(index)
+                            && child.kind() != "type_arguments"
+                        {
+                            pending.push(child);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn rust_path_components(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut components = Vec::new();
+    let mut pending = vec![node];
+    while let Some(candidate) = pending.pop() {
+        match candidate.kind() {
+            "crate" | "self" | "super" | "identifier" | "type_identifier" => {
+                let text = rust_node_text(candidate, source).trim();
+                if !text.is_empty() {
+                    components.push(text.to_string());
+                }
+            }
+            "scoped_identifier" | "scoped_type_identifier" => {
+                if let Some(name) = candidate.child_by_field_name("name") {
+                    pending.push(name);
+                }
+                if let Some(path) = candidate.child_by_field_name("path") {
+                    pending.push(path);
+                }
+            }
+            _ => {}
+        }
+    }
+    components
 }
 
 fn rust_type_signature(node: Node<'_>, source: &str, _top_level: bool) -> String {
@@ -805,7 +1004,9 @@ fn rust_impl_member_identity_signature(node: Node<'_>, source: &str) -> Option<S
         .map(|node| rust_node_text(node, source).trim())?;
     let item_signature = match node.kind() {
         "function_item" | "function_signature_item" => rust_function_signature(node, source),
-        "type_item" | "associated_type" => rust_node_text(node, source).trim().to_string(),
+        "const_item" | "type_item" | "associated_type" => {
+            rust_node_text(node, source).trim().to_string()
+        }
         _ => return None,
     };
     if let Some(trait_node) = impl_item.child_by_field_name("trait") {
@@ -901,45 +1102,22 @@ pub(super) fn collect_rust_type_identifiers(
     source: &str,
     identifiers: &mut HashSet<String>,
 ) {
-    match node.kind() {
-        "identifier" | "type_identifier" | "field_identifier" => {
-            let text = rust_node_text(node, source).trim();
-            if !text.is_empty() {
-                identifiers.insert(text.to_string());
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "identifier" | "type_identifier" | "field_identifier" => {
+                let text = rust_node_text(node, source).trim();
+                if !text.is_empty() {
+                    identifiers.insert(text.to_string());
+                }
             }
+            _ => {}
         }
-        _ => {}
-    }
 
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_rust_type_identifiers(child, source, identifiers);
-    }
-}
-
-fn extract_rust_impl_target_name(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "type_identifier" | "identifier" => {
-            let text = rust_node_text(node, source).trim();
-            (!text.is_empty()).then(|| text.to_string())
-        }
-        "scoped_type_identifier" => node
-            .child_by_field_name("name")
-            .and_then(|name| extract_rust_impl_target_name(name, source))
-            .or_else(|| {
-                let mut cursor = node.walk();
-                node.named_children(&mut cursor)
-                    .find_map(|child| extract_rust_impl_target_name(child, source))
-            }),
-        "generic_type" | "reference_type" | "pointer_type" | "array_type" | "slice_type" => {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .find_map(|child| extract_rust_impl_target_name(child, source))
-        }
-        _ => {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .find_map(|child| extract_rust_impl_target_name(child, source))
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                pending.push(child);
+            }
         }
     }
 }

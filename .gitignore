@@ -16,3 +16,4 @@ bifrost_searchtools/*.so
 .idea
 .vscode/
 **/.DS_Store
+/licenses/THIRD_PARTY_LICENSES.html

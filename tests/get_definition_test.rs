@@ -4576,6 +4576,268 @@ fn imports() {
 }
 
 #[test]
+fn rust_definition_fallback_respects_reference_roles_and_local_bindings() {
+    let source = r#"
+macro_rules! local_macro { () => {} }
+
+trait Values { type Item; }
+trait Borrowed<'a> {}
+trait Serializer { type Error; }
+
+mod errors { pub struct Error; }
+use errors::Error;
+
+struct LocalSerializer;
+impl Serializer for LocalSerializer { type Error = Error; }
+
+struct Decoy {
+    write: usize,
+    Item: usize,
+    writer: usize,
+    root: usize,
+}
+
+impl Decoy {
+    fn write(&self) {}
+    fn root(&self) {}
+}
+
+fn helper() {}
+
+fn exercise<T, W>(root: Decoy)
+where
+    T: Values<Item = W>,
+    W: for<'writer> Borrowed<'writer>,
+{
+    write!("external macro");
+    local_macro!();
+    let Item = 1;
+    let _ = Item;
+    let produced = &root;
+    let _ = produced.root;
+    let _ = root.root;
+    root.write();
+    helper();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", source)
+        .build();
+
+    for marker in [
+        "write!(\"external macro\")",
+        "T: Values",
+        "writer> Borrowed",
+        "let _ = Item",
+        "produced.root",
+    ] {
+        let start = source.find(marker).expect("reference marker");
+        let value = lookup(project.root(), &location_reference("lib.rs", source, start));
+        assert_eq!(
+            value["results"][0]["status"], "no_definition",
+            "{marker}: {value}"
+        );
+    }
+
+    for (marker, expected_fqn, expected_kind) in [
+        ("local_macro!", "local_macro", "macro"),
+        ("Item = W", "Values.Item", "field"),
+        ("helper();", "helper", "function"),
+    ] {
+        let start = source.find(marker).expect("reference marker");
+        let value = lookup(project.root(), &location_reference("lib.rs", source, start));
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{marker}: {value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], expected_fqn,
+            "{marker}: {value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["kind"], expected_kind,
+            "{marker}: {value}"
+        );
+    }
+
+    let receiver = source.find("root.root").expect("explicit receiver");
+    let value = lookup(
+        project.root(),
+        &location_reference("lib.rs", source, receiver),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["name"], "root", "{value}");
+    assert_eq!(result["definitions"][0]["kind"], "parameter", "{value}");
+    assert!(result["definitions"][0].get("fqn").is_none(), "{value}");
+
+    let method = source.rfind("root.write").expect("method call") + "root.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("lib.rs", source, method),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Decoy.write", "{value}");
+    assert_eq!(result["definitions"][0]["kind"], "function", "{value}");
+
+    let imported_type = source.find("= Error;").expect("associated type value") + "= ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("lib.rs", source, imported_type),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "errors.Error", "{value}");
+    assert_eq!(result["definitions"][0]["kind"], "class", "{value}");
+}
+
+#[test]
+fn rust_scoped_owner_resolution_preserves_namespace_and_canonical_identity() {
+    let source = r#"
+mod format {
+    pub struct Format;
+}
+fn format() {}
+
+enum Markdown {
+    Markdown,
+}
+
+struct Collisions {
+    std: usize,
+    manifest: usize,
+}
+
+fn manifest() {}
+mod manifest {
+    pub struct Manifest;
+}
+
+fn exercise() {
+    let _ = format::Format;
+    let _ = Markdown::Markdown;
+    let _: manifest::Manifest;
+    let _: std::path::PathBuf;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .file("src/leaf.rs", "pub struct Error;\n")
+        .file(
+            "src/barrel.rs",
+            "pub use crate::leaf::Error;\npub trait Serializer { type Error; }\npub struct LocalSerializer;\nimpl Serializer for LocalSerializer { type Error = Error; }\n",
+        )
+        .file(
+            "src/consumer.rs",
+            "use crate::barrel::Error;\npub fn consume(_: Error) {}\n",
+        )
+        .file("src/errors.rs", "pub struct Error;\n")
+        .file(
+            "src/parent/mod.rs",
+            "use crate::errors::Error;\npub trait Serializer { type Error; }\npub struct LocalSerializer;\nimpl Serializer for LocalSerializer { type Error = Error; }\npub mod child;\n",
+        )
+        .file(
+            "src/parent/child.rs",
+            "use super::Error;\npub fn consume(_: Error) {}\n",
+        )
+        .file(
+            "src/outer/mod.rs",
+            "mod error;\npub use error::Error;\npub mod middle;\n",
+        )
+        .file("src/outer/error.rs", "pub struct Error;\n")
+        .file(
+            "src/outer/middle/mod.rs",
+            "use super::Error;\npub mod child;\n",
+        )
+        .file(
+            "src/outer/middle/child.rs",
+            "use super::Error;\npub fn consume(_: Error) {}\n",
+        )
+        .build();
+
+    for (marker, expected_fqn, expected_kind) in [
+        ("format::Format", "format", "module"),
+        ("Markdown::Markdown", "Markdown", "class"),
+        ("manifest::Manifest", "manifest", "module"),
+    ] {
+        let start = source.find(marker).expect("owner marker");
+        let value = lookup(
+            project.root(),
+            &location_reference("src/lib.rs", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{marker}: {value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], expected_fqn,
+            "{marker}: {value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["kind"], expected_kind,
+            "{marker}: {value}"
+        );
+    }
+
+    let external = source.find("std::path::PathBuf").expect("external owner");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, external),
+    );
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+
+    let consumer = project
+        .file("src/consumer.rs")
+        .read_to_string()
+        .expect("consumer source");
+    let error = consumer.rfind("Error").expect("imported type use");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/consumer.rs", &consumer, error),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "leaf.Error", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "src/leaf.rs", "{value}");
+
+    let child = project
+        .file("src/parent/child.rs")
+        .read_to_string()
+        .expect("child source");
+    let error = child.rfind("Error").expect("parent import use");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/parent/child.rs", &child, error),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "errors.Error", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "src/errors.rs", "{value}");
+
+    let nested_child = project
+        .file("src/outer/middle/child.rs")
+        .read_to_string()
+        .expect("nested child source");
+    let error = nested_child
+        .rfind("Error")
+        .expect("nested parent import use");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/outer/middle/child.rs", &nested_child, error),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "outer.error.Error",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "src/outer/error.rs",
+        "{value}"
+    );
+}
+
+#[test]
 fn rust_struct_field_access_resolves_from_parameters_and_result_locals() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(

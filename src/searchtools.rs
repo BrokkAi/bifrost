@@ -22,9 +22,9 @@ use crate::analyzer::usages::{
     ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitKind, UsageHitSurface,
 };
 use crate::analyzer::{
-    AnalyzerDefinitionLookup, BoundedDefinitionLookup, CodeUnit, CodeUnitType, DeclarationKind,
-    GO_MODULE_SCOPE_SEGMENT, GoModuleRoot, IAnalyzer, Language, ProjectFile, Range,
-    SummaryFileProjection, go_module_roots,
+    AnalyzerDefinitionLookup, AnalyzerQueryScope, BoundedDefinitionLookup, CodeUnit, CodeUnitType,
+    DeclarationKind, GO_MODULE_SCOPE_SEGMENT, GoModuleRoot, IAnalyzer, Language, ProjectFile,
+    Range, SummaryFileProjection, go_module_roots,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::lsp::conversion::percent_decode;
@@ -4531,6 +4531,12 @@ fn scan_usages_backend(
     targets: Vec<ScanUsageRequest>,
 ) -> ScanUsagesResult {
     let _scope = profiling::scope("searchtools::scan_usages_backend");
+    // A batch is one read-only analyzer request. Keep the read cache alive across
+    // target resolution and every per-target UsageFinder query so later targets
+    // reuse hydrated file states and prepared syntax from earlier targets. The
+    // finder's nested query scopes remain useful for standalone callers; nested
+    // scopes do not clear the cache while this outer scope is active.
+    let _analyzer_query = AnalyzerQueryScope::new(analyzer);
 
     let query_scope = ScanUsagesQueryScope::new(analyzer, paths, include_tests);
     let reference_only_sibling_extensions =

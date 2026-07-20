@@ -1071,6 +1071,20 @@ fn rust_relative_module_path(file: &ProjectFile, module_specifier: &str) -> Opti
         .or_else(|| {
             let (crate_name, rest) = module_specifier.split_once("::")?;
             (Some(crate_name) == rust_current_crate_name(file).as_deref()).then(|| rest.into())
+        })
+        .or_else(|| {
+            let relative = PathBuf::from(module_specifier);
+            if relative.as_os_str().is_empty() {
+                return None;
+            }
+            let parent = file.rel_path().parent().unwrap_or(Path::new(""));
+            let stem = file.rel_path().file_stem()?.to_str()?;
+            let module_root = if matches!(stem, "lib" | "main" | "mod") {
+                parent.to_path_buf()
+            } else {
+                parent.join(stem)
+            };
+            Some(module_root.join(relative))
         })?;
     Some(module.to_string_lossy().replace("::", "/").into())
 }

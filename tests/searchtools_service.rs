@@ -4780,6 +4780,116 @@ fn scan_usages_location_target_uses_column_on_same_line_declarations() {
 }
 
 #[test]
+fn scan_usages_location_batch_follows_chained_rust_type_reexports() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/query/ir.rs",
+            r#"pub struct CodeQueryPlan;
+pub struct LogicalQueryPlan;
+"#,
+        )
+        .file(
+            "src/query/mod.rs",
+            r#"mod ir;
+pub use ir::{CodeQueryPlan, LogicalQueryPlan};
+"#,
+        )
+        .file(
+            "src/structural/mod.rs",
+            r#"pub use crate::query::{CodeQueryPlan, LogicalQueryPlan};
+"#,
+        )
+        .file(
+            "src/lib.rs",
+            r#"pub mod query;
+pub mod structural;
+"#,
+        )
+        .file(
+            "src/execution.rs",
+            r#"use crate::structural::{CodeQueryPlan, LogicalQueryPlan};
+
+pub fn execute(plan: &CodeQueryPlan, logical: &LogicalQueryPlan) {}
+"#,
+        )
+        .file(
+            "src/main.rs",
+            r#"use crate::structural::CodeQueryPlan;
+
+fn plan_summary_text(plan: &CodeQueryPlan) {}
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let args = serde_json::json!({
+        "targets": [
+            {"path": "src/query/ir.rs", "line": 1, "column": 12},
+            {"path": "src/query/ir.rs", "line": 2, "column": 12}
+        ],
+        "include_tests": true
+    });
+    let payload = service
+        .call_tool_json("scan_usages_by_location", &args.to_string())
+        .expect("location scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+
+    assert_eq!(2, results(&value).len(), "payload: {value}");
+    for (short_name, result) in ["CodeQueryPlan", "LogicalQueryPlan"]
+        .into_iter()
+        .zip(results(&value))
+    {
+        assert_eq!("found", result["status"], "payload: {value}");
+        assert_eq!(0, result["unproven_hits"], "payload: {value}");
+        assert!(
+            result["fq_name"]
+                .as_str()
+                .is_some_and(|fq_name| fq_name.ends_with(short_name)),
+            "payload: {value}"
+        );
+        assert!(
+            result["files"].as_array().is_some_and(|files| {
+                files.iter().any(|file| {
+                    file["path"] == "src/execution.rs"
+                        && file["hits"].as_array().is_some_and(|hits| {
+                            hits.iter().any(|hit| {
+                                hit["snippet"]
+                                    .as_str()
+                                    .is_some_and(|snippet| snippet.contains(short_name))
+                            })
+                        })
+                })
+            }),
+            "missing execution-layer use: {value}"
+        );
+    }
+    let code_query = results(&value)
+        .iter()
+        .find(|result| {
+            result["fq_name"]
+                .as_str()
+                .is_some_and(|fq_name| fq_name.ends_with("CodeQueryPlan"))
+        })
+        .expect("CodeQueryPlan result");
+    assert!(
+        code_query["files"].as_array().is_some_and(|files| {
+            files.iter().any(|file| {
+                file["path"] == "src/main.rs"
+                    && file["hits"].as_array().is_some_and(|hits| {
+                        hits.iter().any(|hit| {
+                            hit["snippet"]
+                                .as_str()
+                                .is_some_and(|snippet| snippet.contains("plan_summary_text"))
+                        })
+                    })
+            })
+        }),
+        "missing crate-facing re-export use: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_location_target_selects_js_object_literal_method() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(

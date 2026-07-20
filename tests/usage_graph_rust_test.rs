@@ -386,12 +386,16 @@ pub fn caller() {
 }
 
 #[test]
-fn unsupported_trait_object_receiver_emits_no_partial_edge() {
+fn trait_object_and_impl_trait_receivers_create_exact_trait_edges() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
             "src/lib.rs",
             r#"
 pub trait Runner {
+    fn run(&self);
+}
+
+pub trait OtherTrait {
     fn run(&self);
 }
 
@@ -409,15 +413,59 @@ impl Other {
 pub fn ambiguous(receiver: &dyn Runner) {
     receiver.run();
 }
+
+pub fn opaque(receiver: impl Runner) {
+    receiver.run();
+}
+
+pub fn bounded_ambiguous(receiver: &dyn Runner + Send) {
+    receiver.run();
+}
+
+pub fn bounded_opaque(receiver: impl Runner + Send) {
+    receiver.run();
+}
+
+pub fn higher_ranked(receiver: &dyn for<'a> Runner) {
+    receiver.run();
+}
+
+pub fn other_bounded(receiver: impl OtherTrait + Send) {
+    receiver.run();
+}
+
+pub fn other_higher_ranked(receiver: &dyn for<'a> OtherTrait) {
+    receiver.run();
+}
 "#,
         )
         .build();
 
     let value = common::usage_graph::usage_graph_at(project.root(), "{}");
     assert!(
+        find_edge(&value, "ambiguous", "Runner.run").is_some()
+            && find_edge(&value, "opaque", "Runner.run").is_some()
+            && find_edge(&value, "bounded_ambiguous", "Runner.run").is_some()
+            && find_edge(&value, "bounded_opaque", "Runner.run").is_some()
+            && find_edge(&value, "higher_ranked", "Runner.run").is_some(),
+        "structured trait receiver types must edge to Runner.run: {}",
+        value["edges"]
+    );
+    assert!(
         find_edge(&value, "ambiguous", "Service.run").is_none()
-            && find_edge(&value, "ambiguous", "Other.run").is_none(),
-        "unsupported trait-object receiver must not emit partial same-name edges: {}",
+            && find_edge(&value, "ambiguous", "Other.run").is_none()
+            && find_edge(&value, "opaque", "Service.run").is_none()
+            && find_edge(&value, "opaque", "Other.run").is_none()
+            && find_edge(&value, "bounded_ambiguous", "Service.run").is_none()
+            && find_edge(&value, "bounded_ambiguous", "Other.run").is_none()
+            && find_edge(&value, "bounded_opaque", "Service.run").is_none()
+            && find_edge(&value, "bounded_opaque", "Other.run").is_none()
+            && find_edge(&value, "other_bounded", "Runner.run").is_none()
+            && find_edge(&value, "other_bounded", "Other.run").is_none()
+            && find_edge(&value, "other_bounded", "OtherTrait.run").is_some()
+            && find_edge(&value, "other_higher_ranked", "Runner.run").is_none()
+            && find_edge(&value, "other_higher_ranked", "OtherTrait.run").is_some(),
+        "trait receivers must not emit partial same-name inherent edges: {}",
         value["edges"]
     );
 }
@@ -462,6 +510,57 @@ pub fn caller(flag: bool) {
     assert!(
         find_edge(&value, "caller", "Service.run").is_none(),
         "block-local receiver shadow must not leak to the outer call: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn qualified_macro_free_paths_create_exact_workspace_edges() {
+    let value = inline_usage_graph(&[(
+        "src/lib.rs",
+        r#"
+macro_rules! generated {
+    () => {{
+        $crate::wanted::free();
+        $crate::wanted::Owner::assoc();
+    }};
+}
+
+macro_rules! consume { ($($tokens:tt)*) => {}; }
+
+pub mod wanted {
+    pub struct Owner;
+    pub type Alias = Owner;
+    impl Owner { pub fn assoc() {} }
+    pub fn free() {}
+}
+
+pub mod decoy {
+    pub struct Owner;
+    pub type Alias = Owner;
+    impl Owner { pub fn assoc() {} }
+    pub fn free() {}
+}
+
+pub fn invoke() {
+    consume!({ wanted::free(); });
+    consume!((wanted::Owner::assoc()));
+    consume!((wanted::Alias));
+    consume!({ decoy::free(); });
+    consume!((decoy::Owner::assoc()));
+    consume!((decoy::Alias));
+}
+"#,
+    )]);
+
+    assert!(
+        find_edge(&value, "invoke", "wanted.free").is_some(),
+        "expected invoke -> wanted.free from the nested macro path: {}",
+        value["edges"]
+    );
+    assert!(
+        find_edge(&value, "invoke", "decoy.free").is_some(),
+        "the exact-owner decoy path should retain its own identity: {}",
         value["edges"]
     );
 }
