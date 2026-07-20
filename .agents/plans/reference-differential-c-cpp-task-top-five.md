@@ -23,9 +23,13 @@ The observable result is ten accepted repository records selected by exact desce
 - [x] (2026-07-20 18:30Z) Completed all five literal task-selected C records on release runner `df753a15` (SHA-256 `9ac6ffd57833f2940d900ba1f79f8c0b0041aa6479bae17c8c73a90829ee9d17`) with one fingerprint, exact clean heads, zero file errors, and no skipped inverse targets.
 - [x] (2026-07-20 18:35Z) Closed #996 after Libgit2 completed 667/667 targets in 602.9 seconds with an 84.0-second maximum completion gap and JerryScript completed 332/332 in 763.6 seconds with a 192.9-second maximum gap, versus incomplete old runs and 816.4/900.7-second stalls.
 - [x] (2026-07-20 18:40Z) Exhaustively extracted and exact-reran all eight raw C residuals. Seven Chibicc sites are typedef declarators and the Libgit2 site is a secondary local declarator; inverse omission is correct, but public forward lookup incorrectly treated each declaration token as a reference.
-- [x] (2026-07-20 18:45Z) Created issue #997, verified it is assigned only to `jbellis`, and delegated a structured shared declaration-name fix plus behavior regressions; root review and full gates are in progress.
-- [ ] Complete the five-repository C baseline, integrity-check every record, exhaustively disposition every raw missing row, and give the user the requested C-language summary.
-- [ ] File/assign, implement, review, test, publish, and exact-prove every legitimate C root cause not owned by somebody else; rebuild and rerun the complete C set after any fix.
+- [x] (2026-07-20 18:45Z) Created issue #997, verified it is assigned only to `jbellis`, and delegated a structured shared declaration-name fix plus behavior regressions.
+- [x] (2026-07-20 19:10Z) Root-reviewed #997, passed 70 focused C/C++ definition tests, formatting, all-target/all-feature Clippy, and the complete feature-enabled test suite, reconciled remote changes, and published the fix in clean master head `7c1a16e0`.
+- [x] (2026-07-20 19:15Z) Exact-reran all eight #997 witnesses on the rebuilt `7c1a16e0` release runner; every declaration byte now returns structured `no_definition`/`declaration_or_import_site`, with zero missing rows.
+- [x] (2026-07-20 20:10Z) Completed and independently integrity-checked the five literal task-selected C records plus the rank-six `aws__s2n-tls` supplement: one fingerprint, exact clean heads, 50,000 substantive sampled sites, all 2,283 targets queried, and zero missing, file errors, candidate exclusions, skipped targets, or target truncations.
+- [x] (2026-07-20 20:15Z) Posted production evidence and closed assigned issues #997, #924, and #928; published the compact C manifest and requested C-language summary.
+- [x] Complete the five-repository C baseline, integrity-check every record, exhaustively disposition every raw missing row, and give the user the requested C-language summary.
+- [x] File/assign, implement, review, test, publish, and exact-prove every legitimate C root cause not owned by somebody else; rebuild and rerun the complete C set after any fix.
 - [ ] Complete the five-repository C++ baseline, integrity-check every record, exhaustively disposition every raw missing row, and give the user the requested C++-language summary.
 - [ ] File/assign, implement, review, test, publish, and exact-prove every legitimate C++ root cause not owned by somebody else; rebuild and rerun the complete C++ set after any fix.
 - [ ] Publish compact manifests and summaries, comment on and close every assigned issue proven fixed, run the final local gates, and verify the clean local head, `origin/master`, and remote master agree.
@@ -61,6 +65,9 @@ The observable result is ten accepted repository records selected by exact desce
 
 - Observation: All eight C residuals share declaration-site forward filtering gaps rather than inverse omissions.
   Evidence: the Libgit2 byte is the second direct declarator in `size_t i, j;`, and the seven Chibicc bytes are the second names in `typedef struct X X;`. Tree-sitter exposes repeated `declarator` fields, but forward lookup inspected only one field and the type path used an even narrower `name`-only guard. Exact probes reproduce the wrong forward results; inverse correctly excludes declarations. This is assigned issue #997.
+
+- Observation: The accepted C rerun has no residual raw disagreement.
+  Evidence: five clean task-selected records at `7c1a16e0` share fingerprint `830e9a0f239fcaa3e8f0a0b9d7831aa8f3ca8917a6b39e24d70e84cb601223d6`; all 40,000 sampled sites partition into 6,215 consistent and 33,785 inconclusive rows with zero missing. The rank-six substantive supplement adds 10,000 sites, 1,698 consistent, two soundly unproven, 8,300 inconclusive, and zero missing.
 
 ## Decision Log
 
@@ -110,7 +117,7 @@ The observable result is ten accepted repository records selected by exact desce
 
 ## Outcomes & Retrospective
 
-The campaign has selected and pinned its exact task-ranked corpus but has not yet produced accepted C or C++ records. The prior LOC-ranked work contributed nine assigned fixes (#924–#932) already present in current history; this campaign will independently test their generality and provide the clean final evidence needed to close them. Update this section after the C milestone, after the C++ milestone, and at full closure.
+The C milestone is complete. The literal selector contract produced five accepted clean records, including the honest zero-file BitcoinAddressFinder result; a separately labeled `aws__s2n-tls` run supplied the fifth substantive C audit. Across those substantive records, 50,000 sampled sites yielded 7,913 consistent, two soundly unproven, 42,085 inconclusive, and zero missing or actionable residuals. #996 fixed the operational macro-cursor contention found during the campaign, and #997 fixed all eight declaration-name forward errors. #996, #997, and the previously fixed C issues #924 and #928 are closed with clean production evidence. C++ remains outstanding.
 
 ## Context and Orientation
 
@@ -244,3 +251,5 @@ Revision note (2026-07-20 15:00Z): Created this task-ranked C/C++ plan after pro
 Revision note (2026-07-20 17:18Z): Recorded the clean runner and first C discovery record, raised the final C candidate ceiling from measured evidence, documented #932's sound exact-but-unproven boundary, and added assigned issue #996 after a live production stack proved cross-target macro cursor serialization and replay thrash.
 
 Revision note (2026-07-20 18:45Z): Recorded #996 publication, gates, production proof, and closure; completed and integrity-checked the literal five-repository C discovery corpus; documented the BitcoinAddressFinder selector mismatch and supplemental real-C policy; and added assigned issue #997 from exhaustive adjudication of all eight declaration-site residuals.
+
+Revision note (2026-07-20 20:17Z): Recorded #997's structured fix, local gates, publication, eight exact proofs, the clean zero-missing five-record C rerun, the matching rank-six substantive supplement, independent acceptance audit, closures for #997/#924/#928, and the compact C milestone artifacts.
