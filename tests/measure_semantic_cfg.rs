@@ -21,7 +21,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use brokk_bifrost::analyzer::semantic::{
-    CancellationToken, ControlEdgeKind, SemanticBudget, SemanticOutcome, SemanticRequest,
+    CancellationToken, ControlEdgeKind, SemanticBudget, SemanticOutcome, SemanticProviderError,
+    SemanticRequest, StableDigest,
 };
 use brokk_bifrost::{AnalyzerConfig, Language, Project, TestProject, WorkspaceAnalyzer};
 use serde::{Deserialize, Serialize};
@@ -63,6 +64,7 @@ struct Dataset {
     files_materialized: usize,
     procedure_graphs: Vec<ProcedureDataset>,
     semantic_materialization_ms: Option<f64>,
+    semantic_repeat_materialization_ms: Option<f64>,
     status: String,
 }
 
@@ -179,6 +181,7 @@ struct LayoutContract {
 struct BenchmarkProvenance {
     bifrost_commit: Option<String>,
     bifrost_dirty: Option<bool>,
+    bifrost_tree_fingerprint: Option<String>,
     rustc_version_verbose: Option<String>,
     operating_system: String,
     architecture: String,
@@ -221,6 +224,7 @@ struct DatasetMeasurement {
     edges: usize,
     procedure_row_boundaries: usize,
     semantic_materialization_ms: Option<f64>,
+    semantic_repeat_materialization_ms: Option<f64>,
     construction_freeze_ms: Option<f64>,
     full_forward_traversal_ms: Option<f64>,
     full_reverse_traversal_ms: Option<f64>,
@@ -273,12 +277,21 @@ impl From<LayoutContract> for LayoutContractOwned {
 struct AggregateResult {
     format: &'static str,
     kind: &'static str,
-    provenance: BenchmarkProvenance,
+    aggregation_provenance: BenchmarkProvenance,
+    sample_provenance: BenchmarkProvenance,
+    dataset_provenance: BTreeMap<String, DatasetRepositoryProvenance>,
     fresh_processes_per_layout: usize,
     discarded_warmups_per_layout: usize,
     retained_samples_per_layout: usize,
     raw_samples: BTreeMap<String, Vec<SampleResult>>,
     medians: Vec<MedianMeasurement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct DatasetRepositoryProvenance {
+    origin: String,
+    repository_commit: Option<String>,
+    repository_dirty: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -291,6 +304,7 @@ struct MedianMeasurement {
     edges: usize,
     procedure_row_boundaries: usize,
     semantic_materialization_ms: Option<f64>,
+    semantic_repeat_materialization_ms: Option<f64>,
     construction_freeze_ms: Option<f64>,
     full_forward_traversal_ms: Option<f64>,
     full_reverse_traversal_ms: Option<f64>,
@@ -732,6 +746,7 @@ fn generated_branch_heavy(point_count: usize) -> Dataset {
         files_materialized: 0,
         procedure_graphs: vec![ProcedureDataset { point_count, edges }],
         semantic_materialization_ms: None,
+        semantic_repeat_materialization_ms: None,
         status: "complete".to_owned(),
     }
 }
@@ -762,6 +777,7 @@ fn generated_call_heavy(point_count: usize) -> Dataset {
         files_materialized: 0,
         procedure_graphs: vec![ProcedureDataset { point_count, edges }],
         semantic_materialization_ms: None,
+        semantic_repeat_materialization_ms: None,
         status: "complete".to_owned(),
     }
 }
@@ -802,12 +818,12 @@ fn corpus_dataset(
             root.display()
         );
     }
-    let project = Arc::new(TestProject::new(root, language));
-    let files = project
+    let source_project = Arc::new(TestProject::new(root, language));
+    let files = source_project
         .analyzable_files(language)
         .expect("list semantic CFG corpus files");
     let files_seen = files.len();
-    let project: Arc<dyn Project> = project;
+    let project: Arc<dyn Project> = Arc::clone(&source_project) as Arc<dyn Project>;
     let analyzer = WorkspaceAnalyzer::build(
         project,
         AnalyzerConfig {
@@ -819,20 +835,36 @@ fn corpus_dataset(
     let started = Instant::now();
     let mut procedure_graphs = Vec::new();
     let mut files_materialized = 0usize;
+    let mut materialized_files = Vec::new();
     let mut unavailable = Vec::new();
-    for file in files {
+    for file in &files {
         let mut budget = SemanticBudget::default();
-        let outcome = analyzer
-            .materialize_program_semantics(
-                &file,
-                &mut SemanticRequest::new(&mut budget, &cancellation),
-            )
-            .unwrap_or_else(|error| {
+        let outcome = match analyzer.materialize_program_semantics(
+            file,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        ) {
+            Ok(outcome) => outcome,
+            Err(SemanticProviderError::SourceAccess(detail)) => {
+                source_project.read_source(file).unwrap_or_else(|error| {
+                    panic!(
+                        "benchmark corpus source {} became unreadable after enumeration: {error}",
+                        file.rel_path().display()
+                    )
+                });
+                unavailable.push(format!(
+                    "{}:parse-safety:{}",
+                    file.rel_path().display(),
+                    detail
+                ));
+                continue;
+            }
+            Err(error) => {
                 panic!(
                     "materialize benchmark corpus {}: {error}",
                     file.rel_path().display()
                 )
-            });
+            }
+        };
         let artifact = match outcome {
             SemanticOutcome::Complete { value, .. } => value,
             SemanticOutcome::Unsupported { capability, .. } => {
@@ -866,6 +898,7 @@ fn corpus_dataset(
             SemanticOutcome::Cancelled { .. } => panic!("benchmark cancellation was not requested"),
         };
         files_materialized += 1;
+        materialized_files.push(file.clone());
         for procedure in artifact.procedures() {
             let edges = procedure
                 .cfg()
@@ -886,6 +919,32 @@ fn corpus_dataset(
         }
     }
     let semantic_materialization_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let repeat_started = Instant::now();
+    let mut repeat_materialized = 0usize;
+    for file in &materialized_files {
+        let mut budget = SemanticBudget::default();
+        let outcome = analyzer
+            .materialize_program_semantics(
+                file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "repeat benchmark corpus materialization {}: {error}",
+                    file.rel_path().display()
+                )
+            });
+        if matches!(outcome, SemanticOutcome::Complete { .. }) {
+            repeat_materialized += 1;
+        }
+        black_box(outcome);
+    }
+    assert_eq!(
+        repeat_materialized,
+        materialized_files.len(),
+        "repeated materialization must preserve the completed-file count"
+    );
+    let semantic_repeat_materialization_ms = repeat_started.elapsed().as_secs_f64() * 1_000.0;
     let unavailable_summary = || {
         let examples = unavailable
             .iter()
@@ -924,6 +983,7 @@ fn corpus_dataset(
         files_materialized,
         procedure_graphs,
         semantic_materialization_ms: Some(semantic_materialization_ms),
+        semantic_repeat_materialization_ms: Some(semantic_repeat_materialization_ms),
         status,
     }
 }
@@ -939,6 +999,36 @@ fn git_dirty(root: &Path) -> Option<bool> {
         &["status", "--porcelain", "--untracked-files=normal"],
     )
     .map(|status| !status.is_empty())
+}
+
+fn bifrost_tree_fingerprint(root: &Path) -> Option<String> {
+    let diff = Command::new("git")
+        .current_dir(root)
+        .args(["diff", "--binary", "HEAD", "--"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let untracked = Command::new("git")
+        .current_dir(root)
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let mut material = Vec::with_capacity(diff.stdout.len() + untracked.stdout.len());
+    material.extend_from_slice(git_commit(root)?.as_bytes());
+    material.extend_from_slice(&diff.stdout);
+    for raw_path in untracked.stdout.split(|byte| *byte == 0) {
+        if raw_path.is_empty() {
+            continue;
+        }
+        let relative = std::str::from_utf8(raw_path).ok()?;
+        let contents = fs::read(root.join(relative)).ok()?;
+        material.extend_from_slice(&u64::try_from(raw_path.len()).ok()?.to_le_bytes());
+        material.extend_from_slice(raw_path);
+        material.extend_from_slice(&u64::try_from(contents.len()).ok()?.to_le_bytes());
+        material.extend_from_slice(&contents);
+    }
+    Some(StableDigest::sha256(material).to_string())
 }
 
 fn command_output_in(root: &Path, program: &str, arguments: &[&str]) -> Option<String> {
@@ -997,6 +1087,7 @@ fn benchmark_provenance() -> BenchmarkProvenance {
     BenchmarkProvenance {
         bifrost_commit: git_commit(root),
         bifrost_dirty: git_dirty(root),
+        bifrost_tree_fingerprint: bifrost_tree_fingerprint(root),
         rustc_version_verbose: command_output(&rustc, &["--version", "--verbose"]),
         operating_system: std::env::consts::OS.to_owned(),
         architecture: std::env::consts::ARCH.to_owned(),
@@ -1097,6 +1188,7 @@ fn measure_dataset(layout: Layout, dataset: Dataset) -> DatasetMeasurement {
         files_materialized,
         procedure_graphs,
         semantic_materialization_ms,
+        semantic_repeat_materialization_ms,
         status,
     } = dataset;
     let procedures = procedure_graphs.len();
@@ -1116,6 +1208,7 @@ fn measure_dataset(layout: Layout, dataset: Dataset) -> DatasetMeasurement {
             edges: edge_count,
             procedure_row_boundaries,
             semantic_materialization_ms,
+            semantic_repeat_materialization_ms,
             construction_freeze_ms: None,
             full_forward_traversal_ms: None,
             full_reverse_traversal_ms: None,
@@ -1207,6 +1300,7 @@ fn measure_dataset(layout: Layout, dataset: Dataset) -> DatasetMeasurement {
         edges: edge_count,
         procedure_row_boundaries,
         semantic_materialization_ms,
+        semantic_repeat_materialization_ms,
         construction_freeze_ms: Some(construction_freeze_ms),
         full_forward_traversal_ms: Some(full_forward_traversal_ms),
         full_reverse_traversal_ms: Some(full_reverse_traversal_ms),
@@ -1230,17 +1324,23 @@ fn positive_round() -> usize {
 
 fn sample() -> SampleResult {
     let layout = Layout::from_env();
+    let provenance = benchmark_provenance();
+    assert!(
+        provenance.bifrost_tree_fingerprint.is_some(),
+        "decision-grade layout samples require an exact Bifrost tree fingerprint"
+    );
+    let datasets = datasets()
+        .into_iter()
+        .map(|dataset| measure_dataset(layout, dataset))
+        .collect();
     SampleResult {
-        format: "bifrost_semantic_cfg_benchmark/v2".to_owned(),
+        format: "bifrost_semantic_cfg_benchmark/v4".to_owned(),
         kind: "sample".to_owned(),
-        provenance: benchmark_provenance(),
+        provenance,
         round: positive_round(),
         layout: layout.label().to_owned(),
         layout_contract: layout.contract().into(),
-        datasets: datasets()
-            .into_iter()
-            .map(|dataset| measure_dataset(layout, dataset))
-            .collect(),
+        datasets,
     }
 }
 
@@ -1422,7 +1522,7 @@ fn aggregate(samples_file: &Path) -> AggregateResult {
         let sample: SampleResult = serde_json::from_str(line).unwrap_or_else(|error| {
             panic!("parse benchmark sample line {}: {error}", line_number + 1)
         });
-        assert_eq!(sample.format, "bifrost_semantic_cfg_benchmark/v2");
+        assert_eq!(sample.format, "bifrost_semantic_cfg_benchmark/v4");
         assert_eq!(sample.kind, "sample");
         validate_required_corpora(&sample);
         raw_samples
@@ -1504,6 +1604,14 @@ fn aggregate(samples_file: &Path) -> AggregateResult {
                         .filter_map(|sample| sample.datasets[index].semantic_materialization_ms)
                         .collect(),
                 ),
+                semantic_repeat_materialization_ms: median_f64(
+                    samples
+                        .iter()
+                        .filter_map(|sample| {
+                            sample.datasets[index].semantic_repeat_materialization_ms
+                        })
+                        .collect(),
+                ),
                 construction_freeze_ms: median_f64(
                     samples
                         .iter()
@@ -1553,15 +1661,30 @@ fn aggregate(samples_file: &Path) -> AggregateResult {
             });
         }
     }
-    let provenance = reference_samples
+    let reference_sample = reference_samples
         .first()
-        .expect("bidirectional reference sample exists")
-        .provenance
-        .clone();
+        .expect("bidirectional reference sample exists");
+    let sample_provenance = reference_sample.provenance.clone();
+    let dataset_provenance = reference_sample
+        .datasets
+        .iter()
+        .map(|dataset| {
+            (
+                dataset.name.clone(),
+                DatasetRepositoryProvenance {
+                    origin: dataset.origin.clone(),
+                    repository_commit: dataset.repository_commit.clone(),
+                    repository_dirty: dataset.repository_dirty,
+                },
+            )
+        })
+        .collect();
     AggregateResult {
-        format: "bifrost_semantic_cfg_benchmark_aggregate/v2",
+        format: "bifrost_semantic_cfg_benchmark_aggregate/v5",
         kind: "aggregate",
-        provenance,
+        aggregation_provenance: benchmark_provenance(),
+        sample_provenance,
+        dataset_provenance,
         fresh_processes_per_layout: 9,
         discarded_warmups_per_layout: 2,
         retained_samples_per_layout: 7,
