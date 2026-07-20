@@ -2231,6 +2231,59 @@ object Use {
 }
 
 #[test]
+fn scala_inverted_handles_generic_only_calls_and_semantic_argument_arity() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Calls.scala",
+            r#"package app
+trait Context
+class Transform(value: String)
+object Transform {
+  def apply(value: String): Transform = new Transform(value)
+  def apply(left: String, right: String): Transform = new Transform(left + right)
+}
+object Api {
+  def plain[A]: Int = 1
+  def contextual[A](using Context): Int = 2
+  def explicitZero[A](): Int = 3
+  def explicitOne[A](value: Int): Int = value
+  def five(a: Int, b: Int, c: Int, d: Int, e: Int): Int = a + b + c + d + e
+  def consume(marker: Int, run: String => Transform): Transform = run(marker.toString)
+}
+object Use {
+  import Api.*
+  given Context = new Context {}
+  def plainResult: Int = plain[Int]
+  def contextualResult: Int = contextual[Int]
+  def missingParens: Int = explicitZero[Int]
+  def missingValue: Int = explicitOne[Int]
+  def exact: Int = five(1, 2, 3, 4, 5 /* unused */)
+  def extra: Int = five(1, 2, 3, 4, 5, 6 /* unused */)
+  def methodValue: Transform = consume(1, /* ignored */ Transform)
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+
+    for (caller, callee) in [
+        ("app.Use$.plainResult", "app.Api$.plain"),
+        ("app.Use$.contextualResult", "app.Api$.contextual"),
+        ("app.Use$.exact", "app.Api$.five"),
+        ("app.Use$.methodValue", "app.Transform"),
+    ] {
+        assert!(has_edge(&value, caller, callee), "{}", value["edges"]);
+    }
+    for (caller, callee) in [
+        ("app.Use$.missingParens", "app.Api$.explicitZero"),
+        ("app.Use$.missingValue", "app.Api$.explicitOne"),
+        ("app.Use$.extra", "app.Api$.five"),
+    ] {
+        assert!(!has_edge(&value, caller, callee), "{}", value["edges"]);
+    }
+}
+
+#[test]
 fn scala_inverted_keeps_overload_shape_receiver_and_return_facts_aligned() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

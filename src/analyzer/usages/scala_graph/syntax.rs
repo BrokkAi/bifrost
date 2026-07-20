@@ -59,6 +59,7 @@ pub(crate) struct ScalaCallArgumentList {
 pub(crate) struct ScalaCallSiteShape {
     pub(crate) lists: Vec<ScalaCallArgumentList>,
     pub(crate) method_value_arity: Option<usize>,
+    pub(crate) type_arguments_only: bool,
 }
 
 impl ScalaCallSiteShape {
@@ -73,6 +74,7 @@ impl ScalaCallSiteShape {
                 })
                 .collect(),
             method_value_arity: None,
+            type_arguments_only: false,
         }
     }
 
@@ -1189,15 +1191,18 @@ pub(crate) fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallS
                 kind: ScalaCallArgumentListKind::Ordinary,
             }],
             method_value_arity: None,
+            type_arguments_only: false,
         });
     }
     let mut expression = field_expression_for_member(node).unwrap_or(node);
+    let mut type_arguments_only = false;
     if let Some(generic) = expression.parent().filter(|generic| {
         (generic.kind() == "generic_function"
             && generic.child_by_field_name("function") == Some(expression))
             || (generic.kind() == "generic_type"
                 && generic.child_by_field_name("type") == Some(expression))
     }) {
+        type_arguments_only = generic.kind() == "generic_function";
         expression = generic;
     }
     let mut lists = Vec::new();
@@ -1231,11 +1236,19 @@ pub(crate) fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallS
         }
         let arguments = call.child_by_field_name("arguments")?;
         lists.push(call_argument_list(arguments));
+        type_arguments_only = false;
         expression = call;
+    }
+    if lists.is_empty() && type_arguments_only {
+        lists.push(ScalaCallArgumentList {
+            arity: 0,
+            kind: ScalaCallArgumentListKind::Ordinary,
+        });
     }
     (!lists.is_empty()).then_some(ScalaCallSiteShape {
         lists,
         method_value_arity: None,
+        type_arguments_only,
     })
 }
 
@@ -1291,15 +1304,32 @@ fn call_argument_list(arguments: Node<'_>) -> ScalaCallArgumentList {
     };
     let mut named = arguments.walk();
     ScalaCallArgumentList {
-        arity: arguments.named_children(&mut named).count(),
+        arity: arguments
+            .named_children(&mut named)
+            .filter(|argument| is_semantic_call_argument(*argument))
+            .count(),
         kind,
     }
+}
+
+pub(crate) fn is_semantic_call_argument(node: Node<'_>) -> bool {
+    !matches!(node.kind(), "comment" | "block_comment")
 }
 
 pub(crate) fn scala_call_shape_relation(
     declared: &[ScalaCallableParameterList],
     actual: &ScalaCallSiteShape,
 ) -> ScalaCallShapeRelation {
+    if actual.type_arguments_only {
+        return if declared
+            .iter()
+            .all(|list| list.kind == ScalaParameterListKind::Contextual)
+        {
+            ScalaCallShapeRelation::Complete
+        } else {
+            ScalaCallShapeRelation::Incompatible
+        };
+    }
     if actual.lists.len() == 1
         && actual.lists[0].kind == ScalaCallArgumentListKind::Ordinary
         && actual.lists[0].arity == 0
@@ -1719,6 +1749,7 @@ mod tests {
         let supplied = ScalaCallSiteShape {
             lists: vec![ordinary],
             method_value_arity: None,
+            type_arguments_only: false,
         };
         assert_eq!(
             scala_call_shape_relation(&[contextual(1), explicit(1), contextual(2)], &supplied),
@@ -1734,6 +1765,7 @@ mod tests {
                 &ScalaCallSiteShape {
                     lists: vec![empty],
                     method_value_arity: None,
+                    type_arguments_only: false,
                 }
             ),
             ScalaCallShapeRelation::Complete
@@ -1744,6 +1776,7 @@ mod tests {
                 &ScalaCallSiteShape {
                     lists: vec![ordinary],
                     method_value_arity: None,
+                    type_arguments_only: false,
                 }
             ),
             ScalaCallShapeRelation::Incompatible
@@ -1752,6 +1785,7 @@ mod tests {
         let partial = ScalaCallSiteShape {
             lists: vec![ordinary],
             method_value_arity: Some(1),
+            type_arguments_only: false,
         };
         assert_eq!(
             scala_call_shape_relation(&[explicit(1), explicit(1)], &partial),

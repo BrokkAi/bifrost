@@ -35,8 +35,8 @@ use crate::analyzer::usages::scala_graph::syntax::{
     is_extractor_reference, is_identifier_node, is_infix_pattern_operator,
     is_infix_type_operator_reference, is_owner_qualified_this, is_scala_case_pattern_binder,
     is_scala_class_reference, is_scala_named_argument_assignment, is_scala_object_reference,
-    is_terminal_stable_field_reference, member_qualifier, member_qualifier_node,
-    named_argument_invocation_owner, node_text, parenthesized_arity,
+    is_semantic_call_argument, is_terminal_stable_field_reference, member_qualifier,
+    member_qualifier_node, named_argument_invocation_owner, node_text, parenthesized_arity,
     qualified_stable_type_reference, resolve_stable_object_expression,
     scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
     scala_callable_shape_matches, scala_pattern_binder_names, scala_union_type_alternative_paths,
@@ -2195,6 +2195,7 @@ fn call_parameter_method_value_context(
     let mut arguments_cursor = arguments.walk();
     let Some(parameter_index) = arguments
         .named_children(&mut arguments_cursor)
+        .filter(|argument| is_semantic_call_argument(*argument))
         .position(|argument| argument == node)
     else {
         return ScalaMethodValueContext::Unknown;
@@ -2711,6 +2712,7 @@ fn call_site_shape_with_method_value_context(
         ScalaMethodValueContext::Function(arity) => Some(ScalaCallSiteShape {
             lists: Vec::new(),
             method_value_arity: Some(arity),
+            type_arguments_only: false,
         }),
         ScalaMethodValueContext::Unknown | ScalaMethodValueContext::Incompatible => None,
     }

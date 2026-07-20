@@ -38,10 +38,10 @@ use super::syntax::{
     ScalaPackageContextIndex, ScalaQualifiedStableTypeRole, ScalaSourceFacts,
     call_arities_for_reference, call_site_shape_for_reference, enclosing_template_declarations,
     invocation_function_reference, is_bare_companion_method_value_reference,
-    is_constructor_like_reference, is_declaration_name, is_extractor_reference,
-    is_infix_pattern_operator, is_scala_case_pattern_binder, is_scala_class_reference,
-    is_scala_named_argument_assignment, is_scala_object_reference,
-    is_terminal_stable_field_reference, node_text, parenthesized_arity,
+    is_call_function_reference, is_constructor_like_reference, is_declaration_name,
+    is_extractor_reference, is_infix_pattern_operator, is_scala_case_pattern_binder,
+    is_scala_class_reference, is_scala_named_argument_assignment, is_scala_object_reference,
+    is_semantic_call_argument, is_terminal_stable_field_reference, node_text, parenthesized_arity,
     qualified_stable_type_reference, resolve_stable_object_expression,
     scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
     scala_callable_shape_matches, scala_import_is_visible_at_byte, scala_pattern_binder_names,
@@ -1221,6 +1221,24 @@ impl ProjectTypes {
             .filter(|unit| unit.is_function())
             .collect::<Vec<_>>();
         self.method_declarations_for_members(scala, &members, call_arities)
+            .into_iter()
+            .map(|method| method.fq_name())
+            .collect()
+    }
+
+    fn imported_member_targets_with_shape(
+        &self,
+        scala: &ScalaAnalyzer,
+        member_fqn: &str,
+        call_shape: &ScalaCallSiteShape,
+    ) -> Vec<String> {
+        let members = self
+            .index
+            .by_fqn(member_fqn)
+            .iter()
+            .filter(|unit| unit.is_function())
+            .collect::<Vec<_>>();
+        self.method_declarations_for_members_with_shape(scala, &members, call_shape)
             .into_iter()
             .map(|method| method.fq_name())
             .collect()
@@ -5420,6 +5438,12 @@ fn record_reference(
             {
                 return;
             }
+            // The enclosing `call_expression` owns callable-shape resolution.
+            // Visiting its bare function identifier again must not add an
+            // unshaped imported-member edge after an arity mismatch.
+            if node.kind() == "identifier" && is_call_function_reference(node) {
+                return;
+            }
             if record_local_stable_field_reference(node, ctx, bindings)
                 || record_enclosing_field_qualifier(node, name, ctx, bindings)
                 || record_qualified_stable_reference(node, ctx, bindings)
@@ -5460,6 +5484,25 @@ fn record_reference(
                 }
             }
             if bindings.is_shadowed(name) {
+                return;
+            }
+            if let Some(call_shape) = call_site_shape_for_reference(node)
+                && call_shape.type_arguments_only
+            {
+                if record_lexically_visible_call(node, name, &call_shape, ctx) {
+                    return;
+                }
+                if let Some(imported) = ctx.resolver.resolve_member(name) {
+                    for target in ctx.types.imported_member_targets_with_shape(
+                        ctx.scala,
+                        &imported,
+                        &call_shape,
+                    ) {
+                        ctx.record(target, node);
+                    }
+                    return;
+                }
+                record_unqualified_type_application(node, name, ctx, bindings);
                 return;
             }
             if bare_companion_method_value {
@@ -5899,6 +5942,7 @@ fn call_parameter_method_value_context(
     let mut arguments_cursor = arguments.walk();
     let Some(parameter_index) = arguments
         .named_children(&mut arguments_cursor)
+        .filter(|argument| is_semantic_call_argument(*argument))
         .position(|argument| argument == node)
     else {
         return ScalaMethodValueContext::Unknown;

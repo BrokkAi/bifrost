@@ -2420,6 +2420,70 @@ object Use {
 }
 
 #[test]
+fn scala_usage_finder_handles_generic_only_calls_and_semantic_argument_arity() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Calls.scala",
+        r#"package app
+trait Context
+object Api {
+  def plain[A]: Int = 1
+  def contextual[A](using Context): Int = 2
+  def explicitZero[A](): Int = 3
+  def explicitOne[A](value: Int): Int = value
+  def five(a: Int, b: Int, c: Int, d: Int, e: Int): Int = a + b + c + d + e
+  def transform(value: String): String = value
+  def transform(left: String, right: String): String = left + right
+  def consume(marker: Int, run: String => String): String = run(marker.toString)
+}
+object Use {
+  import Api.*
+  given Context = new Context {}
+  val plainResult = plain[Int] // positive-generic-plain
+  val contextualResult = contextual[Int] // positive-generic-contextual
+  val missingParens = explicitZero[Int] // negative-generic-explicit-zero
+  val missingValue = explicitOne[Int] // negative-generic-explicit-one
+  val exact = five(1, 2, 3, 4, 5 /* unused */) // positive-commented-arity
+  val extra = five(1, 2, 3, 4, 5, 6 /* unused */) // negative-real-extra-argument
+  val methodValue = consume(1, /* ignored */ transform) // positive-commented-parameter-index
+}
+"#,
+    )]);
+
+    for (target_fqn, positive) in [
+        ("app.Api$.plain", "positive-generic-plain"),
+        ("app.Api$.contextual", "positive-generic-contextual"),
+        ("app.Api$.five", "positive-commented-arity"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&target_hits, positive);
+        if target_fqn.ends_with(".five") {
+            assert_no_hit_contains(&target_hits, "negative-real-extra-argument");
+        }
+    }
+
+    for (target_fqn, negative) in [
+        ("app.Api$.explicitZero", "negative-generic-explicit-zero"),
+        ("app.Api$.explicitOne", "negative-generic-explicit-one"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_no_hit_contains(&target_hits, negative);
+    }
+
+    let transforms = analyzer.get_definitions("app.Api$.transform");
+    assert_eq!(
+        transforms.len(),
+        1,
+        "same-file overloads share one physical definition"
+    );
+    let transform_hits = hits(UsageFinder::new().find_usages_default(&analyzer, &transforms));
+    assert_hit_contains(&transform_hits, "positive-commented-parameter-index");
+}
+
+#[test]
 fn scala_usage_finder_shares_structured_call_list_semantics() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "app/Calls.scala",
