@@ -21,9 +21,10 @@ use crate::analyzer::usages::csharp_graph::{
     member_access_receiver as csharp_member_access_receiver, seed_csharp_bindings_before,
 };
 use crate::analyzer::usages::go_graph::{
-    GoIndexedMemberLookup, GoReferenceResolution, extract_go_import_path,
-    go_embedded_field_unit_type_text, go_simple_type_name, go_type_name_parts,
-    go_unique_indexed_member_candidate_at_nearest_depth, resolve_go_reference_with_namespaces,
+    GoIndexedMemberLookup, GoReferenceResolution, GoSelectorDescriptor, extract_go_import_path,
+    go_embedded_field_unit_type_text, go_selector_descriptor, go_simple_type_name,
+    go_type_name_parts, go_unique_indexed_member_candidate_at_nearest_depth,
+    resolve_go_reference_with_namespaces,
 };
 use crate::analyzer::usages::inverted_edges::{ClassRangeIndex, first_precise};
 use crate::analyzer::usages::java_graph::java_signature_arity;
@@ -721,6 +722,9 @@ fn resolve_one(
         ),
         Language::Go => {
             let go = resolve_analyzer::<GoAnalyzer>(analyzer);
+            let selector = tree
+                .as_ref()
+                .and_then(|tree| go_selector_descriptor(tree.root_node(), &site));
             let resolution = go.and_then(|go| {
                 let tree = tree.as_ref()?;
                 let batch = context.go_context(go, &request.file, &source, tree);
@@ -731,6 +735,7 @@ fn resolve_one(
                     &batch.aliases,
                     &batch.dot_imports,
                     &site,
+                    selector.as_ref(),
                 ))
             });
             if let Some(go_analyzer) = go {
@@ -741,6 +746,7 @@ fn resolve_one(
                     &source,
                     tree.as_ref(),
                     &site,
+                    selector.as_ref(),
                     resolution,
                 )
             } else {
@@ -823,35 +829,6 @@ fn finish_lookup_outcome(
 ) -> DefinitionLookupOutcome {
     outcome.reference = Some(site);
     outcome
-}
-
-fn dotted_reference_segments(site: &ResolvedReferenceSite) -> Option<Vec<(String, usize, usize)>> {
-    let mut segments = Vec::new();
-    let mut offset = 0usize;
-    for part in site.text.split('.') {
-        if part.is_empty()
-            || !part
-                .chars()
-                .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-        {
-            return None;
-        }
-        let start = offset;
-        let end = start + part.len();
-        segments.push((part.to_string(), start, end));
-        offset = end + 1;
-    }
-    Some(segments)
-}
-
-fn dotted_focus_segment_index(
-    site: &ResolvedReferenceSite,
-    segments: &[(String, usize, usize)],
-) -> Option<usize> {
-    let focus = site.focus_start_byte.checked_sub(site.range.start_byte)?;
-    segments
-        .iter()
-        .position(|(_, start, end)| *start <= focus && focus < *end)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
