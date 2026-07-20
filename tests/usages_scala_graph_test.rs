@@ -2484,6 +2484,97 @@ object Use {
 }
 
 #[test]
+fn scala_method_values_use_expected_parameter_type_before_overload_uniqueness() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("model/TokenOne.scala", "package model\nclass Token\n"),
+        ("model/TokenTwo.scala", "package model\nclass Token\n"),
+        (
+            "app/LocalTokenDuplicate.scala",
+            "package app\nclass LocalToken\n",
+        ),
+        ("shadow/String.scala", "package shadow\nclass String\n"),
+        (
+            "app/Candidates.scala",
+            "package app\nobject Candidates { def builtin(value: String): Unit = () }\n",
+        ),
+        (
+            "app/ShadowUse.scala",
+            r#"package app
+import shadow.String
+import Candidates.builtin
+
+object ShadowUse {
+  private def consume(value: String)(f: String => Unit): Unit = f(value)
+  val rejected = consume(null)(builtin) // negative-shadowed-builtin-string
+}
+"#,
+        ),
+        (
+            "app/Yaml.scala",
+            r#"package app
+import model.Token
+
+class LocalToken
+
+object Yaml {
+  object Cst { class Document }
+
+  def parse(input: String): String = input
+  def parse(document: Cst.Document): String = "document"
+  def parse(input: String, index: Int): String = input + index
+  def wrong(value: Int): String = value.toString
+  def binary(value: String, index: Int): String = value + index
+  def unknown(value: Missing): String = "unknown"
+  def ambiguous(value: Token): String = "ambiguous"
+  def exact(value: LocalToken): String = "exact"
+
+  private def consumeString(value: String)(f: String => String): String = f(value)
+  private def consumeDocument(value: Cst.Document)(f: Cst.Document => String): String = f(value)
+  private def consumeMissing(value: Missing)(f: Missing => String): String = f(value)
+  private def consumeToken(value: Token)(f: Token => String): String = f(value)
+  private def consumeLocal(value: LocalToken)(f: LocalToken => String): String = f(value)
+
+  val fromString = consumeString("yaml")(parse) // positive-string-method-value
+  val fromDocument = consumeDocument(new Cst.Document)(parse) // positive-document-method-value
+  val wrongSameArity = consumeString("yaml")(wrong) // negative-same-arity-type
+  val wrongBinary = consumeString("yaml")(binary) // negative-binary-method-value
+  val unresolved = consumeMissing(null)(unknown) // negative-unresolved-parameter-type
+  val physicallyAmbiguous = consumeToken(null)(ambiguous) // negative-ambiguous-parameter-type
+  val sourceExact = consumeLocal(new LocalToken)(exact) // positive-source-exact-duplicate-type
+}
+"#,
+        ),
+    ]);
+
+    let parse = definition(&analyzer, "app.Yaml$.parse");
+    let parse_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&parse)));
+    assert_hit_contains(&parse_hits, "positive-string-method-value");
+    assert_hit_contains(&parse_hits, "positive-document-method-value");
+
+    let exact = definition(&analyzer, "app.Yaml$.exact");
+    let exact_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&exact)));
+    assert_hit_contains(&exact_hits, "positive-source-exact-duplicate-type");
+
+    for (target, marker) in [
+        ("app.Yaml$.wrong", "negative-same-arity-type"),
+        ("app.Yaml$.binary", "negative-binary-method-value"),
+        ("app.Yaml$.unknown", "negative-unresolved-parameter-type"),
+        ("app.Yaml$.ambiguous", "negative-ambiguous-parameter-type"),
+        (
+            "app.Candidates$.builtin",
+            "negative-shadowed-builtin-string",
+        ),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_no_hit_contains(&target_hits, marker);
+    }
+}
+
+#[test]
 fn scala_usage_finder_shares_structured_call_list_semantics() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "app/Calls.scala",

@@ -2338,6 +2338,100 @@ object Use {
 }
 
 #[test]
+fn scala_inverted_method_values_use_expected_parameter_type_before_uniqueness() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("model/TokenOne.scala", "package model\nclass Token\n")
+        .file("model/TokenTwo.scala", "package model\nclass Token\n")
+        .file(
+            "app/LocalTokenDuplicate.scala",
+            "package app\nclass LocalToken\n",
+        )
+        .file("shadow/String.scala", "package shadow\nclass String\n")
+        .file(
+            "app/Candidates.scala",
+            "package app\nobject Candidates { def builtin(value: String): Unit = () }\n",
+        )
+        .file(
+            "app/ShadowUse.scala",
+            r#"package app
+import shadow.String
+import Candidates.builtin
+
+object ShadowUse {
+  private def consume(value: String)(f: String => Unit): Unit = f(value)
+  def rejected: Unit = consume(null)(builtin)
+}
+"#,
+        )
+        .file(
+            "app/Yaml.scala",
+            r#"package app
+import model.Token
+
+class LocalToken
+
+object Yaml {
+  object Cst { class Document }
+
+  def parse(input: String): String = input
+  def parse(document: Cst.Document): String = "document"
+  def parse(input: String, index: Int): String = input + index
+  def wrong(value: Int): String = value.toString
+  def binary(value: String, index: Int): String = value + index
+  def unknown(value: Missing): String = "unknown"
+  def ambiguous(value: Token): String = "ambiguous"
+  def exact(value: LocalToken): String = "exact"
+
+  private def consumeString(value: String)(f: String => String): String = f(value)
+  private def consumeDocument(value: Cst.Document)(f: Cst.Document => String): String = f(value)
+  private def consumeMissing(value: Missing)(f: Missing => String): String = f(value)
+  private def consumeToken(value: Token)(f: Token => String): String = f(value)
+  private def consumeLocal(value: LocalToken)(f: LocalToken => String): String = f(value)
+
+  def fromString: String = consumeString("yaml")(parse)
+  def fromDocument: String = consumeDocument(new Cst.Document)(parse)
+  def wrongSameArity: String = consumeString("yaml")(wrong)
+  def wrongBinary: String = consumeString("yaml")(binary)
+  def unresolved: String = consumeMissing(null)(unknown)
+  def physicallyAmbiguous: String = consumeToken(null)(ambiguous)
+  def sourceExact: String = consumeLocal(new LocalToken)(exact)
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+
+    assert!(
+        has_edge(&value, "app.Yaml$.fromString", "app.Yaml$.parse"),
+        "String method value did not select parse: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "app.Yaml$.fromDocument", "app.Yaml$.parse"),
+        "Document method value did not select parse: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "app.Yaml$.sourceExact", "app.Yaml$.exact"),
+        "source-exact duplicate type did not select exact: {}",
+        value["edges"]
+    );
+    for (caller, callee) in [
+        ("app.Yaml$.wrongSameArity", "app.Yaml$.wrong"),
+        ("app.Yaml$.wrongBinary", "app.Yaml$.binary"),
+        ("app.Yaml$.unresolved", "app.Yaml$.unknown"),
+        ("app.Yaml$.physicallyAmbiguous", "app.Yaml$.ambiguous"),
+        ("app.ShadowUse$.rejected", "app.Candidates$.builtin"),
+    ] {
+        assert!(
+            !has_edge(&value, caller, callee),
+            "incompatible method value leaked {caller} -> {callee}: {}",
+            value["edges"]
+        );
+    }
+}
+
+#[test]
 fn scala_inverted_keeps_overload_shape_receiver_and_return_facts_aligned() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

@@ -1,7 +1,9 @@
 use crate::analyzer::scala::{scala_package_prefixes_at, scala_type_lookup_segments};
-use crate::analyzer::{CallableArity, ImportInfo, scala_parenthesized_arity};
+use crate::analyzer::{CallableArity, CodeUnit, ImportInfo, scala_parenthesized_arity};
 use crate::hash::{HashMap, HashSet};
 use tree_sitter::{Node, Parser};
+
+type ScalaParameterFunctionTypePaths = Vec<Vec<Option<Vec<Option<Vec<String>>>>>>;
 
 #[derive(Default)]
 pub(crate) struct ScalaSourceFacts {
@@ -18,6 +20,8 @@ pub(crate) struct ScalaCallableSourceAlternative {
     pub(crate) role: ScalaCallableRole,
     pub(crate) shape: Vec<ScalaCallableParameterList>,
     pub(crate) parameter_function_arities: Vec<Vec<Option<usize>>>,
+    pub(crate) parameter_type_paths: Vec<Vec<Option<Vec<String>>>>,
+    pub(crate) parameter_function_type_paths: ScalaParameterFunctionTypePaths,
     pub(crate) extension_receiver_type_path: Option<Vec<String>>,
     pub(crate) return_type_path: Option<Vec<String>>,
 }
@@ -29,11 +33,34 @@ pub(crate) enum ScalaCallableRole {
     SecondaryConstructor,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ScalaMethodValueContext {
     Unknown,
-    Function(usize),
+    Function(ScalaFunctionParameterShape),
     Incompatible,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ScalaParameterTypeIdentity {
+    Builtin(&'static str),
+    Declaration(CodeUnit),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ScalaFunctionParameterShape {
+    pub(crate) arity: usize,
+    pub(crate) parameter_types: Option<Vec<ScalaParameterTypeIdentity>>,
+    pub(crate) parameter_types_authoritative: bool,
+}
+
+impl ScalaFunctionParameterShape {
+    pub(crate) fn arity_only(arity: usize) -> Self {
+        Self {
+            arity,
+            parameter_types: None,
+            parameter_types_authoritative: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +86,8 @@ pub(crate) struct ScalaCallArgumentList {
 pub(crate) struct ScalaCallSiteShape {
     pub(crate) lists: Vec<ScalaCallArgumentList>,
     pub(crate) method_value_arity: Option<usize>,
+    pub(crate) method_value_parameter_types: Option<Vec<ScalaParameterTypeIdentity>>,
+    pub(crate) method_value_parameter_types_authoritative: bool,
     pub(crate) type_arguments_only: bool,
 }
 
@@ -74,12 +103,28 @@ impl ScalaCallSiteShape {
                 })
                 .collect(),
             method_value_arity: None,
+            method_value_parameter_types: None,
+            method_value_parameter_types_authoritative: false,
             type_arguments_only: false,
         }
     }
 
     pub(crate) fn with_method_value_arity(mut self, arity: Option<usize>) -> Self {
         self.method_value_arity = arity;
+        self.method_value_parameter_types = None;
+        self.method_value_parameter_types_authoritative = false;
+        self
+    }
+
+    pub(crate) fn with_method_value_shape(
+        mut self,
+        shape: Option<ScalaFunctionParameterShape>,
+    ) -> Self {
+        self.method_value_arity = shape.as_ref().map(|shape| shape.arity);
+        self.method_value_parameter_types_authoritative = shape
+            .as_ref()
+            .is_some_and(|shape| shape.parameter_types_authoritative);
+        self.method_value_parameter_types = shape.and_then(|shape| shape.parameter_types);
         self
     }
 }
@@ -191,6 +236,16 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                     .copied()
                     .map(parameter_function_arities)
                     .collect();
+                let parameter_type_paths = parameter_lists
+                    .iter()
+                    .copied()
+                    .map(|parameters| parameter_type_paths(parameters, source))
+                    .collect();
+                let parameter_function_type_paths = parameter_lists
+                    .iter()
+                    .copied()
+                    .map(|parameters| parameter_function_type_paths(parameters, source))
+                    .collect();
                 facts.callable_alternatives_by_range.insert(
                     (node.start_byte(), node.end_byte()),
                     ScalaCallableSourceAlternative {
@@ -202,6 +257,8 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                             }),
                         shape,
                         parameter_function_arities,
+                        parameter_type_paths,
+                        parameter_function_type_paths,
                         extension_receiver_type_path: enclosing_extension_receiver_type_path(
                             node, source,
                         ),
@@ -230,6 +287,8 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                         role: ScalaCallableRole::PrimaryConstructor,
                         shape: lists,
                         parameter_function_arities: Vec::new(),
+                        parameter_type_paths: Vec::new(),
+                        parameter_function_type_paths: Vec::new(),
                         extension_receiver_type_path: None,
                         return_type_path: None,
                     },
@@ -474,6 +533,66 @@ fn parameter_function_arities(parameters: Node<'_>) -> Vec<Option<usize>> {
                 .and_then(function_type_arity)
         })
         .collect()
+}
+
+fn parameter_type_paths(parameters: Node<'_>, source: &str) -> Vec<Option<Vec<String>>> {
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter(|parameter| matches!(parameter.kind(), "parameter" | "class_parameter"))
+        .map(|parameter| {
+            parameter
+                .child_by_field_name("type")
+                .and_then(|type_node| named_type_path(type_node, source))
+        })
+        .collect()
+}
+
+fn parameter_function_type_paths(
+    parameters: Node<'_>,
+    source: &str,
+) -> Vec<Option<Vec<Option<Vec<String>>>>> {
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter(|parameter| matches!(parameter.kind(), "parameter" | "class_parameter"))
+        .map(|parameter| {
+            parameter
+                .child_by_field_name("type")
+                .and_then(|type_node| function_parameter_type_paths(type_node, source))
+        })
+        .collect()
+}
+
+fn function_parameter_type_paths(
+    type_node: Node<'_>,
+    source: &str,
+) -> Option<Vec<Option<Vec<String>>>> {
+    if type_node.kind() != "function_type" {
+        return None;
+    }
+    let parameter_types = type_node.child_by_field_name("parameter_types")?;
+    let mut cursor = parameter_types.walk();
+    Some(
+        parameter_types
+            .named_children(&mut cursor)
+            .map(|parameter_type| named_type_path(parameter_type, source))
+            .collect(),
+    )
+}
+
+/// Preserve only parser-proven named type paths. Applied, function, union, and
+/// other compound types need richer structural comparison; treating only
+/// their leading constructor as exact would make same-arity overloads unsafe.
+fn named_type_path(type_node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    if !matches!(
+        type_node.kind(),
+        "type_identifier" | "stable_type_identifier" | "projected_type"
+    ) {
+        return None;
+    }
+    let path = scala_type_lookup_segments(type_node, source);
+    (!path.is_empty()).then_some(path)
 }
 
 fn function_type_arity(type_node: Node<'_>) -> Option<usize> {
@@ -1191,6 +1310,8 @@ pub(crate) fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallS
                 kind: ScalaCallArgumentListKind::Ordinary,
             }],
             method_value_arity: None,
+            method_value_parameter_types: None,
+            method_value_parameter_types_authoritative: false,
             type_arguments_only: false,
         });
     }
@@ -1248,6 +1369,8 @@ pub(crate) fn call_site_shape_for_reference(node: Node<'_>) -> Option<ScalaCallS
     (!lists.is_empty()).then_some(ScalaCallSiteShape {
         lists,
         method_value_arity: None,
+        method_value_parameter_types: None,
+        method_value_parameter_types_authoritative: false,
         type_arguments_only,
     })
 }
@@ -1749,6 +1872,8 @@ mod tests {
         let supplied = ScalaCallSiteShape {
             lists: vec![ordinary],
             method_value_arity: None,
+            method_value_parameter_types: None,
+            method_value_parameter_types_authoritative: false,
             type_arguments_only: false,
         };
         assert_eq!(
@@ -1765,6 +1890,8 @@ mod tests {
                 &ScalaCallSiteShape {
                     lists: vec![empty],
                     method_value_arity: None,
+                    method_value_parameter_types: None,
+                    method_value_parameter_types_authoritative: false,
                     type_arguments_only: false,
                 }
             ),
@@ -1776,6 +1903,8 @@ mod tests {
                 &ScalaCallSiteShape {
                     lists: vec![ordinary],
                     method_value_arity: None,
+                    method_value_parameter_types: None,
+                    method_value_parameter_types_authoritative: false,
                     type_arguments_only: false,
                 }
             ),
@@ -1785,6 +1914,8 @@ mod tests {
         let partial = ScalaCallSiteShape {
             lists: vec![ordinary],
             method_value_arity: Some(1),
+            method_value_parameter_types: None,
+            method_value_parameter_types_authoritative: false,
             type_arguments_only: false,
         };
         assert_eq!(

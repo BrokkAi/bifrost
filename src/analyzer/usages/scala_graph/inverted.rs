@@ -37,14 +37,15 @@ use super::resolver::{
 use super::shared::ScalaEdgeGraph;
 use super::syntax::{
     ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableRole, ScalaCallableSiteRole,
-    ScalaCallableUsePolicy, ScalaImportContextIndex, ScalaMethodValueContext,
-    ScalaPackageContextIndex, ScalaQualifiedStableTypeRole, ScalaSourceFacts,
-    call_arities_for_reference, call_site_shape_for_reference, enclosing_template_declarations,
-    invocation_function_reference, is_bare_companion_method_value_reference,
-    is_call_function_reference, is_constructor_like_reference, is_declaration_name,
-    is_extractor_reference, is_infix_pattern_operator, is_scala_case_pattern_binder,
-    is_scala_class_reference, is_scala_named_argument_assignment, is_scala_object_reference,
-    is_semantic_call_argument, is_terminal_stable_field_reference, node_text, parenthesized_arity,
+    ScalaCallableUsePolicy, ScalaFunctionParameterShape, ScalaImportContextIndex,
+    ScalaMethodValueContext, ScalaPackageContextIndex, ScalaParameterTypeIdentity,
+    ScalaQualifiedStableTypeRole, ScalaSourceFacts, call_arities_for_reference,
+    call_site_shape_for_reference, enclosing_template_declarations, invocation_function_reference,
+    is_bare_companion_method_value_reference, is_call_function_reference,
+    is_constructor_like_reference, is_declaration_name, is_extractor_reference,
+    is_infix_pattern_operator, is_scala_case_pattern_binder, is_scala_class_reference,
+    is_scala_named_argument_assignment, is_scala_object_reference, is_semantic_call_argument,
+    is_terminal_stable_field_reference, node_text, parenthesized_arity,
     qualified_stable_type_reference, resolve_stable_object_expression,
     scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
     scala_callable_shape_matches, scala_import_is_visible_at_byte, scala_pattern_binder_names,
@@ -1164,19 +1165,30 @@ impl ProjectTypes {
             ScalaCallMatch::Shape(shape) => candidates
                 .iter()
                 .map(|(method, facts, alternatives)| {
-                    count_callable_alternatives_matching(
-                        facts,
-                        alternatives,
-                        fallback_callable_role(scala, method),
-                        |alternative_role, declared| {
-                            scala_callable_alternative_is_candidate(
-                                alternative_role,
-                                declared,
-                                shape,
-                                site_role,
-                            )
-                        },
-                    )
+                    if alternatives.is_empty() {
+                        if shape.method_value_parameter_types_authoritative {
+                            return 0;
+                        }
+                        let fallback = facts
+                            .callable_arity
+                            .or_else(|| facts.arity.map(CallableArity::exact))
+                            .map(ScalaCallableParameterList::explicit)
+                            .into_iter()
+                            .collect::<Vec<_>>();
+                        usize::from(scala_callable_alternative_is_candidate(
+                            fallback_callable_role(scala, method),
+                            &fallback,
+                            shape,
+                            site_role,
+                        ))
+                    } else {
+                        alternatives
+                            .iter()
+                            .filter(|alternative| {
+                                callable_alternative_is_candidate(alternative, shape, site_role)
+                            })
+                            .count()
+                    }
                 })
                 .sum::<usize>(),
         };
@@ -1192,20 +1204,35 @@ impl ProjectTypes {
                     site_role,
                     unique_callable,
                 ),
-                ScalaCallMatch::Shape(shape) => any_callable_alternative(
-                    facts,
-                    alternatives,
-                    fallback_callable_role(scala, method),
-                    |alternative_role, declared| {
+                ScalaCallMatch::Shape(shape) => {
+                    if alternatives.is_empty() {
+                        if shape.method_value_parameter_types_authoritative {
+                            return false;
+                        }
+                        let fallback = facts
+                            .callable_arity
+                            .or_else(|| facts.arity.map(CallableArity::exact))
+                            .map(ScalaCallableParameterList::explicit)
+                            .into_iter()
+                            .collect::<Vec<_>>();
                         scala_callable_alternative_matches(
-                            alternative_role,
-                            declared,
+                            fallback_callable_role(scala, method),
+                            &fallback,
                             Some(shape),
                             site_role,
                             unique_callable,
                         )
-                    },
-                ),
+                    } else {
+                        alternatives.iter().any(|alternative| {
+                            callable_alternative_matches(
+                                alternative,
+                                Some(shape),
+                                site_role,
+                                unique_callable,
+                            )
+                        })
+                    }
+                }
             })
             .map(|(method, _, _)| (*method).clone())
             .collect()
@@ -1523,22 +1550,40 @@ impl ProjectTypes {
         parameter_list: usize,
         parameter_index: usize,
     ) -> Option<usize> {
+        self.callable_parameter_function_shape(
+            scala,
+            method,
+            call_arities,
+            parameter_list,
+            parameter_index,
+        )
+        .map(|shape| shape.arity)
+    }
+
+    pub(crate) fn callable_parameter_function_shape(
+        &self,
+        scala: &ScalaAnalyzer,
+        method: &CodeUnit,
+        call_arities: &[usize],
+        parameter_list: usize,
+        parameter_index: usize,
+    ) -> Option<ScalaFunctionParameterShape> {
         let alternatives = self.callable_alternatives_for(scala, method);
         let mut resolved = None;
         for alternative in alternatives.iter().filter(|alternative| {
             alternative.role == ScalaCallableRole::Ordinary
                 && ordinary_callable_shape_matches(&alternative.shape, Some(call_arities), true)
         }) {
-            let arity = alternative
-                .parameter_function_arities
+            let shape = alternative
+                .parameter_function_shapes
                 .get(parameter_list)
                 .and_then(|parameters| parameters.get(parameter_index))
-                .copied()
+                .cloned()
                 .flatten()?;
-            if resolved.is_some_and(|resolved| resolved != arity) {
+            if resolved.as_ref().is_some_and(|resolved| resolved != &shape) {
                 return None;
             }
-            resolved = Some(arity);
+            resolved = Some(shape);
         }
         resolved
     }
@@ -3163,7 +3208,59 @@ impl ProjectTypes {
                         .map(|facts| CallableAlternative {
                             role: facts.role,
                             shape: facts.shape.clone(),
-                            parameter_function_arities: facts.parameter_function_arities.clone(),
+                            parameter_types: facts
+                                .parameter_type_paths
+                                .iter()
+                                .map(|parameters| {
+                                    parameters
+                                        .iter()
+                                        .map(|path| {
+                                            path.as_deref().and_then(|path| {
+                                                self.resolve_callable_parameter_type_identity(
+                                                    scala,
+                                                    &declaration_resolver,
+                                                    target,
+                                                    path,
+                                                )
+                                            })
+                                        })
+                                        .collect()
+                                })
+                                .collect(),
+                            parameter_function_shapes: facts
+                                .parameter_function_arities
+                                .iter()
+                                .zip(&facts.parameter_function_type_paths)
+                                .map(|(arities, parameter_paths)| {
+                                    arities
+                                        .iter()
+                                        .zip(parameter_paths)
+                                        .map(|(arity, paths)| {
+                                            let arity = (*arity)?;
+                                            let parameter_types = paths.as_ref().and_then(|paths| {
+                                                paths
+                                                    .iter()
+                                                    .map(|path| {
+                                                        path.as_deref().and_then(|path| {
+                                                            self.resolve_callable_parameter_type_identity(
+                                                                scala,
+                                                                &declaration_resolver,
+                                                                target,
+                                                                path,
+                                                            )
+                                                        })
+                                                    })
+                                                    .collect::<Option<Vec<_>>>()
+                                            });
+                                            Some(ScalaFunctionParameterShape {
+                                                arity,
+                                                parameter_types,
+                                                parameter_types_authoritative: true,
+                                            })
+                                        })
+                                        .collect()
+                                })
+                                .collect(),
                             extension_receiver_type: facts
                                 .extension_receiver_type_path
                                 .as_deref()
@@ -3215,7 +3312,8 @@ impl ProjectTypes {
                             ScalaCallableRole::Ordinary
                         },
                         shape: vec![ScalaCallableParameterList::explicit(arity)],
-                        parameter_function_arities: Vec::new(),
+                        parameter_types: Vec::new(),
+                        parameter_function_shapes: Vec::new(),
                         extension_receiver_type: None,
                         return_type: None,
                     })
@@ -3235,7 +3333,8 @@ impl ProjectTypes {
                         ScalaCallableRole::Ordinary
                     },
                     shape: vec![ScalaCallableParameterList::explicit(arity)],
-                    parameter_function_arities: Vec::new(),
+                    parameter_types: Vec::new(),
+                    parameter_function_shapes: Vec::new(),
                     extension_receiver_type: None,
                     return_type: self
                         .facts
@@ -3246,6 +3345,107 @@ impl ProjectTypes {
             Arc::new(fallback)
         })
         .clone()
+    }
+
+    fn resolve_callable_parameter_type_identity(
+        &self,
+        scala: &ScalaAnalyzer,
+        resolver: &NameResolver,
+        declaration: &CodeUnit,
+        path: &[String],
+    ) -> Option<ScalaParameterTypeIdentity> {
+        if let Some(declaration) =
+            self.resolve_callable_parameter_type_unit(scala, resolver, declaration, path)
+        {
+            return Some(ScalaParameterTypeIdentity::Declaration(declaration));
+        }
+        let [simple] = path else {
+            return None;
+        };
+        if resolver.has_type_or_object_or_package_binding(simple) {
+            return None;
+        }
+        scala_builtin_type_name(simple).map(ScalaParameterTypeIdentity::Builtin)
+    }
+
+    fn resolve_callable_parameter_type_unit(
+        &self,
+        scala: &ScalaAnalyzer,
+        resolver: &NameResolver,
+        declaration: &CodeUnit,
+        path: &[String],
+    ) -> Option<CodeUnit> {
+        let (first, rest) = path.split_first()?;
+        if rest.is_empty() {
+            let fqn = resolver.resolve(first)?;
+            let candidates = self
+                .index
+                .by_fqn(&fqn)
+                .iter()
+                .filter(|unit| unit.is_class() && !unit.short_name().ends_with('$'))
+                .cloned()
+                .collect::<Vec<_>>();
+            let same_source = candidates
+                .iter()
+                .filter(|unit| unit.source() == declaration.source())
+                .cloned()
+                .collect::<Vec<_>>();
+            return match same_source.as_slice() {
+                [exact] => Some(exact.clone()),
+                [] => match candidates.as_slice() {
+                    [exact] => Some(exact.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+        }
+
+        let mut scope = scala
+            .structural_parent_of(declaration)
+            .or_else(|| scala.parent_of(declaration));
+        let mut seen = HashSet::default();
+        while let Some(owner) = scope {
+            if !seen.insert(owner.clone()) {
+                break;
+            }
+            let mut roots = self.exact_nested_objects_for_owner(scala, &owner, first);
+            roots.extend(self.exact_nested_types_for_owner(scala, &owner, first));
+            roots.sort();
+            roots.dedup();
+            if let [root] = roots.as_slice() {
+                let mut owners = vec![root.clone()];
+                for segment in &rest[..rest.len() - 1] {
+                    owners = owners
+                        .iter()
+                        .flat_map(|owner| {
+                            self.exact_nested_objects_for_owner(scala, owner, segment)
+                        })
+                        .collect();
+                    owners.sort();
+                    owners.dedup();
+                    if owners.len() != 1 {
+                        break;
+                    }
+                }
+                if owners.len() == 1 {
+                    let terminal = rest.last()?;
+                    let mut matches =
+                        self.exact_nested_types_for_owner(scala, &owners[0], terminal);
+                    matches.sort();
+                    matches.dedup();
+                    if let [exact] = matches.as_slice() {
+                        return Some(exact.clone());
+                    }
+                }
+            } else if !roots.is_empty() {
+                return None;
+            }
+            scope = scala
+                .structural_parent_of(&owner)
+                .or_else(|| scala.parent_of(&owner));
+        }
+
+        self.resolve_qualified_stable_type_unit_at(scala, resolver, path, false, None)
     }
 
     fn exact_case_class_for_companion_apply(
@@ -4016,9 +4216,87 @@ impl ProjectTypes {
 pub(crate) struct CallableAlternative {
     pub(crate) role: ScalaCallableRole,
     pub(crate) shape: Vec<ScalaCallableParameterList>,
-    pub(crate) parameter_function_arities: Vec<Vec<Option<usize>>>,
+    pub(crate) parameter_types: Vec<Vec<Option<ScalaParameterTypeIdentity>>>,
+    pub(crate) parameter_function_shapes: Vec<Vec<Option<ScalaFunctionParameterShape>>>,
     pub(crate) extension_receiver_type: Option<String>,
     pub(crate) return_type: Option<String>,
+}
+
+pub(crate) fn callable_alternative_is_candidate(
+    alternative: &CallableAlternative,
+    actual: &ScalaCallSiteShape,
+    site_role: ScalaCallableSiteRole,
+) -> bool {
+    scala_callable_alternative_is_candidate(alternative.role, &alternative.shape, actual, site_role)
+        && method_value_parameter_types_match(alternative, actual)
+}
+
+pub(crate) fn callable_alternative_matches(
+    alternative: &CallableAlternative,
+    actual: Option<&ScalaCallSiteShape>,
+    site_role: ScalaCallableSiteRole,
+    unique_callable: bool,
+) -> bool {
+    scala_callable_alternative_matches(
+        alternative.role,
+        &alternative.shape,
+        actual,
+        site_role,
+        unique_callable,
+    ) && actual.is_none_or(|actual| method_value_parameter_types_match(alternative, actual))
+}
+
+fn method_value_parameter_types_match(
+    alternative: &CallableAlternative,
+    actual: &ScalaCallSiteShape,
+) -> bool {
+    if !actual.method_value_parameter_types_authoritative {
+        return true;
+    }
+    let Some(expected) = actual.method_value_parameter_types.as_ref() else {
+        return false;
+    };
+    let Some(list_index) = next_explicit_parameter_list_index(&alternative.shape, actual) else {
+        return false;
+    };
+    let Some(declared) = alternative.parameter_types.get(list_index) else {
+        return false;
+    };
+    declared.len() == expected.len()
+        && declared
+            .iter()
+            .zip(expected)
+            .all(|(declared, expected)| declared.as_ref() == Some(expected))
+}
+
+fn next_explicit_parameter_list_index(
+    declared: &[ScalaCallableParameterList],
+    actual: &ScalaCallSiteShape,
+) -> Option<usize> {
+    let mut declared_index = 0usize;
+    for actual_list in &actual.lists {
+        if matches!(
+            actual_list.kind,
+            super::syntax::ScalaCallArgumentListKind::Ordinary
+                | super::syntax::ScalaCallArgumentListKind::Block
+        ) {
+            while declared
+                .get(declared_index)
+                .is_some_and(|list| list.kind == super::syntax::ScalaParameterListKind::Contextual)
+            {
+                declared_index += 1;
+            }
+        }
+        declared.get(declared_index)?;
+        declared_index += 1;
+    }
+    let mut remaining = declared
+        .iter()
+        .enumerate()
+        .skip(declared_index)
+        .filter(|(_, list)| list.kind == super::syntax::ScalaParameterListKind::Explicit);
+    let (index, _) = remaining.next()?;
+    remaining.next().is_none().then_some(index)
 }
 
 #[derive(Clone)]
@@ -4885,45 +5163,6 @@ fn callable_call_shape_matches(
     })
 }
 
-fn any_callable_alternative(
-    facts: &CallableFacts,
-    alternatives: &[CallableAlternative],
-    fallback_role: ScalaCallableRole,
-    mut predicate: impl FnMut(ScalaCallableRole, &[ScalaCallableParameterList]) -> bool,
-) -> bool {
-    if !alternatives.is_empty() {
-        return alternatives
-            .iter()
-            .any(|alternative| predicate(alternative.role, &alternative.shape));
-    }
-    let fallback = facts
-        .callable_arity
-        .or_else(|| facts.arity.map(crate::analyzer::CallableArity::exact))
-        .map(|arity| vec![ScalaCallableParameterList::explicit(arity)])
-        .unwrap_or_default();
-    predicate(fallback_role, &fallback)
-}
-
-fn count_callable_alternatives_matching(
-    facts: &CallableFacts,
-    alternatives: &[CallableAlternative],
-    fallback_role: ScalaCallableRole,
-    mut predicate: impl FnMut(ScalaCallableRole, &[ScalaCallableParameterList]) -> bool,
-) -> usize {
-    if !alternatives.is_empty() {
-        return alternatives
-            .iter()
-            .filter(|alternative| predicate(alternative.role, &alternative.shape))
-            .count();
-    }
-    let fallback = facts
-        .callable_arity
-        .or_else(|| facts.arity.map(crate::analyzer::CallableArity::exact))
-        .map(|arity| vec![ScalaCallableParameterList::explicit(arity)])
-        .unwrap_or_default();
-    usize::from(predicate(fallback_role, &fallback))
-}
-
 fn ordinary_callable_shape_matches(
     declared: &[ScalaCallableParameterList],
     call_arities: Option<&[usize]>,
@@ -5344,13 +5583,13 @@ fn record_reference(
                         let Some(call_shape) = call_site_shape_for_reference(field) else {
                             return;
                         };
-                        let method_value_arity =
+                        let method_value_shape =
                             match companion_method_value_context(node, ctx, bindings) {
-                                ScalaMethodValueContext::Function(arity) => Some(arity),
+                                ScalaMethodValueContext::Function(shape) => Some(shape),
                                 ScalaMethodValueContext::Unknown
                                 | ScalaMethodValueContext::Incompatible => None,
                             };
-                        let call_shape = call_shape.with_method_value_arity(method_value_arity);
+                        let call_shape = call_shape.with_method_value_shape(method_value_shape);
                         let call_arities = call_shape
                             .lists
                             .iter()
@@ -5421,13 +5660,13 @@ fn record_reference(
                     let Some(call_shape) = call_site_shape_for_reference(function) else {
                         return;
                     };
-                    let method_value_arity =
+                    let method_value_shape =
                         match companion_method_value_context(node, ctx, bindings) {
-                            ScalaMethodValueContext::Function(arity) => Some(arity),
+                            ScalaMethodValueContext::Function(shape) => Some(shape),
                             ScalaMethodValueContext::Unknown
                             | ScalaMethodValueContext::Incompatible => None,
                         };
-                    let call_shape = call_shape.with_method_value_arity(method_value_arity);
+                    let call_shape = call_shape.with_method_value_shape(method_value_shape);
                     if record_lexically_visible_call(function, name, &call_shape, ctx) {
                         return;
                     }
@@ -5547,6 +5786,34 @@ fn record_reference(
                     FieldResolution::NoMatch => {}
                 }
             }
+            if let ScalaMethodValueContext::Function(shape) =
+                companion_method_value_context(node, ctx, bindings)
+            {
+                let call_shape = ScalaCallSiteShape {
+                    lists: Vec::new(),
+                    method_value_arity: Some(shape.arity),
+                    method_value_parameter_types: shape.parameter_types,
+                    method_value_parameter_types_authoritative: shape.parameter_types_authoritative,
+                    type_arguments_only: false,
+                };
+                if record_lexically_visible_call(node, name, &call_shape, ctx) {
+                    return;
+                }
+                if let Some(imported) = ctx.resolver.resolve_member(name) {
+                    let targets = ctx.types.imported_member_targets_with_shape(
+                        ctx.scala,
+                        &imported,
+                        &call_shape,
+                    );
+                    for target in targets {
+                        ctx.record(target, node);
+                    }
+                    return;
+                }
+                if !bare_companion_method_value {
+                    return;
+                }
+            }
             if bindings.is_shadowed(name) {
                 return;
             }
@@ -5579,12 +5846,12 @@ fn record_reference(
                             None,
                         )
                     }
-                    ScalaMethodValueContext::Function(arity) => {
+                    ScalaMethodValueContext::Function(shape) => {
                         ctx.types.unique_companion_apply_method_value_target(
                             ctx.scala,
                             &ctx.resolver,
                             name,
-                            Some(&[arity]),
+                            Some(&[shape.arity]),
                         )
                     }
                     ScalaMethodValueContext::Incompatible => {
@@ -5985,9 +6252,9 @@ fn companion_method_value_context(
             return ScalaMethodValueContext::Incompatible;
         };
         let mut cursor = parameter_types.walk();
-        return ScalaMethodValueContext::Function(
+        return ScalaMethodValueContext::Function(ScalaFunctionParameterShape::arity_only(
             parameter_types.named_children(&mut cursor).count(),
-        );
+        ));
     }
     call_parameter_method_value_context(node, ctx, bindings)
 }
@@ -6076,7 +6343,7 @@ fn call_parameter_method_value_context(
 
     let mut resolved = None;
     for method in methods {
-        let Some(arity) = ctx.types.callable_parameter_function_arity(
+        let Some(shape) = ctx.types.callable_parameter_function_shape(
             ctx.scala,
             &method,
             &call_arities,
@@ -6085,10 +6352,10 @@ fn call_parameter_method_value_context(
         ) else {
             return ScalaMethodValueContext::Incompatible;
         };
-        if resolved.is_some_and(|resolved| resolved != arity) {
+        if resolved.as_ref().is_some_and(|resolved| resolved != &shape) {
             return ScalaMethodValueContext::Incompatible;
         }
-        resolved = Some(arity);
+        resolved = Some(shape);
     }
     resolved.map_or(
         ScalaMethodValueContext::Incompatible,
@@ -6150,14 +6417,12 @@ fn record_lexically_visible_call(
             .class_ranges
             .unit_for_exact_span(declaration.start_byte(), declaration.end_byte())
         {
-            match ctx
+            let resolution = ctx
                 .types
-                .effective_method_declarations_for_owner_with_shape(
-                    ctx.scala,
-                    &owner.fq_name(),
-                    member,
-                    call_shape,
-                ) {
+                .effective_method_declarations_for_exact_owner_with_shape(
+                    ctx.scala, owner, member, call_shape,
+                );
+            match resolution {
                 BareMemberResolution::Resolved(methods) => {
                     for method in methods {
                         ctx.record(method.fq_name(), node);
@@ -6165,7 +6430,13 @@ fn record_lexically_visible_call(
                     return true;
                 }
                 BareMemberResolution::Unresolved => return true,
-                BareMemberResolution::NoMatch => {}
+                BareMemberResolution::NoMatch => {
+                    if call_shape.method_value_parameter_types_authoritative
+                        && callable_name_is_bound_for_exact_owner(owner, member, ctx)
+                    {
+                        return true;
+                    }
+                }
             }
         }
         match ordinary_class_member_declarations_for_template(
@@ -6191,6 +6462,22 @@ fn record_lexically_visible_call(
         }
     }
     false
+}
+
+fn callable_name_is_bound_for_exact_owner(
+    owner: &CodeUnit,
+    member: &str,
+    ctx: &ScalaScan<'_, '_>,
+) -> bool {
+    ctx.types
+        .linearized_owners(ctx.scala, owner)
+        .iter()
+        .any(|owner| {
+            ctx.types
+                .members_for_exact_owner_unit(ctx.scala, owner, member)
+                .iter()
+                .any(|unit| unit.is_function())
+        })
 }
 
 fn record_lexically_visible_parameterless_method(

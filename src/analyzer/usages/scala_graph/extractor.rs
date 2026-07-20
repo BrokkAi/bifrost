@@ -1,6 +1,7 @@
 use super::inverted::{
     BareMemberResolution, FieldResolution, MemberReturnResolution, NameResolver, ProjectTypes,
-    TypeApplicationResolution, TypeApplicationRole,
+    TypeApplicationResolution, TypeApplicationRole, callable_alternative_is_candidate,
+    callable_alternative_matches,
 };
 use super::method_call_arity_applies;
 use crate::analyzer::scala::imports::scala_import_infos_from_node;
@@ -27,22 +28,21 @@ use crate::analyzer::usages::scala_graph::resolver::{
 };
 use crate::analyzer::usages::scala_graph::syntax::{
     ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableRole, ScalaCallableSiteRole,
-    ScalaCallableUsePolicy, ScalaImportContextIndex, ScalaMethodValueContext,
-    ScalaPackageContextIndex, ScalaQualifiedStableTypeRole, applied_expression_for_reference,
-    call_arities_for_reference, call_site_shape_for_reference, enclosing_template_declarations,
-    has_ancestor_kind, has_member_qualifier, infix_receiver_for_operator,
-    invocation_function_reference, is_bare_companion_method_value_reference,
-    is_call_function_reference, is_constructor_like_reference, is_declaration_name,
-    is_extractor_reference, is_identifier_node, is_infix_pattern_operator,
-    is_infix_type_operator_reference, is_owner_qualified_this, is_scala_case_pattern_binder,
-    is_scala_class_reference, is_scala_named_argument_assignment, is_scala_object_reference,
-    is_semantic_call_argument, is_terminal_stable_field_reference, member_qualifier,
-    member_qualifier_node, named_argument_invocation_owner, node_text, parenthesized_arity,
-    qualified_stable_type_reference, resolve_stable_object_expression,
-    scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
-    scala_callable_shape_matches, scala_pattern_binder_names, scala_union_type_alternative_paths,
-    stable_identifier_reference, template_direct_term_member_named, template_self_type,
-    terminal_invocation_owner_name,
+    ScalaCallableUsePolicy, ScalaFunctionParameterShape, ScalaImportContextIndex,
+    ScalaMethodValueContext, ScalaPackageContextIndex, ScalaQualifiedStableTypeRole,
+    applied_expression_for_reference, call_arities_for_reference, call_site_shape_for_reference,
+    enclosing_template_declarations, has_ancestor_kind, has_member_qualifier,
+    infix_receiver_for_operator, invocation_function_reference,
+    is_bare_companion_method_value_reference, is_call_function_reference,
+    is_constructor_like_reference, is_declaration_name, is_extractor_reference, is_identifier_node,
+    is_infix_pattern_operator, is_infix_type_operator_reference, is_owner_qualified_this,
+    is_scala_case_pattern_binder, is_scala_class_reference, is_scala_named_argument_assignment,
+    is_scala_object_reference, is_semantic_call_argument, is_terminal_stable_field_reference,
+    member_qualifier, member_qualifier_node, named_argument_invocation_owner, node_text,
+    parenthesized_arity, qualified_stable_type_reference, resolve_stable_object_expression,
+    scala_callable_alternative_matches, scala_callable_shape_matches, scala_pattern_binder_names,
+    scala_union_type_alternative_paths, stable_identifier_reference,
+    template_direct_term_member_named, template_self_type, terminal_invocation_owner_name,
 };
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile, Range, ScalaAnalyzer,
@@ -1360,11 +1360,11 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                             None,
                         )
                     }
-                    ScalaMethodValueContext::Function(arity) => {
+                    ScalaMethodValueContext::Function(shape) => {
                         ctx.types.class_companion_apply_method_value_matches(
                             ctx.scala,
                             &ctx.spec.target,
-                            Some(&[arity]),
+                            Some(&[shape.arity]),
                         )
                     }
                     ScalaMethodValueContext::Incompatible => false,
@@ -2255,7 +2255,7 @@ fn companion_method_value_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> ScalaMet
         let Some(arity) = function_type_arity(expected_type) else {
             return ScalaMethodValueContext::Incompatible;
         };
-        return ScalaMethodValueContext::Function(arity);
+        return ScalaMethodValueContext::Function(ScalaFunctionParameterShape::arity_only(arity));
     }
     call_parameter_method_value_context(node, ctx)
 }
@@ -2352,7 +2352,7 @@ fn call_parameter_method_value_context(
 
     let mut resolved = None;
     for method in methods {
-        let Some(arity) = ctx.types.callable_parameter_function_arity(
+        let Some(shape) = ctx.types.callable_parameter_function_shape(
             ctx.scala,
             &method,
             &call_arities,
@@ -2361,10 +2361,10 @@ fn call_parameter_method_value_context(
         ) else {
             return ScalaMethodValueContext::Incompatible;
         };
-        if resolved.is_some_and(|resolved| resolved != arity) {
+        if resolved.as_ref().is_some_and(|resolved| resolved != &shape) {
             return ScalaMethodValueContext::Incompatible;
         }
-        resolved = Some(arity);
+        resolved = Some(shape);
     }
     resolved.map_or(
         ScalaMethodValueContext::Incompatible,
@@ -2801,18 +2801,20 @@ fn call_site_shape_with_method_value_context(
     ctx: &ScanCtx<'_>,
 ) -> Option<ScalaCallSiteShape> {
     if let Some(shape) = call_site_shape_for_reference(node) {
-        let method_value_arity = applied_expression_for_reference(node).and_then(|expression| {
+        let method_value_shape = applied_expression_for_reference(node).and_then(|expression| {
             match companion_method_value_context(expression, ctx) {
-                ScalaMethodValueContext::Function(arity) => Some(arity),
+                ScalaMethodValueContext::Function(shape) => Some(shape),
                 ScalaMethodValueContext::Unknown | ScalaMethodValueContext::Incompatible => None,
             }
         });
-        return Some(shape.with_method_value_arity(method_value_arity));
+        return Some(shape.with_method_value_shape(method_value_shape));
     }
     match companion_method_value_context(node, ctx) {
-        ScalaMethodValueContext::Function(arity) => Some(ScalaCallSiteShape {
+        ScalaMethodValueContext::Function(shape) => Some(ScalaCallSiteShape {
             lists: Vec::new(),
-            method_value_arity: Some(arity),
+            method_value_arity: Some(shape.arity),
+            method_value_parameter_types: shape.parameter_types,
+            method_value_parameter_types_authoritative: shape.parameter_types_authoritative,
             type_arguments_only: false,
         }),
         ScalaMethodValueContext::Unknown | ScalaMethodValueContext::Incompatible => None,
@@ -2834,25 +2836,17 @@ fn member_call_shape_matches(
                     .callable_alternatives
                     .iter()
                     .filter(|alternative| {
-                        scala_callable_alternative_is_candidate(
-                            alternative.role,
-                            &alternative.shape,
-                            shape,
-                            site_role,
-                        )
+                        callable_alternative_is_candidate(alternative, shape, site_role)
                     })
                     .count()
                     == 1
             });
         return ctx.spec.callable_alternatives.iter().any(|alternative| {
-            scala_callable_alternative_matches(
-                alternative.role,
-                &alternative.shape,
-                call_shape,
-                site_role,
-                unique_callable,
-            )
+            callable_alternative_matches(alternative, call_shape, site_role, unique_callable)
         });
+    }
+    if call_shape.is_some_and(|shape| shape.method_value_parameter_types_authoritative) {
+        return false;
     }
     let fallback_shape = ctx
         .spec
