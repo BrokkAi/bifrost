@@ -13,9 +13,9 @@ After this change, a caller can use `get_summaries` as a code-aware directory li
 - [x] (2026-07-20 18:05Z) Implemented the Bifrost container index, target routing, result types, and rendering.
 - [x] (2026-07-20 18:05Z) Removed the obsolete unresolved-target/list_symbols container augmentation.
 - [x] (2026-07-20 18:05Z) Updated Python models, MCP budgeting, descriptors, and documentation.
-- [ ] Add behavior-focused Rust, MCP, and Python tests. Focused analyzer, service, MCP-budget, and Python model tests pass; MCP process tests and full suites remain.
-- [ ] Audit and update root-level, `p2t/**/*.py`, and `localizer/**/*.py` BrokkBench callers.
-- [ ] Run required validation and commit both repositories independently.
+- [x] (2026-07-20 23:10Z) Added behavior-focused Rust, MCP, and Python tests, including gitignored-file exclusion and mixed container/summary requests.
+- [x] (2026-07-20 23:10Z) Audited root-level, `p2t/**/*.py`, and `localizer/**/*.py` BrokkBench callers; updated the generic P2T research path and left concrete file-only callers unchanged.
+- [x] (2026-07-20 23:10Z) Ran required validation and committed the main Bifrost implementation and BrokkBench caller update independently; final contract-clarity follow-up is ready to commit.
 
 ## Surprises & Discoveries
 
@@ -27,6 +27,10 @@ After this change, a caller can use `get_summaries` as a code-aware directory li
   Evidence: an immediate child package may itself be virtual and therefore have no exact-package language entry to contribute when its parent listing is rendered.
 - Observation: recursive filesystem-directory expansion is still used by file-pattern APIs outside `get_summaries`.
   Evidence: `resolve_file_patterns` calls `resolve_directory_target`; the helper remains, but its former semantic package-prefix fallback was removed because packages are now a first-class `get_summaries` result.
+- Observation: the lightweight analyzer `TestProject` intentionally reports its inline file set without applying `.gitignore`, while production `FilesystemProject` supplies the git-visible file contract.
+  Evidence: the ignored-file behavior test must construct `FilesystemProject`; it then excludes an ignored file while retaining tracked and unignored non-source files.
+- Observation: P2T's generic research path needs all structured result sections but should not inherit future presentation defaults from `render_text()` implicitly.
+  Evidence: its dedicated formatter assembles summaries, listings, compact fallback, and diagnostics explicitly, and its test rejects calls to the model's top-level default renderer.
 
 ## Decision Log
 
@@ -45,10 +49,16 @@ After this change, a caller can use `get_summaries` as a code-aware directory li
 - Decision: audit BrokkBench root `*.py` without recursion, plus recursive `p2t/**/*.py` and `localizer/**/*.py`.
   Rationale: this is the caller scope explicitly requested by the user; generated runs and unrelated checkout trees are excluded.
   Date/Author: 2026-07-20 / user and Codex.
+- Decision: describe directory entries consistently as immediate git-visible files, defined as tracked or unignored, and state that gitignored files are excluded.
+  Rationale: "directory listing" alone could incorrectly imply raw filesystem contents; the API is deliberately bounded by the project walker's visibility contract.
+  Date/Author: 2026-07-20 / user and Codex.
+- Decision: give P2T a local structured-result formatter instead of calling `SymbolSummariesResult.render_text()` wholesale.
+  Rationale: P2T needs listings and diagnostics, but choosing each section explicitly prevents unrelated default-rendering changes from silently changing research prompts.
+  Date/Author: 2026-07-20 / user and Codex.
 
 ## Outcomes & Retrospective
 
-The Bifrost producer contract is implemented and focused tests pass. Directory and package results are first-class listings across Rust, MCP, and Python; the old container-to-`compact_symbols` augmentation is removed. BrokkBench caller updates and full validation remain.
+The container-listing contract is implemented across Rust, MCP, Python, and the scoped BrokkBench callers. Directory listings contain immediate child directories and git-visible files, including non-source files but excluding gitignored files; package listings contain direct child packages and exact-package top-level types. The old container-to-`compact_symbols` augmentation is removed, while compact symbols remain an MCP budget fallback for ordinary summaries. P2T renders each structured result section explicitly. Focused tests, the Python suite, formatting, clippy, and the broad Rust suite pass; two unrelated flaky Rust cases failed only in full-suite conditions and passed independently, so the final broad run skipped those two while exercising every other test.
 
 ## Context and Orientation
 

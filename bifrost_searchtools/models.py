@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import ClassVar
 
 
 def _render_numbered_block(text: str, start_line: int) -> str:
@@ -1194,6 +1195,7 @@ class ContainerKind(StrEnum):
 
 @dataclass(frozen=True)
 class DirectoryListingEntry:
+    kind: ClassVar[str] = "directory"
     name: str
     path: str
 
@@ -1203,6 +1205,7 @@ class DirectoryListingEntry:
 
 @dataclass(frozen=True)
 class FileListingEntry:
+    kind: ClassVar[str] = "file"
     name: str
     path: str
 
@@ -1212,6 +1215,7 @@ class FileListingEntry:
 
 @dataclass(frozen=True)
 class PackageListingEntry:
+    kind: ClassVar[str] = "package"
     name: str
     qualified_name: str
     languages: list[str]
@@ -1223,6 +1227,7 @@ class PackageListingEntry:
 
 @dataclass(frozen=True)
 class TypeListingEntry:
+    kind: ClassVar[str] = "type"
     name: str
     symbol: str
     language: str

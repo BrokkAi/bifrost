@@ -1,6 +1,6 @@
 use brokk_bifrost::{
-    GoAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language, RustAnalyzer, ScalaAnalyzer,
-    TestProject, TypescriptAnalyzer,
+    FilesystemProject, GoAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language, RustAnalyzer,
+    ScalaAnalyzer, TestProject, TypescriptAnalyzer,
     searchtools::{
         ContainerKind, ContainerListingEntry, SummariesParams, SummaryElement, get_summaries,
     },
@@ -157,12 +157,16 @@ fn get_summaries_accepts_mixed_file_and_class_targets() {
 #[test]
 fn get_summaries_lists_immediate_directory_children() {
     let project = InlineTestProject::with_language(Language::Java)
+        .file(".gitignore", "src/ignored.txt\n")
         .file("src/App.java", "class App {}\n")
         .file("src/config.properties", "enabled=true\n")
+        .file("src/ignored.txt", "not visible\n")
         .file("src/internal/Helper.java", "class Helper {}\n")
         .file("tests/AppTest.java", "class AppTest {}\n")
         .build();
-    let analyzer = JavaAnalyzer::from_project(project.project().clone());
+    let analyzer = JavaAnalyzer::from_project(
+        FilesystemProject::new(project.root()).expect("filesystem project"),
+    );
 
     let result = get_summaries(
         &analyzer,
@@ -190,6 +194,10 @@ fn get_summaries_lists_immediate_directory_children() {
     assert!(listing.entries.iter().any(|entry| matches!(
         entry,
         ContainerListingEntry::File { path, .. } if path == "src/config.properties"
+    )));
+    assert!(!listing.entries.iter().any(|entry| matches!(
+        entry,
+        ContainerListingEntry::File { path, .. } if path == "src/ignored.txt"
     )));
     assert!(
         !result

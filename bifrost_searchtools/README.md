@@ -18,7 +18,7 @@ Index a project once, then ask fast structural questions:
 
 - **Symbol search:** find classes, functions, and fields by name pattern.
 - **Locations and sources:** jump to a symbol's definition or pull its source.
-- **Summaries and listings:** get signature-level file/class outlines, immediate directory children, or package types and child packages.
+- **Summaries and listings:** get signature-level file/class outlines, immediate git-visible directory children, or package types and child packages.
 - **Usages and call graph:** scan references to a symbol, or build the
   whole-workspace caller/callee graph (feed it to PageRank for a code map).
 - **Most-relevant files:** rank the files most related to one or more seed files.

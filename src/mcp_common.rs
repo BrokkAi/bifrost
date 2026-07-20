@@ -898,9 +898,11 @@ fn render_container_listings_json(structured: &Value, render_line_numbers: bool)
                 .flatten()
                 .filter_map(Value::as_str)
                 .collect::<Vec<_>>();
-            let language_suffix = (!languages.is_empty())
-                .then(|| format!(" ({})", languages.join(", ")))
-                .unwrap_or_default();
+            let language_suffix = if languages.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", languages.join(", "))
+            };
             let mut lines = vec![format!("{label} {target}{language_suffix}")];
             let entries = listing.get("entries")?.as_array()?;
             lines.extend(entries.iter().filter_map(|entry| {
@@ -916,9 +918,11 @@ fn render_container_listings_json(structured: &Value, render_line_numbers: bool)
                             .flatten()
                             .filter_map(Value::as_str)
                             .collect::<Vec<_>>();
-                        let suffix = (!languages.is_empty())
-                            .then(|| format!("; {}", languages.join(", ")))
-                            .unwrap_or_default();
+                        let suffix = if languages.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; {}", languages.join(", "))
+                        };
                         Some(format!(
                             "[package{suffix}] {}",
                             entry.get("qualified_name")?.as_str()?
@@ -1114,7 +1118,7 @@ pub fn summaries_schema() -> Value {
             "targets": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Project-relative file paths, directory paths, glob patterns, class names, language import/package paths, or absolute paths/globs inside the active workspace. File and glob targets return detailed ranged summaries when they fit the response budget; oversized ordinary summaries are marked degraded and return compact_symbols declaration outlines. Directory targets return their immediate child directories and files. Import/package targets (e.g. \"github.com/org/repo/internal/pkg\") return direct child packages and top-level types declared in that exact package. Oversized listings are truncated and report their total entry count. Examples: \"src/auth/**/*.rs\", \"crates/polars-core/src/frame/**/*.rs\", \"MyClass\", \"github.com/cli/cli/v2/internal/skills/discovery\"."
+                "description": "Targets may be mixed in one call. Use a project-relative directory like an `ls`: it returns immediate child directories and git-visible files (tracked or unignored), including non-source files, without recursively flattening descendants; gitignored files are excluded. Use an OO namespace or language import/package path like a semantic `ls`: it returns direct child packages and top-level types declared in that exact package. A real filesystem directory wins if a target could mean either. Literal files, globs, and class/module symbols return ranged code summaries. Oversized ordinary summaries degrade to compact_symbols; oversized listings retain a total count and set truncated. Examples: \"src/auth\", \"com.example.auth\", \"github.com/cli/cli/v2/internal/skills/discovery\", \"src/auth/**/*.rs\", \"MyClass\"."
             }
         },
         "required": ["targets"]
