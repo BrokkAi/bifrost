@@ -1531,36 +1531,13 @@ fn expression_iterates_target_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
 fn has_target_type_annotation(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     node.child_by_field_name("type")
         .or_else(|| node.child_by_field_name("return_type"))
-        .is_some_and(|type_node| {
-            type_annotation_mentions_target(type_node, ctx)
-                || type_annotation_resolves_to_target_owner(type_node, ctx)
-        })
+        .is_some_and(|type_node| type_annotation_mentions_target(type_node, ctx))
         || node
             .child_by_field_name("name")
             .is_some_and(|name| name_subtree_mentions_target_type(name, ctx))
         || node
             .child_by_field_name("pattern")
             .is_some_and(|pattern| name_subtree_mentions_target_type(pattern, ctx))
-}
-
-fn type_annotation_resolves_to_target_owner(type_node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    let Some(target_owner) = ctx.target_owner else {
-        return false;
-    };
-    ts_resolve_type_text_to_property_owners(
-        ctx.analyzer,
-        ctx.analyzer.global_usage_definition_index(),
-        ctx.file,
-        ctx.source,
-        &ctx.imports,
-        &ctx.aliases,
-        ts_type_annotation_text(type_node, ctx.source).as_str(),
-        0,
-    )
-    .into_iter()
-    .any(|owner| {
-        owner.source() == target_owner.source() && owner.fq_name() == target_owner.fq_name()
-    })
 }
 
 fn type_annotation_mentions_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
