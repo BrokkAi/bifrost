@@ -395,6 +395,10 @@ pub trait Runner {
     fn run(&self);
 }
 
+pub trait OtherTrait {
+    fn run(&self);
+}
+
 pub struct Service;
 pub struct Other;
 
@@ -413,6 +417,26 @@ pub fn ambiguous(receiver: &dyn Runner) {
 pub fn opaque(receiver: impl Runner) {
     receiver.run();
 }
+
+pub fn bounded_ambiguous(receiver: &dyn Runner + Send) {
+    receiver.run();
+}
+
+pub fn bounded_opaque(receiver: impl Runner + Send) {
+    receiver.run();
+}
+
+pub fn higher_ranked(receiver: &dyn for<'a> Runner) {
+    receiver.run();
+}
+
+pub fn other_bounded(receiver: impl OtherTrait + Send) {
+    receiver.run();
+}
+
+pub fn other_higher_ranked(receiver: &dyn for<'a> OtherTrait) {
+    receiver.run();
+}
 "#,
         )
         .build();
@@ -420,7 +444,10 @@ pub fn opaque(receiver: impl Runner) {
     let value = common::usage_graph::usage_graph_at(project.root(), "{}");
     assert!(
         find_edge(&value, "ambiguous", "Runner.run").is_some()
-            && find_edge(&value, "opaque", "Runner.run").is_some(),
+            && find_edge(&value, "opaque", "Runner.run").is_some()
+            && find_edge(&value, "bounded_ambiguous", "Runner.run").is_some()
+            && find_edge(&value, "bounded_opaque", "Runner.run").is_some()
+            && find_edge(&value, "higher_ranked", "Runner.run").is_some(),
         "structured trait receiver types must edge to Runner.run: {}",
         value["edges"]
     );
@@ -428,7 +455,16 @@ pub fn opaque(receiver: impl Runner) {
         find_edge(&value, "ambiguous", "Service.run").is_none()
             && find_edge(&value, "ambiguous", "Other.run").is_none()
             && find_edge(&value, "opaque", "Service.run").is_none()
-            && find_edge(&value, "opaque", "Other.run").is_none(),
+            && find_edge(&value, "opaque", "Other.run").is_none()
+            && find_edge(&value, "bounded_ambiguous", "Service.run").is_none()
+            && find_edge(&value, "bounded_ambiguous", "Other.run").is_none()
+            && find_edge(&value, "bounded_opaque", "Service.run").is_none()
+            && find_edge(&value, "bounded_opaque", "Other.run").is_none()
+            && find_edge(&value, "other_bounded", "Runner.run").is_none()
+            && find_edge(&value, "other_bounded", "Other.run").is_none()
+            && find_edge(&value, "other_bounded", "OtherTrait.run").is_some()
+            && find_edge(&value, "other_higher_ranked", "Runner.run").is_none()
+            && find_edge(&value, "other_higher_ranked", "OtherTrait.run").is_some(),
         "trait receivers must not emit partial same-name inherent edges: {}",
         value["edges"]
     );

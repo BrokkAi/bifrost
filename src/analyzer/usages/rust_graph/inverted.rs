@@ -541,6 +541,15 @@ fn type_node_fqn_with_impl(
                     type_node_fqn_with_impl(trait_node, source, refs, impl_owner_fqn)
                 })
         }
+        "bounded_type" => {
+            let mut cursor = type_node.walk();
+            type_node
+                .named_children(&mut cursor)
+                .find_map(|bound| type_node_fqn_with_impl(bound, source, refs, impl_owner_fqn))
+        }
+        "higher_ranked_trait_bound" => type_node
+            .child_by_field_name("type")
+            .and_then(|bound| type_node_fqn_with_impl(bound, source, refs, impl_owner_fqn)),
         "generic_type" => {
             let base = type_node.child_by_field_name("type")?;
             let base_name = type_node_last_segment(base, source)?;
@@ -570,6 +579,10 @@ fn is_rust_type_node(node: Node<'_>) -> bool {
             | "tuple_type"
             | "unit_type"
             | "never_type"
+            | "abstract_type"
+            | "dynamic_type"
+            | "bounded_type"
+            | "higher_ranked_trait_bound"
     )
 }
 

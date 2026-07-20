@@ -3671,11 +3671,35 @@ fn dynamic(x: &dyn Worker) {
     x.work();
 }
 
+fn bounded_opaque(x: impl Worker + Send) {
+    x.work();
+}
+
+fn bounded_dynamic(x: &dyn Worker + Send) {
+    x.work();
+}
+
+fn higher_ranked_dynamic(x: &dyn for<'a> Worker) {
+    x.work();
+}
+
 fn other_opaque(x: impl Other) {
     x.work();
 }
 
 fn other_dynamic(x: &dyn Other) {
+    x.work();
+}
+
+fn other_bounded_opaque(x: impl Other + Send) {
+    x.work();
+}
+
+fn other_bounded_dynamic(x: &dyn Other + Send) {
+    x.work();
+}
+
+fn other_higher_ranked_dynamic(x: &dyn for<'a> Other) {
     x.work();
 }
 
@@ -3688,7 +3712,7 @@ fn inherent(x: &Inherent) {
 
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
     let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
-    for (owner, expected) in [("Worker", 2), ("Other", 2), ("Inherent", 1)] {
+    for (owner, expected) in [("Worker", 5), ("Other", 5), ("Inherent", 1)] {
         let target = member(&analyzer, &project.file("src/service.rs"), owner, "work");
         let hits = strategy
             .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)

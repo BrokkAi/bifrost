@@ -2247,6 +2247,9 @@ fn rust_named_type_node(type_node: Node<'_>) -> Option<Node<'_>> {
         "reference_type" | "pointer_type" | "array_type" | "bracketed_type" => type_node
             .child_by_field_name("type")
             .and_then(rust_named_type_node),
+        "higher_ranked_trait_bound" => type_node
+            .child_by_field_name("type")
+            .and_then(rust_named_type_node),
         "generic_type" | "qualified_type" => Some(type_node),
         "scoped_type_identifier"
         | "type_identifier"
