@@ -5,6 +5,12 @@ description: Take a query from RQL exploration to a native RQLP policy or tested
 
 A Bifrost rule begins as a versioned `CodeQuery`. It can remain an application-owned query integration, or it can become a native `.rqlp` policy with stable rule identity, severity, completeness, and human/JSON/SARIF reporting. This guide builds a small “direct calls to Python `eval`” query, then shows both production paths.
 
+> **Warning — only code matching is implemented:** Bifrost currently executes
+> only `.rqlp` policies whose analysis has `:type match`. Taint-analysis and
+> typestate-analysis policy syntax is available for authoring and validation,
+> but those analyzers are not implemented yet. Running either type reports
+> `unsupported` and exits with status 2.
+
 This example becomes a structural policy: it finds parsed call expressions whose callee is named `eval`. It does not prove runtime dispatch, taint, reachability, or data flow. Choose a graph step and proof filter when declaration identity matters, and choose another analysis engine when the policy requires an unsupported guarantee.
 
 ## 1. Explore In RQL

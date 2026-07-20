@@ -3,22 +3,25 @@ mod common;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
 use brokk_bifrost::Language;
 use brokk_bifrost::policy::{
     PolicyFailOn, PolicySourceIdentity, evaluate_policy_files, parse_rqlp_source,
     validate_rqlp_source,
 };
-use common::InlineTestProject;
+use common::{InlineTestProject, normalize_line_endings};
 use serde_json::Value;
 
 const POLICY_DOC: &str = "docs/src/content/docs/static-analysis-policies.md";
+const EVALUATION_DOC: &str = "docs/src/content/docs/evaluate-bifrost.md";
 
 const REQUIRED_RQLP_FIXTURES: &[&str] = &[
     "tests/fixtures/policies/dynamic-eval.rqlp",
     "tests/fixtures/policies/attacker-controlled-to-sensitive-sinks.rqlp",
     "tests/fixtures/policies/resource-lifecycle.rqlp",
     "tests/fixtures/policies/endpoints/http-request-parameter.rqlp",
+    "docs/fixtures/ten-minute-evaluation/policies/review-audit-call.rqlp",
 ];
 
 const REQUIRED_JSON_FRAGMENTS: &[(&str, &str)] = &[
@@ -47,8 +50,7 @@ struct MarkedExample {
 #[test]
 fn marked_rqlp_examples_match_checked_fixtures_and_validate() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let docs = read(root.join(POLICY_DOC));
-    let examples = marked_examples(root.join(POLICY_DOC).as_path(), &docs);
+    let examples = all_marked_examples(root);
     let mut found = HashSet::new();
 
     for example in examples.iter().filter(|example| example.kind == "rqlp") {
@@ -93,8 +95,7 @@ fn marked_rqlp_examples_match_checked_fixtures_and_validate() {
 #[test]
 fn marked_normalized_fragments_match_checked_golds() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let docs = read(root.join(POLICY_DOC));
-    let examples = marked_examples(root.join(POLICY_DOC).as_path(), &docs);
+    let examples = all_marked_examples(root);
     let mut found = HashSet::new();
 
     for example in examples.iter().filter(|example| example.kind == "json") {
@@ -149,12 +150,11 @@ fn documented_match_policy_executes_and_future_analysis_boundary_is_explicit() {
             example.kind == "rqlp" && example.target == "tests/fixtures/policies/dynamic-eval.rqlp"
         })
         .expect("documented executable match policy");
+    let source = marked_example(&examples, "source", "dynamic-eval");
+    let human = marked_example(&examples, "human", "dynamic-eval");
 
     let workspace = InlineTestProject::with_language(Language::Python)
-        .file(
-            "app.py",
-            "def run(user_code):\n    return eval(user_code)\n",
-        )
+        .file("app.py", source.body.clone())
         .file("policies/dynamic-eval.rqlp", policy.body.clone())
         .build();
 
@@ -173,6 +173,8 @@ fn documented_match_policy_executes_and_future_analysis_boundary_is_explicit() {
         report["runs"][0]["findings"][0]["policy_id"],
         "bifrost.security.dynamic-eval"
     );
+
+    assert_policy_cli_human(workspace.root(), "policies/dynamic-eval.rqlp", human);
 
     let unsupported_sentence = "evaluation reports `unsupported` until [#824](https://github.com/BrokkAi/bifrost/issues/824)";
     assert_eq!(
@@ -209,6 +211,126 @@ fn documented_match_policy_executes_and_future_analysis_boundary_is_explicit() {
     ));
 }
 
+#[test]
+fn ten_minute_match_policy_runs_through_the_current_cli() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let docs = read(root.join(EVALUATION_DOC));
+    let examples = marked_examples(root.join(EVALUATION_DOC).as_path(), &docs);
+    let policy = marked_example(
+        &examples,
+        "rqlp",
+        "docs/fixtures/ten-minute-evaluation/policies/review-audit-call.rqlp",
+    );
+    let human = marked_example(&examples, "human", "ten-minute-audit");
+    let fixture_root = root.join("docs/fixtures/ten-minute-evaluation");
+    let workspace = InlineTestProject::with_language(Language::Python)
+        .file(
+            "src/app.py",
+            normalize_line_endings(&read(fixture_root.join("src/app.py"))),
+        )
+        .file(
+            "src/service.py",
+            normalize_line_endings(&read(fixture_root.join("src/service.py"))),
+        )
+        .file(
+            "queries/find-audit.rql",
+            normalize_line_endings(&read(fixture_root.join("queries/find-audit.rql"))),
+        )
+        .file("policies/review-audit-call.rqlp", policy.body.clone())
+        .build();
+
+    assert_policy_cli_human(workspace.root(), "policies/review-audit-call.rqlp", human);
+
+    let json = run_policy_cli(
+        workspace.root(),
+        "policies/review-audit-call.rqlp",
+        "json",
+        true,
+    );
+    assert_status(&json, 0);
+    assert!(json.stderr.is_empty());
+    let report: Value = serde_json::from_slice(&json.stdout).expect("canonical policy JSON");
+    assert_eq!(report["runs"][0]["completion"]["type"], "complete");
+    assert_eq!(report["runs"][0]["findings"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        report["runs"][0]["findings"][0]["policy_id"],
+        "bifrost.example.review-audit-call"
+    );
+    assert_eq!(
+        report["runs"][0]["findings"][0]["primary"]["path"],
+        "src/app.py"
+    );
+}
+
+fn all_marked_examples(root: &Path) -> Vec<MarkedExample> {
+    [POLICY_DOC, EVALUATION_DOC]
+        .into_iter()
+        .flat_map(|relative| {
+            let path = root.join(relative);
+            let docs = read(&path);
+            marked_examples(&path, &docs)
+        })
+        .collect()
+}
+
+fn marked_example<'a>(
+    examples: &'a [MarkedExample],
+    kind: &str,
+    target: &str,
+) -> &'a MarkedExample {
+    examples
+        .iter()
+        .find(|example| example.kind == kind && example.target == target)
+        .unwrap_or_else(|| panic!("missing policy docs example {kind}:{target}"))
+}
+
+fn assert_policy_cli_human(root: &Path, policy: &str, documented: &MarkedExample) {
+    let non_gating = run_policy_cli(root, policy, "human", true);
+    assert_status(&non_gating, 0);
+    assert!(
+        non_gating.stderr.is_empty(),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&non_gating.stderr)
+    );
+    let actual = String::from_utf8(non_gating.stdout).expect("UTF-8 human policy report");
+    assert_eq!(
+        actual.trim_end(),
+        documented.body.trim_end(),
+        "documented human policy output drifted for {policy}; current output:\n{actual}"
+    );
+
+    let gating = run_policy_cli(root, policy, "human", false);
+    assert_status(&gating, 1);
+    assert!(gating.stderr.is_empty());
+    assert_eq!(gating.stdout, actual.as_bytes());
+}
+
+fn run_policy_cli(root: &Path, policy: &str, format: &str, never: bool) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bifrost"));
+    command
+        .current_dir(root)
+        .arg("--root")
+        .arg(".")
+        .args(["--policy-file", policy, "--format", format])
+        .env("BIFROST_PARALLELISM", "1");
+    if never {
+        command.args(["--fail-on", "never"]);
+    }
+    command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run documented policy {policy}: {error}"))
+}
+
+fn assert_status(output: &Output, expected: i32) {
+    assert_eq!(
+        output.status.code(),
+        Some(expected),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn marked_examples(path: &Path, contents: &str) -> Vec<MarkedExample> {
     let lines = contents.lines().collect::<Vec<_>>();
     let mut examples = Vec::new();
@@ -232,6 +354,8 @@ fn marked_examples(path: &Path, contents: &str) -> Vec<MarkedExample> {
         let expected_fence = match kind {
             "rqlp" => "```lisp",
             "json" => "```json",
+            "source" => "```python",
+            "human" => "```text",
             other => panic!(
                 "unknown policy docs marker kind {other:?} in {}:{}",
                 path.display(),

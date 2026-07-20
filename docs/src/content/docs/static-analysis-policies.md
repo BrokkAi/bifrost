@@ -9,6 +9,13 @@ and completeness semantics around native [Rune Query Language
 (RQL)](/rune-query-language/) selectors. JSON is available as a normalized or
 reporting form, but it is not an alternate RQLP authoring syntax.
 
+> **Warning — only code matching is implemented:** Bifrost currently executes
+> only policies whose analysis has `:type match`. Taint-analysis and
+> typestate-analysis policies can be authored, parsed, validated, and composed,
+> but their analyzers are not implemented yet. Running either type reports an
+> `unsupported` completion and exits with status 2; accepted syntax must not be
+> interpreted as an enforced taint or typestate result.
+
 > **Important:** An RQL selector returns analysis candidates. An endpoint
 > selector match is diagnostic-neutral. Neither an endpoint match nor the
 > co-presence of a source and sink proves reachability, and neither creates a
@@ -56,6 +63,56 @@ result is evidence for the surrounding policy, so the policy—not the selector�
 owns the finding message, severity, identity, and completion state. A callee
 name match is still a structural fact; it does not by itself prove runtime
 dispatch.
+
+The documentation test runs that exact policy against this source through the
+current `bifrost` binary:
+
+<!-- policy-doc-test:source:dynamic-eval -->
+```python
+def run(user_code):
+    return eval(user_code)
+```
+
+With `--fail-on never`, the complete human report is:
+
+<details>
+<summary>Checked current output</summary>
+
+<!-- policy-doc-test:human:dynamic-eval -->
+```text
+note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL schema 2
+app.py:2:12: [warning] bifrost.security.dynamic-eval: Dynamic evaluation is forbidden
+  finding: cc59cd275916575bf43db14db832fba67ed3b0db15790fbea87a984c3ee1756a (strong)
+  analysis: match (definite, complete)
+  evidence: structural_match call
+  match anchor: strong structural_match app.py
+    semantic owner: python:app.py:canonical_ast_identity:[["function","run"],["return",null],["call","eval"]]
+    selected source: fe36d6a5c7b9aba5fb78c7a1f4a4bf6ea1d43e68de0c65682eb6a0aeb47e65b7
+    occurrence ordinal: 0
+  match terminal: structural_match call; identity python:app.py:canonical_ast_identity:[["function","run"],["return",null],["call","eval"]] at app.py:2:12
+  proof reason: direct_structural_match
+  classification: unclassified
+  proof: proven
+policy rule: bifrost.security.dynamic-eval (No dynamic evaluation)
+  policy hash: 5cf37a869e311d9c8c5c20dcb0c96dea81066eaa7be2109a2a87e602b55f6bbc
+  analysis type: match
+  policy schema: 1 (implicit_compatible)
+  selector schema /analysis/selector: 2 (implicit_compatible)
+  endpoint dependencies: none
+  match directories: none
+  precedence: none
+  message: static - Dynamic evaluation is forbidden
+  severity: fixed warning
+  description: Reject calls that execute source text as Python code.
+  tag: code-execution
+  tag: security
+summary: 1 finding; 1 complete policy run
+```
+
+</details>
+
+The same run with the default `warning` threshold produces identical report
+text and exits 1.
 
 ## Schema Versions And Selectors
 
@@ -449,11 +506,15 @@ dependencies are resolved from their authored query-file, exact-endpoint, and
 directory references:
 
 ```bash
-bifrost --root /path/to/project \
-  --policy-file policies/no-dynamic-eval.rqlp \
+bifrost --root docs/fixtures/ten-minute-evaluation \
+  --policy-file policies/review-audit-call.rqlp \
   --format human \
-  --fail-on warning
+  --fail-on never
 ```
+
+This is the published, executable [ten-minute policy
+example](/evaluate-bifrost/#journey-2-run-a-match-policy). Replace the root and
+policy path with your project when authoring a rule of your own.
 
 Repeat `--policy-file` to produce one deterministic combined report. Choose
 `human`, `json`, or `sarif`; use `--output report.sarif` for synchronized,

@@ -28,6 +28,12 @@ For example, a saved hierarchy query can use `(members (subtypes :transitive tru
 
 ## Static-Analysis Policies
 
+> **Warning — only code matching is implemented:** Policy execution currently
+> supports only analyses with `:type match`. Taint-analysis and
+> typestate-analysis policies can be parsed, validated, and composed, but their
+> analyzers are not implemented yet. Running either type reports `unsupported`
+> and exits with status 2.
+
 Run one or more workspace-relative `.rqlp` policy roots and emit one combined
 canonical report:
 
