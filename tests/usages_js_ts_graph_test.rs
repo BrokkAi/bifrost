@@ -1798,6 +1798,74 @@ fn ts_member_receiver_inference_handles_direct_and_aliased_receivers() {
 }
 
 #[test]
+fn ts_intersection_alias_object_receiver_resolves_exact_property_owner() {
+    let consumer_source = r#"
+import type { OtherOutput, SerializableHookOutput, UnrelatedAlias } from "./types";
+
+export function targetRead() {
+  const sanitized: SerializableHookOutput = { message: "ok", serialized: true };
+  return sanitized.message;
+}
+
+export function controls() {
+  const unrelated: UnrelatedAlias = { message: "other", other: true };
+  const untyped = { message: "plain" };
+  return unrelated.message + untyped.message;
+}
+
+export function shadowed(sanitized: OtherOutput) {
+  return sanitized.message;
+}
+"#;
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "types.ts",
+            r#"
+export interface HookOutput { message: string }
+export interface OtherOutput { message: string }
+export type SerializableHookOutput = HookOutput & { serialized: boolean };
+export type UnrelatedAlias = OtherOutput & { other: boolean };
+"#,
+        )
+        .file("consumer.ts", consumer_source)
+        .build()
+    });
+    let target = find_ts_target(&analyzer, &project.file("types.ts"), |unit| {
+        unit.short_name() == "HookOutput.message" && unit.is_field()
+    });
+    let consumer = project.file("consumer.ts");
+    let expected_read = identifier_occurrence_range(consumer_source, "message", 1);
+
+    let targeted = authoritative_ts_hits(&analyzer, &target, consumer.clone());
+    assert!(
+        targeted
+            .iter()
+            .any(|hit| (hit.start_offset, hit.end_offset) == expected_read),
+        "the intersection-alias receiver read must resolve to HookOutput.message: {targeted:#?}"
+    );
+
+    let workspace = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+    assert!(
+        workspace.iter().any(|hit| {
+            hit.file == consumer && (hit.start_offset, hit.end_offset) == expected_read
+        }),
+        "workspace inverse lookup must retain the exact receiver read: {workspace:#?}"
+    );
+
+    for occurrence in [2, 3, 4, 5, 6] {
+        let control = identifier_occurrence_range(consumer_source, "message", occurrence);
+        assert!(
+            workspace.iter().all(|hit| {
+                hit.file != consumer || (hit.start_offset, hit.end_offset) != control
+            }),
+            "unrelated, untyped, and shadowed receivers must not match HookOutput.message: {workspace:#?}"
+        );
+    }
+}
+
+#[test]
 fn tsx_class_method_call_inside_jsx_is_found() {
     let (project, analyzer) = ts_inline_analyzer(|p| {
         p.file(
