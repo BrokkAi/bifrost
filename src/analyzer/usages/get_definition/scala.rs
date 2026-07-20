@@ -813,6 +813,18 @@ pub(super) fn resolve_scala(
         file,
         source,
     };
+    // A compiler lattice type remains a type even when tree-sitter exposes a
+    // union leaf as a bare identifier recovery shape. Resolve that structured
+    // type role before term-role handling can select a source-backed singleton
+    // fixture such as an illegal `package scala; object Null` declaration.
+    // `resolve_scala_type` still honors legal lexical and imported type
+    // shadows before rejecting an unshadowed compiler intrinsic.
+    if (structured_type_reference || scala_is_type_position(node))
+        && !scala_type_reference_is_singleton(qualified_type_root)
+        && scala_compiler_intrinsic_type_reference(&qualified_type_segments).is_some()
+    {
+        return resolve_scala_type(ctx, &resolver, root, qualified_type_root);
+    }
     if let Some(outcome) = resolve_scala_focused_qualified_path(
         ctx,
         &resolver,
@@ -892,7 +904,10 @@ pub(super) fn resolve_scala(
             {
                 match scala_exact_owner_member_candidate_units(ctx, &owner, text, false) {
                     ScalaExactMemberResolution::Found(mut candidates) => {
-                        candidates.retain(|unit| !ctx.scala.is_type_alias(unit));
+                        candidates.retain(|unit| {
+                            !ctx.scala.is_type_alias(unit)
+                                && !scala_constructor_only_callable(ctx.scala, unit)
+                        });
                         if !candidates.is_empty() {
                             return candidates_outcome(candidates);
                         }
@@ -2041,6 +2056,9 @@ fn scala_is_declaration_name(node: Node<'_>) -> bool {
 }
 
 fn scala_is_type_position(node: Node<'_>) -> bool {
+    if scala_is_recovered_union_type_position(node) {
+        return true;
+    }
     let mut current = node;
     while let Some(parent) = current.parent() {
         if parent.child_by_field_name("type") == Some(current)
@@ -2048,13 +2066,47 @@ fn scala_is_type_position(node: Node<'_>) -> bool {
         {
             return true;
         }
-        if matches!(parent.kind(), "generic_type" | "stable_type_identifier") {
+        if matches!(
+            parent.kind(),
+            "generic_type" | "stable_type_identifier" | "infix_type"
+        ) {
             current = parent;
             continue;
         }
         return false;
     }
     false
+}
+
+/// Recognize tree-sitter's recovery shape for an unparenthesized Scala 3
+/// union in a `val`/`var` type annotation.
+///
+/// For `val value: Left | Right`, the grammar can expose the declaration's
+/// pattern as `alternative_pattern(typed_pattern(value, Left), Right)` rather
+/// than an `infix_type`. The trailing node is still parser-structured: it is a
+/// direct alternative after a typed declaration pattern, not an arbitrary
+/// source-text guess. Treat that node as the continuation of the declared
+/// type so term namespace lookup cannot capture it.
+fn scala_is_recovered_union_type_position(node: Node<'_>) -> bool {
+    let Some(alternative) = node
+        .parent()
+        .filter(|parent| parent.kind() == "alternative_pattern")
+    else {
+        return false;
+    };
+    if alternative.named_child(0) == Some(node) {
+        return false;
+    }
+    let Some(declaration) = alternative
+        .parent()
+        .filter(|parent| matches!(parent.kind(), "val_definition" | "var_definition"))
+    else {
+        return false;
+    };
+    declaration.child_by_field_name("pattern") == Some(alternative)
+        && alternative.named_child(0).is_some_and(|typed| {
+            typed.kind() == "typed_pattern" && typed.child_by_field_name("type").is_some()
+        })
 }
 
 #[derive(Clone, Copy)]
@@ -3349,6 +3401,32 @@ fn scala_fallback_callable_role(scala: &ScalaAnalyzer, unit: &CodeUnit) -> Scala
     } else {
         ScalaCallableRole::Ordinary
     }
+}
+
+/// Whether a physical callable represents only construction syntax.
+///
+/// A synthetic primary constructor shares the enclosing class's simple name,
+/// and a `def this` can do the same. Neither declaration participates in bare
+/// term lookup: an unapplied same-named identifier denotes an ordinary member
+/// or companion object. Keep this decision tied to parser-recorded callable
+/// roles so an ordinary same-named method remains eligible.
+fn scala_constructor_only_callable(scala: &ScalaAnalyzer, unit: &CodeUnit) -> bool {
+    if !unit.is_function() {
+        return false;
+    }
+    let alternatives = scala.project_types().callable_alternatives_for(scala, unit);
+    if alternatives.is_empty() {
+        return matches!(
+            scala_fallback_callable_role(scala, unit),
+            ScalaCallableRole::PrimaryConstructor | ScalaCallableRole::SecondaryConstructor
+        );
+    }
+    alternatives.iter().all(|alternative| {
+        matches!(
+            alternative.role,
+            ScalaCallableRole::PrimaryConstructor | ScalaCallableRole::SecondaryConstructor
+        )
+    })
 }
 
 enum ScalaPhysicalCallableCandidates {

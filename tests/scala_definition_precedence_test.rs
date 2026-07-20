@@ -2483,13 +2483,18 @@ fn scala_compiler_intrinsics_reject_fixture_declarations_after_legal_shadows() {
 object Use {
   val any: Any = null
   val nothing: Null = null
+  val nullable: String | Null = null
   val qualifiedAny: scala.Any = null
   val rootedNull: _root_.scala.Null = null
 }
 "#;
     let shadow = r#"package shadow
 class Any
-object Use { val local: Any = null }
+class Null
+object Use {
+  val local: Any = null
+  val nullable: String | Null = null
+}
 "#;
     let explicit = r#"package explicit
 import shadow.Any
@@ -2502,7 +2507,7 @@ object Use { val imported: Any = null }
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
             "fixtures/Redefinition.scala",
-            "package scala\nclass Any\nclass Null\n",
+            "package scala\nclass Any\nsealed trait Null\nobject Null\n",
         )
         .file("consumer/Use.scala", intrinsic)
         .file("shadow/Use.scala", shadow)
@@ -2523,6 +2528,11 @@ object Use { val imported: Any = null }
         location_in(
             "consumer/Use.scala",
             intrinsic,
+            intrinsic.find("String | Null").unwrap() + "String | ".len(),
+        ),
+        location_in(
+            "consumer/Use.scala",
+            intrinsic,
             intrinsic.find("scala.Any").unwrap() + "scala.".len(),
         ),
         location_in(
@@ -2531,6 +2541,7 @@ object Use { val imported: Any = null }
             intrinsic.find("_root_.scala.Null").unwrap() + "_root_.scala.".len(),
         ),
         location_in("shadow/Use.scala", shadow, shadow.rfind("Any").unwrap()),
+        location_in("shadow/Use.scala", shadow, shadow.rfind("Null").unwrap()),
         location_in(
             "explicit/Use.scala",
             explicit,
@@ -2548,15 +2559,75 @@ object Use { val imported: Any = null }
         &json!({"references": references}).to_string(),
     );
     let results = value["results"].as_array().expect("definition results");
-    for result in &results[..4] {
+    for result in &results[..5] {
         assert_eq!(result["status"], "no_definition", "{value}");
         assert_eq!(
             result["diagnostics"][0]["kind"], "scala_compiler_intrinsic_type",
             "{value}"
         );
     }
-    for result in &results[4..] {
+    for (result, expected) in
+        results[5..]
+            .iter()
+            .zip(["shadow.Any", "shadow.Null", "shadow.Any", "shadow.Any"])
+    {
         assert_eq!(result["status"], "resolved", "{value}");
-        assert_eq!(result["definitions"][0]["fqn"], "shadow.Any", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn scala_bare_companion_term_excludes_curried_enclosing_constructor_role() {
+    let source = r#"package app
+object Types {
+  trait Base
+  class HKTypeLambda(val names: List[String])(factory: HKTypeLambda => String) extends Base {
+    def companion: HKTypeLambda.type = HKTypeLambda
+  }
+  object HKTypeLambda {
+    def apply(names: List[String]): HKTypeLambda = null
+  }
+
+  class Control {
+    val HKTypeLambda: Int = 1
+    val local = HKTypeLambda
+  }
+
+  val constructed = HKTypeLambda(List.empty)
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Types.scala", source)
+        .build();
+    let references = [
+        source
+            .find("= HKTypeLambda\n")
+            .expect("bare companion term")
+            + "= ".len(),
+        source
+            .find("local = HKTypeLambda")
+            .expect("enclosing field")
+            + "local = ".len(),
+        source
+            .find("constructed = HKTypeLambda")
+            .expect("companion application")
+            + "constructed = ".len(),
+    ]
+    .into_iter()
+    .map(|start| location_in("app/Types.scala", source, start))
+    .collect::<Vec<_>>();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for (result, expected) in results.iter().zip([
+        "app.Types$.HKTypeLambda$",
+        "app.Types$.Control.HKTypeLambda",
+        "app.Types$.HKTypeLambda",
+    ]) {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
     }
 }
