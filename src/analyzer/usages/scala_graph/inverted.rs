@@ -47,12 +47,12 @@ use super::syntax::{
     is_extractor_reference, is_field_expression_value, is_identifier_node,
     is_infix_pattern_operator, is_owner_qualified_this, is_scala_case_pattern_binder,
     is_scala_class_reference, is_scala_named_argument_assignment, is_scala_object_reference,
-    is_semantic_call_argument, is_terminal_stable_field_reference, named_argument_invocation_owner,
-    node_text, parenthesized_arity, qualified_stable_type_reference,
-    resolve_stable_object_expression, scala_callable_alternative_is_candidate,
-    scala_callable_alternative_matches, scala_callable_shape_matches,
-    scala_import_is_visible_at_byte, scala_pattern_binder_names, scala_source_facts,
-    scala_union_type_alternative_paths, stable_identifier_prefix_reference,
+    is_semantic_call_argument, is_stable_type_qualifier, is_terminal_stable_field_reference,
+    named_argument_invocation_owner, node_text, parenthesized_arity,
+    qualified_stable_type_reference, resolve_stable_object_expression,
+    scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
+    scala_callable_shape_matches, scala_import_is_visible_at_byte, scala_pattern_binder_names,
+    scala_source_facts, scala_union_type_alternative_paths, stable_identifier_prefix_reference,
     stable_identifier_reference, template_direct_term_member_named, template_self_type,
     terminal_invocation_owner_name,
 };
@@ -5009,20 +5009,19 @@ fn method_value_parameter_types_match(
     alternative: &CallableAlternative,
     actual: &ScalaCallSiteShape,
 ) -> bool {
+    let Some(list_index) = next_explicit_parameter_list_index(&alternative.shape, actual) else {
+        // Once all explicit lists have been consumed, the surrounding
+        // function expectation describes the callable's return value rather
+        // than another curried parameter list. It therefore cannot reject the
+        // completed call even when that return-function parameter is generic
+        // or otherwise lacks an exact physical identity.
+        return true;
+    };
     if !actual.method_value_parameter_types_authoritative {
         return true;
     }
     let Some(expected) = actual.method_value_parameter_types.as_ref() else {
         return false;
-    };
-    let Some(list_index) = next_explicit_parameter_list_index(&alternative.shape, actual) else {
-        // A call that has consumed every explicit parameter list can itself
-        // produce a function value. The surrounding expected function shape
-        // then describes the return value, not another curried parameter list,
-        // so it must not reject an otherwise applicable callable. When an
-        // explicit list remains, the same shape continues to disambiguate a
-        // genuine partial application below.
-        return true;
     };
     let Some(declared) = alternative.parameter_types.get(list_index) else {
         return false;
@@ -6790,6 +6789,18 @@ fn record_reference(
                 return;
             }
             let text = node_text(node, ctx.source);
+            if is_stable_type_qualifier(node)
+                && bindings.resolve_symbol(text).is_unknown()
+                && !bindings.is_shadowed(text)
+                && let Some(ScalaResolvedReference::Exact(target)) =
+                    ctx.visible_type_reference(node, text)
+                && target.is_class()
+                && !target.short_name().ends_with('$')
+                && ctx.types.type_is_stable_owner(ctx.scala, &target)
+            {
+                ctx.record_exact(target, ScalaReferenceRole::Type, node);
+                return;
+            }
             let object_reference = is_scala_object_reference(node);
             if (is_extractor_reference(node) || is_infix_pattern_operator(node))
                 && bindings.resolve_symbol(text).is_unknown()
@@ -7173,6 +7184,40 @@ fn record_reference(
                         &exact_owner,
                         member,
                         call_arities.as_deref(),
+                    )
+                },
+            );
+            if let BareMemberResolution::Resolved(methods) = resolution {
+                for method in methods {
+                    ctx.record_exact_callable(method, operator);
+                }
+            }
+        }
+        "postfix_expression" => {
+            let Some(operator) = scala_postfix_operator_node(node) else {
+                return;
+            };
+            let Some(receiver) = scala_postfix_receiver_node(node, operator) else {
+                return;
+            };
+            let member = node_text(operator, ctx.source).trim();
+            if member.is_empty() {
+                return;
+            }
+            let Some(owner) = receiver_type_fqn(receiver, ctx, bindings) else {
+                return;
+            };
+            let resolution = receiver_type_declaration(receiver, ctx, bindings).map_or_else(
+                || {
+                    ctx.types
+                        .effective_method_declarations_for_owner(ctx.scala, &owner, member, None)
+                },
+                |exact_owner| {
+                    ctx.types.effective_method_declarations_for_exact_owner(
+                        ctx.scala,
+                        &exact_owner,
+                        member,
+                        None,
                     )
                 },
             );
@@ -7837,9 +7882,32 @@ fn reference_is_owned_by_invocation(node: Node<'_>) -> bool {
     if parent.kind() == "infix_expression" && parent.child_by_field_name("operator") == Some(node) {
         return true;
     }
+    if parent.kind() == "postfix_expression" && scala_postfix_operator_node(parent) == Some(node) {
+        return true;
+    }
     parent.kind() == "field_expression"
         && parent.child_by_field_name("field") == Some(node)
         && is_call_function_reference(parent)
+}
+
+fn scala_postfix_operator_node(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    let mut operator = None;
+    for child in node.named_children(&mut cursor) {
+        if matches!(child.kind(), "identifier" | "operator_identifier") {
+            operator = Some(child);
+        }
+    }
+    operator
+}
+
+fn scala_postfix_receiver_node<'tree>(
+    node: Node<'tree>,
+    operator: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.end_byte() <= operator.start_byte())
 }
 
 fn record_unqualified_type_application(

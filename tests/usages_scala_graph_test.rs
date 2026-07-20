@@ -4547,6 +4547,104 @@ object Owners {
 }
 
 #[test]
+fn scala_postfix_calls_and_stable_enum_qualifiers_preserve_exact_roles() {
+    let source = r#"package app
+
+final class Boolish {
+  def &&(next: => Boolean): Boolean = next
+}
+final class OtherBoolish {
+  def &&(next: => Boolean): Boolean = next
+}
+final class Ambiguous {
+  def &&(next: => Boolean): Boolean = next
+  def &&(next: => Int): Boolean = next > 0
+}
+
+enum Kind:
+  case Def(value: Int)
+
+class Plain:
+  class Def
+
+object Standalone:
+  class Def
+
+object Use:
+  def postfix(rhsIsEmpty: Boolish, next: Boolean): Boolean =
+    rhsIsEmpty && // positive-postfix-operator
+      next
+
+  def ambiguous(receiver: Ambiguous, next: Boolean): Boolean =
+    receiver && // negative-postfix-overload
+      next
+
+  val enumValue: Kind.Def = Kind.Def(1) // positive-enum-stable-qualifier
+  val invalidClass: Plain.Def = null // negative-ordinary-class-qualifier
+  val objectValue: Standalone.Def = null // positive-standalone-object-qualifier
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Use.scala", source)]);
+
+    let operator = definition(&analyzer, "app.Boolish.&&");
+    let operator_hits = authoritative_scala_hits(&analyzer, &operator);
+    assert_hit_contains(&operator_hits, "positive-postfix-operator");
+    assert_no_hit_contains(&operator_hits, "negative-postfix-overload");
+    assert_eq!(
+        operator_hits
+            .iter()
+            .filter(|hit| hit.snippet.contains("positive-postfix-operator"))
+            .count(),
+        1,
+        "the postfix expression must own its operator visit: {operator_hits:#?}"
+    );
+
+    let other_operator = definition(&analyzer, "app.OtherBoolish.&&");
+    let other_hits = authoritative_scala_hits(&analyzer, &other_operator);
+    assert_no_hit_contains(&other_hits, "positive-postfix-operator");
+
+    let kind = definition(&analyzer, "app.Kind");
+    let kind_hits = authoritative_scala_hits(&analyzer, &kind);
+    assert_hit_contains(&kind_hits, "positive-enum-stable-qualifier");
+    assert_no_hit_contains(&kind_hits, "negative-ordinary-class-qualifier");
+    assert_no_hit_contains(&kind_hits, "positive-standalone-object-qualifier");
+
+    let nested = definition(&analyzer, "app.Kind$.Def");
+    let nested_hits = authoritative_scala_hits(&analyzer, &nested);
+    assert_hit_contains(&nested_hits, "positive-enum-stable-qualifier");
+
+    let plain = definition(&analyzer, "app.Plain");
+    let plain_hits = authoritative_scala_hits(&analyzer, &plain);
+    assert_no_hit_contains(&plain_hits, "negative-ordinary-class-qualifier");
+
+    let standalone = definition(&analyzer, "app.Standalone$");
+    let standalone_hits = authoritative_scala_hits(&analyzer, &standalone);
+    assert_hit_contains(&standalone_hits, "positive-standalone-object-qualifier");
+}
+
+#[test]
+fn scala_stable_enum_qualifier_fails_closed_for_physical_replicas() {
+    let replica = r#"package model
+enum Kind:
+  case Def(value: Int)
+"#;
+    let consumer = r#"package app
+import model.Kind
+object Use:
+  val value: Kind.Def = null // negative-ambiguous-enum-qualifier
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("jvm/model/Kind.scala", replica),
+        ("js/model/Kind.scala", replica),
+        ("app/Use.scala", consumer),
+    ]);
+
+    for target in analyzer.get_definitions("model.Kind") {
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_no_hit_contains(&target_hits, "negative-ambiguous-enum-qualifier");
+    }
+}
+
+#[test]
 fn scala_case_class_wildcard_exposes_only_stable_companion_children() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (
@@ -5777,6 +5875,70 @@ abstract class Use extends FixtureSuite {
         missing.is_empty(),
         "missing production parity events: {missing:#?}"
     );
+}
+
+#[test]
+fn scala_completed_function_results_do_not_masquerade_as_remaining_curried_lists() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "external/Output.scala",
+            "package external\nfinal class Output\n",
+        ),
+        (
+            "app/Calls.scala",
+            r#"package app
+
+trait Frame
+given Frame = new Frame {}
+
+object Calls:
+  def withStability[A](parse: String => A)(predicate: A => Boolean)(failure: A => RuntimeException): Unit = ()
+  def elementProbeFailure(selector: String, message: String)(using Frame): String => RuntimeException =
+    actual => new RuntimeException(selector + message + actual)
+
+  def retry[A](parse: String => A, predicate: A => Boolean): Unit =
+    withStability(parse)(predicate)(elementProbeFailure("selector", "message")) // positive-completed-generic-function-result
+
+  def serialize(output: external.Output, snapshot: Int): Unit = ()
+  def withOutputStream(write: external.Output => Unit): Unit = ()
+  val saved = withOutputStream(serialize(_, 1)) // positive-completed-external-placeholder
+
+  def remaining(value: Int)(next: Missing): String = value.toString
+  def consumeUnknown[A](next: A => String): String = ""
+  val rejected = consumeUnknown(remaining(1)) // negative-remaining-curried-unknown
+
+  def knownString(value: Int)(next: String): String = next
+  def knownInt(value: Int)(next: Int): String = next.toString
+  def consumeString(run: String => String): String = run("value")
+  val selected = consumeString(knownString(1)) // positive-known-curried-overload
+  val rejectedKnown = consumeString(knownInt(1)) // negative-known-curried-overload
+"#,
+        ),
+    ]);
+
+    for (target_fqn, marker) in [
+        (
+            "app.Calls$.elementProbeFailure",
+            "positive-completed-generic-function-result",
+        ),
+        (
+            "app.Calls$.serialize",
+            "positive-completed-external-placeholder",
+        ),
+        ("app.Calls$.knownString", "positive-known-curried-overload"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, marker);
+    }
+
+    let remaining = definition(&analyzer, "app.Calls$.remaining");
+    let remaining_hits = authoritative_scala_hits(&analyzer, &remaining);
+    assert_no_hit_contains(&remaining_hits, "negative-remaining-curried-unknown");
+
+    let rejected_known = definition(&analyzer, "app.Calls$.knownInt");
+    let rejected_known_hits = authoritative_scala_hits(&analyzer, &rejected_known);
+    assert_no_hit_contains(&rejected_known_hits, "negative-known-curried-overload");
 }
 
 #[test]

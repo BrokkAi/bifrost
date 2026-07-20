@@ -1157,7 +1157,7 @@ fn is_singleton_type_reference(node: Node<'_>) -> bool {
         .is_some_and(|parent| parent.kind() == "singleton_type")
 }
 
-fn is_stable_type_qualifier(node: Node<'_>) -> bool {
+pub(crate) fn is_stable_type_qualifier(node: Node<'_>) -> bool {
     let Some(parent) = node
         .parent()
         .filter(|parent| parent.kind() == "stable_type_identifier")
