@@ -4404,6 +4404,76 @@ object Owner {
 }
 
 #[test]
+fn scala_local_stable_member_imports_preserve_exact_owner_aliases_and_fail_closed() {
+    let consumer_source = r#"package app
+import decoy.Imported.selfAddress
+import model.Cluster
+
+class DirectConsumer {
+  val cluster = Cluster("direct")
+  import cluster.{ selfAddress }
+  def address: String = selfAddress // positive-direct
+}
+
+class AliasedConsumer {
+  val cluster = Cluster("alias")
+  import cluster.{ selfAddress as localAddress }
+  def address: String = localAddress // positive-alias
+}
+
+class UnresolvedConsumer {
+  val cluster = unavailable
+  import cluster.{ selfAddress }
+  def address: String = selfAddress // negative-unresolved-local-owner
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Cluster.scala",
+            r#"package model
+class Cluster(val name: String) {
+  def selfAddress: String = name
+}
+object Cluster {
+  def apply(name: String): Cluster = new Cluster(name)
+}
+"#,
+        ),
+        (
+            "decoy/Imported.scala",
+            r#"package decoy
+object Imported {
+  def selfAddress: String = "decoy"
+}
+"#,
+        ),
+        ("app/Consumers.scala", consumer_source),
+    ]);
+
+    let target = definition(&analyzer, "model.Cluster.selfAddress");
+    let target_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    for marker in ["positive-direct", "positive-alias"] {
+        assert_hit_line(&target_hits, line_of(consumer_source, marker));
+    }
+    assert_no_hit_line(
+        &target_hits,
+        line_of(consumer_source, "negative-unresolved-local-owner"),
+    );
+
+    let decoy = definition(&analyzer, "decoy.Imported$.selfAddress");
+    let decoy_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&decoy)));
+    for marker in [
+        "positive-direct",
+        "positive-alias",
+        "negative-unresolved-local-owner",
+    ] {
+        assert_no_hit_line(&decoy_hits, line_of(consumer_source, marker));
+    }
+}
+
+#[test]
 fn scala_case_class_wildcard_exposes_only_stable_companion_children() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (

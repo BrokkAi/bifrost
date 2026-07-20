@@ -7123,7 +7123,8 @@ fn record_reference(
             if is_call_function_reference(node) || reference_is_owned_by_invocation(node) {
                 return;
             }
-            if record_local_stable_field_reference(node, ctx, bindings)
+            if record_local_stable_imported_member(node, name, ctx, bindings)
+                || record_local_stable_field_reference(node, ctx, bindings)
                 || record_enclosing_field_qualifier(node, name, ctx, bindings)
                 || record_intermediate_stable_object_reference(node, ctx, bindings)
                 || (!is_terminal_stable_field_reference(node)
@@ -7451,6 +7452,120 @@ fn record_reference(
         }
         _ => {}
     }
+}
+
+/// Resolve an explicit member import whose owner is a parser-proven local
+/// stable value, for example:
+///
+/// ```scala
+/// val cluster = Cluster(system)
+/// import cluster.{ selfAddress as localAddress }
+/// use(localAddress)
+/// ```
+///
+/// The ordinary name resolver deliberately interprets import paths as global
+/// namespaces, so it cannot resolve `cluster.selfAddress`. The local inference
+/// environment already carries the exact physical declaration returned by the
+/// `Cluster(...)` application; bridge the parser-recorded import path to that
+/// declaration without reconstructing or scanning source text. A matching
+/// local-root import is authoritative: imprecise owners, missing members, or
+/// conflicting visible imports consume the name and fail closed rather than
+/// falling through to an unrelated global member with the same spelling.
+fn record_local_stable_imported_member(
+    node: Node<'_>,
+    visible_name: &str,
+    ctx: &mut ScalaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
+) -> bool {
+    if bindings.is_shadowed(visible_name) {
+        return false;
+    }
+
+    let mut matched_local_import = false;
+    let mut selected_targets: Option<Vec<CodeUnit>> = None;
+    for import in ctx.imports.iter().filter(|import| {
+        !import.is_wildcard && scala_import_is_visible_at_byte(import, node.start_byte())
+    }) {
+        if import.identifier.as_deref() != Some(visible_name) {
+            continue;
+        }
+        let Some(path) = import.path.as_ref() else {
+            continue;
+        };
+        let Some((member, owner_path)) = path.segments.split_last() else {
+            continue;
+        };
+        let Some(root_name) = owner_path.first() else {
+            continue;
+        };
+        if !bindings.is_shadowed(root_name) {
+            continue;
+        }
+        matched_local_import = true;
+
+        let Some(binding) = precise_scala_binding(bindings, root_name) else {
+            return true;
+        };
+        let Some(mut owner) = binding.receiver_declaration else {
+            return true;
+        };
+        for segment in &owner_path[1..] {
+            let Some(nested) = ctx
+                .types
+                .exact_nested_object_for_owner(ctx.scala, &owner, segment)
+            else {
+                return true;
+            };
+            owner = nested;
+        }
+
+        let mut targets = match ctx.types.field_for_owner_unit(ctx.scala, &owner, member) {
+            FieldResolution::Resolved(field) => vec![field.declaration],
+            FieldResolution::Unresolved => return true,
+            FieldResolution::NoMatch => {
+                if let Some(object) = ctx
+                    .types
+                    .exact_nested_object_for_owner(ctx.scala, &owner, member)
+                {
+                    vec![object]
+                } else {
+                    match ctx
+                        .types
+                        .bare_member_declarations_for_owner(ctx.scala, &owner, member, None)
+                    {
+                        BareMemberResolution::Resolved(methods) if !methods.is_empty() => methods,
+                        BareMemberResolution::Resolved(_)
+                        | BareMemberResolution::NoMatch
+                        | BareMemberResolution::Unresolved => return true,
+                    }
+                }
+            }
+        };
+        targets.sort();
+        targets.dedup();
+        if selected_targets
+            .as_ref()
+            .is_some_and(|selected| selected != &targets)
+        {
+            return true;
+        }
+        selected_targets = Some(targets);
+    }
+
+    if !matched_local_import {
+        return false;
+    }
+    for target in selected_targets.into_iter().flatten() {
+        let role = if target.is_field() {
+            ScalaReferenceRole::Field
+        } else if target.is_function() {
+            ScalaReferenceRole::Callable
+        } else {
+            ScalaReferenceRole::StableObject
+        };
+        ctx.record_exact(target, role, node);
+    }
+    true
 }
 
 fn record_union_receiver_parameterless_methods(
