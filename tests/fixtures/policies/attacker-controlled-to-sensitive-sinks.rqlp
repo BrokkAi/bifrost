@@ -1,0 +1,33 @@
+; Broad compatible source/sink pairs use the generated relation. The specific
+; PII combination supplies a more actionable message and explicitly wins.
+(policy
+  :schema-version 1
+  :id "bifrost.security.attacker-controlled-to-sensitive-sinks"
+  :name "Attacker-controlled data reaches a sensitive sink"
+  :message (generated-message :relation can-reach)
+  :severity warning
+  :analysis
+    (analysis
+      :type taint
+      :mode may
+      :sources
+        (endpoint-set
+          :include-matches [
+            (match-directory
+              :path "tests/fixtures/policies/endpoints"
+              :scope recursive
+              :categories (all [input.user-controlled]))])
+      :sinks
+        (endpoint-set
+          :include-matches [
+            (match-directory
+              :path "tests/fixtures/policies/endpoints"
+              :scope recursive
+              :categories (any [data.pii data.sensitive]))])
+      :finding-combinations [
+        (finding-combination
+          :id "user-input-to-pii"
+          :source (categories :all [input.user-controlled])
+          :sink (categories :all [data.pii data.sensitive])
+          :message "User-controlled I/O can reach sensitive user PII"
+          :supersedes [])]))

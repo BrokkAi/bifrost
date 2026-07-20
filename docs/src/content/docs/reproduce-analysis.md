@@ -3,7 +3,7 @@ title: Reproduce an Analysis
 description: Preserve the inputs, environment, execution contract, and outputs needed to rerun a Bifrost result.
 ---
 
-A reproducible Bifrost analysis needs more than a saved query. Preserve the engine, source, workspace, configuration, execution limits, and complete typed response so another person can distinguish a changed program from a changed analyzer or policy.
+A reproducible Bifrost analysis needs more than a saved query or policy. Preserve the engine, source, workspace, configuration, resolved policy dependency closure, execution limits, and complete typed response so another person can distinguish a changed program from a changed analyzer or policy.
 
 ## Recommended Artifact Layout
 
@@ -13,12 +13,18 @@ bifrost-analysis/
 ├── queries/
 │   ├── rule.rql
 │   └── rule.json
+├── policies/
+│   ├── rule.rqlp
+│   └── endpoints/
+│       ├── source.rqlp
+│       └── sink.rqlp
 ├── results/
-│   └── result.json
+│   ├── query-result.json
+│   └── policy-report.json
 └── README.md
 ```
 
-Commit the RQL used for exploration and the canonical JSON used as the stable integration contract. Pin `schema_version` in the JSON. Preserve raw structured output before transforming it into SARIF, a dashboard, or prose.
+For a raw query, commit the RQL used for exploration and the canonical JSON used as the stable integration contract. Pin `schema_version` in the query JSON. For a policy, commit every explicitly selected `.rqlp` and `.rql` source plus any registered catalog input. Preserve the canonical policy JSON report before transforming it into a dashboard or prose; human, JSON, and SARIF policy outputs share one canonical model, but JSON is easiest to compare mechanically.
 
 ## Run Manifest
 
@@ -62,11 +68,55 @@ Use a machine-readable manifest such as:
 
 Replace example values with observed values; do not copy `0.8.4` into a future run without checking the binary. Record only environment variables that affect Bifrost behavior, and redact secrets before publication.
 
+### Policy runs
+
+For `--policy-file`, record the source pins and the resolved meaning separately.
+Omitted policy/endpoint and nested RQL versions select the latest compatible
+compiled-in lineage; an explicit version is an exact reproducibility pin. The
+report retains the actual version and origin either way, but publication
+artifacts should normally use explicit pins or show that strict mode accepted
+the complete dependency closure.
+
+Add fields such as:
+
+```json
+{
+  "policy": {
+    "roots": ["policies/rule.rqlp"],
+    "source_sha256": {"policies/rule.rqlp": "<source hash>"},
+    "policy_schema": {"version": 1, "origin": "explicit"},
+    "semantic_hash": "<loaded policy semantic hash>",
+    "resolved_rql_schemas": [{"version": 2, "origin": "explicit"}],
+    "endpoint_manifests": ["<selected endpoint manifest hash>"],
+    "catalogs": []
+  },
+  "execution": {
+    "command": "bifrost --root . --policy-file policies/rule.rqlp --format json --fail-on never --require-explicit-schema-versions",
+    "format": "json",
+    "fail_on": "never"
+  },
+  "result": {
+    "path": "results/policy-report.json",
+    "sha256": "<report hash>",
+    "completion": "complete",
+    "exit_status": 0,
+    "diagnostics_truncated": false
+  }
+}
+```
+
+The source hash explains byte-level changes such as comments or formatting.
+The loaded semantic hash explains changes to resolved schema, selector,
+endpoint, catalog, or precedence meaning. Preserve both rather than treating
+one as a substitute for the other. A selected endpoint-directory manifest is
+part of the policy meaning; the directory path and unselected leaves are not.
+
 ## Capture The Execution Contract
 
 - **Engine:** binary version, full source commit when known, build features/profile, and plugin or package version.
 - **Source:** repository and full commit, dirty-tree status or patch, workspace root, submodules, generated/vendor policy, and relevant file filters.
 - **Query:** both RQL and canonical JSON when applicable, `schema_version`, file hash, result detail, limits, languages, and path filters.
+- **Policy:** every root and dependency source, source hashes, resolved policy/endpoint and nested RQL schema versions plus origins, loaded semantic hash, selected endpoint and catalog manifests, precedence manifest, report limits, output format, `--fail-on`, and strict-version mode.
 - **Interface:** exact CLI command, MCP toolset and arguments, Python package version and call, or Rust dependency revision.
 - **Environment:** operating system and hardware when timing matters; semantic model ID/directory and accelerator settings when semantic search is involved.
 - **Response:** every typed result variant, diagnostics, `truncated`, proof tiers, provenance, and `provenance_truncated` before downstream filtering.
@@ -84,7 +134,7 @@ Use the [evaluation protocol](/evaluation-evidence/) when publishing timing, mem
 1. Check out the recorded Bifrost and source revisions in clean environments.
 2. Verify the query and result hashes.
 3. Run the exact command or API call and compare complete structured output, allowing only fields explicitly documented as nondeterministic.
-4. Confirm diagnostics and all truncation fields before comparing match counts.
+4. Confirm diagnostics, policy completion, and all truncation fields before comparing match or finding counts. Status 2 is never a clean zero-finding result.
 5. Document any mismatch as an engine, grammar, corpus, environment, or policy difference rather than silently updating the expected artifact.
 
 Finally, attach a [software citation](/cite-bifrost/) and state the bounded claim supported by the result. The [agent result-safety rules](/agent-result-safety/) apply equally to human-authored reports.

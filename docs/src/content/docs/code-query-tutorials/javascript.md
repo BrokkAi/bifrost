@@ -3,7 +3,7 @@ title: JavaScript
 description: Query JavaScript member calls, arrows, class expressions, field access, and new expressions with query_code.
 ---
 
-> Last verified end to end: 2026-07-14 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-18 (`query_code` schema version 2).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
 
@@ -204,6 +204,8 @@ Anonymous class expressions are queryable as `class`, but the assignment binding
   "truncated": false,
   "diagnostics": [
     {
+      "code": "unsupported_structural_feature",
+      "impact": "incomplete",
       "language": "javascript",
       "message": "structural adapter for javascript does not support role(s): kwargs"
     }

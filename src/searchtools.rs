@@ -4621,11 +4621,11 @@ fn scan_usages_backend(
                 };
                 work_entries.push(ScanUsagesWorkEntry::Ambiguous { request, item });
             }
-            FuzzyResult::Failure { fq_name, reason } => {
-                let diagnostic = query.graph_failure.as_ref();
-                let reason_kind = diagnostic
-                    .map(|diagnostic| diagnostic.reason_kind.clone())
-                    .unwrap_or_default();
+            FuzzyResult::Failure {
+                fq_name,
+                reason_kind,
+                reason,
+            } => {
                 let reason = if reason_kind == "unsupported_target_shape" {
                     unsupported_target_shape_message(overloads.first())
                 } else {

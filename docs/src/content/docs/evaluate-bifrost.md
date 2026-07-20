@@ -1,11 +1,15 @@
 ---
 title: Evaluate Bifrost in Ten Minutes
-description: Run one reproducible query through the CLI, agent MCP, and VS Code.
+description: Run one reproducible query and match policy through the CLI, agent MCP, and VS Code.
 ---
 
-> Last verified end to end: 2026-07-15 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-20 (`query_code` schema version 2).
+> Match-policy path verified the same day (policy schema version 1).
 
-This evaluation uses one checked-in Python fixture and one saved RQL query through three interfaces. Each journey should find the same call at `src/app.py:5`, so differences come from the interface rather than the analysis question.
+This evaluation uses one checked-in Python fixture, one saved RQL query, and one
+match-only policy. The query journeys and policy should all find the same call
+at `src/app.py:5`, so differences come from the interface rather than the
+analysis question.
 
 The exercise proves that Bifrost can index a small project, match a normalized call shape, execute equivalent RQL and JSON, and preserve the source location across CLI, MCP, and VS Code. It does not measure large-repository performance, prove that every possible Python call resolves, or exercise control flow or data flow.
 
@@ -95,7 +99,78 @@ bifrost --root . --tool query_code --args '{"languages":["python"],"match":{"kin
 
 It should return the same path, line, text, and truncation state. This parity is useful when exploring in RQL before checking a stable JSON query into an integration.
 
-## Journey 2: Agent MCP
+## Journey 2: Run A Match Policy
+
+The published fixture also contains `policies/review-audit-call.rqlp`. It wraps
+the same RQL selector in stable finding metadata:
+
+<!-- policy-doc-test:rqlp:docs/fixtures/ten-minute-evaluation/policies/review-audit-call.rqlp -->
+```lisp
+(policy
+  :schema-version 1
+  :id "bifrost.example.review-audit-call"
+  :name "Review direct audit calls"
+  :message "Review this direct audit call"
+  :severity warning
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql-file
+          :schema-version 2
+          :path "queries/find-audit.rql")))
+```
+
+Run the exact checked-in policy from the fixture root:
+
+```bash
+bifrost --root . \
+  --policy-file policies/review-audit-call.rqlp \
+  --format human \
+  --fail-on never
+```
+
+`--fail-on never` keeps this demonstration command at status 0 without hiding
+the finding. The documentation test runs that exact command through the current
+`bifrost` binary and checks this complete human output. The report identifies
+the `audit(...)` call at `src/app.py:5:12` and ends with one complete policy run.
+
+<details>
+<summary>Checked current output</summary>
+
+<!-- policy-doc-test:human:ten-minute-audit -->
+```text
+src/app.py:5:12: [warning] bifrost.example.review-audit-call: Review this direct audit call
+  finding: d3487ef4eec5e33c12d12de98086dc7043f0fd76221509292747ecdc9aab754b (strong)
+  analysis: match (definite, complete)
+  evidence: structural_match call
+  match anchor: strong structural_match src/app.py
+    semantic owner: python:src/app.py:canonical_ast_identity:[["function","handle"],["return",null],["call","audit"]]
+    selected source: b82212cae37708e517b4c19801ba9695e0d65de240ca51bb395e9cbb6bd6302f
+    occurrence ordinal: 0
+  match terminal: structural_match call; identity python:src/app.py:canonical_ast_identity:[["function","handle"],["return",null],["call","audit"]] at src/app.py:5:12
+  proof reason: direct_structural_match
+  classification: unclassified
+  proof: proven
+policy rule: bifrost.example.review-audit-call (Review direct audit calls)
+  policy hash: 9ba02503633473300a66dae5526d362c374d9136f437e6f0519eea56fd2ff273
+  analysis type: match
+  policy schema: 1 (explicit)
+  selector schema /analysis/selector: 2 (explicit)
+  endpoint dependencies: none
+  match directories: none
+  precedence: none
+  message: static - Review this direct audit call
+  severity: fixed warning
+summary: 1 finding; 1 complete policy run
+```
+
+</details>
+
+Run the same command with `--fail-on warning` to use the policy as a gate. The
+report is identical, but the process exits 1 because the finding is a warning.
+
+## Journey 3: Agent MCP
 
 Configure the agent's Bifrost server with the fixture directory as its explicit root and the query-capable toolset:
 
@@ -119,7 +194,7 @@ Both calls should return the same `src/app.py:5` match as the CLI. The saved fil
 
 If the first call is impossible because `query_code` is missing, the agent has not loaded a query-capable MCP configuration. If only the second fails, verify the active workspace root and relative file path. A successful symbol-tool call alone does not prove query access.
 
-## Journey 3: VS Code
+## Journey 4: VS Code
 
 Install the [Bifrost VS Code extension](/vscode/), then open the fixture directory as the workspace:
 
@@ -135,6 +210,11 @@ This unsaved-buffer behavior is specific to the VS Code language-server request.
 
 ## Interpret The Result
 
-All three initial runs should agree on one structural call shape. That result proves the parsed call site exists; it is not yet a claim about every runtime target or caller. For declaration identity and proof tiers, continue with [Reference Traversal](/code-query-tutorials/reference-traversal/). For language-specific boundaries, use the [capability matrix](/capabilities/).
+All query runs and the match policy should agree on one structural call shape.
+The policy adds diagnostic identity and presentation; it does not strengthen the
+underlying fact into a claim about every runtime target or caller. For
+declaration identity and proof tiers, continue with [Reference
+Traversal](/code-query-tutorials/reference-traversal/). For language-specific
+boundaries, use the [capability matrix](/capabilities/).
 
 Before treating any larger query as complete, inspect `truncated` and all returned diagnostics. When graph steps are present, also distinguish `proven` from `unproven` edges and check `provenance_truncated`. Continue with [Agent Result Safety](/agent-result-safety/) before using these results in automated claims, or [Build a Static-Analysis Rule](/build-static-analysis-rule/) to productize a query.

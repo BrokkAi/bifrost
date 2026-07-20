@@ -3,7 +3,7 @@ title: Ruby
 description: Query Ruby keyword calls, blocks, imports, qualified classes, and precision boundaries with query_code.
 ---
 
-> Last verified end to end: 2026-07-14 (`query_code` schema version 2).
+> Last verified end to end: 2026-07-18 (`query_code` schema version 2).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
 
@@ -539,6 +539,8 @@ Only fully static strings provide a `module` role. The interpolated `plugins/#{t
 {
   "diagnostics": [
     {
+      "code": "unsupported_structural_feature",
+      "impact": "incomplete",
       "language": "ruby",
       "message": "structural adapter for ruby does not support role(s): decorators"
     }

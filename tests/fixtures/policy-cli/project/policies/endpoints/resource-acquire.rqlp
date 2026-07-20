@@ -1,0 +1,14 @@
+(endpoint
+  :schema-version 1
+  :id "bifrost.resources.acquire"
+  :name "Resource acquisition"
+  :display-name "acquired resource"
+  :role source
+  :categories [resource.lifecycle resource.acquire]
+  :selector
+    (rql
+      :schema-version 2
+      (language python
+        (call :callee (name "open_resource"))))
+  :binding return-value
+  :supersedes [])

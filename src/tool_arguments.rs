@@ -1,6 +1,7 @@
 use crate::analyzer::Language;
 use crate::git_file::parse_rev_path;
 use crate::git_file::{read_git_file, resolve_git_file_path};
+use crate::workspace_document::has_portable_windows_path_prefix;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -503,22 +504,11 @@ fn normalize_workspace_file_path(raw: &str, workspace_root: &Path) -> Result<Str
     }
 
     if looks_like_absolute_path(trimmed) {
-        return normalize_absolute_literal_path(trimmed, workspace_root);
+        return normalize_absolute_path_lexically(trimmed, workspace_root);
     }
 
-    let relative = normalize_relative_slash_path(&slash_string(trimmed))
-        .map_err(|_| "query file path escapes active workspace".to_string())?;
-    let candidate = workspace_root.join(&relative);
-    let Ok(canonical_candidate) = candidate.canonicalize() else {
-        return Ok(relative);
-    };
-    let canonical_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    canonical_candidate
-        .strip_prefix(&canonical_root)
-        .map(path_to_slash_string)
-        .map_err(|_| outside_workspace_error(raw, workspace_root))
+    normalize_relative_slash_path(&slash_string(trimmed))
+        .map_err(|_| "query file path escapes active workspace".to_string())
 }
 
 fn normalize_object_array_string_field(
@@ -627,15 +617,7 @@ fn normalize_relative_path_preserving_escape(relative: &str) -> Result<String, S
 }
 
 fn looks_like_absolute_path(raw: &str) -> bool {
-    Path::new(raw).is_absolute() || is_windows_absolute_path(raw)
-}
-
-fn is_windows_absolute_path(raw: &str) -> bool {
-    let bytes = raw.as_bytes();
-    bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'/' | b'\\')
+    Path::new(raw).is_absolute() || has_portable_windows_path_prefix(raw)
 }
 
 fn contains_glob_syntax(raw: &str) -> bool {

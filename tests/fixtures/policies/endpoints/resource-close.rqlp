@@ -1,0 +1,12 @@
+(endpoint
+  :id "bifrost.resources.close"
+  :name "Resource close"
+  :display-name "resource close"
+  :role sink
+  :categories [resource.lifecycle resource.close]
+  :selector
+    (rql
+      (language python
+        (call :callee (name "close"))))
+  :binding receiver
+  :supersedes [])

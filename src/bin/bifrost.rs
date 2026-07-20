@@ -1,5 +1,6 @@
 use std::env;
-use std::path::PathBuf;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[path = "bifrost/code_query_repl.rs"]
@@ -11,6 +12,11 @@ use brokk_bifrost::mcp_common::{McpRenderOptions, run_stdio_server};
 use brokk_bifrost::mcp_registry::{
     resolve_server_spec, resolve_server_spec_for_render_options, searchtools_toolset_order,
 };
+use brokk_bifrost::policy::{
+    HumanRenderOptions, POLICY_EXIT_UNRELIABLE, PolicyBatchOutcome, PolicyFailOn,
+    PolicyRenderError, PolicyReportDocument, SarifToolIdentity, escape_terminal_text,
+    evaluate_policy_files, write_policy_human, write_policy_json, write_policy_sarif,
+};
 use brokk_bifrost::scoped_project::create_cli_tool_service;
 use brokk_bifrost::searchtools_render::RenderOptions;
 use brokk_bifrost::skill_install::{
@@ -19,19 +25,97 @@ use brokk_bifrost::skill_install::{
 use brokk_bifrost::tool_arguments::normalize_tool_arguments_for_cli;
 use code_query_repl::run_code_query_repl;
 use serde_json::{Value, json};
+use tempfile::NamedTempFile;
+
+enum CliRunResult {
+    Complete,
+    PolicyStatus(u8),
+}
+
+struct CliRunError {
+    message: String,
+    policy_invocation: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyOutputFormat {
+    Human,
+    Json,
+    Sarif,
+}
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
+    match run(env::args().skip(1)) {
+        Ok(CliRunResult::Complete) => ExitCode::SUCCESS,
+        Ok(CliRunResult::PolicyStatus(status)) => ExitCode::from(status),
         Err(err) => {
-            eprintln!("{err}");
-            ExitCode::FAILURE
+            eprintln!("{}", escape_terminal_text(&err.message));
+            if err.policy_invocation {
+                ExitCode::from(POLICY_EXIT_UNRELIABLE)
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }
 
-fn run() -> Result<(), String> {
-    let mut args = env::args().skip(1);
+fn run(args: impl Iterator<Item = String>) -> Result<CliRunResult, CliRunError> {
+    let args = args.collect::<Vec<_>>();
+    let policy_invocation = has_policy_syntax(&args);
+    run_inner(args.into_iter(), policy_invocation).map_err(|message| CliRunError {
+        message,
+        policy_invocation,
+    })
+}
+
+fn has_policy_syntax(args: &[String]) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        if matches!(
+            argument,
+            "--policy-file"
+                | "--format"
+                | "--fail-on"
+                | "--output"
+                | "--require-explicit-schema-versions"
+        ) {
+            return true;
+        }
+
+        index += 1;
+        if option_requires_value(argument) && index < args.len() {
+            index += 1;
+        }
+    }
+    false
+}
+
+fn option_requires_value(argument: &str) -> bool {
+    matches!(
+        argument,
+        "--root"
+            | "--mcp"
+            | "--target"
+            | "--skills-root"
+            | "--mode"
+            | "--skill-set"
+            | "--server"
+            | "--tool"
+            | "--args"
+            | "--query-file"
+            | "--sources"
+            | "--policy-file"
+            | "--format"
+            | "--fail-on"
+            | "--output"
+    )
+}
+
+fn run_inner(
+    mut args: impl Iterator<Item = String>,
+    policy_invocation: bool,
+) -> Result<CliRunResult, String> {
     let mut root =
         env::current_dir().map_err(|err| format!("Failed to get current directory: {err}"))?;
     let mut root_explicit = false;
@@ -52,6 +136,15 @@ fn run() -> Result<(), String> {
     let mut tool_sources = Vec::new();
     let mut query_file: Option<String> = None;
     let mut render_options = McpRenderOptions::default();
+    let mut no_line_numbers_seen = false;
+    let mut force_semantic_cpu_seen = false;
+    let mut policy_files = Vec::new();
+    let mut policy_format = PolicyOutputFormat::Human;
+    let mut policy_format_seen = false;
+    let mut policy_fail_on = PolicyFailOn::Warning;
+    let mut policy_fail_on_seen = false;
+    let mut policy_output: Option<PathBuf> = None;
+    let mut require_explicit_schema_versions = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -157,10 +250,49 @@ fn run() -> Result<(), String> {
                     .ok_or_else(|| "--sources requires a path".to_string())?;
                 tool_sources.push(value);
             }
+            "--policy-file" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--policy-file requires a path".to_string())?;
+                policy_files.push(PathBuf::from(value));
+            }
+            "--format" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--format requires human, json, or sarif".to_string())?;
+                if policy_format_seen {
+                    return Err("--format may only be provided once".to_string());
+                }
+                policy_format = parse_policy_format(&value)?;
+                policy_format_seen = true;
+            }
+            "--fail-on" => {
+                let value = args.next().ok_or_else(|| {
+                    "--fail-on requires never, finding, note, warning, or error".to_string()
+                })?;
+                if policy_fail_on_seen {
+                    return Err("--fail-on may only be provided once".to_string());
+                }
+                policy_fail_on = parse_policy_fail_on(&value)?;
+                policy_fail_on_seen = true;
+            }
+            "--output" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--output requires a path".to_string())?;
+                if policy_output.replace(PathBuf::from(value)).is_some() {
+                    return Err("--output may only be provided once".to_string());
+                }
+            }
+            "--require-explicit-schema-versions" => {
+                require_explicit_schema_versions = true;
+            }
             "--no-line-numbers" => {
+                no_line_numbers_seen = true;
                 render_options.render_line_numbers = false;
             }
             "--force-semantic-cpu" => {
+                force_semantic_cpu_seen = true;
                 // Lets semantic_search run (and be advertised) on hosts without a
                 // CUDA/Metal accelerator. Consumed via env by the registry + service.
                 unsafe { env::set_var("BIFROST_FORCE_SEMANTIC_CPU", "1") };
@@ -169,16 +301,48 @@ fn run() -> Result<(), String> {
                 // Optional positional topic: `--help <tool>` shows that tool's
                 // description and parameters. Ignore a following flag.
                 let topic = args.next().filter(|a| !a.starts_with('-'));
-                return print_help(topic.as_deref());
+                return print_help(topic.as_deref()).map(|()| CliRunResult::Complete);
             }
             "--version" | "-V" => {
                 println!("bifrost {}", env!("CARGO_PKG_VERSION"));
-                return Ok(());
+                return Ok(CliRunResult::Complete);
             }
             other => {
                 return Err(format!("Unknown argument: {other}"));
             }
         }
+    }
+
+    if policy_invocation {
+        if policy_files.is_empty() {
+            return Err("policy mode requires at least one --policy-file".to_string());
+        }
+        if query_file.is_some()
+            || tool_name.is_some()
+            || tool_args_seen
+            || !tool_sources.is_empty()
+            || run_lsp
+            || run_repl
+            || run_skill_install
+            || install_option_seen
+            || mcp_mode.is_some()
+            || no_line_numbers_seen
+            || force_semantic_cpu_seen
+        {
+            return Err(
+                "--policy-file and policy output options cannot be combined with --query-file, --tool, --args, --sources, --mcp, --lsp, --repl, skill-install options, --no-line-numbers, or --force-semantic-cpu"
+                    .to_string(),
+            );
+        }
+        let status = run_policy_mode(
+            root,
+            &policy_files,
+            policy_format,
+            policy_fail_on,
+            policy_output.as_deref(),
+            require_explicit_schema_versions,
+        );
+        return Ok(CliRunResult::PolicyStatus(status));
     }
 
     if let Some(query_file) = query_file {
@@ -204,7 +368,8 @@ fn run() -> Result<(), String> {
             json!({ "query_file": query_file }),
             &[],
             render_options,
-        );
+        )
+        .map(|()| CliRunResult::Complete);
     }
 
     if let Some(tool_name) = tool_name {
@@ -214,7 +379,8 @@ fn run() -> Result<(), String> {
                     .to_string(),
             );
         }
-        return run_tool(root, &tool_name, tool_args, &tool_sources, render_options);
+        return run_tool(root, &tool_name, tool_args, &tool_sources, render_options)
+            .map(|()| CliRunResult::Complete);
     }
 
     if !tool_sources.is_empty() {
@@ -235,7 +401,8 @@ fn run() -> Result<(), String> {
             skill_set,
             force: force_install,
             dry_run: dry_run_install,
-        });
+        })
+        .map(|()| CliRunResult::Complete);
     }
 
     if install_option_seen {
@@ -256,22 +423,177 @@ fn run() -> Result<(), String> {
     if !root_explicit {
         eprintln!(
             "bifrost: no --root supplied, using current directory: {}",
-            root.display()
+            escape_terminal_text(root.to_string_lossy().as_ref())
         );
     }
 
     if run_lsp {
-        return run_lsp_stdio_server(root);
+        return run_lsp_stdio_server(root).map(|()| CliRunResult::Complete);
     }
 
     if run_repl {
-        return run_code_query_repl(root);
+        return run_code_query_repl(root).map(|()| CliRunResult::Complete);
     }
 
     let mode = mcp_mode.as_deref().unwrap_or("searchtools");
     let git_repo = brokk_bifrost::mcp_registry::workspace_is_git(&root);
     let spec = resolve_server_spec_for_render_options(mode, render_options, git_repo)?;
-    run_stdio_server(root, render_options, &spec)
+    run_stdio_server(root, render_options, &spec).map(|()| CliRunResult::Complete)
+}
+
+fn parse_policy_format(value: &str) -> Result<PolicyOutputFormat, String> {
+    match value {
+        "human" => Ok(PolicyOutputFormat::Human),
+        "json" => Ok(PolicyOutputFormat::Json),
+        "sarif" => Ok(PolicyOutputFormat::Sarif),
+        other => Err(format!(
+            "Invalid --format value: {other}. Expected human, json, or sarif."
+        )),
+    }
+}
+
+fn parse_policy_fail_on(value: &str) -> Result<PolicyFailOn, String> {
+    match value {
+        "never" => Ok(PolicyFailOn::Never),
+        "finding" => Ok(PolicyFailOn::Finding),
+        "note" => Ok(PolicyFailOn::Note),
+        "warning" => Ok(PolicyFailOn::Warning),
+        "error" => Ok(PolicyFailOn::Error),
+        other => Err(format!(
+            "Invalid --fail-on value: {other}. Expected never, finding, note, warning, or error."
+        )),
+    }
+}
+
+fn run_policy_mode(
+    root: PathBuf,
+    policy_files: &[PathBuf],
+    format: PolicyOutputFormat,
+    fail_on: PolicyFailOn,
+    output_path: Option<&Path>,
+    require_explicit_schema_versions: bool,
+) -> u8 {
+    let outcome = match evaluate_policy_files(
+        root,
+        policy_files,
+        require_explicit_schema_versions,
+        fail_on,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            eprintln!(
+                "bifrost: policy evaluation failed: {}",
+                escape_terminal_text(&error.to_string())
+            );
+            return POLICY_EXIT_UNRELIABLE;
+        }
+    };
+    let status = outcome.exit_status();
+    let write_result = match output_path {
+        Some(path) => write_policy_output_file(path, format, &outcome),
+        None => write_policy_stdout(format, &outcome),
+    };
+    if let Err(error) = write_result {
+        eprintln!(
+            "bifrost: policy report output failed: {}",
+            escape_terminal_text(&error)
+        );
+        return POLICY_EXIT_UNRELIABLE;
+    }
+    if status == POLICY_EXIT_UNRELIABLE {
+        eprintln!(
+            "bifrost: policy evaluation was incomplete or invalid; see the emitted report for details"
+        );
+    }
+    status
+}
+
+fn write_policy_stdout(
+    format: PolicyOutputFormat,
+    outcome: &PolicyBatchOutcome,
+) -> Result<(), String> {
+    // Buffer the bounded encoding before touching stdout so size/serialization
+    // failures cannot emit a partial machine document and remain stderr-only.
+    let mut encoded = Vec::new();
+    render_policy_report(
+        format,
+        outcome.report(),
+        &mut encoded,
+        outcome.max_serialized_report_bytes(),
+    )
+    .map_err(|error| error.to_string())?;
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    stdout
+        .write_all(&encoded)
+        .and_then(|()| stdout.flush())
+        .map_err(|error| error.to_string())
+}
+
+fn write_policy_output_file(
+    destination: &Path,
+    format: PolicyOutputFormat,
+    outcome: &PolicyBatchOutcome,
+) -> Result<(), String> {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = NamedTempFile::new_in(parent).map_err(|error| {
+        format!(
+            "failed to create a temporary output beside {}: {error}",
+            destination.display()
+        )
+    })?;
+    render_policy_report(
+        format,
+        outcome.report(),
+        &mut temporary,
+        outcome.max_serialized_report_bytes(),
+    )
+    .map_err(|error| error.to_string())?;
+    temporary.flush().map_err(|error| {
+        format!(
+            "failed to flush temporary output for {}: {error}",
+            destination.display()
+        )
+    })?;
+    temporary.as_file().sync_all().map_err(|error| {
+        format!(
+            "failed to sync temporary output for {}: {error}",
+            destination.display()
+        )
+    })?;
+    let temporary_path = temporary.into_temp_path();
+    temporary_path.persist(destination).map_err(|error| {
+        format!(
+            "failed to atomically replace {}: {error}",
+            destination.display()
+        )
+    })
+}
+
+fn render_policy_report<W: Write>(
+    format: PolicyOutputFormat,
+    report: &PolicyReportDocument,
+    output: W,
+    max_serialized_bytes: usize,
+) -> Result<u64, PolicyRenderError> {
+    match format {
+        PolicyOutputFormat::Human => write_policy_human(
+            report,
+            &HumanRenderOptions::default(),
+            output,
+            max_serialized_bytes,
+        ),
+        PolicyOutputFormat::Json => write_policy_json(report, output, max_serialized_bytes),
+        PolicyOutputFormat::Sarif => write_policy_sarif(
+            report,
+            &SarifToolIdentity::default(),
+            output,
+            max_serialized_bytes,
+        ),
+    }
 }
 
 fn parse_install_target(value: &str) -> Result<InstallTarget, String> {
@@ -378,6 +700,7 @@ USAGE:
     bifrost --repl             Run the interactive code-query REPL
     bifrost --tool NAME        Run a single tool once, print JSON result, and exit
     bifrost --query-file PATH  Run a .rql or .json code query once, print JSON result, and exit
+    bifrost --policy-file PATH Evaluate one or more static-analysis policy files and exit
     bifrost --install-skills   Install Bifrost Agent Skills into a .agents/skills root
     bifrost --version | --help [TOOL]
 
@@ -390,6 +713,13 @@ OPTIONS:
     --query-file PATH      Run a workspace-relative .rql or .json CodeQuery directly.
     --sources PATH         Restrict one-shot --tool workspace construction to selected files,
                            directories, or globs. Repeatable; valid only with --tool.
+    --policy-file PATH     Evaluate a workspace-relative .rqlp policy. Repeatable.
+    --format FORMAT        Policy output: human, json, or sarif (default: human)
+    --fail-on THRESHOLD    Policy finding threshold: never, finding, note, warning, or error
+                           (default: warning; finding includes unrated findings)
+    --require-explicit-schema-versions
+                           Reject inferred policy and RQL schema versions
+    --output PATH          Atomically write policy output to PATH instead of stdout
     --no-line-numbers      Render source output without leading line numbers
     --target project|global
                            Skill install destination for --install-skills
@@ -439,6 +769,9 @@ EXAMPLES:
 
     # Run a saved RQL or JSON code query (current directory is the default root):
     bifrost --query-file queries/audit.rql
+
+    # Evaluate two policy roots together and emit one canonical JSON report:
+    bifrost --root /path/to/project --policy-file policies/security.rqlp --policy-file policies/correctness.rqlp --format json
 
     # Human code-query exploration with S-expressions, completion, docs, and history:
     bifrost --root /path/to/project --repl

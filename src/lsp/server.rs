@@ -28,17 +28,22 @@ use lsp_types::request::{
 };
 use lsp_types::{
     CancelParams, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
-    CodeActionResponse, ConfigurationItem, ConfigurationParams, Diagnostic, DiagnosticSeverity,
+    CodeActionResponse, CompletionItem, CompletionItemKind, CompletionList, CompletionResponse,
+    CompletionTextEdit, ConfigurationItem, ConfigurationParams, Diagnostic, DiagnosticSeverity,
     DidChangeConfigurationParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentChanges, FileChangeType, Hover, HoverContents,
-    InitializeParams, MarkupContent, MarkupKind, NumberOrString, OneOf,
+    DidSaveTextDocumentParams, DocumentChanges, Documentation, FileChangeType, Hover,
+    HoverContents, InitializeParams, MarkupContent, MarkupKind, NumberOrString, OneOf,
     OptionalVersionedTextDocumentIdentifier, Position, ProgressToken, PublishDiagnosticsParams,
     Registration, RegistrationParams, TextDocumentEdit, TextEdit, Uri, WorkDoneProgress,
     WorkDoneProgressBegin, WorkDoneProgressCreateParams, WorkDoneProgressEnd,
     WorkDoneProgressReport, WorkspaceEdit,
 };
 
+use crate::analyzer::policy::{
+    PolicySourceDiagnosticSeverity, rqlp_source_completion_at, rqlp_source_help_at,
+    validate_rqlp_source,
+};
 use crate::analyzer::structural::query::{
     QuerySourceEdit, query_source_help_at, validate_query_source,
 };
@@ -677,6 +682,12 @@ fn handle_request(
     state: &mut ServerState,
     req: Request,
 ) -> Result<(), String> {
+    if matches!(
+        req.method.as_str(),
+        ValidateQuery::METHOD | QueryHover::METHOD | ValidatePolicy::METHOD | PolicyHover::METHOD
+    ) {
+        return handle_source_only_request(connection, req);
+    }
     if req.method == Formatting::METHOD {
         return handle_formatting_request(connection, state, req);
     }
@@ -689,18 +700,15 @@ fn handle_request(
     if req.method == SemanticTokensFullRequest::METHOD {
         return handle_semantic_tokens_request(connection, state, req);
     }
+    if req.method == Completion::METHOD {
+        return handle_completion_request(connection, state, req);
+    }
 
     let id = req.id.clone();
     let id_for_log = format!("{id:?}");
     let method = req.method.clone();
     let _query_scope = AnalyzerQueryScope::new(state.workspace.analyzer());
     let response = match req.method.as_str() {
-        ValidateQuery::METHOD => {
-            decode_and_run::<ValidateQuery, _>(req, |params| Ok(validate_query_request(params)))
-        }
-        QueryHover::METHOD => {
-            decode_and_run::<QueryHover, _>(req, |params| Ok(query_hover_request(params)))
-        }
         RuneIrRequest::METHOD => decode_and_run::<RuneIrRequest, _>(req, |params| {
             rune_ir::handle(&state.workspace, state.project(), params)
         }),
@@ -756,16 +764,6 @@ fn handle_request(
             Ok(signature_help::handle(
                 &state.workspace,
                 state.project(),
-                &params,
-            ))
-        }),
-        Completion::METHOD => decode_and_run::<Completion, _>(req, |params| {
-            // Borrow the overlay field directly (not via `state.project()`) so
-            // it disjoint-borrows from `&mut state.completion_cache`.
-            Ok(completion::handle(
-                &mut state.completion_cache,
-                &state.workspace,
-                state.overlay.as_ref(),
                 &params,
             ))
         }),
@@ -850,6 +848,66 @@ fn handle_request(
             format!("Method not implemented: {}", req.method),
         ),
     };
+    send_immediate_response(connection, &method, &id_for_log, response)
+}
+
+fn handle_source_only_request(connection: &Connection, req: Request) -> Result<(), String> {
+    let id_for_log = format!("{:?}", req.id);
+    let method = req.method.clone();
+    let response = match req.method.as_str() {
+        ValidateQuery::METHOD => {
+            decode_and_run::<ValidateQuery, _>(req, |params| Ok(validate_query_request(params)))
+        }
+        QueryHover::METHOD => {
+            decode_and_run::<QueryHover, _>(req, |params| Ok(query_hover_request(params)))
+        }
+        ValidatePolicy::METHOD => {
+            decode_and_run::<ValidatePolicy, _>(req, |params| Ok(validate_policy_request(params)))
+        }
+        PolicyHover::METHOD => {
+            decode_and_run::<PolicyHover, _>(req, |params| Ok(policy_hover_request(params)))
+        }
+        _ => unreachable!("source-only request dispatch checked the method"),
+    };
+    send_immediate_response(connection, &method, &id_for_log, response)
+}
+
+fn handle_completion_request(
+    connection: &Connection,
+    state: &mut ServerState,
+    req: Request,
+) -> Result<(), String> {
+    let id_for_log = format!("{:?}", req.id);
+    let method = req.method.clone();
+    let response = decode_and_run::<Completion, _>(req, |params| {
+        let uri = &params.text_document_position.text_document.uri;
+        if let Some(document) = state
+            .open_documents
+            .get(uri.as_str())
+            .filter(|document| formatting::is_bifrost_policy_language(&document.language_id))
+        {
+            return Ok(policy_completion_request(document, &params));
+        }
+
+        let _query_scope = AnalyzerQueryScope::new(state.workspace.analyzer());
+        // Borrow the overlay field directly (not via `state.project()`) so it
+        // disjoint-borrows from `&mut state.completion_cache`.
+        Ok(completion::handle(
+            &mut state.completion_cache,
+            &state.workspace,
+            state.overlay.as_ref(),
+            &params,
+        ))
+    });
+    send_immediate_response(connection, &method, &id_for_log, response)
+}
+
+fn send_immediate_response(
+    connection: &Connection,
+    method: &str,
+    id_for_log: &str,
+    response: Response,
+) -> Result<(), String> {
     if let Some(error) = response.error.as_ref() {
         eprintln!(
             "[bifrost-lsp] request error method={} id={} code={} message={}",
@@ -1315,6 +1373,9 @@ fn handle_formatting_request(
     let document_uri = params.text_document.uri.clone();
     let rules = state.runtime_configuration.formatter_commands.clone();
     let prepared = match state.open_documents.get(document_uri.as_str()) {
+        Some(document) if formatting::is_bifrost_policy_language(&document.language_id) => {
+            Ok(Some(formatting::prepare_bifrost_policy(&document.text)))
+        }
         Some(document) if formatting::is_bifrost_sexp_language(&document.language_id) => {
             Ok(Some(formatting::prepare_bifrost_sexp(&document.text)))
         }
@@ -1919,6 +1980,27 @@ impl lsp_types::request::Request for QueryHover {
     const METHOD: &'static str = "bifrost/queryHover";
 }
 
+/// Source-only policy validation for the RQLP editor. The request carries the
+/// live buffer and deliberately has no URI, workspace, registry, or analyzer.
+enum ValidatePolicy {}
+
+impl lsp_types::request::Request for ValidatePolicy {
+    type Params = PolicySourceParams;
+    type Result = ValidatePolicyResult;
+
+    const METHOD: &'static str = "bifrost/validatePolicy";
+}
+
+/// Source-only schema hover for policy and endpoint authoring.
+enum PolicyHover {}
+
+impl lsp_types::request::Request for PolicyHover {
+    type Params = PolicyHoverParams;
+    type Result = Option<Hover>;
+
+    const METHOD: &'static str = "bifrost/policyHover";
+}
+
 /// Inspect the matcher-visible Rune IR for the smallest indexed declaration
 /// enclosing a cursor or selection in the current overlay.
 enum RuneIrRequest {}
@@ -1942,7 +2024,23 @@ struct QueryHoverParams {
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
+struct PolicySourceParams {
+    source: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct PolicyHoverParams {
+    source: String,
+    position: Position,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
 struct ValidateQueryResult {
+    diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ValidatePolicyResult {
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -1967,6 +2065,37 @@ fn validate_query_request(params: QuerySourceParams) -> ValidateQueryResult {
         })
         .collect();
     ValidateQueryResult { diagnostics }
+}
+
+fn validate_policy_request(params: PolicySourceParams) -> ValidatePolicyResult {
+    let line_starts = compute_line_starts(&params.source);
+    let diagnostics = validate_rqlp_source(&params.source)
+        .into_iter()
+        .map(|diagnostic| {
+            let range = lsp_types::Range {
+                start: byte_offset_to_position(
+                    &params.source,
+                    &line_starts,
+                    diagnostic.range.start,
+                ),
+                end: byte_offset_to_position(&params.source, &line_starts, diagnostic.range.end),
+            };
+            let severity = match diagnostic.severity {
+                PolicySourceDiagnosticSeverity::Error => DiagnosticSeverity::ERROR,
+                PolicySourceDiagnosticSeverity::Warning => DiagnosticSeverity::WARNING,
+            };
+            Diagnostic::new(
+                range,
+                Some(severity),
+                Some(NumberOrString::String(diagnostic.code.to_string())),
+                Some("Bifrost RQL Policy".to_string()),
+                diagnostic.message,
+                None,
+                None,
+            )
+        })
+        .collect();
+    ValidatePolicyResult { diagnostics }
 }
 
 const RQL_LANGUAGE_ID: &str = "bifrost-rql";
@@ -2091,6 +2220,58 @@ fn query_hover_request(params: QueryHoverParams) -> Option<Hover> {
         }),
         range: Some(range),
     })
+}
+
+fn policy_hover_request(params: PolicyHoverParams) -> Option<Hover> {
+    let line_starts = compute_line_starts(&params.source);
+    let offset = position_to_byte_offset(&params.source, &line_starts, &params.position);
+    let help = rqlp_source_help_at(&params.source, offset)?;
+    let range = lsp_types::Range {
+        start: byte_offset_to_position(&params.source, &line_starts, help.range.start),
+        end: byte_offset_to_position(&params.source, &line_starts, help.range.end),
+    };
+    Some(Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: format!("```rqlp\n{}\n```\n\n{}", help.signature, help.description),
+        }),
+        range: Some(range),
+    })
+}
+
+fn policy_completion_request(
+    document: &OpenDocument,
+    params: &lsp_types::CompletionParams,
+) -> Option<CompletionResponse> {
+    let line_starts = compute_line_starts(&document.text);
+    let offset = position_to_byte_offset(
+        &document.text,
+        &line_starts,
+        &params.text_document_position.position,
+    );
+    let completion = rqlp_source_completion_at(&document.text, offset)?;
+    let range = lsp_types::Range {
+        start: byte_offset_to_position(&document.text, &line_starts, completion.range.start),
+        end: byte_offset_to_position(&document.text, &line_starts, completion.range.end),
+    };
+    Some(CompletionResponse::List(CompletionList {
+        is_incomplete: false,
+        items: vec![CompletionItem {
+            label: completion.label.to_string(),
+            kind: Some(CompletionItemKind::KEYWORD),
+            detail: Some(completion.signature.to_string()),
+            documentation: Some(Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: completion.description,
+            })),
+            filter_text: Some(completion.label.to_string()),
+            text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                range,
+                completion.new_text,
+            ))),
+            ..CompletionItem::default()
+        }],
+    }))
 }
 
 #[derive(Clone)]

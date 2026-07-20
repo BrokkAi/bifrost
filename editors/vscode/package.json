@@ -42,6 +42,7 @@
     "onLanguage:php",
     "onLanguage:scala",
     "onLanguage:bifrost-rql",
+    "onLanguage:bifrost-rql-policy",
     "onLanguage:bifrost-rune-ir"
   ],
   "main": "./out/extension.js",
@@ -60,6 +61,21 @@
         "icon": {
           "light": "./icons/bifrost-rql.png",
           "dark": "./icons/bifrost-rql.png"
+        }
+      },
+      {
+        "id": "bifrost-rql-policy",
+        "aliases": [
+          "Bifrost RQL Policy",
+          "bifrost-rql-policy"
+        ],
+        "extensions": [
+          ".rqlp"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/bifrost-rql-policy.svg",
+          "dark": "./icons/bifrost-rql-policy.svg"
         }
       },
       {
@@ -83,6 +99,11 @@
         "language": "bifrost-rql",
         "scopeName": "source.bifrost-rql",
         "path": "./syntaxes/bifrost-rql.tmLanguage.json"
+      },
+      {
+        "language": "bifrost-rql-policy",
+        "scopeName": "source.bifrost-rql-policy",
+        "path": "./syntaxes/bifrost-rql-policy.tmLanguage.json"
       },
       {
         "language": "bifrost-rune-ir",

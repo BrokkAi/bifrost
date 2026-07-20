@@ -14,6 +14,7 @@ import {
   type RqlReceiverAnalysisResult,
   type RqlReferenceSiteResult
 } from "../src/rql_query";
+import { RQL_POLICY_LANGUAGE_ID } from "../src/rql_validation";
 
 function runner(overrides: Partial<RqlQueryRunner> = {}): RqlQueryRunner {
   return {
@@ -73,6 +74,25 @@ void test("warns without issuing a request when Bifrost is not ready", async () 
   assert.deepEqual(warnings, [
     "Bifrost is not ready. Start the language server and wait for indexing to finish."
   ]);
+});
+
+void test("does not expose query execution to RQL policy documents", async () => {
+  const warnings: string[] = [];
+  let requests = 0;
+  const response = await runRqlQuery(
+    { languageId: RQL_POLICY_LANGUAGE_ID, text: "(policy)" },
+    runner({
+      sendRequest: () => {
+        requests += 1;
+        return Promise.resolve({ text: "unexpected", results: [] });
+      },
+      showWarning: (message) => warnings.push(message)
+    })
+  );
+
+  assert.equal(response, undefined);
+  assert.equal(requests, 0);
+  assert.deepEqual(warnings, ["Open a Bifrost RQL file to run a query."]);
 });
 
 void test("reports request failures through the error UI", async () => {

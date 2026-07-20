@@ -43,9 +43,12 @@ pub(crate) mod target_kind;
 mod traits;
 pub(crate) mod workspace_graph;
 
+#[cfg(test)]
+pub(crate) use call_relations::CallArgument;
 pub(crate) use call_relations::{
-    CallBindingCache, CallDispatchBoundaryKind, CallDispatchTarget, CallRelationLimits,
-    CallRelationResult, CallRelationService, CallSite, ExactCallLocation, bind_call_site_arguments,
+    CallBindingCache, CallBindingStatus, CallDispatchBoundaryKind, CallDispatchTarget,
+    CallRelationDiagnostic, CallRelationDiagnosticCode, CallRelationLimits, CallRelationResult,
+    CallRelationService, CallSite, ExactCallLocation, bind_call_site_arguments,
     call_dispatch_equivalence_source, is_call_relation_unit, nearest_call_relation_unit,
 };
 pub use candidates::{

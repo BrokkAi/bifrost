@@ -1,0 +1,13 @@
+(policy
+  :schema-version 1
+  :id "bifrost.example.review-audit-call"
+  :name "Review direct audit calls"
+  :message "Review this direct audit call"
+  :severity warning
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql-file
+          :schema-version 2
+          :path "queries/find-audit.rql")))

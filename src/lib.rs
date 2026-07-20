@@ -33,10 +33,12 @@ mod project_watcher;
 mod python_module;
 pub mod reference_differential;
 mod relevance;
+mod schema_version;
 pub mod scoped_project;
 pub mod searchtools;
 pub mod searchtools_render;
 pub mod searchtools_service;
+mod sexp;
 pub mod skill_install;
 pub mod structured_data;
 pub mod summary;
@@ -46,6 +48,8 @@ mod test_support;
 mod text_utils;
 pub mod tool_arguments;
 mod util;
+mod workspace_document;
+pub use analyzer::policy;
 pub use analyzer::usages;
 
 pub use analyzer::{
@@ -61,6 +65,7 @@ pub use analyzer::{
     TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
     WorkspaceAnalyzer, collect_workspace_files,
 };
+pub use cancellation::CancellationToken;
 pub use project_watcher::{ChangeDelta, ProjectChangeWatcher};
 pub use searchtools_service::{
     SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode, ToolOutput,

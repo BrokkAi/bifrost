@@ -1,0 +1,14 @@
+(policy
+  :schema-version 1
+  :id "bifrost.test.note-eval"
+  :name "Note dynamic evaluation"
+  :message "Dynamic evaluation was selected"
+  :severity note
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql
+          :schema-version 2
+          (language python
+            (call :callee (name "eval"))))))

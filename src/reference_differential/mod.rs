@@ -1048,7 +1048,9 @@ fn classify_group_result(
                 }
             }
         }
-        FuzzyResult::Failure { fq_name, reason } => set_group_inconclusive(
+        FuzzyResult::Failure {
+            fq_name, reason, ..
+        } => set_group_inconclusive(
             records,
             &group.site_indexes,
             &format!("inverse failure for {fq_name}: {reason}"),

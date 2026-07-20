@@ -29,6 +29,16 @@ For source-first examples across every structural adapter, see the [language tut
 
 Use `:json` in the REPL to inspect the canonical JSON generated for the current RQL query.
 
+RQL is also the selector language nested inside [static-analysis policy
+documents](/static-analysis-policies/). A `.rqlp` file is a distinct policy
+language and contains one `(policy ...)` or diagnostic-neutral `(endpoint ...)`
+document; it is not a saved query and cannot be run through `--query-file`.
+Inline selectors use `(rql [:schema-version N] QUERY)`, while
+`(rql-file [:schema-version N] :path "workspace/relative.rql")` defers one
+saved selector to workspace-backed policy loading. Policy/endpoint and nested
+RQL schema versions are resolved independently. JSON remains a CodeQuery and
+reporting surface, not an alternate `.rqlp` authoring syntax.
+
 Use `:ir <language>` for the opposite direction: paste source code through a line containing only `:end`, then inspect the [Rune IR](/rune-ir/) produced by that language's real structural adapter and copy the generated starter RQL. Use the `tsx` language label for TypeScript snippets containing JSX. Rune IR is the normalized source-side representation matched by `CodeQuery`; it is not RQL's query-side IR.
 
 ## Complete Example
@@ -148,7 +158,7 @@ JavaScript and TypeScript provide the bounded receiver provider. Other languages
 
 Only declarations indexed by the active workspace analyzer can appear. A visible usage of library code does not imply that the library declaration itself is indexed or queryable.
 
-RQL is not yet a stable external API. It is intended to make interactive exploration pleasant while preserving `query_code` and JSON `CodeQuery` as the stable integration surface.
+RQL is not yet a stable standalone external query API. It is intended to make interactive exploration pleasant while preserving `query_code` and JSON `CodeQuery` as the stable raw-query integration surface. The versioned RQLP schema separately records nested RQL schema resolution as part of a policy's loaded meaning.
 
 ## Commands
 

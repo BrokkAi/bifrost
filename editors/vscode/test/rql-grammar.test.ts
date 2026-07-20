@@ -24,13 +24,14 @@ async function grammar() {
   return loadTextMateGrammar(grammarPath, scopeName);
 }
 
-void test("registers Bifrost RQL as a distinct .rql language", () => {
+void test("registers distinct RQL, policy, and Rune IR languages", () => {
   const manifest = JSON.parse(
     fs.readFileSync(path.join(extensionRoot, "package.json"), "utf8")
   ) as ExtensionManifest;
   const runeIrSourceContext =
     "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == ruby";
   assert.ok(manifest.activationEvents.includes("onLanguage:bifrost-rql"));
+  assert.ok(manifest.activationEvents.includes("onLanguage:bifrost-rql-policy"));
   assert.ok(manifest.activationEvents.includes("onLanguage:bifrost-rune-ir"));
   assert.deepEqual(manifest.contributes.languages, [
     {
@@ -41,6 +42,16 @@ void test("registers Bifrost RQL as a distinct .rql language", () => {
       icon: {
         light: "./icons/bifrost-rql.png",
         dark: "./icons/bifrost-rql.png"
+      }
+    },
+    {
+      id: "bifrost-rql-policy",
+      aliases: ["Bifrost RQL Policy", "bifrost-rql-policy"],
+      extensions: [".rqlp"],
+      configuration: "./language-configuration.json",
+      icon: {
+        light: "./icons/bifrost-rql-policy.svg",
+        dark: "./icons/bifrost-rql-policy.svg"
       }
     },
     {
@@ -59,6 +70,11 @@ void test("registers Bifrost RQL as a distinct .rql language", () => {
       language: "bifrost-rql",
       scopeName,
       path: "./syntaxes/bifrost-rql.tmLanguage.json"
+    },
+    {
+      language: "bifrost-rql-policy",
+      scopeName: "source.bifrost-rql-policy",
+      path: "./syntaxes/bifrost-rql-policy.tmLanguage.json"
     },
     {
       language: "bifrost-rune-ir",

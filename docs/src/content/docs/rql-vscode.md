@@ -17,6 +17,28 @@ through 120 columns. Longer forms place their entries on indented lines and
 keep `:property value` pairs together when possible. The formatter preserves
 comments and does not edit incomplete S-expressions.
 
+## RQL Policy Documents
+
+The extension recognizes `.rqlp` as the distinct **Bifrost RQL Policy**
+language. Policy and endpoint buffers receive debounced source validation,
+schema-resolution hover, optional-version completion, conservative policy
+highlighting, and 100-column formatting. Nested query syntax receives RQL
+highlighting only inside `(rql ...)`; an `(rql-file ...)` reference is validated
+and resolved later by a workspace-backed policy load.
+
+Policy validation uses the current unsaved source, but it deliberately does not
+load endpoint directories, catalogs, or referenced query files. Formatting
+preserves comments and omitted `:schema-version` fields and returns no edit for
+an incomplete S-expression.
+
+An `.rqlp` buffer is not an RQL query document. It never enables the Play
+action, cannot publish findings into **Bifrost Query Results**, and cannot be
+passed to `--query-file`. Execute a saved `(policy ...)` root with
+`bifrost --policy-file`; an `(endpoint ...)` is a diagnostic-neutral dependency,
+not an executable root. See [Static-Analysis
+Policies](/static-analysis-policies/) for the complete authoring and reporting
+contract.
+
 This Play action is a VS Code language-server feature. It does not start an MCP server, expose `query_code` to an agent, or prove that an agent can run RQL. For agent access, configure a query-capable MCP toolset and use a saved workspace `.rql` file through `query_file`; MCP does not accept unsaved editor text or raw inline RQL. See [MCP query and RQL availability](/mcp/#query-and-rql-availability).
 
 ```lisp

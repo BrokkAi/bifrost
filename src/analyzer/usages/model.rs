@@ -284,7 +284,11 @@ pub enum FuzzyResult {
         unproven_total_by_overload: HashMap<CodeUnit, usize>,
     },
     /// The analyzer/LLM could not produce a result for this query.
-    Failure { fq_name: String, reason: String },
+    Failure {
+        fq_name: String,
+        reason_kind: String,
+        reason: String,
+    },
     /// Multiple definitions share the short name; hits are returned but should be filtered.
     Ambiguous {
         short_name: String,
@@ -695,6 +699,7 @@ mod tests {
     fn fuzzy_result_into_either_failure_returns_error() {
         let result = FuzzyResult::Failure {
             fq_name: "pkg.Foo.bar".to_string(),
+            reason_kind: "missing_analyzer_capability".to_string(),
             reason: "no analyzer".to_string(),
         };
         assert!(result.into_either().is_err());
