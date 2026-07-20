@@ -1032,8 +1032,9 @@ fn peak_rss_bytes() -> u64 {
 }
 
 enum ColdReadGuard {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     Enabled {
+        #[cfg(target_os = "macos")]
         file: fs::File,
         label: &'static str,
     },
@@ -1075,7 +1076,6 @@ impl ColdReadGuard {
                 unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
             if result == 0 {
                 return Self::Enabled {
-                    file,
                     label: "linux_posix_fadvise_dontneed",
                 };
             }
@@ -1090,18 +1090,18 @@ impl ColdReadGuard {
 
     const fn label(&self) -> &'static str {
         match self {
-            #[cfg(unix)]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             Self::Enabled { label, .. } => label,
             Self::Unavailable => "unavailable",
         }
     }
 
     const fn is_available(&self) -> bool {
-        #[cfg(unix)]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             matches!(self, Self::Enabled { .. })
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             false
         }
