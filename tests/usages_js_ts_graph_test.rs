@@ -2002,6 +2002,111 @@ export function render() {
 }
 
 #[test]
+fn js_anonymous_default_object_binding_has_exact_targeted_and_workspace_usages() {
+    let consumer_source = r#"import selected from "./selected.js";
+import other from "./other.js";
+import { named } from "./named.js";
+
+export function readSelected() {
+  return selected;
+}
+
+export function readSelectedMember() {
+  return selected.value;
+}
+
+export function controls() {
+  return other.value + named;
+}
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file("selected.js", "export default { value: 1 };\n")
+            .file("other.js", "export default { value: 2 };\n")
+            .file("named.js", "export const named = 3;\n")
+            .file("consumer.js", consumer_source)
+            .build()
+    });
+    let target = find_js_target(&analyzer, &project.file("selected.js"), |unit| {
+        unit.short_name() == "default"
+    });
+    let expected = BTreeSet::from([
+        identifier_occurrence_range(consumer_source, "selected", 2),
+        identifier_occurrence_range(consumer_source, "selected", 3),
+    ]);
+
+    let targeted = authoritative_js_hits(&analyzer, &target, project.file("consumer.js"))
+        .into_iter()
+        .filter(|hit| {
+            hit.kind
+                .included_in(brokk_bifrost::usages::UsageHitSurface::ExternalUsages)
+        })
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expected, targeted, "targeted inverse hits must stay exact");
+
+    let workspace = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    )
+    .into_iter()
+    .filter(|hit| hit.file == project.file("consumer.js"))
+    .map(|hit| (hit.start_offset, hit.end_offset))
+    .collect::<BTreeSet<_>>();
+    assert_eq!(
+        expected, workspace,
+        "workspace inverse hits must not widen to another default or named export"
+    );
+}
+
+#[test]
+fn ts_anonymous_default_value_binding_has_exact_targeted_and_workspace_usages() {
+    let consumer_source = r#"import selected from "./selected";
+import other from "./other";
+import { named } from "./named";
+
+export function readSelected() {
+  return selected;
+}
+
+export function controls() {
+  return other + named;
+}
+"#;
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file("selected.ts", "export default (): number => 1;\n")
+            .file("other.ts", "export default (): number => 2;\n")
+            .file("named.ts", "export const named = 3;\n")
+            .file("consumer.ts", consumer_source)
+            .build()
+    });
+    let target = find_ts_target(&analyzer, &project.file("selected.ts"), |unit| {
+        unit.short_name() == "default"
+    });
+    let expected = BTreeSet::from([identifier_occurrence_range(consumer_source, "selected", 2)]);
+
+    let targeted = authoritative_ts_hits(&analyzer, &target, project.file("consumer.ts"))
+        .into_iter()
+        .filter(|hit| {
+            hit.kind
+                .included_in(brokk_bifrost::usages::UsageHitSurface::ExternalUsages)
+        })
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expected, targeted, "targeted inverse hits must stay exact");
+
+    let workspace = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    )
+    .into_iter()
+    .filter(|hit| hit.file == project.file("consumer.ts"))
+    .map(|hit| (hit.start_offset, hit.end_offset))
+    .collect::<BTreeSet<_>>();
+    assert_eq!(
+        expected, workspace,
+        "workspace inverse hits must not widen to another default or named export"
+    );
+}
+
+#[test]
 fn js_commonjs_module_exports_object_literal_member_resolves_required_module_usage() {
     let (project, analyzer) = js_inline_analyzer(|p| {
         p.file(

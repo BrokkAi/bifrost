@@ -35,7 +35,13 @@ pub(crate) fn seeds_for_target(
         for (exported_name, entry) in &exports.exports_by_name {
             let local = match entry {
                 ExportEntry::Local { local_name } => Some(local_name.as_str()),
-                ExportEntry::Default { local_name } => local_name.as_deref(),
+                ExportEntry::Default { local_name } => {
+                    // Anonymous default exports have no local binding, but their
+                    // analyzer declaration is the file-scoped synthetic `default`.
+                    // Treat that structured declaration name as the local export
+                    // identity so inverse queries can seed it.
+                    Some(local_name.as_deref().unwrap_or("default"))
+                }
                 ExportEntry::ReexportedNamed { .. } => None,
             };
             if let Some(local_name) = local

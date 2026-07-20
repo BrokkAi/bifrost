@@ -693,7 +693,15 @@ fn canonical_export_keys_inner(
                     return keys.clone();
                 }
             }
-            ExportEntry::Default { local_name: None } => return BTreeSet::new(),
+            ExportEntry::Default { local_name: None } => {
+                // Anonymous default exports are represented by the analyzer's
+                // synthetic, file-scoped `default` declaration. Anchor lookup to
+                // the exporting file so unrelated anonymous defaults stay distinct.
+                if let Some(keys) = declarations.get(&(file.clone(), "default".to_string())) {
+                    return keys.clone();
+                }
+                return BTreeSet::new();
+            }
             ExportEntry::ReexportedNamed { .. } => {}
         }
     }
