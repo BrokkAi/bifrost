@@ -1,0 +1,18 @@
+# This is the compilable subset used to produce bin/*.class.
+# Parser-only sources that intentionally contain unresolved Java are excluded.
+A.java
+AnnotatedClass.java
+B.java
+BaseClass.java
+C.java
+CamelClass.java
+CyclicMethods.java
+D.java
+E.java
+EnumClass.java
+F.java
+MethodReturner.java
+ServiceImpl.java
+ServiceInterface.java
+UseE.java
+XExtendsY.java

@@ -56,16 +56,42 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --check
 
-  csharp-external-fixture:
-    name: C# external fixture provenance
+  # Security boundary: checked-in binaries are opaque review surfaces. Rebuild them from
+  # versioned source with pinned toolchains to reject tampered or malicious test payloads.
+  external-fixture:
+    name: ${{ matrix.name }} fixture provenance
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fixture: csharp
+            name: C# external
+          - fixture: java
+            name: Java class
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-dotnet@v5
+
+      - name: Set up .NET
+        if: matrix.fixture == 'csharp'
+        uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 8.0.418
-      - name: Rebuild and verify managed fixture
+
+      - name: Set up Java
+        if: matrix.fixture == 'java'
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21.0.8+9'
+
+      - name: Rebuild and verify C# external fixture
+        if: matrix.fixture == 'csharp'
         run: bash scripts/verify-csharp-external-fixture.sh
+
+      - name: Rebuild and verify Java class fixture
+        if: matrix.fixture == 'java'
+        run: bash scripts/verify-java-class-fixture.sh
 
   vscode:
     name: vscode
