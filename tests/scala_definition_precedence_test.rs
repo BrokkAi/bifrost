@@ -152,6 +152,191 @@ fn scala_term_namespace_resolves_explicitly_imported_stable_object() {
 }
 
 #[test]
+fn scala_explicit_imports_precede_wildcard_terms_for_direct_and_brace_selectors() {
+    let direct = r#"package consumers
+import org.scalactic._
+import org.scalatest.UnquotedString
+object Direct { val rendered = UnquotedString("direct") }
+"#;
+    let brace = r#"package consumers
+import org.scalatest.{UnquotedString}
+import org.scalactic._
+object Brace { val rendered = UnquotedString("brace") }
+"#;
+    let external = r#"package consumers
+import akka.event.Logging._
+import org.slf4j.MDC
+object External { MDC.put("key", "value") }
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "org/scalactic/UnquotedString.scala",
+            "package org.scalactic\nclass UnquotedString\nobject UnquotedString { def apply(value: String): UnquotedString = new UnquotedString }\n",
+        )
+        .file(
+            "org/scalatest/UnquotedString.scala",
+            "package org.scalatest\nclass UnquotedString\nobject UnquotedString { def apply(value: String): UnquotedString = new UnquotedString }\n",
+        )
+        .file(
+            "akka/event/Logging.scala",
+            "package akka.event\nobject Logging { object MDC { def put(key: String, value: String): Unit = () } }\n",
+        )
+        .file("consumers/Direct.scala", direct)
+        .file("consumers/Brace.scala", brace)
+        .file("consumers/External.scala", external)
+        .build();
+    let references = [
+        location_in(
+            "consumers/Direct.scala",
+            direct,
+            direct.rfind("UnquotedString").expect("direct call"),
+        ),
+        location_in(
+            "consumers/Brace.scala",
+            brace,
+            brace.rfind("UnquotedString").expect("brace call"),
+        ),
+        location_in(
+            "consumers/External.scala",
+            external,
+            external.rfind("MDC.put").expect("external receiver"),
+        ),
+    ];
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for result in &results[..2] {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], "org.scalatest.UnquotedString$.apply",
+            "{value}"
+        );
+    }
+    assert_eq!(
+        results[2]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+    assert_eq!(
+        results[2]["diagnostics"][0]["kind"], "unresolvable_import_boundary",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_parser_proven_term_roles_precede_same_named_type_aliases() {
+    let kyo = r#"package kyo
+
+opaque type Maybe[+A] = A | Null
+object Maybe {
+  def apply[A](value: A): Maybe[A] = value
+  opaque type Present[+A] = A
+  object Present {
+    def apply[A](value: A): Present[A] = value
+    def unapply(value: Any): Option[Int] = None
+  }
+}
+
+opaque type Path = String
+object Path { def apply(value: String): Path = value }
+
+object Result {
+  opaque type Success[+A] = A
+  object Success {
+    def apply[A](value: A): Success[A] = value
+    def unapply(value: Any): Option[Int] = None
+  }
+}
+
+"#;
+    let dotty = r#"package dotty.tools.dotc.ast
+
+object tpd {
+  opaque type New = String
+  object New { def unapply(value: Any): Option[Int] = None }
+  opaque type Block = String
+  object Block { def unapply(value: Any): Option[Int] = None }
+}
+"#;
+    let use_source = r#"package consumer
+
+import kyo.*
+import dotty.tools.dotc.ast.tpd.*
+
+object Use {
+  val maybe = Maybe(1)
+  val path = Path("root")
+  val success = Result.Success(1)
+
+  def extract(value: Any): Int = value match {
+    case Result.Success(found) => found
+    case Maybe.Present(found)  => found
+    case New(found)            => found
+    case Block(found)          => found
+    case _                     => 0
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("kyo/Terms.scala", kyo)
+        .file("dotty/tools/dotc/ast/tpd.scala", dotty)
+        .file("consumer/Use.scala", use_source)
+        .build();
+    let at = |needle: &str| {
+        location_in(
+            "consumer/Use.scala",
+            use_source,
+            use_source.find(needle).expect("unique term-role reference"),
+        )
+    };
+    let at_terminal = |needle: &str| {
+        let start = use_source.find(needle).expect("unique qualified term role");
+        location_in(
+            "consumer/Use.scala",
+            use_source,
+            start + needle.rfind('.').expect("qualified term role") + 1,
+        )
+    };
+    let at_last_terminal = |needle: &str| {
+        let start = use_source.rfind(needle).expect("qualified extractor role");
+        location_in(
+            "consumer/Use.scala",
+            use_source,
+            start + needle.rfind('.').expect("qualified extractor role") + 1,
+        )
+    };
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": [
+            at("Maybe(1)"),
+            at("Path(\"root\")"),
+            at_terminal("Result.Success(1)"),
+            at_last_terminal("Result.Success(found)"),
+            at_last_terminal("Maybe.Present(found)"),
+            at("New(found)"),
+            at("Block(found)"),
+        ]})
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for (result, expected) in results.iter().zip([
+        "kyo.Maybe$.apply",
+        "kyo.Path$.apply",
+        "kyo.Result$.Success$.apply",
+        "kyo.Result$.Success$.unapply",
+        "kyo.Maybe$.Present$.unapply",
+        "dotty.tools.dotc.ast.tpd$.New$.unapply",
+        "dotty.tools.dotc.ast.tpd$.Block$.unapply",
+    ]) {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
 fn scala_location_definition_accepts_inherited_default_argument_call() {
     let source = r#"package app
 

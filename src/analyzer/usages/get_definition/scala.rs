@@ -2,8 +2,8 @@ use super::*;
 use crate::analyzer::scala::{
     ScalaSupertypeLookupPath, ScalaWildcardImportEnvironment, ScalaWildcardOwnerFacts,
     resolve_scala_wildcard_import_environment, scala_enclosing_package_root_candidates,
-    scala_import_path, scala_import_visible_at, scala_lexical_scope_path_at,
-    scala_package_prefixes_at, scala_type_lookup_segments,
+    scala_import_path, scala_import_path_candidates, scala_import_visible_at,
+    scala_lexical_scope_path_at, scala_package_prefixes_at, scala_type_lookup_segments,
 };
 use crate::analyzer::usages::scala_graph::local::{
     ScalaLocalBinding, precise_scala_binding, seed_scala_binding,
@@ -15,8 +15,9 @@ use crate::analyzer::usages::scala_graph::namespace::{
 };
 use crate::analyzer::usages::scala_graph::syntax::{
     ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableRole, ScalaCallableSiteRole,
-    applied_expression_for_reference, call_arities_for_reference, call_site_shape_for_reference,
-    is_scala_case_pattern_binder, is_scala_named_argument_assignment,
+    ScalaQualifiedStableTypeRole, applied_expression_for_reference, call_arities_for_reference,
+    call_site_shape_for_reference, is_extractor_reference, is_scala_case_pattern_binder,
+    is_scala_named_argument_assignment, qualified_stable_type_reference,
     scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
     scala_pattern_binder_names,
 };
@@ -160,6 +161,13 @@ impl<'a> ForwardScalaNameResolver<'a> {
         }
     }
 
+    fn resolve_explicit_singleton(&self, raw: &str) -> ScalaNameResolution {
+        let Some(simple) = scala_forward_simple_name(raw) else {
+            return ScalaNameResolution::Unresolved;
+        };
+        self.resolve_explicit_owner_segments(&[simple.to_string()], ScalaOwnerKind::SingletonObject)
+    }
+
     fn resolve_owner(&self, raw: &str, kind: ScalaOwnerKind) -> ScalaNameResolution {
         let Some(simple) = scala_forward_simple_name(raw) else {
             return ScalaNameResolution::Unresolved;
@@ -189,40 +197,10 @@ impl<'a> ForwardScalaNameResolver<'a> {
         segments: &[String],
         kind: ScalaOwnerKind,
     ) -> ScalaNameResolution {
-        let Some(simple) = segments.last().map(String::as_str) else {
+        if segments.is_empty() {
             return ScalaNameResolution::Unresolved;
-        };
-        let binding = if segments.len() > 1 {
-            segments[0].as_str()
-        } else {
-            simple
-        };
-        let mut matching_explicit_import = false;
-        let mut explicit_candidates = Vec::new();
-        for import in self.visible_imports() {
-            let Some(path) = scala_import_path(import) else {
-                continue;
-            };
-            if !import.is_wildcard
-                && import
-                    .identifier
-                    .as_deref()
-                    .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path))
-                    == binding
-            {
-                matching_explicit_import = true;
-                let tail = &segments[1..];
-                explicit_candidates.extend(
-                    import_candidate_fq_names(&path, &self.package)
-                        .into_iter()
-                        .flat_map(|candidate| scala_nested_type_candidates(candidate, tail, true)),
-                );
-            }
         }
-        match self.resolve_candidate_tier(explicit_candidates, kind) {
-            ScalaNameResolution::Unresolved if matching_explicit_import => {
-                return ScalaNameResolution::MissingExplicitImport;
-            }
+        match self.resolve_explicit_owner_segments(segments, kind) {
             ScalaNameResolution::Unresolved => {}
             outcome => return outcome,
         }
@@ -285,6 +263,50 @@ impl<'a> ForwardScalaNameResolver<'a> {
         ScalaNameResolution::Unresolved
     }
 
+    fn resolve_explicit_owner_segments(
+        &self,
+        segments: &[String],
+        kind: ScalaOwnerKind,
+    ) -> ScalaNameResolution {
+        let Some(simple) = segments.last().map(String::as_str) else {
+            return ScalaNameResolution::Unresolved;
+        };
+        let binding = if segments.len() > 1 {
+            segments[0].as_str()
+        } else {
+            simple
+        };
+        let mut matching_explicit_import = false;
+        let mut explicit_candidates = Vec::new();
+        for import in self.visible_imports() {
+            let Some(path) = scala_import_path(import) else {
+                continue;
+            };
+            if import.is_wildcard
+                || import
+                    .identifier
+                    .as_deref()
+                    .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path))
+                    != binding
+            {
+                continue;
+            }
+            matching_explicit_import = true;
+            let tail = &segments[1..];
+            explicit_candidates.extend(
+                import_candidate_fq_names(&path, &self.package)
+                    .into_iter()
+                    .flat_map(|candidate| scala_nested_type_candidates(candidate, tail, true)),
+            );
+        }
+        match self.resolve_candidate_tier(explicit_candidates, kind) {
+            ScalaNameResolution::Unresolved if matching_explicit_import => {
+                ScalaNameResolution::MissingExplicitImport
+            }
+            outcome => outcome,
+        }
+    }
+
     fn resolve_wildcard_singleton(&self, name: &str) -> ScalaNameResolution {
         let segments = [name.to_string()];
         let mut owners = Vec::new();
@@ -301,6 +323,54 @@ impl<'a> ForwardScalaNameResolver<'a> {
                 ScalaNameResolution::Ambiguous => return ScalaNameResolution::Ambiguous,
                 ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Unresolved => {}
             }
+        }
+        owners.sort();
+        owners.dedup();
+        match owners.as_slice() {
+            [] => self.resolve_direct_wildcard_singleton(name),
+            [owner] => ScalaNameResolution::Resolved(owner.clone()),
+            _ => ScalaNameResolution::Ambiguous,
+        }
+    }
+
+    fn resolve_direct_wildcard_singleton(&self, name: &str) -> ScalaNameResolution {
+        let mut owners = Vec::new();
+        for import in self.visible_imports().filter(|import| import.is_wildcard) {
+            let Some(path) = scala_import_path(import) else {
+                continue;
+            };
+            let import_prefixes = import
+                .path
+                .as_ref()
+                .map(|path| path.lexical_prefixes.as_slice())
+                .filter(|prefixes| !prefixes.is_empty())
+                .unwrap_or(&self.package_prefixes);
+            let mut selected = Vec::new();
+            for candidate in scala_import_path_candidates(&path, import_prefixes) {
+                for owner in [candidate.clone(), format!("{candidate}$")] {
+                    let nested = format!("{owner}.{name}$");
+                    selected.extend(
+                        self.support
+                            .fqn(&nested)
+                            .into_iter()
+                            .filter(|unit| unit.is_class() && unit.fq_name() == nested)
+                            .map(|unit| ScalaOwnerIdentity {
+                                fqn: unit.fq_name(),
+                                kind: ScalaOwnerKind::SingletonObject,
+                                _declaration: unit,
+                            }),
+                    );
+                }
+                selected.sort();
+                selected.dedup();
+                if !selected.is_empty() {
+                    break;
+                }
+            }
+            if selected.len() > 1 {
+                return ScalaNameResolution::Ambiguous;
+            }
+            owners.extend(selected);
         }
         owners.sort();
         owners.dedup();
@@ -395,7 +465,10 @@ impl<'a> ForwardScalaNameResolver<'a> {
                             self.support
                                 .fqn(&candidate)
                                 .into_iter()
-                                .find(|unit| unit.is_function() || unit.is_field())
+                                .find(|unit| {
+                                    (unit.is_function() || unit.is_field())
+                                        && !self.scala.is_type_alias(unit)
+                                })
                                 .map(|unit| unit.fq_name())
                         })
                     })
@@ -601,12 +674,6 @@ pub(super) fn resolve_scala(
         scala_lexical_scope_path_at(root, node.start_byte()),
         node.start_byte(),
     );
-    if let Some(outcome) = resolve_scala_bare_apply_fast_path(
-        scala, analyzer, support, file, source, root, node, &resolver,
-    ) {
-        return outcome;
-    }
-
     let ctx = ScalaLookupCtx {
         scala,
         analyzer,
@@ -614,6 +681,14 @@ pub(super) fn resolve_scala(
         file,
         source,
     };
+    if let Some(outcome) = resolve_scala_parser_proven_term_role(ctx, &resolver, root, node) {
+        return outcome;
+    }
+    if let Some(outcome) = resolve_scala_bare_apply_fast_path(
+        scala, analyzer, support, file, source, root, node, &resolver,
+    ) {
+        return outcome;
+    }
 
     match scala_reference_node(node) {
         Some(ScalaReferenceNode::Type(type_node)) => {
@@ -658,6 +733,23 @@ pub(super) fn resolve_scala(
             if let Some(fqn) = scala_resolve_visible_term(ctx, &resolver, identifier, text) {
                 return scala_fqn_outcome(support, &fqn, text);
             }
+            match resolver.resolve_explicit_singleton(text) {
+                ScalaNameResolution::Resolved(owner) => {
+                    return scala_fqn_outcome(support, &owner.fqn, text);
+                }
+                ScalaNameResolution::MissingExplicitImport => {
+                    return boundary(format!(
+                        "`{text}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
+                    ));
+                }
+                ScalaNameResolution::Ambiguous => {
+                    return no_definition(
+                        "ambiguous_scala_explicit_import",
+                        format!("Scala explicit imports expose multiple `{text}` objects"),
+                    );
+                }
+                ScalaNameResolution::Unresolved => {}
+            }
             if let Some(owner) =
                 scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, identifier.start_byte())
             {
@@ -696,6 +788,185 @@ pub(super) fn resolve_scala(
             ),
         ),
     }
+}
+
+fn resolve_scala_parser_proven_term_role(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver<'_>,
+    root: Node<'_>,
+    node: Node<'_>,
+) -> Option<DefinitionLookupOutcome> {
+    if let Some(reference) = qualified_stable_type_reference(node, ctx.source)
+        && matches!(
+            reference.role,
+            ScalaQualifiedStableTypeRole::Apply | ScalaQualifiedStableTypeRole::Extractor
+        )
+    {
+        let root_name = reference
+            .segments
+            .first()
+            .expect("qualified Scala term has a root segment");
+        if scala_lexical_binding_declares_name_before(
+            root,
+            ctx.source,
+            root_name,
+            node.start_byte(),
+        ) {
+            return None;
+        }
+        let display_name = reference.segments.join(".");
+        return Some(
+            match resolver
+                .resolve_owner_segments(&reference.segments, ScalaOwnerKind::SingletonObject)
+            {
+                ScalaNameResolution::Resolved(owner) => match reference.role {
+                    ScalaQualifiedStableTypeRole::Apply => scala_apply_or_constructor_outcome(
+                        ctx.scala,
+                        ctx.support,
+                        ctx.file,
+                        &owner.fqn,
+                        &display_name,
+                        call_site_shape_for_reference(reference.expression).as_ref(),
+                    ),
+                    ScalaQualifiedStableTypeRole::Extractor => scala_extractor_outcome(
+                        ctx,
+                        &owner,
+                        &display_name,
+                        call_site_shape_for_reference(reference.expression).as_ref(),
+                    ),
+                    ScalaQualifiedStableTypeRole::Type
+                    | ScalaQualifiedStableTypeRole::Constructor => unreachable!(),
+                },
+                ScalaNameResolution::MissingExplicitImport => boundary(format!(
+                    "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
+                )),
+                ScalaNameResolution::Ambiguous => no_definition(
+                    "ambiguous_scala_term_namespace",
+                    format!("`{display_name}` resolves to multiple physical Scala objects"),
+                ),
+                ScalaNameResolution::Unresolved => return None,
+            },
+        );
+    }
+
+    if !is_extractor_reference(node) {
+        return None;
+    }
+    let name = scala_node_text(node, ctx.source).trim();
+    if name.is_empty() {
+        return Some(no_definition(
+            "no_reference_text",
+            "Scala extractor reference is blank",
+        ));
+    }
+    if scala_lexical_binding_declares_name_before(root, ctx.source, name, node.start_byte()) {
+        return Some(no_definition(
+            "local_variable_reference",
+            format!("`{name}` is a local Scala value"),
+        ));
+    }
+    let resolution = match resolver.resolve_explicit_singleton(name) {
+        ScalaNameResolution::Unresolved => match resolver.resolve_wildcard_singleton(name) {
+            ScalaNameResolution::Unresolved => {
+                resolver.resolve_owner(name, ScalaOwnerKind::SingletonObject)
+            }
+            outcome => outcome,
+        },
+        outcome => outcome,
+    };
+    Some(match resolution {
+        ScalaNameResolution::Resolved(owner) => scala_extractor_outcome(
+            ctx,
+            &owner,
+            name,
+            call_site_shape_for_reference(node).as_ref(),
+        ),
+        ScalaNameResolution::MissingExplicitImport => boundary(format!(
+            "`{name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
+        )),
+        ScalaNameResolution::Ambiguous => no_definition(
+            "ambiguous_scala_term_namespace",
+            format!("`{name}` resolves to multiple physical Scala objects"),
+        ),
+        ScalaNameResolution::Unresolved => return None,
+    })
+}
+
+fn scala_extractor_outcome(
+    ctx: ScalaLookupCtx<'_>,
+    owner: &ScalaOwnerIdentity,
+    reference: &str,
+    call_shape: Option<&ScalaCallSiteShape>,
+) -> DefinitionLookupOutcome {
+    let mut candidates = ["unapply", "unapplySeq"]
+        .into_iter()
+        .flat_map(|member| ctx.support.fqn(&format!("{}.{member}", owner.fqn)))
+        .filter(|unit| unit.is_function())
+        .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(&owner._declaration))
+        .collect::<Vec<_>>();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    match scala_physical_callable_candidates(ctx.scala, candidates) {
+        ScalaPhysicalCallableCandidates::Unique(candidates) => {
+            return candidates_outcome(candidates);
+        }
+        ScalaPhysicalCallableCandidates::Ambiguous => {
+            return no_definition(
+                "ambiguous_scala_callable",
+                format!("`{reference}` has multiple physical extractor owners"),
+            );
+        }
+        ScalaPhysicalCallableCandidates::NoCandidates => {}
+    }
+
+    let class_fqn = owner.fqn.trim_end_matches('$');
+    let class_units = ctx
+        .support
+        .fqn(class_fqn)
+        .into_iter()
+        .filter(|unit| {
+            unit.is_class()
+                && unit.fq_name() == class_fqn
+                && unit.source() == owner._declaration.source()
+        })
+        .collect::<Vec<_>>();
+    if let [class] = class_units.as_slice() {
+        let constructor_name = scala_constructor_member_name(class_fqn);
+        let constructor_fqn = format!("{class_fqn}.{constructor_name}");
+        let constructors = ctx
+            .support
+            .fqn(&constructor_fqn)
+            .into_iter()
+            .filter(|unit| unit.is_function() && unit.fq_name() == constructor_fqn)
+            .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(class))
+            .collect::<Vec<_>>();
+        match scala_physical_callable_candidates(
+            ctx.scala,
+            scala_filter_callable_units(
+                ctx.scala,
+                constructors,
+                call_shape,
+                ScalaCallableSiteRole::PrimaryConstruction,
+            ),
+        ) {
+            ScalaPhysicalCallableCandidates::Unique(candidates) => {
+                return candidates_outcome(candidates);
+            }
+            ScalaPhysicalCallableCandidates::Ambiguous => {
+                return no_definition(
+                    "ambiguous_scala_callable",
+                    format!("`{reference}` has multiple physical extractor constructors"),
+                );
+            }
+            ScalaPhysicalCallableCandidates::NoCandidates => {}
+        }
+    }
+    no_definition(
+        "no_applicable_scala_callable",
+        format!(
+            "`{reference}` has no indexed companion `unapply`, `unapplySeq`, or primary extractor constructor"
+        ),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1388,6 +1659,30 @@ fn resolve_scala_call(
                         }
                     }
                 }
+            }
+            match resolver.resolve_explicit_singleton(name) {
+                ScalaNameResolution::Resolved(owner) => {
+                    return scala_apply_or_constructor_outcome(
+                        ctx.scala,
+                        ctx.support,
+                        ctx.file,
+                        &owner.fqn,
+                        name,
+                        scala_call_site_shape(ctx, root, function).as_ref(),
+                    );
+                }
+                ScalaNameResolution::MissingExplicitImport => {
+                    return boundary(format!(
+                        "`{name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
+                    ));
+                }
+                ScalaNameResolution::Ambiguous => {
+                    return no_definition(
+                        "ambiguous_scala_explicit_import",
+                        format!("Scala explicit imports expose multiple `{name}` objects"),
+                    );
+                }
+                ScalaNameResolution::Unresolved => {}
             }
             if let Some(imported_member) = scala_wildcard_imported_member_outcome(
                 ctx,
@@ -2334,6 +2629,7 @@ fn scala_wildcard_imported_member_outcome(
         let import_candidates =
             scala_wildcard_imported_member_units(ctx.support, &path, &file_package, member)
                 .into_iter()
+                .filter(|unit| !ctx.scala.is_type_alias(unit))
                 .filter(|unit| scala_member_candidate_applies(ctx, unit, call_shape, false))
                 .collect::<Vec<_>>();
         if !import_candidates.is_empty() {
@@ -3336,6 +3632,7 @@ fn scala_imported_member_shadows_bare_call(
         if import.is_wildcard {
             if scala_wildcard_imported_member_units(support, &path, &file_package, name)
                 .into_iter()
+                .filter(|unit| !scala.is_type_alias(unit))
                 .any(|unit| {
                     scala_member_unit_applies(
                         scala,
@@ -3365,7 +3662,7 @@ fn scala_imported_member_shadows_bare_call(
                 .into_iter()
                 .chain(support.fqn(&normalized))
                 .chain(support.fqn(&format!("{candidate}$")))
-                .any(|unit| unit.is_function() || unit.is_field())
+                .any(|unit| (unit.is_function() || unit.is_field()) && !scala.is_type_alias(&unit))
             {
                 return true;
             }
