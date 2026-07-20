@@ -5570,12 +5570,12 @@ impl NameResolver {
         // closed in the same way as ordinary imports.
         for (simple, declaration) in types.package_types_in("scala").iter() {
             if scala_default_namespace_is_source_backed(simple) {
-                names.add_declaration(simple.clone(), declaration, 0);
+                names.add_declaration(simple.clone(), declaration, 1);
             }
         }
         for (simple, declaration) in types.package_objects_in(scala, "scala").iter() {
             if scala_default_namespace_is_source_backed(simple) {
-                object_names.add_declaration(simple.clone(), declaration, 0);
+                object_names.add_declaration(simple.clone(), declaration, 1);
             }
         }
         // Parser-established package scopes are visible from innermost to
@@ -5588,7 +5588,11 @@ impl NameResolver {
             // in this compilation unit beat imports. Within the package
             // scopes established by nested/sequential package clauses, the
             // innermost package wins over its enclosing package.
-            let package_priority = 64u8.saturating_add(index.min(63) as u8);
+            let package_priority = if package.is_empty() {
+                0
+            } else {
+                64u8.saturating_add(index.min(63) as u8)
+            };
             for (simple, decl) in types.package_types_in(package).iter() {
                 let priority = if source_file == Some(decl.source()) {
                     224u8.saturating_add(index.min(30) as u8)
@@ -7180,11 +7184,14 @@ fn record_reference(
         }
         "identifier" | "operator_identifier" => {
             let name = node_text(node, ctx.source);
-            if name.is_empty()
-                || has_ancestor_kind(node, "import_declaration")
-                || is_declaration_name(node)
-                || is_scala_case_pattern_binder(node)
-            {
+            if name.is_empty() {
+                return;
+            }
+            if has_ancestor_kind(node, "import_declaration") {
+                record_local_stable_imported_member(node, name, ctx, bindings);
+                return;
+            }
+            if is_declaration_name(node) || is_scala_case_pattern_binder(node) {
                 return;
             }
             if let Some(owner_node) =
@@ -7587,7 +7594,17 @@ fn record_local_stable_imported_member(
         let Some(binding) = precise_scala_binding(bindings, root_name) else {
             return true;
         };
-        let Some(mut owner) = binding.receiver_declaration else {
+        let Some(mut owner) = binding.receiver_declaration.or_else(|| {
+            let receiver_type = binding.receiver_type.as_deref()?;
+            let mut candidates = ctx
+                .types
+                .index
+                .by_fqn(receiver_type)
+                .iter()
+                .filter(|unit| unit.is_class());
+            let declaration = candidates.next()?.clone();
+            candidates.next().is_none().then_some(declaration)
+        }) else {
             return true;
         };
         for segment in &owner_path[1..] {
@@ -9397,6 +9414,20 @@ fn resolve_receiver_type_node(type_node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> O
     if path.is_empty() {
         return None;
     }
+    if path.len() > 1
+        && let Some(root) = path
+            .first()
+            .and_then(|root| ctx.lexically_visible_object_unit(type_node.start_byte(), root))
+        && let Some(declaration) = ctx.types.resolve_qualified_stable_type_unit_at(
+            ctx.scala,
+            &ctx.resolver,
+            &path,
+            false,
+            Some(root),
+        )
+    {
+        return Some(declaration.fq_name());
+    }
     match ctx.exact_lexically_visible_type(type_node) {
         ScalaTypeNamespaceResolution::Resolved(declaration) => {
             return Some(declaration.fq_name());
@@ -9419,6 +9450,21 @@ fn resolve_receiver_type_declaration_node(
     ctx: &ScalaScan<'_, '_>,
 ) -> Option<CodeUnit> {
     let type_node = scala_capture_underlying_type(type_node, ctx.source);
+    let path = scala_type_lookup_segments(type_node, ctx.source);
+    if path.len() > 1
+        && let Some(root) = path
+            .first()
+            .and_then(|root| ctx.lexically_visible_object_unit(type_node.start_byte(), root))
+        && let Some(declaration) = ctx.types.resolve_qualified_stable_type_unit_at(
+            ctx.scala,
+            &ctx.resolver,
+            &path,
+            false,
+            Some(root),
+        )
+    {
+        return Some(declaration);
+    }
     match ctx.exact_lexically_visible_type(type_node) {
         ScalaTypeNamespaceResolution::Resolved(declaration) => Some(declaration),
         ScalaTypeNamespaceResolution::AuthoritativeMiss

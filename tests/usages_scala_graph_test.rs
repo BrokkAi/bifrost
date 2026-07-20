@@ -4474,6 +4474,79 @@ object Imported {
 }
 
 #[test]
+fn scala_exact_lexical_roots_cover_receiver_types_import_selectors_and_late_objects() {
+    let source = r#"package app
+
+object Cst { class Stream(val documents: Int) }
+object ClipPath { class Ref(val id: String) }
+object Cache { class Data }
+object Imported { val callsiteClass: String = "decoy" }
+
+final class KnownCallsite(val callsiteClass: String, val callsiteMethod: String)
+
+object Owners {
+  object Cst { class Stream(val documents: Int) }
+  object ClipPath { class Ref(val id: String) }
+
+  def document(stream: Cst.Stream): Int = stream.documents // positive-qualified-receiver
+  def clip(ref: ClipPath.Ref): String = ref.id // positive-sibling-qualified-receiver
+
+  def imported(callsite: KnownCallsite): String = {
+    import callsite.{callsiteClass, callsiteMethod} // positive-local-import-selector
+    callsiteClass + callsiteMethod
+  }
+
+  def unresolved(callsite: Missing): String = {
+    import Imported.callsiteClass
+    import callsite.{callsiteClass}
+    callsiteClass // negative-imprecise-local-import-owner
+  }
+
+  given Cache.Data = new Cache.Data // positive-late-lexical-root
+
+  object Cache { class Data }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("app/Owners.scala", source)]);
+
+    for (target_fqn, marker) in [
+        (
+            "app.Owners$.Cst$.Stream.documents",
+            "positive-qualified-receiver",
+        ),
+        (
+            "app.Owners$.ClipPath$.Ref.id",
+            "positive-sibling-qualified-receiver",
+        ),
+        (
+            "app.KnownCallsite.callsiteClass",
+            "positive-local-import-selector",
+        ),
+        ("app.Owners$.Cache$.Data", "positive-late-lexical-root"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, marker);
+        assert_no_hit_contains(&target_hits, "negative-imprecise-local-import-owner");
+    }
+
+    for decoy_fqn in [
+        "app.Cst$.Stream.documents",
+        "app.ClipPath$.Ref.id",
+        "app.Cache$.Data",
+        "app.Imported$.callsiteClass",
+    ] {
+        let decoy = definition(&analyzer, decoy_fqn);
+        let decoy_hits = authoritative_scala_hits(&analyzer, &decoy);
+        assert_no_hit_contains(&decoy_hits, "positive-qualified-receiver");
+        assert_no_hit_contains(&decoy_hits, "positive-sibling-qualified-receiver");
+        assert_no_hit_contains(&decoy_hits, "positive-local-import-selector");
+        assert_no_hit_contains(&decoy_hits, "positive-late-lexical-root");
+        assert_no_hit_contains(&decoy_hits, "negative-imprecise-local-import-owner");
+    }
+}
+
+#[test]
 fn scala_case_class_wildcard_exposes_only_stable_companion_children() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (
@@ -5242,6 +5315,7 @@ fn scala_inverse_uses_default_and_absolute_type_namespaces_with_exact_precedence
 class Int
 object Int { val MinValue: Int = null }
 class Option[A]
+object Some
 object None
 class deprecated extends scala.annotation.StaticAnnotation
 class Any
@@ -5252,6 +5326,36 @@ class Null
             "other/Other.scala",
             r#"package other
 class Option[A]
+"#,
+        ),
+        ("fixtures/DefaultTerms.scala", "object Some\nobject None\n"),
+        (
+            "Build.scala",
+            r#"object Build {
+  val some = Some // positive-scala-some-over-default-package-decoy
+  val none = None // positive-scala-none-over-default-package-decoy
+}
+"#,
+        ),
+        (
+            "SameFile.scala",
+            r#"object Some
+object None
+object SameFile {
+  val some = Some // negative-same-file-some-shadow
+  val none = None // negative-same-file-none-shadow
+}
+"#,
+        ),
+        (
+            "shadowterm/Use.scala",
+            r#"package shadowterm
+object Some
+object None
+object Use {
+  val some = Some // negative-package-some-shadow
+  val none = None // negative-package-none-shadow
+}
 "#,
         ),
         (
@@ -5324,6 +5428,32 @@ object Use {
         default_query.candidate_files
     );
     assert_hit_contains(&hits(default_query.result), "positive-default-generic");
+
+    for (target_fqn, marker, shadow_markers) in [
+        (
+            "scala.Some$",
+            "positive-scala-some-over-default-package-decoy",
+            [
+                "negative-same-file-some-shadow",
+                "negative-package-some-shadow",
+            ],
+        ),
+        (
+            "scala.None$",
+            "positive-scala-none-over-default-package-decoy",
+            [
+                "negative-same-file-none-shadow",
+                "negative-package-none-shadow",
+            ],
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, marker);
+        for shadow_marker in shadow_markers {
+            assert_no_hit_contains(&target_hits, shadow_marker);
+        }
+    }
 
     for (target_fqn, marker) in [
         ("scala.Any", "negative-intrinsic-any"),
