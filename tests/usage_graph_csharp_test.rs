@@ -727,6 +727,18 @@ namespace Demo {
 namespace Other {
     public class Outer { public class Nested { public static int Value; } }
 }
+namespace App {
+    public class Constants { public class Globals { public static int Value; } }
+}
+namespace Imported {
+    public class ImportedOwner { public class Nested { public static int Value; } }
+}
+namespace Imported.System {
+    public class String { }
+}
+namespace System {
+    public class String { }
+}
 "#,
         )
         .file(
@@ -734,6 +746,7 @@ namespace Other {
             r#"
 using Alias = Demo.Outer.Nested;
 using Demo;
+using Imported;
 namespace App;
 public class Base {
     protected Holder InheritedOuter;
@@ -745,6 +758,9 @@ public class Consumer : Base {
         var aliasValue = Alias.Value;
         var nestedValue = Demo.Outer.Nested.Value;
         var genericValue = Generic<int>.Value;
+        var relativeNestedValue = Constants.Globals.Value;
+        var importedNestedValue = ImportedOwner.Nested.Value;
+        System.String globalString = null;
         var unrelated = Other.Outer.Nested.Value;
         var fieldValue = Outer.Nested;
     }
@@ -772,6 +788,30 @@ public class Consumer : Base {
             value["edges"]
         );
     }
+    assert!(
+        has_edge(&value, "App.Consumer.Receivers", "App.Constants$Globals"),
+        "a dotted nested type should resolve relative to the file namespace: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "App.Consumer.Receivers",
+            "Imported.ImportedOwner$Nested"
+        ),
+        "a using namespace should expose nested types declared directly in it: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "App.Consumer.Receivers", "System.String"),
+        "a dotted global type should remain visible after rejecting imported child namespaces: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "App.Consumer.Receivers", "Imported.System.String"),
+        "using Imported must not make Imported.System visible as System: {}",
+        value["edges"]
+    );
     assert!(
         has_edge(&value, "App.Consumer.Patterns", "Demo.PatternType"),
         "is/switch pattern type roots should be recorded: {}",

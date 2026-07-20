@@ -3024,6 +3024,64 @@ fn csharp_global_qualified_simple_type_bypasses_current_namespace() {
 }
 
 #[test]
+fn csharp_dotted_type_lookup_allows_imported_nested_type() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Imported/ImportedOwner.cs",
+            "namespace Imported { public class ImportedOwner { public class Nested { } } }\n",
+        )
+        .file(
+            "App/Consumer.cs",
+            "using Imported;\nnamespace App { public class Consumer { public void Read(ImportedOwner.Nested input) { input.ToString(); } } }\n",
+        )
+        .build();
+    let line = "namespace App { public class Consumer { public void Read(ImportedOwner.Nested input) { input.ToString(); } } }";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Consumer.cs","line":2,"column":{}}}]}}"#,
+            column_of(line, "input.ToString")
+        ),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["types"][0]["fqn"], "Imported.ImportedOwner$Nested",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_dotted_type_lookup_does_not_import_child_namespace() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Imported/System/String.cs",
+            "namespace Imported.System { public class String { } }\n",
+        )
+        .file(
+            "System/String.cs",
+            "namespace System { public class String { } }\n",
+        )
+        .file(
+            "App/Consumer.cs",
+            "using Imported;\nnamespace App { public class Consumer { public void Read(System.String input) { input.ToString(); } } }\n",
+        )
+        .build();
+    let line = "namespace App { public class Consumer { public void Read(System.String input) { input.ToString(); } } }";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Consumer.cs","line":2,"column":{}}}]}}"#,
+            column_of(line, "input.ToString")
+        ),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["types"][0]["fqn"], "System.String",
+        "{value}"
+    );
+}
+
+#[test]
 fn csharp_type_lookup_preserves_partial_declaration_locations() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

@@ -544,10 +544,6 @@ impl CSharpAnalyzer {
             return self.visible_type_candidates_inner(file, target, false, usage);
         }
 
-        if normalized.contains('.') {
-            return self.type_candidates_by_fqn(&normalized, usage);
-        }
-
         let mut namespace = self.namespace_of_file(file);
         if !namespace.is_empty() {
             let candidates =
@@ -560,7 +556,9 @@ impl CSharpAnalyzer {
         let mut visible = Vec::new();
         for using_namespace in self.using_namespaces_of(file) {
             visible.extend(
-                self.type_candidates_by_fqn(&format!("{using_namespace}.{normalized}"), usage),
+                self.type_candidates_by_fqn(&format!("{using_namespace}.{normalized}"), usage)
+                    .into_iter()
+                    .filter(|candidate| candidate.package_name() == using_namespace),
             );
         }
         if !visible.is_empty() {

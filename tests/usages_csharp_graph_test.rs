@@ -3093,6 +3093,18 @@ namespace Demo {
 namespace Other {
     public class Outer { public class Nested { public static int Value; } }
 }
+namespace App {
+    public class Constants { public class Globals { public static int Value; } }
+}
+namespace Imported {
+    public class ImportedOwner { public class Nested { public static int Value; } }
+}
+namespace Imported.System {
+    public class String { }
+}
+namespace System {
+    public class String { }
+}
 "#,
         ),
         (
@@ -3101,6 +3113,7 @@ namespace Other {
 using Alias = Demo.Outer.Nested;
 using Nested = Demo.OtherType;
 using Demo;
+using Imported;
 namespace App {
     public class Base {
         protected Holder InheritedOuter;
@@ -3113,6 +3126,9 @@ namespace App {
             var aliasValue = Alias.Value;
             var nestedValue = Demo.Outer.Nested.Value;
             var genericValue = Generic<int>.Value;
+            var relativeNestedValue = Constants.Globals.Value;
+            var importedNestedValue = ImportedOwner.Nested.Value;
+            System.String globalString = null;
             var unrelated = Other.Outer.Nested.Value;
             var unresolved = Missing.Nested.Value;
             var fieldValue = Outer.Nested;
@@ -3227,6 +3243,41 @@ namespace App {
         generic_hits
             .iter()
             .all(|hit| hit.snippet.contains("Generic<int>.Value"))
+    );
+
+    let relative_nested = type_definition(&analyzer, "App.Constants$Globals");
+    let relative_nested_hits = query(relative_nested.clone());
+    assert_eq!(1, relative_nested_hits.len(), "{relative_nested_hits:#?}");
+    assert!(
+        relative_nested_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("Constants.Globals.Value")),
+        "a dotted nested type must resolve relative to the file namespace: {relative_nested_hits:#?}"
+    );
+
+    let imported_nested = type_definition(&analyzer, "Imported.ImportedOwner$Nested");
+    let imported_nested_hits = query(imported_nested);
+    assert_eq!(1, imported_nested_hits.len(), "{imported_nested_hits:#?}");
+    assert!(
+        imported_nested_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("ImportedOwner.Nested.Value")),
+        "a using namespace should expose a nested type whose outer type is declared directly in that namespace: {imported_nested_hits:#?}"
+    );
+
+    let global_string = type_definition(&analyzer, "System.String");
+    let global_string_hits = query(global_string);
+    assert_eq!(1, global_string_hits.len(), "{global_string_hits:#?}");
+    assert!(
+        global_string_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("System.String globalString")),
+        "a using namespace must not import a same-named child namespace: {global_string_hits:#?}"
+    );
+    let imported_child_string = type_definition(&analyzer, "Imported.System.String");
+    assert!(
+        query(imported_child_string).is_empty(),
+        "using Imported must not make Imported.System visible as System"
     );
 
     let pattern = type_definition(&analyzer, "Demo.PatternType");
@@ -3347,6 +3398,12 @@ namespace App {
     assert!(
         default_query.candidate_files.contains(&consumer),
         "shared declaration routing should retain expression receiver candidates"
+    );
+    let relative_default_query =
+        UsageFinder::new().query(&analyzer, &[relative_nested], 1000, 1000);
+    assert!(
+        relative_default_query.candidate_files.contains(&consumer),
+        "shared declaration routing should retain relative nested receiver candidates"
     );
 }
 
