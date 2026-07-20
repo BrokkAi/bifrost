@@ -11,12 +11,14 @@ use super::execution::plan::{
     PhysicalQueryPlan,
 };
 use super::execution::profile::{
-    QueryExecutionProfile, QueryOperatorDisposition, QueryOperatorProfile,
+    QueryCacheProfile, QueryExecutionProfile, QueryOperatorDisposition, QueryOperatorProfile,
+    QueryOperatorTermination, QueryOperatorWorkProfile,
 };
 use super::facts::{FileFacts, Span};
 use super::kinds::{NormalizedKind, Role};
 use super::matcher::FactMatch;
 use super::planner::QueryPlan;
+use super::provider::StructuralFactsCacheOutcome;
 use super::query::schema::{reference_kind_label, usage_proof_label};
 use super::query::{
     CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
@@ -815,6 +817,10 @@ enum PipelineVia {
 struct ReferenceTraversalCache {
     inbound: HashMap<CodeUnit, Vec<ReferenceHit>>,
     outbound: HashMap<ProjectFile, Vec<ReferenceHit>>,
+    inbound_incomplete: HashSet<CodeUnit>,
+    outbound_incomplete: HashSet<ProjectFile>,
+    inbound_exhausted: HashSet<CodeUnit>,
+    outbound_exhausted: HashSet<ProjectFile>,
     reported_inbound: HashSet<CodeUnit>,
 }
 
@@ -1039,6 +1045,23 @@ impl DirectImportGraph {
             .map(|source| compact.nodes()[*source as usize].clone())
             .collect()
     }
+
+    fn importer_count(&self, file: &ProjectFile) -> usize {
+        let Some(compact) = &self.compact else {
+            return 0;
+        };
+        compact
+            .node_id(file)
+            .map_or(0, |target| compact.incoming(target).len())
+    }
+
+    fn forward_relation_complete(&self, files: &[ProjectFile]) -> bool {
+        files.iter().all(|file| self.forward.contains_key(file))
+    }
+
+    fn reverse_relation_complete(&self) -> bool {
+        self.complete && self.unsupported.is_empty()
+    }
 }
 
 /// Run `query` across every language provider the analyzer exposes.
@@ -1201,6 +1224,8 @@ struct CodeQueryExecutionBudget {
     examined_references: usize,
     pipeline_rows: usize,
     provenance_steps: usize,
+    import_files_resolved: usize,
+    import_edges_resolved: usize,
 }
 
 #[derive(Clone)]
@@ -1208,6 +1233,10 @@ struct CachedSeedExecution {
     rows: Vec<PipelineRow>,
     diagnostics: Vec<CodeQueryDiagnostic>,
     truncated: bool,
+    /// Whether the cached rows exhaust the seed relation, independently of
+    /// whether an enclosing limit can still return a semantically complete
+    /// response from a terminal-cap probe.
+    complete: Option<bool>,
 }
 
 struct QueryExecutionState<'a> {
@@ -1220,6 +1249,7 @@ struct QueryExecutionState<'a> {
     reference_cache: ReferenceTraversalCache,
     call_cache: CallTraversalCache,
     import_graph: Option<DirectImportGraph>,
+    cache_profile: Option<QueryCacheProfile>,
     profile: Option<QueryExecutionProfile>,
 }
 
@@ -1259,6 +1289,17 @@ pub(crate) fn execute_code_query_detailed(
     execute_internal(analyzer, query, limits, cancellation, None, false)
 }
 
+/// Internal opt-in profile entry point used by the M2 measurement harness.
+/// Public query surfaces remain unchanged until the explicit M5 rollout.
+#[cfg(test)]
+pub(crate) fn execute_code_query_profiled(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+) -> DetailedCodeQueryResult {
+    execute_internal(analyzer, query, limits, None, None, true)
+}
+
 #[cfg(test)]
 fn execute_with_receiver_budget_for_test(
     analyzer: &dyn IAnalyzer,
@@ -1284,6 +1325,8 @@ fn execute_internal(
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
     capture_profile: bool,
 ) -> DetailedCodeQueryResult {
+    let request_started = capture_profile.then(Instant::now);
+    let planning_started = capture_profile.then(Instant::now);
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return detailed_result_without_evidence(
             cancelled_query_result(),
@@ -1310,6 +1353,7 @@ fn execute_internal(
         }
     };
     let physical_plan = PhysicalQueryPlan::select(logical_plan);
+    let planning_ns = planning_started.map(elapsed_ns).unwrap_or(0);
     let mut diagnostics = Vec::new();
     let mut state = QueryExecutionState {
         analyzer,
@@ -1321,9 +1365,12 @@ fn execute_internal(
         reference_cache: ReferenceTraversalCache::default(),
         call_cache: CallTraversalCache::default(),
         import_graph: None,
-        profile: capture_profile.then(|| QueryExecutionProfile::sequential(&physical_plan)),
+        cache_profile: capture_profile.then(QueryCacheProfile::default),
+        profile: capture_profile
+            .then(|| QueryExecutionProfile::sequential(&physical_plan, planning_ns)),
     };
     let mut profile_branch = state.profile.as_ref().map(|_| Vec::new());
+    let execution_started = capture_profile.then(Instant::now);
     let mut execution = execute_plan(
         &physical_plan,
         physical_plan.root(),
@@ -1333,6 +1380,11 @@ fn execute_internal(
         &mut diagnostics,
         &mut profile_branch,
     );
+    if let (Some(profile), Some(started)) = (&mut state.profile, execution_started) {
+        profile.execution_ns = elapsed_ns(started);
+    }
+    let execution_work_profile = capture_profile.then(|| execution_profile_work(state.budget));
+    let rendering_started = capture_profile.then(Instant::now);
     let mut cancelled = execution.cancelled;
     let mut truncated = execution.truncated;
     // Preserve the pre-composition response shape for a plain structural
@@ -1390,6 +1442,16 @@ fn execute_internal(
         ));
     }
     let work = execution_work(state.budget);
+    if let Some(profile) = &mut state.profile {
+        let total_work = execution_profile_work(state.budget);
+        let execution_work = execution_work_profile.unwrap_or_default();
+        profile.rendering_ns = rendering_started.map(elapsed_ns).unwrap_or(0);
+        profile.total_elapsed_ns = request_started.map(elapsed_ns).unwrap_or(0);
+        profile.execution_work = execution_work;
+        profile.rendering_work = total_work.saturating_sub(execution_work);
+        profile.work = total_work;
+        profile.cache = state.cache_profile.unwrap_or_default();
+    }
     let profile = state.profile;
     let detailed = DetailedCodeQueryResult {
         result: CodeQueryResult {
@@ -1569,6 +1631,24 @@ fn execution_work(budget: CodeQueryExecutionBudget) -> CodeQueryExecutionWork {
         pipeline_rows: as_u64(budget.pipeline_rows),
         examined_references: as_u64(budget.examined_references),
     }
+}
+
+fn execution_profile_work(budget: CodeQueryExecutionBudget) -> QueryOperatorWorkProfile {
+    let as_u64 = |value| u64::try_from(value).unwrap_or(u64::MAX);
+    QueryOperatorWorkProfile {
+        scanned_files: as_u64(budget.scanned_files),
+        scanned_source_bytes: as_u64(budget.scanned_source_bytes),
+        fact_nodes: as_u64(budget.fact_nodes),
+        pipeline_rows: as_u64(budget.pipeline_rows),
+        examined_references: as_u64(budget.examined_references),
+        provenance_steps: as_u64(budget.provenance_steps),
+        import_files_resolved: as_u64(budget.import_files_resolved),
+        import_edges_resolved: as_u64(budget.import_edges_resolved),
+    }
+}
+
+fn elapsed_ns(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 fn detailed_evidence_for_pipeline_value(
@@ -2259,13 +2339,24 @@ fn execute_plan(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     profile_branch: &mut Option<Vec<usize>>,
 ) -> PlanExecution {
-    let mut started = state.profile.as_ref().map(|_| Instant::now());
+    let profiling = state.profile.is_some();
+    let invocation_started = profiling.then(Instant::now);
     let physical_node = plan.node(node_id);
     let physical_operator = physical_node.operator();
     let logical_operator = plan.logical_node(node_id).operator();
     let mut input_rows = 0;
+    let mut rows_visited = 0;
+    let mut relation_expansions = 0;
+    let mut rows_discarded = None;
+    let mut temporary_capacity_bytes_lower_bound = 0;
     let mut disposition = QueryOperatorDisposition::Completed;
     let mut self_truncated = false;
+    let mut dependency_execution_ns = 0u64;
+    let mut merge_ns = 0u64;
+    let mut terminations = profiling.then(Vec::new);
+    let mut work_started = profiling.then(|| execution_profile_work(state.budget));
+    let mut cache_started = state.cache_profile;
+    let mut own_diagnostic_start = diagnostics.len();
 
     let execution = match (physical_operator, logical_operator) {
         (PhysicalQueryOperator::SeedScan, LogicalQueryOperator::Seed(seed)) => {
@@ -2274,9 +2365,19 @@ fn execute_plan(
                 .is_some_and(CancellationToken::is_cancelled)
             {
                 disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::CancellationBeforeWork,
+                );
                 cancelled_plan_execution()
             } else {
                 let execution = execute_seed(seed, terminal_cap, state, limits, diagnostics);
+                if terminal_cap.is_some_and(|cap| execution.rows.len() >= cap) {
+                    push_operator_termination(
+                        &mut terminations,
+                        QueryOperatorTermination::TerminalCap,
+                    );
+                }
                 self_truncated = execution.truncated;
                 if execution.cancelled {
                     disposition = QueryOperatorDisposition::Cancelled;
@@ -2293,6 +2394,7 @@ fn execute_plan(
             },
         ) => {
             let dependency = physical_node.dependencies()[0];
+            let dependency_started = profiling.then(Instant::now);
             let child = execute_plan(
                 plan,
                 dependency,
@@ -2302,20 +2404,33 @@ fn execute_plan(
                 diagnostics,
                 profile_branch,
             );
-            input_rows = child.rows.len();
-            if started.is_some() {
-                started = Some(Instant::now());
+            if let Some(started) = dependency_started {
+                dependency_execution_ns =
+                    dependency_execution_ns.saturating_add(elapsed_ns(started));
             }
+            input_rows = child.rows.len();
+            work_started = profiling.then(|| execution_profile_work(state.budget));
+            cache_started = state.cache_profile;
+            own_diagnostic_start = diagnostics.len();
             if child.cancelled {
                 disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::DependencyCancelled,
+                );
                 child
             } else if child.pipeline_halted {
                 disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::DependencyPipelineHalted,
+                );
                 PlanExecution {
                     pipeline_halted: !final_in_authored_suffix,
                     ..child
                 }
             } else {
+                let mut instrumentation = profiling.then(QueryStepInstrumentation::default);
                 let mut stepped = apply_plan_step(
                     step,
                     *final_in_authored_suffix,
@@ -2324,7 +2439,20 @@ fn execute_plan(
                     limits,
                     terminal_cap,
                     diagnostics,
+                    instrumentation.as_mut(),
                 );
+                if let Some(instrumentation) = instrumentation {
+                    rows_visited = instrumentation.rows_visited;
+                    relation_expansions = instrumentation.relation_expansions;
+                    temporary_capacity_bytes_lower_bound =
+                        instrumentation.temporary_capacity_bytes_lower_bound;
+                }
+                if terminal_cap.is_some_and(|cap| stepped.rows.len() >= cap) {
+                    push_operator_termination(
+                        &mut terminations,
+                        QueryOperatorTermination::TerminalCap,
+                    );
+                }
                 self_truncated = stepped.truncated;
                 if stepped.cancelled {
                     disposition = QueryOperatorDisposition::Cancelled;
@@ -2344,6 +2472,10 @@ fn execute_plan(
                 .is_some_and(CancellationToken::is_cancelled)
             {
                 disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::CancellationBeforeWork,
+                );
                 cancelled_plan_execution()
             } else {
                 debug_assert_eq!(
@@ -2368,6 +2500,7 @@ fn execute_plan(
                     if let Some(branch) = profile_branch.as_mut() {
                         branch.push(index);
                     }
+                    let dependency_started = profiling.then(Instant::now);
                     let mut child = execute_plan(
                         plan,
                         dependency,
@@ -2377,32 +2510,64 @@ fn execute_plan(
                         diagnostics,
                         profile_branch,
                     );
+                    if let Some(started) = dependency_started {
+                        dependency_execution_ns =
+                            dependency_execution_ns.saturating_add(elapsed_ns(started));
+                    }
                     if let Some(branch) = profile_branch.as_mut() {
                         let popped = branch.pop();
                         debug_assert_eq!(popped, Some(index));
                     }
                     input_rows = input_rows.saturating_add(child.rows.len());
+                    let prefix_started = profiling.then(Instant::now);
                     prefix_branch_rows(&mut child.rows, index);
                     prefix_branch_diagnostics(&mut diagnostics[diagnostic_start..], index);
+                    if let Some(started) = prefix_started {
+                        merge_ns = merge_ns.saturating_add(elapsed_ns(started));
+                    }
+                    work_started = profiling.then(|| execution_profile_work(state.budget));
+                    cache_started = state.cache_profile;
+                    own_diagnostic_start = diagnostics.len();
                     truncated |= child.truncated;
                     if child.cancelled {
+                        push_operator_termination(
+                            &mut terminations,
+                            QueryOperatorTermination::DependencyCancelled,
+                        );
                         cancelled_child = Some(child);
                         break;
                     }
                     branch_rows.push(child.rows);
                 }
-                if started.is_some() {
-                    started = Some(Instant::now());
-                }
+                rows_visited = input_rows;
                 if let Some(child) = cancelled_child {
                     disposition = QueryOperatorDisposition::Skipped;
                     child
                 } else {
-                    let mut rows = combine_set_rows(*op, branch_rows);
+                    let merge_started = profiling.then(Instant::now);
+                    let (mut rows, merge_measurement) =
+                        combine_set_rows(*op, branch_rows, profiling);
+                    if let Some(started) = merge_started {
+                        merge_ns = merge_ns.saturating_add(elapsed_ns(started));
+                    }
+                    if let Some(merge_measurement) = merge_measurement {
+                        rows_discarded = Some(merge_measurement.rows_discarded);
+                        temporary_capacity_bytes_lower_bound =
+                            merge_measurement.temporary_capacity_bytes_lower_bound;
+                    }
                     if let Some(cap) = terminal_cap
                         && rows.len() > cap
                     {
                         self_truncated = true;
+                        rows_discarded = Some(
+                            rows_discarded
+                                .unwrap_or_default()
+                                .saturating_add(rows.len() - cap),
+                        );
+                        push_operator_termination(
+                            &mut terminations,
+                            QueryOperatorTermination::TerminalCap,
+                        );
                         rows.truncate(cap);
                     }
                     PlanExecution {
@@ -2416,6 +2581,7 @@ fn execute_plan(
         }
         (PhysicalQueryOperator::Limit, LogicalQueryOperator::Limit { count, .. }) => {
             let dependency = physical_node.dependencies()[0];
+            let dependency_started = profiling.then(Instant::now);
             let mut child = execute_plan(
                 plan,
                 dependency,
@@ -2425,16 +2591,32 @@ fn execute_plan(
                 diagnostics,
                 profile_branch,
             );
-            input_rows = child.rows.len();
-            if started.is_some() {
-                started = Some(Instant::now());
+            if let Some(started) = dependency_started {
+                dependency_execution_ns =
+                    dependency_execution_ns.saturating_add(elapsed_ns(started));
             }
+            input_rows = child.rows.len();
+            rows_visited = input_rows;
+            rows_discarded = Some(0);
+            work_started = profiling.then(|| execution_profile_work(state.budget));
+            cache_started = state.cache_profile;
+            own_diagnostic_start = diagnostics.len();
             let dependency_cancelled = child.cancelled;
             let token_cancelled = state
                 .cancellation
                 .is_some_and(CancellationToken::is_cancelled);
             if dependency_cancelled || token_cancelled {
-                if token_cancelled && !dependency_cancelled {
+                push_operator_termination(
+                    &mut terminations,
+                    if dependency_cancelled {
+                        QueryOperatorTermination::DependencyCancelled
+                    } else {
+                        QueryOperatorTermination::CancellationDuringWork
+                    },
+                );
+                if dependency_cancelled {
+                    disposition = QueryOperatorDisposition::Skipped;
+                } else if token_cancelled {
                     disposition = QueryOperatorDisposition::Cancelled;
                 }
                 child.cancelled = true;
@@ -2443,6 +2625,8 @@ fn execute_plan(
             }
             if child.rows.len() > *count {
                 self_truncated = true;
+                rows_discarded = Some(child.rows.len() - *count);
+                push_operator_termination(&mut terminations, QueryOperatorTermination::ResultLimit);
                 push_truncation_diagnostic(diagnostics, &state.budget, *count);
                 child.rows.truncate(*count);
                 child.truncated = true;
@@ -2452,14 +2636,56 @@ fn execute_plan(
         _ => unreachable!("physical operator must implement its logical query node"),
     };
 
-    if let (Some(profile), Some(started)) = (&mut state.profile, started) {
+    if profiling {
+        append_diagnostic_terminations(
+            &mut terminations,
+            &diagnostics[own_diagnostic_start.min(diagnostics.len())..],
+        );
+        if self_truncated
+            && terminations
+                .as_ref()
+                .is_some_and(|terminations| terminations.is_empty())
+        {
+            push_operator_termination(
+                &mut terminations,
+                QueryOperatorTermination::AnalysisIncomplete,
+            );
+        }
+        if execution.cancelled && disposition == QueryOperatorDisposition::Cancelled {
+            push_operator_termination(
+                &mut terminations,
+                QueryOperatorTermination::CancellationDuringWork,
+            );
+        }
+    }
+
+    if let (Some(profile), Some(started)) = (&mut state.profile, invocation_started) {
+        let total_elapsed_ns = elapsed_ns(started);
+        let work =
+            execution_profile_work(state.budget).saturating_sub(work_started.unwrap_or_default());
+        let cache = state
+            .cache_profile
+            .unwrap_or_default()
+            .saturating_sub(cache_started.unwrap_or_default());
         profile.record(QueryOperatorProfile {
             node: node_id,
             branch: profile_branch.as_deref().unwrap_or_default().to_vec(),
             operator: physical_operator,
             disposition,
-            elapsed_ns: u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            elapsed_ns: total_elapsed_ns.saturating_sub(dependency_execution_ns),
+            total_elapsed_ns,
+            dependency_execution_ns,
+            dependency_wait_ns: 0,
+            merge_ns,
+            scheduling_overhead_ns: 0,
             input_rows,
+            rows_visited,
+            relation_expansions,
+            rows_discarded,
+            temporary_capacity_bytes_lower_bound,
+            work,
+            cache,
+            terminations: terminations.unwrap_or_default(),
             output_rows: execution.rows.len(),
             operator_truncated: self_truncated,
             result_truncated: execution.truncated,
@@ -2467,6 +2693,76 @@ fn execute_plan(
         });
     }
     execution
+}
+
+fn push_operator_termination(
+    terminations: &mut Option<Vec<QueryOperatorTermination>>,
+    termination: QueryOperatorTermination,
+) {
+    if let Some(terminations) = terminations
+        && !terminations.contains(&termination)
+    {
+        terminations.push(termination);
+    }
+}
+
+fn append_diagnostic_terminations(
+    terminations: &mut Option<Vec<QueryOperatorTermination>>,
+    diagnostics: &[CodeQueryDiagnostic],
+) {
+    for diagnostic in diagnostics {
+        let termination = match diagnostic.code {
+            // Cancellation ownership is classified from the executor state
+            // below. A diagnostic can be emitted or replayed by a parent that
+            // only observed a cancelled dependency, so prose provenance is
+            // not sufficient to call it operator-local work.
+            CodeQueryDiagnosticCode::Cancelled => None,
+            CodeQueryDiagnosticCode::ExecutionBudgetExhausted => {
+                Some(QueryOperatorTermination::ExecutionBudget)
+            }
+            CodeQueryDiagnosticCode::PipelineBudgetExhausted => {
+                Some(QueryOperatorTermination::PipelineBudget)
+            }
+            CodeQueryDiagnosticCode::ImportGraphBudgetExhausted => {
+                Some(QueryOperatorTermination::ImportGraphBudget)
+            }
+            CodeQueryDiagnosticCode::ResultLimitReached => {
+                Some(QueryOperatorTermination::ResultLimit)
+            }
+            CodeQueryDiagnosticCode::CallRelationBudgetExhausted
+            | CodeQueryDiagnosticCode::CallRelationCandidateLimit
+            | CodeQueryDiagnosticCode::ReferenceSourceBytesTruncated
+            | CodeQueryDiagnosticCode::ReferenceCandidateFilesTruncated
+            | CodeQueryDiagnosticCode::ReferenceCandidatesOmitted
+            | CodeQueryDiagnosticCode::ReferenceCallsiteLimit
+            | CodeQueryDiagnosticCode::UsesCandidateLimit
+            | CodeQueryDiagnosticCode::UsesCandidatesOmitted => {
+                Some(QueryOperatorTermination::AnalysisLimit)
+            }
+            CodeQueryDiagnosticCode::UnsupportedStructuralFeature
+            | CodeQueryDiagnosticCode::MissingStructuralAdapter
+            | CodeQueryDiagnosticCode::UnsupportedImportAnalysis
+            | CodeQueryDiagnosticCode::UsesParserUnsupported => {
+                Some(QueryOperatorTermination::UnsupportedAnalysis)
+            }
+            CodeQueryDiagnosticCode::SemanticResultsOmitted
+            | CodeQueryDiagnosticCode::ReceiverAnalysisPartial
+            | CodeQueryDiagnosticCode::CallRelationParseFailed
+            | CodeQueryDiagnosticCode::CallRelationCandidatesOmitted
+            | CodeQueryDiagnosticCode::CallRelationAnalysisFailed
+            | CodeQueryDiagnosticCode::ReferenceAnalysisFailed => {
+                Some(QueryOperatorTermination::AnalysisIncomplete)
+            }
+            CodeQueryDiagnosticCode::InvalidPlan
+            | CodeQueryDiagnosticCode::CallRelationTargetsAmbiguous
+            | CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous
+            | CodeQueryDiagnosticCode::UsesTargetsAmbiguous
+            | CodeQueryDiagnosticCode::BroadQuery => None,
+        };
+        if let Some(termination) = termination {
+            push_operator_termination(terminations, termination);
+        }
+    }
 }
 
 fn cancelled_plan_execution() -> PlanExecution {
@@ -2492,6 +2788,11 @@ fn execute_seed(
     let desired_rows = terminal_cap.unwrap_or(budget_cap).min(budget_cap);
     let capped_by_budget = terminal_cap.is_none_or(|cap| budget_cap <= cap);
     if let Some(cached) = state.seed_cache.get(&cache_key).cloned() {
+        if let Some(profile) = &mut state.cache_profile {
+            profile
+                .seed_result
+                .record_hit(cached.complete, cached.rows.len());
+        }
         diagnostics.extend(cached.diagnostics);
         let mut rows = cached.rows;
         let locally_capped = capped_by_budget && rows.len() > desired_rows;
@@ -2507,6 +2808,9 @@ fn execute_seed(
             cancelled: false,
             pipeline_halted: false,
         };
+    }
+    if let Some(profile) = &mut state.cache_profile {
+        profile.seed_result.record_miss();
     }
     if desired_rows == 0 {
         push_pipeline_budget_diagnostic(diagnostics, &state.budget);
@@ -2607,6 +2911,7 @@ fn execute_seed(
     let match_cap = desired_rows.saturating_add(usize::from(probing_budget));
     let mut pending: Vec<PendingMatch> = Vec::new();
     let mut truncated = false;
+    let mut cache_complete = state.cache_profile.as_ref().map(|_| true);
     for (_path, language, provider, file) in candidates {
         if state
             .cancellation
@@ -2622,6 +2927,7 @@ fn execute_seed(
         let Some(source) = provider.structural_source(&file) else {
             push_seed_provider_omission(diagnostics, language, &file, "indexed source snapshot");
             truncated = true;
+            cache_complete = cache_complete.map(|_| false);
             continue;
         };
         let mut projected = state.budget;
@@ -2633,6 +2939,7 @@ fn execute_seed(
         {
             push_budget_diagnostic(diagnostics, &projected);
             truncated = true;
+            cache_complete = cache_complete.map(|_| false);
             break;
         }
         state.budget.scanned_files = projected.scanned_files;
@@ -2640,7 +2947,32 @@ fn execute_seed(
         if !source_index.may_match(&source) {
             continue;
         }
-        let Some(facts) = provider.structural_facts(&file) else {
+        let facts = if state.cache_profile.is_some() {
+            let (facts, outcome) = provider.structural_facts_with_outcome(&file);
+            if let Some(profile) = &mut state.cache_profile {
+                match outcome {
+                    StructuralFactsCacheOutcome::MemoryHit => profile
+                        .seed_structural_facts
+                        .record_memory_hit(facts.is_some()),
+                    StructuralFactsCacheOutcome::PersistedHydration => {
+                        profile.seed_structural_facts.record_persisted_hydration()
+                    }
+                    StructuralFactsCacheOutcome::Extracted => {
+                        profile.seed_structural_facts.record_extraction();
+                    }
+                    StructuralFactsCacheOutcome::Unavailable => {
+                        profile.seed_structural_facts.record_unavailable();
+                    }
+                    StructuralFactsCacheOutcome::Unknown => {
+                        profile.seed_structural_facts.record_unknown();
+                    }
+                }
+            }
+            facts
+        } else {
+            provider.structural_facts(&file)
+        };
+        let Some(facts) = facts else {
             push_seed_provider_omission(
                 diagnostics,
                 language,
@@ -2648,6 +2980,7 @@ fn execute_seed(
                 "normalized structural facts",
             );
             truncated = true;
+            cache_complete = cache_complete.map(|_| false);
             continue;
         };
         projected = state.budget;
@@ -2659,6 +2992,7 @@ fn execute_seed(
         {
             push_budget_diagnostic(diagnostics, &projected);
             truncated = true;
+            cache_complete = cache_complete.map(|_| false);
             break;
         }
         state.budget.fact_nodes = projected.fact_nodes;
@@ -2669,11 +3003,16 @@ fn execute_seed(
                 .map(|fact_match| (language, file.clone(), Arc::clone(&facts), fact_match)),
         );
         if pending.len() >= match_cap {
+            // The cap stopped the scan before the remaining candidates were
+            // examined. This can be enough for a root limit probe while still
+            // being unsafe to advertise as a complete reusable seed layer.
+            cache_complete = cache_complete.map(|_| false);
             break;
         }
     }
     if pending.len() > desired_rows {
         pending.truncate(desired_rows);
+        cache_complete = cache_complete.map(|_| false);
         if capped_by_budget {
             truncated = true;
             push_pipeline_budget_diagnostic(diagnostics, &state.budget);
@@ -2699,6 +3038,13 @@ fn execute_seed(
             }
         })
         .collect::<Vec<_>>();
+    let cache_complete = cache_complete.map(|complete| {
+        complete
+            && !truncated
+            && !diagnostics[diagnostic_start..]
+                .iter()
+                .any(|diagnostic| diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete)
+    });
     state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(rows.len());
     state.seed_cache.insert(
         cache_key,
@@ -2706,14 +3052,25 @@ fn execute_seed(
             rows: rows.clone(),
             diagnostics: diagnostics[diagnostic_start..].to_vec(),
             truncated,
+            complete: cache_complete,
         },
     );
+    if let Some(profile) = &mut state.cache_profile {
+        profile.seed_result.record_build(cache_complete);
+    }
     PlanExecution {
         rows,
         truncated,
         cancelled: false,
         pipeline_halted: false,
     }
+}
+
+#[derive(Default)]
+struct QueryStepInstrumentation {
+    rows_visited: usize,
+    relation_expansions: usize,
+    temporary_capacity_bytes_lower_bound: u64,
 }
 
 fn push_seed_provider_omission(
@@ -2734,6 +3091,7 @@ fn push_seed_provider_omission(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_plan_step(
     step: &QueryStep,
     final_in_authored_suffix: bool,
@@ -2742,6 +3100,7 @@ fn apply_plan_step(
     limits: CodeQueryExecutionLimits,
     terminal_cap: Option<usize>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    instrumentation: Option<&mut QueryStepInstrumentation>,
 ) -> PlanExecution {
     let mut truncated = false;
     if state
@@ -2760,12 +3119,61 @@ fn apply_plan_step(
             .import_graph
             .get_or_insert_with(|| DirectImportGraph::new(state.analyzer));
         let graph_exhausted = if step == &QueryStep::ImportersOf {
-            ensure_complete_import_graph(
+            let cache_observation = state
+                .cache_profile
+                .as_ref()
+                .map(|_| (graph.complete, graph.reverse_relation_complete()));
+            if let (Some(profile), Some((cache_hit, cache_complete))) =
+                (&mut state.cache_profile, cache_observation)
+            {
+                if cache_hit {
+                    let replayed_edges = rows
+                        .iter()
+                        .filter_map(|row| match &row.value {
+                            PipelineValue::File(file) => Some(graph.importer_count(file)),
+                            PipelineValue::StructuralMatch(_)
+                            | PipelineValue::Declaration(_)
+                            | PipelineValue::ReferenceSite(_)
+                            | PipelineValue::CallSite(_)
+                            | PipelineValue::ExpressionSite(_)
+                            | PipelineValue::ReceiverAnalysis(_) => None,
+                        })
+                        .sum();
+                    profile
+                        .import_reverse
+                        .record_hit(Some(cache_complete), replayed_edges);
+                } else {
+                    profile.import_reverse.record_miss();
+                }
+            }
+            let import_work_before = state
+                .cache_profile
+                .as_ref()
+                .map(|_| (graph.resolved_files, graph.resolved_edges));
+            let exhausted = ensure_complete_import_graph(
                 state.analyzer,
                 graph,
                 limits.max_scanned_files,
                 limits.max_pipeline_rows,
-            )
+            );
+            if let Some((resolved_files_before, resolved_edges_before)) = import_work_before {
+                state.budget.import_files_resolved = state
+                    .budget
+                    .import_files_resolved
+                    .saturating_add(graph.resolved_files.saturating_sub(resolved_files_before));
+                state.budget.import_edges_resolved = state
+                    .budget
+                    .import_edges_resolved
+                    .saturating_add(graph.resolved_edges.saturating_sub(resolved_edges_before));
+            }
+            if cache_observation.is_some_and(|(cache_hit, _)| !cache_hit)
+                && let Some(profile) = &mut state.cache_profile
+            {
+                profile
+                    .import_reverse
+                    .record_build(Some(!exhausted && graph.reverse_relation_complete()));
+            }
+            exhausted
         } else {
             let mut frontier = rows
                 .iter()
@@ -2781,13 +3189,58 @@ fn apply_plan_step(
                 .collect::<Vec<_>>();
             frontier.sort_by_key(rel_path_string);
             frontier.dedup();
-            ensure_forward_import_edges(
+            let cache_observation = state.cache_profile.as_ref().map(|_| {
+                let cache_hit = frontier.iter().all(|file| {
+                    graph.forward.contains_key(file) || graph.unsupported.contains(file)
+                });
+                let cache_complete = cache_hit && graph.forward_relation_complete(&frontier);
+                let replayed_edges = frontier
+                    .iter()
+                    .filter_map(|file| graph.forward.get(file))
+                    .map(Vec::len)
+                    .sum();
+                (cache_hit, cache_complete, replayed_edges)
+            });
+            if let (Some(profile), Some((cache_hit, cache_complete, replayed_edges))) =
+                (&mut state.cache_profile, cache_observation)
+            {
+                if cache_hit {
+                    profile
+                        .import_forward
+                        .record_hit(Some(cache_complete), replayed_edges);
+                } else {
+                    profile.import_forward.record_miss();
+                }
+            }
+            let import_work_before = state
+                .cache_profile
+                .as_ref()
+                .map(|_| (graph.resolved_files, graph.resolved_edges));
+            let exhausted = ensure_forward_import_edges(
                 state.analyzer,
                 graph,
                 &frontier,
                 limits.max_scanned_files,
                 limits.max_pipeline_rows,
-            )
+            );
+            if let Some((resolved_files_before, resolved_edges_before)) = import_work_before {
+                state.budget.import_files_resolved = state
+                    .budget
+                    .import_files_resolved
+                    .saturating_add(graph.resolved_files.saturating_sub(resolved_files_before));
+                state.budget.import_edges_resolved = state
+                    .budget
+                    .import_edges_resolved
+                    .saturating_add(graph.resolved_edges.saturating_sub(resolved_edges_before));
+            }
+            if cache_observation.is_some_and(|(cache_hit, _, _)| !cache_hit)
+                && let Some(profile) = &mut state.cache_profile
+            {
+                profile.import_forward.record_build(Some(
+                    !exhausted && graph.forward_relation_complete(&frontier),
+                ));
+            }
+            exhausted
         };
         if graph_exhausted {
             truncated = true;
@@ -2813,6 +3266,8 @@ fn apply_plan_step(
         state.cancellation,
         diagnostics,
         state.receiver_budget_override,
+        &mut state.cache_profile,
+        instrumentation,
     );
     truncated |= step_truncated;
     if state
@@ -2897,7 +3352,21 @@ fn prefix_branch_diagnostics(diagnostics: &mut [CodeQueryDiagnostic], branch: us
     }
 }
 
-fn combine_set_rows(op: SetOperator, mut branches: Vec<Vec<PipelineRow>>) -> Vec<PipelineRow> {
+struct SetMergeMeasurement {
+    rows_discarded: usize,
+    temporary_capacity_bytes_lower_bound: u64,
+}
+
+fn combine_set_rows(
+    op: SetOperator,
+    mut branches: Vec<Vec<PipelineRow>>,
+    measure: bool,
+) -> (Vec<PipelineRow>, Option<SetMergeMeasurement>) {
+    let input_rows = if measure {
+        branches.iter().map(Vec::len).sum::<usize>()
+    } else {
+        0
+    };
     match op {
         SetOperator::Union => {
             let mut output = Vec::new();
@@ -2913,7 +3382,14 @@ fn combine_set_rows(op: SetOperator, mut branches: Vec<Vec<PipelineRow>>) -> Vec
                     );
                 }
             }
-            output
+            let measurement = measure.then(|| SetMergeMeasurement {
+                rows_discarded: input_rows.saturating_sub(output.len()),
+                temporary_capacity_bytes_lower_bound: hash_capacity_bytes_lower_bound::<
+                    PipelineKey,
+                    usize,
+                >(indexes.capacity()),
+            });
+            (output, measurement)
         }
         SetOperator::Intersect => {
             let first = branches.remove(0);
@@ -2954,7 +3430,21 @@ fn combine_set_rows(op: SetOperator, mut branches: Vec<Vec<PipelineRow>>) -> Vec
                     );
                 }
             }
-            output
+            let measurement = measure.then(|| SetMergeMeasurement {
+                rows_discarded: input_rows.saturating_sub(output.len()),
+                temporary_capacity_bytes_lower_bound: later
+                    .iter()
+                    .map(|branch| {
+                        hash_capacity_bytes_lower_bound::<PipelineKey, PipelineRow>(
+                            branch.capacity(),
+                        )
+                    })
+                    .fold(0u64, u64::saturating_add)
+                    .saturating_add(hash_capacity_bytes_lower_bound::<PipelineKey, usize>(
+                        indexes.capacity(),
+                    )),
+            });
+            (output, measurement)
         }
         SetOperator::Except => {
             let first = branches.remove(0);
@@ -2963,12 +3453,27 @@ fn combine_set_rows(op: SetOperator, mut branches: Vec<Vec<PipelineRow>>) -> Vec
                 .flatten()
                 .map(|row| row.value.key())
                 .collect::<HashSet<_>>();
-            first
+            let output = first
                 .into_iter()
                 .filter(|row| !excluded.contains(&row.value.key()))
-                .collect()
+                .collect::<Vec<_>>();
+            let measurement = measure.then(|| SetMergeMeasurement {
+                rows_discarded: input_rows.saturating_sub(output.len()),
+                temporary_capacity_bytes_lower_bound: hash_capacity_bytes_lower_bound::<
+                    PipelineKey,
+                    (),
+                >(excluded.capacity()),
+            });
+            (output, measurement)
         }
     }
+}
+
+fn hash_capacity_bytes_lower_bound<K, V>(capacity: usize) -> u64 {
+    u64::try_from(
+        capacity.saturating_mul(std::mem::size_of::<K>().saturating_add(std::mem::size_of::<V>())),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 fn cancelled_query_result() -> CodeQueryResult {
@@ -3106,6 +3611,8 @@ fn apply_pipeline_step(
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
+    cache_profile: &mut Option<QueryCacheProfile>,
+    instrumentation: Option<&mut QueryStepInstrumentation>,
 ) -> (Vec<PipelineRow>, bool, bool) {
     let max_pipeline_rows = limits.max_pipeline_rows;
     let mut output = Vec::new();
@@ -3123,6 +3630,7 @@ fn apply_pipeline_step(
         QueryStep::ReceiverTargets(_) | QueryStep::PointsTo(_) | QueryStep::MemberTargets(_)
     )
     .then(|| ReceiverQueryService::new(analyzer));
+    let mut instrumentation = instrumentation;
 
     let mut indexed_declarations = indexed_declarations;
     'rows: for row in rows {
@@ -3131,6 +3639,9 @@ fn apply_pipeline_step(
         }
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return (output, true, receiver_truncated);
+        }
+        if let Some(instrumentation) = instrumentation.as_deref_mut() {
+            instrumentation.rows_visited = instrumentation.rows_visited.saturating_add(1);
         }
         let mut row_exhausted = false;
         if let (
@@ -3167,6 +3678,11 @@ fn apply_pipeline_step(
                     &mut trace_exhausted,
                     &mut receiver_truncated,
                 );
+                if let Some(instrumentation) = instrumentation.as_deref_mut() {
+                    instrumentation.relation_expansions = instrumentation
+                        .relation_expansions
+                        .saturating_add(expansions.len());
+                }
                 for expansion in expansions {
                     insert_pipeline_row(
                         &mut output,
@@ -3336,6 +3852,7 @@ fn apply_pipeline_step(
                     diagnostics,
                     max_pipeline_rows.saturating_sub(budget.pipeline_rows),
                     cancellation,
+                    cache_profile,
                 );
                 row_exhausted = reference_exhausted;
                 expansions
@@ -3355,6 +3872,7 @@ fn apply_pipeline_step(
                     max_step_outputs,
                     cancellation,
                     diagnostics,
+                    cache_profile,
                 );
                 row_exhausted = reference_exhausted;
                 expansions
@@ -3378,6 +3896,7 @@ fn apply_pipeline_step(
                     max_step_outputs,
                     cancellation,
                     diagnostics,
+                    cache_profile,
                 );
                 row_exhausted = call_exhausted;
                 expansions
@@ -3397,6 +3916,7 @@ fn apply_pipeline_step(
                     max_step_outputs,
                     cancellation,
                     diagnostics,
+                    cache_profile,
                 );
                 row_exhausted = call_exhausted;
                 expansions
@@ -3512,6 +4032,12 @@ fn apply_pipeline_step(
             _ => unreachable!("query step domains are validated before execution"),
         };
 
+        if let Some(instrumentation) = instrumentation.as_deref_mut() {
+            instrumentation.relation_expansions = instrumentation
+                .relation_expansions
+                .saturating_add(expansions.len());
+        }
+
         for expansion in expansions {
             if !expansion.budgeted && budget.pipeline_rows >= max_pipeline_rows {
                 exhausted = true;
@@ -3576,6 +4102,13 @@ fn apply_pipeline_step(
                 if count == 1 { "" } else { "s" }
             ),
         });
+    }
+    if let Some(instrumentation) = instrumentation {
+        let index_bytes = indexes.capacity().saturating_mul(
+            std::mem::size_of::<PipelineKey>().saturating_add(std::mem::size_of::<usize>()),
+        );
+        instrumentation.temporary_capacity_bytes_lower_bound =
+            u64::try_from(index_bytes).unwrap_or(u64::MAX);
     }
     (output, exhausted, receiver_truncated)
 }
@@ -3917,6 +4450,7 @@ fn call_declaration_expansions(
     max_outputs: usize,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    cache_profile: &mut Option<QueryCacheProfile>,
 ) -> (Vec<PipelineExpansion>, bool) {
     let incoming = matches!(step, QueryStep::Callers(_));
     let diagnostic_start = diagnostics.len();
@@ -3951,6 +4485,7 @@ fn call_declaration_expansions(
             limits,
             cancellation,
             diagnostics,
+            cache_profile,
         );
         exhausted |= result.truncated || result.cancelled;
         for site in result
@@ -4081,6 +4616,7 @@ fn call_site_expansions(
     max_outputs: usize,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    cache_profile: &mut Option<QueryCacheProfile>,
 ) -> (Vec<PipelineExpansion>, bool) {
     let incoming = matches!(step, QueryStep::CallSitesTo(_));
     let result = cached_call_relation(
@@ -4092,6 +4628,7 @@ fn call_site_expansions(
         limits,
         cancellation,
         diagnostics,
+        cache_profile,
     );
     let mut sites = result
         .sites
@@ -4120,15 +4657,32 @@ fn cached_call_relation(
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    cache_profile: &mut Option<QueryCacheProfile>,
 ) -> CallRelationResult {
     let results = if incoming {
         &mut cache.incoming
     } else {
         &mut cache.outgoing
     };
+    let layer = cache_profile.as_mut().map(|profile| {
+        if incoming {
+            &mut profile.incoming_call
+        } else {
+            &mut profile.outgoing_call
+        }
+    });
     let result = if let Some(result) = results.get(unit) {
+        if let Some(layer) = layer {
+            layer.record_hit(
+                Some(call_relation_result_complete(result)),
+                result.sites.len(),
+            );
+        }
         result.clone()
     } else {
+        if let Some(layer) = layer {
+            layer.record_miss();
+        }
         let relation_limits = CallRelationLimits {
             max_files: limits
                 .max_scanned_files
@@ -4167,6 +4721,14 @@ fn cached_call_relation(
         if budget_exhausted {
             push_budget_diagnostic(diagnostics, budget);
         }
+        if let Some(profile) = cache_profile {
+            let layer = if incoming {
+                &mut profile.incoming_call
+            } else {
+                &mut profile.outgoing_call
+            };
+            layer.record_build(Some(call_relation_result_complete(&result)));
+        }
         results.insert(unit.clone(), result.clone());
         result
     };
@@ -4188,16 +4750,19 @@ fn cached_call_relation(
     result
 }
 
-fn map_call_relation_diagnostic(
-    language: &'static str,
-    diagnostic: CallRelationDiagnostic,
-) -> CodeQueryDiagnostic {
-    debug_assert!(!diagnostic.context.is_empty());
-    debug_assert_eq!(
-        diagnostic.reason_kind.is_some(),
-        diagnostic.code == CallRelationDiagnosticCode::AnalysisFailed
-    );
-    let (code, impact) = match diagnostic.code {
+fn call_relation_result_complete(result: &CallRelationResult) -> bool {
+    !result.truncated
+        && !result.cancelled
+        && result.diagnostics.iter().all(|diagnostic| {
+            map_call_relation_diagnostic_code(diagnostic.code).1
+                != CodeQueryDiagnosticImpact::Incomplete
+        })
+}
+
+fn map_call_relation_diagnostic_code(
+    code: CallRelationDiagnosticCode,
+) -> (CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact) {
+    match code {
         CallRelationDiagnosticCode::BudgetExhausted => (
             CodeQueryDiagnosticCode::CallRelationBudgetExhausted,
             CodeQueryDiagnosticImpact::Incomplete,
@@ -4222,7 +4787,19 @@ fn map_call_relation_diagnostic(
             CodeQueryDiagnosticCode::CallRelationAnalysisFailed,
             CodeQueryDiagnosticImpact::Incomplete,
         ),
-    };
+    }
+}
+
+fn map_call_relation_diagnostic(
+    language: &'static str,
+    diagnostic: CallRelationDiagnostic,
+) -> CodeQueryDiagnostic {
+    debug_assert!(!diagnostic.context.is_empty());
+    debug_assert_eq!(
+        diagnostic.reason_kind.is_some(),
+        diagnostic.code == CallRelationDiagnosticCode::AnalysisFailed
+    );
+    let (code, impact) = map_call_relation_diagnostic_code(diagnostic.code);
     CodeQueryDiagnostic {
         code,
         impact,
@@ -4351,9 +4928,22 @@ fn inbound_reference_expansions(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     max_hits: usize,
     cancellation: Option<&CancellationToken>,
+    cache_profile: &mut Option<QueryCacheProfile>,
 ) -> (Vec<PipelineExpansion>, bool) {
-    let mut exhausted = false;
-    if !cache.inbound.contains_key(&declaration.unit) {
+    let cache_hit = cache.inbound.contains_key(&declaration.unit);
+    let mut exhausted = cache_hit && cache.inbound_exhausted.contains(&declaration.unit);
+    if let Some(profile) = cache_profile {
+        if cache_hit {
+            profile.inbound_reference.record_hit(
+                Some(!cache.inbound_incomplete.contains(&declaration.unit)),
+                cache.inbound.get(&declaration.unit).map_or(0, Vec::len),
+            );
+        } else {
+            profile.inbound_reference.record_miss();
+        }
+    }
+    if !cache_hit {
+        let diagnostic_start = diagnostics.len();
         let remaining_files = limits
             .max_scanned_files
             .saturating_sub(budget.scanned_files);
@@ -4392,6 +4982,13 @@ fn inbound_reference_expansions(
         ) {
             push_budget_diagnostic(diagnostics, budget);
             cache.inbound.insert(declaration.unit.clone(), Vec::new());
+            if cache_profile.is_some() {
+                cache.inbound_incomplete.insert(declaration.unit.clone());
+            }
+            cache.inbound_exhausted.insert(declaration.unit.clone());
+            if let Some(profile) = cache_profile {
+                profile.inbound_reference.record_build(Some(false));
+            }
             return (Vec::new(), true);
         }
         let mut hits = Vec::new();
@@ -4544,6 +5141,21 @@ fn inbound_reference_expansions(
                     });
                 }
             }
+        }
+        let cache_complete = cache_profile.as_ref().map(|_| {
+            !exhausted
+                && !diagnostics[diagnostic_start..]
+                    .iter()
+                    .any(|diagnostic| diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete)
+        });
+        if cache_complete == Some(false) {
+            cache.inbound_incomplete.insert(declaration.unit.clone());
+        }
+        if exhausted {
+            cache.inbound_exhausted.insert(declaration.unit.clone());
+        }
+        if let Some(profile) = cache_profile {
+            profile.inbound_reference.record_build(cache_complete);
         }
         cache.inbound.insert(declaration.unit.clone(), hits);
     }
@@ -4785,9 +5397,23 @@ fn outbound_reference_expansions(
     max_step_outputs: usize,
     cancellation: Option<&CancellationToken>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    cache_profile: &mut Option<QueryCacheProfile>,
 ) -> (Vec<PipelineExpansion>, bool) {
-    let mut exhausted = false;
-    if !cache.outbound.contains_key(declaration.unit.source()) {
+    let source_file = declaration.unit.source();
+    let cache_hit = cache.outbound.contains_key(source_file);
+    let mut exhausted = cache_hit && cache.outbound_exhausted.contains(source_file);
+    if let Some(profile) = cache_profile {
+        if cache_hit {
+            profile.outbound_reference.record_hit(
+                Some(!cache.outbound_incomplete.contains(source_file)),
+                cache.outbound.get(source_file).map_or(0, Vec::len),
+            );
+        } else {
+            profile.outbound_reference.record_miss();
+        }
+    }
+    if !cache_hit {
+        let diagnostic_start = diagnostics.len();
         let (hits, scan_exhausted) = scan_outbound_reference_hits(
             analyzer,
             declaration.unit.source(),
@@ -4798,9 +5424,22 @@ fn outbound_reference_expansions(
             diagnostics,
         );
         exhausted = scan_exhausted;
-        cache
-            .outbound
-            .insert(declaration.unit.source().clone(), hits);
+        let cache_complete = cache_profile.as_ref().map(|_| {
+            !scan_exhausted
+                && !diagnostics[diagnostic_start..]
+                    .iter()
+                    .any(|diagnostic| diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete)
+        });
+        if cache_complete == Some(false) {
+            cache.outbound_incomplete.insert(source_file.clone());
+        }
+        if scan_exhausted {
+            cache.outbound_exhausted.insert(source_file.clone());
+        }
+        if let Some(profile) = cache_profile {
+            profile.outbound_reference.record_build(cache_complete);
+        }
+        cache.outbound.insert(source_file.clone(), hits);
     }
     let mut sites = Vec::new();
     let mut omitted = 0usize;
@@ -6598,7 +7237,9 @@ mod tests {
     use super::*;
     use crate::analyzer::structural::CodeQuery;
     use crate::analyzer::usages::get_definition::ResolvedReferenceSite;
-    use crate::analyzer::{CodeUnitType, TestProject, TypescriptAnalyzer};
+    use crate::analyzer::{
+        CodeUnitType, JavaAnalyzer, PhpAnalyzer, TestProject, TypescriptAnalyzer,
+    };
     use serde_json::json;
     use std::cell::Cell;
     use std::path::PathBuf;
@@ -6614,6 +7255,44 @@ mod tests {
             language: "workspace",
             message: "prose deliberately carries no classification words".to_string(),
         }
+    }
+
+    fn assert_serial_profile_reconciles(profile: &QueryExecutionProfile) {
+        assert_eq!(profile.format, "bifrost_code_query_execution_profile/v1");
+        assert_eq!(profile.peak_concurrency, 1);
+        assert!(
+            profile
+                .planning_ns
+                .saturating_add(profile.execution_ns)
+                .saturating_add(profile.rendering_ns)
+                <= profile.total_elapsed_ns,
+            "named request phases must fit inside total request wall time"
+        );
+        for observation in &profile.operators {
+            assert_eq!(
+                observation.total_elapsed_ns,
+                observation
+                    .elapsed_ns
+                    .saturating_add(observation.dependency_execution_ns),
+                "operator self and inline dependency execution must reconcile"
+            );
+            assert_eq!(observation.dependency_wait_ns, 0);
+            assert_eq!(observation.scheduling_overhead_ns, 0);
+            assert!(observation.merge_ns <= observation.elapsed_ns);
+        }
+        let operator_work = profile
+            .operators
+            .iter()
+            .fold(QueryOperatorWorkProfile::default(), |work, observation| {
+                work.saturating_add(observation.work)
+            });
+        assert_eq!(operator_work, profile.execution_work);
+        assert_eq!(
+            profile
+                .execution_work
+                .saturating_add(profile.rendering_work),
+            profile.work
+        );
     }
 
     #[test]
@@ -6788,6 +7467,110 @@ mod tests {
     }
 
     #[test]
+    fn call_cache_profile_uses_typed_diagnostics_for_completeness() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root.clone(), Language::TypeScript));
+        let unit = CodeUnit::new(
+            ProjectFile::new(root, "src/missing.ts"),
+            CodeUnitType::Function,
+            "",
+            "caller",
+        );
+        let mut cache = CallTraversalCache::default();
+        let mut budget = CodeQueryExecutionBudget::default();
+        let mut diagnostics = Vec::new();
+        let mut profile = Some(QueryCacheProfile::default());
+
+        let built = cached_call_relation(
+            &analyzer,
+            &unit,
+            false,
+            &mut cache,
+            &mut budget,
+            CodeQueryExecutionLimits::default(),
+            None,
+            &mut diagnostics,
+            &mut profile,
+        );
+        assert!(!built.truncated);
+        assert!(!built.cancelled);
+        assert!(
+            built.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == CallRelationDiagnosticCode::AnalysisFailed
+            })
+        );
+
+        let replayed = cached_call_relation(
+            &analyzer,
+            &unit,
+            false,
+            &mut cache,
+            &mut budget,
+            CodeQueryExecutionLimits::default(),
+            None,
+            &mut diagnostics,
+            &mut profile,
+        );
+        assert_eq!(replayed.sites.len(), built.sites.len());
+        assert_eq!(replayed.diagnostics, built.diagnostics);
+        assert_eq!(replayed.truncated, built.truncated);
+        assert_eq!(replayed.cancelled, built.cancelled);
+
+        cache.incoming.insert(
+            unit.clone(),
+            CallRelationResult {
+                diagnostics: vec![CallRelationDiagnostic {
+                    code: CallRelationDiagnosticCode::ParseFailed,
+                    message: "parse failed".to_string(),
+                    context: "caller".to_string(),
+                    reason_kind: None,
+                }],
+                ..CallRelationResult::default()
+            },
+        );
+        let incoming = cached_call_relation(
+            &analyzer,
+            &unit,
+            true,
+            &mut cache,
+            &mut budget,
+            CodeQueryExecutionLimits::default(),
+            None,
+            &mut diagnostics,
+            &mut profile,
+        );
+        assert!(!incoming.truncated);
+        assert!(!incoming.cancelled);
+
+        let profile = profile.expect("cache profile");
+        assert_eq!(profile.outgoing_call.lookups, 2);
+        assert_eq!(profile.outgoing_call.misses, 1);
+        assert_eq!(profile.outgoing_call.builds, 1);
+        assert_eq!(profile.outgoing_call.incomplete_builds, 1);
+        assert_eq!(profile.outgoing_call.complete_builds, 0);
+        assert_eq!(profile.outgoing_call.hits, 1);
+        assert_eq!(profile.outgoing_call.incomplete_hits, 1);
+        assert_eq!(profile.outgoing_call.complete_hits, 0);
+        assert_eq!(profile.incoming_call.lookups, 1);
+        assert_eq!(profile.incoming_call.hits, 1);
+        assert_eq!(profile.incoming_call.incomplete_hits, 1);
+        assert_eq!(profile.incoming_call.complete_hits, 0);
+
+        let advisory = CallRelationResult {
+            diagnostics: vec![CallRelationDiagnostic {
+                code: CallRelationDiagnosticCode::TargetsAmbiguous,
+                message: "ambiguous".to_string(),
+                context: "caller".to_string(),
+                reason_kind: None,
+            }],
+            ..CallRelationResult::default()
+        };
+        assert!(call_relation_result_complete(&advisory));
+    }
+
+    #[test]
     fn outbound_uses_missing_reference_or_definitions_is_typed_incomplete() {
         let root = std::env::temp_dir().join("bifrost-outbound-lookup-completeness");
         let file = ProjectFile::new(root, "src/app.ts");
@@ -6931,6 +7714,7 @@ mod tests {
             8,
             None,
             &mut diagnostics,
+            &mut None,
         );
 
         assert!(expansions.is_empty());
@@ -6990,6 +7774,7 @@ mod tests {
             8,
             None,
             &mut diagnostics,
+            &mut None,
         );
 
         assert!(expansions.is_empty());
@@ -7132,6 +7917,7 @@ mod tests {
             &mut diagnostics,
             8,
             None,
+            &mut None,
         );
 
         assert!(expansions.is_empty());
@@ -7161,6 +7947,7 @@ mod tests {
             &mut diagnostics,
             8,
             None,
+            &mut None,
         );
 
         assert!(expansions.is_empty());
@@ -7548,7 +8335,7 @@ mod tests {
         let profile = detailed
             .profile
             .expect("valid execution should be profiled");
-        assert_eq!(profile.peak_concurrency, 1);
+        assert_serial_profile_reconciles(&profile);
         assert_eq!(
             profile
                 .operators
@@ -7580,6 +8367,457 @@ mod tests {
             seed_observations.iter().all(|observation| {
                 observation.disposition == QueryOperatorDisposition::Completed
             })
+        );
+        assert_eq!(seed_observations[0].cache.seed_result.lookups, 1);
+        assert_eq!(seed_observations[0].cache.seed_result.misses, 1);
+        assert_eq!(seed_observations[0].cache.seed_result.builds, 1);
+        assert_eq!(seed_observations[0].cache.seed_result.complete_builds, 1);
+        assert_eq!(seed_observations[1].cache.seed_result.lookups, 1);
+        assert_eq!(seed_observations[1].cache.seed_result.hits, 1);
+        assert_eq!(seed_observations[1].cache.seed_result.complete_hits, 1);
+        assert_eq!(seed_observations[1].cache.seed_result.replayed_items, 1);
+        assert_eq!(profile.cache.seed_result.lookups, 2);
+        assert_eq!(profile.cache.seed_result.misses, 1);
+        assert_eq!(profile.cache.seed_result.hits, 1);
+        assert_eq!(profile.cache.seed_result.complete_builds, 1);
+        assert_eq!(profile.cache.seed_result.complete_hits, 1);
+        let union = profile
+            .operators
+            .iter()
+            .find(|observation| observation.operator == PhysicalQueryOperator::SequentialUnion)
+            .expect("union observation");
+        assert_eq!(union.input_rows, 2);
+        assert_eq!(union.output_rows, 1);
+        assert_eq!(union.rows_discarded, Some(1));
+        assert!(union.temporary_capacity_bytes_lower_bound > 0);
+    }
+
+    #[test]
+    fn profile_marks_truncated_seed_materialization_and_replay_incomplete() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+            .write("function first() {}\nfunction second() {}\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let branch = json!({ "match": { "kind": "function" } });
+        let query = CodeQuery::from_json(&json!({
+            "union": [branch.clone(), branch]
+        }))
+        .expect("query");
+
+        let detailed = execute_internal(
+            &analyzer,
+            &query,
+            CodeQueryExecutionLimits {
+                max_scanned_files: 1,
+                max_pipeline_rows: 2,
+                ..CodeQueryExecutionLimits::default()
+            },
+            None,
+            None,
+            true,
+        );
+
+        assert!(detailed.result.truncated);
+        let profile = detailed.profile.expect("profile");
+        assert_serial_profile_reconciles(&profile);
+        assert_eq!(profile.cache.seed_result.lookups, 2);
+        assert_eq!(profile.cache.seed_result.misses, 1);
+        assert_eq!(profile.cache.seed_result.incomplete_builds, 1);
+        assert_eq!(profile.cache.seed_result.hits, 1);
+        assert_eq!(profile.cache.seed_result.incomplete_hits, 1);
+        let seed_observations = profile
+            .operators
+            .iter()
+            .filter(|observation| observation.operator == PhysicalQueryOperator::SeedScan)
+            .collect::<Vec<_>>();
+        assert_eq!(seed_observations.len(), 2);
+        assert_eq!(seed_observations[0].cache.seed_result.incomplete_builds, 1);
+        assert_eq!(seed_observations[1].cache.seed_result.incomplete_hits, 1);
+        assert!(seed_observations.iter().all(|observation| {
+            observation
+                .terminations
+                .contains(&QueryOperatorTermination::PipelineBudget)
+        }));
+    }
+
+    #[test]
+    fn profile_does_not_call_a_terminal_cap_seed_cache_complete() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+            .write("function first() {}\nfunction second() {}\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let query = CodeQuery::from_json(&json!({
+            "match": { "kind": "function" },
+            "limit": 1
+        }))
+        .expect("query");
+
+        let detailed =
+            execute_code_query_profiled(&analyzer, &query, CodeQueryExecutionLimits::default());
+
+        assert_eq!(detailed.result.results.len(), 1);
+        assert!(detailed.result.truncated);
+        let profile = detailed.profile.expect("profile");
+        assert_serial_profile_reconciles(&profile);
+        assert_eq!(profile.cache.seed_result.misses, 1);
+        assert_eq!(profile.cache.seed_result.incomplete_builds, 1);
+        assert_eq!(profile.cache.seed_result.complete_builds, 0);
+        let seed = profile
+            .operators
+            .iter()
+            .find(|observation| observation.operator == PhysicalQueryOperator::SeedScan)
+            .expect("seed observation");
+        assert_eq!(seed.cache.seed_result.incomplete_builds, 1);
+        assert_eq!(
+            seed.terminations,
+            vec![QueryOperatorTermination::TerminalCap]
+        );
+        let limit = profile
+            .operators
+            .iter()
+            .find(|observation| observation.operator == PhysicalQueryOperator::Limit)
+            .expect("limit observation");
+        assert_eq!(
+            limit.terminations,
+            vec![QueryOperatorTermination::ResultLimit]
+        );
+    }
+
+    #[test]
+    fn profile_marks_unsupported_seed_materialization_and_replay_incomplete() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+            .write("function target(options: object) {}\ntarget({ flag: true });\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let branch = json!({
+            "match": {
+                "kind": "call",
+                "kwargs": { "flag": { "kind": "boolean_literal" } }
+            }
+        });
+        let query = CodeQuery::from_json(&json!({
+            "union": [branch.clone(), branch]
+        }))
+        .expect("query");
+
+        let detailed =
+            execute_code_query_profiled(&analyzer, &query, CodeQueryExecutionLimits::default());
+
+        assert!(matches!(
+            detailed.result.completion(),
+            CodeQueryCompletion::Incomplete { codes }
+                if codes.contains(&CodeQueryDiagnosticCode::UnsupportedStructuralFeature)
+        ));
+        let profile = detailed.profile.expect("profile");
+        assert_serial_profile_reconciles(&profile);
+        assert_eq!(profile.cache.seed_result.incomplete_builds, 1);
+        assert_eq!(profile.cache.seed_result.incomplete_hits, 1);
+        let seeds = profile
+            .operators
+            .iter()
+            .filter(|observation| observation.operator == PhysicalQueryOperator::SeedScan)
+            .collect::<Vec<_>>();
+        assert_eq!(seeds.len(), 2);
+        assert!(seeds.iter().all(|observation| {
+            observation
+                .terminations
+                .contains(&QueryOperatorTermination::UnsupportedAnalysis)
+        }));
+    }
+
+    #[test]
+    fn profile_marks_unsupported_import_builds_and_replays_incomplete() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("app.php"))
+            .write("<?php\nfunction target() {}\n")
+            .expect("write source");
+        let analyzer = PhpAnalyzer::from_project(TestProject::new(root, Language::Php));
+        let imports = json!({
+            "match": { "kind": "function", "name": "target" },
+            "steps": [{ "op": "file_of" }, { "op": "imports_of" }]
+        });
+        let importers = json!({
+            "match": { "kind": "function", "name": "target" },
+            "steps": [{ "op": "file_of" }, { "op": "importers_of" }]
+        });
+        let query = CodeQuery::from_json(&json!({
+            "union": [imports.clone(), imports, importers.clone(), importers]
+        }))
+        .expect("query");
+
+        let detailed =
+            execute_code_query_profiled(&analyzer, &query, CodeQueryExecutionLimits::default());
+
+        assert!(matches!(
+            detailed.result.completion(),
+            CodeQueryCompletion::Incomplete { codes }
+                if codes.contains(&CodeQueryDiagnosticCode::UnsupportedImportAnalysis)
+        ));
+        let profile = detailed.profile.expect("profile");
+        assert_serial_profile_reconciles(&profile);
+        assert_eq!(profile.cache.import_forward.lookups, 2);
+        assert_eq!(profile.cache.import_forward.misses, 1);
+        assert_eq!(profile.cache.import_forward.incomplete_builds, 1);
+        assert_eq!(profile.cache.import_forward.complete_builds, 0);
+        assert_eq!(profile.cache.import_forward.hits, 1);
+        assert_eq!(profile.cache.import_forward.incomplete_hits, 1);
+        assert_eq!(profile.cache.import_forward.complete_hits, 0);
+        assert_eq!(profile.cache.import_reverse.lookups, 2);
+        assert_eq!(profile.cache.import_reverse.misses, 1);
+        assert_eq!(profile.cache.import_reverse.incomplete_builds, 1);
+        assert_eq!(profile.cache.import_reverse.complete_builds, 0);
+        assert_eq!(profile.cache.import_reverse.hits, 1);
+        assert_eq!(profile.cache.import_reverse.incomplete_hits, 1);
+        assert_eq!(profile.cache.import_reverse.complete_hits, 0);
+        assert_eq!(
+            profile
+                .operators
+                .iter()
+                .filter(|observation| {
+                    observation.operator == PhysicalQueryOperator::PipelineStep
+                        && observation
+                            .terminations
+                            .contains(&QueryOperatorTermination::UnsupportedAnalysis)
+                })
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn profile_distinguishes_seed_reuse_from_structural_facts_reuse() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+            .write("export function left() {}\nexport function right() {}\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let query = CodeQuery::from_json(&json!({
+            "union": [
+                { "match": { "kind": "function", "name": "left" } },
+                { "match": { "kind": "function", "name": "right" } }
+            ]
+        }))
+        .expect("query");
+
+        let detailed =
+            execute_code_query_profiled(&analyzer, &query, CodeQueryExecutionLimits::default());
+
+        assert_eq!(detailed.result.results.len(), 2);
+        assert_eq!(detailed.result.completion(), CodeQueryCompletion::Complete);
+        let profile = detailed.profile.expect("profile");
+        assert_serial_profile_reconciles(&profile);
+        assert_eq!(profile.cache.seed_result.lookups, 2);
+        assert_eq!(profile.cache.seed_result.misses, 2);
+        assert_eq!(profile.cache.seed_result.hits, 0);
+        assert_eq!(profile.cache.seed_result.complete_builds, 2);
+        assert_eq!(profile.cache.seed_structural_facts.lookups, 2);
+        assert_eq!(profile.cache.seed_structural_facts.extractions, 1);
+        assert_eq!(profile.cache.seed_structural_facts.memory_hits, 1);
+        assert_eq!(profile.cache.seed_structural_facts.replayed_files, 1);
+        let seed_observations = profile
+            .operators
+            .iter()
+            .filter(|observation| observation.operator == PhysicalQueryOperator::SeedScan)
+            .collect::<Vec<_>>();
+        assert_eq!(seed_observations.len(), 2);
+        assert_eq!(seed_observations[0].branch, vec![0]);
+        assert_eq!(
+            seed_observations[0].cache.seed_structural_facts.extractions,
+            1
+        );
+        assert_eq!(
+            seed_observations[0].cache.seed_structural_facts.memory_hits,
+            0
+        );
+        assert_eq!(seed_observations[1].branch, vec![1]);
+        assert_eq!(
+            seed_observations[1].cache.seed_structural_facts.memory_hits,
+            1
+        );
+        assert_eq!(
+            seed_observations[1]
+                .cache
+                .seed_structural_facts
+                .replayed_files,
+            1
+        );
+        let union = profile
+            .operators
+            .iter()
+            .find(|observation| observation.operator == PhysicalQueryOperator::SequentialUnion)
+            .expect("union observation");
+        assert_eq!(union.input_rows, 2);
+        assert_eq!(union.rows_visited, 2);
+        assert_eq!(union.rows_discarded, Some(0));
+        assert!(union.temporary_capacity_bytes_lower_bound > 0);
+    }
+
+    #[test]
+    fn profile_records_one_complete_import_graph_build_and_sibling_reuse() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("bench/LeftHub.java"))
+            .write("package bench;\npublic class LeftHub {}\n")
+            .expect("write left hub");
+        ProjectFile::new(root.clone(), PathBuf::from("bench/RightHub.java"))
+            .write("package bench;\npublic class RightHub {}\n")
+            .expect("write right hub");
+        for name in ["One", "Two"] {
+            ProjectFile::new(root.clone(), PathBuf::from(format!("bench/Node{name}.java")))
+                .write(&format!(
+                    "package bench;\nimport bench.LeftHub;\nimport bench.RightHub;\npublic class Node{name} {{}}\n"
+                ))
+                .expect("write importer");
+        }
+        let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
+        let branch = |name: &str| {
+            json!({
+                "where": [format!("bench/{name}.java")],
+                "languages": ["java"],
+                "match": { "kind": "class", "name": name },
+                "steps": [{ "op": "file_of" }, { "op": "importers_of" }]
+            })
+        };
+        let query = CodeQuery::from_json(&json!({
+            "union": [branch("LeftHub"), branch("RightHub")]
+        }))
+        .expect("query");
+
+        let detailed =
+            execute_code_query_profiled(&analyzer, &query, CodeQueryExecutionLimits::default());
+
+        assert_eq!(detailed.result.results.len(), 2);
+        assert_eq!(detailed.result.completion(), CodeQueryCompletion::Complete);
+        let profile = detailed.profile.expect("profile");
+        assert_serial_profile_reconciles(&profile);
+        assert_eq!(profile.cache.import_reverse.lookups, 2);
+        assert_eq!(profile.cache.import_reverse.misses, 1);
+        assert_eq!(profile.cache.import_reverse.complete_builds, 1);
+        assert_eq!(profile.cache.import_reverse.hits, 1);
+        assert_eq!(profile.cache.import_reverse.complete_hits, 1);
+        assert!(profile.cache.import_reverse.replayed_items > 0);
+        let import_steps = profile
+            .operators
+            .iter()
+            .filter(|observation| observation.cache.import_reverse.lookups > 0)
+            .collect::<Vec<_>>();
+        assert_eq!(import_steps.len(), 2);
+        assert_eq!(import_steps[0].branch, vec![0]);
+        assert_eq!(import_steps[0].cache.import_reverse.misses, 1);
+        assert_eq!(import_steps[0].cache.import_reverse.complete_builds, 1);
+        assert_eq!(import_steps[0].work.import_files_resolved, 4);
+        assert_eq!(import_steps[0].work.import_edges_resolved, 4);
+        assert_eq!(import_steps[1].branch, vec![1]);
+        assert_eq!(import_steps[1].cache.import_reverse.hits, 1);
+        assert_eq!(import_steps[1].cache.import_reverse.complete_hits, 1);
+        assert_eq!(import_steps[1].work.import_files_resolved, 0);
+        assert_eq!(import_steps[1].work.import_edges_resolved, 0);
+        assert!(import_steps.iter().all(|observation| {
+            observation.input_rows == 1
+                && observation.rows_visited == 1
+                && observation.relation_expansions == 2
+                && observation.output_rows == 2
+                && observation.rows_discarded.is_none()
+        }));
+    }
+
+    #[test]
+    fn profile_preserves_incomplete_reference_cache_state_for_a_sibling() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let source = "export function target() {}\nfunction one() { target(); }\nfunction two() { target(); }\n";
+        ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+            .write(source)
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let branch = json!({
+            "match": { "kind": "function", "name": "target" },
+            "steps": [
+                { "op": "enclosing_decl" },
+                { "op": "references_of" },
+                { "op": "file_of" }
+            ]
+        });
+        let query = CodeQuery::from_json(&json!({
+            "union": [branch.clone(), branch]
+        }))
+        .expect("query");
+
+        let detailed = execute_internal(
+            &analyzer,
+            &query,
+            CodeQueryExecutionLimits {
+                max_scanned_source_bytes: source.len().saturating_mul(2).saturating_add(4),
+                ..CodeQueryExecutionLimits::default()
+            },
+            None,
+            None,
+            true,
+        );
+
+        assert!(detailed.result.truncated);
+        assert!(
+            detailed
+                .result
+                .results
+                .iter()
+                .all(|item| { !matches!(item.value, CodeQueryResultValue::File { .. }) })
+        );
+        let profile = detailed.profile.expect("profile");
+        assert_serial_profile_reconciles(&profile);
+        assert_eq!(profile.cache.inbound_reference.lookups, 2);
+        assert_eq!(profile.cache.inbound_reference.misses, 1);
+        assert_eq!(profile.cache.inbound_reference.incomplete_builds, 1);
+        assert_eq!(profile.cache.inbound_reference.hits, 1);
+        assert_eq!(profile.cache.inbound_reference.incomplete_hits, 1);
+        let reference_steps = profile
+            .operators
+            .iter()
+            .filter(|observation| observation.cache.inbound_reference.lookups > 0)
+            .collect::<Vec<_>>();
+        assert_eq!(reference_steps.len(), 2);
+        assert!(
+            reference_steps
+                .iter()
+                .all(|observation| observation.result_truncated)
+        );
+        assert!(
+            reference_steps[0]
+                .terminations
+                .contains(&QueryOperatorTermination::AnalysisLimit)
+        );
+        assert!(
+            reference_steps[1]
+                .terminations
+                .contains(&QueryOperatorTermination::AnalysisIncomplete),
+            "sibling terminations: {:?}",
+            reference_steps[1].terminations
+        );
+        assert_eq!(
+            profile
+                .operators
+                .iter()
+                .filter(|observation| {
+                    observation
+                        .terminations
+                        .contains(&QueryOperatorTermination::DependencyPipelineHalted)
+                })
+                .count(),
+            2,
+            "neither branch may continue a known-incomplete reference layer"
         );
     }
 
@@ -7613,6 +8851,7 @@ mod tests {
         assert_eq!(detailed.result.results.len(), 2);
         assert!(detailed.result.truncated);
         let profile = detailed.profile.expect("profile");
+        assert_serial_profile_reconciles(&profile);
         let limit = profile
             .operators
             .iter()
@@ -7625,6 +8864,12 @@ mod tests {
         assert!(limit.operator_truncated);
         assert!(limit.result_truncated);
         assert!(!limit.result_cancelled);
+        assert_eq!(limit.rows_visited, 3);
+        assert_eq!(limit.rows_discarded, Some(1));
+        assert_eq!(
+            limit.terminations,
+            vec![QueryOperatorTermination::ResultLimit]
+        );
         let union = profile
             .operators
             .iter()
@@ -7634,6 +8879,13 @@ mod tests {
         assert_eq!(union.output_rows, 3);
         assert!(union.operator_truncated);
         assert!(!union.result_truncated);
+        assert_eq!(union.rows_visited, 8);
+        assert_eq!(union.rows_discarded, Some(5));
+        assert!(union.temporary_capacity_bytes_lower_bound > 0);
+        assert_eq!(
+            union.terminations,
+            vec![QueryOperatorTermination::TerminalCap]
+        );
     }
 
     #[test]
@@ -7683,6 +8935,7 @@ mod tests {
             .expect("cancellation should interrupt a final branch step after a partial row");
 
         let profile = detailed.profile.expect("profile");
+        assert_serial_profile_reconciles(&profile);
         let union = profile
             .operators
             .iter()
@@ -7697,6 +8950,20 @@ mod tests {
         assert!(union.result_cancelled);
         assert_eq!(union.output_rows, limit.input_rows);
         assert!(limit.result_cancelled);
+        assert_eq!(
+            union.terminations,
+            vec![QueryOperatorTermination::DependencyCancelled]
+        );
+        assert_eq!(
+            limit.terminations,
+            vec![QueryOperatorTermination::DependencyCancelled]
+        );
+        assert!(profile.operators.iter().any(|observation| {
+            observation.disposition == QueryOperatorDisposition::Cancelled
+                && observation
+                    .terminations
+                    .contains(&QueryOperatorTermination::CancellationDuringWork)
+        }));
         assert_eq!(detailed.result.completion(), CodeQueryCompletion::Cancelled);
     }
 

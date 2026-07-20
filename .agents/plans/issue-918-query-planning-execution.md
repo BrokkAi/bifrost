@@ -17,7 +17,7 @@ The first independently verifiable milestone is deliberately sequential. Existin
 - [x] (2026-07-20 14:28Z) Inspected the reference implementation's SQL-to-memory graph techniques and separated transferable techniques from unsuitable sparse-ID, repeated-build, and quadratic paths.
 - [x] (2026-07-20 14:28Z) Chose the storage-neutral sequential plan spine and the measured later graph-materialization boundary described below.
 - [x] (2026-07-20 15:09Z) Milestone 1: lowered authored queries into a logical DAG, selected and executed an explicit sequential physical plan without public semantic change, added opt-in structured explain/profile observations, completed adversarial review, and passed the focused tests plus strict all-target/all-feature Clippy.
-- [ ] Milestone 2: complete operator instrumentation and benchmark representative compositional queries before defining a scheduling heuristic.
+- [x] (2026-07-20 20:38Z) Milestone 2: completed opt-in operator, work, cache, termination, and request-phase instrumentation; added a versioned ignored benchmark; ran optimized reversed-order measurements plus an M1 ordinary-path differential; and deliberately deferred scheduler thresholds and storage selection.
 - [ ] Milestone 3: introduce exact derived-layer dependency keys and cancellation-aware complete-value single-flight, then run a promote-or-discard SQL-to-memory graph materialization experiment.
 - [ ] Milestone 4: add a bounded scheduler plus sequential and parallel union implementations, select between them with benchmark-derived policy, and preserve deterministic semantics and budgets.
 - [ ] Milestone 5: expose explain/profile through the supported query surfaces, document measured thresholds and rejected alternatives, and complete adversarial review and repository validation.
@@ -59,6 +59,21 @@ The first independently verifiable milestone is deliberately sequential. Existin
 
 - Observation: this machine has rustup Cargo before Homebrew Cargo but Homebrew `cargo-clippy` before rustup's proxy on `PATH`.
   Evidence: plain `cargo clippy` compiled dependencies with the pinned rustup compiler and then invoked Homebrew Clippy, yielding `E0514` incompatible-compiler metadata despite the same displayed release. Direct `rustup run 1.96.0 cargo-clippy` used the pinned driver and passed the strict gate.
+
+- Observation: cache "hit" is not decision-grade without both lifecycle and completeness.
+  Evidence: request-local seed results, seed-path structural facts, inbound/outbound references, incoming/outgoing calls, and forward/reverse imports have different reuse boundaries. Seed materialization can also satisfy a root terminal-cap probe while remaining incomplete as a reusable relation. The M2 profile therefore records typed per-layer outcomes, complete/incomplete/unknown builds and hits, replayed payload counts, and exact seed-path memory, hydration, extraction, unavailable, and unknown outcomes.
+
+- Observation: instrumenting completeness exposed an existing partial-reference replay correctness gap.
+  Evidence: after a budget-exhausted reference traversal populated a request-local partial cache, a sibling branch replayed those rows but could continue into a later step as though the relation were complete. The cache now retains execution exhaustion separately from telemetry completeness, and a focused regression proves both sibling pipelines halt instead of deriving a misleading downstream value from a partial relation.
+
+- Observation: dependency wait and scheduler overhead are real profile fields but necessarily zero in Milestone 2.
+  Evidence: the physical executor still invokes dependency subtrees inline on one thread. The profile separates operator self-time, inclusive time, dependency execution, dependency wait, merge, and scheduler overhead so M3/M4 can populate the waiting and scheduling fields without changing the schema, while M2 asserts `peak_concurrency = 1` and zero wait/overhead.
+
+- Observation: the same topology can have very different overlap ceilings and shared-dependency constraints.
+  Evidence: optimized large distinct exact unions projected 49.73–49.80 percent idealized perfect-overlap headroom, while large distinct broad unions projected only 14.35–14.40 percent. Identical seeds, shared reference traversal, and shared import topology were deliberately ineligible. These are optimistic wall-time lower bounds, not measured parallel speedups.
+
+- Observation: opt-in profile collection is cheap on these fixtures, but the ordinary M2 code path is not literally byte-for-byte cost-free versus M1.
+  Evidence: paired M2 profiled/unprofiled deltas ranged from -0.77 to +1.91 percent across two optimized rounds. A separate four-round public-API comparison against the exact M1 checkpoint preserved all result digests and produced combined ordinary-path medians from -0.32 to +1.82 percent, with one non-reproduced broad-query timing outlier.
 
 ## Decision Log
 
@@ -106,6 +121,26 @@ The first independently verifiable milestone is deliberately sequential. Existin
   Rationale: normal queries should not pay measurement overhead, while a skipped parent may legitimately forward a cancelled child's terminal-domain partial rows. A disposition plus operator-local and propagated status represents that case without claiming the parent produced those rows.
   Date/Author: 2026-07-20 / Codex
 
+- Decision: keep the M2 executor sequential and model only an explicitly idealized perfect-overlap lower bound for eligible branches.
+  Rationale: there is no scheduler, dependency single-flight, or bounded parallel operator yet. Assuming unchanged set/rendering work and zero scheduler contention makes the projection useful for ranking experiments without misrepresenting it as an A/B result. Real sequential-versus-parallel measurement remains Milestone 4 work.
+  Date/Author: 2026-07-20 / Codex
+
+- Decision: expose structural-facts materialization outcome through a defaulted provider method and scope profile counters to seed-path observations.
+  Rationale: global provider deltas include structural-facts lookups performed inside semantic resolvers and cannot distinguish memory reuse, persisted hydration, extraction, or unavailability for a specific seed operator. The default preserves third-party provider compatibility while the tree-sitter provider supplies exact outcomes.
+  Date/Author: 2026-07-20 / Codex
+
+- Decision: preserve relation-exhaustion state when replaying incomplete request-local reference caches.
+  Rationale: allowing a sibling to run later steps over partial reference rows can produce downstream values that appear complete. This is a correctness repair uncovered by M2 completeness instrumentation, not a scheduling optimization; the profile's separate incomplete counters remain telemetry-only.
+  Date/Author: 2026-07-20 / Codex
+
+- Decision: keep the measurement harness internal and ignored, emit versioned machine-readable raw samples, and record the summarized evidence in `.agents/docs/issue-918-code-query-execution-benchmark-2026-07-20.md`.
+  Rationale: normal test runs should remain deterministic and fast, while decision runs need exact tree, machine, compiler, limits, query, result digest, cache contract, and order provenance. An internal harness can evolve with the physical profile until Milestone 5 defines a public surface.
+  Date/Author: 2026-07-20 / Codex
+
+- Decision: do not choose a scheduling threshold or SQL-to-memory graph candidate from the M2 synthetic results.
+  Rationale: the benchmark omits real scheduler contention, per-request CPU time, RSS/retained bytes, persisted reopen, asymmetric branches, and real-repository fanout. It validates instrumentation and nominates later experiments; it cannot promote or discard a production representation.
+  Date/Author: 2026-07-20 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 is complete. Parsed JSON and RQL now converge on a dense dependency-first logical DAG with exact shared seed nodes, then select a one-to-one physical plan with explicit seed, step, sequential set, and root-limit operators. The existing query path executes through that plan while preserving authored branch order, fair budget roll-forward, cache replay and charging, provenance, diagnostics, cancellation checkpoints, intermediate-step exhaustion, and the global `limit + 1` probe.
@@ -113,6 +148,18 @@ Milestone 1 is complete. Parsed JSON and RQL now converge on a dense dependency-
 The internal opt-in profile carries a semantic physical explanation, stable shared node and branch-invocation identities, self-time, input and forwarded output cardinality, disposition, local clipping, propagated truncation/cancellation, and `peak_concurrency = 1`. Ordinary query and policy execution leave profiling disabled. Review found and corrected explain-semantic loss, invocation ambiguity, skipped-operator status, unconditional instrumentation overhead, hidden set clipping, and forwarded partial-row accounting.
 
 Validation passed with 5 execution-plan tests, 85 structural query tests, 3 focused profile tests, all 73 `code_query_pipelines` tests, `cargo fmt --all`, `git diff --check`, and pinned-toolchain `cargo-clippy --all-targets --all-features -- -D warnings`. No SQL loader, graph cache, scheduler, guessed parallel threshold, public profile surface, or new dependency was added. Those remain explicitly gated by Milestones 2 through 5.
+
+Milestone 2 is complete. The opt-in profile now separates planning, execution, rendering, operator self-time, inline dependency execution, dependency wait, merge, and scheduler overhead; reconciles execution and rendering work; records input, visited, expanded, discarded, and output cardinality; estimates temporary container capacity; and attaches typed cancellation, budget, terminal-cap, result-limit, unsupported-analysis, and incomplete-analysis markers. Cache observations distinguish request-local seed results, exact seed-path structural-facts outcomes, inbound/outbound references, incoming/outgoing calls, and forward/reverse imports, including completeness and replay counts. The serial executor continues to report one peak worker and zero wait/scheduler time.
+
+Final adversarial review caught two false-complete telemetry paths before checkpointing. Call-cache completeness now derives from typed call-relation diagnostic impact as well as truncation/cancellation, and import-cache completeness treats unsupported source files as cached-but-incomplete for both orientations. Focused regressions cover incomplete call build/replay, incomplete incoming call replay, advisory call ambiguity, and unsupported PHP forward/reverse import build/replay.
+
+The ignored release benchmark covers TypeScript and Java, 16- and 128-file branch scales, exact and broad queries, identical and distinct branches, shared reference traversal, shared import topology, fresh-analyzer first requests, and same-analyzer later requests. Two final reversed-order rounds on an Apple M4 showed large distinct exact idealized overlap headroom of 49.73–49.80 percent and large distinct broad headroom of 14.35–14.40 percent. Paired profile-collection overhead for the large cases stayed between -0.77 and +0.22 percent. A temporary four-round public-API harness compared the exact M1 checkpoint with M2, preserved every result digest, and observed combined ordinary-path median deltas from -0.32 to +1.82 percent.
+
+The profile also uncovered and fixed partial reference-cache replay that allowed a sibling to continue later pipeline steps after the cached relation had exhausted its budget. A regression now proves the incomplete sibling remains halted. This is the only intentional ordinary-result semantic correction in M2; it prevents a partial cached relation from being treated as complete.
+
+Final validation passed with 5 execution-plan tests plus the ignored benchmark registration, 85 structural query tests, all 40 structural search tests including 11 focused profile cases, the exact structural-facts outcome test, all 73 `code_query_pipelines` tests, both optimized benchmark rounds, `cargo fmt --all`, `git diff --check`, and pinned-toolchain `cargo-clippy --all-targets --all-features -- -D warnings`.
+
+No threshold was selected. The reported headroom is an idealized wall-time projection with zero scheduler cost, not measured parallel execution or CPU-capacity evidence. The fixtures do not measure RSS, retained bytes, persisted reopen, asymmetric branches, high-fanout real repositories, or real scheduler contention, so they neither promote nor discard a SQL-backed graph layer. Milestone 3 remains responsible for exact dependency keys and cancellation-aware complete-value single-flight; Milestone 4 remains responsible for actual bounded sequential/parallel A/B measurements and policy selection.
 
 ## Context and Orientation
 
@@ -140,7 +187,7 @@ Lower the logical arena one-to-one into `PhysicalQueryPlan`. Select `SeedScan`, 
 
 Refactor `search.rs::execute_internal` into the explicit stages `validate and lower -> physical selection -> sequential physical execution -> render`. Execute seed, step, set, and limit nodes through the existing helpers and shared `QueryExecutionState`; do not change those helpers' semantics. Wrap node execution with a structured internal observation containing node ID, operator, elapsed wall time, input rows, output rows, truncation, and cancellation. The request profile contains the physical explain model and `peak_concurrency`, which is exactly one for this milestone. Existing public `query_code` output remains unchanged.
 
-Milestone 2 turns the profile skeleton into decision-grade measurement. Add cache hit, miss, and wait counts; dependency wait time; rows or edges visited; merge time; scheduling overhead; temporary allocation estimates where practical; and cancellation/early-termination markers. Extend the benchmark harness with representative composed queries and versioned machine-readable results. Cover cold and warm caches, distinct and identical branches, small and large outputs, shared graph prerequisites, multiple repository sizes and languages, and sequential versus experimental unconstrained execution. Do not publish a threshold until repeated optimized runs separate scheduler wins from noise.
+Milestone 2 turns the profile skeleton into decision-grade measurement. Add cache hit, miss, and wait counts; dependency execution and wait time; rows or edges visited; merge time; scheduling overhead; temporary allocation estimates where practical; and cancellation/early-termination markers. Extend the benchmark harness with representative composed queries and versioned machine-readable results. Cover fresh-analyzer and same-analyzer-later cache states, distinct and identical branches, small and large outputs, shared graph prerequisites, multiple synthetic workspace sizes, and TypeScript and Java. Keep physical execution sequential and calculate an explicitly idealized perfect-overlap lower bound only for complete distinct branches without shared derived dependencies. Do not introduce experimental parallel execution or publish a threshold here; repeated optimized sequential-versus-parallel A/B runs belong to Milestone 4 after Milestone 3 establishes complete-value single-flight.
 
 Milestone 3 creates explicit shared dependency keys and a promote-or-discard graph materialization experiment. Generalize the complete-value single-flight lifecycle from `CompleteSemanticArtifactCache` instead of duplicating leader, waiter, cancellation, retry, and publication logic. The key includes workspace or store generation, derived-layer kind, projection/filter/configuration identity, and representation version. First prove with an in-memory fake layer that concurrent consumers cause one build, cancelled waiters do not cancel the leader, a failed leader wakes a retry, and incomplete results are never cached.
 
@@ -162,6 +209,25 @@ For Milestone 1, run:
     cargo test --test code_query_pipelines
     rustup run 1.96.0 cargo-clippy --all-targets --all-features -- -D warnings
     git diff --check
+
+For Milestone 2, run the focused semantic and profile gates:
+
+    cargo fmt --all
+    cargo test --lib analyzer::structural::execution
+    cargo test --lib analyzer::structural::query
+    cargo test --lib structural_facts_cache_reports_exact_materialization_outcomes
+    cargo test --test code_query_pipelines
+    rustup run 1.96.0 cargo-clippy --all-targets --all-features -- -D warnings
+    git diff --check
+
+Run the ignored optimized measurement twice with reversed order:
+
+    BIFROST_SEMANTIC_INDEX=off BIFROST_CODE_QUERY_BENCH_ROUND=0 \
+      cargo test --release --lib code_query_execution_profile_measurement -- --ignored --nocapture
+    BIFROST_SEMANTIC_INDEX=off BIFROST_CODE_QUERY_BENCH_ROUND=1 \
+      cargo test --release --lib code_query_execution_profile_measurement -- --ignored --nocapture
+
+Redirect the full JSON lines when preserving raw output; one default run is roughly two megabytes because every profiled sample retains its full operator plan and observations. Summarize, rather than commit, the raw output in `.agents/docs/issue-918-code-query-execution-benchmark-2026-07-20.md`.
 
 If an isolated target is necessary, use `scripts/with-isolated-cargo-target.sh`; never create a manually named Bifrost target directory in `/tmp`.
 
@@ -188,6 +254,11 @@ If a single-flight leader fails, its permit must remove the in-flight entry and 
 If a SQL graph experiment regresses cold latency, memory, write amplification, or database size beyond its declared gate, remove or leave it behind an experiment-only path and record the result. Durable rows remain authoritative; an in-memory graph snapshot can always be rebuilt for the exact generation.
 
 ## Artifacts and Notes
+
+Milestone 2 benchmark configuration, optimized medians, cache/work contracts,
+ordinary-path M1 comparison, limitations, and the decision to defer threshold
+selection are recorded in
+`.agents/docs/issue-918-code-query-execution-benchmark-2026-07-20.md`.
 
 The intended first-milestone plan shape for two identical union branches is:
 
@@ -217,6 +288,8 @@ The later SQL-to-memory freeze algorithm is:
 Revision note (2026-07-20): Created the self-contained issue #918 plan after live issue inspection, current-code diagnosis, prior Bifrost graph/snapshot measurement review, and primary-source study of the reference repository. The plan deliberately starts with a sequential logical/physical execution spine and postpones SQL graph loading and parallel scheduling until structured profiles can justify them.
 
 Revision note (2026-07-20, Milestone 1): Recorded the completed sequential plan spine, implicit recursive-executor state that had to become explicit, semantic explain and invocation-profile review fixes, opt-in instrumentation boundary, exact validation results, and the pinned Clippy invocation required by this machine's mixed rustup/Homebrew command lookup.
+
+Revision note (2026-07-20, Milestone 2): Recorded the completed profile schema and cache lifecycle attribution, the partial-reference replay correctness repair, the versioned ignored benchmark, optimized reversed-order evidence, explicit idealized-headroom limits, ordinary-path M1 comparison, and the decision to leave single-flight, SQL promotion, real parallel execution, and policy selection to later milestones.
 
 ## Interfaces and Dependencies
 
