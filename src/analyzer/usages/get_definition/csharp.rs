@@ -1199,17 +1199,19 @@ fn csharp_object_initializer_label_outcome(
     label: Node<'_>,
 ) -> Option<DefinitionLookupOutcome> {
     let initializer = csharp_object_initializer_for_label(label)?;
-    let object_creation = initializer.parent()?;
-    if object_creation.kind() != "object_creation_expression" {
-        return None;
-    }
-    let type_node = object_creation
-        .child_by_field_name("type")
-        .or_else(|| csharp_first_type_child(object_creation))?;
+    let Some(type_node) = csharp_object_initializer_owner_type_node(initializer) else {
+        return Some(no_definition(
+            "unknown_object_initializer_owner",
+            "C# object initializer target type could not be inferred",
+        ));
+    };
     let type_name = csharp_reference_type_text(type_node, source);
     let mut owners = csharp_logical_visible_type_candidates(csharp, definitions, file, &type_name);
     if owners.len() != 1 {
-        return None;
+        return Some(no_definition(
+            "ambiguous_object_initializer_owner",
+            format!("C# object initializer target type `{type_name}` is not uniquely resolved"),
+        ));
     }
     let owner = owners.remove(0);
     Some(csharp_member_outcome(

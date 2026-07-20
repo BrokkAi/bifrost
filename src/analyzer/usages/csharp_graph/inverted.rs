@@ -24,7 +24,8 @@ use super::extractor::{
 use super::resolver::{
     UnqualifiedMethodGroupResolution, argument_count, class_unit_for_fq_name,
     extension_visibility_site_key, first_type_child, is_member_variable_declaration,
-    is_type_reference_node, nearest_member_candidates_for_owner, node_text, reference_type_text,
+    is_type_reference_node, nearest_member_candidates_for_owner, node_text,
+    object_initializer_for_label, object_initializer_owner_type_node, reference_type_text,
     resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner, same_node,
     unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
     usage_class_field_receiver_type, usage_member_declared_type_fq_name,
@@ -311,6 +312,20 @@ fn record_reference(
         // node. `new Foo()`'s type child is itself a type reference, so it is
         // covered here without a separate object-creation case.
         "identifier" | "type" => {
+            if node.kind() == "identifier"
+                && let Some(initializer) = object_initializer_for_label(node)
+            {
+                let name = node_text(node, ctx.source);
+                if let Some(type_node) = object_initializer_owner_type_node(initializer)
+                    && let Some(owner) = ctx
+                        .resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node)
+                {
+                    ctx.record_nearest_member(&owner, name, node, None, None);
+                } else {
+                    ctx.record_unproven(name, node);
+                }
+                return;
+            }
             if node.kind() == "identifier"
                 && let Some((invocation, explicit_generic_arity)) =
                     csharp_unqualified_invocation_for_name(node)

@@ -6437,6 +6437,105 @@ public sealed class Dto {
 }
 
 #[test]
+fn usage_finder_csharp_resolves_implicit_new_initializer_owner_from_declarator() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "src/ImplicitNew.cs",
+        r#"namespace Example;
+
+public sealed class Key {}
+
+public class BaseShortcut {
+    public string Key { get; set; } = "";
+}
+
+public sealed class Shortcut : BaseShortcut {
+    public string Title { get; set; } = "";
+}
+
+public sealed class OtherShortcut {
+    public string Key { get; set; } = "";
+}
+
+public static class Consumer {
+    // Keep the newer field-backed-property syntax: tree-sitter recovers the
+    // following implicit-new declaration inside an ERROR node, as in Terminal.Gui.
+    public static bool Toggle { get => field; set => field = value; }
+
+    public static void Build() {
+        Shortcut shortcut = new () { Key = "target", Title = "show" };
+        OtherShortcut other = new () { Key = "other" };
+    }
+}
+"#,
+    )]);
+
+    let consumer = project.file("src/ImplicitNew.cs");
+    let source = consumer.read_to_string().expect("implicit-new source");
+    let target_label = source.find("Key = \"target\"").expect("target label");
+    let other_label = source.find("Key = \"other\"").expect("other label");
+    let target = member_field(&analyzer, "Example.BaseShortcut", "Key");
+    let other = member_field(&analyzer, "Example.OtherShortcut", "Key");
+    let same_named_type = type_definition(&analyzer, "Example.Key");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    for (offset, expected_fqn) in [
+        (target_label, "Example.BaseShortcut.Key"),
+        (other_label, "Example.OtherShortcut.Key"),
+    ] {
+        let forward = definition_lookup(
+            project.root(),
+            "src/ImplicitNew.cs",
+            offset,
+            offset + "Key".len(),
+        );
+        assert_eq!(forward["results"][0]["status"], "resolved", "{forward}");
+        assert_eq!(
+            forward["results"][0]["definitions"][0]["fqn"], expected_fqn,
+            "{forward}"
+        );
+    }
+
+    let targeted = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result
+        .into_either()
+        .expect("targeted implicit-new initializer query should resolve");
+    let whole_workspace = UsageFinder::new()
+        .query(&analyzer, std::slice::from_ref(&target), 1000, 1000)
+        .result
+        .into_either()
+        .expect("whole-workspace implicit-new initializer query should resolve");
+    for hits in [&targeted, &whole_workspace] {
+        assert_eq!(hits.len(), 1, "{hits:#?}");
+        assert!(hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= target_label
+                && target_label + "Key".len() <= hit.end_offset
+        }));
+    }
+
+    let other_hits = graph_hits(&analyzer, &other);
+    assert_eq!(other_hits.len(), 1, "{other_hits:#?}");
+    assert!(other_hits.iter().any(|hit| {
+        hit.file == consumer
+            && hit.start_offset <= other_label
+            && other_label + "Key".len() <= hit.end_offset
+    }));
+    assert!(
+        graph_hits(&analyzer, &same_named_type).is_empty(),
+        "initializer labels must not resolve as same-named types"
+    );
+}
+
+#[test]
 fn usage_finder_csharp_finds_inherited_object_initializer_labels_in_all_scopes() {
     let (project, analyzer) = csharp_analyzer_with_files(&[
         (

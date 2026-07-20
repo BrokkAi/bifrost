@@ -4,12 +4,12 @@ use crate::analyzer::usages::csharp_graph::resolver::{
     class_unit_for_fq_name, enclosing_declared_type, extension_visibility_site_key,
     first_type_child, is_type_reference_node, member_name_is_locally_bound,
     nearest_member_candidates_for_owner, node_text, normalize_type_text,
-    object_initializer_for_label, receiver_targets_owner, reference_type_text,
-    resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner, resolves_to_target,
-    resolves_to_target_at, same_node, seed_visible_bindings_at, type_identity_matches,
-    unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
-    unqualified_member_resolves_to_owner, usage_class_field_receiver_type,
-    usage_visible_extension_method_candidates,
+    object_initializer_for_label, object_initializer_owner_type_node, receiver_targets_owner,
+    reference_type_text, resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner,
+    resolves_to_target, resolves_to_target_at, same_node, seed_visible_bindings_at,
+    type_identity_matches, unqualified_member_has_local_binding,
+    unqualified_member_has_structured_shadow, unqualified_member_resolves_to_owner,
+    usage_class_field_receiver_type, usage_visible_extension_method_candidates,
 };
 use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::SymbolResolution;
@@ -814,16 +814,7 @@ fn object_initializer_label_owner_resolution(
     let Some(initializer) = object_initializer_for_label(node) else {
         return LabelOwnerResolution::NotLabel;
     };
-    let Some(object_creation) = initializer.parent() else {
-        return LabelOwnerResolution::Unknown;
-    };
-    if object_creation.kind() != "object_creation_expression" {
-        return LabelOwnerResolution::Unknown;
-    }
-    let Some(type_node) = object_creation
-        .child_by_field_name("type")
-        .or_else(|| first_type_child(object_creation))
-    else {
+    let Some(type_node) = object_initializer_owner_type_node(initializer) else {
         return LabelOwnerResolution::Unknown;
     };
     let Some(receiver_fqn) = resolve_type_fq_name_at(
