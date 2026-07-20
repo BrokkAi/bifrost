@@ -157,6 +157,13 @@ artifact does not carry the tagged version.
 All three can also be triggered manually from the GitHub Actions UI with a `tag`
 input.
 
+To announce a published GitHub Release in Discord, set the
+`DISCORD_RELEASE_WEBHOOK_URL` repository Actions secret to the target channel's
+webhook URL. The release workflow reuses GitHub's generated release notes,
+prevents mentions from being parsed, and leaves a failed Discord delivery as a
+warning so it cannot invalidate an already-published release. It uses built-in
+runner tools, so no additional GitHub Actions allowlist entry is needed.
+
 ## Version Policy
 
 - The crate version in `Cargo.toml` is the single source of truth for the Rust
