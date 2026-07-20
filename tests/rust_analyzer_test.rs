@@ -1,6 +1,7 @@
 use brokk_bifrost::{
     CodeUnit, CodeUnitType, IAnalyzer, Language, Project, ProjectFile, RustAnalyzer, TestProject,
 };
+use std::path::Path;
 use tempfile::tempdir;
 
 mod common;
@@ -238,19 +239,19 @@ impl LocalTrait for Self {
     let analyzer = RustAnalyzer::from_project(project.project().clone());
 
     let writer = definition(&analyzer, "model.Writer");
-    assert_eq!(writer.source().rel_path().to_string_lossy(), "src/model.rs");
+    assert_eq!(
+        writer.source().rel_path(),
+        Path::new("src").join("model.rs")
+    );
     let writer_method = definition(&analyzer, "model.Writer.write");
     assert_eq!(
-        writer_method.source().rel_path().to_string_lossy(),
-        "src/impls.rs"
+        writer_method.source().rel_path(),
+        Path::new("src").join("impls.rs")
     );
     let namespace_writer_method = definition(&analyzer, "model.Writer.act");
     assert_eq!(
-        namespace_writer_method
-            .source()
-            .rel_path()
-            .to_string_lossy(),
-        "src/impls.rs"
+        namespace_writer_method.source().rel_path(),
+        Path::new("src").join("impls.rs")
     );
 
     assert!(analyzer.get_definitions("impls.Writer").is_empty());

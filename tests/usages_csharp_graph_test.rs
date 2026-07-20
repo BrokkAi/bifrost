@@ -6261,6 +6261,112 @@ public sealed class Dto {
 }
 
 #[test]
+fn usage_finder_csharp_finds_inherited_object_initializer_labels_in_all_scopes() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "src/Descriptors.cs",
+            r#"namespace Example;
+
+public record BaseDescriptor {
+    public string Kind { get; set; } = "";
+}
+public record GalleryDescriptor : BaseDescriptor;
+public record HidingDescriptor : BaseDescriptor {
+    public new string Kind { get; set; } = "";
+}
+public sealed class UnrelatedDescriptor {
+    public string Kind { get; set; } = "";
+}
+
+public class ExportFragment {
+    public string IntegrityTag { get; set; } = "";
+}
+public sealed class PassThroughFragment : ExportFragment;
+"#,
+        ),
+        (
+            "src/Consumers.cs",
+            r#"namespace Example;
+
+public static class Consumers {
+    public static void Build() {
+        var gallery = new GalleryDescriptor { Kind = "gallery" };
+        gallery.Kind = "ordinary assignment";
+        _ = new HidingDescriptor { Kind = "hidden" };
+        _ = new UnrelatedDescriptor { Kind = "unrelated" };
+        _ = new PassThroughFragment { IntegrityTag = "integrity" };
+    }
+}
+"#,
+        ),
+    ]);
+
+    let consumer = project.file("src/Consumers.cs");
+    let source = consumer.read_to_string().expect("consumer source");
+    let gallery_label = source.find("Kind = \"gallery\"").expect("gallery label");
+    let ordinary_assignment = source
+        .find("gallery.Kind")
+        .expect("ordinary inherited assignment")
+        + "gallery.".len();
+    let integrity_label = source
+        .find("IntegrityTag = \"integrity\"")
+        .expect("integrity label");
+    let hidden_label = source.find("Kind = \"hidden\"").expect("hidden label");
+
+    let base_kind = member_field(&analyzer, "Example.BaseDescriptor", "Kind");
+    let base_integrity = member_field(&analyzer, "Example.ExportFragment", "IntegrityTag");
+    let hidden_kind = member_field(&analyzer, "Example.HidingDescriptor", "Kind");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    for (target, expected_offsets) in [
+        (base_kind.clone(), vec![gallery_label, ordinary_assignment]),
+        (base_integrity, vec![integrity_label]),
+    ] {
+        let targeted = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1,
+                1000,
+            )
+            .result
+            .into_either()
+            .expect("targeted inherited initializer query should resolve");
+        let whole_workspace = UsageFinder::new()
+            .query(&analyzer, std::slice::from_ref(&target), 1000, 1000)
+            .result
+            .into_either()
+            .expect("whole-workspace inherited initializer query should resolve");
+
+        for hits in [&targeted, &whole_workspace] {
+            assert_eq!(hits.len(), expected_offsets.len(), "{target:#?}: {hits:#?}");
+            for expected in &expected_offsets {
+                assert!(
+                    hits.iter().any(|hit| {
+                        hit.file == consumer
+                            && hit.start_offset <= *expected
+                            && *expected + target.identifier().len() <= hit.end_offset
+                    }),
+                    "{} should include byte {expected}: {hits:#?}",
+                    target.fq_name()
+                );
+            }
+        }
+    }
+
+    let hidden_hits = graph_hits(&analyzer, &hidden_kind);
+    assert_eq!(hidden_hits.len(), 1, "{hidden_hits:#?}");
+    assert!(hidden_hits.iter().any(|hit| {
+        hit.file == consumer
+            && hit.start_offset <= hidden_label
+            && hidden_label + "Kind".len() <= hit.end_offset
+    }));
+}
+
+#[test]
 fn csharp_graph_object_initializer_label_matches_logical_partial_type() {
     let (project, analyzer) = csharp_analyzer_with_files(&[
         (
