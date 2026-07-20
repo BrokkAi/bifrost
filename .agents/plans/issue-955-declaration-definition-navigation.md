@@ -24,6 +24,7 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
 - [x] (2026-07-20 16:18Z) Applied all seven guided-review findings: restored broad LSP ambiguity behavior, isolated physical C++ navigation occurrences from general ranges, centralized physical selection/status/diagnostics, retained later declarations, bounded target expansion, and cached LSP rendering inputs.
 - [x] (2026-07-20 19:21Z) Reran focused and complete validation after the seven-finding repair: 188 LSP, 18 MCP, 538 analyzer navigation, and 17 click tests passed; all 44 Python tests, formatting, isolated all-feature clippy, the complete isolated all-feature Rust suite, doc tests, and diff checks passed.
 - [x] (2026-07-20 19:38Z) Fetched and merged `origin/master` at `c59d6f61`, resolved the two Python public-surface conflicts by retaining both APIs, and passed 188 LSP, 18 MCP, 541 analyzer navigation, 17 click, Python, formatting, isolated clippy, complete all-feature Rust, doc-test, and diff-check gates.
+- [x] (2026-07-20 19:42Z) Merged the five additional master commits that landed during the full-suite run, including the overlapping C++ declarator fix, and passed the affected navigation gates with 188 LSP, 18 MCP, 543 analyzer navigation, and 17 click tests plus 2 ignored stress tests.
 - [ ] Push the synchronized branch and publish a ready-for-review pull request.
 
 ## Surprises & Discoveries
@@ -58,6 +59,8 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
   Evidence: The first isolated full-suite run passed 1,456 library tests but reported six permission/GPG environment failures. The unchanged privileged rerun passed the library suite (1,462 passed, 4 ignored), every integration suite, and doc tests with exit code 0, then removed its isolated Cargo target.
 - Observation: The final master refresh advanced by 61 commits and overlapped the Python package exports/tests, but not the declaration-navigation semantics.
   Evidence: Git produced only two content conflicts, in `bifrost_searchtools/__init__.py` and `python_tests/test_searchtools_client.py`. Both were additive export/import conflicts and were resolved by retaining master's new container-listing types alongside `DeclarationLookupResult`, `DefinitionLookupResult`, and `NavigationOperation`; all Rust navigation files merged automatically and the complete gates passed.
+- Observation: Master advanced by another five commits while the complete post-merge suite was running, including a C++ declarator-resolution change in this issue's hotspot.
+  Evidence: The second merge at `a86ae862` applied without conflicts. The refreshed C++-aware analyzer navigation suite grew from 541 to 543 tests and passed in full, alongside all 188 LSP, 18 privileged MCP, and 17 non-stress click-around tests.
 
 ## Decision Log
 
@@ -115,18 +118,18 @@ The requested guided review completed its security, duplication, senior-engineer
 
 Post-repair focused validation passes with 188 LSP server tests, 18 MCP tests, 538 analyzer navigation tests, and 17 click-around tests plus 2 ignored stress tests. New regressions cover definition-oriented broad range consumers, mixed same/cross-file prototypes, declaration-after-definition ordering for functions and types, per-result and per-batch target budgets, overload ambiguity without a false link-unit diagnostic, and broad LSP ambiguity behavior.
 
-The final refresh merged 61 newer master commits at `c59d6f61`, including Rust associated-item and receiver-resolution work. The merged branch passes 188 LSP server tests, 18 MCP tests, 541 analyzer navigation tests, and 17 click-around tests plus 2 ignored stress tests. The Python suite, formatting, isolated all-target/all-feature clippy, the complete isolated all-feature Rust suite (1,471 library tests plus every integration target), doc tests, and diff checks also pass.
+The final synchronization merged 61 newer master commits at `c59d6f61`, including Rust associated-item and receiver-resolution work, then five more commits at `a86ae862` that landed during validation and included overlapping C++ declarator work. The complete suite at `c59d6f61` passes with 1,471 library tests plus every integration target and doc tests; Python, formatting, isolated all-target/all-feature clippy, and diff checks also pass. After the final five-commit delta, the affected gates pass with 188 LSP server tests, 18 MCP tests, 543 analyzer navigation tests, and 17 click-around tests plus 2 ignored stress tests.
 
 Final validation passed:
 
-    focused all-feature Rust suites after final master merge: 188 LSP, 18 MCP, 541 analyzer, 17 click tests passed; 2 stress tests ignored
+    focused all-feature Rust suites after final master merge: 188 LSP, 18 MCP, 543 analyzer, 17 click tests passed; 2 stress tests ignored
     scripts/test_python.sh: 44 passed
     cargo fmt --all: clean
     all-target/all-feature clippy: clean in an isolated target
-    complete cargo test --features nlp,python after final master merge: passed in a privileged isolated target, including 1,471 library tests and 0 doc-test failures
+    complete cargo test --features nlp,python after the 61-commit master merge: passed in a privileged isolated target, including 1,471 library tests and 0 doc-test failures
     git diff --check: clean
 
-The final issue diff against synchronized `origin/master` is 37 files, 2,369 insertions, and 247 deletions. No UsageBench files were changed, and no branch switch or rebase was performed.
+The final issue diff against synchronized `origin/master` is 37 files, 2,374 insertions, and 247 deletions. No UsageBench files were changed, and no branch switch or rebase was performed.
 
 ## Context and Orientation
 
@@ -239,3 +242,5 @@ Plan revision note (2026-07-20 16:18Z): Recorded all seven review findings as ap
 Plan revision note (2026-07-20 19:21Z): Recorded final post-repair validation, including the sandbox-only subprocess/GPG failures and clean privileged rerun, current focused counts, formatting, Python, clippy, full-suite, doc-test, and diff-check evidence before the synchronization/publication milestone.
 
 Plan revision note (2026-07-20 19:38Z): Recorded the 61-commit final master refresh, the additive Python export/test conflict resolution, updated focused counts, clean post-merge Python, formatting, clippy, complete all-feature Rust and doc-test gates, and the final synchronized issue diff before publication.
+
+Plan revision note (2026-07-20 19:42Z): Recorded the five additional master commits that landed during full validation, the conflict-free overlapping C++ merge, the final 543-test analyzer-navigation count, and passing affected LSP, MCP, and click-around gates at `a86ae862`.
