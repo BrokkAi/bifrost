@@ -31,6 +31,10 @@ fn character_column_of(line: &str, needle: &str) -> usize {
 }
 
 fn location_reference(path: &str, source: &str, start: usize) -> String {
+    json!({"references": [location_query(path, source, start)]}).to_string()
+}
+
+fn location_query(path: &str, source: &str, start: usize) -> Value {
     let prefix = &source[..start];
     let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
     let column = prefix
@@ -39,7 +43,7 @@ fn location_reference(path: &str, source: &str, start: usize) -> String {
         .chars()
         .count()
         + 1;
-    json!({"references": [{"path": path, "line": line, "column": column}]}).to_string()
+    json!({"path": path, "line": line, "column": column})
 }
 
 #[test]
@@ -16168,6 +16172,91 @@ void run() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "RawData.use", "{value}");
+}
+
+#[test]
+fn cpp_secondary_local_declarator_is_not_an_indexed_field_reference() {
+    let source = r#"
+typedef unsigned long size_t;
+struct Record {
+    int j;
+};
+int read(Record *record) {
+    size_t i, j;
+    j = i;
+    return record->j;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.c", source)
+        .build();
+
+    let declaration = source.find("i, j;").expect("multi-declarator local") + 3;
+    let local_use = source.find("    j = i;").expect("local value use") + 4;
+    let field_use = source.rfind("record->j").expect("qualified field use") + "record->".len();
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("app.c", source, declaration),
+                location_query("app.c", source, local_use),
+                location_query("app.c", source, field_use),
+            ]
+        })
+        .to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "no_definition", "{value}");
+    assert_eq!(
+        results[0]["diagnostics"][0]["kind"], "declaration_or_import_site",
+        "{value}"
+    );
+    assert_eq!(results[1]["status"], "no_definition", "{value}");
+    assert_eq!(
+        results[1]["diagnostics"][0]["kind"], "local_variable_reference",
+        "{value}"
+    );
+    assert_eq!(results[2]["status"], "resolved", "{value}");
+    assert_eq!(results[2]["definitions"][0]["fqn"], "Record.j", "{value}");
+}
+
+#[test]
+fn cpp_typedef_alias_declarator_is_not_a_type_reference() {
+    let source = r#"
+typedef struct Scope Scope;
+struct Scope {
+    int value;
+};
+Scope *identity(Scope *scope) {
+    return scope;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.c", source)
+        .build();
+
+    let alias = source.find("Scope Scope;").expect("typedef alias") + "Scope ".len();
+    let type_use = source.find("Scope *identity").expect("typedef type use");
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("app.c", source, alias),
+                location_query("app.c", source, type_use),
+            ]
+        })
+        .to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "no_definition", "{value}");
+    assert_eq!(
+        results[0]["diagnostics"][0]["kind"], "declaration_or_import_site",
+        "{value}"
+    );
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(results[1]["definitions"][0]["fqn"], "Scope", "{value}");
 }
 
 #[test]

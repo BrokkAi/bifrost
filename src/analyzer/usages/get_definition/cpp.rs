@@ -35,7 +35,7 @@ pub(super) fn resolve_cpp(
     };
     let reference = cpp_reference_node(node);
     if let Some(CppReferenceNode::Type(type_node)) = reference {
-        if cpp_is_type_declaration_name(node) {
+        if cpp_is_declaration_name(node) {
             return no_definition(
                 "declaration_or_import_site",
                 format!("`{}` is not a C++ reference site", site.text),
@@ -274,22 +274,6 @@ fn cpp_reference_node(node: Node<'_>) -> Option<CppReferenceNode<'_>> {
         | "literal_operator_name" => Some(CppReferenceNode::Identifier(current)),
         _ => None,
     }
-}
-
-fn cpp_is_type_declaration_name(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    parent.child_by_field_name("name") == Some(node)
-        && matches!(
-            parent.kind(),
-            "class_specifier"
-                | "struct_specifier"
-                | "union_specifier"
-                | "enum_specifier"
-                | "alias_declaration"
-                | "type_definition"
-        )
 }
 
 fn resolve_cpp_type(
