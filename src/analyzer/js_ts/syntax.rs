@@ -24,7 +24,7 @@ pub(crate) struct JsTsLexicalBindingIndex {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct JsTsDirectPropertyDefinition<'tree> {
     pub(crate) receiver: JsTsStaticMemberReceiver<'tree>,
-    pub(crate) range: Range,
+    pub(crate) property_range: Range,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -184,14 +184,18 @@ pub(crate) fn direct_property_definitions<'tree>(
             _ => None,
         };
         if let Some((receiver, property)) = receiver
-            && let Some(range) = target_ranges
+            && target_ranges
                 .iter()
-                .filter(|range| range_contains_node(range, property))
-                .min_by_key(|range| range.end_byte - range.start_byte)
+                .any(|range| range_contains_node(range, property))
         {
             let definition = JsTsDirectPropertyDefinition {
                 receiver,
-                range: *range,
+                property_range: Range {
+                    start_byte: property.start_byte(),
+                    end_byte: property.end_byte(),
+                    start_line: property.start_position().row,
+                    end_line: property.end_position().row,
+                },
             };
             definitions.push(definition);
         }
