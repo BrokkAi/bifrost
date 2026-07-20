@@ -209,6 +209,62 @@ public sealed class HiddenCommand : BaseCommand {
 }
 
 #[test]
+fn inverted_graph_resolves_null_forgiving_method_groups() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Demo.cs",
+            r#"
+namespace Demo;
+
+public delegate void WaitCallback(object state);
+
+public sealed class Command {
+    private void PoolableCommit(object state) {}
+    private void Accept(WaitCallback callback) {}
+
+    public void Run() {
+        Accept(new WaitCallback(PoolableCommit!));
+    }
+
+    public void RunParenthesized() {
+        Accept((PoolableCommit!));
+    }
+
+    public void RunShadowed(WaitCallback PoolableCommit) {
+        Accept(new WaitCallback(PoolableCommit!));
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "Demo.Command.Run", "Demo.Command.PoolableCommit"),
+        "null-forgiving method group should produce an inverted edge: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "Demo.Command.RunParenthesized",
+            "Demo.Command.PoolableCommit"
+        ),
+        "parenthesized null-forgiving method group should produce an inverted edge: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(
+            &value,
+            "Demo.Command.RunShadowed",
+            "Demo.Command.PoolableCommit"
+        ),
+        "same-named parameter must remain a structured shadow: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn inverted_graph_resolves_inherited_members_at_the_nearest_declaring_type() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

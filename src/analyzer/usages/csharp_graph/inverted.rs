@@ -23,11 +23,12 @@ use super::extractor::{
 };
 use super::resolver::{
     UnqualifiedMethodGroupResolution, argument_count, class_unit_for_fq_name,
-    extension_visibility_site_key, first_type_child, is_type_reference_node,
-    nearest_member_candidates_for_owner, node_text, reference_type_text, resolve_type_fq_name_at,
-    resolve_unqualified_method_group_for_owner, unqualified_member_has_local_binding,
-    unqualified_member_has_structured_shadow, usage_member_declared_type_fq_name,
-    usage_method_return_type_fq_name_for_arity, usage_visible_extension_method_candidates,
+    extension_visibility_site_key, first_type_child, is_member_variable_declaration,
+    is_type_reference_node, nearest_member_candidates_for_owner, node_text, reference_type_text,
+    resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner,
+    unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
+    usage_member_declared_type_fq_name, usage_method_return_type_fq_name_for_arity,
+    usage_visible_extension_method_candidates,
 };
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
@@ -428,11 +429,13 @@ fn receiver_type_fqn(
         "identifier" => {
             let name = node_text(receiver, ctx.source);
             // A typed local resolves to its type; otherwise the name may be a
-            // static type, unless it is a known (shadowed) untyped local.
+            // class field/property or a static type, unless it is shadowed.
             first_precise(bindings, name).or_else(|| {
-                (!bindings.is_shadowed(name))
-                    .then(|| ctx.resolve_type_fqn_at(name, receiver))
-                    .flatten()
+                if bindings.is_shadowed(name) {
+                    return None;
+                }
+                enclosing_member_type_fqn(receiver, name, ctx)
+                    .or_else(|| ctx.resolve_type_fqn_at(name, receiver))
             })
         }
         "this" | "base" => ctx
@@ -491,6 +494,9 @@ fn seed_variable_declaration(
     ctx: &CsScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
+    if is_member_variable_declaration(node) {
+        return;
+    }
     let Some(type_node) = node.child_by_field_name("type") else {
         return;
     };
@@ -622,10 +628,20 @@ fn expression_type_fqn(
         }
         "identifier" => {
             let name = node_text(expression, ctx.source);
-            first_precise(bindings, name)
+            first_precise(bindings, name).or_else(|| {
+                (!bindings.is_shadowed(name))
+                    .then(|| enclosing_member_type_fqn(expression, name, ctx))
+                    .flatten()
+            })
         }
         _ => None,
     }
+}
+
+fn enclosing_member_type_fqn(node: Node<'_>, name: &str, ctx: &CsScan<'_, '_>) -> Option<String> {
+    let owner_fqn = ctx.enclosing_class(node.start_byte())?;
+    let owner = class_unit_for_fq_name(ctx.csharp, owner_fqn)?;
+    usage_member_declared_type_fq_name(ctx.csharp, &owner, name)
 }
 
 fn invocation_return_type_fqn(

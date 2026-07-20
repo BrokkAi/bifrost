@@ -3708,6 +3708,205 @@ namespace Domain {
 }
 
 #[test]
+fn usage_finder_csharp_finds_same_class_field_initializer_reads_across_physical_owners() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Reference/Options.cs",
+            r#"
+namespace Runtime;
+
+public static class Options {
+    public const int Tick = 1;
+    public static readonly int Minute = Tick;
+    public const int Counter = Tick;
+}
+"#,
+        )
+        .file(
+            "Implementation/Options.cs",
+            r#"
+namespace Runtime;
+
+public static class Options {
+    public const int Tick = 1;
+    public static readonly int Minute = Tick;
+    public const int Counter = Tick;
+}
+"#,
+        )
+        .build();
+    let analyzer = CSharpAnalyzer::from_project(project.project().clone());
+    let mut targets = analyzer
+        .get_all_declarations()
+        .iter()
+        .filter(|unit| unit.is_field() && unit.fq_name() == "Runtime.Options.Tick")
+        .cloned()
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    assert_eq!(2, targets.len(), "expected duplicate physical fields");
+
+    let candidate_files = Arc::new(analyzer.get_analyzed_files().into_iter().collect());
+    let provider = ExplicitCandidateProvider::new(Arc::clone(&candidate_files));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            &targets,
+            Some(&provider),
+            candidate_files.len(),
+            100,
+        );
+    let hits = query
+        .result
+        .into_either()
+        .expect("same-class field initializer query should resolve");
+    assert_eq!(
+        4,
+        hits.len(),
+        "each physical owner has two structured field reads: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| hit.snippet.contains("= Tick")),
+        "declaration names must not be counted as reads: {hits:#?}"
+    );
+}
+
+#[test]
+fn usage_finder_csharp_finds_precise_local_and_intermediate_field_receivers() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Reference/List.cs",
+            r#"
+namespace System.Collections.Generic;
+
+public class List<T> {
+    public T[] ToArray() => null;
+    public void Reverse() {}
+}
+"#,
+        )
+        .file(
+            "Implementation/List.cs",
+            r#"
+namespace System.Collections.Generic;
+
+public class List<T> {
+    public T[] ToArray() => null;
+    public void Reverse() {}
+}
+"#,
+        )
+        .file(
+            "Reference/NodeFactory.cs",
+            r#"
+namespace Runtime;
+
+public class TargetDetails { public int Architecture { get; } }
+public class OtherTargetDetails { public int Architecture { get; } }
+public class NodeFactory { public TargetDetails Target { get; } }
+public class ConflictingFactory { public TargetDetails Target { get; } }
+"#,
+        )
+        .file(
+            "Implementation/NodeFactory.cs",
+            r#"
+namespace Runtime;
+
+public class TargetDetails { public int Architecture { get; } }
+public class OtherTargetDetails { public int Architecture { get; } }
+public class NodeFactory { public TargetDetails Target { get; } }
+public class ConflictingFactory { public OtherTargetDetails Target { get; } }
+"#,
+        )
+        .file(
+            "Consumer.cs",
+            r#"
+using System.Collections.Generic;
+using Runtime;
+
+public class Consumer {
+    private NodeFactory factory;
+
+    public void UseList() {
+        var parts = new List<string>();
+        List<string> argNames = new List<string>();
+        string[] values = argNames.ToArray();
+        parts.Reverse();
+    }
+
+    public int UseTarget(NodeFactory factory) => factory.Target.Architecture;
+    public int UseConflicting(ConflictingFactory conflict) => conflict.Target.Architecture;
+    public int UseShadowed(TargetDetails factory) => factory.Target.Architecture;
+
+    public int UseUnknownShadow() {
+        var factory = MissingFactory();
+        return factory.Target.Architecture;
+    }
+}
+"#,
+        )
+        .build();
+    let workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("persisted C# receiver project should build");
+    let analyzer = workspace.analyzer();
+    let declarations = analyzer.get_all_declarations();
+    let targets_for = |fq_name: &str| {
+        let mut targets = declarations
+            .iter()
+            .filter(|unit| unit.fq_name() == fq_name)
+            .cloned()
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets.dedup();
+        assert_eq!(2, targets.len(), "expected duplicate physical {fq_name}");
+        targets
+    };
+    let candidate_files = Arc::new(analyzer.get_analyzed_files().into_iter().collect());
+    let provider = ExplicitCandidateProvider::new(Arc::clone(&candidate_files));
+    let expected = [
+        ("System.Collections.Generic.List`1.ToArray", "ToArray"),
+        ("System.Collections.Generic.List`1.Reverse", "Reverse"),
+        ("Runtime.NodeFactory.Target", "Target"),
+        ("Runtime.TargetDetails.Architecture", "Architecture"),
+    ];
+
+    analyzer.reset_global_usage_definition_index_build_count_for_test();
+    analyzer.reset_definition_candidates_query_count_for_test();
+    for (fq_name, snippet) in expected {
+        let targets = targets_for(fq_name);
+        let hits = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                analyzer,
+                &targets,
+                Some(&provider),
+                candidate_files.len(),
+                100,
+            )
+            .result
+            .into_either()
+            .unwrap_or_else(|error| panic!("{fq_name} query should resolve: {error}"));
+        assert_eq!(1, hits.len(), "{fq_name}: {hits:#?}");
+        assert!(
+            hits.iter().all(|hit| hit.snippet.contains(snippet)),
+            "{fq_name}: {hits:#?}"
+        );
+    }
+    assert_eq!(
+        1,
+        analyzer.global_usage_definition_index_build_count_for_test(),
+        "all receiver queries should share the generation-scoped definition index"
+    );
+    assert_eq!(
+        0,
+        analyzer.definition_candidates_query_count_for_test(),
+        "inverse receiver resolution must not fall back to persisted candidate SQL"
+    );
+}
+
+#[test]
 fn usage_finder_csharp_finds_unique_private_method_group_argument() {
     let (project, analyzer) = csharp_analyzer_with_files(&[(
         "Demo/Command.cs",
@@ -3843,6 +4042,104 @@ namespace Demo {
         }),
         "inverse lookup should follow transparent method-group wrappers: {hits:#?}"
     );
+}
+
+#[test]
+fn usage_finder_csharp_follows_null_forgiving_method_group_arguments() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "Runtime/VolatileEnlistmentMultiplexing.cs",
+        r#"
+namespace Runtime;
+
+public delegate void WaitCallback(object state);
+
+public sealed class VolatileEnlistmentMultiplexing {
+    private void PoolableCommit(object state) {}
+    private void Accept(WaitCallback callback) {}
+
+    public void Run() {
+        Accept(new WaitCallback(PoolableCommit!));
+    }
+
+    public void RunParenthesized() {
+        Accept((PoolableCommit!));
+    }
+
+    public void RunShadowed(WaitCallback PoolableCommit) {
+        Accept(new WaitCallback(PoolableCommit!));
+    }
+}
+
+public sealed class AmbiguousMultiplexing {
+    private void PoolableCommit(object state) {}
+    private void PoolableCommit(string state) {}
+    private void Accept(WaitCallback callback) {}
+
+    public void Run() {
+        Accept(PoolableCommit!);
+    }
+}
+"#,
+    )]);
+    let consumer = project.file("Runtime/VolatileEnlistmentMultiplexing.cs");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let unique = member_function_with_signature(
+        &analyzer,
+        "Runtime.VolatileEnlistmentMultiplexing",
+        "PoolableCommit",
+        "(object)",
+    );
+    let hits = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&unique),
+            Some(&provider),
+            1,
+            100,
+        )
+        .result
+        .into_either()
+        .expect("unique null-forgiving method group should resolve");
+    assert_eq!(
+        2,
+        hits.len(),
+        "shadowed argument must be excluded: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.snippet.contains("PoolableCommit!"))
+    );
+
+    let ambiguous = member_function_with_signature(
+        &analyzer,
+        "Runtime.AmbiguousMultiplexing",
+        "PoolableCommit",
+        "(object)",
+    );
+    let result = CSharpUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&ambiguous),
+        &analyzer.get_analyzed_files().into_iter().collect(),
+        100,
+    );
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } => {
+            assert!(
+                hits_by_overload
+                    .get(&ambiguous)
+                    .is_none_or(|hits| hits.is_empty()),
+                "ambiguous overload must not be proven"
+            );
+            assert_eq!(Some(&1), unproven_total_by_overload.get(&ambiguous));
+        }
+        other => panic!("expected ambiguous method group evidence, got {other:#?}"),
+    }
 }
 
 #[test]

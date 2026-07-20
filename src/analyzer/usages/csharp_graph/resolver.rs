@@ -215,6 +215,9 @@ fn seed_variable_declaration(
     bindings: &mut LocalInferenceEngine<String>,
     usage: bool,
 ) {
+    if is_member_variable_declaration(node) {
+        return;
+    }
     let Some(type_node) = node.child_by_field_name("type") else {
         return;
     };
@@ -249,6 +252,15 @@ fn seed_variable_declaration(
             seed_symbol_for_type(name_node, type_node, csharp, file, source, bindings, usage);
         }
     }
+}
+
+pub(super) fn is_member_variable_declaration(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "field_declaration" | "event_field_declaration"
+        )
+    })
 }
 
 fn var_initializer_member_type(
@@ -578,7 +590,7 @@ fn member_declared_type_fq_name_inner(
             .into_iter()
             .collect()
     };
-    candidates
+    let mut resolved_types = candidates
         .into_iter()
         .filter(|unit| unit.is_field() && unit.fq_name() == member_fqn)
         .filter_map(|unit| {
@@ -591,7 +603,10 @@ fn member_declared_type_fq_name_inner(
                 resolve_member_type_fq_name(csharp, unit.source(), owner, type_text, usage)
             })
         })
-        .next()
+        .collect::<Vec<_>>();
+    resolved_types.sort();
+    resolved_types.dedup();
+    (resolved_types.len() == 1).then(|| resolved_types.remove(0))
 }
 
 /// Resolve the type named by a method's declared return type, so a call
@@ -1941,6 +1956,8 @@ const LOCAL_BINDING_SCOPE_BARRIERS: &[&str] = &[
     "local_function_statement",
     "lambda_expression",
     "anonymous_method_expression",
+    "field_declaration",
+    "event_field_declaration",
     "class_declaration",
     "interface_declaration",
     "struct_declaration",

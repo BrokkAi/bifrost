@@ -627,6 +627,11 @@ fn transparent_expression_parent(current: Node<'_>, parent: Node<'_>) -> bool {
         "parenthesized_expression" | "checked_expression"
     ) || (parent.kind() == "cast_expression"
         && parent.child_by_field_name("value") == Some(current))
+        || (parent.kind() == "postfix_unary_expression"
+            && parent.named_child(0) == Some(current)
+            && parent
+                .child(parent.child_count().saturating_sub(1))
+                .is_some_and(|operator| operator.kind() == "!"))
 }
 
 fn unqualified_method_call_resolution(
