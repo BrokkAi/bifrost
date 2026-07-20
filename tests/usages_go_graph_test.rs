@@ -34,6 +34,65 @@ func run() {
 }
 
 #[test]
+fn go_inverse_keeps_package_variable_reads_and_ordinary_writes() {
+    let (_project, analyzer) = go_analyzer_with_files(&[(
+        "state.go",
+        r#"package app
+
+var uiServerPort int
+
+func packageAccess(port int) int {
+    _ = uiServerPort
+    uiServerPort = port
+    _ = uiServerPort
+    return uiServerPort
+}
+
+func shortShadow() int {
+    uiServerPort := 1
+    uiServerPort = uiServerPort + 1
+    return uiServerPort
+}
+
+func localShadow() int {
+    var uiServerPort = 1
+    uiServerPort = uiServerPort + 1
+    return uiServerPort
+}
+
+func parameterShadow(uiServerPort int) int {
+    uiServerPort = uiServerPort + 1
+    return uiServerPort
+}
+"#,
+    )]);
+    let target = definition(&analyzer, "example.com/app._module_.uiServerPort");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let targeted = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("targeted package-variable lookup should resolve");
+    let targeted_lines: BTreeSet<_> = targeted.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        BTreeSet::from([6, 7, 8, 9]),
+        targeted_lines,
+        "targeted inverse lookup should retain only the package reads and ordinary write: {targeted:#?}"
+    );
+
+    let whole_workspace = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&target))
+        .into_either()
+        .expect("whole-workspace package-variable lookup should resolve");
+    let whole_workspace_lines: BTreeSet<_> = whole_workspace.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        BTreeSet::from([6, 7, 8, 9]),
+        whole_workspace_lines,
+        "whole-workspace inverse lookup should retain the package sites and exclude :=, var, and parameter shadows: {whole_workspace:#?}"
+    );
+}
+
+#[test]
 fn go_graph_strategy_finds_same_package_references_without_imports() {
     let (project, analyzer) = go_analyzer_with_files(&[
         ("helper.go", "package main\nfunc helper() {}\n"),

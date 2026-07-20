@@ -333,11 +333,15 @@ fn seed_assignment_like(
     declare_lhs: bool,
 ) {
     let slots = lhs_identifier_slots(node, ctx.source);
-    let bindings = infer_names_from_values(slots.clone(), rhs_expressions(node), ctx, locals);
+    let mut bindings = infer_names_from_values(slots.clone(), rhs_expressions(node), ctx, locals);
     if declare_lhs {
         for name in slots.into_iter().flatten() {
             locals.declare_shadow(name);
         }
+    } else {
+        // Ordinary `=` updates an existing lexical binding; it must not turn an
+        // otherwise unbound package name into a local shadow.
+        bindings.retain(|(name, _)| locals.is_shadowed(name));
     }
     apply_inferred_bindings(bindings, locals);
 }
