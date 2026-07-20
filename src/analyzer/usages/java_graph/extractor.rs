@@ -4,10 +4,11 @@ use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::java_graph::hits;
 use crate::analyzer::usages::java_graph::resolver::{
     TargetKind, TargetSpec, argument_list_arity, bare_field_context_matches_target,
-    bare_method_context_matches_target, has_proven_static_import, infer_type_from_value,
-    is_declaration_name, is_ignored_type_context, java_method_signatures_match,
-    nested_type_for_owner, node_text, receiver_matches_target, resolve_non_nested_type_from_node,
-    resolve_type_from_node, resolve_type_segments, same_owner_context, seed_class_binding,
+    bare_method_context_matches_target, constructor_method_reference_receiver,
+    has_proven_static_import, infer_type_from_value, is_declaration_name, is_ignored_type_context,
+    java_method_signatures_match, nested_type_for_owner, node_text, receiver_matches_target,
+    resolve_non_nested_type_from_node, resolve_type_from_node, resolve_type_segments,
+    same_owner_context, seed_class_binding,
 };
 use crate::analyzer::usages::java_graph::return_type::{FileReturnCache, MethodReturnCache};
 use crate::analyzer::usages::local_inference::{
@@ -394,23 +395,61 @@ fn maybe_record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if node.kind() == "object_creation_expression" {
-        let Some(type_node) = node.child_by_field_name("type") else {
-            return;
-        };
-        if !type_terminal_name_matches(type_node, ctx) {
-            return;
-        }
-        let Some(resolved) = resolve_type_from_node(type_node, ctx) else {
-            return;
-        };
-        if resolved.fq_name() != ctx.spec.owner.fq_name() {
-            return;
-        }
-        if !callable_arity_matches_target(node, ctx) {
-            return;
-        }
+    if let Some(receiver) = constructor_method_reference_receiver(node) {
+        maybe_record_constructor_method_reference(node, receiver, ctx);
+        return;
+    }
+    if node.kind() != "object_creation_expression" {
+        return;
+    }
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return;
+    };
+    if !type_terminal_name_matches(type_node, ctx) {
+        return;
+    }
+    let Some(resolved) = resolve_type_from_node(type_node, ctx) else {
+        return;
+    };
+    if resolved.fq_name() != ctx.spec.owner.fq_name() {
+        return;
+    }
+    if !callable_arity_matches_target(node, ctx) {
+        return;
+    }
+    hits::push_hit(node, ctx);
+}
+
+fn maybe_record_constructor_method_reference(
+    node: Node<'_>,
+    receiver: Node<'_>,
+    ctx: &mut ScanCtx<'_>,
+) {
+    let Some(owner) = resolve_type_from_node(receiver, ctx) else {
+        return;
+    };
+    if owner != ctx.spec.owner {
+        return;
+    }
+    let constructor_fqn = format!("{}.{}", owner.fq_name(), owner.identifier());
+    let candidates = ctx
+        .java
+        .global_usage_definition_index()
+        .by_fqn(&constructor_fqn)
+        .iter()
+        .filter(|candidate| candidate.is_function() && !candidate.is_synthetic())
+        .collect::<Vec<_>>();
+    let matching = candidates
+        .iter()
+        .filter(|candidate| ctx.spec.targets.contains(*candidate))
+        .count();
+    if matching == 0 {
+        return;
+    }
+    if matching == candidates.len() {
         hits::push_hit(node, ctx);
+    } else {
+        hits::push_unproven_hit(node, ctx);
     }
 }
 

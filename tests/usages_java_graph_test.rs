@@ -2688,6 +2688,54 @@ public class Consumer {
 }
 
 #[test]
+fn java_graph_strategy_finds_constructor_method_references() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "app/Request.java",
+            "package app; public class Request { public Request(String value) {} }\n",
+        ),
+        (
+            "app/Other.java",
+            "package app; public class Other { public Other(String value) {} }\n",
+        ),
+        (
+            "app/Consumer.java",
+            r#"
+package app;
+
+public class Consumer {
+    Request direct(String value) {
+        return new Request(value); // positive-object-creation
+    }
+
+    java.util.function.Function<String, Request> factory() {
+        return Request::new; // positive-constructor-reference
+    }
+
+    java.util.function.Function<String, Other> otherFactory() {
+        return Other::new; // negative-wrong-owner
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "app.Request.Request");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let constructor_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    ));
+
+    assert_eq!(2, constructor_hits.len(), "{constructor_hits:#?}");
+    assert_hit_contains(&constructor_hits, "positive-object-creation");
+    assert_hit_contains(&constructor_hits, "positive-constructor-reference");
+    assert_no_hit_contains(&constructor_hits, "negative-wrong-owner");
+}
+
+#[test]
 fn java_graph_strategy_ignores_comment_extra_nodes_when_matching_java_overloads() {
     let parser_source = r#"
 package org.telegram;

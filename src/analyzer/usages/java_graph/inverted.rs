@@ -19,7 +19,8 @@
 //! return type, matching the same inference used when seeding locals.
 
 use super::resolver::{
-    is_ignored_type_context, node_text, resolve_nested_type_for_owner, resolve_type_segments,
+    constructor_method_reference_receiver, is_ignored_type_context, node_text,
+    resolve_nested_type_for_owner, resolve_type_segments,
 };
 use super::return_type::{
     FileReturnCache, JavaReturnTypeContext, LexicalTypeResolution, METHOD_RECEIVER_CHAIN_LIMIT,
@@ -210,6 +211,7 @@ fn record_reference(
     bindings: &LocalInferenceEngine<String>,
 ) {
     match node.kind() {
+        "object_creation_expression" => record_constructor_reference(node, ctx),
         // `new Foo()` and generics resolve via the type_identifier children, so
         // a scoped parent handles all of its semantic type segments (avoids
         // double counting while retaining outer-owner references).
@@ -247,6 +249,10 @@ fn record_reference(
             }
         }
         "method_reference" => {
+            if let Some(receiver) = constructor_method_reference_receiver(node) {
+                record_constructor_reference_for_type(receiver, node, ctx);
+                return;
+            }
             let Some((receiver, member_node)) = method_reference_parts(node) else {
                 return;
             };
@@ -279,6 +285,33 @@ fn record_reference(
             }
         }
         _ => {}
+    }
+}
+
+fn record_constructor_reference(node: Node<'_>, ctx: &mut JavaScan<'_, '_>) {
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return;
+    };
+    record_constructor_reference_for_type(type_node, node, ctx);
+}
+
+fn record_constructor_reference_for_type(
+    type_node: Node<'_>,
+    reference_node: Node<'_>,
+    ctx: &mut JavaScan<'_, '_>,
+) {
+    let Some(owner) = ctx.resolve_type(type_node) else {
+        return;
+    };
+    let constructor_fqn = format!("{}.{}", owner.fq_name(), owner.identifier());
+    let declared = ctx
+        .java
+        .global_usage_definition_index()
+        .by_fqn(&constructor_fqn)
+        .iter()
+        .any(|candidate| candidate.is_function() && !candidate.is_synthetic());
+    if declared {
+        ctx.record(constructor_fqn, reference_node);
     }
 }
 

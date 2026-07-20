@@ -10843,6 +10843,58 @@ public class UseTarget {
 }
 
 #[test]
+fn java_enclosing_fields_shadow_static_wildcard_imports() {
+    let source = r#"
+package app;
+
+import static pkg.ImportedFields.*;
+
+public class Consumer extends pkg.Base {
+    int collision;
+
+    int read() {
+        return collision + inheritedCollision + importedOnly;
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "pkg/ImportedFields.java",
+            r#"
+package pkg;
+
+public class ImportedFields {
+    public static int collision;
+    public static int inheritedCollision;
+    public static int importedOnly;
+}
+"#,
+        )
+        .file(
+            "pkg/Base.java",
+            "package pkg; public class Base { protected int inheritedCollision; }\n",
+        )
+        .file("app/Consumer.java", source)
+        .build();
+
+    for (name, expected) in [
+        ("collision", "app.Consumer.collision"),
+        ("inheritedCollision", "pkg.Base.inheritedCollision"),
+        ("importedOnly", "pkg.ImportedFields.importedOnly"),
+    ] {
+        let start = source.rfind(name).expect("bare field reference");
+        let value = lookup(
+            project.root(),
+            &location_reference("app/Consumer.java", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{name}: {value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{name}: {value}");
+        assert_eq!(result["definitions"][0]["kind"], "field", "{name}: {value}");
+    }
+}
+
+#[test]
 fn java_typed_receiver_method_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
@@ -20447,6 +20499,106 @@ fn java_reference_context_resolves_field_access_member_to_field() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "app.Types.JSON", "{value}");
+}
+
+#[test]
+fn java_definition_lookup_honors_each_focused_selector_segment() {
+    let source = r#"
+package app;
+
+public class Consumer {
+    Types value;
+
+    void run() {
+        Types.get();
+        java.util.function.Supplier<Types> reference = Types::get;
+        java.util.function.Function<Argument, Types> generic = Types::<Argument>create;
+        java.util.function.Supplier<Types> constructor = Types::new;
+        Types.Nested.create();
+        value.nested.create();
+        new Types.Nested();
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "app/Types.java",
+            r#"
+package app;
+
+public class Types {
+    public Types() {}
+    public static Types get() { return new Types(); }
+    public static <T> Types create(T value) { return new Types(); }
+    public Nested nested = new Nested();
+
+    public static class Nested {
+        public Nested() {}
+        public static void create() {}
+    }
+}
+"#,
+        )
+        .file(
+            "app/Argument.java",
+            "package app; public class Argument {}\n",
+        )
+        .file("app/Consumer.java", source)
+        .build();
+
+    let cases = [
+        ("Types.get();", "Types", "app.Types"),
+        ("Types.get();", "get", "app.Types.get"),
+        ("Types::get", "Types", "app.Types"),
+        ("Types::get", "get", "app.Types.get"),
+        ("Types::<Argument>create", "Types", "app.Types"),
+        ("Types::<Argument>create", "Argument", "app.Argument"),
+        ("Types::<Argument>create", "create", "app.Types.create"),
+        ("Types::new", "Types", "app.Types"),
+        ("Types::new", "new", "app.Types.Types"),
+        ("Types.Nested.create();", "Types", "app.Types"),
+        ("Types.Nested.create();", "Nested", "app.Types.Nested"),
+        (
+            "Types.Nested.create();",
+            "create",
+            "app.Types.Nested.create",
+        ),
+        ("value.nested.create();", "value", "app.Consumer.value"),
+        ("value.nested.create();", "nested", "app.Types.nested"),
+        (
+            "value.nested.create();",
+            "create",
+            "app.Types.Nested.create",
+        ),
+        ("new Types.Nested();", "Types", "app.Types"),
+        ("new Types.Nested();", "Nested", "app.Types.Nested.Nested"),
+    ];
+    let references = cases
+        .iter()
+        .map(|(marker, focus, _)| {
+            let marker_start = source.find(marker).expect("case marker");
+            let start = marker_start + marker.find(focus).expect("focus in marker");
+            serde_json::from_str::<Value>(&location_reference("app/Consumer.java", source, start))
+                .expect("location reference JSON")["references"][0]
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    let value = lookup(
+        project.root(),
+        &json!({ "references": references }).to_string(),
+    );
+
+    for (index, (marker, focus, expected)) in cases.iter().enumerate() {
+        let result = &value["results"][index];
+        assert_eq!(
+            result["status"], "resolved",
+            "{marker} focus {focus}: {value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["fqn"], *expected,
+            "{marker} focus {focus}: {value}"
+        );
+    }
 }
 
 #[test]
