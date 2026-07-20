@@ -116,7 +116,7 @@ impl TargetSpec {
         let callable_alternatives = if !target.is_field() && target.is_function() {
             scala
                 .project_types()
-                .callable_alternatives_for(scala, target)
+                .effective_callable_alternatives_for(scala, target)
         } else {
             Arc::new(Vec::new())
         };

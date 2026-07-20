@@ -3251,6 +3251,161 @@ object Use { val sdk = SbtScalaSdkData(Some("other")) }
 }
 
 #[test]
+fn scala_overrides_inherit_defaults_only_from_exact_callable_families() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "defaults/Overrides.scala",
+            r#"
+package defaults
+
+trait DirectBase {
+  def direct(incomplete: Boolean, completion: Boolean = false): Int = 0
+}
+class Direct extends DirectBase {
+  override def direct(incomplete: Boolean, completion: Boolean): Int = 1
+  def one: Int = direct(true) // positive-direct-inherited-default
+  def two: Int = direct(true, false) // positive-direct-explicit
+}
+
+trait Root {
+  def transitive(incomplete: Boolean, completion: Boolean = false): Int = 0
+}
+trait Mid extends Root {
+  override def transitive(incomplete: Boolean, completion: Boolean): Int = 1
+}
+class Leaf extends Mid {
+  override def transitive(incomplete: Boolean, completion: Boolean): Int = 2
+  def one: Int = transitive(true) // positive-transitive-inherited-default
+}
+
+trait DifferentTypesBase {
+  def different(value: String, fallback: String = "fallback"): Int = 0
+}
+class DifferentTypes extends DifferentTypesBase {
+  def different(value: Int, fallback: Int): Int = 1
+  def one: Int = different(1) // negative-different-parameter-types
+}
+
+trait DifferentListsBase {
+  def differentLists(value: Boolean)(fallback: Boolean = false): Int = 0
+}
+class DifferentLists extends DifferentListsBase {
+  def differentLists(value: Boolean, fallback: Boolean): Int = 1
+  def one: Int = differentLists(true) // negative-different-list-topology
+}
+
+trait UnresolvedBase {
+  def unresolved(value: Missing, fallback: Missing = null): Int = 0
+}
+class Unresolved extends UnresolvedBase {
+  override def unresolved(value: Missing, fallback: Missing): Int = 1
+  def one: Int = unresolved(null) // negative-unresolved-parameter-identity
+}
+
+trait CompetingLeft {
+  def competing(first: Boolean = false, second: Boolean): Int = 0
+}
+trait CompetingRight {
+  def competing(first: Boolean, second: Boolean = false): Int = 0
+}
+class Competing extends CompetingLeft with CompetingRight {
+  override def competing(first: Boolean, second: Boolean): Int = 1
+  def none: Int = competing() // negative-unrelated-default-contributors
+}
+"#,
+        ),
+        ("shadow/Boolean.scala", "package shadow\nclass Boolean\n"),
+        (
+            "defaults/Shadowed.scala",
+            r#"
+package defaults
+trait BuiltinBase {
+  def shadowed(value: scala.Boolean, fallback: scala.Boolean = false): Int = 0
+}
+class Shadowed extends BuiltinBase {
+  def shadowed(value: shadow.Boolean, fallback: shadow.Boolean): Int = 1
+  def one: Int = shadowed(new shadow.Boolean) // negative-user-type-versus-builtin
+}
+"#,
+        ),
+        (
+            "jvm/physical/Base.scala",
+            r#"package physical
+trait Base { def ambiguous(value: Boolean, fallback: Boolean = false): Int = 0 }
+"#,
+        ),
+        (
+            "js/physical/Base.scala",
+            r#"package physical
+trait Base { def ambiguous(value: Boolean, fallback: Boolean = false): Int = 0 }
+"#,
+        ),
+        (
+            "physical/Use.scala",
+            r#"package physical
+class Use extends Base {
+  override def ambiguous(value: Boolean, fallback: Boolean): Int = 1
+  def one: Int = ambiguous(true) // negative-ambiguous-physical-ancestor
+}
+"#,
+        ),
+    ]);
+
+    for (target, expected) in [
+        (
+            "defaults.Direct.direct",
+            vec![
+                "positive-direct-inherited-default",
+                "positive-direct-explicit",
+            ],
+        ),
+        (
+            "defaults.Leaf.transitive",
+            vec!["positive-transitive-inherited-default"],
+        ),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        for marker in expected {
+            assert_hit_contains(&target_hits, marker);
+        }
+    }
+
+    for (target, marker) in [
+        (
+            "defaults.DifferentTypes.different",
+            "negative-different-parameter-types",
+        ),
+        (
+            "defaults.DifferentLists.differentLists",
+            "negative-different-list-topology",
+        ),
+        (
+            "defaults.Unresolved.unresolved",
+            "negative-unresolved-parameter-identity",
+        ),
+        (
+            "defaults.Shadowed.shadowed",
+            "negative-user-type-versus-builtin",
+        ),
+        (
+            "physical.Use.ambiguous",
+            "negative-ambiguous-physical-ancestor",
+        ),
+        (
+            "defaults.Competing.competing",
+            "negative-unrelated-default-contributors",
+        ),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_no_hit_contains(&target_hits, marker);
+    }
+}
+
+#[test]
 fn scala_companion_apply_and_infix_usages_preserve_exact_targets() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (

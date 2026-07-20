@@ -19,6 +19,7 @@ pub(crate) struct ScalaSourceFacts {
 pub(crate) struct ScalaCallableSourceAlternative {
     pub(crate) role: ScalaCallableRole,
     pub(crate) shape: Vec<ScalaCallableParameterList>,
+    pub(crate) parameter_defaults: Vec<Vec<bool>>,
     pub(crate) parameter_function_arities: Vec<Vec<Option<usize>>>,
     pub(crate) parameter_type_paths: Vec<Vec<Option<Vec<String>>>>,
     pub(crate) parameter_function_type_paths: ScalaParameterFunctionTypePaths,
@@ -236,6 +237,11 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                     .copied()
                     .map(parameter_function_arities)
                     .collect();
+                let parameter_defaults = parameter_lists
+                    .iter()
+                    .copied()
+                    .map(callable_parameter_defaults)
+                    .collect();
                 let parameter_type_paths = parameter_lists
                     .iter()
                     .copied()
@@ -256,6 +262,7 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                                 ScalaCallableRole::SecondaryConstructor
                             }),
                         shape,
+                        parameter_defaults,
                         parameter_function_arities,
                         parameter_type_paths,
                         parameter_function_type_paths,
@@ -271,21 +278,32 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
             }
             "class_definition" | "full_enum_case" => {
                 let mut cursor = node.walk();
-                let mut lists = node
+                let parameter_lists = node
                     .named_children(&mut cursor)
                     .filter(|child| child.kind() == "class_parameters")
+                    .collect::<Vec<_>>();
+                let mut lists = parameter_lists
+                    .iter()
+                    .copied()
                     .map(callable_parameter_list)
+                    .collect::<Vec<_>>();
+                let mut parameter_defaults = parameter_lists
+                    .iter()
+                    .copied()
+                    .map(callable_parameter_defaults)
                     .collect::<Vec<_>>();
                 if lists.is_empty() {
                     lists.push(ScalaCallableParameterList::explicit(CallableArity::exact(
                         0,
                     )));
+                    parameter_defaults.push(Vec::new());
                 }
                 facts.callable_alternatives_by_range.insert(
                     (node.start_byte(), node.end_byte()),
                     ScalaCallableSourceAlternative {
                         role: ScalaCallableRole::PrimaryConstructor,
                         shape: lists,
+                        parameter_defaults,
                         parameter_function_arities: Vec::new(),
                         parameter_type_paths: Vec::new(),
                         parameter_function_type_paths: Vec::new(),
@@ -520,6 +538,15 @@ fn callable_parameter_list(parameters: Node<'_>) -> ScalaCallableParameterList {
         arity: callable_arity_for_parameters(parameters),
         kind,
     }
+}
+
+fn callable_parameter_defaults(parameters: Node<'_>) -> Vec<bool> {
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter(|parameter| matches!(parameter.kind(), "parameter" | "class_parameter"))
+        .map(|parameter| parameter.child_by_field_name("default_value").is_some())
+        .collect()
 }
 
 fn parameter_function_arities(parameters: Node<'_>) -> Vec<Option<usize>> {
@@ -2037,6 +2064,7 @@ enum Event:
         assert!(callable.shape[0].arity.accepts(1));
         assert!(callable.shape[0].arity.accepts(2));
         assert!(!callable.shape[0].arity.accepts(0));
+        assert_eq!(callable.parameter_defaults, vec![vec![false, true]]);
         assert!(facts.case_class_ranges.contains(&range));
     }
 

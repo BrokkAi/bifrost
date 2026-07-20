@@ -370,6 +370,152 @@ object Ambiguous {
 }
 
 #[test]
+fn scala_inverted_overrides_inherit_defaults_only_from_exact_callable_families() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "defaults/Overrides.scala",
+            r#"package defaults
+trait DirectBase {
+  def direct(incomplete: Boolean, completion: Boolean = false): Int = 0
+}
+class Direct extends DirectBase {
+  override def direct(incomplete: Boolean, completion: Boolean): Int = 1
+  def one: Int = direct(true)
+  def two: Int = direct(true, false)
+}
+trait Root {
+  def transitive(incomplete: Boolean, completion: Boolean = false): Int = 0
+}
+trait Mid extends Root {
+  override def transitive(incomplete: Boolean, completion: Boolean): Int = 1
+}
+class Leaf extends Mid {
+  override def transitive(incomplete: Boolean, completion: Boolean): Int = 2
+  def one: Int = transitive(true)
+}
+trait DifferentTypesBase {
+  def different(value: String, fallback: String = "fallback"): Int = 0
+}
+class DifferentTypes extends DifferentTypesBase {
+  def different(value: Int, fallback: Int): Int = 1
+  def one: Int = different(1)
+}
+trait DifferentListsBase {
+  def differentLists(value: Boolean)(fallback: Boolean = false): Int = 0
+}
+class DifferentLists extends DifferentListsBase {
+  def differentLists(value: Boolean, fallback: Boolean): Int = 1
+  def one: Int = differentLists(true)
+}
+trait UnresolvedBase {
+  def unresolved(value: Missing, fallback: Missing = null): Int = 0
+}
+class Unresolved extends UnresolvedBase {
+  override def unresolved(value: Missing, fallback: Missing): Int = 1
+  def one: Int = unresolved(null)
+}
+trait CompetingLeft {
+  def competing(first: Boolean = false, second: Boolean): Int = 0
+}
+trait CompetingRight {
+  def competing(first: Boolean, second: Boolean = false): Int = 0
+}
+class Competing extends CompetingLeft with CompetingRight {
+  override def competing(first: Boolean, second: Boolean): Int = 1
+  def none: Int = competing()
+}
+"#,
+        )
+        .file("shadow/Boolean.scala", "package shadow\nclass Boolean\n")
+        .file(
+            "defaults/Shadowed.scala",
+            r#"package defaults
+trait BuiltinBase {
+  def shadowed(value: scala.Boolean, fallback: scala.Boolean = false): Int = 0
+}
+class Shadowed extends BuiltinBase {
+  def shadowed(value: shadow.Boolean, fallback: shadow.Boolean): Int = 1
+  def one: Int = shadowed(new shadow.Boolean)
+}
+"#,
+        )
+        .file(
+            "jvm/physical/Base.scala",
+            "package physical\ntrait Base { def ambiguous(value: Boolean, fallback: Boolean = false): Int = 0 }\n",
+        )
+        .file(
+            "js/physical/Base.scala",
+            "package physical\ntrait Base { def ambiguous(value: Boolean, fallback: Boolean = false): Int = 0 }\n",
+        )
+        .file(
+            "physical/Use.scala",
+            r#"package physical
+class Use extends Base {
+  override def ambiguous(value: Boolean, fallback: Boolean): Int = 1
+  def one: Int = ambiguous(true)
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+
+    for (caller, concrete, ancestor) in [
+        (
+            "defaults.Direct.one",
+            "defaults.Direct.direct",
+            "defaults.DirectBase.direct",
+        ),
+        (
+            "defaults.Direct.two",
+            "defaults.Direct.direct",
+            "defaults.DirectBase.direct",
+        ),
+        (
+            "defaults.Leaf.one",
+            "defaults.Leaf.transitive",
+            "defaults.Root.transitive",
+        ),
+    ] {
+        assert!(
+            has_edge(&value, caller, concrete),
+            "inherited default did not retain concrete override {caller} -> {concrete}: {}",
+            value["edges"]
+        );
+        assert!(
+            !has_edge(&value, caller, ancestor),
+            "inherited default substituted ancestor target {caller} -> {ancestor}: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        !has_edge(&value, "defaults.Leaf.one", "defaults.Mid.transitive"),
+        "transitive inherited default substituted the intermediate override: {}",
+        value["edges"]
+    );
+
+    for (caller, concrete) in [
+        (
+            "defaults.DifferentTypes.one",
+            "defaults.DifferentTypes.different",
+        ),
+        (
+            "defaults.DifferentLists.one",
+            "defaults.DifferentLists.differentLists",
+        ),
+        ("defaults.Unresolved.one", "defaults.Unresolved.unresolved"),
+        ("defaults.Shadowed.one", "defaults.Shadowed.shadowed"),
+        ("physical.Use.one", "physical.Use.ambiguous"),
+        ("defaults.Competing.none", "defaults.Competing.competing"),
+    ] {
+        assert!(
+            !has_edge(&value, caller, concrete),
+            "unproven override family inherited a default {caller} -> {concrete}: {}",
+            value["edges"]
+        );
+    }
+}
+
+#[test]
 fn scala_inverted_typed_receivers_keep_exact_physical_owner_identity() {
     let replica = |platform: &str, argument_type: &str, argument: &str| {
         format!(

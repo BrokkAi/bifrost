@@ -148,6 +148,7 @@ pub(crate) struct ProjectTypes {
     source_facts_by_file: Mutex<HashMap<ProjectFile, ScalaSourceFactsCell>>,
     bulk_file_states: Option<HashMap<ProjectFile, FileState>>,
     callable_alternatives_by_unit: Mutex<HashMap<CodeUnit, CallableAlternativesCell>>,
+    effective_callable_alternatives_by_unit: Mutex<HashMap<CodeUnit, CallableAlternativesCell>>,
     extension_methods_by_owner_member:
         Mutex<HashMap<ExtensionOwnerMemberKey, ExtensionMethodEntries>>,
     override_targets_by_method: Mutex<HashMap<String, OverrideTargetEntries>>,
@@ -200,6 +201,7 @@ impl ProjectTypes {
             source_facts_by_file: Mutex::new(HashMap::default()),
             bulk_file_states: None,
             callable_alternatives_by_unit: Mutex::new(HashMap::default()),
+            effective_callable_alternatives_by_unit: Mutex::new(HashMap::default()),
             extension_methods_by_owner_member: Mutex::new(HashMap::default()),
             override_targets_by_method: Mutex::new(HashMap::default()),
             exported_member_bindings_by_owner: Mutex::new(HashMap::default()),
@@ -286,6 +288,7 @@ impl ProjectTypes {
             source_facts_by_file: Mutex::new(HashMap::default()),
             bulk_file_states: Some(file_states),
             callable_alternatives_by_unit: Mutex::new(HashMap::default()),
+            effective_callable_alternatives_by_unit: Mutex::new(HashMap::default()),
             extension_methods_by_owner_member: Mutex::new(HashMap::default()),
             override_targets_by_method: Mutex::new(HashMap::default()),
             exported_member_bindings_by_owner: Mutex::new(HashMap::default()),
@@ -1143,7 +1146,7 @@ impl ProjectTypes {
                     (
                         *method,
                         facts,
-                        self.callable_alternatives_for(scala, method),
+                        self.effective_callable_alternatives_for(scala, method),
                     )
                 })
             })
@@ -3208,6 +3211,7 @@ impl ProjectTypes {
                         .map(|facts| CallableAlternative {
                             role: facts.role,
                             shape: facts.shape.clone(),
+                            parameter_defaults: facts.parameter_defaults.clone(),
                             parameter_types: facts
                                 .parameter_type_paths
                                 .iter()
@@ -3312,6 +3316,7 @@ impl ProjectTypes {
                             ScalaCallableRole::Ordinary
                         },
                         shape: vec![ScalaCallableParameterList::explicit(arity)],
+                        parameter_defaults: Vec::new(),
                         parameter_types: Vec::new(),
                         parameter_function_shapes: Vec::new(),
                         extension_receiver_type: None,
@@ -3333,6 +3338,7 @@ impl ProjectTypes {
                         ScalaCallableRole::Ordinary
                     },
                     shape: vec![ScalaCallableParameterList::explicit(arity)],
+                    parameter_defaults: Vec::new(),
                     parameter_types: Vec::new(),
                     parameter_function_shapes: Vec::new(),
                     extension_receiver_type: None,
@@ -3345,6 +3351,142 @@ impl ProjectTypes {
             Arc::new(fallback)
         })
         .clone()
+    }
+
+    /// Return the source-declared callable alternatives with default parameters
+    /// inherited by exact override families applied to the concrete declaration.
+    ///
+    /// Scala dispatches a call to an override even when the omitted argument's
+    /// default is declared only by an ancestor.  We preserve that concrete
+    /// target, but merge defaults only when every parameter position has an
+    /// exact, source-backed type identity and the hierarchy itself is
+    /// unambiguous.
+    pub(crate) fn effective_callable_alternatives_for(
+        &self,
+        scala: &ScalaAnalyzer,
+        target: &CodeUnit,
+    ) -> CachedCallableAlternatives {
+        let cell = self
+            .effective_callable_alternatives_by_unit
+            .lock()
+            .expect("Scala effective callable-alternative cache poisoned")
+            .entry(target.clone())
+            .or_insert_with(|| Arc::new(OnceLock::new()))
+            .clone();
+        cell.get_or_init(|| {
+            let declared = self.callable_alternatives_for(scala, target);
+            let Some(owner) = self.exact_structural_parent(scala, target) else {
+                return declared;
+            };
+            if !target.is_function()
+                || declared.is_empty()
+                || !self.hierarchy_is_unambiguous(scala, &owner)
+            {
+                return declared;
+            }
+
+            let linearized = self.linearized_owners(scala, &owner);
+            if linearized.first() != Some(&owner) {
+                return declared;
+            }
+            let mut effective = declared.as_ref().clone();
+            for alternative in &mut effective {
+                if alternative.role != ScalaCallableRole::Ordinary
+                    || alternative.parameter_defaults.len() != alternative.shape.len()
+                    || alternative.parameter_types.len() != alternative.shape.len()
+                {
+                    continue;
+                }
+                let declared_alternative = alternative.clone();
+                let Some(defaults) = self.inherited_default_mask_for_alternative(
+                    scala,
+                    &linearized[1..],
+                    target.identifier(),
+                    &declared_alternative,
+                ) else {
+                    continue;
+                };
+                alternative.parameter_defaults = defaults;
+                apply_parameter_defaults_to_shape(alternative);
+            }
+            Arc::new(effective)
+        })
+        .clone()
+    }
+
+    fn hierarchy_is_unambiguous(&self, scala: &ScalaAnalyzer, root: &CodeUnit) -> bool {
+        let mut pending = vec![root.clone()];
+        let mut seen = HashSet::default();
+        while let Some(owner) = pending.pop() {
+            if !seen.insert(owner.clone()) {
+                continue;
+            }
+            match self.exact_direct_ancestor_resolution(scala, &owner) {
+                ScalaDirectAncestorResolution::Resolved(ancestors) => pending.extend(ancestors),
+                ScalaDirectAncestorResolution::Ambiguous => return false,
+            }
+        }
+        true
+    }
+
+    fn inherited_default_mask_for_alternative(
+        &self,
+        scala: &ScalaAnalyzer,
+        ancestors: &[CodeUnit],
+        member: &str,
+        declared: &CallableAlternative,
+    ) -> Option<Vec<Vec<bool>>> {
+        let mut defaults = declared.parameter_defaults.clone();
+        let mut inherited = Vec::new();
+        for owner in ancestors {
+            let mut exact = Vec::new();
+            let mut unknown = false;
+            for method in self
+                .members_for_exact_owner_unit(scala, owner, member)
+                .into_iter()
+                .filter(|unit| unit.is_function())
+            {
+                for alternative in self.callable_alternatives_for(scala, method).iter() {
+                    match override_family_relation(declared, alternative) {
+                        OverrideFamilyRelation::Exact => exact.push(alternative.clone()),
+                        OverrideFamilyRelation::Unknown => unknown = true,
+                        OverrideFamilyRelation::Different => {}
+                    }
+                }
+            }
+            if unknown || exact.len() > 1 {
+                return None;
+            }
+            let Some(ancestor) = exact.pop() else {
+                continue;
+            };
+            inherited.push((owner.clone(), ancestor));
+        }
+        for (index, (left, _)) in inherited.iter().enumerate() {
+            for (right, _) in &inherited[index + 1..] {
+                if !self.exact_owner_inherits(scala, left, right)
+                    && !self.exact_owner_inherits(scala, right, left)
+                {
+                    return None;
+                }
+            }
+        }
+        for (_, ancestor) in inherited {
+            if ancestor.parameter_defaults.len() != defaults.len() {
+                return None;
+            }
+            for (effective_list, inherited_list) in
+                defaults.iter_mut().zip(&ancestor.parameter_defaults)
+            {
+                if effective_list.len() != inherited_list.len() {
+                    return None;
+                }
+                for (effective, inherited) in effective_list.iter_mut().zip(inherited_list) {
+                    *effective |= *inherited;
+                }
+            }
+        }
+        Some(defaults)
     }
 
     fn resolve_callable_parameter_type_identity(
@@ -4216,10 +4358,86 @@ impl ProjectTypes {
 pub(crate) struct CallableAlternative {
     pub(crate) role: ScalaCallableRole,
     pub(crate) shape: Vec<ScalaCallableParameterList>,
+    pub(crate) parameter_defaults: Vec<Vec<bool>>,
     pub(crate) parameter_types: Vec<Vec<Option<ScalaParameterTypeIdentity>>>,
     pub(crate) parameter_function_shapes: Vec<Vec<Option<ScalaFunctionParameterShape>>>,
     pub(crate) extension_receiver_type: Option<String>,
     pub(crate) return_type: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OverrideFamilyRelation {
+    Exact,
+    Different,
+    Unknown,
+}
+
+fn override_family_relation(
+    declared: &CallableAlternative,
+    ancestor: &CallableAlternative,
+) -> OverrideFamilyRelation {
+    if declared.role != ScalaCallableRole::Ordinary
+        || ancestor.role != ScalaCallableRole::Ordinary
+        || declared.shape.len() != ancestor.shape.len()
+    {
+        return OverrideFamilyRelation::Different;
+    }
+    for (declared_list, ancestor_list) in declared.shape.iter().zip(&ancestor.shape) {
+        if declared_list.kind != ancestor_list.kind
+            || declared_list.arity.total() != ancestor_list.arity.total()
+            || callable_arity_is_repeated(declared_list.arity)
+                != callable_arity_is_repeated(ancestor_list.arity)
+        {
+            return OverrideFamilyRelation::Different;
+        }
+    }
+    if declared.parameter_types.len() != declared.shape.len()
+        || ancestor.parameter_types.len() != ancestor.shape.len()
+    {
+        return OverrideFamilyRelation::Unknown;
+    }
+    for ((declared_types, ancestor_types), declared_shape) in declared
+        .parameter_types
+        .iter()
+        .zip(&ancestor.parameter_types)
+        .zip(&declared.shape)
+    {
+        if declared_types.len() != declared_shape.arity.total()
+            || ancestor_types.len() != declared_shape.arity.total()
+        {
+            return OverrideFamilyRelation::Unknown;
+        }
+        for (declared_type, ancestor_type) in declared_types.iter().zip(ancestor_types) {
+            match (declared_type, ancestor_type) {
+                (Some(declared_type), Some(ancestor_type)) if declared_type == ancestor_type => {}
+                (Some(_), Some(_)) => return OverrideFamilyRelation::Different,
+                _ => return OverrideFamilyRelation::Unknown,
+            }
+        }
+    }
+    OverrideFamilyRelation::Exact
+}
+
+fn callable_arity_is_repeated(arity: CallableArity) -> bool {
+    arity.accepts(arity.total().saturating_add(1))
+}
+
+fn apply_parameter_defaults_to_shape(alternative: &mut CallableAlternative) {
+    for (list, defaults) in alternative
+        .shape
+        .iter_mut()
+        .zip(&alternative.parameter_defaults)
+    {
+        let total = list.arity.total();
+        if defaults.len() != total {
+            continue;
+        }
+        let repeated = callable_arity_is_repeated(list.arity);
+        let required = total
+            .saturating_sub(defaults.iter().filter(|is_default| **is_default).count())
+            .saturating_sub(usize::from(repeated));
+        list.arity = CallableArity::new(required, total, repeated);
+    }
 }
 
 pub(crate) fn callable_alternative_is_candidate(
