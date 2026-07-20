@@ -8,6 +8,7 @@ use crate::analyzer::js_ts::build_weighted_cache;
 
 pub(super) struct CSharpMemoCaches {
     budget_bytes: u64,
+    pub(super) namespace_by_file: Cache<ProjectFile, Arc<String>>,
     pub(super) using_namespaces: Cache<ProjectFile, Arc<Vec<String>>>,
     pub(super) using_aliases: Cache<ProjectFile, Arc<HashMap<String, String>>>,
     pub(super) imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
@@ -27,6 +28,7 @@ impl CSharpMemoCaches {
     pub(super) fn new(budget_bytes: u64) -> Self {
         Self {
             budget_bytes,
+            namespace_by_file: build_weighted_cache(budget_bytes / 16, weight_string),
             using_namespaces: build_weighted_cache(budget_bytes / 8, weight_string_vec),
             using_aliases: build_weighted_cache(budget_bytes / 8, weight_string_map),
             imported_code_units: build_weighted_cache(
@@ -48,6 +50,10 @@ impl CSharpMemoCaches {
     pub(super) fn budget_bytes(&self) -> u64 {
         self.budget_bytes
     }
+}
+
+fn weight_string(_key: &ProjectFile, value: &Arc<String>) -> u32 {
+    weight_bytes(size_of::<String>() as u64 + value.len() as u64)
 }
 
 fn weight_string_vec(_key: &ProjectFile, value: &Arc<Vec<String>>) -> u32 {

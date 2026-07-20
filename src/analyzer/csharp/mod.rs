@@ -240,15 +240,23 @@ impl CSharpAnalyzer {
     }
 
     pub fn namespace_of_file(&self, file: &ProjectFile) -> String {
-        let package = self.inner.package_name_of(file).unwrap_or_default();
-        if !package.is_empty() {
-            return package.to_string();
+        if let Some(cached) = self.memo_caches.namespace_by_file.get(file) {
+            return (*cached).clone();
         }
-        self.declarations(file)
-            .into_iter()
-            .map(|unit| unit.package_name().to_string())
-            .find(|package| !package.is_empty())
-            .unwrap_or_default()
+        let package = self.inner.package_name_of(file).unwrap_or_default();
+        let namespace = if package.is_empty() {
+            self.declarations(file)
+                .into_iter()
+                .map(|unit| unit.package_name().to_string())
+                .find(|package| !package.is_empty())
+                .unwrap_or_default()
+        } else {
+            package
+        };
+        self.memo_caches
+            .namespace_by_file
+            .insert(file.clone(), Arc::new(namespace.clone()));
+        namespace
     }
 
     pub fn external_declaration_index(&self) -> &CSharpExternalDeclarationIndex {
