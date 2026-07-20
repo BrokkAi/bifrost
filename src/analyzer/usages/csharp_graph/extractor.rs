@@ -520,7 +520,7 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 TargetMemberResolution::NotFound => push_unproven_hit(node, ctx),
             }
         }
-        TargetKind::Method if is_unqualified_method_group_argument(node, ctx.source) => {
+        TargetKind::Method if is_unqualified_method_group_value(node, ctx.source) => {
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
             seed_visible_bindings_at(
                 binding_scope_node(node),
@@ -617,7 +617,7 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-pub(super) fn is_unqualified_method_group_argument(node: Node<'_>, source: &str) -> bool {
+pub(super) fn is_unqualified_method_group_value(node: Node<'_>, source: &str) -> bool {
     if node.kind() != "identifier"
         || is_declaration_name(node)
         || is_type_reference_node(node)
@@ -625,25 +625,37 @@ pub(super) fn is_unqualified_method_group_argument(node: Node<'_>, source: &str)
     {
         return false;
     }
-    let Some(argument) = containing_argument_through_transparent_expressions(node) else {
-        return false;
-    };
-    argument.child_by_field_name("name") != Some(node)
+    containing_method_group_value_context(node)
 }
 
-fn containing_argument_through_transparent_expressions(node: Node<'_>) -> Option<Node<'_>> {
+fn containing_method_group_value_context(node: Node<'_>) -> bool {
     let mut current = node;
     while let Some(parent) = current.parent() {
-        if parent.kind() == "argument" {
-            return Some(parent);
+        match parent.kind() {
+            "argument" => return parent.child_by_field_name("name") != Some(node),
+            "assignment_expression" => {
+                return parent.child_by_field_name("right") == Some(current)
+                    && parent
+                        .child_by_field_name("operator")
+                        .is_some_and(|operator| matches!(operator.kind(), "=" | "+=" | "-="));
+            }
+            "variable_declarator" => {
+                return parent.child_by_field_name("name") != Some(current)
+                    && parent.named_child(parent.named_child_count().saturating_sub(1))
+                        == Some(current);
+            }
+            "property_declaration" => {
+                return parent.child_by_field_name("value") == Some(current);
+            }
+            _ => {}
         }
         if transparent_expression_parent(current, parent) {
             current = parent;
         } else {
-            return None;
+            return false;
         }
     }
-    None
+    false
 }
 
 fn transparent_expression_parent(current: Node<'_>, parent: Node<'_>) -> bool {

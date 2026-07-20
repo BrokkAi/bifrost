@@ -19,6 +19,11 @@ The observable result is ten accepted repository records selected by exact desce
 - [x] (2026-07-20 17:05Z) Sealed the clean Go-Ethereum C discovery record with zero missing rows, then proved its sole candidate-limit exclusion contains 121,349 candidates and that a 250,000 ceiling clears the complete file with zero file errors.
 - [x] (2026-07-20 17:10Z) Re-probed both #932 QGIS witnesses on the frozen clean head: each retained an exact inverse hit as `unproven`; traced this to sound macro uncertainty from the missing generated `qgis_core.h`, not a remaining default-argument defect.
 - [x] (2026-07-20 17:15Z) Diagnosed pathological Libgit2/JerryScript inverse progress as a distinct macro-environment cursor contention/replay defect, created GitHub issue #996, and verified it is assigned only to `jbellis` before delegating implementation.
+- [x] (2026-07-20 18:05Z) Integrated and published the per-worker macro cursor fix through clean master head `df753a15`; formatting, all-target/all-feature Clippy, and the complete feature-enabled test suite passed locally.
+- [x] (2026-07-20 18:30Z) Completed all five literal task-selected C records on release runner `df753a15` (SHA-256 `9ac6ffd57833f2940d900ba1f79f8c0b0041aa6479bae17c8c73a90829ee9d17`) with one fingerprint, exact clean heads, zero file errors, and no skipped inverse targets.
+- [x] (2026-07-20 18:35Z) Closed #996 after Libgit2 completed 667/667 targets in 602.9 seconds with an 84.0-second maximum completion gap and JerryScript completed 332/332 in 763.6 seconds with a 192.9-second maximum gap, versus incomplete old runs and 816.4/900.7-second stalls.
+- [x] (2026-07-20 18:40Z) Exhaustively extracted and exact-reran all eight raw C residuals. Seven Chibicc sites are typedef declarators and the Libgit2 site is a secondary local declarator; inverse omission is correct, but public forward lookup incorrectly treated each declaration token as a reference.
+- [x] (2026-07-20 18:45Z) Created issue #997, verified it is assigned only to `jbellis`, and delegated a structured shared declaration-name fix plus behavior regressions; root review and full gates are in progress.
 - [ ] Complete the five-repository C baseline, integrity-check every record, exhaustively disposition every raw missing row, and give the user the requested C-language summary.
 - [ ] File/assign, implement, review, test, publish, and exact-prove every legitimate C root cause not owned by somebody else; rebuild and rerun the complete C set after any fix.
 - [ ] Complete the five-repository C++ baseline, integrity-check every record, exhaustively disposition every raw missing row, and give the user the requested C++-language summary.
@@ -50,6 +55,12 @@ The observable result is ten accepted repository records selected by exact desce
 
 - Observation: A shared macro-environment forward cursor serializes concurrent inverse targets and thrashes on interleaved source frontiers.
   Evidence: during the C discovery run, eight workers blocked in `VisibilityIndex::call_arity_evidence` on the same per-file cursor mutex while two workers replayed recursive include events through `mark_macro_events_ambiguous`. The cursor resets whenever a target requests a lower byte frontier, so concurrent target scans repeatedly replay the prefix under lock. This is issue #996 and is distinct from #929's class-strength parse cache.
+
+- Observation: The literal fourth-ranked C selection has no C implementation files or C-task evidence.
+  Evidence: `tasks.py` reports 42 fully filtered tasks for `bernardladenthin__BitcoinAddressFinder`, but all 42 task change sets touch Java and none touches C/C++ headers or sources. The pinned clone contains 276 Java files, ten OpenCL kernels, eight headers, and zero `.c`, `.cc`, `.cpp`, or `.cxx` files, so the differential correctly completed a clean zero-eligible-file record. `task_repos` canonicalizes a multi-language repository by a fixed language preference before applying `langs=["c"]`; it does not validate the task-touched language.
+
+- Observation: All eight C residuals share declaration-site forward filtering gaps rather than inverse omissions.
+  Evidence: the Libgit2 byte is the second direct declarator in `size_t i, j;`, and the seven Chibicc bytes are the second names in `typedef struct X X;`. Tree-sitter exposes repeated `declarator` fields, but forward lookup inspected only one field and the type path used an even narrower `name`-only guard. Exact probes reproduce the wrong forward results; inverse correctly excludes declarations. This is assigned issue #997.
 
 ## Decision Log
 
@@ -91,6 +102,10 @@ The observable result is ten accepted repository records selected by exact desce
 
 - Decision: Interrupt the discovery corpus after filing and assigning #996, then resume only from a clean fixed runner.
   Rationale: Libgit2 and JerryScript had no durable records, the live stack proved they were exercising the defect, and continuing would spend hours producing evidence that must be rerun after the fix. The append-only Go-Ethereum record remains intact as discovery evidence.
+  Date/Author: 2026-07-20 / Codex
+
+- Decision: Preserve BitcoinAddressFinder as the literal task-ranked fourth record, and supplement rather than replace it with rank-six `aws__s2n-tls` after #997 is fixed.
+  Rationale: Substituting a different repository would violate the user's exact `tasks.py` selector contract, while calling a zero-file record meaningful C coverage would be misleading. The supplement keeps selector provenance intact and produces five substantive C audits; it will be labeled extra rather than silently promoted into the top five.
   Date/Author: 2026-07-20 / Codex
 
 ## Outcomes & Retrospective
@@ -227,3 +242,5 @@ No product interface change is assumed. Preserve the differential CLI and report
 Revision note (2026-07-20 15:00Z): Created this task-ranked C/C++ plan after proving the earlier LOC-ranked campaign did not satisfy the selector contract. Pinned the exact `SFT_PREDICATES` call, descending-count tie break, ten repository heads, zero-overlap discovery, existing issue ownership, frozen-runner discipline, language-summary boundaries, delegation limits, local gates, direct-master workflow, and clean full-language closure requirement before launching analyzers.
 
 Revision note (2026-07-20 17:18Z): Recorded the clean runner and first C discovery record, raised the final C candidate ceiling from measured evidence, documented #932's sound exact-but-unproven boundary, and added assigned issue #996 after a live production stack proved cross-target macro cursor serialization and replay thrash.
+
+Revision note (2026-07-20 18:45Z): Recorded #996 publication, gates, production proof, and closure; completed and integrity-checked the literal five-repository C discovery corpus; documented the BitcoinAddressFinder selector mismatch and supplemental real-C policy; and added assigned issue #997 from exhaustive adjudication of all eight declaration-site residuals.

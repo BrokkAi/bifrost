@@ -18,7 +18,7 @@
 //! chains) are an unhandled recall gap, not a wrong edge.
 
 use super::extractor::{
-    is_declaration_name, is_unqualified_method_group_argument, member_access_name,
+    is_declaration_name, is_unqualified_method_group_value, member_access_name,
     member_access_receiver,
 };
 use super::resolver::{
@@ -334,8 +334,8 @@ fn record_reference(
                 return;
             }
             if is_declaration_name(node) || !is_type_reference_node(node) {
-                // An unqualified `Member(..)` call attributes to the enclosing class.
-                if is_unqualified_method_group_argument(node, ctx.source) {
+                // Unqualified calls and method-group values attribute to the enclosing class.
+                if is_unqualified_method_group_value(node, ctx.source) {
                     let Some(owner_fqn) = ctx
                         .class_ranges
                         .enclosing(node.start_byte())

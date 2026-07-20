@@ -4713,6 +4713,107 @@ namespace System.Xml.Serialization {
 }
 
 #[test]
+fn usage_finder_csharp_finds_event_and_delegate_assignment_method_groups() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "Demo/Subscriber.cs",
+        r#"
+namespace Demo;
+
+public delegate void Handler(int value);
+
+public sealed class Source {
+    public event Handler Changed;
+}
+
+public sealed class Subscriber {
+    private Handler saved;
+
+    private void OnChanged(int value) {}
+
+    public void Wire(Source source) {
+        source.Changed += OnChanged;
+        saved = OnChanged;
+        Handler local = OnChanged;
+        Handler wrapped = ((Handler)OnChanged!);
+    }
+
+    public void WireShadowed(Source source, Handler OnChanged) {
+        source.Changed += OnChanged;
+        saved = OnChanged;
+    }
+}
+"#,
+    )]);
+
+    let target = member_function_with_arity(&analyzer, "Demo.Subscriber", "OnChanged", 1);
+    let consumer = project.file("Demo/Subscriber.cs");
+    let source = consumer.read_to_string().expect("consumer source");
+    let event_start = source
+        .find("source.Changed += OnChanged")
+        .expect("event method group")
+        + "source.Changed += ".len();
+    let forward = definition_lookup(
+        project.root(),
+        "Demo/Subscriber.cs",
+        event_start,
+        event_start + "OnChanged".len(),
+    );
+    assert_eq!(forward["results"][0]["status"], "resolved", "{forward}");
+    assert_eq!(
+        forward["results"][0]["definitions"][0]["fqn"], "Demo.Subscriber.OnChanged",
+        "{forward}"
+    );
+
+    let hits = graph_hits(&analyzer, &target);
+    assert_eq!(
+        4,
+        hits.len(),
+        "event, assignment, initializer, and wrapped initializer should resolve; shadowed values should not: {hits:#?}"
+    );
+    for expected_start in [
+        event_start,
+        source
+            .find("saved = OnChanged")
+            .expect("delegate assignment")
+            + "saved = ".len(),
+        source
+            .find("Handler local = OnChanged")
+            .expect("delegate initializer")
+            + "Handler local = ".len(),
+        source
+            .find("Handler wrapped = ((Handler)OnChanged!)")
+            .expect("wrapped delegate initializer")
+            + "Handler wrapped = ((Handler)".len(),
+    ] {
+        assert!(
+            hits.iter().any(|hit| {
+                hit.start_offset <= expected_start
+                    && expected_start + "OnChanged".len() <= hit.end_offset
+            }),
+            "missing inverse method-group hit at byte {expected_start}: {hits:#?}"
+        );
+    }
+    for shadowed_start in [
+        source
+            .rfind("source.Changed += OnChanged")
+            .expect("shadowed event method group")
+            + "source.Changed += ".len(),
+        source
+            .rfind("saved = OnChanged")
+            .expect("shadowed delegate assignment")
+            + "saved = ".len(),
+    ] {
+        assert!(
+            hits.iter().all(|hit| {
+                !(hit.start_offset <= shadowed_start
+                    && shadowed_start + "OnChanged".len() <= hit.end_offset)
+            }),
+            "parameter-shadowed method-group value must not count at byte {shadowed_start}: {hits:#?}"
+        );
+    }
+}
+
+#[test]
 fn usage_finder_csharp_finds_unique_private_method_group_argument() {
     let (project, analyzer) = csharp_analyzer_with_files(&[(
         "Demo/Command.cs",
