@@ -23,11 +23,12 @@ use super::extractor::{
 };
 use super::resolver::{
     UnqualifiedMethodGroupResolution, argument_count, class_unit_for_fq_name,
-    extension_visibility_site_key, first_type_child, is_type_reference_node,
-    method_return_type_fq_name_for_arity, nearest_member_candidates_for_owner, node_text,
-    reference_type_text, resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner,
+    extension_visibility_site_key, first_type_child, is_member_variable_declaration,
+    is_type_reference_node, nearest_member_candidates_for_owner, node_text, reference_type_text,
+    resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner, same_node,
     unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
-    visible_extension_method_candidates,
+    usage_class_field_receiver_type, usage_member_declared_type_fq_name,
+    usage_method_return_type_fq_name_for_arity, usage_visible_extension_method_candidates,
 };
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
@@ -37,7 +38,9 @@ use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInfere
 use crate::analyzer::{
     CSharpAnalyzer, CSharpMemberName, CallableArity, CodeUnit, IAnalyzer, ProjectFile,
     csharp_attribute_type_names, csharp_callable_arity, csharp_conditional_member_access,
-    csharp_member_name, csharp_unqualified_invocation_for_name,
+    csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver, csharp_member_name,
+    csharp_type_leftmost_identifier, csharp_type_reference_root,
+    csharp_unqualified_invocation_for_name,
 };
 use crate::hash::{HashMap, HashSet};
 use tree_sitter::Node;
@@ -199,10 +202,9 @@ impl CsScan<'_, '_> {
                 );
                 if !self.extension_cache.contains_key(&extension_key) {
                     let receiver_types = [owner_fqn.to_string()];
-                    let mut extensions = visible_extension_method_candidates(
+                    let mut extensions = usage_visible_extension_method_candidates(
                         self.csharp,
                         self.analyzer,
-                        self.file,
                         self.source,
                         node,
                         &receiver_types,
@@ -280,6 +282,18 @@ fn record_reference(
     ctx: &mut CsScan<'_, '_>,
     bindings: &LocalInferenceEngine<String>,
 ) {
+    if let Some(candidate) = csharp_constant_pattern_type_candidate(node) {
+        record_structured_type_candidate(candidate, true, ctx, bindings);
+    }
+    if let Some(receiver) = csharp_member_access_type_receiver(node) {
+        record_structured_type_candidate(receiver, true, ctx, bindings);
+    }
+    if let Some(root) = csharp_type_reference_root(node)
+        && same_node(root, node)
+    {
+        record_structured_type_candidate(root, false, ctx, bindings);
+        return;
+    }
     match node.kind() {
         "attribute" => {
             let Some(name) = node.child_by_field_name("name") else {
@@ -288,7 +302,7 @@ fn record_reference(
             let names = csharp_attribute_type_names(name, ctx.source);
             for candidate in ctx
                 .csharp
-                .unambiguous_attribute_type_candidates(ctx.file, &names)
+                .usage_unambiguous_attribute_type_candidates(ctx.file, &names)
             {
                 ctx.record(candidate.fq_name(), name);
             }
@@ -418,6 +432,38 @@ fn record_reference(
     }
 }
 
+fn record_structured_type_candidate(
+    candidate: Node<'_>,
+    reject_value_receiver: bool,
+    ctx: &mut CsScan<'_, '_>,
+    bindings: &LocalInferenceEngine<String>,
+) {
+    if reject_value_receiver {
+        let Some(leftmost) = csharp_type_leftmost_identifier(candidate) else {
+            return;
+        };
+        let name = node_text(leftmost, ctx.source);
+        if !bindings.resolve_symbol(name).is_unknown()
+            || unqualified_member_has_structured_shadow(leftmost, ctx.source)
+            || !usage_class_field_receiver_type(
+                leftmost,
+                name,
+                ctx.analyzer,
+                ctx.csharp,
+                ctx.file,
+                ctx.source,
+            )
+            .is_unknown()
+        {
+            return;
+        }
+    }
+    let reference = reference_type_text(candidate, ctx.source);
+    if let Some(fqn) = ctx.resolve_type_fqn_at(&reference, candidate) {
+        ctx.record(fqn, candidate);
+    }
+}
+
 /// The fqn of a receiver expression's type, for the shapes that resolve without
 /// return-type inference.
 fn receiver_type_fqn(
@@ -429,11 +475,13 @@ fn receiver_type_fqn(
         "identifier" => {
             let name = node_text(receiver, ctx.source);
             // A typed local resolves to its type; otherwise the name may be a
-            // static type, unless it is a known (shadowed) untyped local.
+            // class field/property or a static type, unless it is shadowed.
             first_precise(bindings, name).or_else(|| {
-                (!bindings.is_shadowed(name))
-                    .then(|| ctx.resolve_type_fqn_at(name, receiver))
-                    .flatten()
+                if bindings.is_shadowed(name) {
+                    return None;
+                }
+                enclosing_member_type_fqn(receiver, name, ctx)
+                    .or_else(|| ctx.resolve_type_fqn_at(name, receiver))
             })
         }
         "this" | "base" => ctx
@@ -492,6 +540,9 @@ fn seed_variable_declaration(
     ctx: &CsScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
+    if is_member_variable_declaration(node) {
+        return;
+    }
     let Some(type_node) = node.child_by_field_name("type") else {
         return;
     };
@@ -615,19 +666,28 @@ fn expression_type_fqn(
             let owner_fqn = receiver_type_fqn(receiver, ctx, bindings)?;
             let owner = class_unit_for_fq_name(ctx.csharp, &owner_fqn)?;
             let name = csharp_member_name(name_node)?;
-            super::resolver::member_declared_type_fq_name(
+            usage_member_declared_type_fq_name(
                 ctx.csharp,
-                ctx.file,
                 &owner,
                 node_text(name.identifier, ctx.source),
             )
         }
         "identifier" => {
             let name = node_text(expression, ctx.source);
-            first_precise(bindings, name)
+            first_precise(bindings, name).or_else(|| {
+                (!bindings.is_shadowed(name))
+                    .then(|| enclosing_member_type_fqn(expression, name, ctx))
+                    .flatten()
+            })
         }
         _ => None,
     }
+}
+
+fn enclosing_member_type_fqn(node: Node<'_>, name: &str, ctx: &CsScan<'_, '_>) -> Option<String> {
+    let owner_fqn = ctx.enclosing_class(node.start_byte())?;
+    let owner = class_unit_for_fq_name(ctx.csharp, owner_fqn)?;
+    usage_member_declared_type_fq_name(ctx.csharp, &owner, name)
 }
 
 fn invocation_return_type_fqn(
@@ -700,9 +760,8 @@ fn method_return_type_for_call(
     explicit_generic_arity: Option<usize>,
     explicit_type_arguments: Option<&[String]>,
 ) -> Option<String> {
-    method_return_type_fq_name_for_arity(
+    usage_method_return_type_fq_name_for_arity(
         ctx.csharp,
-        ctx.file,
         owner,
         method_name,
         Some(arity),

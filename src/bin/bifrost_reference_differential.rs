@@ -733,6 +733,10 @@ fn run_engine(
             "progress phase=inverse completed={completed} total={total} target={target} repo={progress_repo} elapsed={:.1}s",
             started.elapsed().as_secs_f64()
         ),
+        ReferenceDifferentialProgress::InverseTargetStarted { total, target } => eprintln!(
+            "progress phase=inverse status=started total={total} target={target} repo={progress_repo} elapsed={:.1}s",
+            started.elapsed().as_secs_f64()
+        ),
     })
 }
 

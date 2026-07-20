@@ -506,6 +506,97 @@ fn identifier_occurrence_range(
 }
 
 #[test]
+fn js_window_global_property_finds_bare_global_without_widening_members() {
+    let source = r#"window.Promise = makePromise();
+function readGlobal() { return typeof Promise; }
+function readExplicit() { return window.Promise; }
+function shadowed(Promise) { return typeof Promise; }
+function shadowedWindow(window) { return window.Promise; }
+function readOther() { return other.Promise; }
+other.Promise = makeOtherPromise();
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("polyfills.js", source).build());
+    let file = project.file("polyfills.js");
+    let target = find_js_target(&analyzer, &file, |unit| {
+        unit.is_field() && unit.fq_name() == "window.Promise"
+    });
+
+    let hits = authoritative_js_hits(&analyzer, &target, file);
+    let ranges: BTreeSet<_> = hits
+        .iter()
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect();
+
+    assert_eq!(
+        BTreeSet::from([
+            identifier_occurrence_range(source, "Promise", 2),
+            identifier_occurrence_range(source, "Promise", 3),
+        ]),
+        ranges,
+        "only exact explicit and unshadowed bare browser globals should resolve: {hits:#?}"
+    );
+}
+
+#[test]
+fn js_window_global_property_rejects_named_expression_receiver_bindings() {
+    for source in [
+        r#"const holder = function* window() {
+  window.Promise = makePromise();
+  return typeof Promise;
+};
+"#,
+        r#"const Holder = class window {
+  readGlobal() {
+    window.Promise = makePromise();
+    return typeof Promise;
+  }
+};
+"#,
+    ] {
+        let (project, analyzer) = js_inline_analyzer(|p| p.file("polyfills.js", source).build());
+        let file = project.file("polyfills.js");
+        let target = find_js_target(&analyzer, &file, |unit| {
+            unit.is_field() && unit.fq_name() == "window.Promise"
+        });
+
+        let hits = authoritative_js_hits(&analyzer, &target, file);
+        assert!(
+            hits.is_empty(),
+            "a named expression's self-binding is not the browser global: {hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn js_window_global_property_respects_later_lexical_bindings() {
+    for source in [
+        r#"window.Promise = makePromise();
+function readBeforeFileBinding() { return typeof Promise; }
+const Promise = makeLocalPromise();
+"#,
+        r#"window.Promise = makePromise();
+function readBeforeFunctionBinding() {
+    const before = typeof Promise;
+    var Promise;
+    return before;
+}
+"#,
+    ] {
+        let (project, analyzer) = js_inline_analyzer(|p| p.file("polyfills.js", source).build());
+        let file = project.file("polyfills.js");
+        let target = find_js_target(&analyzer, &file, |unit| {
+            unit.is_field() && unit.fq_name() == "window.Promise"
+        });
+
+        let hits = authoritative_js_hits(&analyzer, &target, file);
+        assert!(
+            hits.is_empty(),
+            "TDZ and var-hoisted bindings must shadow earlier reads: {hits:#?}"
+        );
+    }
+}
+
+#[test]
 fn authoritative_js_usage_counts_assignment_pattern_default_rhs() {
     let source = r#"const UNKNOWN = 0;
 class Path {

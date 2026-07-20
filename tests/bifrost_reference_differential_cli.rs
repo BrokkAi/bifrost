@@ -296,6 +296,10 @@ fn run_repo_writes_completed_jsonl_report_for_tiny_project() {
     );
     assert!(stderr.contains("progress phase=forward"), "{stderr}");
     assert!(
+        stderr.contains("progress phase=inverse status=started total=2 target="),
+        "{stderr}"
+    );
+    assert!(
         stderr.contains("progress phase=inverse completed=1 total=2"),
         "{stderr}"
     );

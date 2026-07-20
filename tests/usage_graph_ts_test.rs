@@ -350,6 +350,123 @@ export function caller() {
 }
 
 #[test]
+fn js_window_global_property_edges_from_bare_global_only() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "polyfills.js",
+            r#"
+window.Promise = function Promise() {};
+function readGlobal() { return typeof Promise; }
+function readExplicit() { return window.Promise; }
+function shadowed(Promise) { return typeof Promise; }
+function readOther() { return other.Promise; }
+other.Promise = makeOtherPromise();
+"#,
+        )
+        .build();
+
+    let graph = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&graph, "readGlobal", "window.Promise"),
+        "bare browser global should resolve to the exact modeled window property: {}",
+        graph["edges"]
+    );
+    assert!(
+        has_edge(&graph, "readExplicit", "window.Promise"),
+        "explicit browser-global member reads should share the exact edge: {}",
+        graph["edges"]
+    );
+    assert!(
+        !has_edge(&graph, "shadowed", "window.Promise"),
+        "parameter shadows must not resolve to the browser global: {}",
+        graph["edges"]
+    );
+    assert!(
+        !has_edge(&graph, "readOther", "window.Promise"),
+        "same-name properties on unrelated objects must not resolve to the browser global: {}",
+        graph["edges"]
+    );
+}
+
+#[test]
+fn js_window_global_property_edges_reject_bound_declaration_receiver() {
+    for (source, extra_file) in [
+        (
+            r#"const window = makeLocalWindow();
+window.Promise = function Promise() {};
+function readGlobal() { return typeof Promise; }
+"#,
+            None,
+        ),
+        (
+            r#"import window from "./shim.js";
+window.Promise = function Promise() {};
+function readGlobal() { return typeof Promise; }
+"#,
+            Some("export default {};"),
+        ),
+        (
+            r#"const holder = function* window() {
+  window.Promise = function Promise() {};
+  function readGlobal() { return typeof Promise; }
+  return readGlobal();
+};
+"#,
+            None,
+        ),
+    ] {
+        let project =
+            InlineTestProject::with_language(Language::JavaScript).file("polyfills.js", source);
+        let project = if let Some(contents) = extra_file {
+            project.file("shim.js", contents)
+        } else {
+            project
+        }
+        .build();
+        let graph = usage_graph_at(project.root(), "{}");
+        assert!(
+            !has_edge(&graph, "readGlobal", "window.Promise"),
+            "a locally or import-bound window receiver is not the browser global: {}",
+            graph["edges"]
+        );
+    }
+}
+
+#[test]
+fn js_window_global_property_edges_respect_later_lexical_bindings() {
+    for (caller, body) in [
+        (
+            "readBeforeFileBinding",
+            r#"function readBeforeFileBinding() { return typeof Promise; }
+const Promise = makeLocalPromise();
+"#,
+        ),
+        (
+            "readBeforeFunctionBinding",
+            r#"function readBeforeFunctionBinding() {
+    const before = typeof Promise;
+    var Promise;
+    return before;
+}
+"#,
+        ),
+    ] {
+        let project = InlineTestProject::with_language(Language::JavaScript)
+            .file(
+                "polyfills.js",
+                format!("window.Promise = function Promise() {{}};\n{body}"),
+            )
+            .build();
+        let graph = usage_graph_at(project.root(), "{}");
+        assert!(
+            !has_edge(&graph, caller, "window.Promise"),
+            "TDZ and var-hoisted bindings must shadow earlier reads: {}",
+            graph["edges"]
+        );
+    }
+}
+
+#[test]
 fn ts_block_local_receiver_shadow_does_not_leak_to_outer_call() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(

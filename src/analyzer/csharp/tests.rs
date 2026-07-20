@@ -295,3 +295,15 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
         .get(node.start_byte()..node.end_byte())
         .unwrap_or_default()
 }
+
+#[test]
+fn csharp_issue701_arity_key_keeps_generic_owner_and_normalizes_constructor_member() {
+    assert_eq!(
+        super::csharp_arity_preserving_full_name("Ns.List`1.#ctor"),
+        "Ns.List`1.List"
+    );
+    assert_eq!(
+        super::csharp_arity_preserving_full_name("global::Ns.Outer+Inner`1.#ctor"),
+        "Ns.Outer.Inner`1.Inner"
+    );
+}

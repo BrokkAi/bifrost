@@ -4847,6 +4847,263 @@ fn scan_usages_location_target_selects_js_object_literal_method() {
 }
 
 #[test]
+fn scan_usages_location_recovers_lookup_only_local_assignment_property_reads() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "assignment.js",
+            r#"function selected(other) {
+  const node = {};
+  consume(node.operator);
+  node.operator = "=";
+  consume(node.operator);
+  node.operator = "+";
+  consume(other.operator);
+  {
+    const node = {};
+    consume(node.operator);
+  }
+}
+
+function sibling() {
+  const node = {};
+  consume(node.operator);
+}
+"#,
+        )
+        .file(
+            "other.js",
+            r#"function elsewhere() {
+  const node = {};
+  consume(node.operator);
+}
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"assignment.js","line":4,"column":8,"symbol":"node.operator"}],"include_tests":true}"#,
+        )
+        .expect("location scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let result = only_result(&value);
+
+    assert_eq!("found", result["status"], "payload: {value}");
+    assert_eq!("assignment.js#node.operator", result["symbol"], "{value}");
+    assert_eq!(0, result["unproven_hits"], "payload: {value}");
+    assert_eq!(1, result["total_hits"], "payload: {value}");
+    assert_eq!("assignment.js", result["files"][0]["path"], "{value}");
+    assert_eq!(5, result["files"][0]["hits"][0]["line"], "{value}");
+
+    let unrelated_payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"assignment.js","line":7,"column":17,"symbol":"node.operator"}],"include_tests":true}"#,
+        )
+        .expect("unrelated location scan succeeds");
+    let unrelated: Value = serde_json::from_str(&unrelated_payload).expect("valid response");
+    assert_eq!(
+        "not_found",
+        only_result(&unrelated)["status"],
+        "{unrelated}"
+    );
+}
+
+#[test]
+fn scan_usages_location_recovers_nested_local_assignment_property_reads() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "fetch.js",
+            r#"function selected(fetchParams, other) {
+  consume(fetchParams.controller.controller);
+  const stream = {
+    start(controller) {
+      fetchParams.controller.controller = controller;
+      consume(fetchParams.controller.controller);
+    },
+  };
+  consume(fetchParams.controller.controller);
+  consume(other.controller.controller);
+  consume(fetchParams.other.controller);
+  {
+    const fetchParams = {};
+    consume(fetchParams.controller.controller);
+  }
+  return stream;
+}
+
+function sibling(fetchParams) {
+  consume(fetchParams.controller.controller);
+}
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"fetch.js","line":5,"column":30,"symbol":"fetchParams.controller.controller"}],"include_tests":true}"#,
+        )
+        .expect("location scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let result = only_result(&value);
+
+    assert_eq!("found", result["status"], "payload: {value}");
+    assert_eq!(
+        "fetch.js#fetchParams.controller.controller", result["symbol"],
+        "{value}"
+    );
+    assert_eq!(0, result["unproven_hits"], "payload: {value}");
+    assert_eq!(2, result["total_hits"], "payload: {value}");
+    let lines: BTreeSet<u64> = result["files"][0]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["line"].as_u64().expect("hit line"))
+        .collect();
+    assert_eq!(BTreeSet::from([6, 9]), lines, "payload: {value}");
+}
+
+#[test]
+fn scan_usages_location_recovers_lookup_only_local_object_property_reads() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "object.js",
+            r#"consume(options.enabled);
+export const options = { enabled: true };
+consume(options.enabled);
+options.enabled = false;
+consume(other.enabled);
+
+function shadowed() {
+  const options = {};
+  consume(options.enabled);
+}
+
+function sibling() {
+  const options = {};
+  consume(options.enabled);
+}
+"#,
+        )
+        .file(
+            "other.js",
+            r#"function elsewhere() {
+  const options = {};
+  consume(options.enabled);
+}
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"object.js","line":2,"column":26,"symbol":"options.enabled"}],"include_tests":true}"#,
+        )
+        .expect("location scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let result = only_result(&value);
+
+    assert_eq!("found", result["status"], "payload: {value}");
+    assert_eq!("object.js#options.enabled", result["symbol"], "{value}");
+    assert_eq!(0, result["unproven_hits"], "payload: {value}");
+    assert_eq!(1, result["total_hits"], "payload: {value}");
+    assert_eq!("object.js", result["files"][0]["path"], "{value}");
+    assert_eq!(3, result["files"][0]["hits"][0]["line"], "{value}");
+}
+
+#[test]
+fn scan_usages_location_recovers_declared_commonjs_export_root_property_reads() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "safer.js",
+            r#"var plain = {};
+plain.kStringMaxLength = 1;
+consume(plain.kStringMaxLength);
+
+var safer = {};
+if (!safer.kStringMaxLength) {
+  safer.kStringMaxLength = getLimit();
+}
+if (!safer.constants) {
+  safer.constants = {};
+  if (safer.kStringMaxLength) {
+    safer.constants.MAX_STRING_LENGTH = safer.kStringMaxLength;
+  }
+}
+consume(other.kStringMaxLength);
+{
+  const safer = {};
+  consume(safer.kStringMaxLength);
+}
+
+function sibling() {
+  const safer = {};
+  consume(safer.kStringMaxLength);
+}
+
+module.exports = safer;
+"#,
+        )
+        .file(
+            "consumer.js",
+            r#"const exported = require("./safer");
+consume(exported.kStringMaxLength);
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"safer.js","line":7,"column":9,"symbol":"safer.kStringMaxLength"}],"include_tests":true}"#,
+        )
+        .expect("location scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let result = only_result(&value);
+
+    assert_eq!("found", result["status"], "payload: {value}");
+    assert_eq!(
+        "safer.js#safer.kStringMaxLength", result["symbol"],
+        "{value}"
+    );
+    assert_eq!(0, result["unproven_hits"], "payload: {value}");
+    assert_eq!(3, result["total_hits"], "payload: {value}");
+    let hits: BTreeSet<(String, u64)> = result["files"]
+        .as_array()
+        .expect("files array")
+        .iter()
+        .flat_map(|file| {
+            let path = file["path"].as_str().expect("file path").to_string();
+            file["hits"]
+                .as_array()
+                .expect("hits array")
+                .iter()
+                .map(move |hit| (path.clone(), hit["line"].as_u64().expect("hit line")))
+        })
+        .collect();
+    assert_eq!(
+        BTreeSet::from([
+            ("consumer.js".to_string(), 2),
+            ("safer.js".to_string(), 11),
+            ("safer.js".to_string(), 12),
+        ]),
+        hits,
+        "payload: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_location_prefers_scala_class_over_shared_primary_constructor_range() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

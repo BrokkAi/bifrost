@@ -1,4 +1,4 @@
-use crate::analyzer::js_ts::syntax::compute_import_binder;
+use crate::analyzer::js_ts::syntax::{JsTsLexicalBindingIndex, compute_import_binder, slice};
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_target_filtered};
 use crate::analyzer::usages::js_ts_graph::extractor::compute_export_index;
 use crate::analyzer::usages::model::{
@@ -14,7 +14,7 @@ use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 use rayon::prelude::*;
 use std::collections::{BTreeSet, VecDeque};
-use tree_sitter::Parser;
+use tree_sitter::{Node, Parser};
 
 /// JS/TS resolution maps for one language: a re-export + importer index built from the
 /// per-file export/import indices plus analyzer-level module resolution
@@ -690,6 +690,65 @@ pub(super) fn member_name(target: &CodeUnit) -> Option<String> {
     }
     let last = parts.last().copied()?;
     Some(last.trim_end_matches("$static").to_string())
+}
+
+pub(in crate::analyzer::usages) fn browser_global_property_shape(
+    target: &CodeUnit,
+) -> Option<(&str, &str)> {
+    if !target.is_field() && !target.is_function() {
+        return None;
+    }
+    let (object, property) = target.short_name().split_once('.')?;
+    (object == "window" && !property.is_empty() && !property.contains('.'))
+        .then_some((object, property))
+}
+
+pub(in crate::analyzer::usages) fn unbound_browser_global_property<'a>(
+    analyzer: &dyn IAnalyzer,
+    target: &'a CodeUnit,
+    root: Node<'_>,
+    source: &str,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+) -> Option<(&'a str, &'a str)> {
+    let (object_name, property_name) = browser_global_property_shape(target)?;
+    if analyzer.parent_of(target).is_some() {
+        return None;
+    }
+
+    let target_ranges = analyzer.ranges(target);
+    let mut found = false;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "member_expression"
+            && node.parent().is_some_and(|parent| {
+                parent.kind() == "assignment_expression"
+                    && parent
+                        .child_by_field_name("left")
+                        .is_some_and(|left| left.id() == node.id())
+            })
+            && let (Some(object), Some(property)) = (
+                node.child_by_field_name("object"),
+                node.child_by_field_name("property"),
+            )
+            && slice(object, source) == object_name
+            && slice(property, source) == property_name
+            && target_ranges.iter().any(|range| {
+                range.start_byte <= property.start_byte() && property.end_byte() <= range.end_byte
+            })
+        {
+            found = true;
+            if lexical_bindings.is_bound_at(object_name, object.start_byte()) {
+                return None;
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+
+    found.then_some((object_name, property_name))
 }
 
 pub(super) fn is_static_member(target: &CodeUnit) -> bool {

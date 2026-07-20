@@ -165,21 +165,30 @@ impl CSharpAnalyzer {
         &self,
         parallel: bool,
     ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
-        let mut by_namespace_and_name: HashMap<(String, String), Vec<ProjectFile>> =
+        let mut by_namespace_and_name: HashMap<String, HashMap<String, Vec<ProjectFile>>> =
             HashMap::default();
         let mut by_fq_name: HashMap<String, Vec<ProjectFile>> = HashMap::default();
-        for target in self.inner.all_files() {
-            for unit in self
-                .inner
-                .top_level_declarations(&target)
+        let mut namespaces_by_file: HashMap<ProjectFile, Vec<String>> = HashMap::default();
+        let files: Vec<_> = self.inner.all_files();
+        for target in &files {
+            let top_level = self.inner.top_level_declarations(target);
+            let mut namespaces = HashSet::default();
+            for unit in &top_level {
+                namespaces.insert(unit.package_name().to_string());
+            }
+            if namespaces.is_empty() {
+                namespaces.insert(String::new());
+            }
+            namespaces_by_file.insert(target.clone(), namespaces.into_iter().collect());
+
+            for unit in top_level
                 .into_iter()
                 .filter(|unit| unit.kind() == CodeUnitType::Class)
             {
                 by_namespace_and_name
-                    .entry((
-                        unit.package_name().to_string(),
-                        unit.identifier().to_string(),
-                    ))
+                    .entry(unit.package_name().to_string())
+                    .or_default()
+                    .entry(unit.identifier().to_string())
                     .or_default()
                     .push(target.clone());
                 by_fq_name
@@ -193,20 +202,25 @@ impl CSharpAnalyzer {
             }
         }
 
-        let files: Vec<_> = self.inner.all_files();
         build_reverse_file_index(
             &files,
             |candidate| {
                 let Some(identifiers) = self.inner.type_identifiers_of(candidate) else {
                     return Vec::new();
                 };
-                let candidate_namespace = self.namespace_of_file(candidate);
+                let candidate_namespaces = namespaces_by_file
+                    .get(candidate)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
                 let mut resolved_targets = Vec::new();
                 for identifier in identifiers {
-                    if let Some(namespace_targets) = by_namespace_and_name
-                        .get(&(candidate_namespace.clone(), identifier.clone()))
-                    {
-                        resolved_targets.extend(namespace_targets.iter().cloned());
+                    for candidate_namespace in candidate_namespaces {
+                        if let Some(namespace_targets) = by_namespace_and_name
+                            .get(candidate_namespace)
+                            .and_then(|by_name| by_name.get(&identifier))
+                        {
+                            resolved_targets.extend(namespace_targets.iter().cloned());
+                        }
                     }
                     if let Some(fq_targets) = by_fq_name.get(&identifier) {
                         resolved_targets.extend(fq_targets.iter().cloned());
