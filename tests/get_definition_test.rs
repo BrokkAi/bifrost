@@ -14821,6 +14821,85 @@ fn csharp_extension_method_resolves_from_visible_namespace() {
 }
 
 #[test]
+fn csharp_extension_candidates_require_structured_external_receiver_evidence() {
+    let source = r#"using System;
+namespace ClosedXML.Excel;
+
+internal static class TypeExtensions {
+    public static string Describe(this Type type) => "type";
+    public static Type GetUnderlyingType(this Type type) => type;
+
+    public static bool IsNullable(Type type) =>
+        Nullable.GetUnderlyingType(type) != null;
+
+    public static string DescribeLocal(Type type) {
+        Type local = type;
+        return local.Describe();
+    }
+}
+
+internal static class UriExtensions {
+    public static string Describe(this Uri uri) => "uri";
+}
+
+internal static class Consumer {
+    public static string DescribeType(Type type) => type.Describe();
+    public static string DescribeUri(Uri uri) => uri.Describe();
+    public static string Unknown() => mystery.Describe();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("ClosedXML/Extensions/TypeExtensions.cs", source)
+        .build();
+
+    let sites = [
+        ("Nullable.GetUnderlyingType", "Nullable."),
+        ("local.Describe()", "local."),
+        ("type.Describe()", "type."),
+        ("uri.Describe()", "uri."),
+        ("mystery.Describe()", "mystery."),
+    ];
+    let references = sites
+        .into_iter()
+        .map(|(needle, receiver)| {
+            let offset = source.find(needle).expect("reference site") + receiver.len();
+            location_query("ClosedXML/Extensions/TypeExtensions.cs", source, offset)
+        })
+        .collect::<Vec<_>>();
+    let value = lookup(
+        project.root(),
+        &json!({ "references": references }).to_string(),
+    );
+
+    for index in [0, 4] {
+        assert_ne!(
+            value["results"][index]["status"], "resolved",
+            "an untyped receiver must not borrow a visible extension owner: {value}"
+        );
+        assert!(
+            value["results"][index]["definitions"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "an untyped receiver must not produce a local definition: {value}"
+        );
+    }
+
+    for index in [1, 2] {
+        assert_eq!(value["results"][index]["status"], "resolved", "{value}");
+        assert_eq!(
+            value["results"][index]["definitions"][0]["fqn"],
+            "ClosedXML.Excel.TypeExtensions.Describe",
+            "declared Type evidence must select only the Type extension: {value}"
+        );
+    }
+    assert_eq!(value["results"][3]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][3]["definitions"][0]["fqn"], "ClosedXML.Excel.UriExtensions.Describe",
+        "declared Uri evidence must select only the Uri extension: {value}"
+    );
+}
+
+#[test]
 fn csharp_inapplicable_direct_member_yields_to_matching_extension() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

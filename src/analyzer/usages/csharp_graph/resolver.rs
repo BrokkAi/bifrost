@@ -804,10 +804,21 @@ fn seed_symbol_for_type(
     bindings: &mut LocalInferenceEngine<String>,
     usage: bool,
 ) {
-    if let Some(target) =
-        resolve_type_fq_name_for_scope(csharp, file, &reference_type_text(type_node, source), usage)
-    {
+    let reference = reference_type_text(type_node, source);
+    if let Some(target) = resolve_type_fq_name_for_scope(csharp, file, &reference, usage) {
         bindings.seed_symbol(node_text(name_node, source), target);
+    } else if !usage {
+        let normalized = normalize_type_text(&reference);
+        let raw_type = csharp
+            .using_aliases_of(file)
+            .get(&normalized)
+            .cloned()
+            .unwrap_or(normalized);
+        if raw_type.is_empty() || raw_type == "var" {
+            bindings.declare_shadow(node_text(name_node, source));
+        } else {
+            bindings.seed_symbol(node_text(name_node, source), raw_type);
+        }
     } else {
         bindings.declare_shadow(node_text(name_node, source));
     }
@@ -1139,13 +1150,17 @@ fn extension_method_receiver_type_inner(
     }
     let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer)?;
     let owner = analyzer.parent_of(unit)?;
-    analyzer
+    let receiver_type = analyzer
         .signatures(unit)
         .iter()
-        .find_map(|signature| extension_receiver_type_from_signature(signature))
-        .and_then(|type_text| {
-            resolve_member_type_fq_name(csharp, unit.source(), &owner, &type_text, usage)
-        })
+        .find_map(|signature| extension_receiver_type_from_signature(signature))?;
+    let resolved =
+        resolve_member_type_fq_name(csharp, unit.source(), &owner, &receiver_type, usage);
+    if usage {
+        resolved
+    } else {
+        resolved.or_else(|| Some(normalize_type_text(&receiver_type)))
+    }
 }
 
 #[derive(Default)]
@@ -1238,6 +1253,9 @@ fn visible_extension_method_candidates_inner(
 ) -> Vec<CodeUnit> {
     let compatible_receiver_types =
         compatible_receiver_type_names(csharp, analyzer, receiver_type_names, usage);
+    if !usage && compatible_receiver_types.is_empty() {
+        return Vec::new();
+    }
     let scopes = extension_visibility_scopes(csharp, source, site, usage);
     let named_candidates = if usage {
         csharp
@@ -1284,18 +1302,22 @@ fn visible_extension_method_candidates_inner(
             })
             .filter(|unit| is_extension_method(analyzer, unit))
             .filter(|unit| {
-                compatible_receiver_types.is_empty()
-                    || (if usage {
-                        usage_extension_method_receiver_type(analyzer, unit)
-                    } else {
-                        extension_method_receiver_type(analyzer, unit)
-                    })
-                    .is_none_or(|receiver| {
-                        let receiver = csharp_normalize_full_name(&receiver);
-                        compatible_receiver_types
-                            .iter()
-                            .any(|candidate| type_identity_matches(candidate, &receiver))
-                    })
+                let receiver = if usage {
+                    usage_extension_method_receiver_type(analyzer, unit)
+                } else {
+                    extension_method_receiver_type(analyzer, unit)
+                };
+                let matches_receiver = |receiver: String| {
+                    let receiver = csharp_normalize_full_name(&receiver);
+                    compatible_receiver_types
+                        .iter()
+                        .any(|candidate| type_identity_matches(candidate, &receiver))
+                };
+                if usage {
+                    compatible_receiver_types.is_empty() || receiver.is_none_or(matches_receiver)
+                } else {
+                    receiver.is_some_and(matches_receiver)
+                }
             })
             .collect::<Vec<_>>();
         let Some(call_arity) = call_arity else {

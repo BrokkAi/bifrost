@@ -149,8 +149,13 @@ pub(super) fn resolve_csharp(
             );
             let mut receiver_type_names = owners.iter().map(CodeUnit::fq_name).collect::<Vec<_>>();
             if receiver_type_names.is_empty() {
-                receiver_type_names =
-                    csharp_explicit_receiver_type_names(csharp, file, source, receiver);
+                receiver_type_names = csharp_structured_receiver_type_names(
+                    csharp,
+                    file,
+                    source,
+                    tree.root_node(),
+                    receiver,
+                );
             }
             let arity = csharp_invocation_arity(name, source);
             let outcome = csharp_member_outcome(
@@ -316,10 +321,11 @@ pub(super) fn resolve_csharp(
     }
 }
 
-fn csharp_explicit_receiver_type_names(
+fn csharp_structured_receiver_type_names(
     csharp: &CSharpAnalyzer,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     mut receiver: Node<'_>,
 ) -> Vec<String> {
     while matches!(
@@ -330,6 +336,16 @@ fn csharp_explicit_receiver_type_names(
             return Vec::new();
         };
         receiver = inner;
+    }
+    if receiver.kind() == "identifier" {
+        let name = csharp_node_text(receiver, source);
+        let bindings =
+            csharp_legacy_bindings_before_scoped(csharp, file, source, root, receiver.start_byte());
+        return bindings
+            .resolve_symbol(name)
+            .as_precise()
+            .map(|types| types.iter().cloned().collect())
+            .unwrap_or_default();
     }
     let type_node = match receiver.kind() {
         "cast_expression" => receiver.child_by_field_name("type"),
