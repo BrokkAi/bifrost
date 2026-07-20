@@ -8,6 +8,7 @@ use common::InlineTestProject;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
+#[cfg(unix)]
 use tempfile::TempDir;
 
 #[test]
