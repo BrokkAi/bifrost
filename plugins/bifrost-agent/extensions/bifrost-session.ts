@@ -15,6 +15,7 @@ import {
 import {
   createBoundedToolError,
   mapToolResult,
+  renderToolCall,
   renderToolResult,
   toolLabel,
   toolParameters,
@@ -445,6 +446,8 @@ class BifrostSession implements BifrostSessionController {
         parameters: toolParameters(tool),
         execute: async (_toolCallId, params, signal) =>
           await this.executeTool(tool, registeredName, params, signal),
+        renderCall: (args, theme, context) =>
+          renderToolCall(registeredName, args, context.expanded, theme),
         renderResult: renderToolResult,
       });
       this.ownedPiToolNames.add(registeredName);

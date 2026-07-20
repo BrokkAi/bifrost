@@ -185,6 +185,7 @@ test("registers a namespaced tool and forwards the canonical MCP name", async ()
   assert.deepEqual(session.status(), connectedStatus("/workspace", ["symbols"], SYMBOL_TOOL_NAMES.length));
   assert.deepEqual(resolved, [{ root: "/workspace", toolset: "symbol" }]);
   assert.equal(pi.registered[0].name, "bifrost_search_symbols");
+  assert.equal(typeof pi.registered[0].renderCall, "function");
   assert.equal(typeof pi.registered[0].renderResult, "function");
   assert.deepEqual(new Set(pi.activeNames), new Set(["read", ...piNames(SYMBOL_TOOL_NAMES)]));
 

@@ -8,7 +8,6 @@ import {
   formatSize,
   keyHint,
   truncateHead,
-  truncateToVisualLines,
   type AgentToolResult,
   type Theme,
   type ToolRenderResultOptions,
@@ -79,6 +78,29 @@ export async function createBoundedToolError(message: string, cause?: unknown): 
   return new Error(bounded.text, { cause });
 }
 
+export function renderToolCall(
+  toolName: string,
+  args: Record<string, unknown>,
+  expanded: boolean,
+  theme: Theme,
+): Component {
+  const title = theme.fg("toolTitle", theme.bold(toolName));
+  if (Object.keys(args).length === 0) {
+    return new Text(title, 0, 0);
+  }
+  if (expanded) {
+    return new Text(`${title}\n${theme.fg("muted", JSON.stringify(args, null, 2))}`, 0, 0);
+  }
+
+  const summary = Object.entries(args)
+    .map(([name, value]) => `${name}: ${summarizeArgument(value)}`)
+    .join("  ");
+  return {
+    render: (width: number) => [truncateToWidth(`${title} ${theme.fg("muted", summary)}`, width, "...")],
+    invalidate(): void {},
+  };
+}
+
 export function renderToolResult(
   result: AgentToolResult<BifrostToolDetails>,
   options: ToolRenderResultOptions,
@@ -103,7 +125,7 @@ export function renderToolResult(
       .map((line) => theme.fg("toolOutput", line))
       .join("\n");
     if (options.expanded) {
-      container.addChild(new Text(styledOutput, 0, 0));
+      container.addChild(new Text(`\n${styledOutput}`, 0, 0));
     } else {
       container.addChild(collapsedOutput(styledOutput, theme));
     }
@@ -122,7 +144,7 @@ export function renderToolResult(
           : `Truncated: showing ${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}`,
       );
     }
-    container.addChild(new Text(theme.fg("warning", `[${warnings.join(". ")}]`), 0, 0));
+    container.addChild(new Text(`\n${theme.fg("warning", `[${warnings.join(". ")}]`)}`, 0, 0));
   }
 
   return container;
@@ -161,28 +183,38 @@ function modelTruncationNotice(fullOutputPath: string): string {
 function collapsedOutput(output: string, theme: Theme): Component {
   let cachedWidth: number | undefined;
   let cachedLines: string[] | undefined;
-  let cachedSkipped: number | undefined;
+  let cachedRemaining: number | undefined;
   return {
     render(width: number): string[] {
       if (cachedLines === undefined || cachedWidth !== width) {
-        const preview = truncateToVisualLines(output, TUI_PREVIEW_LINES, width);
-        cachedLines = preview.visualLines;
-        cachedSkipped = preview.skippedCount;
+        const allLines = new Text(output, 0, 0).render(width);
+        cachedLines = allLines.slice(0, TUI_PREVIEW_LINES);
+        cachedRemaining = Math.max(0, allLines.length - TUI_PREVIEW_LINES);
         cachedWidth = width;
       }
-      if (cachedSkipped && cachedSkipped > 0) {
-        const hint = theme.fg("muted", `... (${cachedSkipped} earlier lines,`)
+      if (cachedRemaining && cachedRemaining > 0) {
+        const hint = theme.fg("muted", `... (${cachedRemaining} more visual lines,`)
           + ` ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
-        return [truncateToWidth(hint, width, "..."), ...(cachedLines ?? [])];
+        return ["", ...(cachedLines ?? []), truncateToWidth(hint, width, "...")];
       }
-      return cachedLines ?? [];
+      return ["", ...(cachedLines ?? [])];
     },
     invalidate(): void {
       cachedWidth = undefined;
       cachedLines = undefined;
-      cachedSkipped = undefined;
+      cachedRemaining = undefined;
     },
   };
+}
+
+function summarizeArgument(value: unknown): string {
+  if (typeof value === "string") {
+    return value.replace(/\s+/g, " ").trim();
+  }
+  if (Array.isArray(value) && value.every((item) => ["string", "number", "boolean"].includes(typeof item))) {
+    return value.map((item) => summarizeArgument(item)).join(", ");
+  }
+  return JSON.stringify(value) ?? String(value);
 }
 
 function textContent(result: AgentToolResult<BifrostToolDetails>): string {

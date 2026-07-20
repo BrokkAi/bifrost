@@ -7,6 +7,7 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, initTheme } from "@earendil-works
 
 import {
   mapToolResult,
+  renderToolCall,
   renderToolResult,
   toolLabel,
   toolParameters,
@@ -15,6 +16,7 @@ import {
 initTheme("dark", false);
 
 const plainTheme = {
+  bold: (text) => text,
   fg: (_color, text) => text,
 };
 
@@ -106,6 +108,23 @@ test("caps oversized MCP errors after their full tool prefix and saves complete 
   assert.equal(await readFile(fullOutputPath, "utf8"), fullError);
 });
 
+test("renders concise tool arguments and expands their complete JSON", () => {
+  const args = {
+    patterns: ["Widget", "Widget\nFactory"],
+    include_tests: true,
+    note: "first line\nsecond line",
+  };
+  const collapsed = renderToolCall("bifrost_search_symbols", args, false, plainTheme).render(140);
+  const expanded = renderToolCall("bifrost_search_symbols", args, true, plainTheme).render(140);
+
+  assert.deepEqual(collapsed, [
+    "bifrost_search_symbols patterns: Widget, Widget Factory  include_tests: true  note: first line second line",
+  ]);
+  const expandedText = expanded.map((line) => line.trimEnd()).join("\n");
+  assert.match(expandedText, /^bifrost_search_symbols\n\{/);
+  assert.match(expandedText, /"patterns": \[/);
+});
+
 test("caps the model result and saves complete output in a dedicated overflow file", async (t) => {
   const oversized = `${"x".repeat(80)}\n`.repeat(DEFAULT_MAX_LINES + 1000);
   const overflowOnly = `${oversized}OVERFLOW_ONLY`;
@@ -130,6 +149,7 @@ test("caps the model result and saves complete output in a dedicated overflow fi
     plainTheme,
   ).render(80).join("\n");
   assert.match(tuiOutput, new RegExp(fullOutputPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(tuiOutput, /more visual lines/);
   assert.match(tuiOutput, /to expand/);
   assert.doesNotMatch(tuiOutput, /Output truncated at Pi's/);
 
@@ -157,10 +177,13 @@ test("keeps the TUI compact until the user expands tool output", () => {
     plainTheme,
   ).render(80);
 
-  assert.equal(collapsed.length, 6);
-  assert.match(collapsed.join("\n"), /to expand/);
-  assert.doesNotMatch(collapsed.join("\n"), /result 1(?:\n|$)/);
-  assert.match(collapsed.join("\n"), /result 12/);
+  assert.equal(collapsed.length, 7);
+  assert.equal(collapsed[0], "");
+  assert.equal(collapsed[1].trimEnd(), "result 1");
+  assert.doesNotMatch(collapsed.join("\n"), /result 12/);
+  assert.match(collapsed.at(-1), /7 more visual lines/);
+  assert.match(collapsed.at(-1), /to expand/);
+  assert.equal(expanded[0].trim(), "");
   assert.match(expanded.join("\n"), /result 1/);
   assert.match(expanded.join("\n"), /result 12/);
 
@@ -169,5 +192,7 @@ test("keeps the TUI compact until the user expands tool output", () => {
     { expanded: false, isPartial: false },
     plainTheme,
   ).render(8);
-  assert.equal(wrappedCollapsed.length, 6);
+  assert.equal(wrappedCollapsed.length, 7);
+  assert.equal(wrappedCollapsed[0], "");
+  assert.match(wrappedCollapsed.at(-1), /^\.\.\. \(/);
 });
