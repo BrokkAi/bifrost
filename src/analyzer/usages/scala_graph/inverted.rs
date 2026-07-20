@@ -201,37 +201,6 @@ fn sorted_unique_units(mut units: Vec<CodeUnit>) -> Vec<CodeUnit> {
 }
 
 impl ProjectTypes {
-    pub(crate) fn build(scala: &ScalaAnalyzer) -> Self {
-        let index = scala.global_usage_definition_index_shared();
-        let type_aliases = Arc::new(
-            scala
-                .all_declarations()
-                .filter(|unit| scala.is_type_alias(unit))
-                .collect(),
-        );
-        Self {
-            index,
-            type_aliases,
-            facts: scala.usage_facts_index_shared(),
-            direct_ancestors_by_owner: None,
-            direct_ancestors_by_unit: None,
-            ambiguous_direct_ancestor_owners: None,
-            structural_parent_by_unit: None,
-            scala_trait_fqns: None,
-            package_types_by_package: Mutex::new(HashMap::default()),
-            package_objects_by_package: Mutex::new(HashMap::default()),
-            nested_types_by_owner: Mutex::new(HashMap::default()),
-            nested_objects_by_owner: Mutex::new(HashMap::default()),
-            source_facts_by_file: Mutex::new(HashMap::default()),
-            bulk_file_states: None,
-            callable_alternatives_by_unit: Mutex::new(HashMap::default()),
-            effective_callable_alternatives_by_unit: Mutex::new(HashMap::default()),
-            extension_methods_by_owner_member: Mutex::new(HashMap::default()),
-            override_targets_by_method: Mutex::new(HashMap::default()),
-            exported_member_bindings_by_owner: Mutex::new(HashMap::default()),
-        }
-    }
-
     pub(crate) fn build_from_file_states(file_states: HashMap<ProjectFile, FileState>) -> Self {
         let mut declarations = Vec::new();
         let mut seen = HashSet::default();
@@ -332,6 +301,12 @@ impl ProjectTypes {
         types.direct_ancestors_by_unit = Some(direct_ancestors_by_unit);
         types.ambiguous_direct_ancestor_owners = Some(ambiguous_direct_ancestor_owners);
         types
+    }
+
+    pub(crate) fn exact_direct_ancestors_snapshot(
+        &self,
+    ) -> Option<&HashMap<CodeUnit, Vec<CodeUnit>>> {
+        self.direct_ancestors_by_unit.as_ref()
     }
 
     fn bulk_file_state(&self, file: &ProjectFile) -> Option<&FileState> {
@@ -4571,7 +4546,8 @@ impl ProjectTypes {
                 .get(file)
                 .map(|state| state.source.as_str())
                 .filter(|source| !source.is_empty())
-                .map(str::to_owned),
+                .map(str::to_owned)
+                .or_else(|| scala.indexed_source(file)),
             None => scala.indexed_source(file),
         }
     }

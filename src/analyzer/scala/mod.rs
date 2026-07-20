@@ -263,12 +263,14 @@ impl ScalaAnalyzer {
 
     /// Owned handles to the workspace indexes (refcount bumps, not map
     /// clones), for per-query views held behind `Arc` caches.
+    #[allow(dead_code)]
     pub(crate) fn global_usage_definition_index_shared(
         &self,
     ) -> Arc<crate::analyzer::GlobalUsageDefinitionIndex> {
         self.inner.global_usage_definition_index_shared()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn usage_facts_index_shared(&self) -> Arc<UsageFactsIndex> {
         self.inner.usage_facts_index_shared()
     }
@@ -276,11 +278,34 @@ impl ScalaAnalyzer {
     pub(crate) fn project_types(
         &self,
     ) -> Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes> {
+        self.initialize_project_types(|| {
+            self.bulk_file_states(self.analyzed_files(), BulkFileStateSource::Omit)
+        })
+    }
+
+    fn project_types_from_file_states(
+        &self,
+        file_states: HashMap<ProjectFile, FileState>,
+    ) -> Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes> {
+        self.initialize_project_types(|| file_states)
+    }
+
+    fn initialize_project_types<F>(
+        &self,
+        file_states: F,
+    ) -> Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes>
+    where
+        F: FnOnce() -> HashMap<ProjectFile, FileState>,
+    {
         self.project_types
             .get_or_init(|| {
                 self.project_types_build_count
                     .fetch_add(1, Ordering::Relaxed);
-                Arc::new(crate::analyzer::usages::scala_graph::ScalaProjectTypes::build(self))
+                Arc::new(
+                    crate::analyzer::usages::scala_graph::ScalaProjectTypes::build_from_file_states(
+                        file_states(),
+                    ),
+                )
             })
             .clone()
     }

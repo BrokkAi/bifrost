@@ -272,6 +272,7 @@ class StableWildcardChild extends StableBase
     let stable_wildcard_child = definition(&analyzer, "companion.StableWildcardChild");
 
     analyzer.reset_full_hydration_count_for_test();
+    analyzer.reset_scala_project_types_build_count_for_test();
 
     assert_eq!(
         fq_names(analyzer.get_direct_descendants(&base)),
@@ -327,6 +328,11 @@ class StableWildcardChild extends StableBase
         analyzer.bulk_hydration_count_for_test(),
         6,
         "descendant construction should project each Scala file once"
+    );
+    assert_eq!(
+        analyzer.scala_project_types_build_count_for_test(),
+        1,
+        "descendant construction and ancestor queries must share one project-types snapshot"
     );
 }
 

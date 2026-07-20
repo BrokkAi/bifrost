@@ -41,10 +41,11 @@ impl ScalaAnalyzer {
             }
         }
 
-        let (ancestors_by_owner, _) = self
-            .project_types()
-            .resolve_direct_ancestors_from_file_states(&file_states);
-        for (owner, ancestors) in &ancestors_by_owner {
+        let types = self.project_types_from_file_states(file_states);
+        let ancestors_by_owner = types
+            .exact_direct_ancestors_snapshot()
+            .expect("source-free Scala project types cache exact direct ancestors");
+        for (owner, ancestors) in ancestors_by_owner {
             self.direct_ancestors
                 .insert(owner.clone(), Arc::new(ancestors.clone()));
         }
