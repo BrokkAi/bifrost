@@ -1462,6 +1462,7 @@ fn infer_receiver_binding(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<LocalBind
     let name = node.child_by_field_name("name")?;
     if name.kind() == "identifier"
         && value.kind() == "object"
+        && node.child_by_field_name("type").is_none()
         && ctx
             .target_owner
             .is_none_or(|owner| slice(name, ctx.source) != owner.identifier())
