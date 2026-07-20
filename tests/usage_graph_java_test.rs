@@ -213,6 +213,11 @@ class Consumer {
         );
     }
     assert!(
+        find_edge(&value, "app.Consumer.factory", "app.Request").is_some(),
+        "constructor method-reference receiver must also edge to its type: {}",
+        value["edges"]
+    );
+    assert!(
         find_edge(&value, "app.Consumer.otherFactory", "app.Request.Request").is_none(),
         "wrong-owner constructor reference must not edge to Request: {}",
         value["edges"]

@@ -303,6 +303,7 @@ fn record_constructor_reference_for_type(
     let Some(owner) = ctx.resolve_type(type_node) else {
         return;
     };
+    ctx.record(owner.fq_name().to_string(), type_node);
     let constructor_fqn = format!("{}.{}", owner.fq_name(), owner.identifier());
     let declared = ctx
         .java

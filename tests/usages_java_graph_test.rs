@@ -2733,6 +2733,16 @@ public class Consumer {
     assert_hit_contains(&constructor_hits, "positive-object-creation");
     assert_hit_contains(&constructor_hits, "positive-constructor-reference");
     assert_no_hit_contains(&constructor_hits, "negative-wrong-owner");
+
+    let request_type = definition(&analyzer, "app.Request");
+    let type_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&request_type),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&type_hits, "positive-constructor-reference");
+    assert_no_hit_contains(&type_hits, "negative-wrong-owner");
 }
 
 #[test]

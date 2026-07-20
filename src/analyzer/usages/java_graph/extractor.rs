@@ -276,6 +276,14 @@ fn maybe_record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if let Some(receiver) = constructor_method_reference_receiver(node) {
+        if resolve_type_from_node(receiver, ctx)
+            .is_some_and(|owner| owner.fq_name() == ctx.spec.owner.fq_name())
+        {
+            hits::push_hit(receiver, ctx);
+        }
+        return;
+    }
     if maybe_record_static_qualifier_type_hit(node, ctx) {
         return;
     }
