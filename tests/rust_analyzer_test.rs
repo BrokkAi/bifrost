@@ -160,12 +160,101 @@ fn test_impl_target_extraction_variants() {
 
     assert!(!analyzer.get_definitions("MyStruct").is_empty());
     assert!(!analyzer.get_definitions("MyStruct.do_something").is_empty());
+    assert!(analyzer.get_definitions("T").is_empty());
     assert!(!analyzer.get_definitions("T.do_something").is_empty());
-    assert!(!analyzer.get_definitions("StringLike").is_empty());
-    assert!(!analyzer.get_definitions("StringLike.is_empty").is_empty());
+    assert!(analyzer.get_definitions("StringLike").is_empty());
+    assert!(!analyzer.get_definitions("ast.StringLike").is_empty());
+    assert!(
+        !analyzer
+            .get_definitions("ast.StringLike.is_empty")
+            .is_empty()
+    );
+    assert!(analyzer.get_definitions("Vec").is_empty());
     assert!(!analyzer.get_definitions("Vec.do_something").is_empty());
     assert!(!analyzer.get_definitions("T.deref").is_empty());
     assert!(!analyzer.get_definitions("T.len").is_empty());
+}
+
+#[test]
+fn rust_impl_members_use_real_owner_identity_without_publishing_phantom_types() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/model.rs",
+            r#"
+pub struct Writer;
+"#,
+        )
+        .file(
+            "src/local.rs",
+            r#"
+pub struct Option;
+"#,
+        )
+        .file(
+            "src/impls.rs",
+            r#"
+// Impl owner members stay indexed without nominal stand-ins.
+use crate::model::Writer;
+use std::option::Option;
+
+trait LocalTrait {
+    fn act(&self);
+    fn act_s(&self);
+    fn act_f(&self);
+    fn act_t(&self);
+}
+
+impl Writer {
+    fn write(&self) {}
+}
+
+impl LocalTrait for Option<u8> {
+    fn act(&self) {}
+}
+
+impl<S> LocalTrait for S {
+    fn act_s(&self) {}
+}
+
+impl<F> LocalTrait for F {
+    fn act_f(&self) {}
+}
+
+impl<T> LocalTrait for T {
+    fn act_t(&self) {}
+}
+
+impl LocalTrait for Self {
+    fn act(&self) {}
+}
+"#,
+        )
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+
+    let writer = definition(&analyzer, "model.Writer");
+    assert_eq!(writer.source().rel_path().to_string_lossy(), "src/model.rs");
+    let writer_method = definition(&analyzer, "model.Writer.write");
+    assert_eq!(
+        writer_method.source().rel_path().to_string_lossy(),
+        "src/impls.rs"
+    );
+
+    assert!(analyzer.get_definitions("impls.Writer").is_empty());
+    assert!(analyzer.get_definitions("impls.Option").is_empty());
+    assert!(analyzer.get_definitions("impls.S").is_empty());
+    assert!(analyzer.get_definitions("impls.F").is_empty());
+    assert!(analyzer.get_definitions("impls.T").is_empty());
+    assert!(analyzer.get_definitions("impls.Self").is_empty());
+    assert!(analyzer.get_definitions("std.option.Option").is_empty());
+
+    assert!(!analyzer.get_definitions("std.option.Option.act").is_empty());
+    assert!(!analyzer.get_definitions("impls.S.act_s").is_empty());
+    assert!(!analyzer.get_definitions("impls.F.act_f").is_empty());
+    assert!(!analyzer.get_definitions("impls.T.act_t").is_empty());
+    assert!(!analyzer.get_definitions("impls.Self.act").is_empty());
+    assert!(analyzer.get_definitions("local.Option.act").is_empty());
+    assert_eq!(analyzer.get_definitions("local.Option").len(), 1);
 }
 
 #[test]

@@ -1,5 +1,5 @@
 use crate::analyzer::cognitive_complexity;
-use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
+use crate::analyzer::{CodeUnit, Language, LanguageAdapter, ProjectFile};
 use std::sync::LazyLock;
 use tree_sitter::Tree;
 
@@ -39,10 +39,14 @@ impl LanguageAdapter for RustAdapter {
 
     fn storage_content_qualifier(
         &self,
-        _code_unit: &crate::analyzer::CodeUnit,
+        code_unit: &crate::analyzer::CodeUnit,
         _content_qualifier: &str,
     ) -> String {
-        String::new()
+        if rust_unit_has_explicit_qualifier(code_unit) {
+            code_unit.package_name().to_string()
+        } else {
+            String::new()
+        }
     }
 
     fn persisted_content_qualifier_supports_substring_search(&self) -> bool {
@@ -53,8 +57,12 @@ impl LanguageAdapter for RustAdapter {
         String::new()
     }
 
-    fn hydrate_content_qualifier(&self, _content_qualifier: &str, file: &ProjectFile) -> String {
-        rust_package_name(file)
+    fn hydrate_content_qualifier(&self, content_qualifier: &str, file: &ProjectFile) -> String {
+        if content_qualifier.is_empty() {
+            rust_package_name(file)
+        } else {
+            content_qualifier.to_string()
+        }
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
@@ -90,4 +98,8 @@ impl LanguageAdapter for RustAdapter {
     fn cognitive_complexity_config(&self) -> Option<&'static cognitive_complexity::Config> {
         Some(&RUST_COGNITIVE_CONFIG)
     }
+}
+
+fn rust_unit_has_explicit_qualifier(code_unit: &CodeUnit) -> bool {
+    code_unit.package_name() != rust_package_name(code_unit.source())
 }
