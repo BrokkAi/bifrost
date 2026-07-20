@@ -25,10 +25,10 @@ use super::resolver::{
     UnqualifiedMethodGroupResolution, argument_count, class_unit_for_fq_name,
     extension_visibility_site_key, first_type_child, is_member_variable_declaration,
     is_type_reference_node, nearest_member_candidates_for_owner, node_text, reference_type_text,
-    resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner,
+    resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner, same_node,
     unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
-    usage_member_declared_type_fq_name, usage_method_return_type_fq_name_for_arity,
-    usage_visible_extension_method_candidates,
+    usage_class_field_receiver_type, usage_member_declared_type_fq_name,
+    usage_method_return_type_fq_name_for_arity, usage_visible_extension_method_candidates,
 };
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
@@ -38,7 +38,9 @@ use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInfere
 use crate::analyzer::{
     CSharpAnalyzer, CSharpMemberName, CallableArity, CodeUnit, IAnalyzer, ProjectFile,
     csharp_attribute_type_names, csharp_callable_arity, csharp_conditional_member_access,
-    csharp_member_name, csharp_unqualified_invocation_for_name,
+    csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver, csharp_member_name,
+    csharp_type_leftmost_identifier, csharp_type_reference_root,
+    csharp_unqualified_invocation_for_name,
 };
 use crate::hash::{HashMap, HashSet};
 use tree_sitter::Node;
@@ -280,6 +282,18 @@ fn record_reference(
     ctx: &mut CsScan<'_, '_>,
     bindings: &LocalInferenceEngine<String>,
 ) {
+    if let Some(candidate) = csharp_constant_pattern_type_candidate(node) {
+        record_structured_type_candidate(candidate, true, ctx, bindings);
+    }
+    if let Some(receiver) = csharp_member_access_type_receiver(node) {
+        record_structured_type_candidate(receiver, true, ctx, bindings);
+    }
+    if let Some(root) = csharp_type_reference_root(node)
+        && same_node(root, node)
+    {
+        record_structured_type_candidate(root, false, ctx, bindings);
+        return;
+    }
     match node.kind() {
         "attribute" => {
             let Some(name) = node.child_by_field_name("name") else {
@@ -415,6 +429,38 @@ fn record_reference(
             }
         }
         _ => {}
+    }
+}
+
+fn record_structured_type_candidate(
+    candidate: Node<'_>,
+    reject_value_receiver: bool,
+    ctx: &mut CsScan<'_, '_>,
+    bindings: &LocalInferenceEngine<String>,
+) {
+    if reject_value_receiver {
+        let Some(leftmost) = csharp_type_leftmost_identifier(candidate) else {
+            return;
+        };
+        let name = node_text(leftmost, ctx.source);
+        if !bindings.resolve_symbol(name).is_unknown()
+            || unqualified_member_has_structured_shadow(leftmost, ctx.source)
+            || !usage_class_field_receiver_type(
+                leftmost,
+                name,
+                ctx.analyzer,
+                ctx.csharp,
+                ctx.file,
+                ctx.source,
+            )
+            .is_unknown()
+        {
+            return;
+        }
+    }
+    let reference = reference_type_text(candidate, ctx.source);
+    if let Some(fqn) = ctx.resolve_type_fqn_at(&reference, candidate) {
+        ctx.record(fqn, candidate);
     }
 }
 

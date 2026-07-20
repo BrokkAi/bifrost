@@ -2931,6 +2931,426 @@ fn csharp_default_candidates_keep_generic_reference_arity() {
 }
 
 #[test]
+fn csharp_issue701_persisted_inverse_fallback_preserves_arity_and_physical_types() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Collections/ICollection.First.cs",
+            "namespace System.Collections { public partial interface ICollection { void CopyTo(); } }\n",
+        )
+        .file(
+            "Collections/ICollection.Second.cs",
+            "namespace System.Collections { public partial interface ICollection { int Count { get; } } }\n",
+        )
+        .file(
+            "Collections/GenericICollection.cs",
+            "namespace System.Collections.Generic { public interface ICollection<T> { } }\n",
+        )
+        .file(
+            "Contracts/Nested.First.cs",
+            "namespace Contracts { public partial class Outer { public partial class Nested { } } }\n",
+        )
+        .file(
+            "Contracts/Nested.Second.cs",
+            "namespace Contracts { public partial class Outer { public partial class Nested { } } }\n",
+        )
+        .file(
+            "Consumers/RuntimeShape.cs",
+            r#"
+using System.Collections;
+using System.Collections.Generic;
+namespace App {
+    public class RuntimeShape : ICollection {
+        void ICollection.CopyTo() { }
+        public ICollection Echo(ICollection value) => value;
+        public ICollection<int> Generic;
+    }
+}
+"#,
+        )
+        .file(
+            "Consumers/MonoShape.cs",
+            r#"
+using System.Collections;
+namespace System.Collections.Generic {
+    public class MonoShape : ICollection {
+        void ICollection.CopyTo() { }
+    }
+}
+"#,
+        )
+        .file(
+            "Consumers/NestedShape.cs",
+            "namespace App { public class NestedShape { Contracts.Outer.Nested Value; } }\n",
+        )
+        .build();
+    let workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("persisted arity project should build");
+    let analyzer = workspace.analyzer();
+    let declarations = analyzer.get_all_declarations();
+    let targets = |fq_name: &str| {
+        declarations
+            .iter()
+            .filter(|unit| unit.is_class() && unit.fq_name() == fq_name)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    let nongeneric = targets("System.Collections.ICollection");
+    assert_eq!(2, nongeneric.len(), "physical partial declarations");
+    let generic = targets("System.Collections.Generic.ICollection`1");
+    assert_eq!(1, generic.len(), "generic collision declaration");
+    let nested = targets("Contracts.Outer$Nested");
+    assert_eq!(2, nested.len(), "physical dotted nested declarations");
+
+    let runtime = project.file("Consumers/RuntimeShape.cs");
+    let mono = project.file("Consumers/MonoShape.cs");
+    let nested_consumer = project.file("Consumers/NestedShape.cs");
+    let candidate_files = Arc::new(
+        [runtime.clone(), mono.clone(), nested_consumer.clone()]
+            .into_iter()
+            .collect(),
+    );
+    let provider = ExplicitCandidateProvider::new(Arc::clone(&candidate_files));
+    let query = |query_targets: &[CodeUnit]| {
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                analyzer,
+                query_targets,
+                Some(&provider),
+                candidate_files.len(),
+                1000,
+            )
+            .result
+            .into_either()
+            .expect("persisted inverse query should resolve")
+    };
+
+    let nongeneric_hits = query(&nongeneric);
+    assert!(
+        nongeneric_hits
+            .iter()
+            .any(|hit| hit.file == runtime && hit.snippet.contains("ICollection Echo")),
+        "runtime-shaped imports should resolve the nongeneric type: {nongeneric_hits:#?}"
+    );
+    assert!(
+        nongeneric_hits
+            .iter()
+            .any(|hit| hit.file == mono && hit.snippet.contains(": ICollection")),
+        "the current generic namespace must fall through to the nongeneric using: {nongeneric_hits:#?}"
+    );
+    assert!(
+        {
+            let source = runtime.read_to_string().expect("runtime consumer source");
+            let start = source.find("ICollection<int>").expect("generic reference");
+            nongeneric_hits.iter().all(|hit| {
+                !(hit.file == runtime
+                    && hit.start_offset <= start
+                    && start + "ICollection<int>".len() <= hit.end_offset)
+            })
+        },
+        "generic references must not collide with nongeneric targets: {nongeneric_hits:#?}"
+    );
+
+    let generic_hits = query(&generic);
+    assert_eq!(1, generic_hits.len(), "{generic_hits:#?}");
+    assert!(
+        generic_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("ICollection<int>"))
+    );
+
+    let nested_hits = query(&nested);
+    assert_eq!(1, nested_hits.len(), "{nested_hits:#?}");
+    assert!(nested_hits.iter().all(|hit| hit.file == nested_consumer));
+
+    let default_query = UsageFinder::new().query(analyzer, &nested, 1000, 1000);
+    assert!(
+        default_query.candidate_files.contains(&nested_consumer),
+        "dotted nested identity should route its consumer: {:#?}",
+        default_query.candidate_files
+    );
+}
+
+#[test]
+fn csharp_issue701_structured_type_roles_cover_alias_receivers_and_patterns_without_values() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Types.cs",
+            r#"
+namespace Demo {
+    public interface Marker { void Touch(); }
+    public class PatternType { }
+    public class OtherType { }
+    public class InheritedPattern { }
+    public enum Mode { Enabled }
+    public class Generic<T> { public static int Value; }
+    public class Holder { public int Nested; }
+    public class InheritedOuter { public class Nested { public static int Value; } }
+    public class Outer { public class Nested { public static int Value; } }
+}
+namespace Other {
+    public class Outer { public class Nested { public static int Value; } }
+}
+"#,
+        ),
+        (
+            "Consumer.cs",
+            r#"
+using Alias = Demo.Outer.Nested;
+using Nested = Demo.OtherType;
+using Demo;
+namespace App {
+    public class Base {
+        protected Holder InheritedOuter;
+        protected const int InheritedPattern = 1;
+    }
+    public class Consumer : Base, Marker {
+        private Holder Outer;
+        public const int LocalConstant = 2;
+        public Marker Echo(Marker value, object member) {
+            var aliasValue = Alias.Value;
+            var nestedValue = Demo.Outer.Nested.Value;
+            var genericValue = Generic<int>.Value;
+            var unrelated = Other.Outer.Nested.Value;
+            var unresolved = Missing.Nested.Value;
+            var fieldValue = Outer.Nested;
+            if (member is PatternType || member is OtherType) { }
+            return value;
+        }
+        void Marker.Touch() { }
+        public bool Shadowed(object member, int PatternType) => member is PatternType;
+        public bool Switched(object member) => member switch { PatternType => true, _ => false };
+        public bool Constant(object member) => member is Mode.Enabled;
+        public bool BareConstant(object member) => member is LocalConstant;
+        public bool Inherited(object member) {
+            var value = InheritedOuter.Nested;
+            return member is InheritedPattern;
+        }
+        public int Local(Holder Outer) => Outer.Nested;
+    }
+}
+"#,
+        ),
+    ]);
+    let consumer = project.file("Consumer.cs");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = |target: CodeUnit| {
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(&analyzer, &[target], Some(&provider), 1, 1000)
+            .result
+            .into_either()
+            .expect("structured type query should resolve")
+    };
+    let nested = definition_by(&analyzer, |unit| {
+        unit.is_class() && unit.fq_name() == "Demo.Outer$Nested"
+    });
+    let nested_hits = query(nested.clone());
+    let source = consumer.read_to_string().expect("consumer source");
+    let alias_lhs = source.find("Nested = Demo.OtherType").expect("alias lhs");
+    assert!(
+        nested_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("using Alias")),
+        "alias RHS should count: {nested_hits:#?}"
+    );
+    assert!(
+        nested_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("Alias.Value")),
+        "alias receiver should count: {nested_hits:#?}"
+    );
+    assert!(
+        nested_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("Demo.Outer.Nested.Value")),
+        "intermediate nested receiver should count: {nested_hits:#?}"
+    );
+    assert!(
+        nested_hits
+            .iter()
+            .all(|hit| !(hit.start_offset <= alias_lhs
+                && alias_lhs + "Nested".len() <= hit.end_offset)),
+        "alias LHS must not count: {nested_hits:#?}"
+    );
+    assert!(
+        [
+            source
+                .find("Other.Outer.Nested.Value")
+                .expect("unrelated nested receiver")
+                + "Other.Outer.".len(),
+            source
+                .find("var fieldValue = Outer.Nested;")
+                .expect("field receiver")
+                + "var fieldValue = Outer.".len(),
+            source
+                .rfind("=> Outer.Nested;")
+                .expect("parameter receiver")
+                + "=> Outer.".len(),
+        ]
+        .into_iter()
+        .all(|start| nested_hits.iter().all(|hit| {
+            !(hit.start_offset <= start && start + "Nested".len() <= hit.end_offset)
+        })),
+        "unrelated and value receivers must not count: {nested_hits:#?}"
+    );
+    let raw_result = CSharpUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&nested),
+        &std::iter::once(consumer.clone()).collect(),
+        1000,
+    );
+    let unresolved_start = source
+        .find("Missing.Nested.Value")
+        .expect("unresolved receiver");
+    match raw_result {
+        FuzzyResult::Success {
+            unproven_by_overload,
+            ..
+        } => assert!(
+            unproven_by_overload.values().flatten().any(|hit| {
+                hit.start_offset <= unresolved_start
+                    && unresolved_start + "Missing.Nested".len() <= hit.end_offset
+            }),
+            "an unresolved structured receiver should retain unproven completeness evidence"
+        ),
+        other => panic!("structured receiver query should succeed: {other:#?}"),
+    }
+
+    let generic = type_definition(&analyzer, "Demo.Generic`1");
+    let generic_hits = query(generic);
+    assert_eq!(1, generic_hits.len(), "{generic_hits:#?}");
+    assert!(
+        generic_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("Generic<int>.Value"))
+    );
+
+    let pattern = type_definition(&analyzer, "Demo.PatternType");
+    let pattern_hits = query(pattern);
+    assert!(
+        pattern_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("is PatternType ||")),
+        "constant-pattern binary left spine should count: {pattern_hits:#?}"
+    );
+    assert!(
+        pattern_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("switch { PatternType")),
+        "switch constant pattern should count: {pattern_hits:#?}"
+    );
+    assert!(
+        {
+            let start = source
+                .rfind("member is PatternType")
+                .expect("shadowed pattern")
+                + "member is ".len();
+            pattern_hits.iter().all(|hit| {
+                !(hit.start_offset <= start && start + "PatternType".len() <= hit.end_offset)
+            })
+        },
+        "value-shadowed pattern must not count: {pattern_hits:#?}"
+    );
+
+    let marker = type_definition(&analyzer, "Demo.Marker");
+    let marker_hits = query(marker);
+    assert!(
+        marker_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("Base, Marker"))
+    );
+    assert!(
+        marker_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("Marker Echo"))
+    );
+    assert!(
+        marker_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("Echo(Marker"))
+    );
+    assert!(
+        marker_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("Marker.Touch"))
+    );
+
+    let enabled = definition_by(&analyzer, |unit| {
+        unit.is_field() && unit.fq_name() == "Demo.Mode.Enabled"
+    });
+    let enabled_hits = query(enabled);
+    assert_eq!(1, enabled_hits.len(), "{enabled_hits:#?}");
+    assert!(
+        enabled_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("member is Mode.Enabled")),
+        "qualified constant patterns should retain direct field hits: {enabled_hits:#?}"
+    );
+
+    let local_constant = definition_by(&analyzer, |unit| {
+        unit.is_field() && unit.fq_name() == "App.Consumer.LocalConstant"
+    });
+    let local_constant_hits = CSharpUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&local_constant),
+            &std::iter::once(consumer.clone()).collect(),
+            1000,
+        )
+        .all_hits_including_imports();
+    assert_eq!(1, local_constant_hits.len(), "{local_constant_hits:#?}");
+    assert!(
+        local_constant_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("member is LocalConstant")),
+        "bare constant patterns should retain direct self-field hits: {local_constant_hits:#?}"
+    );
+
+    let inherited_constant = definition_by(&analyzer, |unit| {
+        unit.is_field() && unit.fq_name() == "App.Base.InheritedPattern"
+    });
+    let inherited_constant_hits = query(inherited_constant);
+    assert_eq!(
+        1,
+        inherited_constant_hits.len(),
+        "{inherited_constant_hits:#?}"
+    );
+    assert!(
+        inherited_constant_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("member is InheritedPattern")),
+        "bare inherited constants should retain direct field hits: {inherited_constant_hits:#?}"
+    );
+
+    let inherited_nested = type_definition(&analyzer, "Demo.InheritedOuter$Nested");
+    let inherited_nested_hits = query(inherited_nested);
+    assert!(
+        inherited_nested_hits
+            .iter()
+            .all(|hit| !hit.snippet.contains("InheritedOuter.Nested")),
+        "an inherited field receiver must not become a type hit: {inherited_nested_hits:#?}"
+    );
+    let inherited_pattern = type_definition(&analyzer, "Demo.InheritedPattern");
+    let inherited_pattern_hits = query(inherited_pattern);
+    assert!(
+        inherited_pattern_hits
+            .iter()
+            .all(|hit| !hit.snippet.contains("member is InheritedPattern")),
+        "an inherited constant must not become a type hit: {inherited_pattern_hits:#?}"
+    );
+
+    let default_query = UsageFinder::new().query(&analyzer, &[nested], 1000, 1000);
+    assert!(
+        default_query.candidate_files.contains(&consumer),
+        "shared declaration routing should retain expression receiver candidates"
+    );
+}
+
+#[test]
 fn csharp_graph_distinguishes_generic_and_nongeneric_constructor_owners() {
     let (_project, analyzer) = csharp_analyzer_with_files(&[
         (

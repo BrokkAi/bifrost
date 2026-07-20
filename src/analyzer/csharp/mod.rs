@@ -53,6 +53,12 @@ pub(crate) fn csharp_using_directive_is_global(node: Node<'_>) -> bool {
 }
 
 pub(crate) fn csharp_using_directive_target(node: Node<'_>, source: &str) -> Option<String> {
+    csharp_using_directive_target_node(node)
+        .map(|target| csharp_type_node_identity(target, source))
+        .filter(|target| !target.is_empty())
+}
+
+pub(crate) fn csharp_using_directive_target_node(node: Node<'_>) -> Option<Node<'_>> {
     if node.kind() != "using_directive" {
         return None;
     }
@@ -60,8 +66,6 @@ pub(crate) fn csharp_using_directive_target(node: Node<'_>, source: &str) -> Opt
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| alias.is_none_or(|alias| child != &alias))
-        .map(|target| csharp_type_node_identity(target, source))
-        .filter(|target| !target.is_empty())
 }
 
 pub(crate) fn csharp_using_directive_namespace(node: Node<'_>, source: &str) -> Option<String> {
@@ -597,10 +601,13 @@ impl CSharpAnalyzer {
         if !exact.is_empty() {
             return exact;
         }
+        let arity_key = csharp_arity_preserving_full_name(fqn);
         index
             .by_normalized_fqn(&csharp_normalize_full_name(fqn))
             .iter()
-            .filter(|unit| unit.is_class())
+            .filter(|unit| {
+                unit.is_class() && csharp_arity_preserving_full_name(&unit.fq_name()) == arity_key
+            })
             .cloned()
             .collect()
     }
@@ -611,10 +618,22 @@ impl CSharpAnalyzer {
         if !exact.is_empty() {
             return exact.to_vec();
         }
+        let arity_key = csharp_arity_preserving_full_name(fqn);
         index
             .by_normalized_fqn(&csharp_normalize_full_name(fqn))
-            .to_vec()
+            .iter()
+            .filter(|unit| csharp_arity_preserving_full_name(&unit.fq_name()) == arity_key)
+            .cloned()
+            .collect()
     }
+}
+
+fn csharp_arity_preserving_full_name(fq_name: &str) -> String {
+    let normalized = fq_name
+        .strip_prefix("global::")
+        .unwrap_or(fq_name)
+        .replace(['$', '+'], ".");
+    normalize_csharp_constructor_name(normalized)
 }
 
 pub(crate) fn csharp_normalize_full_name(fq_name: &str) -> String {
@@ -626,6 +645,10 @@ pub(crate) fn csharp_normalize_full_name(fq_name: &str) -> String {
         .map(strip_csharp_generic_arity)
         .collect::<Vec<_>>()
         .join(".");
+    normalize_csharp_constructor_name(normalized)
+}
+
+fn normalize_csharp_constructor_name(normalized: String) -> String {
     let Some(owner) = normalized.strip_suffix(".#ctor") else {
         return normalized;
     };
@@ -637,6 +660,7 @@ pub(crate) fn csharp_normalize_full_name(fq_name: &str) -> String {
         .rfind('.')
         .map(|separator| &owner[separator + 1..])
         .unwrap_or(owner);
+    let constructor_name = strip_csharp_generic_arity(constructor_name);
     if constructor_name.is_empty() {
         normalized
     } else {
@@ -684,11 +708,12 @@ fn csharp_type_node_identity_with_terminal_suffix(
     let mut alias_qualified = false;
     while let Some(current) = stack.pop() {
         match current.kind() {
-            "qualified_name" | "alias_qualified_name" => {
+            "qualified_name" | "alias_qualified_name" | "member_access_expression" => {
                 alias_qualified |= current.kind() == "alias_qualified_name";
                 let qualifier = current
                     .child_by_field_name("qualifier")
                     .or_else(|| current.child_by_field_name("alias"))
+                    .or_else(|| current.child_by_field_name("expression"))
                     .or_else(|| current.named_child(0));
                 let name = current
                     .child_by_field_name("name")
@@ -766,6 +791,173 @@ fn csharp_type_node_identity_with_terminal_suffix(
     } else {
         segments.join(".")
     }
+}
+
+pub(crate) fn csharp_type_reference_root(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        let parent = node.parent()?;
+        if matches!(
+            parent.kind(),
+            "qualified_name"
+                | "alias_qualified_name"
+                | "generic_name"
+                | "nullable_type"
+                | "array_type"
+                | "pointer_type"
+                | "type"
+                | "simple_base_type"
+                | "primary_constructor_base_type"
+        ) {
+            node = parent;
+            continue;
+        }
+        if parent
+            .child_by_field_name("type")
+            .is_some_and(|type_node| same_csharp_node(type_node, node))
+            || parent
+                .child_by_field_name("return_type")
+                .is_some_and(|type_node| same_csharp_node(type_node, node))
+            || parent
+                .child_by_field_name("returns")
+                .is_some_and(|type_node| same_csharp_node(type_node, node))
+            || csharp_as_expression_type_operand(parent, node)
+        {
+            return Some(node);
+        }
+        if matches!(
+            parent.kind(),
+            "type_argument_list" | "base_list" | "explicit_interface_specifier"
+        ) || parent.kind() == "object_creation_expression"
+        {
+            return Some(node);
+        }
+        if parent.kind() == "using_directive"
+            && (parent.child_by_field_name("name").is_some()
+                || csharp_using_directive_is_static(parent))
+            && csharp_using_directive_target_node(parent)
+                .is_some_and(|target| same_csharp_node(target, node))
+        {
+            return Some(node);
+        }
+        if matches!(
+            parent.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "struct_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "record_struct_declaration"
+        ) && !parent
+            .child_by_field_name("name")
+            .is_some_and(|name| same_csharp_node(name, node))
+        {
+            return Some(node);
+        }
+        return None;
+    }
+}
+
+pub(crate) fn csharp_constant_pattern_type_candidate(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "constant_pattern" {
+        return None;
+    }
+    let mut candidate = node.named_child(0)?;
+    while candidate.kind() == "binary_expression" {
+        candidate = candidate
+            .child_by_field_name("left")
+            .or_else(|| candidate.named_child(0))?;
+    }
+    matches!(
+        candidate.kind(),
+        "identifier"
+            | "qualified_name"
+            | "alias_qualified_name"
+            | "generic_name"
+            | "member_access_expression"
+    )
+    .then_some(candidate)
+}
+
+pub(crate) fn csharp_member_access_type_receiver(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "member_access_expression" {
+        return None;
+    }
+    let receiver = node
+        .child_by_field_name("expression")
+        .or_else(|| node.named_child(0))?;
+    matches!(
+        receiver.kind(),
+        "identifier"
+            | "qualified_name"
+            | "alias_qualified_name"
+            | "generic_name"
+            | "member_access_expression"
+    )
+    .then_some(receiver)
+}
+
+pub(crate) fn csharp_type_terminal_identifier(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "identifier" | "predefined_type" => return Some(node),
+            "qualified_name" | "alias_qualified_name" | "member_access_expression" => {
+                node = node
+                    .child_by_field_name("name")
+                    .or_else(|| node.named_child(node.named_child_count().saturating_sub(1)))?;
+            }
+            "generic_name" => {
+                node = node
+                    .child_by_field_name("name")
+                    .or_else(|| node.named_child(0))?;
+            }
+            "nullable_type"
+            | "array_type"
+            | "pointer_type"
+            | "type"
+            | "simple_base_type"
+            | "primary_constructor_base_type" => {
+                node = node
+                    .child_by_field_name("type")
+                    .or_else(|| node.named_child(0))?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+pub(crate) fn csharp_type_leftmost_identifier(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "identifier" | "predefined_type" => return Some(node),
+            "qualified_name" | "alias_qualified_name" | "member_access_expression" => {
+                node = node
+                    .child_by_field_name("qualifier")
+                    .or_else(|| node.child_by_field_name("alias"))
+                    .or_else(|| node.child_by_field_name("expression"))
+                    .or_else(|| node.named_child(0))?;
+            }
+            "generic_name" => {
+                node = node
+                    .child_by_field_name("name")
+                    .or_else(|| node.named_child(0))?;
+            }
+            "nullable_type"
+            | "array_type"
+            | "pointer_type"
+            | "type"
+            | "simple_base_type"
+            | "primary_constructor_base_type" => {
+                node = node
+                    .child_by_field_name("type")
+                    .or_else(|| node.named_child(0))?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn same_csharp_node(left: Node<'_>, right: Node<'_>) -> bool {
+    left.start_byte() == right.start_byte() && left.end_byte() == right.end_byte()
 }
 
 /// Return the structured name node when `node` is inside a C# attribute's name.

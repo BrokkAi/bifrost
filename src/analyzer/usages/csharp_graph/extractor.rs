@@ -4,8 +4,8 @@ use crate::analyzer::usages::csharp_graph::resolver::{
     class_unit_for_fq_name, enclosing_declared_type, expression_resolves_to_type,
     extension_visibility_site_key, first_type_child, is_type_reference_node,
     member_name_is_locally_bound, nearest_member_candidates_for_owner, node_text,
-    normalize_type_text, object_initializer_for_label, receiver_targets_owner, reference_type_node,
-    reference_type_text, resolve_unqualified_method_group_for_owner, resolves_to_target,
+    normalize_type_text, object_initializer_for_label, receiver_targets_owner, reference_type_text,
+    resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner, resolves_to_target,
     resolves_to_target_at, same_node, seed_visible_bindings_at, type_identity_matches,
     unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
     unqualified_member_resolves_to_owner, usage_class_field_receiver_type,
@@ -18,7 +18,9 @@ use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::{
     CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, csharp_attribute_terminal_name,
     csharp_attribute_type_names, csharp_callable_arity, csharp_conditional_member_access,
-    csharp_member_name, csharp_unqualified_invocation_for_name,
+    csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver, csharp_member_name,
+    csharp_type_leftmost_identifier, csharp_type_reference_root, csharp_type_terminal_identifier,
+    csharp_unqualified_invocation_for_name,
 };
 use crate::hash::HashMap;
 use crate::text_utils::compute_line_starts;
@@ -128,6 +130,13 @@ enum TargetMemberResolution {
     NotFound,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TypeCandidateRole {
+    Ordinary,
+    Pattern,
+    Receiver,
+}
+
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if *ctx.limit_exceeded {
         return;
@@ -156,14 +165,30 @@ fn scan_type_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         scan_attribute_reference(node, ctx);
         return;
     }
-    if !matches!(node.kind(), "identifier" | "type") || is_declaration_name(node) {
+    if let Some(candidate) = csharp_constant_pattern_type_candidate(node) {
+        scan_structured_type_candidate(candidate, TypeCandidateRole::Pattern, ctx);
+    }
+    if let Some(receiver) = csharp_member_access_type_receiver(node) {
+        scan_structured_type_candidate(receiver, TypeCandidateRole::Receiver, ctx);
+    }
+    let Some(root) = csharp_type_reference_root(node) else {
+        return;
+    };
+    if !same_node(root, node) || is_declaration_name(root) {
         return;
     }
-    if !is_type_reference_node(node) {
-        scan_static_type_qualifier(node, ctx);
+    scan_structured_type_candidate(root, TypeCandidateRole::Ordinary, ctx);
+}
+
+fn scan_structured_type_candidate(
+    candidate: Node<'_>,
+    role: TypeCandidateRole,
+    ctx: &mut ScanCtx<'_>,
+) {
+    let Some(terminal) = csharp_type_terminal_identifier(candidate) else {
         return;
-    }
-    let raw_name = normalize_type_text(node_text(node, ctx.source));
+    };
+    let raw_name = normalize_type_text(node_text(terminal, ctx.source));
     if raw_name != ctx.spec.member_name
         && !ctx
             .csharp
@@ -172,10 +197,51 @@ fn scan_type_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
-    let reference_node = reference_type_node(node);
-    let reference = reference_type_text(reference_node, ctx.source);
-    if type_reference_resolves_to_target(node, ctx, &reference) {
-        push_hit(reference_node, ctx);
+
+    if role != TypeCandidateRole::Ordinary {
+        let Some(leftmost) = csharp_type_leftmost_identifier(candidate) else {
+            return;
+        };
+        let left_name = normalize_type_text(node_text(leftmost, ctx.source));
+        let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+        seed_visible_bindings_at(
+            binding_scope_node(candidate),
+            candidate,
+            ctx.csharp,
+            ctx.file,
+            ctx.source,
+            &mut bindings,
+        );
+        if member_name_is_locally_bound(&left_name, &bindings)
+            || unqualified_member_has_structured_shadow(leftmost, ctx.source)
+            || !usage_class_field_receiver_type(
+                leftmost,
+                &left_name,
+                ctx.analyzer,
+                ctx.csharp,
+                ctx.file,
+                ctx.source,
+            )
+            .is_unknown()
+        {
+            return;
+        }
+    }
+
+    let reference = reference_type_text(candidate, ctx.source);
+    match resolve_type_fq_name_at(
+        ctx.csharp,
+        ctx.file,
+        &ctx.class_ranges,
+        &reference,
+        candidate,
+        ctx.source,
+    ) {
+        Some(resolved) if type_identity_matches(&resolved, &ctx.spec.target.fq_name()) => {
+            push_hit(candidate, ctx);
+        }
+        None if role == TypeCandidateRole::Receiver => push_unproven_hit(candidate, ctx),
+        Some(_) | None => {}
     }
 }
 
@@ -206,62 +272,6 @@ fn scan_attribute_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         push_hit(name, ctx);
     }
-}
-
-fn scan_static_type_qualifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if node.kind() != "identifier" || !is_member_access_expression_receiver(node) {
-        return;
-    }
-    let raw_name = normalize_type_text(node_text(node, ctx.source));
-    if raw_name != ctx.spec.member_name
-        && !ctx
-            .csharp
-            .using_aliases_of(ctx.file)
-            .contains_key(&raw_name)
-    {
-        return;
-    }
-
-    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    seed_visible_bindings_at(
-        binding_scope_node(node),
-        node,
-        ctx.csharp,
-        ctx.file,
-        ctx.source,
-        &mut bindings,
-    );
-    if !bindings.resolve_symbol(&raw_name).is_unknown()
-        || !usage_class_field_receiver_type(node, &raw_name, ctx.csharp, ctx.file, ctx.source)
-            .is_unknown()
-    {
-        return;
-    }
-
-    if type_reference_resolves_to_target(node, ctx, &raw_name) {
-        push_hit(node, ctx);
-    } else {
-        push_unproven_hit(node, ctx);
-    }
-}
-
-fn is_member_access_expression_receiver(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        parent.kind() == "member_access_expression"
-            && member_access_receiver(parent).is_some_and(|receiver| same_node(receiver, node))
-    })
-}
-
-fn type_reference_resolves_to_target(node: Node<'_>, ctx: &ScanCtx<'_>, reference: &str) -> bool {
-    resolves_to_target_at(
-        ctx.file,
-        &ctx.class_ranges,
-        reference,
-        node,
-        ctx.source,
-        &ctx.spec.target,
-        ctx.csharp,
-    )
 }
 
 fn scan_constructor_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -359,7 +369,14 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         &mut bindings,
     );
     if ctx.spec.kind == TargetKind::Method && ctx.spec.is_extension_method() {
-        match receiver_targets_owner(receiver_node, ctx.csharp, ctx.file, ctx.source, &bindings) {
+        match receiver_targets_owner(
+            receiver_node,
+            ctx.analyzer,
+            ctx.csharp,
+            ctx.file,
+            ctx.source,
+            &bindings,
+        ) {
             SymbolResolution::Precise(targets) => {
                 let receiver_type_names = targets.into_iter().collect::<Vec<_>>();
                 if extension_call_resolution(
@@ -388,7 +405,14 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         return;
     }
-    match receiver_targets_owner(receiver_node, ctx.csharp, ctx.file, ctx.source, &bindings) {
+    match receiver_targets_owner(
+        receiver_node,
+        ctx.analyzer,
+        ctx.csharp,
+        ctx.file,
+        ctx.source,
+        &bindings,
+    ) {
         SymbolResolution::Precise(targets)
             if targets.iter().any(|target| {
                 receiver_fqn_target_member_resolution(target, name.explicit_generic_arity, ctx)
@@ -578,6 +602,7 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 node,
                 &ctx.spec.member_name,
                 &ctx.spec.owner,
+                ctx.analyzer,
                 ctx.csharp,
                 ctx.file,
                 ctx.source,

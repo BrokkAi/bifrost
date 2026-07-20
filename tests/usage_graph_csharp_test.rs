@@ -709,6 +709,99 @@ fn nested_partial_type_references_edge_to_nested_type() {
 }
 
 #[test]
+fn csharp_issue701_structured_expression_type_roots_have_inverted_graph_parity() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Types.cs",
+            r#"
+namespace Demo {
+    public class PatternType { }
+    public class OtherType { }
+    public class InheritedPattern { }
+    public enum Mode { Enabled }
+    public class Generic<T> { public static int Value; }
+    public class Holder { public int Nested; }
+    public class InheritedOuter { public class Nested { public static int Value; } }
+    public class Outer { public class Nested { public static int Value; } }
+}
+namespace Other {
+    public class Outer { public class Nested { public static int Value; } }
+}
+"#,
+        )
+        .file(
+            "Consumer.cs",
+            r#"
+using Alias = Demo.Outer.Nested;
+using Demo;
+namespace App;
+public class Base {
+    protected Holder InheritedOuter;
+    protected const int InheritedPattern = 1;
+}
+public class Consumer : Base {
+    private Holder Outer;
+    public void Receivers() {
+        var aliasValue = Alias.Value;
+        var nestedValue = Demo.Outer.Nested.Value;
+        var genericValue = Generic<int>.Value;
+        var unrelated = Other.Outer.Nested.Value;
+        var fieldValue = Outer.Nested;
+    }
+    public bool Patterns(object member) {
+        if (member is PatternType || member is OtherType) { }
+        return member switch { PatternType => true, _ => false };
+    }
+    public bool Constant(object member) => member is Mode.Enabled;
+    public bool Inherited(object member) {
+        var value = InheritedOuter.Nested;
+        return member is InheritedPattern;
+    }
+    public bool Shadowed(object member, int PatternType) => member is PatternType;
+    public int Local(Holder Outer) => Outer.Nested;
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    for callee in ["Demo.Outer$Nested", "Demo.Generic`1"] {
+        assert!(
+            has_edge(&value, "App.Consumer.Receivers", callee),
+            "structured receiver should edge to {callee}: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        has_edge(&value, "App.Consumer.Patterns", "Demo.PatternType"),
+        "is/switch pattern type roots should be recorded: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "App.Consumer.Constant", "Demo.Mode"),
+        "a qualified constant pattern should retain its receiver type edge: {}",
+        value["edges"]
+    );
+    for callee in ["Demo.InheritedOuter$Nested", "Demo.InheritedPattern"] {
+        assert!(
+            !has_edge(&value, "App.Consumer.Inherited", callee),
+            "an inherited value member must shadow visible type {callee}: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        !has_edge(&value, "App.Consumer.Shadowed", "Demo.PatternType"),
+        "a parameter-shadowed constant pattern must remain a value: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "App.Consumer.Local", "Demo.Outer$Nested"),
+        "a parameter receiver must not become a type edge: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn attribute_reference_edges_to_attribute_type() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

@@ -4,9 +4,9 @@ use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::{
     CSharpAnalyzer, CSharpMemberName, CallableArity, CodeUnit, IAnalyzer, ProjectFile,
-    csharp_as_expression_type_operand, csharp_callable_arity, csharp_conditional_member_access,
-    csharp_member_name, csharp_method_generic_arity, csharp_normalize_full_name,
-    csharp_signature_return_type, csharp_source_identifier, csharp_type_node_identity,
+    csharp_callable_arity, csharp_conditional_member_access, csharp_member_name,
+    csharp_method_generic_arity, csharp_normalize_full_name, csharp_signature_return_type,
+    csharp_source_identifier, csharp_type_node_identity, csharp_type_reference_root,
     csharp_using_directive_is_global, csharp_using_directive_is_static,
     csharp_using_directive_namespace, csharp_using_directive_target, resolve_analyzer,
 };
@@ -1610,16 +1610,18 @@ pub(in crate::analyzer::usages) fn binding_scope_node(mut node: Node<'_>) -> Nod
 
 pub(super) fn receiver_targets_owner(
     receiver_node: Node<'_>,
+    analyzer: &dyn IAnalyzer,
     csharp: &CSharpAnalyzer,
     file: &ProjectFile,
     source: &str,
     bindings: &LocalInferenceEngine<String>,
 ) -> SymbolResolution<String> {
-    receiver_type_fq_names(receiver_node, csharp, file, source, bindings)
+    receiver_type_fq_names(receiver_node, analyzer, csharp, file, source, bindings)
 }
 
 fn receiver_type_fq_names(
     receiver_node: Node<'_>,
+    analyzer: &dyn IAnalyzer,
     csharp: &CSharpAnalyzer,
     file: &ProjectFile,
     source: &str,
@@ -1631,7 +1633,14 @@ fn receiver_type_fq_names(
             match bindings.resolve_symbol(receiver) {
                 SymbolResolution::Precise(targets) => SymbolResolution::Precise(targets),
                 SymbolResolution::Unknown if !bindings.is_shadowed(receiver) => {
-                    usage_class_field_receiver_type(receiver_node, receiver, csharp, file, source)
+                    usage_class_field_receiver_type(
+                        receiver_node,
+                        receiver,
+                        analyzer,
+                        csharp,
+                        file,
+                        source,
+                    )
                 }
                 resolution => resolution,
             }
@@ -1654,7 +1663,7 @@ fn receiver_type_fq_names(
             .unwrap_or(SymbolResolution::Unknown),
         "parenthesized_expression" | "checked_expression" => receiver_node
             .named_child(0)
-            .map(|inner| receiver_type_fq_names(inner, csharp, file, source, bindings))
+            .map(|inner| receiver_type_fq_names(inner, analyzer, csharp, file, source, bindings))
             .unwrap_or(SymbolResolution::Unknown),
         "cast_expression" | "as_expression" => receiver_node
             .child_by_field_name(if receiver_node.kind() == "cast_expression" {
@@ -1677,14 +1686,32 @@ fn receiver_type_fq_names(
 pub(super) fn usage_class_field_receiver_type(
     receiver_node: Node<'_>,
     receiver: &str,
+    analyzer: &dyn IAnalyzer,
     csharp: &CSharpAnalyzer,
     file: &ProjectFile,
     source: &str,
 ) -> SymbolResolution<String> {
-    enclosing_declared_type(receiver_node, csharp, file, source)
-        .and_then(|enclosing| usage_member_declared_type_fq_name(csharp, &enclosing, receiver))
-        .map(|fq_name| SymbolResolution::Precise(std::iter::once(fq_name).collect()))
-        .unwrap_or(SymbolResolution::Unknown)
+    let Some(enclosing) = enclosing_declared_type(receiver_node, csharp, file, source) else {
+        return SymbolResolution::Unknown;
+    };
+    let candidates =
+        nearest_member_candidates_for_owner(analyzer, csharp, &enclosing, receiver, None);
+    if candidates.is_empty() {
+        return SymbolResolution::Unknown;
+    }
+    let mut resolved_types = candidates
+        .iter()
+        .filter(|candidate| candidate.is_field())
+        .filter_map(|candidate| analyzer.parent_of(candidate))
+        .filter_map(|owner| usage_member_declared_type_fq_name(csharp, &owner, receiver))
+        .collect::<Vec<_>>();
+    resolved_types.sort();
+    resolved_types.dedup();
+    if resolved_types.len() == 1 {
+        SymbolResolution::Precise(resolved_types.into_iter().collect())
+    } else {
+        SymbolResolution::Ambiguous
+    }
 }
 
 pub(super) fn expression_resolves_to_type(
@@ -2003,10 +2030,12 @@ fn binding_container_has_name(node: Node<'_>, source: &str, name: &str) -> bool 
 /// that field only when it appears inside the owning type and is not shadowed by a local
 /// binding (parameter or local variable) of the same name. This proves self-references such
 /// as `Last = value` inside a method of the field's own class.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn unqualified_member_resolves_to_owner(
     node: Node<'_>,
     member_name: &str,
     owner: &CodeUnit,
+    analyzer: &dyn IAnalyzer,
     csharp: &CSharpAnalyzer,
     file: &ProjectFile,
     source: &str,
@@ -2015,65 +2044,19 @@ pub(super) fn unqualified_member_resolves_to_owner(
     if member_name_is_locally_bound(member_name, bindings) {
         return false;
     }
-    enclosing_declared_type(node, csharp, file, source)
-        .is_some_and(|enclosing| enclosing.fq_name() == owner.fq_name())
+    enclosing_declared_type(node, csharp, file, source).is_some_and(|enclosing| {
+        let candidates =
+            nearest_member_candidates_for_owner(analyzer, csharp, &enclosing, member_name, None);
+        candidates.iter().any(|candidate| {
+            analyzer
+                .parent_of(candidate)
+                .is_some_and(|declaring_owner| declaring_owner.fq_name() == owner.fq_name())
+        })
+    })
 }
 
-pub(in crate::analyzer::usages) fn is_type_reference_node(mut node: Node<'_>) -> bool {
-    while let Some(parent) = node.parent() {
-        if csharp_as_expression_type_operand(parent, node) {
-            return true;
-        }
-        if parent
-            .child_by_field_name("type")
-            .is_some_and(|type_node| same_node(type_node, node))
-            || parent
-                .child_by_field_name("return_type")
-                .is_some_and(|type_node| same_node(type_node, node))
-            || parent
-                .child_by_field_name("returns")
-                .is_some_and(|type_node| same_node(type_node, node))
-        {
-            return true;
-        }
-        if parent.kind() == "type" {
-            return true;
-        }
-        if parent.kind() == "type_argument_list" {
-            return true;
-        }
-        if parent.kind() == "explicit_interface_specifier" {
-            return true;
-        }
-        if parent.kind() == "object_creation_expression" {
-            return true;
-        }
-        if csharp_using_directive_is_static(parent) {
-            return true;
-        }
-        if matches!(
-            parent.kind(),
-            "class_declaration"
-                | "interface_declaration"
-                | "struct_declaration"
-                | "record_declaration"
-                | "record_struct_declaration"
-        ) && !parent
-            .child_by_field_name("name")
-            .is_some_and(|name| same_node(name, node))
-        {
-            return true;
-        }
-        if matches!(
-            parent.kind(),
-            "qualified_name" | "generic_name" | "nullable_type" | "array_type" | "base_list"
-        ) {
-            node = parent;
-            continue;
-        }
-        return false;
-    }
-    false
+pub(in crate::analyzer::usages) fn is_type_reference_node(node: Node<'_>) -> bool {
+    csharp_type_reference_root(node).is_some()
 }
 
 pub(in crate::analyzer::usages) fn argument_count(node: Node<'_>, _source: &str) -> usize {
