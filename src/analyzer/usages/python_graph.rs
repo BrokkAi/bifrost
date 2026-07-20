@@ -37,7 +37,35 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let resolver = PythonEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_edges(analyzer, nodes, keep_file))
+    Some(inverted::build_python_edges(
+        analyzer,
+        resolver.py,
+        nodes,
+        nodes,
+        keep_file,
+    ))
+}
+
+/// Build caller nodes for the whole Python graph while resolving only the
+/// requested callee targets. Dead-code analysis needs every declaration as a
+/// possible caller, but only inbound edges for its bounded candidate set.
+pub(crate) fn build_python_usage_edges_for_targets<F>(
+    analyzer: &dyn IAnalyzer,
+    nodes: &HashSet<String>,
+    targets: &HashSet<String>,
+    keep_file: F,
+) -> Option<UsageEdges>
+where
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let resolver = PythonEdgeResolver::try_new(analyzer)?;
+    Some(inverted::build_python_edges(
+        analyzer,
+        resolver.py,
+        nodes,
+        targets,
+        keep_file,
+    ))
 }
 
 pub(crate) fn build_python_usage_edge_weights<F>(
@@ -178,7 +206,7 @@ impl<'a> UsageEdgeResolver<'a> for PythonEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_python_edges(analyzer, self.py, nodes, keep_file)
+        inverted::build_python_edges(analyzer, self.py, nodes, nodes, keep_file)
     }
 
     fn build_edge_weights<F>(
@@ -190,7 +218,7 @@ impl<'a> UsageEdgeResolver<'a> for PythonEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_python_edges(analyzer, self.py, nodes, keep_file)
+        inverted::build_python_edges(analyzer, self.py, nodes, nodes, keep_file)
     }
 }
 

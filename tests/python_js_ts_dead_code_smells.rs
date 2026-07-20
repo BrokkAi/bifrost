@@ -504,6 +504,73 @@ class Runner:
 }
 
 #[test]
+fn python_dead_code_targeted_graph_preserves_expensive_member_resolution_paths() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Command:
+    def call_result_target(self):
+        return 1
+
+    def keyword_target(self):
+        return 2
+
+class Noise:
+    def irrelevant(self):
+        return 3
+
+def build() -> Command:
+    return Command()
+
+def noise() -> Noise:
+    return Noise()
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Command, Noise, build, noise
+
+def run():
+    build().call_result_target()
+    Command(keyword_target=1)
+    noise().irrelevant()
+    Noise(unrelated=2)
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let call_result_target = python_definition(&analyzer, "service.Command.call_result_target");
+    let keyword_target = python_definition(&analyzer, "service.Command.keyword_target");
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["service.py".to_string(), "consumer.py".to_string()],
+            fq_names: vec![call_result_target.fq_name(), keyword_target.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    for target in [
+        "service.Command.call_result_target",
+        "service.Command.keyword_target",
+    ] {
+        assert!(result.report.contains(target), "{}", result.report);
+    }
+    assert_eq!(
+        2,
+        result
+            .report
+            .matches("one workspace inbound edge from consumer.run")
+            .count(),
+        "{}",
+        result.report
+    );
+}
+
+#[test]
 fn js_dead_code_smell_reports_unused_export() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
