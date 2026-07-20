@@ -5087,6 +5087,123 @@ object Consumer {
 }
 
 #[test]
+fn scala_file_major_scan_preserves_forward_roles_across_namespace_and_inheritance_shapes() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "defs/Definitions.scala",
+            r#"package defs
+
+enum ImportedMode { case Live, Idle }
+
+case class Product(value: Int)
+
+object Container {
+  case class Settings(value: Int)
+}
+
+trait Parent {
+  def inherited(value: Int): Int = value
+  def iterator: Iterator[Int] = Iterator.empty
+}
+class Child extends Parent {
+  val ref: Int = 1
+}
+trait OtherParent { def iterator: Iterator[Int] = Iterator.empty }
+
+opaque type Token = Int
+object Token {
+  def empty[A]: Token = 0
+  def direct(value: Int): Int = value
+}
+
+object Syntax {
+  extension (value: String) def cyan: String = value
+}
+
+trait ImportsHolder { def addImports(value: Int): Unit = () }
+class ImportsHolderImpl extends ImportsHolder
+object ImportsHolder {
+  def apply(value: Int)(implicit project: String): ImportsHolder = new ImportsHolderImpl
+}
+"#,
+        ),
+        (
+            "use/Use.scala",
+            r#"package use
+
+import defs.*
+import defs.Container.*
+import defs.ImportedMode.*
+import defs.Syntax.*
+
+object Use extends Parent {
+  def contextual(value: Int)(using String): Int = value
+  def curried(value: Int)(suffix: String): String = value.toString + suffix
+
+  val importedRoot = ImportedMode.Live // positive-imported-stable-type-root
+  val syntheticFactory = Product(1) // positive-synthetic-factory
+  val nestedSyntheticFactory = Settings(2) // positive-nested-synthetic-factory
+  val contextualCall = contextual(3) // positive-contextual-unqualified
+  val inheritedCall = inherited(4) // positive-inherited-unqualified
+  val methodValue: String => String = curried(5) // positive-partial-method-value
+  def receiverInherited(child: Child) = child.inherited(6) // positive-inherited-receiver
+  def receiverParameterless(child: Child) = child.iterator // positive-inherited-parameterless
+  def capturedReceiver(child: Child^) = child.iterator // positive-captured-receiver
+  def intersectionReceiver(child: Child & OtherParent) = child.iterator // negative-intersection-receiver
+  val singletonGeneric = Token.empty[Int] // positive-generic-nullary-singleton
+  val singletonDirect = Token.direct(7) // positive-direct-singleton
+  val extensionLiteral = "value".cyan // positive-literal-extension
+  val importedEnumField = Live // positive-imported-enum-field
+  def receiverField(child: Child) = child.ref // positive-typed-receiver-field
+  val inferredHolder = ImportsHolder(1)("project")
+  inferredHolder.addImports(8) // positive-applied-receiver-result
+}
+"#,
+        ),
+    ]);
+
+    let mut missing = Vec::new();
+    for (target_fqn, marker) in [
+        ("defs.ImportedMode", "positive-imported-stable-type-root"),
+        ("defs.Product.Product", "positive-synthetic-factory"),
+        (
+            "defs.Container$.Settings.Settings",
+            "positive-nested-synthetic-factory",
+        ),
+        ("use.Use$.contextual", "positive-contextual-unqualified"),
+        ("defs.Parent.inherited", "positive-inherited-unqualified"),
+        ("use.Use$.curried", "positive-partial-method-value"),
+        ("defs.Parent.inherited", "positive-inherited-receiver"),
+        ("defs.Parent.iterator", "positive-inherited-parameterless"),
+        ("defs.Parent.iterator", "positive-captured-receiver"),
+        ("defs.Token$.empty", "positive-generic-nullary-singleton"),
+        ("defs.Token$.direct", "positive-direct-singleton"),
+        ("defs.Syntax$.cyan", "positive-literal-extension"),
+        ("defs.ImportedMode$.Live", "positive-imported-enum-field"),
+        ("defs.Child.ref", "positive-typed-receiver-field"),
+        (
+            "defs.ImportsHolder.addImports",
+            "positive-applied-receiver-result",
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        if !target_hits.iter().any(|hit| hit.snippet.contains(marker)) {
+            missing.push((target_fqn, marker, target_hits));
+        }
+    }
+    assert!(missing.is_empty(), "missing parity events: {missing:#?}");
+
+    let inherited_iterator = definition(&analyzer, "defs.Parent.iterator");
+    let inherited_iterator_hits = hits(
+        UsageFinder::new()
+            .find_usages_default(&analyzer, std::slice::from_ref(&inherited_iterator)),
+    );
+    assert_no_hit_contains(&inherited_iterator_hits, "negative-intersection-receiver");
+}
+
+#[test]
 fn scala_unqualified_calls_resolve_through_lexical_owner_tiers() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "app/Owners.scala",

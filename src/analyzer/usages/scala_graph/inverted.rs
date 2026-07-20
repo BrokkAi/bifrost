@@ -6859,6 +6859,16 @@ fn record_reference(
                             unit.is_function() || ctx.types.has_term_field_declaration(unit)
                         })
                         .collect::<Vec<_>>();
+                    if !imported_units.is_empty()
+                        && imported_units.iter().all(|unit| unit.is_synthetic())
+                        && (ctx.visible_type(function, name).is_some()
+                            || ctx
+                                .visible_object_reference(function.start_byte(), name)
+                                .is_some())
+                    {
+                        record_unqualified_type_application(function, name, ctx, bindings);
+                        return;
+                    }
                     if !imported_units.is_empty() {
                         let imported_fields = imported_units
                             .iter()
@@ -6886,6 +6896,14 @@ fn record_reference(
                         ) {
                             ctx.record_exact_callable_with_shape(target, function, &call_shape);
                         }
+                        return;
+                    }
+                    if ctx.visible_type(function, name).is_some()
+                        || ctx
+                            .visible_object_reference(function.start_byte(), name)
+                            .is_some()
+                    {
+                        record_unqualified_type_application(function, name, ctx, bindings);
                         return;
                     }
                     if !imported_type_alias_only
@@ -6988,10 +7006,18 @@ fn record_reference(
             if is_field_expression_value(node)
                 && bindings.resolve_symbol(name).is_unknown()
                 && !bindings.is_shadowed(name)
-                && let Some(target) = ctx.visible_object_reference(node.start_byte(), name)
             {
-                ctx.record_resolved(target, ScalaReferenceRole::StableObject, node);
-                return;
+                if let Some(ScalaResolvedReference::Exact(target)) =
+                    ctx.visible_type_reference(node, name)
+                    && ctx.types.type_is_stable_owner(ctx.scala, &target)
+                {
+                    ctx.record_exact(target, ScalaReferenceRole::Type, node);
+                    return;
+                }
+                if let Some(target) = ctx.visible_object_reference(node.start_byte(), name) {
+                    ctx.record_resolved(target, ScalaReferenceRole::StableObject, node);
+                    return;
+                }
             }
             let bare_companion_method_value = is_bare_companion_method_value_reference(node);
             if (is_extractor_reference(node) || is_infix_pattern_operator(node))
@@ -7077,7 +7103,8 @@ fn record_reference(
                     }
                 }
             }
-            if let Some(call_shape) = call_site_shape_for_reference(node)
+            if !is_terminal_stable_field_reference(node)
+                && let Some(call_shape) = call_site_shape_for_reference(node)
                 && call_shape.type_arguments_only
             {
                 if record_lexically_visible_call(node, name, &call_shape, ctx) {
@@ -7491,18 +7518,48 @@ fn record_unqualified_type_application(
         } else {
             TypeApplicationRole::BareApplication
         };
+    let call_shape = call_site_shape_for_reference(function);
     let resolution = ctx.types.resolve_type_application(
         ctx.scala,
         &ctx.resolver,
         class_fqn.as_deref(),
         object_fqn.as_deref(),
         name,
-        call_site_shape_for_reference(function).as_ref(),
+        call_shape.as_ref(),
         application_role,
         Some(ctx.source_file),
     );
     if let Some(target) = resolution.type_target {
-        ctx.record_exact(target, ScalaReferenceRole::Type, function);
+        ctx.record_exact(target.clone(), ScalaReferenceRole::Type, function);
+        let exact_companions = ctx.types.exact_companion_objects(ctx.scala, &target);
+        let has_exact_companion_callable = resolution.callable_targets.iter().any(|callable| {
+            ctx.scala
+                .structural_parent_of(callable)
+                .is_some_and(|owner| exact_companions.contains(&owner))
+        });
+        if application_role == TypeApplicationRole::BareApplication && !has_exact_companion_callable
+        {
+            for constructor in ctx
+                .types
+                .exact_member_declarations(ctx.scala, &target, target.identifier())
+                .into_iter()
+                .filter(CodeUnit::is_synthetic)
+                .filter(|constructor| {
+                    ctx.types.constructor_target_matches(
+                        ctx.scala,
+                        constructor,
+                        call_shape.as_ref(),
+                        ScalaCallableSiteRole::PrimaryConstruction,
+                    )
+                })
+            {
+                ctx.record_exact_companion_callable(
+                    constructor,
+                    ScalaReferenceRole::CompanionApplication,
+                    function,
+                );
+            }
+        }
     }
     for callable in resolution.callable_targets {
         ctx.record_exact_companion_callable(
@@ -8027,7 +8084,7 @@ fn record_lexically_visible_call(
             match resolution {
                 BareMemberResolution::Resolved(methods) => {
                     for method in methods {
-                        ctx.record_exact_callable(method, node);
+                        ctx.record_exact_callable_with_shape(method, node, call_shape);
                     }
                     return true;
                 }
@@ -8049,7 +8106,7 @@ fn record_lexically_visible_call(
         ) {
             BareMemberResolution::Resolved(methods) => {
                 for method in methods {
-                    ctx.record_exact_callable(method, node);
+                    ctx.record_exact_callable_with_shape(method, node, call_shape);
                 }
                 return true;
             }
@@ -8926,6 +8983,7 @@ fn exact_owner_field_binding(
 }
 
 fn resolve_receiver_type_node(type_node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
+    let type_node = scala_capture_underlying_type(type_node, ctx.source);
     let path = scala_type_lookup_segments(type_node, ctx.source);
     if path.is_empty() {
         return None;
@@ -8951,12 +9009,32 @@ fn resolve_receiver_type_declaration_node(
     type_node: Node<'_>,
     ctx: &ScalaScan<'_, '_>,
 ) -> Option<CodeUnit> {
+    let type_node = scala_capture_underlying_type(type_node, ctx.source);
     match ctx.exact_lexically_visible_type(type_node) {
         ScalaTypeNamespaceResolution::Resolved(declaration) => Some(declaration),
         ScalaTypeNamespaceResolution::AuthoritativeMiss
         | ScalaTypeNamespaceResolution::Ambiguous
         | ScalaTypeNamespaceResolution::NoMatch => None,
     }
+}
+
+/// Tree-sitter represents Scala 3's postfix capture marker (`T^`) as an
+/// `infix_type` whose right operand is the zero-width missing node. Preserve
+/// the parser's structure while resolving the actual receiver type on the
+/// left; ordinary infix/intersection types remain untouched.
+fn scala_capture_underlying_type<'tree>(type_node: Node<'tree>, source: &str) -> Node<'tree> {
+    if type_node.kind() == "infix_type"
+        && type_node
+            .child_by_field_name("operator")
+            .is_some_and(|operator| node_text(operator, source).trim() == "^")
+        && type_node
+            .child_by_field_name("right")
+            .is_some_and(|right| right.start_byte() == right.end_byte())
+        && let Some(left) = type_node.child_by_field_name("left")
+    {
+        return left;
+    }
+    type_node
 }
 
 fn visible_extensions(

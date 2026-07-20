@@ -1642,17 +1642,21 @@ pub(crate) fn scala_call_shape_relation(
     for actual_list in &actual.lists {
         match actual_list.kind {
             ScalaCallArgumentListKind::Ordinary | ScalaCallArgumentListKind::Block => {
-                while declared
-                    .get(declared_index)
-                    .is_some_and(|list| list.kind == ScalaParameterListKind::Contextual)
-                {
+                while declared.get(declared_index).is_some_and(|list| {
+                    list.kind == ScalaParameterListKind::Contextual
+                        && declared[declared_index + 1..]
+                            .iter()
+                            .any(|remaining| remaining.kind == ScalaParameterListKind::Explicit)
+                }) {
                     declared_index += 1;
                 }
                 let Some(declared_list) = declared.get(declared_index) else {
                     return ScalaCallShapeRelation::Incompatible;
                 };
-                if declared_list.kind != ScalaParameterListKind::Explicit
-                    || !declared_list.arity.accepts(actual_list.arity)
+                if !matches!(
+                    declared_list.kind,
+                    ScalaParameterListKind::Explicit | ScalaParameterListKind::Contextual
+                ) || !declared_list.arity.accepts(actual_list.arity)
                 {
                     return ScalaCallShapeRelation::Incompatible;
                 }
@@ -2075,7 +2079,33 @@ mod tests {
                     type_arguments_only: false,
                 }
             ),
-            ScalaCallShapeRelation::Incompatible
+            ScalaCallShapeRelation::Complete
+        );
+        assert_eq!(
+            scala_call_shape_relation(
+                &[explicit(1), contextual(1)],
+                &ScalaCallSiteShape {
+                    lists: vec![ordinary, ordinary],
+                    method_value_arity: None,
+                    method_value_parameter_types: None,
+                    method_value_parameter_types_authoritative: false,
+                    type_arguments_only: false,
+                }
+            ),
+            ScalaCallShapeRelation::Complete
+        );
+        assert_eq!(
+            scala_call_shape_relation(
+                &[contextual(1), explicit(1)],
+                &ScalaCallSiteShape {
+                    lists: vec![ordinary],
+                    method_value_arity: None,
+                    method_value_parameter_types: None,
+                    method_value_parameter_types_authoritative: false,
+                    type_arguments_only: false,
+                }
+            ),
+            ScalaCallShapeRelation::Complete
         );
 
         let partial = ScalaCallSiteShape {
