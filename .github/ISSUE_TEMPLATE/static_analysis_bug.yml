@@ -1,0 +1,90 @@
+name: Static-analysis bug
+description: Report an incorrect, missing, inconsistent, or unexpectedly slow analysis result.
+title: ""
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A small code example or an exact repository location helps us reproduce analyzer behavior. Please do not include private source code or secrets.
+
+  - type: dropdown
+    id: affected-analysis
+    attributes:
+      label: Affected analysis
+      description: Which Bifrost analysis surface is closest to the problem?
+      options:
+        - Parsing or structural CodeQuery/RQL
+        - Definitions
+        - References, usages, or calls
+        - Symbols, imports, or type hierarchy
+        - Code-quality analysis
+        - Semantic search
+        - Analysis performance or caching
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: languages
+    attributes:
+      label: Language(s)
+      description: List every source language involved, including multiple languages when the behavior crosses language boundaries.
+      placeholder: For example, Rust, Python, or JavaScript and TypeScript
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed-result
+    attributes:
+      label: What did Bifrost report?
+      description: Describe the incorrect or missing result, inconsistency, or performance behavior you observed.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-result
+    attributes:
+      label: What should it report?
+      description: Describe the result or behavior you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide a minimal snippet with file names, a public repository URL with an exact commit and file/range, or the smallest witness you can share if the original source is private.
+      placeholder: |
+        // src/example.rs
+        // Include the smallest code needed to demonstrate the behavior.
+
+        Repository and commit, if applicable:
+        Relevant file and source range:
+    validations:
+      required: true
+
+  - type: textarea
+    id: invocation
+    attributes:
+      label: How was the analysis run?
+      description: Optionally include the CLI command, RQL or JSON query, MCP call, LSP action, or API invocation.
+
+  - type: input
+    id: version-environment
+    attributes:
+      label: Bifrost version and environment
+      description: Optionally include the Bifrost version or commit, interface, operating system, and relevant configuration.
+      placeholder: For example, Bifrost 0.8.4 via MCP on macOS
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Complete output or diagnostics
+      description: Optionally include logs or the structured response, including diagnostics, proof tiers, and truncation fields when relevant.
+
+  - type: markdown
+    attributes:
+      value: |
+        For benchmark or large-repository reports, see [Reproduce an Analysis](https://brokkai.github.io/bifrost/reproduce-analysis/) for the fuller evidence format.

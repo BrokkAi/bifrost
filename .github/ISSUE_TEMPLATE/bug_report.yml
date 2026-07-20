@@ -1,0 +1,64 @@
+name: Other bug
+description: Report a problem with installation, an interface, an integration, or other non-analysis behavior.
+title: ""
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use the static-analysis bug form instead when Bifrost returned an incorrect or missing result for source code.
+
+  - type: dropdown
+    id: affected-surface
+    attributes:
+      label: Affected surface
+      description: Where did you encounter the problem?
+      options:
+        - CLI
+        - MCP or agent plugin
+        - LSP or editor integration
+        - VS Code extension
+        - Python client
+        - Rust library
+        - Installation or release packaging
+        - Documentation or website
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed-behavior
+    attributes:
+      label: What happened?
+      description: Describe the problem and its effect on your workflow.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: How can we reproduce it?
+      description: List the smallest set of steps you know. If the problem is intermittent, describe when it tends to occur.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: What did you expect?
+      description: Describe the behavior you expected instead.
+    validations:
+      required: true
+
+  - type: input
+    id: version-environment
+    attributes:
+      label: Version and environment
+      description: Optionally include the Bifrost version or commit, interface or package version, operating system, and relevant configuration.
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Logs, screenshots, or other context
+      description: Optionally add anything else that may help us understand the problem. Please remove secrets and private data.
