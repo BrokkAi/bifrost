@@ -144,9 +144,11 @@ pub(crate) fn read_workspace_document(
     // rejects a target that would escape. Match-directory traversal uses the
     // classified entry API below and never follows symlinks. Nonblocking mode
     // prevents an explicitly named or concurrently substituted FIFO from
-    // stalling before the opened-handle regular-file check.
+    // stalling before the opened-handle regular-file check. `maybe_dir` lets
+    // Windows open a directory handle so the same check can reject it as a
+    // non-regular file, matching platforms where directories open normally.
     let mut options = OpenOptions::new();
-    options.read(true);
+    options.read(true).maybe_dir(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_NONBLOCK);
     let file = root
