@@ -18,7 +18,8 @@ use crate::analyzer::usages::traits::{
 use crate::analyzer::{CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 pub(in crate::analyzer::usages) use reference::{
-    GoReferenceResolution, resolve_go_reference_with_namespaces,
+    GoReferenceResolution, GoSelectorDescriptor, go_selector_descriptor,
+    resolve_go_reference_with_namespaces,
 };
 use std::collections::BTreeSet;
 

@@ -20,7 +20,7 @@
 
 use super::resolver::{
     constructor_method_reference_receiver, is_ignored_type_context, node_text,
-    resolve_nested_type_for_owner, resolve_type_segments,
+    resolve_field_access_type, resolve_nested_type_for_owner, resolve_type_segments,
 };
 use super::return_type::{
     FileReturnCache, JavaReturnTypeContext, LexicalTypeResolution, METHOD_RECEIVER_CHAIN_LIMIT,
@@ -107,6 +107,21 @@ impl JavaScan<'_, '_> {
     }
 
     fn resolve_type(&self, node: Node<'_>) -> Option<CodeUnit> {
+        if matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier") {
+            return resolve_type_segments(
+                node,
+                self.source,
+                |candidate| self.resolve_non_nested_type(candidate),
+                |owner, name| self.resolve_nested_type(owner, name),
+            )
+            .into_iter()
+            .last()
+            .map(|(resolved, _)| resolved);
+        }
+        self.resolve_non_nested_type(node)
+    }
+
+    fn resolve_non_nested_type(&self, node: Node<'_>) -> Option<CodeUnit> {
         match java_lexical_type_from_node(self.java, self.analyzer, self.file, self.source, node) {
             LexicalTypeResolution::Resolved(unit) => return Some(unit),
             LexicalTypeResolution::Blocked => return None,
@@ -303,6 +318,7 @@ fn record_constructor_reference_for_type(
     let Some(owner) = ctx.resolve_type(type_node) else {
         return;
     };
+    ctx.record(owner.fq_name().to_string(), type_node);
     let constructor_fqn = format!("{}.{}", owner.fq_name(), owner.identifier());
     let declared = ctx
         .java
@@ -409,9 +425,24 @@ fn receiver_type_fqn_at_depth(
             .class_ranges
             .enclosing(object.start_byte())
             .map(str::to_string),
-        "type_identifier" | "scoped_type_identifier" | "generic_type" => {
+        "type_identifier" | "scoped_identifier" | "scoped_type_identifier" | "generic_type" => {
             ctx.resolve_type_fqn(object)
         }
+        "field_access" => resolve_field_access_type(
+            object,
+            ctx.source,
+            |base| {
+                let name = node_text(base, ctx.source);
+                if bindings.is_shadowed(name) {
+                    Err(())
+                } else {
+                    Ok(ctx.resolve_type(base))
+                }
+            },
+            |qualified| ctx.java.resolve_usage_type_name(ctx.file, qualified),
+            |owner, name| ctx.resolve_nested_type(owner, name),
+        )
+        .map(|owner| owner.fq_name()),
         "object_creation_expression" => object
             .child_by_field_name("type")
             .and_then(|type_node| ctx.resolve_type_fqn(type_node)),

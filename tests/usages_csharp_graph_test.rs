@@ -380,6 +380,85 @@ fn csharp_graph_resolves_nested_partial_type_references_in_sibling_file() {
 }
 
 #[test]
+fn usage_finder_csharp_resolves_sibling_nested_constructor_in_enclosing_type() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "Demo/Nested.cs",
+        r#"namespace Demo;
+
+public class Outer {
+    public class Consumer {
+        public object Build() => new Target(42);
+    }
+
+    public class Target(int value) {}
+}
+
+public class OtherOuter {
+    public class Target(int value) {}
+    public object Build() => new Target(7);
+}
+"#,
+    )]);
+
+    let consumer = project.file("Demo/Nested.cs");
+    let source = consumer.read_to_string().expect("nested source");
+    let outer_call = source
+        .find("Target(42)")
+        .expect("outer target construction");
+    let other_call = source.find("Target(7)").expect("other target construction");
+    let outer_target = type_definition(&analyzer, "Demo.Outer$Target");
+    let other_target = type_definition(&analyzer, "Demo.OtherOuter$Target");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    let forward = definition_lookup(
+        project.root(),
+        "Demo/Nested.cs",
+        outer_call,
+        outer_call + "Target".len(),
+    );
+    assert_eq!(forward["results"][0]["status"], "resolved", "{forward}");
+    assert_eq!(
+        forward["results"][0]["definitions"][0]["fqn"], "Demo.Outer$Target",
+        "{forward}"
+    );
+
+    let targeted = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&outer_target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result
+        .into_either()
+        .expect("targeted sibling-nested query should resolve");
+    let whole_workspace = UsageFinder::new()
+        .query(&analyzer, std::slice::from_ref(&outer_target), 1000, 1000)
+        .result
+        .into_either()
+        .expect("whole-workspace sibling-nested query should resolve");
+    for hits in [&targeted, &whole_workspace] {
+        assert_eq!(hits.len(), 1, "{hits:#?}");
+        assert!(hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= outer_call
+                && outer_call + "Target".len() <= hit.end_offset
+        }));
+    }
+
+    let unrelated_hits = graph_hits(&analyzer, &other_target);
+    assert_eq!(unrelated_hits.len(), 1, "{unrelated_hits:#?}");
+    assert!(unrelated_hits.iter().any(|hit| {
+        hit.file == consumer
+            && hit.start_offset <= other_call
+            && other_call + "Target".len() <= hit.end_offset
+    }));
+}
+
+#[test]
 fn csharp_graph_nested_type_reference_respects_type_parameter_shadow() {
     let (project, analyzer) = csharp_analyzer_with_files(&[
         (
@@ -3535,6 +3614,60 @@ namespace System.Reflection.Emit {
             .into_either()
             .expect("default partial pattern query should resolve")
             .len()
+    );
+}
+
+#[test]
+fn csharp_tuple_element_type_is_a_usage_but_its_declaration_name_is_not() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Configuration/MapperConfiguration.cs",
+            "namespace Configuration { public class MapperConfiguration { } }\n",
+        ),
+        (
+            "MapperGenerator.cs",
+            r#"
+using Configuration;
+
+namespace Generators;
+
+public class MapperGenerator {
+    private static (MapperConfiguration MapperConfiguration, int Diagnostics) BuildDefaults() {
+        return default;
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = type_definition(&analyzer, "Configuration.MapperConfiguration");
+    let hits = graph_hits(&analyzer, &target);
+    let consumer = project.file("MapperGenerator.cs");
+    let source = consumer.read_to_string().expect("tuple consumer source");
+    let type_start = source
+        .find("(MapperConfiguration")
+        .expect("tuple element type")
+        + 1;
+    let name_start = source
+        .find("MapperConfiguration,")
+        .expect("tuple element declaration name");
+
+    assert_eq!(
+        1,
+        hits.len(),
+        "only the tuple element type should count: {hits:#?}"
+    );
+    let hit = hits.iter().next().expect("tuple type hit");
+    assert_eq!(consumer, hit.file);
+    assert!(
+        hit.start_offset <= type_start
+            && type_start + "MapperConfiguration".len() <= hit.end_offset,
+        "tuple type token should be returned: {hit:#?}"
+    );
+    assert!(
+        !(hit.start_offset <= name_start
+            && name_start + "MapperConfiguration".len() <= hit.end_offset),
+        "tuple element declaration name must stay excluded: {hit:#?}"
     );
 }
 

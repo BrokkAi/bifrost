@@ -825,15 +825,7 @@ pub(crate) fn csharp_type_reference_root(mut node: Node<'_>) -> Option<Node<'_>>
             node = parent;
             continue;
         }
-        if parent
-            .child_by_field_name("type")
-            .is_some_and(|type_node| same_csharp_node(type_node, node))
-            || parent
-                .child_by_field_name("return_type")
-                .is_some_and(|type_node| same_csharp_node(type_node, node))
-            || parent
-                .child_by_field_name("returns")
-                .is_some_and(|type_node| same_csharp_node(type_node, node))
+        if csharp_is_structured_type_role(parent, node)
             || csharp_as_expression_type_operand(parent, node)
             || csharp_is_expression_type_operand(parent, node)
         {
@@ -870,6 +862,22 @@ pub(crate) fn csharp_type_reference_root(mut node: Node<'_>) -> Option<Node<'_>>
         }
         return None;
     }
+}
+
+fn csharp_is_structured_type_role(parent: Node<'_>, node: Node<'_>) -> bool {
+    // A tuple element exposes both `type` and `name` identifier children. Keep
+    // that distinction declaration-driven: only the grammar's `type` field is
+    // a reference, even when the element name has identical text.
+    let fields: &[&str] = if parent.kind() == "tuple_element" {
+        &["type"]
+    } else {
+        &["type", "return_type", "returns"]
+    };
+    fields.iter().any(|field| {
+        parent
+            .child_by_field_name(field)
+            .is_some_and(|candidate| same_csharp_node(candidate, node))
+    })
 }
 
 pub(crate) fn csharp_constant_pattern_type_candidate(node: Node<'_>) -> Option<Node<'_>> {

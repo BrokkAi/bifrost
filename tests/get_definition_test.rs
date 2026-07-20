@@ -10459,6 +10459,157 @@ func (br *Buf) Lock() {
 }
 
 #[test]
+fn go_selector_focus_resolves_only_the_structured_prefix() {
+    let source = r#"
+package main
+
+import cfg "example.com/app/config"
+
+type Command struct {
+    Options cfg.Options
+}
+
+func (c *Command) run() {
+    _ = c.Options.KeepUserTurns
+}
+
+func shadow() {
+    cfg := Command{}
+    _ = cfg.Options.KeepUserTurns
+}
+
+var _ cfg.Options
+"#;
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "config/config.go",
+            r#"
+package config
+
+type Options struct {
+    KeepUserTurns bool
+}
+"#,
+        )
+        .file("main.go", source)
+        .build();
+
+    let chain = source
+        .find("c.Options.KeepUserTurns")
+        .expect("receiver chain");
+    let receiver = lookup(
+        project.root(),
+        &location_reference("main.go", source, chain),
+    );
+    let result = &receiver["results"][0];
+    assert_eq!(result["status"], "resolved", "{receiver}");
+    assert_eq!(result["definitions"][0]["name"], "c", "{receiver}");
+    assert_eq!(
+        result["definitions"][0]["kind"], "receiver_parameter",
+        "{receiver}"
+    );
+
+    for (offset, expected) in [
+        ("c.".len(), "example.com/app.Command.Options"),
+        (
+            "c.Options.".len(),
+            "example.com/app/config.Options.KeepUserTurns",
+        ),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference("main.go", source, chain + offset),
+        );
+        assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+        assert_eq!(
+            value["results"][0]["definitions"][0]["fqn"], expected,
+            "{value}"
+        );
+    }
+
+    let shadowed = source
+        .find("cfg.Options.KeepUserTurns")
+        .expect("shadowed local chain");
+    for (offset, expected) in [
+        ("cfg.".len(), "example.com/app.Command.Options"),
+        (
+            "cfg.Options.".len(),
+            "example.com/app/config.Options.KeepUserTurns",
+        ),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference("main.go", source, shadowed + offset),
+        );
+        assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+        assert_eq!(
+            value["results"][0]["definitions"][0]["fqn"], expected,
+            "{value}"
+        );
+    }
+
+    let alias_start = source.rfind("cfg.Options").expect("package alias chain");
+    let alias = lookup(
+        project.root(),
+        &location_reference("main.go", source, alias_start),
+    );
+    assert_eq!(
+        alias["results"][0]["status"], "unresolvable_import_boundary",
+        "{alias}"
+    );
+
+    let package_type = lookup(
+        project.root(),
+        &location_reference("main.go", source, alias_start + "cfg.".len()),
+    );
+    assert_eq!(
+        package_type["results"][0]["status"], "resolved",
+        "{package_type}"
+    );
+    assert_eq!(
+        package_type["results"][0]["definitions"][0]["fqn"], "example.com/app/config.Options",
+        "{package_type}"
+    );
+}
+
+#[test]
+fn go_selector_focus_preserves_ambiguous_intermediate_members() {
+    let source = r#"
+package main
+
+type Leaf struct { ID string }
+type Left struct { Leaf }
+type Right struct { Leaf }
+type Model struct {
+    Left
+    Right
+}
+
+func inspect(model Model) {
+    _ = model.Leaf.ID
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("main.go", source)
+        .build();
+    let chain = source.find("model.Leaf.ID").expect("ambiguous chain");
+
+    for offset in ["model.".len(), "model.Leaf.".len()] {
+        let value = lookup(
+            project.root(),
+            &location_reference("main.go", source, chain + offset),
+        );
+        assert_eq!(value["results"][0]["status"], "ambiguous", "{value}");
+        assert_eq!(
+            value["results"][0]["diagnostics"][0]["kind"], "ambiguous_definition",
+            "{value}"
+        );
+    }
+}
+
+#[test]
 fn go_receiver_chain_with_missing_terminal_still_honors_receiver_focus() {
     let project = InlineTestProject::with_language(Language::Go)
         .file(
@@ -10933,6 +11084,61 @@ public class UseTarget {
         result["definitions"][0]["path"], "pkg/Target.java",
         "{value}"
     );
+}
+
+#[test]
+fn java_try_resource_receiver_shadows_same_named_imported_type() {
+    let source = r#"
+package app;
+
+import other.Indexer;
+
+public class SentenceSourceIndexer implements AutoCloseable {
+    private Indexer indexer;
+
+    public void execute() throws Exception {
+        try (SentenceSourceIndexer indexer = new SentenceSourceIndexer()) {
+            indexer.run(); // resource-receiver
+        }
+        indexer.run(); // field-receiver-after-try
+    }
+
+    public void run() {}
+    public void close() {}
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "other/Indexer.java",
+            "package other; public class Indexer { public void run() {} }\n",
+        )
+        .file("app/SentenceSourceIndexer.java", source)
+        .build();
+
+    for (marker, expected) in [
+        (
+            "indexer.run(); // resource-receiver",
+            "app.SentenceSourceIndexer.run",
+        ),
+        (
+            "indexer.run(); // field-receiver-after-try",
+            "other.Indexer.run",
+        ),
+    ] {
+        let start = source.find(marker).expect("receiver marker") + marker.find("run").unwrap();
+        let value = lookup(
+            project.root(),
+            &location_reference("app/SentenceSourceIndexer.java", source, start),
+        );
+        assert_eq!(
+            value["results"][0]["status"], "resolved",
+            "{marker}: {value}"
+        );
+        assert_eq!(
+            value["results"][0]["definitions"][0]["fqn"], expected,
+            "{marker}: {value}"
+        );
+    }
 }
 
 #[test]

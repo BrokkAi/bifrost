@@ -870,6 +870,47 @@ fn csharp_issue701_is_expression_edges_to_logical_partial_type() {
 }
 
 #[test]
+fn tuple_element_type_edges_once_while_its_declaration_name_stays_excluded() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Configuration/MapperConfiguration.cs",
+            "namespace Configuration { public class MapperConfiguration { } }\n",
+        )
+        .file(
+            "MapperGenerator.cs",
+            r#"
+using Configuration;
+
+namespace Generators;
+
+public class MapperGenerator {
+    private static (MapperConfiguration MapperConfiguration, int Diagnostics) BuildDefaults() {
+        return default;
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    let edge = value["edges"]
+        .as_array()
+        .expect("usage graph edges")
+        .iter()
+        .find(|edge| {
+            edge["from"]
+                .as_str()
+                .is_some_and(|from| from.ends_with("Generators.MapperGenerator.BuildDefaults"))
+                && edge["to"].as_str() == Some("Configuration.MapperConfiguration")
+        })
+        .unwrap_or_else(|| panic!("tuple type edge should exist: {}", value["edges"]));
+    assert_eq!(
+        edge["weight"], 1,
+        "the same-spelled tuple declaration name must not add a second site: {edge}"
+    );
+}
+
+#[test]
 fn attribute_reference_edges_to_attribute_type() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

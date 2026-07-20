@@ -219,7 +219,7 @@ fn java_declaration_name_type(
     name: Node<'_>,
 ) -> Option<CodeUnit> {
     match parent.kind() {
-        "formal_parameter" if parent.child_by_field_name("name") == Some(name) => {
+        "formal_parameter" | "resource" if parent.child_by_field_name("name") == Some(name) => {
             parent.child_by_field_name("type").and_then(|type_node| {
                 java_type_from_node_with_context(analyzer, java, file, source, type_node)
             })
@@ -1133,6 +1133,7 @@ const JAVA_TYPE_LOOKUP_SCOPE_NODES: &[&str] = &[
     "catch_clause",
     "enhanced_for_statement",
     "for_statement",
+    "try_with_resources_statement",
 ];
 
 fn java_bindings_before_scoped(
@@ -1176,7 +1177,15 @@ fn java_seed_active_path(
         }
         if enters_scope {
             bindings.enter_scope();
-            java_seed_scope_declarations(analyzer, java, file, source, node, bindings);
+            java_seed_scope_declarations(
+                analyzer,
+                java,
+                file,
+                source,
+                node,
+                cutoff_start,
+                bindings,
+            );
         } else {
             java_seed_inline_typed_binding(analyzer, java, file, source, node, bindings);
         }
@@ -1197,6 +1206,7 @@ fn java_seed_scope_declarations(
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
+    cutoff_start: usize,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
     match node.kind() {
@@ -1220,6 +1230,27 @@ fn java_seed_scope_declarations(
         "enhanced_for_statement" => {
             if let Some(name) = node.child_by_field_name("name") {
                 bindings.declare_shadow(java_node_text(name, source));
+            }
+        }
+        "try_with_resources_statement" => {
+            let Some(resources) = node.child_by_field_name("resources") else {
+                return;
+            };
+            let cutoff_in_resources =
+                resources.start_byte() <= cutoff_start && cutoff_start < resources.end_byte();
+            let cutoff_in_body = node.child_by_field_name("body").is_some_and(|body| {
+                body.start_byte() <= cutoff_start && cutoff_start < body.end_byte()
+            });
+            if !cutoff_in_resources && !cutoff_in_body {
+                return;
+            }
+            let mut cursor = resources.walk();
+            for resource in resources.named_children(&mut cursor) {
+                if resource.kind() == "resource"
+                    && (cutoff_in_body || resource.end_byte() <= cutoff_start)
+                {
+                    java_seed_typed_name_binding(analyzer, java, file, source, resource, bindings);
+                }
             }
         }
         _ => {}
@@ -1256,19 +1287,30 @@ fn java_seed_inline_typed_binding(
             }
         }
         "formal_parameter" => {
-            let Some(name) = node.child_by_field_name("name") else {
-                return;
-            };
-            let binding_name = java_node_text(name, source);
-            if let Some(unit) = node.child_by_field_name("type").and_then(|type_node| {
-                java_type_from_node_with_context(analyzer, java, file, source, type_node)
-            }) {
-                bindings.seed_symbol(binding_name, unit);
-            } else {
-                bindings.declare_shadow(binding_name);
-            }
+            java_seed_typed_name_binding(analyzer, java, file, source, node, bindings)
         }
         _ => {}
+    }
+}
+
+fn java_seed_typed_name_binding(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    let binding_name = java_node_text(name, source);
+    if let Some(unit) = node.child_by_field_name("type").and_then(|type_node| {
+        java_type_from_node_with_context(analyzer, java, file, source, type_node)
+    }) {
+        bindings.seed_symbol(binding_name, unit);
+    } else {
+        bindings.declare_shadow(binding_name);
     }
 }
 
@@ -1595,7 +1637,7 @@ fn collect_java_type_text_binding_before(
                     }
                 }
             }
-            "formal_parameter" => {
+            "formal_parameter" | "resource" => {
                 if let Some(name_node) = node.child_by_field_name("name")
                     && name_node.start_byte() < before_byte
                     && java_node_text(name_node, source) == name
@@ -1807,8 +1849,9 @@ fn java_member_candidates(
 
     let owner = analyzer.definitions(owner_fqn).next();
     if allow_generated_accessors && let Some(owner) = owner.as_ref() {
-        let generated_accessor_candidates =
-            java_lombok_accessor_field_candidates(analyzer, support, owner, member);
+        let generated_accessor_candidates = java_lombok_accessor_field_candidates_for_arity(
+            analyzer, support, owner, member, arity,
+        );
         if !generated_accessor_candidates.is_empty() {
             return candidates_outcome(generated_accessor_candidates);
         }
@@ -1881,6 +1924,7 @@ struct JavaAccessorProperty {
     kind: JavaAccessorKind,
     field_name: String,
     requires_boolean_field: bool,
+    arity: usize,
 }
 
 pub(crate) fn java_lombok_accessor_field_candidates(
@@ -1889,9 +1933,48 @@ pub(crate) fn java_lombok_accessor_field_candidates(
     owner: &CodeUnit,
     member: &str,
 ) -> Vec<CodeUnit> {
+    java_lombok_accessor_field_candidates_for_arity(analyzer, support, owner, member, None)
+}
+
+pub(crate) fn java_lombok_generated_accessor_field_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    owner: &CodeUnit,
+    member: &str,
+    arity: Option<usize>,
+) -> Vec<CodeUnit> {
+    if java_accessor_property(member).is_none() {
+        return Vec::new();
+    }
+    let declared_methods = java_filter_member_candidates(
+        support.fqn(&format!("{}.{}", owner.fq_name(), member)),
+        JavaMemberLookupKind::Method,
+    );
+    let declared_method_wins = match arity {
+        Some(arity) => declared_methods
+            .iter()
+            .any(|method| java_callable_accepts_arity(analyzer, method, arity)),
+        None => !declared_methods.is_empty(),
+    };
+    if declared_method_wins {
+        return Vec::new();
+    }
+    java_lombok_accessor_field_candidates_for_arity(analyzer, support, owner, member, arity)
+}
+
+fn java_lombok_accessor_field_candidates_for_arity(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    owner: &CodeUnit,
+    member: &str,
+    arity: Option<usize>,
+) -> Vec<CodeUnit> {
     let Some(accessor) = java_accessor_property(member) else {
         return Vec::new();
     };
+    if arity.is_some_and(|arity| arity != accessor.arity) {
+        return Vec::new();
+    }
     let mut fields: Vec<_> = support
         .fqn(&format!("{}.{}", owner.fq_name(), accessor.field_name))
         .into_iter()
@@ -1945,6 +2028,7 @@ fn java_accessor_property(member: &str) -> Option<JavaAccessorProperty> {
         kind,
         field_name: java_bean_decapitalize(suffix),
         requires_boolean_field,
+        arity: usize::from(kind == JavaAccessorKind::Setter),
     })
 }
 
