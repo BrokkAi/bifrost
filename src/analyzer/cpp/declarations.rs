@@ -897,18 +897,18 @@ impl<'a> CppVisitor<'a> {
         );
         let has_body = definition_body_present;
         if !has_body && self.parsed.contains_declaration(&code_unit) {
+            self.parsed.record_navigation_range(
+                code_unit.clone(),
+                explicit_range.unwrap_or_else(|| cpp_declaration_range(declaration_node)),
+            );
             return code_unit;
         }
         if has_body {
             if let Some(range) = explicit_range {
-                self.parsed.replace_code_unit_with_range_preserving_ranges(
-                    code_unit.clone(),
-                    range,
-                    None,
-                    None,
-                );
+                self.parsed
+                    .replace_code_unit_with_range(code_unit.clone(), range, None, None);
             } else {
-                self.parsed.replace_code_unit_preserving_ranges(
+                self.parsed.replace_code_unit(
                     code_unit.clone(),
                     declaration_node,
                     self.source,
@@ -1107,13 +1107,8 @@ impl<'a> CppVisitor<'a> {
             return;
         };
         let code_unit = function.code_unit(self.file.clone());
-        self.parsed.replace_code_unit_preserving_ranges(
-            code_unit.clone(),
-            node,
-            self.source,
-            None,
-            None,
-        );
+        self.parsed
+            .replace_code_unit(code_unit.clone(), node, self.source, None, None);
         let signature = render_cpp_function_display_signature_from_node(
             node,
             self.source,
@@ -1277,6 +1272,8 @@ impl<'a> CppVisitor<'a> {
         let code_unit =
             function.code_unit_with_synthetic(self.file.clone(), scope.class_unit.is_some());
         if self.parsed.contains_declaration(&code_unit) {
+            self.parsed
+                .record_navigation_range(code_unit, cpp_declaration_range(declaration_node));
             return;
         }
         self.parsed
@@ -1480,6 +1477,15 @@ impl<'a> CppVisitor<'a> {
         self.parsed
             .add_code_unit(code_unit.clone(), node, self.source, None, None);
         self.parsed.add_signature(code_unit, signature);
+    }
+}
+
+fn cpp_declaration_range(node: Node<'_>) -> Range {
+    Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
     }
 }
 

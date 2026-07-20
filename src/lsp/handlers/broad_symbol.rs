@@ -6,8 +6,8 @@ use crate::analyzer::declaration_range::code_unit_declaration_name_range;
 use crate::analyzer::lexical_definitions::LexicalDefinition;
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, DefinitionLookupStatus, NavigationTarget,
-    navigation_declaration_site_targets, resolve_definition_batch_with_source,
-    resolve_navigation_batch_with_source,
+    navigation_declaration_site_at_offset, navigation_declaration_site_targets,
+    resolve_definition_batch_with_source, resolve_navigation_batch_with_source,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Project, ProjectFile, Range as ByteRange};
 use crate::lsp::conversion::position_to_byte_offset;
@@ -74,7 +74,13 @@ fn symbol_target_at_position(
         end_line: 0,
     };
     let declaration =
-        selected_code_unit_declaration_at_cursor(analyzer, &file, &content, &selected, |_| true);
+        selected_code_unit_declaration_at_cursor(analyzer, &file, &content, &selected, |_| true)
+            .or_else(|| match resolution {
+                TargetResolution::Navigation(_) => {
+                    navigation_declaration_site_at_offset(&file, &content, start_byte)
+                }
+                TargetResolution::Broad => None,
+            });
     let (candidates, navigation_targets, lexical_definition) = match resolution {
         TargetResolution::Broad => declaration
             .map(|declaration| (vec![declaration], Vec::new(), None))
@@ -214,10 +220,8 @@ fn resolved_target(
                 resolve_definition_batch_with_source(analyzer, requests, file.clone(), content)
                     .into_iter()
                     .next()?;
-            if !matches!(
-                outcome.status,
-                DefinitionLookupStatus::Resolved | DefinitionLookupStatus::Ambiguous
-            ) || (outcome.definitions.is_empty() && outcome.lexical_definition.is_none())
+            if outcome.status != DefinitionLookupStatus::Resolved
+                || (outcome.definitions.is_empty() && outcome.lexical_definition.is_none())
             {
                 return None;
             }

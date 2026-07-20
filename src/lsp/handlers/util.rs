@@ -90,27 +90,80 @@ pub(super) fn code_unit_location(
 pub(super) fn navigation_target_location(
     analyzer: &dyn IAnalyzer,
     project: &dyn Project,
+    cache: &mut NavigationLocationCache,
     target: &NavigationTarget,
 ) -> Option<Location> {
-    let Some(declaration_range) = target.declaration_range else {
-        return code_unit_location(analyzer, project, &target.code_unit);
-    };
     let file = target.code_unit.source();
-    let body = project.read_source(file).ok()?;
-    let line_starts = compute_line_starts(&body);
-    let context = DeclarationNameRangeContext::new(file, body.clone());
-    let lsp_range = context
-        .name_range_for_declaration(&target.code_unit, declaration_range)
-        .map(|range| byte_range_to_lsp_range(&body, &line_starts, &range))
+    let cached = cache.file(project, file)?;
+    let body = cached.context.content();
+    let declaration_range = target.declaration_range.unwrap_or_else(|| {
+        analyzer
+            .ranges(&target.code_unit)
+            .iter()
+            .min()
+            .copied()
+            .unwrap_or(ByteRange {
+                start_byte: 0,
+                end_byte: body.len(),
+                start_line: 0,
+                end_line: 0,
+            })
+    });
+    let exact_name_range = if target.declaration_range.is_some() {
+        cached
+            .context
+            .name_range_for_declaration(&target.code_unit, declaration_range)
+    } else {
+        cached.context.name_range(analyzer, &target.code_unit)
+    };
+    let lsp_range = exact_name_range
+        .map(|range| byte_range_to_lsp_range(body, &cached.line_starts, &range))
         .or_else(|| {
-            identifier_selection_range(&target.code_unit, &body, &line_starts, &declaration_range)
+            identifier_selection_range(
+                &target.code_unit,
+                body,
+                &cached.line_starts,
+                &declaration_range,
+            )
         })
-        .unwrap_or_else(|| byte_range_to_lsp_range(&body, &line_starts, &declaration_range));
+        .unwrap_or_else(|| byte_range_to_lsp_range(body, &cached.line_starts, &declaration_range));
     let uri: Uri = path_to_uri_string(&file.abs_path()).parse().ok()?;
     Some(Location {
         uri,
         range: lsp_range,
     })
+}
+
+#[derive(Default)]
+pub(super) struct NavigationLocationCache {
+    files: HashMap<PathBuf, NavigationLocationFile>,
+}
+
+struct NavigationLocationFile {
+    context: DeclarationNameRangeContext,
+    line_starts: Vec<usize>,
+}
+
+impl NavigationLocationCache {
+    fn file<'a>(
+        &'a mut self,
+        project: &dyn Project,
+        file: &ProjectFile,
+    ) -> Option<&'a NavigationLocationFile> {
+        let key = file.abs_path();
+        if !self.files.contains_key(&key) {
+            let body = project.read_source(file).ok()?;
+            let line_starts = compute_line_starts(&body);
+            self.files.insert(
+                key.clone(),
+                NavigationLocationFile {
+                    context: DeclarationNameRangeContext::new(file, body),
+                    line_starts,
+                },
+            );
+        }
+        self.files.get(&key)
+    }
 }
 
 pub(super) fn code_unit_location_from_content(

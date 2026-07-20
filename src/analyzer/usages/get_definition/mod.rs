@@ -284,6 +284,10 @@ fn resolve_navigation_requests(
     requests: Vec<DefinitionLookupRequest>,
     operation: NavigationOperation,
 ) -> Vec<NavigationLookupOutcome> {
+    const MAX_NAVIGATION_TARGETS_PER_RESULT: usize = 256;
+    const MAX_NAVIGATION_TARGETS_PER_BATCH: usize = 1024;
+    context.navigation_target_limit = (MAX_NAVIGATION_TARGETS_PER_BATCH / requests.len().max(1))
+        .clamp(1, MAX_NAVIGATION_TARGETS_PER_RESULT);
     let languages: Vec<_> = requests
         .iter()
         .map(|request| language_for_file(&request.file))
@@ -368,14 +372,17 @@ pub(crate) fn navigation_declaration_site_targets(
         }];
     }
     let mut context = DefinitionBatchContext::new(analyzer, false);
-    let outcome = cpp::select_navigation_outcome(
-        analyzer,
-        &mut context,
-        candidates_outcome(vec![candidate]),
-        operation,
-    );
-    let outcome = finalize_navigation_outcome(outcome, operation);
-    cpp::navigation_targets(analyzer, &mut context, &outcome.definitions, operation)
+    cpp::select_navigation_targets(&mut context, &[candidate], operation).targets
+}
+
+pub(crate) fn navigation_declaration_site_at_offset(
+    file: &ProjectFile,
+    source: &str,
+    offset: usize,
+) -> Option<CodeUnit> {
+    (language_for_file(file) == Language::Cpp)
+        .then(|| cpp::declaration_at_offset(file, source, offset))
+        .flatten()
 }
 
 pub(crate) fn resolve_definition_batch_with_source_and_cancellation(
@@ -453,10 +460,12 @@ struct DefinitionBatchContext<'a> {
     // caches must use indexed source rather than the request's live disk source.
     cpp_indexed_sources: HashMap<ProjectFile, Option<Arc<String>>>,
     cpp_indexed_trees: HashMap<ProjectFile, Option<Tree>>,
+    cpp_navigation_indexes: HashMap<ProjectFile, Option<Arc<cpp::CppNavigationIndex>>>,
     cpp_structural_alias_paths: HashMap<CodeUnit, Vec<String>>,
     cpp_class_ranges: HashMap<ProjectFile, Arc<ClassRangeIndex>>,
     cpp_enclosing_class_chains: HashMap<CodeUnit, Arc<Vec<CodeUnit>>>,
     python_contexts: HashMap<ProjectFile, Arc<python::PythonDefinitionContext>>,
+    navigation_target_limit: usize,
     #[cfg(test)]
     cpp_class_range_builds: usize,
     #[cfg(test)]
@@ -480,10 +489,12 @@ impl<'a> DefinitionBatchContext<'a> {
             cpp_visibility: HashMap::default(),
             cpp_indexed_sources: HashMap::default(),
             cpp_indexed_trees: HashMap::default(),
+            cpp_navigation_indexes: HashMap::default(),
             cpp_structural_alias_paths: HashMap::default(),
             cpp_class_ranges: HashMap::default(),
             cpp_enclosing_class_chains: HashMap::default(),
             python_contexts: HashMap::default(),
+            navigation_target_limit: 256,
             #[cfg(test)]
             cpp_class_range_builds: 0,
             #[cfg(test)]
@@ -607,6 +618,21 @@ impl<'a> DefinitionBatchContext<'a> {
             .and_then(|source| cpp::parse_cpp_tree(&source));
         self.cpp_indexed_trees.insert(file.clone(), parsed.clone());
         parsed
+    }
+
+    fn cpp_navigation_index(&mut self, file: &ProjectFile) -> Option<Arc<cpp::CppNavigationIndex>> {
+        if let Some(index) = self.cpp_navigation_indexes.get(file) {
+            return index.clone();
+        }
+        let index = self.cpp_indexed_source(file).and_then(|source| {
+            let tree = self.cpp_indexed_tree(file)?;
+            Some(Arc::new(cpp::CppNavigationIndex::build(
+                file, &source, &tree,
+            )))
+        });
+        self.cpp_navigation_indexes
+            .insert(file.clone(), index.clone());
+        index
     }
 
     fn cpp_class_ranges(&mut self, file: &ProjectFile) -> Arc<ClassRangeIndex> {
@@ -898,12 +924,11 @@ fn resolve_one(
     };
 
     let resolved = if let Some(operation) = operation {
-        let selected = if language == Language::Cpp {
-            cpp::select_navigation_outcome(analyzer, context, resolved, operation)
-        } else {
+        if language == Language::Cpp {
             resolved
-        };
-        finalize_navigation_outcome(selected, operation)
+        } else {
+            finalize_navigation_outcome(resolved, operation)
+        }
     } else {
         resolved
     };
@@ -1070,7 +1095,7 @@ fn finalize_navigation_outcome(
 }
 
 fn navigation_lookup_outcome(
-    analyzer: &dyn IAnalyzer,
+    _analyzer: &dyn IAnalyzer,
     context: &mut DefinitionBatchContext<'_>,
     outcome: DefinitionLookupOutcome,
     language: Language,
@@ -1083,31 +1108,75 @@ fn navigation_lookup_outcome(
         lexical_definition,
         mut diagnostics,
     } = outcome;
-    let mut targets = if language == Language::Cpp {
-        cpp::navigation_targets(analyzer, context, &definitions, operation)
-    } else {
-        definitions
-            .into_iter()
-            .map(|code_unit| NavigationTarget {
-                code_unit,
-                declaration_range: None,
-            })
-            .collect()
-    };
+    let (mut targets, structure_unavailable, unproven_link_unit, mut truncated) =
+        if language == Language::Cpp {
+            let selection = cpp::select_navigation_targets(context, &definitions, operation);
+            (
+                selection.targets,
+                selection.structure_unavailable,
+                selection.unproven_link_unit,
+                selection.truncated,
+            )
+        } else {
+            let mut targets: Vec<_> = definitions
+                .iter()
+                .cloned()
+                .map(|code_unit| NavigationTarget {
+                    code_unit,
+                    declaration_range: None,
+                })
+                .collect();
+            let truncated = targets.len() > context.navigation_target_limit;
+            targets.truncate(context.navigation_target_limit);
+            (targets, false, false, truncated)
+        };
     targets.sort_by(|left, right| {
         (&left.code_unit, left.declaration_range).cmp(&(&right.code_unit, right.declaration_range))
     });
     targets.dedup();
 
+    diagnostics.retain(|diagnostic| {
+        !matches!(
+            diagnostic.kind.as_str(),
+            "no_definition"
+                | "no_declaration"
+                | "navigation_targets_truncated"
+                | cpp::CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC
+                | "cpp_navigation_structure_unavailable"
+        )
+    });
+
     if lexical_definition.is_some() {
         status = DefinitionLookupStatus::Resolved;
-    } else if !targets.is_empty() {
-        status = if targets.len() == 1 {
+        truncated = false;
+    } else if targets.is_empty() {
+        if !definitions.is_empty() {
+            diagnostics.retain(|diagnostic| diagnostic.kind != "ambiguous_definition");
+            status = DefinitionLookupStatus::NoDefinition;
+            diagnostics.push(DefinitionLookupDiagnostic {
+                kind: match operation {
+                    NavigationOperation::Declaration => "no_declaration",
+                    NavigationOperation::Definition => "no_definition",
+                }
+                .to_string(),
+                message: match operation {
+                    NavigationOperation::Declaration => {
+                        "navigation candidates contain no declaration target"
+                    }
+                    NavigationOperation::Definition => {
+                        "navigation candidates contain no implementation body"
+                    }
+                }
+                .to_string(),
+            });
+        }
+    } else {
+        diagnostics.retain(|diagnostic| diagnostic.kind != "ambiguous_definition");
+        status = if targets.len() == 1 && !truncated {
             DefinitionLookupStatus::Resolved
         } else {
             DefinitionLookupStatus::Ambiguous
         };
-        diagnostics.retain(|diagnostic| diagnostic.kind != "ambiguous_definition");
         if status == DefinitionLookupStatus::Ambiguous {
             diagnostics.push(DefinitionLookupDiagnostic {
                 kind: "ambiguous_definition".to_string(),
@@ -1122,16 +1191,33 @@ fn navigation_lookup_outcome(
         }
     }
 
-    if language == Language::Cpp && operation == NavigationOperation::Definition {
-        diagnostics.retain(|diagnostic| diagnostic.kind != cpp::CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC);
-        if targets.len() > 1 {
-            diagnostics.push(DefinitionLookupDiagnostic {
-                kind: cpp::CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC.to_string(),
-                message:
-                    "multiple C/C++ definition bodies remain, but no build graph proves one link unit"
-                        .to_string(),
-            });
-        }
+    if structure_unavailable {
+        diagnostics.push(DefinitionLookupDiagnostic {
+            kind: "cpp_navigation_structure_unavailable".to_string(),
+            message: "one or more C/C++ candidates could not be classified from indexed syntax"
+                .to_string(),
+        });
+    }
+    if unproven_link_unit {
+        diagnostics.push(DefinitionLookupDiagnostic {
+            kind: cpp::CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC.to_string(),
+            message:
+                "multiple C/C++ definition bodies remain, but no build graph proves one link unit"
+                    .to_string(),
+        });
+    }
+    if truncated {
+        diagnostics.push(DefinitionLookupDiagnostic {
+            kind: "navigation_targets_truncated".to_string(),
+            message: format!(
+                "{} navigation targets were truncated to the request budget of {}",
+                match operation {
+                    NavigationOperation::Declaration => "declaration",
+                    NavigationOperation::Definition => "definition",
+                },
+                context.navigation_target_limit
+            ),
+        });
     }
 
     NavigationLookupOutcome {

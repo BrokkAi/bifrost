@@ -3,7 +3,7 @@ use lsp_types::{GotoDefinitionParams, GotoDefinitionResponse, Location};
 use crate::analyzer::{Project, WorkspaceAnalyzer};
 use crate::lsp::conversion::byte_range_to_lsp_range;
 use crate::lsp::handlers::broad_symbol::navigation_target_at_position;
-use crate::lsp::handlers::util::navigation_target_location;
+use crate::lsp::handlers::util::{NavigationLocationCache, navigation_target_location};
 use crate::navigation::NavigationOperation;
 
 /// Resolve `textDocument/definition`. Strategy:
@@ -35,8 +35,11 @@ pub fn handle(
         }]));
     }
     let mut locations = Vec::with_capacity(target.navigation_targets.len());
+    let mut location_cache = NavigationLocationCache::default();
     for navigation_target in target.navigation_targets {
-        if let Some(loc) = navigation_target_location(analyzer, project, &navigation_target) {
+        if let Some(loc) =
+            navigation_target_location(analyzer, project, &mut location_cache, &navigation_target)
+        {
             locations.push(loc);
         }
     }

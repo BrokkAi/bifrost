@@ -15840,6 +15840,192 @@ fn cpp_navigation_distinguishes_same_file_declaration_and_definition_ranges() {
 }
 
 #[test]
+fn cpp_navigation_keeps_general_symbol_ranges_definition_oriented() {
+    let source = "void run();\nvoid run() {}\nvoid invoke() { run(); }\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+
+    let locations = call_search_tool_json(
+        project.root(),
+        "get_symbol_locations",
+        r#"{"symbols":["run"]}"#,
+    );
+    assert_eq!(locations["locations"][0]["start_line"], 2, "{locations}");
+
+    let by_reference = lookup_reference(
+        project.root(),
+        r#"{"references":[{"symbol":"invoke","context":"void invoke() { run(); }","target":"run"}]}"#,
+    );
+    assert_eq!(
+        by_reference["results"][0]["definitions"][0]["start_line"], 2,
+        "{by_reference}"
+    );
+}
+
+#[test]
+fn cpp_declaration_navigation_keeps_all_physical_prototypes_before_filtering() {
+    let header = "void run();\n";
+    let implementation = "#include \"service.h\"\nvoid run();\nvoid run() {}\n";
+    let caller = "#include \"service.h\"\nvoid invoke() { run(); }\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("service.h", header)
+        .file("service.cpp", implementation)
+        .file("app.cpp", caller)
+        .build();
+    let call = caller.rfind("run").expect("function call");
+
+    let declaration =
+        lookup_declaration(project.root(), &location_reference("app.cpp", caller, call));
+    assert_eq!(
+        declaration["results"][0]["status"], "ambiguous",
+        "{declaration}"
+    );
+    let targets = declaration["results"][0]["declarations"]
+        .as_array()
+        .expect("declaration targets");
+    assert_eq!(targets.len(), 2, "{declaration}");
+    assert!(targets.iter().any(|target| target["path"] == "service.h"));
+    assert!(
+        targets
+            .iter()
+            .any(|target| { target["path"] == "service.cpp" && target["start_line"] == 2 })
+    );
+}
+
+#[test]
+fn cpp_navigation_retains_declarations_that_follow_definitions() {
+    let function_source = "void run() {}\nvoid run();\nvoid invoke() { run(); }\n";
+    let function_project = InlineTestProject::with_language(Language::Cpp)
+        .file("function.cpp", function_source)
+        .build();
+    let function_call = function_source.rfind("run").expect("function call");
+    let function_args = location_reference("function.cpp", function_source, function_call);
+    let declaration = lookup_declaration(function_project.root(), &function_args);
+    let definition = lookup(function_project.root(), &function_args);
+    assert_eq!(
+        declaration["results"][0]["declarations"][0]["start_line"],
+        2
+    );
+    assert_eq!(definition["results"][0]["definitions"][0]["start_line"], 1);
+
+    let type_source = "struct Item {};\nstruct Item;\nItem make();\n";
+    let type_project = InlineTestProject::with_language(Language::Cpp)
+        .file("type.cpp", type_source)
+        .build();
+    let type_reference = type_source.rfind("Item").expect("type reference");
+    let type_args = location_reference("type.cpp", type_source, type_reference);
+    let declaration = lookup_declaration(type_project.root(), &type_args);
+    let definition = lookup(type_project.root(), &type_args);
+    assert_eq!(
+        declaration["results"][0]["declarations"][0]["start_line"],
+        2
+    );
+    assert_eq!(definition["results"][0]["definitions"][0]["start_line"], 1);
+}
+
+#[test]
+fn cpp_navigation_bounds_repeated_physical_targets() {
+    let mut source = "void run();\n".repeat(300);
+    source.push_str("void invoke() { run(); }\n");
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("generated.cpp", &source)
+        .build();
+    let call = source.rfind("run").expect("function call");
+    let result = lookup_declaration(
+        project.root(),
+        &location_reference("generated.cpp", &source, call),
+    );
+
+    assert_eq!(result["results"][0]["status"], "ambiguous", "{result}");
+    assert_eq!(
+        result["results"][0]["declarations"]
+            .as_array()
+            .map(Vec::len),
+        Some(256),
+        "{result}"
+    );
+    assert!(
+        result["results"][0]["diagnostics"]
+            .as_array()
+            .is_some_and(|diagnostics| diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic["kind"] == "navigation_targets_truncated")),
+        "{result}"
+    );
+}
+
+#[test]
+fn cpp_navigation_bounds_repeated_targets_across_a_batch() {
+    let mut source = "void run();\n".repeat(300);
+    source.push_str("void invoke() { run(); }\n");
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("generated.cpp", &source)
+        .build();
+    let call = source.rfind("run").expect("function call");
+    let prefix = &source[..call];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, current_line)| current_line)
+        .chars()
+        .count()
+        + 1;
+    let references = (0..5)
+        .map(|_| json!({"path": "generated.cpp", "line": line, "column": column}))
+        .collect::<Vec<_>>();
+    let result = lookup_declaration(
+        project.root(),
+        &json!({"references": references}).to_string(),
+    );
+
+    let results = result["results"].as_array().expect("batch results");
+    assert_eq!(results.len(), 5, "{result}");
+    assert_eq!(
+        results
+            .iter()
+            .map(|item| item["declarations"].as_array().map_or(0, Vec::len))
+            .sum::<usize>(),
+        1020,
+        "{result}"
+    );
+    assert!(results.iter().all(|item| {
+        item["diagnostics"].as_array().is_some_and(|diagnostics| {
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic["kind"] == "navigation_targets_truncated")
+        })
+    }));
+}
+
+#[test]
+fn cpp_overload_ambiguity_does_not_claim_an_unproven_link_unit() {
+    let target = "namespace ns { class Net { public: int load(); int load(int value); }; int Net::load() { return 0; } int Net::load(int value) { return value; } }\n";
+    let caller = "#include \"target.h\"\nvoid invoke(ns::Net& net) { net.load(1, 2); }\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("target.h", target)
+        .file("app.cpp", caller)
+        .build();
+    let call = caller.rfind("load").expect("method call");
+    let result = lookup(project.root(), &location_reference("app.cpp", caller, call));
+
+    assert_eq!(result["results"][0]["status"], "ambiguous", "{result}");
+    assert_eq!(
+        result["results"][0]["definitions"].as_array().map(Vec::len),
+        Some(2),
+        "{result}"
+    );
+    assert!(
+        result["results"][0]["diagnostics"]
+            .as_array()
+            .is_none_or(|diagnostics| diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic["kind"] != "unproven_cpp_link_unit")),
+        "{result}"
+    );
+}
+
+#[test]
 fn cpp_definition_navigation_keeps_multiple_bodies_ambiguous() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file("service.h", "void run();\n")

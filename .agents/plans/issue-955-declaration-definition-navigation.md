@@ -21,6 +21,8 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
 - [x] (2026-07-20 15:18Z) Merged current `origin/master`, confirmed the branch is zero commits behind, and passed focused Rust, Python, formatting, all-feature clippy, the complete isolated all-feature Rust suite, and diff checks.
 - [x] (2026-07-20 15:27Z) Ran the named guided specialist review against the synchronized `master` merge base and prepared a deduplicated findings index for interactive triage.
 - [x] (2026-07-20 15:29Z) Merged the one additional master cache-isolation commit that landed during review, reran all 187 LSP integration tests, and confirmed the reviewed issue diff and seven findings are unchanged against the refreshed base.
+- [x] (2026-07-20 16:18Z) Applied all seven guided-review findings: restored broad LSP ambiguity behavior, isolated physical C++ navigation occurrences from general ranges, centralized physical selection/status/diagnostics, retained later declarations, bounded target expansion, and cached LSP rendering inputs.
+- [ ] Rerun focused and complete validation, checkpoint the reviewed repair, refresh `origin/master`, and publish a ready-for-review pull request.
 
 ## Surprises & Discoveries
 
@@ -46,6 +48,10 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
   Evidence: Existing consumers such as `get_symbol_locations` and `get_definitions_by_reference` choose the earliest general range, so a same-file prototype/body pair can now render the prototype where the pre-follow-up behavior rendered the body.
 - Observation: The physical-range layer exposed two older logical-selection assumptions that must now be removed rather than duplicated: broad LSP consumers should still fail closed on ambiguity, and C++ status/link-unit diagnostics must be derived from typed physical targets rather than raw target cardinality.
   Evidence: The architecture, senior, and duplication reviewers independently traced these failures to `broad_symbol.rs`, the two selectors in `get_definition/cpp.rs`, and the second finalization pass in `get_definition/mod.rs`.
+- Observation: Preserving physical C++ occurrences does not require changing persisted analyzer state or broad `IAnalyzer::ranges` semantics.
+  Evidence: A bounded request-time `CppNavigationIndex` can re-run the existing structured declaration visitor over the cached indexed source/tree, retain prototype/body occurrences separately, and leave `get_symbol_locations`, summaries, and `get_definitions_by_reference` definition-oriented.
+- Observation: The public location request limit bounds references but not the number of physical targets produced by each reference.
+  Evidence: A generated file containing 300 repeated prototypes expanded into 300 navigation targets before this repair. Per-result and per-batch budgets now cap the response at 256 and 1,024 targets respectively and serialize `navigation_targets_truncated`.
 
 ## Decision Log
 
@@ -76,6 +82,9 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
 - Decision: Resolve the follow-up with a range-aware target type owned by explicit navigation, leaving `CodeUnit` identity and `DefinitionLookupOutcome` unchanged.
   Rationale: The index already retains all declaration ranges. Carrying the selected physical range through MCP and LSP preserves broad resolver semantics, represents multiple same-file bodies, and avoids widening a navigation concern into analyzer identity, hover, references, rename, or call analysis.
   Date/Author: 2026-07-20 / Codex
+- Decision: Queue and apply every finding from the synchronized guided review as one architectural repair milestone.
+  Rationale: The user explicitly requested all findings be fixed. A separate on-demand C++ physical-occurrence index removes the global range leak and makes the remaining filtering, declaration-order, diagnostic, resource-bound, and duplication findings parts of one coherent selector rather than independent patches.
+  Date/Author: 2026-07-20 / Codex
 
 ## Outcomes & Retrospective
 
@@ -93,7 +102,9 @@ The architectural follow-up is now implemented. C++ definition replacement prese
 
 The branch was then synchronized by merging current `origin/master` at `273dd103`; it was zero commits behind master. Post-merge focused suites pass with 187 LSP, 18 MCP, 532 analyzer, and 17 click tests plus 2 ignored stress tests. All 44 Python tests pass, formatting and diff checks are clean, isolated all-target/all-feature clippy passes, and the complete isolated `cargo test --features nlp,python` run passes including doc tests. When one additional master commit landed during review, it was merged cleanly at `7ee06e18`; that commit only isolates LSP test caches and documents the override. All 187 LSP integration tests pass after the refresh, and the branch is again zero commits behind `origin/master`.
 
-The requested guided review has completed its security, duplication, senior-engineering, DevOps, and architecture passes over `master...HEAD`. After scoping and deduplication, the interactive index contains seven findings: two high, four medium, and one low. The high findings are a broad-LSP ambiguity regression and the leakage of preserved navigation ranges into existing definition-oriented tools. Medium findings cover duplicated physical/logical C++ selection, inconsistent status/link-unit diagnostics, declaration-after-definition indexing, and unbounded navigation target expansion with repeated LSP reparsing. The low finding covers duplicated quadratic range-merge logic. No critical issue, injection, path traversal, secret exposure, dependency risk, or infrastructure configuration issue was found. Triage and fixes intentionally wait for the guided-review menu choice.
+The requested guided review completed its security, duplication, senior-engineering, DevOps, and architecture passes over `master...HEAD`. After scoping and deduplication, all seven findings—two high, four medium, and one low—were applied. Broad LSP consumers again fail closed on ambiguity while explicit navigation retains ambiguous target arrays. Physical C++ occurrences now live in a bounded request-time index rather than general analyzer ranges; the one typed physical selector owns filtering, status, ambiguity, truncation, and link-unit diagnostics; later prototypes and forward declarations are retained; and LSP renders all targets from a per-file source/tree cache. The obsolete preserving-range wrappers and their quadratic merge logic were removed.
+
+Post-repair focused validation passes with 188 LSP server tests, 18 MCP tests, 538 analyzer navigation tests, and 17 click-around tests plus 2 ignored stress tests. New regressions cover definition-oriented broad range consumers, mixed same/cross-file prototypes, declaration-after-definition ordering for functions and types, per-result and per-batch target budgets, overload ambiguity without a false link-unit diagnostic, and broad LSP ambiguity behavior.
 
 Final validation passed:
 
@@ -209,3 +220,7 @@ Plan revision note (2026-07-20 15:18Z): Recorded the clean `origin/master` merge
 Plan revision note (2026-07-20 15:27Z): Recorded the five-reviewer guided review against synchronized master, its deduplicated severity totals and principal findings, and the deliberate pause for interactive triage.
 
 Plan revision note (2026-07-20 15:29Z): Recorded the final master cache-isolation merge that landed during review, its passing affected LSP suite, the restored zero-behind state, and confirmation that the issue findings remain unchanged against the refreshed base.
+
+Plan revision note (2026-07-20 15:42Z): Queued all seven guided-review findings at the user's direction and reopened implementation/validation/publication milestones for a ready pull request.
+
+Plan revision note (2026-07-20 16:18Z): Recorded all seven review findings as applied, the request-time physical-occurrence architecture, bounded target and cached LSP rendering behavior, and the passing post-repair focused suites before checkpointing.

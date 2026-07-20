@@ -101,7 +101,7 @@ fn code_unit_declaration_name_ranges_in_tree(
         .collect()
 }
 
-fn code_unit_declaration_name_range_for_range(
+pub(crate) fn code_unit_declaration_name_range_for_range(
     content: &str,
     root: Node<'_>,
     code_unit: &CodeUnit,
