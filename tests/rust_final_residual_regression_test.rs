@@ -376,3 +376,138 @@ impl From<ListStyleType> for ListStyleType {
         "ambiguous root owner identity must not canonicalize to the physical enum: {found:#?}"
     );
 }
+
+#[test]
+fn inverse_rust_usages_do_not_shadow_imported_type_with_impl_associated_type_name() {
+    let consumer = r#"
+use super::Error;
+
+pub struct KeySerializer;
+impl Serializer for KeySerializer {
+    type Error = Error;
+    type Sequence = Impossible<Self::Error, Error>;
+}
+
+fn local_alias() {
+    type Error = ();
+    let _: Error;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "pub mod ser;\n")
+        .file(
+            "src/ser.rs",
+            "pub mod key;\npub struct Error;\npub trait Serializer { type Error; type Sequence; }\npub struct Impossible<A, B>(A, B);\n",
+        )
+        .file("src/ser/key.rs", consumer)
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "ser.Error");
+    let candidates = [project.file("src/ser/key.rs")].into_iter().collect();
+    let found = authoritative_hits(&analyzer, target, candidates);
+    let direct_rhs = consumer
+        .find("type Error = Error")
+        .map(|start| start + "type Error = ".len())
+        .map(|start| (start, start + "Error".len()))
+        .expect("direct associated type RHS reference");
+    let generic_rhs = consumer
+        .find("Impossible<Self::Error, Error>")
+        .map(|start| start + "Impossible<Self::Error, ".len())
+        .map(|start| (start, start + "Error".len()))
+        .expect("generic Error reference");
+    let self_associated = consumer
+        .find("Self::Error")
+        .map(|start| start + "Self::".len())
+        .map(|start| (start, start + "Error".len()))
+        .expect("Self associated type reference");
+    let local_alias_reference = consumer
+        .find("let _: Error")
+        .map(|start| start + "let _: ".len())
+        .map(|start| (start, start + "Error".len()))
+        .expect("local type alias reference");
+
+    for expected in [direct_rhs, generic_rhs] {
+        assert!(
+            found
+                .iter()
+                .any(|hit| (hit.start_offset, hit.end_offset) == expected),
+            "an associated type name must not shadow imported RHS type references: {found:#?}"
+        );
+    }
+    assert!(
+        found
+            .iter()
+            .all(|hit| ![self_associated, local_alias_reference]
+                .contains(&(hit.start_offset, hit.end_offset))),
+        "associated and local aliases must remain distinct from the imported type: {found:#?}"
+    );
+}
+
+#[test]
+fn inverse_rust_usages_find_impl_associated_type_through_self_in_macro_owner() {
+    let source = r#"
+pub trait Stream { type Item; }
+
+pin_project! {
+    pub struct TimeoutRepeating<S> {
+        stream: S,
+    }
+}
+
+pub struct Other;
+
+impl<S: Stream> Stream for TimeoutRepeating<S> {
+    type Item = Result<S::Item, ()>;
+
+    fn poll_next(&mut self) -> Option<Self::Item> {
+        None
+    }
+}
+
+
+impl Stream for Other {
+    type Item = ();
+
+    fn poll_next(&mut self) -> Option<Self::Item> {
+        None
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "TimeoutRepeating.Item");
+    assert_eq!(
+        analyzer.parent_of(&target).as_ref().map(CodeUnit::fq_name),
+        Some("TimeoutRepeating".to_string()),
+        "macro-defined impl members must retain their structural owner"
+    );
+    let candidates = [project.file("src/lib.rs")].into_iter().collect();
+    let found = authoritative_hits(&analyzer, target, candidates);
+    let target_impl = source.find("impl<S: Stream>").expect("target impl");
+    let expected = source[target_impl..]
+        .find("Self::Item")
+        .map(|start| target_impl + start + "Self::".len())
+        .map(|start| (start, start + "Item".len()))
+        .expect("Self::Item reference");
+    let other_impl = source.find("impl Stream for Other").expect("other impl");
+    let unrelated = source[other_impl..]
+        .find("Self::Item")
+        .map(|start| other_impl + start + "Self::".len())
+        .map(|start| (start, start + "Item".len()))
+        .expect("unrelated Self::Item reference");
+
+    assert!(
+        found
+            .iter()
+            .any(|hit| (hit.start_offset, hit.end_offset) == expected),
+        "Self::Item must resolve to the impl associated type: {found:#?}"
+    );
+    assert!(
+        found
+            .iter()
+            .all(|hit| (hit.start_offset, hit.end_offset) != unrelated),
+        "Self::Item in another impl must not resolve to the target: {found:#?}"
+    );
+}

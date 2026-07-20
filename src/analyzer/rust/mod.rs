@@ -287,6 +287,11 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.direct_children(code_unit)
     }
 
+    fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        IAnalyzer::parent_of(&self.inner, code_unit)
+            .or_else(|| self.inner.structural_parent_of(code_unit))
+    }
+
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
         self.inner.import_statements(file)
     }

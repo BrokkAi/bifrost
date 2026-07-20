@@ -367,7 +367,10 @@ fn is_local_use_binding_node(node: Node<'_>) -> bool {
 
 fn is_shadowed_identifier(text: &str, node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     if lexical_scope::is_pattern_binding_identifier(node)
-        || ctx.name_shadowed_at(text, node.start_byte())
+        || ctx.lexical_scope.name_bound_at(text, node.start_byte())
+        || (!ctx.target_self_file
+            && ctx.lexical_scope.item_bound_at(text, node.start_byte())
+            && !is_impl_associated_type_value_reference(node))
     {
         return true;
     }
@@ -379,6 +382,22 @@ fn is_shadowed_identifier(text: &str, node: Node<'_>, ctx: &ScanCtx<'_>) -> bool
             decl.identifier == text
                 && (decl.range.start_byte != start || decl.range.end_byte != end)
         })
+}
+
+fn is_impl_associated_type_value_reference(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "type_item" {
+            return enclosing_impl_item(parent).is_some()
+                && parent.child_by_field_name("type").is_some_and(|value| {
+                    value.start_byte() <= node.start_byte() && node.end_byte() <= value.end_byte()
+                });
+        }
+        if matches!(parent.kind(), "block" | "declaration_list" | "source_file") {
+            return false;
+        }
+        node = parent;
+    }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1305,6 +1324,9 @@ fn self_static_owner_matches_target(owner_node: Node<'_>, ctx: &MemberScanCtx<'_
     while let Some(node) = current {
         match node.kind() {
             "impl_item" => {
+                if impl_item_contains_requested_target(node, ctx) {
+                    return true;
+                }
                 if ctx.scan_target != ctx.requested_target
                     && let Some(requested_owner) = ctx.rust.parent_of(ctx.requested_target)
                     && !ctx.rust.is_rust_trait_declaration(&requested_owner)
@@ -1339,6 +1361,15 @@ fn self_static_owner_matches_target(owner_node: Node<'_>, ctx: &MemberScanCtx<'_
         }
     }
     false
+}
+
+fn impl_item_contains_requested_target(node: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
+    ctx.file == ctx.requested_target.source()
+        && ctx
+            .rust
+            .ranges(ctx.requested_target)
+            .into_iter()
+            .any(|range| node.start_byte() <= range.start_byte && range.end_byte <= node.end_byte())
 }
 
 fn self_like_constructor_returns(

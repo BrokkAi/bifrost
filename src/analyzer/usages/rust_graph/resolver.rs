@@ -579,7 +579,8 @@ fn local_declaration_graph_seeds(
     analyzer: &RustAnalyzer,
     target: &CodeUnit,
 ) -> BTreeSet<(ProjectFile, String)> {
-    let seed_target = if is_member_target(analyzer, target) {
+    let member_target = is_member_target(analyzer, target);
+    let seed_target = if member_target {
         analyzer.parent_of(target)
     } else {
         Some(target.clone())
@@ -587,7 +588,13 @@ fn local_declaration_graph_seeds(
     let Some(seed_target) = seed_target else {
         return BTreeSet::new();
     };
-    if !is_local_declaration(analyzer, &seed_target) {
+    // Macro-generated and imported impl target types may not have their own
+    // declaration in this file. Their impl members do, and the parser retains
+    // the exact structural owner for those members. Seed that owner identity so
+    // associated references inside the impl remain graph-addressable.
+    if !(is_local_declaration(analyzer, &seed_target)
+        || member_target && is_local_declaration(analyzer, target))
+    {
         return BTreeSet::new();
     }
     [(
