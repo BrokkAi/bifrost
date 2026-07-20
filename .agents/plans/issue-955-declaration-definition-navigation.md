@@ -17,8 +17,8 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
 - [x] (2026-07-20 12:42Z) Advertised and dispatched LSP declaration navigation through the shared selector and extended the click-test harness with declaration operations.
 - [x] (2026-07-20 14:27Z) Ran the focused Rust suites, all 44 Python client tests, formatting, all-target/all-feature clippy, the complete all-feature Rust suite including doc tests, and `git diff --check`.
 - [x] (2026-07-20 14:27Z) Completed the five guided specialist reviews, addressed the high/medium findings within scope, reran affected tests and full gates, and recorded the one range-model follow-up below.
-- [x] (2026-07-20 15:32Z) Extended explicit navigation outcomes with physical declaration ranges so same-file C++ prototypes and bodies remain distinct without changing broad `CodeUnit` identity.
-- [ ] Synchronize the completed branch with current `origin/master`, rerun affected and full gates, and checkpoint the integrated state.
+- [x] (2026-07-20 15:12Z) Extended explicit navigation outcomes with physical declaration ranges so same-file C++ prototypes and bodies remain distinct without changing broad `CodeUnit` identity.
+- [x] (2026-07-20 15:18Z) Merged current `origin/master`, confirmed the branch is zero commits behind, and passed focused Rust, Python, formatting, all-feature clippy, the complete isolated all-feature Rust suite, and diff checks.
 - [ ] Run the named guided specialist review against the synchronized `master` merge base and present its findings index for interactive triage.
 
 ## Surprises & Discoveries
@@ -85,6 +85,8 @@ Milestone 3 completed LSP support. Initialization advertises `declarationProvide
 The guided review ran security, DevOps, duplication, architecture, and senior-engineering specialists. Security and DevOps reported no findings. Review fixes consolidated LSP target construction, reused shared C++ exact-range and Rust associated-type helpers, returned ambiguous LSP candidates instead of discarding them, made unknown C++ structure fail closed, narrowed stale ambiguity-diagnostic cleanup to C++, and extended C++ multi-body and wrong-arity coverage. Its sole deferred finding was the same-file C++ prototype/body range separation now completed below.
 
 The architectural follow-up is now implemented. C++ definition replacement preserves earlier physical declaration ranges, while a new navigation-only target pairs the semantic `CodeUnit` with the exact range chosen from tree-sitter structure. MCP and LSP render the identifier within that range. Same-file prototype/body calls, prototype-to-body declaration-site navigation, and multiple same-file bodies are covered; the focused all-feature suites pass with 187 LSP server tests, 18 MCP tests, 525 analyzer tests, and 17 click tests plus 2 ignored stress tests.
+
+The branch was then synchronized by merging current `origin/master` at `273dd103`; it is zero commits behind master. Post-merge focused suites pass with 187 LSP, 18 MCP, 532 analyzer, and 17 click tests plus 2 ignored stress tests. All 44 Python tests pass, formatting and diff checks are clean, isolated all-target/all-feature clippy passes, and the complete isolated `cargo test --features nlp,python` run passes including doc tests.
 
 Final validation passed:
 
@@ -193,4 +195,6 @@ Plan revision note (2026-07-20 14:27Z): Recorded the completed specialist review
 
 Plan revision note (2026-07-20 15:04Z): Reopened the plan for the requested architectural follow-up, chose a navigation-only physical-range target over a global index-identity change, and added synchronization plus guided-review milestones.
 
-Plan revision note (2026-07-20 15:32Z): Recorded the completed range-aware navigation milestone, the C++ replacement-range root cause, new same-file call/declaration-site/multi-body coverage, and passing focused all-feature suites before checkpointing.
+Plan revision note (2026-07-20 15:12Z): Recorded the completed range-aware navigation milestone, the C++ replacement-range root cause, new same-file call/declaration-site/multi-body coverage, and passing focused all-feature suites before checkpointing.
+
+Plan revision note (2026-07-20 15:18Z): Recorded the clean `origin/master` merge, zero-behind state, post-merge focused and full validation evidence, and the clippy-driven LSP expression cleanup before checkpointing the synchronized state.

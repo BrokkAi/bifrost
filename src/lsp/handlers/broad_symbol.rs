@@ -76,22 +76,19 @@ fn symbol_target_at_position(
     let declaration =
         selected_code_unit_declaration_at_cursor(analyzer, &file, &content, &selected, |_| true);
     let (candidates, navigation_targets, lexical_definition) = match resolution {
-        TargetResolution::Broad => {
-            let target = declaration
-                .map(|declaration| (vec![declaration], Vec::new(), None))
-                .or_else(|| {
-                    reject_ambiguous_import(analyzer, &file, &content, start_byte, end_byte)?;
-                    resolved_target(
-                        analyzer,
-                        &file,
-                        Arc::new(content.clone()),
-                        start_byte,
-                        end_byte,
-                        resolution,
-                    )
-                })?;
-            target
-        }
+        TargetResolution::Broad => declaration
+            .map(|declaration| (vec![declaration], Vec::new(), None))
+            .or_else(|| {
+                reject_ambiguous_import(analyzer, &file, &content, start_byte, end_byte)?;
+                resolved_target(
+                    analyzer,
+                    &file,
+                    Arc::new(content.clone()),
+                    start_byte,
+                    end_byte,
+                    resolution,
+                )
+            })?,
         TargetResolution::Navigation(operation) => {
             reject_ambiguous_import(analyzer, &file, &content, start_byte, end_byte)?;
             match resolved_target(
