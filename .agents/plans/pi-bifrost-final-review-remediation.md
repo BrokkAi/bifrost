@@ -16,6 +16,7 @@ After this change, Pi users can keep their intended Bifrost capability settings 
 - [x] (2026-07-18) Removed the synthetic cross-host workflow regression and restored the pre-existing GitHub and VS Code release sequence after a scope audit.
 - [x] (2026-07-18 06:35Z) Completed package, repository, artifact, real-Pi, process-leak, AST-rule, workflow, and independent-review validation.
 - [x] (2026-07-20) Addressed maintainer review: aligned cross-toolset capability requirements with the Rust registry, made process and package tests portable, and expanded Pi package CI to Linux, macOS, and Windows.
+- [x] (2026-07-20) Sanitized MCP- and model-controlled terminal content before trusted Pi theme styling while preserving raw oversized diagnostics in overflow files.
 
 ## Surprises & Discoveries
 
@@ -61,6 +62,10 @@ After this change, Pi users can keep their intended Bifrost capability settings 
 - Decision: Let one Pi capability request multiple server toolsets while retaining capability-based activation.
   Rationale: `analyze_commit` belongs to the Rust `slopcop` registry but is part of Pi's default Symbols capability. Declaring both `symbol` and `slopcop` models that boundary without changing Rust or activating unrelated quality tools.
   Date/Author: 2026-07-20 / Pi agent after maintainer review.
+
+- Decision: Sanitize untrusted terminal text with Node's built-in VT-control remover plus visible escaping for residual controls, before applying Pi theme styling.
+  Rationale: OSC, CSI, C0, and C1 handling is a terminal boundary concern. The standard-library implementation avoids another package dependency, while raw complete diagnostics remain available only in overflow files.
+  Date/Author: 2026-07-20 / Pi agent after security review.
 
 ## Outcomes & Retrospective
 
@@ -164,3 +169,5 @@ Revision note (2026-07-18): Recorded the completed lifecycle owner, race and cle
 Revision note (2026-07-18): A later scope audit found that reordering GitHub and VS Code publication was unrelated to the Pi issue. Restored the existing sequence, removed its cross-host workflow regression, and retained only a dedicated Pi package job.
 
 Revision note (2026-07-20): Recorded maintainer-review remediation for the default capability/toolset mismatch, independent registry-boundary fixtures, portable npm subprocesses, canonical temporary paths, and three-platform Pi package CI.
+
+Revision note (2026-07-20): Added terminal-control sanitization and security regressions after review reproduced an OSC 52 sequence surviving call and result rendering.

@@ -6,9 +6,12 @@ import test from "node:test";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, initTheme } from "@earendil-works/pi-coding-agent";
 
 import {
+  createBoundedToolError,
   mapToolResult,
   renderToolCall,
   renderToolResult,
+  sanitizeTerminalLine,
+  sanitizeTerminalText,
   toolLabel,
   toolParameters,
 } from "../extensions/mcp-adapter.ts";
@@ -123,6 +126,63 @@ test("renders concise tool arguments and expands their complete JSON", () => {
   const expandedText = expanded.map((line) => line.trimEnd()).join("\n");
   assert.match(expandedText, /^bifrost_search_symbols\n\{/);
   assert.match(expandedText, /"patterns": \[/);
+});
+
+test("sanitizes terminal controls before applying trusted TUI styling", () => {
+  const osc52 = "\u001b]52;c;U0VDUkVU\u0007";
+  const unsafeText = `before${osc52}after\u0001`;
+  const styledTheme = {
+    bold: (text) => text,
+    fg: (_color, text) => `\u001b[32m${text}\u001b[0m`,
+  };
+
+  assert.equal(sanitizeTerminalText(unsafeText), "beforeafter\\u0001");
+  assert.equal(sanitizeTerminalText("\u001b[31mred\u001b[0m\u007f"), "red\\u007f");
+  assert.equal(sanitizeTerminalText("\u009b31mred\u009b0m"), "red");
+  assert.equal(sanitizeTerminalText("\u009d52;c;data\u009c"), "\\u009d52;c;data\\u009c");
+  assert.equal(sanitizeTerminalText("lone\u001b"), "lone\\u001b");
+  assert.equal(sanitizeTerminalLine("first\nsecond"), "first\\nsecond");
+  assert.equal(toolLabel({ name: "unsafe", annotations: { title: unsafeText } }), "beforeafter\\u0001");
+  assert.equal(toolLabel({ name: "safe_fallback", annotations: { title: osc52 } }), "Safe Fallback");
+
+  const collapsedCall = renderToolCall(
+    "bifrost_search_symbols",
+    { [`unsafe\nname`]: unsafeText },
+    false,
+    styledTheme,
+  ).render(160).join("\n");
+  const expandedCall = renderToolCall(
+    "bifrost_search_symbols",
+    { note: unsafeText },
+    true,
+    styledTheme,
+  ).render(160).join("\n");
+  const renderedResult = renderToolResult(
+    { content: [{ type: "text", text: unsafeText }], details: {} },
+    { expanded: false, isPartial: false },
+    styledTheme,
+  ).render(160).join("\n");
+
+  for (const rendered of [collapsedCall, expandedCall, renderedResult]) {
+    assert.doesNotMatch(rendered, /\u001b\]52/);
+    assert.doesNotMatch(rendered, /\u0007|\u0001/);
+    assert.match(rendered, /\u001b\[32m/);
+  }
+  assert.match(collapsedCall, /unsafe\\nname: beforeafter\\u0001/);
+  assert.match(renderedResult, /beforeafter\\u0001/);
+});
+
+test("bounds sanitized errors while preserving raw diagnostics", async (t) => {
+  const rawError = `Bifrost failed: ${"\u0001".repeat(10_000)}`;
+  const error = await createBoundedToolError(rawError);
+  const pathMatch = error.message.match(/Full output: ([^\]]+)]$/);
+
+  assert.ok(pathMatch);
+  assert.doesNotMatch(error.message, /\u0001/);
+  assert.ok(Buffer.byteLength(error.message, "utf8") <= DEFAULT_MAX_BYTES);
+  assert.ok(error.message.split("\n").length <= DEFAULT_MAX_LINES);
+  t.after(() => rm(dirname(pathMatch[1]), { recursive: true }));
+  assert.equal(await readFile(pathMatch[1], "utf8"), rawError);
 });
 
 test("caps the model result and saves complete output in a dedicated overflow file", async (t) => {

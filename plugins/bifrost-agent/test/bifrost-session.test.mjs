@@ -365,11 +365,35 @@ test("derives active Bifrost tools from Pi's post-filter tool set", async () => 
   );
 });
 
-test("detects duplicate canonical names before registration", () => {
+test("detects duplicate and terminal-unsafe canonical names before registration", () => {
   assert.throws(
     () => assertToolsHaveUniqueNames([{ name: "same" }, { name: "same" }]),
     /duplicate tool name: same/,
   );
+  assert.throws(
+    () => assertToolsHaveUniqueNames([{ name: "unsafe\u001b]52;c;U0VDUkVU\u0007" }]),
+    /unsafe name/,
+  );
+});
+
+test("sanitizes discovered labels and descriptions before registration", async () => {
+  const osc52 = "\u001b]52;c;U0VDUkVU\u0007";
+  const tools = symbolTools();
+  tools[0] = {
+    ...tools[0],
+    annotations: { title: `Symbol${osc52} Search` },
+    description: `Search${osc52} symbols.`,
+  };
+  const pi = fakePi();
+  const session = createBifrostSession(
+    pi,
+    dependencies([fakeClient({ listTools: async () => tools })]),
+  );
+
+  assert.equal(await session.start("/workspace", ["symbols"]), true);
+  const registered = pi.registered.find((tool) => tool.name === "bifrost_search_symbols");
+  assert.equal(registered.label, "Bifrost: Symbol Search");
+  assert.doesNotMatch(registered.description, /\u001b\]52|U0VDUkVU|\u0007/);
 });
 
 test("changing capabilities reconnects, registers new tools, and preserves unrelated active tools", async () => {
@@ -903,8 +927,9 @@ test("shutdown retains failed cleanup ownership and retries it", async () => {
   assert.equal(client.closeCount, 2);
 });
 
-test("startup failure preserves a concise diagnostic and underlying cause in status", async () => {
-  const client = fakeClient({ connect: async () => { throw new Error("protocol handshake failed"); } });
+test("startup failure preserves a safe diagnostic and underlying cause in status", async () => {
+  const cause = new Error("protocol\u001b]52;c;U0VDUkVU\u0007 handshake failed");
+  const client = fakeClient({ connect: async () => { throw cause; } });
   const errors = [];
   const session = createBifrostSession(fakePi(), dependencies([client], errors));
 
@@ -916,5 +941,5 @@ test("startup failure preserves a concise diagnostic and underlying cause in sta
     session.status().lastOperationError.message,
     "Bifrost MCP configuration failed: protocol handshake failed",
   );
-  assert.equal(session.status().lastOperationError.cause.message, "protocol handshake failed");
+  assert.equal(session.status().lastOperationError.cause, cause);
 });

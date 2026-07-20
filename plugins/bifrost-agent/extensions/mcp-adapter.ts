@@ -1,6 +1,7 @@
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 
 import {
   DEFAULT_MAX_BYTES,
@@ -29,11 +30,17 @@ export function toolParameters(tool: Tool) {
 }
 
 export function toolLabel(tool: Tool): string {
-  return tool.annotations?.title?.trim() || tool.name
-    .split("_")
-    .filter(Boolean)
-    .map((part) => part[0]!.toUpperCase() + part.slice(1))
-    .join(" ");
+  const advertisedTitle = sanitizeTerminalLine(tool.annotations?.title?.trim() ?? "");
+  if (advertisedTitle) {
+    return advertisedTitle;
+  }
+  return sanitizeTerminalLine(
+    tool.name
+      .split("_")
+      .filter(Boolean)
+      .map((part) => part[0]!.toUpperCase() + part.slice(1))
+      .join(" "),
+  );
 }
 
 export async function mapToolResult(
@@ -74,7 +81,7 @@ export async function mapToolResult(
 }
 
 export async function createBoundedToolError(message: string, cause?: unknown): Promise<Error> {
-  const bounded = await boundModelText(message);
+  const bounded = await boundModelText(sanitizeTerminalText(message), message);
   return new Error(bounded.text, { cause });
 }
 
@@ -84,17 +91,20 @@ export function renderToolCall(
   expanded: boolean,
   theme: Theme,
 ): Component {
-  const title = theme.fg("toolTitle", theme.bold(toolName));
+  const title = theme.fg("toolTitle", theme.bold(sanitizeTerminalLine(toolName)));
   if (Object.keys(args).length === 0) {
     return new Text(title, 0, 0);
   }
   if (expanded) {
-    return new Text(`${title}\n${theme.fg("muted", JSON.stringify(args, null, 2))}`, 0, 0);
+    const formattedArgs = sanitizeTerminalText(JSON.stringify(args, null, 2));
+    return new Text(`${title}\n${theme.fg("muted", formattedArgs)}`, 0, 0);
   }
 
-  const summary = Object.entries(args)
-    .map(([name, value]) => `${name}: ${summarizeArgument(value)}`)
-    .join("  ");
+  const summary = sanitizeTerminalLine(
+    Object.entries(args)
+      .map(([name, value]) => `${name}: ${summarizeArgument(value)}`)
+      .join("  "),
+  );
   return {
     render: (width: number) => [truncateToWidth(`${title} ${theme.fg("muted", summary)}`, width, "...")],
     invalidate(): void {},
@@ -120,6 +130,7 @@ export function renderToolResult(
   }
 
   if (output) {
+    output = sanitizeTerminalText(output);
     const styledOutput = output
       .split("\n")
       .map((line) => theme.fg("toolOutput", line))
@@ -134,7 +145,7 @@ export function renderToolResult(
   if (details?.truncation?.truncated || details?.fullOutputPath) {
     const warnings: string[] = [];
     if (details.fullOutputPath) {
-      warnings.push(`Full output: ${details.fullOutputPath}`);
+      warnings.push(`Full output: ${sanitizeTerminalText(details.fullOutputPath)}`);
     }
     const truncation = details.truncation;
     if (truncation?.truncated) {
@@ -150,13 +161,17 @@ export function renderToolResult(
   return container;
 }
 
-async function boundModelText(text: string): Promise<{ text: string; details: BifrostToolDetails }> {
+async function boundModelText(
+  text: string,
+  fullText: string = text,
+): Promise<{ text: string; details: BifrostToolDetails }> {
   const initial = truncateHead(text);
-  if (!initial.truncated) {
+  const fullTextTruncated = fullText === text ? initial.truncated : truncateHead(fullText).truncated;
+  if (!initial.truncated && !fullTextTruncated) {
     return { text, details: {} };
   }
 
-  const fullOutputPath = await saveFullOutput(text);
+  const fullOutputPath = await saveFullOutput(fullText);
   const notice = modelTruncationNotice(fullOutputPath);
   const suffix = `\n\n${notice}`;
   const truncation = truncateHead(text, {
@@ -205,6 +220,21 @@ function collapsedOutput(output: string, theme: Theme): Component {
       cachedRemaining = undefined;
     },
   };
+}
+
+export function sanitizeTerminalText(text: string): string {
+  return stripVTControlCharacters(text).replace(
+    /[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/g,
+    visibleControlCharacter,
+  );
+}
+
+export function sanitizeTerminalLine(text: string): string {
+  return sanitizeTerminalText(text).replaceAll("\n", "\\n");
+}
+
+function visibleControlCharacter(character: string): string {
+  return `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`;
 }
 
 function summarizeArgument(value: unknown): string {

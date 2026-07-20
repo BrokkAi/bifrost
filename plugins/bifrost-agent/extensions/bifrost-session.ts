@@ -17,6 +17,8 @@ import {
   mapToolResult,
   renderToolCall,
   renderToolResult,
+  sanitizeTerminalLine,
+  sanitizeTerminalText,
   toolLabel,
   toolParameters,
 } from "./mcp-adapter.ts";
@@ -442,7 +444,9 @@ class BifrostSession implements BifrostSessionController {
       this.pi.registerTool({
         name: registeredName,
         label: `Bifrost: ${toolLabel(tool)}`,
-        description: `${tool.description ?? `Bifrost MCP tool ${tool.name}.`} Output is truncated to the first 2,000 lines or 50 KB; full output is saved to a temporary file.`,
+        description: sanitizeTerminalText(
+          `${tool.description ?? `Bifrost MCP tool ${tool.name}.`} Output is truncated to the first 2,000 lines or 50 KB; full output is saved to a temporary file.`,
+        ),
         parameters: toolParameters(tool),
         execute: async (_toolCallId, params, signal) =>
           await this.executeTool(tool, registeredName, params, signal),
@@ -532,6 +536,9 @@ export function assertToolsHaveUniqueNames(tools: Tool[]): void {
     if (!tool.name.trim()) {
       throw new Error("Bifrost advertised a tool without a name.");
     }
+    if (sanitizeTerminalLine(tool.name) !== tool.name) {
+      throw new Error("Bifrost advertised a tool with an unsafe name.");
+    }
     if (discovered.has(tool.name)) {
       throw new Error(`Bifrost advertised duplicate tool name: ${tool.name}.`);
     }
@@ -590,7 +597,7 @@ function selectedMcpToolNames(
 }
 
 function configurationError(cause: unknown): Error {
-  const reason = cause instanceof Error ? `: ${cause.message}` : ".";
+  const reason = cause instanceof Error ? `: ${sanitizeTerminalText(cause.message)}` : ".";
   return new Error(`Bifrost MCP configuration failed${reason}`, { cause });
 }
 
