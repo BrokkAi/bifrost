@@ -324,9 +324,9 @@ struct InheritedMemberOwners {
     receiver_owners: Vec<CodeUnit>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum InheritedMemberState {
-    Related,
+    Related(HashSet<CodeUnit>),
     Blocked,
     None,
 }
@@ -358,26 +358,28 @@ fn inherited_member_owners(
             receiver_owners,
         };
     }
-    let mut seen = HashSet::from_iter([scala_normalized_fq_name(&owner.fq_name())]);
-    let mut related_owner_fq_names = seen.clone();
+    let mut seen = HashSet::from_iter([owner.clone()]);
+    let mut related_declaration_owners = seen.clone();
     let mut inherited_state_by_owner = HashMap::from_iter([(
-        scala_normalized_fq_name(&owner.fq_name()),
-        InheritedMemberState::Related,
+        owner.clone(),
+        InheritedMemberState::Related(HashSet::from_iter([owner.clone()])),
     )]);
     for descendant in scala.get_descendants(owner) {
-        let descendant_fq_name = scala_normalized_fq_name(&descendant.fq_name());
-        if !seen.insert(descendant_fq_name.clone()) {
+        if !seen.insert(descendant.clone()) {
             continue;
         }
         match direct_member_state(scala, &descendant, kind, member_name, arity) {
             DirectMemberState::RelatedOverride => {
-                related_owner_fq_names.insert(descendant_fq_name.clone());
-                inherited_state_by_owner.insert(descendant_fq_name, InheritedMemberState::Related);
+                related_declaration_owners.insert(descendant.clone());
+                inherited_state_by_owner.insert(
+                    descendant.clone(),
+                    InheritedMemberState::Related(HashSet::from_iter([descendant.clone()])),
+                );
                 family_owners.push(descendant.clone());
                 receiver_owners.push(descendant);
             }
             DirectMemberState::BlockingDeclaration => {
-                inherited_state_by_owner.insert(descendant_fq_name, InheritedMemberState::Blocked);
+                inherited_state_by_owner.insert(descendant.clone(), InheritedMemberState::Blocked);
             }
             DirectMemberState::None => {
                 let state = inherited_member_state_from_ancestors(
@@ -386,11 +388,12 @@ fn inherited_member_owners(
                     kind,
                     member_name,
                     arity,
-                    &related_owner_fq_names,
+                    &related_declaration_owners,
                     &inherited_state_by_owner,
                 );
-                inherited_state_by_owner.insert(descendant_fq_name, state);
-                if state == InheritedMemberState::Related {
+                let is_related = matches!(state, InheritedMemberState::Related(_));
+                inherited_state_by_owner.insert(descendant.clone(), state);
+                if is_related {
                     receiver_owners.push(descendant);
                 }
             }
@@ -408,25 +411,24 @@ fn inherited_member_state_from_ancestors(
     kind: TargetKind,
     member_name: &str,
     arity: Option<usize>,
-    related_owner_fq_names: &HashSet<String>,
-    inherited_state_by_owner: &HashMap<String, InheritedMemberState>,
+    related_declaration_owners: &HashSet<CodeUnit>,
+    inherited_state_by_owner: &HashMap<CodeUnit, InheritedMemberState>,
 ) -> InheritedMemberState {
     let mut related_matches = HashSet::default();
     let mut has_blocking_match = false;
     for ancestor in scala.get_direct_ancestors(descendant) {
-        let ancestor_fq_name = scala_normalized_fq_name(&ancestor.fq_name());
         if owner_declares_matching_member(scala, &ancestor, kind, member_name, arity) {
-            if related_owner_fq_names.contains(&ancestor_fq_name) {
-                related_matches.insert(ancestor_fq_name);
+            if related_declaration_owners.contains(&ancestor) {
+                related_matches.insert(ancestor);
             } else {
                 has_blocking_match = true;
             }
             continue;
         }
 
-        match inherited_state_by_owner.get(&ancestor_fq_name) {
-            Some(InheritedMemberState::Related) => {
-                related_matches.insert(ancestor_fq_name);
+        match inherited_state_by_owner.get(&ancestor) {
+            Some(InheritedMemberState::Related(declarations)) => {
+                related_matches.extend(declarations.iter().cloned());
             }
             Some(InheritedMemberState::Blocked) => has_blocking_match = true,
             Some(InheritedMemberState::None) | None => {}
@@ -436,7 +438,7 @@ fn inherited_member_state_from_ancestors(
         return InheritedMemberState::Blocked;
     }
     if related_matches.len() == 1 {
-        InheritedMemberState::Related
+        InheritedMemberState::Related(related_matches)
     } else {
         InheritedMemberState::None
     }
@@ -452,7 +454,11 @@ fn direct_member_state(
     if kind == TargetKind::Method
         && scala
             .definitions(&format!("{}.{}", owner.fq_name(), member_name))
-            .any(|unit| unit.is_function() && method_arity_matches(scala, &unit, arity))
+            .any(|unit| {
+                unit.is_function()
+                    && scala.parent_of(&unit).as_ref() == Some(owner)
+                    && method_arity_matches(scala, &unit, arity)
+            })
     {
         return DirectMemberState::RelatedOverride;
     }
@@ -472,7 +478,10 @@ fn owner_declares_matching_member(
 ) -> bool {
     scala
         .definitions(&format!("{}.{}", owner.fq_name(), member_name))
-        .any(|unit| member_matches_target_kind(scala, &unit, kind, arity))
+        .any(|unit| {
+            scala.parent_of(&unit).as_ref() == Some(owner)
+                && member_matches_target_kind(scala, &unit, kind, arity)
+        })
 }
 
 fn member_matches_target_kind(

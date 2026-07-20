@@ -2963,6 +2963,93 @@ class Ambiguous[A] extends RB.SetHelper[A]
 }
 
 #[test]
+fn scala_inverted_graph_handles_generic_companion_enum_roots_and_convergent_diamonds() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Model.scala",
+            r#"package app
+
+object Chart {
+  final case class Encoding[A, B](left: A, right: B)
+  def generic = Encoding[Int, String](1, "one")
+}
+
+enum Extent {
+  case Continuous(min: Double, max: Double)
+  case Categories(keys: List[String])
+}
+object Extent {
+  def categories(keys: List[String]): Extent = Extent.Categories(keys)
+}
+object Scale {
+  def keys(extent: Extent): List[String] = extent match {
+    case Extent.Categories(values) => values
+    case _ => Nil
+  }
+}
+
+trait SharedOps { infix def contains(value: Int): Boolean = true }
+trait Intermediate extends SharedOps
+class Convergent extends Intermediate with SharedOps
+object EnumerationLike {
+  def selected(ids: Convergent): Boolean = ids contains 1
+}
+
+trait LeftOps { infix def contains(value: Int): Boolean = true }
+trait RightOps { infix def contains(value: Int): Boolean = true }
+object AmbiguousLike {
+  def selected(ids: LeftOps | RightOps): Boolean = ids contains 1
+}
+"#,
+        )
+        .file(
+            "jvm/replica/Extent.scala",
+            "package replica\nenum Extent { case Categories(keys: List[String]) }\nobject Extent\n",
+        )
+        .file(
+            "js/replica/Extent.scala",
+            "package replica\nenum Extent { case Categories(keys: List[String]) }\nobject Extent\n",
+        )
+        .file(
+            "external/Use.scala",
+            r#"package external
+object Use {
+  def keys(extent: replica.Extent): List[String] = extent match {
+    case replica.Extent.Categories(values) => values
+    case _ => Nil
+  }
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+
+    for (caller, callee) in [
+        ("app.Chart$.generic", "app.Chart$.Encoding"),
+        ("app.Scale$.keys", "app.Extent.Categories"),
+        ("app.EnumerationLike$.selected", "app.SharedOps.contains"),
+    ] {
+        assert!(
+            has_edge(&value, caller, callee),
+            "missing #662 structured edge {caller} -> {callee}: {}",
+            value["edges"]
+        );
+    }
+    for callee in ["app.LeftOps.contains", "app.RightOps.contains"] {
+        assert!(
+            !has_edge(&value, "app.AmbiguousLike$.selected", callee),
+            "distinct diamond selected {callee}: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        !has_edge(&value, "external.Use$.keys", "replica.Extent.Categories"),
+        "physically ambiguous enum root selected a case: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn scala_inverted_resolves_package_lexical_field_and_application_projections() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

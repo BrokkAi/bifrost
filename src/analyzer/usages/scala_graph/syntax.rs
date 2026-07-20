@@ -943,9 +943,31 @@ pub(crate) fn is_infix_pattern_operator(node: Node<'_>) -> bool {
 }
 
 pub(crate) fn is_call_function_reference(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        parent.kind() == "call_expression" && parent.child_by_field_name("function") == Some(node)
+    let mut expression = node;
+    if let Some(generic) = expression.parent().filter(|parent| {
+        parent.kind() == "generic_function"
+            && parent.child_by_field_name("function") == Some(expression)
+    }) {
+        expression = generic;
+    }
+    expression.parent().is_some_and(|parent| {
+        parent.kind() == "call_expression"
+            && parent.child_by_field_name("function") == Some(expression)
     })
+}
+
+/// Peel the type-argument wrapper from a call's parser-recorded function.
+///
+/// Scala `Factory[A](...)` is a `call_expression` whose function is a
+/// `generic_function`, while `Factory(...)` exposes the identifier directly.
+/// Call-role consumers must classify both through the same reference node so
+/// generic applications retain the identifier's exact source range.
+pub(crate) fn invocation_function_reference(function: Node<'_>) -> Node<'_> {
+    if function.kind() == "generic_function" {
+        function.child_by_field_name("function").unwrap_or(function)
+    } else {
+        function
+    }
 }
 
 pub(crate) fn is_terminal_stable_field_reference(node: Node<'_>) -> bool {

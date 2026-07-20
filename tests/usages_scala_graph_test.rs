@@ -7969,6 +7969,110 @@ class External extends Base {
 }
 
 #[test]
+fn scala_usage_finder_handles_generic_companion_enum_roots_and_convergent_diamonds() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Model.scala",
+        r#"package app
+
+object Chart {
+  final case class Encoding[A, B](left: A, right: B)
+  val generic = Encoding[Int, String](1, "one") // positive-generic-apply
+}
+
+enum Extent {
+  case Continuous(min: Double, max: Double)
+  case Categories(keys: List[String])
+}
+object Extent {
+  def categories(keys: List[String]): Extent = Extent.Categories(keys)
+}
+object Scale {
+  def keys(extent: Extent): List[String] = extent match {
+    case Extent.Categories(values) => values // positive-enum-extractor
+    case _ => Nil
+  }
+}
+"#,
+    )]);
+
+    for (target, expected) in [
+        ("app.Chart$.Encoding", "positive-generic-apply"),
+        ("app.Extent.Categories", "positive-enum-extractor"),
+    ] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&target_hits, expected);
+    }
+}
+
+#[test]
+fn scala_usage_finder_deduplicates_convergent_member_paths() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Diamond.scala",
+        r#"package app
+trait SharedOps { infix def contains(value: Int): Boolean = true }
+trait Intermediate extends SharedOps
+class Convergent extends Intermediate with SharedOps
+object EnumerationLike {
+  def selected(ids: Convergent): Boolean = ids contains 1 // positive-convergent-infix
+}
+trait LeftOps { infix def contains(value: Int): Boolean = true }
+trait RightOps { infix def contains(value: Int): Boolean = true }
+object AmbiguousLike {
+  def selected(ids: LeftOps | RightOps): Boolean = ids contains 1 // negative-distinct-diamond
+}
+"#,
+    )]);
+    let target = definition(&analyzer, "app.SharedOps.contains");
+    let target_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    assert_hit_contains(&target_hits, "positive-convergent-infix");
+    assert_no_hit_contains(&target_hits, "negative-distinct-diamond");
+    for target in ["app.LeftOps.contains", "app.RightOps.contains"] {
+        let target = definition(&analyzer, target);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_no_hit_contains(&target_hits, "negative-distinct-diamond");
+    }
+}
+
+#[test]
+fn scala_usage_finder_fails_closed_for_physical_enum_root_ambiguity() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "jvm/replica/Extent.scala",
+            "package replica\nenum Extent { case Categories(keys: List[String]) }\nobject Extent\n",
+        ),
+        (
+            "js/replica/Extent.scala",
+            "package replica\nenum Extent { case Categories(keys: List[String]) }\nobject Extent\n",
+        ),
+        (
+            "external/Use.scala",
+            r#"package external
+object Use {
+  def keys(extent: replica.Extent): List[String] = extent match {
+    case replica.Extent.Categories(values) => values // negative-physical-enum-root
+    case _ => Nil
+  }
+}
+"#,
+        ),
+    ]);
+    for path in ["jvm/replica/Extent.scala", "js/replica/Extent.scala"] {
+        let target = analyzer
+            .get_definitions("replica.Extent.Categories")
+            .into_iter()
+            .find(|unit| rel_path_string(unit.source()) == path)
+            .unwrap_or_else(|| panic!("missing physical enum case in {path}"));
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_no_hit_contains(&target_hits, "negative-physical-enum-root");
+    }
+}
+
+#[test]
 fn scala_abstract_parameterless_contract_accepts_exact_field_implementation_references() {
     let replica = |platform: &str| {
         format!(

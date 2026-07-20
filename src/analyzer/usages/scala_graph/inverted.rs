@@ -37,9 +37,10 @@ use super::syntax::{
     ScalaCallableUsePolicy, ScalaImportContextIndex, ScalaMethodValueContext,
     ScalaPackageContextIndex, ScalaQualifiedStableTypeRole, ScalaSourceFacts,
     call_arities_for_reference, call_site_shape_for_reference, enclosing_template_declarations,
-    is_bare_companion_method_value_reference, is_constructor_like_reference, is_declaration_name,
-    is_extractor_reference, is_infix_pattern_operator, is_scala_case_pattern_binder,
-    is_scala_class_reference, is_scala_named_argument_assignment, is_scala_object_reference,
+    invocation_function_reference, is_bare_companion_method_value_reference,
+    is_constructor_like_reference, is_declaration_name, is_extractor_reference,
+    is_infix_pattern_operator, is_scala_case_pattern_binder, is_scala_class_reference,
+    is_scala_named_argument_assignment, is_scala_object_reference,
     is_terminal_stable_field_reference, node_text, parenthesized_arity,
     qualified_stable_type_reference, resolve_stable_object_expression,
     scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
@@ -2468,7 +2469,7 @@ impl ProjectTypes {
             .or_else(|| scala_builtin_type_name(first).map(str::to_string));
         }
 
-        match resolver.resolve_qualified_type_root(self, first, None) {
+        match resolver.resolve_qualified_type_root(self, first, Vec::new()) {
             ScalaQualifiedTypeRootResolution::Resolved(
                 ScalaQualifiedTypeRootBinding::StableObjects(mut owners),
             ) => {
@@ -2568,6 +2569,23 @@ impl ProjectTypes {
         terminal_object: bool,
         lexical_root: Option<CodeUnit>,
     ) -> Option<CodeUnit> {
+        self.resolve_qualified_stable_type_unit_at_with_lexical_roots(
+            scala,
+            resolver,
+            segments,
+            terminal_object,
+            lexical_root.into_iter().collect(),
+        )
+    }
+
+    pub(super) fn resolve_qualified_stable_type_unit_at_with_lexical_roots(
+        &self,
+        scala: &ScalaAnalyzer,
+        resolver: &NameResolver,
+        segments: &[String],
+        terminal_object: bool,
+        lexical_roots: Vec<CodeUnit>,
+    ) -> Option<CodeUnit> {
         let (first, rest) = segments.split_first()?;
         if rest.is_empty() {
             let fqn = if terminal_object {
@@ -2584,7 +2602,7 @@ impl ProjectTypes {
             };
         }
 
-        match resolver.resolve_qualified_type_root(self, first, lexical_root) {
+        match resolver.resolve_qualified_type_root(self, first, lexical_roots) {
             ScalaQualifiedTypeRootResolution::Resolved(
                 ScalaQualifiedTypeRootBinding::StableObjects(mut owners),
             ) => {
@@ -2651,6 +2669,24 @@ impl ProjectTypes {
                 .cloned();
         }
         self.unique_type_by_normalized_fqn(&normalized).cloned()
+    }
+
+    pub(super) fn resolve_qualified_stable_type_at_with_lexical_roots(
+        &self,
+        scala: &ScalaAnalyzer,
+        resolver: &NameResolver,
+        segments: &[String],
+        terminal_object: bool,
+        lexical_roots: Vec<CodeUnit>,
+    ) -> Option<String> {
+        self.resolve_qualified_stable_type_unit_at_with_lexical_roots(
+            scala,
+            resolver,
+            segments,
+            terminal_object,
+            lexical_roots,
+        )
+        .map(|unit| unit.fq_name())
     }
 
     fn resolve_type_in_callable_declaration_context(
@@ -3213,6 +3249,36 @@ impl ProjectTypes {
                     .stable_owner_ranges
                     .contains(&(range.start_byte, range.end_byte))
             })
+    }
+
+    pub(super) fn stable_roots_for_resolved_type_name(
+        &self,
+        scala: &ScalaAnalyzer,
+        resolver: &NameResolver,
+        name: &str,
+    ) -> Vec<CodeUnit> {
+        let Some(fqn) = resolver.resolve(name) else {
+            return Vec::new();
+        };
+        let Some(declaration) = self
+            .unique_type_by_normalized_fqn(&scala_normalized_fq_name(&fqn))
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        // This bridge exists only for stable *type* roots such as enums. A
+        // standalone object must stay in the term namespace so the resolver
+        // can detect same-priority package/object alias collisions.
+        if declaration.short_name().ends_with('$') {
+            return Vec::new();
+        }
+        let mut roots = self.exact_companion_objects(scala, &declaration);
+        if self.type_is_stable_owner(scala, &declaration) {
+            roots.push(declaration);
+        }
+        roots.sort();
+        roots.dedup();
+        roots
     }
 
     pub(super) fn exact_companion_objects(
@@ -4524,11 +4590,13 @@ impl NameResolver {
         &self,
         types: &ProjectTypes,
         raw: &str,
-        lexical_object: Option<CodeUnit>,
+        mut lexical_objects: Vec<CodeUnit>,
     ) -> ScalaQualifiedTypeRootResolution {
-        if let Some(object) = lexical_object {
+        lexical_objects.sort();
+        lexical_objects.dedup();
+        if !lexical_objects.is_empty() {
             return ScalaQualifiedTypeRootResolution::Resolved(
-                ScalaQualifiedTypeRootBinding::StableObjects(vec![object]),
+                ScalaQualifiedTypeRootBinding::StableObjects(lexical_objects),
             );
         }
         let Some(simple) = simple_type_name(raw) else {
@@ -5201,6 +5269,7 @@ fn record_reference(
             let Some(function) = node.child_by_field_name("function") else {
                 return;
             };
+            let function = invocation_function_reference(function);
             match function.kind() {
                 // `recv.method(..)` — type the receiver, then `Owner.method`.
                 "field_expression" => {
@@ -5570,7 +5639,7 @@ fn record_qualified_stable_reference(
     {
         return true;
     }
-    let lexical_root = reference
+    let lexical_object_root = reference
         .segments
         .first()
         .and_then(|root| ctx.lexically_visible_object_unit(node.start_byte(), root));
@@ -5579,24 +5648,52 @@ fn record_qualified_stable_reference(
         lexical_type_root,
         ScalaTypeNamespaceResolution::AuthoritativeMiss | ScalaTypeNamespaceResolution::Ambiguous
     );
+    let lexical_roots = match &lexical_type_root {
+        ScalaTypeNamespaceResolution::Resolved(declaration) => {
+            let mut roots = ctx.types.exact_companion_objects(ctx.scala, declaration);
+            if ctx.types.type_is_stable_owner(ctx.scala, declaration) {
+                roots.push(declaration.clone());
+            }
+            roots.sort();
+            roots.dedup();
+            roots
+        }
+        ScalaTypeNamespaceResolution::NoMatch => {
+            let root = reference.segments.first().expect("qualified stable root");
+            let mut roots =
+                ctx.types
+                    .stable_roots_for_resolved_type_name(ctx.scala, &ctx.resolver, root);
+            if roots.is_empty()
+                && let Some(object) = lexical_object_root
+            {
+                roots.push(object);
+            }
+            roots
+        }
+        ScalaTypeNamespaceResolution::AuthoritativeMiss
+        | ScalaTypeNamespaceResolution::Ambiguous => Vec::new(),
+    };
     let class_fqn = (!class_lookup_blocked)
         .then(|| {
-            ctx.types.resolve_qualified_stable_type_at(
-                ctx.scala,
-                &ctx.resolver,
-                &reference.segments,
-                false,
-                lexical_root.clone(),
-            )
+            ctx.types
+                .resolve_qualified_stable_type_at_with_lexical_roots(
+                    ctx.scala,
+                    &ctx.resolver,
+                    &reference.segments,
+                    false,
+                    lexical_roots.clone(),
+                )
         })
         .flatten();
-    let object_fqn = ctx.types.resolve_qualified_stable_type_at(
-        ctx.scala,
-        &ctx.resolver,
-        &reference.segments,
-        true,
-        lexical_root,
-    );
+    let object_fqn = ctx
+        .types
+        .resolve_qualified_stable_type_at_with_lexical_roots(
+            ctx.scala,
+            &ctx.resolver,
+            &reference.segments,
+            true,
+            lexical_roots,
+        );
     if class_fqn.is_none()
         && !class_lookup_blocked
         && reference.role == ScalaQualifiedStableTypeRole::Type

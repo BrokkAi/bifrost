@@ -30,12 +30,13 @@ use crate::analyzer::usages::scala_graph::syntax::{
     ScalaPackageContextIndex, ScalaQualifiedStableTypeRole, applied_expression_for_reference,
     call_arities_for_reference, call_site_shape_for_reference, enclosing_template_declarations,
     has_ancestor_kind, has_member_qualifier, infix_receiver_for_operator,
-    is_bare_companion_method_value_reference, is_call_function_reference,
-    is_constructor_like_reference, is_declaration_name, is_extractor_reference, is_identifier_node,
-    is_infix_pattern_operator, is_infix_type_operator_reference, is_owner_qualified_this,
-    is_scala_case_pattern_binder, is_scala_class_reference, is_scala_named_argument_assignment,
-    is_scala_object_reference, is_terminal_stable_field_reference, member_qualifier,
-    member_qualifier_node, named_argument_invocation_owner, node_text, parenthesized_arity,
+    invocation_function_reference, is_bare_companion_method_value_reference,
+    is_call_function_reference, is_constructor_like_reference, is_declaration_name,
+    is_extractor_reference, is_identifier_node, is_infix_pattern_operator,
+    is_infix_type_operator_reference, is_owner_qualified_this, is_scala_case_pattern_binder,
+    is_scala_class_reference, is_scala_named_argument_assignment, is_scala_object_reference,
+    is_terminal_stable_field_reference, member_qualifier, member_qualifier_node,
+    named_argument_invocation_owner, node_text, parenthesized_arity,
     qualified_stable_type_reference, resolve_stable_object_expression,
     scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
     scala_callable_shape_matches, scala_pattern_binder_names, scala_union_type_alternative_paths,
@@ -327,6 +328,7 @@ fn scan_call_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(function) = node.child_by_field_name("function") else {
         return;
     };
+    let function = invocation_function_reference(function);
     let text = node_text(function, ctx.source).trim();
     if companion_apply_call_is_proven(function, text, ctx) {
         add_hit(function, ctx);
@@ -1508,24 +1510,33 @@ fn exact_object_role_matches(object: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
             .any(|companion| companion == object)
 }
 
-fn exact_stable_lexical_root(node: Node<'_>, root: &str, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
+fn exact_stable_lexical_roots(node: Node<'_>, root: &str, ctx: &ScanCtx<'_>) -> Vec<CodeUnit> {
     match exact_lexically_visible_type_root(node, ctx) {
         ScalaTypeNamespaceResolution::Resolved(declaration) => {
             if declaration.short_name().ends_with('$') {
-                return Some(declaration);
+                return vec![declaration];
             }
-            let companions = ctx.types.exact_companion_objects(ctx.scala, &declaration);
-            match companions.as_slice() {
-                [companion] => Some(companion.clone()),
-                [] if ctx.types.type_is_stable_owner(ctx.scala, &declaration) => Some(declaration),
-                [] | [_, _, ..] => None,
+            let mut roots = ctx.types.exact_companion_objects(ctx.scala, &declaration);
+            if ctx.types.type_is_stable_owner(ctx.scala, &declaration) {
+                roots.push(declaration);
             }
+            roots.sort();
+            roots.dedup();
+            roots
         }
         ScalaTypeNamespaceResolution::NoMatch => {
-            lexically_visible_nested_object_unit(node, root, ctx)
+            let mut roots =
+                ctx.types
+                    .stable_roots_for_resolved_type_name(ctx.scala, &ctx.name_resolver, root);
+            if roots.is_empty()
+                && let Some(object) = lexically_visible_nested_object_unit(node, root, ctx)
+            {
+                roots.push(object);
+            }
+            roots
         }
         ScalaTypeNamespaceResolution::AuthoritativeMiss
-        | ScalaTypeNamespaceResolution::Ambiguous => None,
+        | ScalaTypeNamespaceResolution::Ambiguous => Vec::new(),
     }
 }
 
@@ -1536,14 +1547,15 @@ fn resolve_qualified_stable_type_unit_at(
     ctx: &ScanCtx<'_>,
 ) -> Option<CodeUnit> {
     let root = segments.first()?;
-    let lexical_root = exact_stable_lexical_root(node, root, ctx);
-    ctx.types.resolve_qualified_stable_type_unit_at(
-        ctx.scala,
-        &ctx.name_resolver,
-        segments,
-        terminal_object,
-        lexical_root,
-    )
+    let lexical_roots = exact_stable_lexical_roots(node, root, ctx);
+    ctx.types
+        .resolve_qualified_stable_type_unit_at_with_lexical_roots(
+            ctx.scala,
+            &ctx.name_resolver,
+            segments,
+            terminal_object,
+            lexical_roots,
+        )
 }
 
 fn resolve_qualified_stable_type_at(
