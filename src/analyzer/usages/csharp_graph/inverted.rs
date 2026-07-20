@@ -24,10 +24,10 @@ use super::extractor::{
 use super::resolver::{
     UnqualifiedMethodGroupResolution, argument_count, class_unit_for_fq_name,
     extension_visibility_site_key, first_type_child, is_type_reference_node,
-    method_return_type_fq_name_for_arity, nearest_member_candidates_for_owner, node_text,
-    reference_type_text, resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner,
-    unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
-    visible_extension_method_candidates,
+    nearest_member_candidates_for_owner, node_text, reference_type_text, resolve_type_fq_name_at,
+    resolve_unqualified_method_group_for_owner, unqualified_member_has_local_binding,
+    unqualified_member_has_structured_shadow, usage_member_declared_type_fq_name,
+    usage_method_return_type_fq_name_for_arity, usage_visible_extension_method_candidates,
 };
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
@@ -199,10 +199,9 @@ impl CsScan<'_, '_> {
                 );
                 if !self.extension_cache.contains_key(&extension_key) {
                     let receiver_types = [owner_fqn.to_string()];
-                    let mut extensions = visible_extension_method_candidates(
+                    let mut extensions = usage_visible_extension_method_candidates(
                         self.csharp,
                         self.analyzer,
-                        self.file,
                         self.source,
                         node,
                         &receiver_types,
@@ -288,7 +287,7 @@ fn record_reference(
             let names = csharp_attribute_type_names(name, ctx.source);
             for candidate in ctx
                 .csharp
-                .unambiguous_attribute_type_candidates(ctx.file, &names)
+                .usage_unambiguous_attribute_type_candidates(ctx.file, &names)
             {
                 ctx.record(candidate.fq_name(), name);
             }
@@ -615,9 +614,8 @@ fn expression_type_fqn(
             let owner_fqn = receiver_type_fqn(receiver, ctx, bindings)?;
             let owner = class_unit_for_fq_name(ctx.csharp, &owner_fqn)?;
             let name = csharp_member_name(name_node)?;
-            super::resolver::member_declared_type_fq_name(
+            usage_member_declared_type_fq_name(
                 ctx.csharp,
-                ctx.file,
                 &owner,
                 node_text(name.identifier, ctx.source),
             )
@@ -700,9 +698,8 @@ fn method_return_type_for_call(
     explicit_generic_arity: Option<usize>,
     explicit_type_arguments: Option<&[String]>,
 ) -> Option<String> {
-    method_return_type_fq_name_for_arity(
+    usage_method_return_type_fq_name_for_arity(
         ctx.csharp,
-        ctx.file,
         owner,
         method_name,
         Some(arity),

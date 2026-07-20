@@ -44,6 +44,7 @@ use tree_sitter::{Language as TreeSitterLanguage, Node};
 /// unqualified / `this` / `self` reference to its enclosing class. Sources the
 /// analyzer's own fqns, so nested classes resolve to whatever fqn the analyzer
 /// emits.
+#[derive(Clone)]
 pub(crate) struct ClassRangeIndex {
     ranges: Vec<(usize, usize, CodeUnit, String)>,
 }

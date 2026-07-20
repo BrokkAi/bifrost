@@ -20,6 +20,7 @@ pub(super) struct CSharpMemoCaches {
     pub(super) global_using_namespaces: OnceLock<HashSet<String>>,
     pub(super) global_using_aliases: OnceLock<HashMap<String, String>>,
     pub(super) global_static_using_types: OnceLock<Vec<CodeUnit>>,
+    pub(super) usage_global_static_using_types: OnceLock<Vec<CodeUnit>>,
 }
 
 impl CSharpMemoCaches {
@@ -40,6 +41,7 @@ impl CSharpMemoCaches {
             global_using_namespaces: OnceLock::new(),
             global_using_aliases: OnceLock::new(),
             global_static_using_types: OnceLock::new(),
+            usage_global_static_using_types: OnceLock::new(),
         }
     }
 

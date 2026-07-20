@@ -569,6 +569,25 @@ impl IAnalyzer for MultiAnalyzer {
                 .sum::<usize>()
     }
 
+    fn reset_definition_candidates_query_count_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .reset_definition_candidates_query_count_for_test();
+        }
+    }
+
+    fn definition_candidates_query_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .definition_candidates_query_count_for_test()
+            })
+            .sum()
+    }
+
     fn reset_full_declaration_scan_count_for_test(&self) {
         for delegate in self.delegates.values() {
             delegate

@@ -160,11 +160,31 @@ impl CSharpAnalyzer {
         self.inner.full_hydration_count_for_test()
     }
 
+    #[doc(hidden)]
+    pub fn reset_definition_candidates_query_count_for_test(&self) {
+        self.inner
+            .reset_definition_candidates_query_count_for_test();
+    }
+
+    #[doc(hidden)]
+    pub fn definition_candidates_query_count_for_test(&self) -> usize {
+        self.inner.definition_candidates_query_count_for_test()
+    }
+
     pub(crate) fn declaration_candidates_by_identifier(
         &self,
         identifier: &str,
     ) -> BTreeSet<CodeUnit> {
         self.inner.lookup_declarations_by_identifier(identifier)
+    }
+
+    pub(crate) fn usage_declaration_candidates_by_identifier(
+        &self,
+        identifier: &str,
+    ) -> &[CodeUnit] {
+        self.inner
+            .global_usage_definition_index()
+            .identifier(identifier)
     }
 
     pub(crate) fn declaration_candidates_by_fqn(
@@ -184,8 +204,28 @@ impl CSharpAnalyzer {
         self.inner.lookup_members_for_owner_name(owner_fqn, name)
     }
 
+    pub(crate) fn usage_member_candidates_for_owner(
+        &self,
+        owner_fqn: &str,
+        name: &str,
+    ) -> Vec<CodeUnit> {
+        let normalized = csharp_normalize_full_name(owner_fqn);
+        self.inner
+            .global_usage_definition_index()
+            .members_for_owner_name(owner_fqn, &normalized, name)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn workspace_namespace_exists(&self, namespace: &str) -> bool {
         self.inner.persisted_package_exists(namespace)
+    }
+
+    pub(crate) fn usage_workspace_namespace_exists(&self, namespace: &str) -> bool {
+        self.inner
+            .global_usage_definition_index()
+            .package_exists(namespace)
     }
 
     pub fn namespace_of_file(&self, file: &ProjectFile) -> String {
@@ -318,7 +358,7 @@ impl CSharpAnalyzer {
                     let target = normalize_csharp_type_fragment(
                         target.strip_prefix("global::").unwrap_or(target),
                     );
-                    types.extend(self.type_candidates_by_fqn(&target));
+                    types.extend(self.type_candidates_by_fqn(&target, false));
                 }
             }
             types.sort();
@@ -327,8 +367,43 @@ impl CSharpAnalyzer {
         })
     }
 
+    pub(crate) fn usage_global_static_using_types(&self) -> &[CodeUnit] {
+        self.memo_caches
+            .usage_global_static_using_types
+            .get_or_init(|| {
+                let mut types = Vec::new();
+                for file in self.inner.all_files() {
+                    for target in self
+                        .inner
+                        .import_info_of(&file)
+                        .iter()
+                        .filter(|import| {
+                            import.raw_snippet.trim_start().starts_with("global using ")
+                        })
+                        .filter_map(csharp_static_using_from_import)
+                    {
+                        let target = normalize_csharp_type_fragment(
+                            target.strip_prefix("global::").unwrap_or(target),
+                        );
+                        types.extend(self.type_candidates_by_fqn(&target, true));
+                    }
+                }
+                types.sort();
+                types.dedup();
+                types
+            })
+    }
+
     pub fn visible_type_candidates(&self, file: &ProjectFile, name: &str) -> Vec<CodeUnit> {
-        self.visible_type_candidates_inner(file, name, true)
+        self.visible_type_candidates_inner(file, name, true, false)
+    }
+
+    pub(crate) fn usage_visible_type_candidates(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+    ) -> Vec<CodeUnit> {
+        self.visible_type_candidates_inner(file, name, true, true)
     }
 
     pub(crate) fn partial_type_parts(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
@@ -339,6 +414,21 @@ impl CSharpAnalyzer {
         let mut parts: Vec<_> = self
             .inner
             .get_definitions(&owner.fq_name())
+            .into_iter()
+            .filter(|unit| unit.is_class() && self.type_declaration_key(unit) == owner_key)
+            .collect();
+        self.sort_type_candidates(&mut parts);
+        parts.dedup();
+        parts
+    }
+
+    pub(crate) fn usage_partial_type_parts(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
+        if !owner.is_class() {
+            return Vec::new();
+        }
+        let owner_key = self.type_declaration_key(owner);
+        let mut parts: Vec<_> = self
+            .usage_definition_candidates_by_fqn(&owner.fq_name())
             .into_iter()
             .filter(|unit| unit.is_class() && self.type_declaration_key(unit) == owner_key)
             .collect();
@@ -399,11 +489,27 @@ impl CSharpAnalyzer {
             .flatten()
     }
 
+    pub(crate) fn resolve_usage_visible_type(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+    ) -> Option<CodeUnit> {
+        let candidates = self.usage_visible_type_candidates(file, name);
+        (self.logical_type_count(&candidates) == 1)
+            .then(|| {
+                let mut candidates = candidates;
+                self.sort_type_candidates(&mut candidates);
+                candidates.into_iter().next()
+            })
+            .flatten()
+    }
+
     fn visible_type_candidates_inner(
         &self,
         file: &ProjectFile,
         name: &str,
         resolve_aliases: bool,
+        usage: bool,
     ) -> Vec<CodeUnit> {
         let mut normalized = normalize_csharp_type_fragment(name);
         if normalized.is_empty() {
@@ -425,22 +531,23 @@ impl CSharpAnalyzer {
             };
         }
         if global_qualified {
-            return self.type_candidates_by_fqn(&normalized);
+            return self.type_candidates_by_fqn(&normalized, usage);
         }
         if resolve_aliases
             && let Some(target) = self.using_aliases_of(file).get(&normalized)
             && target != &normalized
         {
-            return self.visible_type_candidates_inner(file, target, false);
+            return self.visible_type_candidates_inner(file, target, false, usage);
         }
 
         if normalized.contains('.') {
-            return self.type_candidates_by_fqn(&normalized);
+            return self.type_candidates_by_fqn(&normalized, usage);
         }
 
         let mut namespace = self.namespace_of_file(file);
         if !namespace.is_empty() {
-            let candidates = self.type_candidates_by_fqn(&format!("{namespace}.{normalized}"));
+            let candidates =
+                self.type_candidates_by_fqn(&format!("{namespace}.{normalized}"), usage);
             if !candidates.is_empty() {
                 return candidates;
             }
@@ -448,24 +555,59 @@ impl CSharpAnalyzer {
 
         let mut visible = Vec::new();
         for namespace in self.using_namespaces_of(file) {
-            visible.extend(self.type_candidates_by_fqn(&format!("{namespace}.{normalized}")));
+            visible
+                .extend(self.type_candidates_by_fqn(&format!("{namespace}.{normalized}"), usage));
         }
 
         while let Some(separator) = namespace.rfind('.') {
             namespace.truncate(separator);
-            visible.extend(self.type_candidates_by_fqn(&format!("{namespace}.{normalized}")));
+            visible
+                .extend(self.type_candidates_by_fqn(&format!("{namespace}.{normalized}"), usage));
         }
 
-        visible.extend(self.type_candidates_by_fqn(&normalized));
+        visible.extend(self.type_candidates_by_fqn(&normalized, usage));
         visible
     }
 
-    fn type_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+    fn type_candidates_by_fqn(&self, fqn: &str, usage: bool) -> Vec<CodeUnit> {
+        if usage {
+            return self.usage_type_candidates_by_fqn(fqn);
+        }
         self.inner
             .forward_definition_fqn(fqn)
             .into_iter()
             .filter(|unit| unit.is_class())
             .collect()
+    }
+
+    pub(crate) fn usage_type_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        let index = self.inner.global_usage_definition_index();
+        let exact = index
+            .by_fqn(fqn)
+            .iter()
+            .filter(|unit| unit.is_class())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !exact.is_empty() {
+            return exact;
+        }
+        index
+            .by_normalized_fqn(&csharp_normalize_full_name(fqn))
+            .iter()
+            .filter(|unit| unit.is_class())
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn usage_definition_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        let index = self.inner.global_usage_definition_index();
+        let exact = index.by_fqn(fqn);
+        if !exact.is_empty() {
+            return exact.to_vec();
+        }
+        index
+            .by_normalized_fqn(&csharp_normalize_full_name(fqn))
+            .to_vec()
     }
 }
 
@@ -941,6 +1083,15 @@ impl IAnalyzer for CSharpAnalyzer {
     fn global_usage_definition_index_build_count_for_test(&self) -> usize {
         self.inner
             .global_usage_definition_index_build_count_for_test()
+    }
+
+    fn reset_definition_candidates_query_count_for_test(&self) {
+        self.inner
+            .reset_definition_candidates_query_count_for_test();
+    }
+
+    fn definition_candidates_query_count_for_test(&self) -> usize {
+        self.inner.definition_candidates_query_count_for_test()
     }
 
     fn reset_full_declaration_scan_count_for_test(&self) {

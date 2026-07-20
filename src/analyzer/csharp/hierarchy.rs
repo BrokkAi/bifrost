@@ -34,12 +34,12 @@ impl CSharpAnalyzer {
 
     /// Inverse usage proof requires one logical attribute type. An ambiguous
     /// annotation is not a proven reference to every declaration it might name.
-    pub(crate) fn unambiguous_attribute_type_candidates(
+    pub(crate) fn usage_unambiguous_attribute_type_candidates(
         &self,
         file: &ProjectFile,
         names: &[String],
     ) -> Vec<CodeUnit> {
-        match self.attribute_type_resolution(file, names) {
+        match self.attribute_type_resolution_inner(file, names, true) {
             AttributeTypeResolution::Resolved(candidates) => candidates,
             AttributeTypeResolution::Unresolved | AttributeTypeResolution::Ambiguous(_) => {
                 Vec::new()
@@ -52,10 +52,23 @@ impl CSharpAnalyzer {
         file: &ProjectFile,
         names: &[String],
     ) -> AttributeTypeResolution {
+        self.attribute_type_resolution_inner(file, names, false)
+    }
+
+    fn attribute_type_resolution_inner(
+        &self,
+        file: &ProjectFile,
+        names: &[String],
+        usage: bool,
+    ) -> AttributeTypeResolution {
         let mut candidates = Vec::new();
         let mut successful_spellings = 0usize;
         for name in names {
-            let visible = self.visible_type_candidates(file, name);
+            let visible = if usage {
+                self.usage_visible_type_candidates(file, name)
+            } else {
+                self.visible_type_candidates(file, name)
+            };
             // C# suppresses errors from each of the two attribute spellings
             // independently. An ambiguous spelling contributes no candidate;
             // the other spelling can still resolve uniquely.
@@ -65,7 +78,7 @@ impl CSharpAnalyzer {
             let applicable = visible
                 .into_iter()
                 .filter(|candidate| {
-                    self.attribute_class_evidence(candidate)
+                    self.attribute_class_evidence(candidate, usage)
                         != AttributeClassEvidence::DefinitelyNot
                 })
                 .collect::<Vec<_>>();
@@ -83,7 +96,11 @@ impl CSharpAnalyzer {
         }
     }
 
-    fn attribute_class_evidence(&self, candidate: &CodeUnit) -> AttributeClassEvidence {
+    fn attribute_class_evidence(
+        &self,
+        candidate: &CodeUnit,
+        usage: bool,
+    ) -> AttributeClassEvidence {
         const ATTRIBUTE_FQN: &str = "System.Attribute";
 
         let mut stack = vec![candidate.clone()];
@@ -99,7 +116,11 @@ impl CSharpAnalyzer {
                 return AttributeClassEvidence::Proven;
             }
 
-            let mut parts = self.partial_type_parts(&current);
+            let mut parts = if usage {
+                self.usage_partial_type_parts(&current)
+            } else {
+                self.partial_type_parts(&current)
+            };
             if parts.is_empty() {
                 parts.push(current);
             }
@@ -113,7 +134,11 @@ impl CSharpAnalyzer {
                         decisive_non_attribute_base = true;
                         continue;
                     }
-                    let ancestors = self.visible_type_candidates(part.source(), &raw);
+                    let ancestors = if usage {
+                        self.usage_visible_type_candidates(part.source(), &raw)
+                    } else {
+                        self.visible_type_candidates(part.source(), &raw)
+                    };
                     if ancestors.is_empty() {
                         unresolved_ancestry = true;
                         continue;
@@ -134,6 +159,14 @@ impl CSharpAnalyzer {
         } else {
             AttributeClassEvidence::DefinitelyNot
         }
+    }
+
+    pub(crate) fn usage_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        self.inner
+            .raw_supertypes_of(code_unit)
+            .iter()
+            .filter_map(|raw| self.resolve_usage_visible_type(code_unit.source(), raw))
+            .collect()
     }
 }
 

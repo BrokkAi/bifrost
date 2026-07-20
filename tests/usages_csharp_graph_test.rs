@@ -3,7 +3,9 @@ mod common;
 use brokk_bifrost::usages::{
     CSharpUsageGraphStrategy, ExplicitCandidateProvider, FuzzyResult, UsageAnalyzer, UsageFinder,
 };
-use brokk_bifrost::{CSharpAnalyzer, CodeUnit, CodeUnitType, IAnalyzer, Language};
+use brokk_bifrost::{
+    AnalyzerConfig, CSharpAnalyzer, CodeUnit, CodeUnitType, IAnalyzer, Language, WorkspaceAnalyzer,
+};
 use common::{InlineTestProject, call_search_tool_json, csharp_nested_partial_cacheinfo_project};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -1267,6 +1269,168 @@ namespace Demo {
                 && chained_start + "ResultOnly".len() <= hit.end_offset
         }),
         "persisted type-parameter metadata must retain chained return inference: {persisted_hits:#?}"
+    );
+}
+
+#[test]
+fn persisted_csharp_inverse_reuses_one_definition_index_without_candidate_queries() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("Demo/GlobalUsings.cs", "global using Demo;\n")
+        .file(
+            "Demo/Widget.Part1.cs",
+            r#"
+namespace Demo {
+    public partial class Widget<T> {
+        public void Touch() {}
+    }
+}
+"#,
+        )
+        .file(
+            "Demo/Widget.Part2.cs",
+            r#"
+namespace Demo {
+    public partial class Widget<T> {
+        public void Touch() {}
+    }
+}
+"#,
+        )
+        .file(
+            "Consumers/AliasConsumer.cs",
+            r#"
+using Alias = Demo.Widget<int>;
+namespace Consumers {
+    public class AliasConsumer {
+        public void Run() {
+            Alias value = new Alias();
+            value.Touch();
+        }
+    }
+}
+"#,
+        )
+        .file(
+            "Consumers/GlobalConsumer.cs",
+            r#"
+namespace Consumers {
+    public class GlobalConsumer {
+        public void Run() {
+            Widget<string> value = new Widget<string>();
+            value.Touch();
+        }
+    }
+}
+"#,
+        )
+        .file(
+            "Consumers/UnrelatedConsumer.cs",
+            r#"
+namespace Other {
+    public class Widget<T> {
+        public void Touch() {}
+    }
+}
+namespace Consumers {
+    public class UnrelatedConsumer {
+        public void Run() {
+            Other.Widget<int> value = new Other.Widget<int>();
+            value.Touch();
+        }
+    }
+}
+"#,
+        )
+        .build();
+    let workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("persisted C# analyzer should build");
+    let analyzer = workspace.analyzer();
+    let declarations = analyzer.get_all_declarations();
+    let mut targets = declarations
+        .iter()
+        .filter(|unit| unit.is_function() && unit.identifier() == "Touch")
+        .filter(|unit| {
+            analyzer
+                .parent_of(unit)
+                .is_some_and(|owner| owner.package_name() == "Demo")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    assert_eq!(
+        2,
+        targets.len(),
+        "expected both physical partial members: {declarations:#?}"
+    );
+
+    analyzer.reset_global_usage_definition_index_build_count_for_test();
+    analyzer.reset_definition_candidates_query_count_for_test();
+    let target_fqn = targets[0].fq_name();
+    assert!(targets.iter().all(|target| target.fq_name() == target_fqn));
+    let forward = analyzer.definitions(&target_fqn).collect::<Vec<_>>();
+    assert_eq!(2, forward.len(), "persisted forward lookup parity");
+    assert_eq!(
+        0,
+        analyzer.global_usage_definition_index_build_count_for_test(),
+        "ordinary forward definitions must not hydrate the global usage index"
+    );
+    assert!(
+        analyzer.definition_candidates_query_count_for_test() > 0,
+        "the forward assertion must exercise bounded persisted candidate SQL"
+    );
+
+    let alias_consumer = project.file("Consumers/AliasConsumer.cs");
+    let global_consumer = project.file("Consumers/GlobalConsumer.cs");
+    let unrelated_consumer = project.file("Consumers/UnrelatedConsumer.cs");
+    let candidate_files = Arc::new(
+        [
+            alias_consumer.clone(),
+            global_consumer.clone(),
+            unrelated_consumer.clone(),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let provider = ExplicitCandidateProvider::new(Arc::clone(&candidate_files));
+    analyzer.reset_definition_candidates_query_count_for_test();
+    for attempt in 0..2 {
+        let hits = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                analyzer,
+                &targets,
+                Some(&provider),
+                candidate_files.len(),
+                100,
+            )
+            .result
+            .into_either()
+            .expect("partial member inverse query should resolve");
+        assert_eq!(2, hits.len(), "attempt {attempt}: {hits:#?}");
+        assert!(
+            hits.iter().any(|hit| hit.file == alias_consumer),
+            "attempt {attempt}: alias-qualified consumer missing: {hits:#?}"
+        );
+        assert!(
+            hits.iter().any(|hit| hit.file == global_consumer),
+            "attempt {attempt}: global-using consumer missing: {hits:#?}"
+        );
+        assert!(
+            hits.iter().all(|hit| hit.file != unrelated_consumer),
+            "attempt {attempt}: same-named unrelated owner leaked: {hits:#?}"
+        );
+    }
+    assert_eq!(
+        1,
+        analyzer.global_usage_definition_index_build_count_for_test(),
+        "the generation-scoped inverse definition index should be shared"
+    );
+    assert_eq!(
+        0,
+        analyzer.definition_candidates_query_count_for_test(),
+        "inverse resolution must not return to persisted definition-candidate SQL after build"
     );
 }
 
