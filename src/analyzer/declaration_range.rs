@@ -39,6 +39,20 @@ impl DeclarationNameRangeContext {
         self.name_ranges(analyzer, code_unit).into_iter().next()
     }
 
+    pub(crate) fn name_range_for_declaration(
+        &self,
+        code_unit: &CodeUnit,
+        declaration_range: Range,
+    ) -> Option<Range> {
+        let root = self.root_node()?;
+        code_unit_declaration_name_range_for_range(
+            &self.content,
+            root,
+            code_unit,
+            declaration_range,
+        )
+    }
+
     pub(crate) fn name_ranges(&self, analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<Range> {
         let Some(root) = self.root_node() else {
             return Vec::new();

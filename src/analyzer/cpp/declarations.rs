@@ -901,10 +901,14 @@ impl<'a> CppVisitor<'a> {
         }
         if has_body {
             if let Some(range) = explicit_range {
-                self.parsed
-                    .replace_code_unit_with_range(code_unit.clone(), range, None, None);
+                self.parsed.replace_code_unit_with_range_preserving_ranges(
+                    code_unit.clone(),
+                    range,
+                    None,
+                    None,
+                );
             } else {
-                self.parsed.replace_code_unit(
+                self.parsed.replace_code_unit_preserving_ranges(
                     code_unit.clone(),
                     declaration_node,
                     self.source,
@@ -1103,8 +1107,13 @@ impl<'a> CppVisitor<'a> {
             return;
         };
         let code_unit = function.code_unit(self.file.clone());
-        self.parsed
-            .replace_code_unit(code_unit.clone(), node, self.source, None, None);
+        self.parsed.replace_code_unit_preserving_ranges(
+            code_unit.clone(),
+            node,
+            self.source,
+            None,
+            None,
+        );
         let signature = render_cpp_function_display_signature_from_node(
             node,
             self.source,

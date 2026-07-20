@@ -15552,6 +15552,36 @@ fn cpp_navigation_distinguishes_header_declaration_and_source_definition() {
 }
 
 #[test]
+fn cpp_navigation_distinguishes_same_file_declaration_and_definition_ranges() {
+    let source = "void run();\nvoid run() {}\nvoid invoke() { run(); }\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+    let call = source.rfind("run").expect("function call");
+    let args = location_reference("app.cpp", source, call);
+
+    let declaration = lookup_declaration(project.root(), &args);
+    assert_eq!(
+        declaration["results"][0]["status"], "resolved",
+        "{declaration}"
+    );
+    assert_eq!(
+        declaration["results"][0]["declarations"][0]["start_line"], 1,
+        "{declaration}"
+    );
+
+    let definition = lookup(project.root(), &args);
+    assert_eq!(
+        definition["results"][0]["status"], "resolved",
+        "{definition}"
+    );
+    assert_eq!(
+        definition["results"][0]["definitions"][0]["start_line"], 2,
+        "{definition}"
+    );
+}
+
+#[test]
 fn cpp_definition_navigation_keeps_multiple_bodies_ambiguous() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file("service.h", "void run();\n")
@@ -15578,6 +15608,31 @@ fn cpp_definition_navigation_keeps_multiple_bodies_ambiguous() {
             .is_some_and(|diagnostics| diagnostics
                 .iter()
                 .any(|diagnostic| { diagnostic["kind"] == "unproven_cpp_link_unit" })),
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_definition_navigation_keeps_same_file_bodies_ambiguous() {
+    let source = "void run() {}\nvoid run() {}\nvoid invoke() { run(); }\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+    let call = source.rfind("run").expect("function call");
+    let value = lookup(project.root(), &location_reference("app.cpp", source, call));
+
+    assert_eq!(value["results"][0]["status"], "ambiguous", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"].as_array().map(Vec::len),
+        Some(2),
+        "{value}"
+    );
+    assert!(
+        value["results"][0]["diagnostics"]
+            .as_array()
+            .is_some_and(|diagnostics| diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic["kind"] == "unproven_cpp_link_unit")),
         "{value}"
     );
 }

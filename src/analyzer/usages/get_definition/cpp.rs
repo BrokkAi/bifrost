@@ -16,6 +16,56 @@ enum CppNavigationKind {
     Unknown,
 }
 
+pub(super) fn navigation_targets(
+    analyzer: &dyn IAnalyzer,
+    context: &mut DefinitionBatchContext<'_>,
+    candidates: &[CodeUnit],
+    operation: NavigationOperation,
+) -> Vec<NavigationTarget> {
+    let mut classified = Vec::new();
+    for candidate in candidates {
+        let Some(tree) = context.cpp_indexed_tree(candidate.source()) else {
+            if operation == NavigationOperation::Declaration {
+                classified.push((candidate.clone(), None, CppNavigationKind::Unknown));
+            }
+            continue;
+        };
+        let root = tree.root_node();
+        let ranges = analyzer.ranges(candidate);
+        if ranges.is_empty() && !candidate.is_callable() && !candidate.is_class() {
+            classified.push((candidate.clone(), None, CppNavigationKind::Both));
+            continue;
+        }
+        classified.extend(ranges.iter().copied().map(|range| {
+            let kind = cpp_navigation_kind_for_range(root, candidate, &range);
+            (candidate.clone(), Some(range), kind)
+        }));
+    }
+    let has_declaration_only = classified
+        .iter()
+        .any(|(_, _, kind)| *kind == CppNavigationKind::DeclarationOnly);
+    classified
+        .into_iter()
+        .filter(|(_, _, kind)| match operation {
+            NavigationOperation::Declaration => {
+                if has_declaration_only {
+                    *kind == CppNavigationKind::DeclarationOnly
+                } else {
+                    true
+                }
+            }
+            NavigationOperation::Definition => matches!(
+                *kind,
+                CppNavigationKind::Definition | CppNavigationKind::Both
+            ),
+        })
+        .map(|(code_unit, declaration_range, _)| NavigationTarget {
+            code_unit,
+            declaration_range,
+        })
+        .collect()
+}
+
 pub(super) fn select_navigation_outcome(
     analyzer: &dyn IAnalyzer,
     context: &mut DefinitionBatchContext<'_>,
@@ -111,42 +161,58 @@ fn cpp_navigation_kind(
     let mut has_split_declaration = false;
     let mut has_definition = false;
     for range in ranges {
-        let Some(node) = cpp_declaration_node_for_range(root, &range) else {
-            continue;
-        };
-        if candidate.is_callable() {
-            if cpp_subtree_contains(node, |descendant| {
-                descendant.kind() == "function_definition"
-                    && descendant.child_by_field_name("body").is_some()
-            }) {
-                has_definition = true;
-            } else {
-                has_split_declaration = true;
-            }
-        } else if cpp_subtree_contains(node, |descendant| {
-            matches!(
-                descendant.kind(),
-                "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
-            )
-        }) {
-            if cpp_subtree_contains(node, |descendant| {
-                matches!(
-                    descendant.kind(),
-                    "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
-                ) && descendant.child_by_field_name("body").is_some()
-            }) {
-                has_definition = true;
-            } else {
-                has_split_declaration = true;
-            }
-        } else {
-            return CppNavigationKind::Both;
+        match cpp_navigation_kind_for_range(root, candidate, &range) {
+            CppNavigationKind::DeclarationOnly => has_split_declaration = true,
+            CppNavigationKind::Definition => has_definition = true,
+            CppNavigationKind::Both => return CppNavigationKind::Both,
+            CppNavigationKind::Unknown => {}
         }
     }
     match (has_split_declaration, has_definition) {
         (true, false) => CppNavigationKind::DeclarationOnly,
         (false, true) | (true, true) => CppNavigationKind::Definition,
         (false, false) => CppNavigationKind::Unknown,
+    }
+}
+
+fn cpp_navigation_kind_for_range(
+    root: Node<'_>,
+    candidate: &CodeUnit,
+    range: &Range,
+) -> CppNavigationKind {
+    if !candidate.is_callable() && !candidate.is_class() {
+        return CppNavigationKind::Both;
+    }
+    let Some(node) = cpp_declaration_node_for_range(root, range) else {
+        return CppNavigationKind::Unknown;
+    };
+    if candidate.is_callable() {
+        return if cpp_subtree_contains(node, |descendant| {
+            descendant.kind() == "function_definition"
+                && descendant.child_by_field_name("body").is_some()
+        }) {
+            CppNavigationKind::Definition
+        } else {
+            CppNavigationKind::DeclarationOnly
+        };
+    }
+    if !cpp_subtree_contains(node, |descendant| {
+        matches!(
+            descendant.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+        )
+    }) {
+        return CppNavigationKind::Both;
+    }
+    if cpp_subtree_contains(node, |descendant| {
+        matches!(
+            descendant.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+        ) && descendant.child_by_field_name("body").is_some()
+    }) {
+        CppNavigationKind::Definition
+    } else {
+        CppNavigationKind::DeclarationOnly
     }
 }
 

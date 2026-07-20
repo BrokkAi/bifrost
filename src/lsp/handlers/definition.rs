@@ -1,9 +1,9 @@
 use lsp_types::{GotoDefinitionParams, GotoDefinitionResponse, Location};
 
-use crate::analyzer::{Project, Range as ByteRange, WorkspaceAnalyzer};
+use crate::analyzer::{Project, WorkspaceAnalyzer};
 use crate::lsp::conversion::byte_range_to_lsp_range;
 use crate::lsp::handlers::broad_symbol::navigation_target_at_position;
-use crate::lsp::handlers::util::code_unit_location;
+use crate::lsp::handlers::util::navigation_target_location;
 use crate::navigation::NavigationOperation;
 
 /// Resolve `textDocument/definition`. Strategy:
@@ -34,26 +34,9 @@ pub fn handle(
             range,
         }]));
     }
-    if target.declaration_site {
-        let range = byte_range_to_lsp_range(
-            &target.content,
-            &target.line_starts,
-            &ByteRange {
-                start_byte: target.start_byte,
-                end_byte: target.end_byte,
-                start_line: 0,
-                end_line: 0,
-            },
-        );
-        return Some(GotoDefinitionResponse::Array(vec![Location {
-            uri: uri.clone(),
-            range,
-        }]));
-    }
-
-    let mut locations = Vec::with_capacity(target.candidates.len());
-    for cu in target.candidates {
-        if let Some(loc) = code_unit_location(analyzer, project, &cu) {
+    let mut locations = Vec::with_capacity(target.navigation_targets.len());
+    for navigation_target in target.navigation_targets {
+        if let Some(loc) = navigation_target_location(analyzer, project, &navigation_target) {
             locations.push(loc);
         }
     }

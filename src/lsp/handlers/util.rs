@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::analyzer::common::{language_for_file, source_identifier_for_target};
-use crate::analyzer::declaration_range::code_unit_declaration_name_range;
+use crate::analyzer::declaration_range::{
+    DeclarationNameRangeContext, code_unit_declaration_name_range,
+};
+use crate::analyzer::usages::get_definition::NavigationTarget;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range as ByteRange};
 use crate::lsp::conversion::{byte_range_to_lsp_range, path_to_uri_string, uri_to_path};
 #[cfg(test)]
@@ -82,6 +85,32 @@ pub(super) fn code_unit_location(
     let body = project.read_source(code_unit.source()).ok()?;
     let line_starts = compute_line_starts(&body);
     code_unit_location_from_content(analyzer, code_unit.source(), &body, &line_starts, code_unit)
+}
+
+pub(super) fn navigation_target_location(
+    analyzer: &dyn IAnalyzer,
+    project: &dyn Project,
+    target: &NavigationTarget,
+) -> Option<Location> {
+    let Some(declaration_range) = target.declaration_range else {
+        return code_unit_location(analyzer, project, &target.code_unit);
+    };
+    let file = target.code_unit.source();
+    let body = project.read_source(file).ok()?;
+    let line_starts = compute_line_starts(&body);
+    let context = DeclarationNameRangeContext::new(file, body.clone());
+    let lsp_range = context
+        .name_range_for_declaration(&target.code_unit, declaration_range)
+        .map(|range| byte_range_to_lsp_range(&body, &line_starts, &range))
+        .or_else(|| {
+            identifier_selection_range(&target.code_unit, &body, &line_starts, &declaration_range)
+        })
+        .unwrap_or_else(|| byte_range_to_lsp_range(&body, &line_starts, &declaration_range));
+    let uri: Uri = path_to_uri_string(&file.abs_path()).parse().ok()?;
+    Some(Location {
+        uri,
+        range: lsp_range,
+    })
 }
 
 pub(super) fn code_unit_location_from_content(

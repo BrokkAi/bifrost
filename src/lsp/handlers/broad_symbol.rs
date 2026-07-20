@@ -5,8 +5,9 @@ use lsp_types::{Position, Uri};
 use crate::analyzer::declaration_range::code_unit_declaration_name_range;
 use crate::analyzer::lexical_definitions::LexicalDefinition;
 use crate::analyzer::usages::get_definition::{
-    DefinitionLookupRequest, DefinitionLookupStatus, navigation_declaration_site_target,
-    resolve_definition_batch_with_source, resolve_navigation_batch_with_source,
+    DefinitionLookupRequest, DefinitionLookupStatus, NavigationTarget,
+    navigation_declaration_site_targets, resolve_definition_batch_with_source,
+    resolve_navigation_batch_with_source,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Project, ProjectFile, Range as ByteRange};
 use crate::lsp::conversion::position_to_byte_offset;
@@ -20,8 +21,8 @@ pub(super) struct BroadSymbolTarget {
     pub(super) line_starts: Vec<usize>,
     pub(super) start_byte: usize,
     pub(super) end_byte: usize,
-    pub(super) declaration_site: bool,
     pub(super) candidates: Vec<CodeUnit>,
+    pub(super) navigation_targets: Vec<NavigationTarget>,
     pub(super) lexical_definition: Option<LexicalDefinition>,
 }
 
@@ -74,11 +75,10 @@ fn symbol_target_at_position(
     };
     let declaration =
         selected_code_unit_declaration_at_cursor(analyzer, &file, &content, &selected, |_| true);
-    let (candidates, lexical_definition, declaration_site) = match resolution {
+    let (candidates, navigation_targets, lexical_definition) = match resolution {
         TargetResolution::Broad => {
-            let declaration_site = declaration.is_some();
             let target = declaration
-                .map(|declaration| (vec![declaration], None))
+                .map(|declaration| (vec![declaration], Vec::new(), None))
                 .or_else(|| {
                     reject_ambiguous_import(analyzer, &file, &content, start_byte, end_byte)?;
                     resolved_target(
@@ -90,7 +90,7 @@ fn symbol_target_at_position(
                         resolution,
                     )
                 })?;
-            (target.0, target.1, declaration_site)
+            target
         }
         TargetResolution::Navigation(operation) => {
             reject_ambiguous_import(analyzer, &file, &content, start_byte, end_byte)?;
@@ -102,16 +102,21 @@ fn symbol_target_at_position(
                 end_byte,
                 resolution,
             ) {
-                Some((candidates, lexical_definition)) => (candidates, lexical_definition, false),
-                None => (
-                    vec![navigation_declaration_site_target(
-                        analyzer,
-                        declaration?,
-                        operation,
-                    )?],
-                    None,
-                    true,
-                ),
+                Some((candidates, navigation_targets, lexical_definition)) => {
+                    (candidates, navigation_targets, lexical_definition)
+                }
+                None => {
+                    let navigation_targets =
+                        navigation_declaration_site_targets(analyzer, declaration?, operation);
+                    if navigation_targets.is_empty() {
+                        return None;
+                    }
+                    let candidates = navigation_targets
+                        .iter()
+                        .map(|target| target.code_unit.clone())
+                        .collect();
+                    (candidates, navigation_targets, None)
+                }
             }
         }
     };
@@ -122,8 +127,8 @@ fn symbol_target_at_position(
         line_starts,
         start_byte,
         end_byte,
-        declaration_site,
         candidates,
+        navigation_targets,
         lexical_definition,
     })
 }
@@ -194,7 +199,11 @@ fn resolved_target(
     start_byte: usize,
     end_byte: usize,
     resolution: TargetResolution,
-) -> Option<(Vec<CodeUnit>, Option<LexicalDefinition>)> {
+) -> Option<(
+    Vec<CodeUnit>,
+    Vec<NavigationTarget>,
+    Option<LexicalDefinition>,
+)> {
     let requests = vec![DefinitionLookupRequest {
         file: file.clone(),
         line: None,
@@ -202,25 +211,44 @@ fn resolved_target(
         start_byte: Some(start_byte),
         end_byte: Some(end_byte),
     }];
-    let outcomes = match resolution {
+    match resolution {
         TargetResolution::Broad => {
-            resolve_definition_batch_with_source(analyzer, requests, file.clone(), content)
+            let outcome =
+                resolve_definition_batch_with_source(analyzer, requests, file.clone(), content)
+                    .into_iter()
+                    .next()?;
+            if !matches!(
+                outcome.status,
+                DefinitionLookupStatus::Resolved | DefinitionLookupStatus::Ambiguous
+            ) || (outcome.definitions.is_empty() && outcome.lexical_definition.is_none())
+            {
+                return None;
+            }
+            Some((outcome.definitions, Vec::new(), outcome.lexical_definition))
         }
-        TargetResolution::Navigation(operation) => resolve_navigation_batch_with_source(
-            analyzer,
-            requests,
-            file.clone(),
-            content,
-            operation,
-        ),
-    };
-    let outcome = outcomes.into_iter().next()?;
-    if !matches!(
-        outcome.status,
-        DefinitionLookupStatus::Resolved | DefinitionLookupStatus::Ambiguous
-    ) || (outcome.definitions.is_empty() && outcome.lexical_definition.is_none())
-    {
-        return None;
+        TargetResolution::Navigation(operation) => {
+            let outcome = resolve_navigation_batch_with_source(
+                analyzer,
+                requests,
+                file.clone(),
+                content,
+                operation,
+            )
+            .into_iter()
+            .next()?;
+            if !matches!(
+                outcome.status,
+                DefinitionLookupStatus::Resolved | DefinitionLookupStatus::Ambiguous
+            ) || (outcome.targets.is_empty() && outcome.lexical_definition.is_none())
+            {
+                return None;
+            }
+            let candidates = outcome
+                .targets
+                .iter()
+                .map(|target| target.code_unit.clone())
+                .collect();
+            Some((candidates, outcome.targets, outcome.lexical_definition))
+        }
     }
-    Some((outcome.definitions, outcome.lexical_definition))
 }

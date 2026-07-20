@@ -204,6 +204,21 @@ pub(crate) struct DefinitionLookupOutcome {
     pub(crate) diagnostics: Vec<DefinitionLookupDiagnostic>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NavigationTarget {
+    pub(crate) code_unit: CodeUnit,
+    pub(crate) declaration_range: Option<Range>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NavigationLookupOutcome {
+    pub(crate) status: DefinitionLookupStatus,
+    pub(crate) reference: Option<ResolvedReferenceSite>,
+    pub(crate) targets: Vec<NavigationTarget>,
+    pub(crate) lexical_definition: Option<LexicalDefinition>,
+    pub(crate) diagnostics: Vec<DefinitionLookupDiagnostic>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DefinitionLookupStatus {
     Resolved,
@@ -251,7 +266,7 @@ pub(crate) fn resolve_navigation_batch(
     analyzer: &dyn IAnalyzer,
     requests: Vec<DefinitionLookupRequest>,
     operation: NavigationOperation,
-) -> Vec<DefinitionLookupOutcome> {
+) -> Vec<NavigationLookupOutcome> {
     let _scope = profiling::scope("get_definition::resolve_navigation_batch");
     if profiling::enabled() {
         profiling::note(format!(
@@ -260,7 +275,27 @@ pub(crate) fn resolve_navigation_batch(
         ));
     }
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
-    resolve_definition_requests(analyzer, &mut context, requests, None, Some(operation))
+    resolve_navigation_requests(analyzer, &mut context, requests, operation)
+}
+
+fn resolve_navigation_requests(
+    analyzer: &dyn IAnalyzer,
+    context: &mut DefinitionBatchContext<'_>,
+    requests: Vec<DefinitionLookupRequest>,
+    operation: NavigationOperation,
+) -> Vec<NavigationLookupOutcome> {
+    let languages: Vec<_> = requests
+        .iter()
+        .map(|request| language_for_file(&request.file))
+        .collect();
+    let outcomes = resolve_definition_requests(analyzer, context, requests, None, Some(operation));
+    languages
+        .into_iter()
+        .zip(outcomes)
+        .map(|(language, outcome)| {
+            navigation_lookup_outcome(analyzer, context, outcome, language, operation)
+        })
+        .collect()
 }
 
 fn resolve_definition_requests(
@@ -315,19 +350,22 @@ pub(crate) fn resolve_navigation_batch_with_source(
     file: ProjectFile,
     source: Arc<String>,
     operation: NavigationOperation,
-) -> Vec<DefinitionLookupOutcome> {
+) -> Vec<NavigationLookupOutcome> {
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
     context.sources.insert(file, Ok(source));
-    resolve_definition_requests(analyzer, &mut context, requests, None, Some(operation))
+    resolve_navigation_requests(analyzer, &mut context, requests, operation)
 }
 
-pub(crate) fn navigation_declaration_site_target(
+pub(crate) fn navigation_declaration_site_targets(
     analyzer: &dyn IAnalyzer,
     candidate: CodeUnit,
     operation: NavigationOperation,
-) -> Option<CodeUnit> {
+) -> Vec<NavigationTarget> {
     if language_for_file(candidate.source()) != Language::Cpp {
-        return Some(candidate);
+        return vec![NavigationTarget {
+            code_unit: candidate,
+            declaration_range: None,
+        }];
     }
     let mut context = DefinitionBatchContext::new(analyzer, false);
     let outcome = cpp::select_navigation_outcome(
@@ -336,10 +374,8 @@ pub(crate) fn navigation_declaration_site_target(
         candidates_outcome(vec![candidate]),
         operation,
     );
-    finalize_navigation_outcome(outcome, operation)
-        .definitions
-        .into_iter()
-        .next()
+    let outcome = finalize_navigation_outcome(outcome, operation);
+    cpp::navigation_targets(analyzer, &mut context, &outcome.definitions, operation)
 }
 
 pub(crate) fn resolve_definition_batch_with_source_and_cancellation(
@@ -1031,6 +1067,80 @@ fn finalize_navigation_outcome(
         });
     }
     outcome
+}
+
+fn navigation_lookup_outcome(
+    analyzer: &dyn IAnalyzer,
+    context: &mut DefinitionBatchContext<'_>,
+    outcome: DefinitionLookupOutcome,
+    language: Language,
+    operation: NavigationOperation,
+) -> NavigationLookupOutcome {
+    let DefinitionLookupOutcome {
+        mut status,
+        reference,
+        definitions,
+        lexical_definition,
+        mut diagnostics,
+    } = outcome;
+    let mut targets = if language == Language::Cpp {
+        cpp::navigation_targets(analyzer, context, &definitions, operation)
+    } else {
+        definitions
+            .into_iter()
+            .map(|code_unit| NavigationTarget {
+                code_unit,
+                declaration_range: None,
+            })
+            .collect()
+    };
+    targets.sort_by(|left, right| {
+        (&left.code_unit, left.declaration_range).cmp(&(&right.code_unit, right.declaration_range))
+    });
+    targets.dedup();
+
+    if lexical_definition.is_some() {
+        status = DefinitionLookupStatus::Resolved;
+    } else if !targets.is_empty() {
+        status = if targets.len() == 1 {
+            DefinitionLookupStatus::Resolved
+        } else {
+            DefinitionLookupStatus::Ambiguous
+        };
+        diagnostics.retain(|diagnostic| diagnostic.kind != "ambiguous_definition");
+        if status == DefinitionLookupStatus::Ambiguous {
+            diagnostics.push(DefinitionLookupDiagnostic {
+                kind: "ambiguous_definition".to_string(),
+                message: format!(
+                    "{} navigation resolved to multiple workspace targets",
+                    match operation {
+                        NavigationOperation::Declaration => "declaration",
+                        NavigationOperation::Definition => "definition",
+                    }
+                ),
+            });
+        }
+    }
+
+    if language == Language::Cpp && operation == NavigationOperation::Definition {
+        diagnostics.retain(|diagnostic| diagnostic.kind != cpp::CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC);
+        if targets.len() > 1 {
+            diagnostics.push(DefinitionLookupDiagnostic {
+                kind: cpp::CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC.to_string(),
+                message:
+                    "multiple C/C++ definition bodies remain, but no build graph proves one link unit"
+                        .to_string(),
+            });
+        }
+    }
+
+    NavigationLookupOutcome {
+        status,
+        reference,
+        targets,
+        lexical_definition,
+        diagnostics,
+    }
 }
 
 fn ambiguous_candidates_outcome(

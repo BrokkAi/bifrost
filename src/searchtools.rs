@@ -1937,7 +1937,7 @@ fn render_definition_lookup(
     analyzer: &dyn IAnalyzer,
     query: DefinitionReferenceQuery,
     file: &ProjectFile,
-    outcome: crate::analyzer::usages::get_definition::DefinitionLookupOutcome,
+    outcome: crate::analyzer::usages::get_definition::NavigationLookupOutcome,
     operation: NavigationOperation,
     render_cache: &mut DefinitionCandidateRenderCache,
 ) -> DefinitionLookupResult {
@@ -1950,7 +1950,7 @@ fn render_definition_lookup(
         outcome.status.as_str().to_string()
     };
     let mut definitions =
-        definition_candidates_with_cache(analyzer, &outcome.definitions, render_cache);
+        navigation_candidates_with_cache(analyzer, &outcome.targets, render_cache);
     if let Some(definition) = outcome.lexical_definition.as_ref()
         && let Some(candidate) = lexical_definition_candidate(analyzer, file, definition)
     {
@@ -2056,6 +2056,28 @@ impl DefinitionCandidateRenderCache {
             .as_ref()
             .and_then(|context| context.name_range(analyzer, unit));
         display_range_with_declaration_name(analyzer, unit, name_range)
+    }
+
+    fn navigation_display_range(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        target: &crate::analyzer::usages::get_definition::NavigationTarget,
+    ) -> Option<Range> {
+        let Some(declaration_range) = target.declaration_range else {
+            return self.display_range(analyzer, &target.code_unit);
+        };
+        let context = self
+            .contexts
+            .entry(target.code_unit.source().clone())
+            .or_insert_with(|| load_declaration_name_context(analyzer, target.code_unit.source()));
+        if let Some(mut name_range) = context.as_ref().and_then(|context| {
+            context.name_range_for_declaration(&target.code_unit, declaration_range)
+        }) {
+            name_range.start_line += 1;
+            name_range.end_line += 1;
+            return Some(name_range);
+        }
+        Some(declaration_range)
     }
 }
 
@@ -2173,24 +2195,22 @@ fn definition_candidates(analyzer: &dyn IAnalyzer, units: &[CodeUnit]) -> Vec<De
         .collect()
 }
 
-fn definition_candidates_with_cache(
+fn navigation_candidates_with_cache(
     analyzer: &dyn IAnalyzer,
-    units: &[CodeUnit],
+    targets: &[crate::analyzer::usages::get_definition::NavigationTarget],
     render_cache: &mut DefinitionCandidateRenderCache,
 ) -> Vec<DefinitionCandidate> {
-    units
+    targets
         .iter()
-        .filter_map(|unit| definition_candidate_with_cache(analyzer, unit, render_cache))
+        .filter_map(|target| {
+            let range = render_cache.navigation_display_range(analyzer, target)?;
+            Some(definition_candidate_from_range(
+                analyzer,
+                &target.code_unit,
+                range,
+            ))
+        })
         .collect()
-}
-
-fn definition_candidate_with_cache(
-    analyzer: &dyn IAnalyzer,
-    unit: &CodeUnit,
-    render_cache: &mut DefinitionCandidateRenderCache,
-) -> Option<DefinitionCandidate> {
-    let range = render_cache.display_range(analyzer, unit)?;
-    Some(definition_candidate_from_range(analyzer, unit, range))
 }
 
 fn definition_candidate(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<DefinitionCandidate> {

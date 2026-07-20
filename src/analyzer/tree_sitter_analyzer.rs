@@ -983,6 +983,24 @@ impl ParsedFile {
         self.add_code_unit(code_unit, node, source, parent, top_level);
     }
 
+    pub fn replace_code_unit_preserving_ranges(
+        &mut self,
+        code_unit: CodeUnit,
+        node: Node<'_>,
+        source: &str,
+        parent: Option<CodeUnit>,
+        top_level: Option<CodeUnit>,
+    ) {
+        let previous_ranges = self.ranges.get(&code_unit).cloned().unwrap_or_default();
+        self.replace_code_unit(code_unit.clone(), node, source, parent, top_level);
+        let ranges = self.ranges.entry(code_unit).or_default();
+        for range in previous_ranges {
+            if !ranges.contains(&range) {
+                ranges.push(range);
+            }
+        }
+    }
+
     pub fn replace_code_unit_with_range(
         &mut self,
         code_unit: CodeUnit,
@@ -992,6 +1010,23 @@ impl ParsedFile {
     ) {
         self.remove_code_unit(&code_unit);
         self.add_code_unit_with_range(code_unit, range, parent, top_level);
+    }
+
+    pub fn replace_code_unit_with_range_preserving_ranges(
+        &mut self,
+        code_unit: CodeUnit,
+        range: Range,
+        parent: Option<CodeUnit>,
+        top_level: Option<CodeUnit>,
+    ) {
+        let previous_ranges = self.ranges.get(&code_unit).cloned().unwrap_or_default();
+        self.replace_code_unit_with_range(code_unit.clone(), range, parent, top_level);
+        let ranges = self.ranges.entry(code_unit).or_default();
+        for range in previous_ranges {
+            if !ranges.contains(&range) {
+                ranges.push(range);
+            }
+        }
     }
 
     pub(crate) fn declarations(&self) -> &HashSet<CodeUnit> {

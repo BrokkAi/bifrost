@@ -17,6 +17,9 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
 - [x] (2026-07-20 12:42Z) Advertised and dispatched LSP declaration navigation through the shared selector and extended the click-test harness with declaration operations.
 - [x] (2026-07-20 14:27Z) Ran the focused Rust suites, all 44 Python client tests, formatting, all-target/all-feature clippy, the complete all-feature Rust suite including doc tests, and `git diff --check`.
 - [x] (2026-07-20 14:27Z) Completed the five guided specialist reviews, addressed the high/medium findings within scope, reran affected tests and full gates, and recorded the one range-model follow-up below.
+- [x] (2026-07-20 15:32Z) Extended explicit navigation outcomes with physical declaration ranges so same-file C++ prototypes and bodies remain distinct without changing broad `CodeUnit` identity.
+- [ ] Synchronize the completed branch with current `origin/master`, rerun affected and full gates, and checkpoint the integrated state.
+- [ ] Run the named guided specialist review against the synchronized `master` merge base and present its findings index for interactive triage.
 
 ## Surprises & Discoveries
 
@@ -36,6 +39,8 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
   Evidence: Persistence, clangd parity, macro-arity, and usage-graph tests initially expected prototypes in `definitions`. Fixtures that intended body navigation now contain bodies; usage tests that intentionally target prototypes use declaration navigation; multi-target explicit navigation now asserts `ambiguous`.
 - Observation: Same-file C++ prototype/body pairs are collapsed by the current per-file `CodeUnit` replacement identity before navigation selection receives them.
   Evidence: Specialist review traced `replace_code_unit` and the range-only result model: the selector can separate header/source physical candidates, but cannot return different ranges for a prototype and body represented by one same-file `CodeUnit`.
+- Observation: The decisive information loss occurred when C++ indexing replaced a prototype `CodeUnit` with its body and deleted the prototype's previously indexed range.
+  Evidence: The initial range-aware navigation regression still selected line 2 for declaration navigation. Updating the two C++ body-replacement paths to preserve prior ranges made declaration select line 1 and definition select line 2 while retaining one semantic `CodeUnit`.
 
 ## Decision Log
 
@@ -63,6 +68,9 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
 - Decision: Defer same-file C++ prototype/body separation to a range-aware navigation-target or index-identity follow-up.
   Rationale: Fixing it here would require changing the analyzer's declaration identity or returning operation-specific ranges, a larger architectural change than the approved cross-file candidate selector. Header/source separation—the issue contract—is fully implemented.
   Date/Author: 2026-07-20 / Codex
+- Decision: Resolve the follow-up with a range-aware target type owned by explicit navigation, leaving `CodeUnit` identity and `DefinitionLookupOutcome` unchanged.
+  Rationale: The index already retains all declaration ranges. Carrying the selected physical range through MCP and LSP preserves broad resolver semantics, represents multiple same-file bodies, and avoids widening a navigation concern into analyzer identity, hover, references, rename, or call analysis.
+  Date/Author: 2026-07-20 / Codex
 
 ## Outcomes & Retrospective
 
@@ -74,7 +82,9 @@ Milestone 2 completed the public MCP and Python surface. MCP discovery, schema l
 
 Milestone 3 completed LSP support. Initialization advertises `declarationProvider`, both declaration and definition requests use the explicit analyzer selector, and the click harness covers Java, C++, and Rust distinctions. All 187 LSP server tests and 17 non-stress click-around tests pass; the C++ click contract also proves a prototype is not returned as its own definition.
 
-The guided review ran security, DevOps, duplication, architecture, and senior-engineering specialists. Security and DevOps reported no findings. Review fixes consolidated LSP target construction, reused shared C++ exact-range and Rust associated-type helpers, returned ambiguous LSP candidates instead of discarding them, made unknown C++ structure fail closed, narrowed stale ambiguity-diagnostic cleanup to C++, and extended C++ multi-body and wrong-arity coverage. The sole deferred finding is same-file C++ prototype/body range separation described above.
+The guided review ran security, DevOps, duplication, architecture, and senior-engineering specialists. Security and DevOps reported no findings. Review fixes consolidated LSP target construction, reused shared C++ exact-range and Rust associated-type helpers, returned ambiguous LSP candidates instead of discarding them, made unknown C++ structure fail closed, narrowed stale ambiguity-diagnostic cleanup to C++, and extended C++ multi-body and wrong-arity coverage. Its sole deferred finding was the same-file C++ prototype/body range separation now completed below.
+
+The architectural follow-up is now implemented. C++ definition replacement preserves earlier physical declaration ranges, while a new navigation-only target pairs the semantic `CodeUnit` with the exact range chosen from tree-sitter structure. MCP and LSP render the identifier within that range. Same-file prototype/body calls, prototype-to-body declaration-site navigation, and multiple same-file bodies are covered; the focused all-feature suites pass with 187 LSP server tests, 18 MCP tests, 525 analyzer tests, and 17 click tests plus 2 ignored stress tests.
 
 Final validation passed:
 
@@ -108,6 +118,8 @@ Third, extend MCP and Python surfaces. Add `get_declarations_by_location` with t
 Fourth, advertise `declarationProvider`, dispatch `textDocument/declaration`, and route both declaration and definition requests through one explicit LSP navigation handler. Add `ClickOperation::Declaration` and click-around cases for the same Java, C++, and Rust distinctions.
 
 Finally, run all validation commands, then perform the five guided specialist reviews over the complete branch diff. Consolidate findings, fix all critical/high findings and sound lower-severity findings within scope, rerun affected checks, and checkpoint the reviewed state.
+
+As an architectural follow-up, add a navigation-only target that pairs a `CodeUnit` with the exact indexed declaration range selected for the requested operation. Classify each C++ physical range from its tree-sitter node, prefer declaration-only ranges for declaration navigation, select body ranges for definition navigation, and recompute ambiguity from the physical targets. Teach MCP rendering and LSP locations to derive the identifier range within that selected declaration range. Do not change broad lookup outcomes or the persisted `CodeUnit` identity.
 
 ## Concrete Steps
 
@@ -178,3 +190,7 @@ Plan revision note (2026-07-20 12:41Z): Recorded the completed MCP/Python/docume
 Plan revision note (2026-07-20 12:42Z): Recorded the completed LSP milestone, including explicit declaration dispatch, operation-aware declaration-site fallback, and passing server/click-around evidence before checkpointing.
 
 Plan revision note (2026-07-20 14:27Z): Recorded the completed specialist review, fixes and deferred same-file range-model follow-up, compatibility updates to legacy C++ tests, coherent-toolchain validation commands, and final passing gates before the reviewed checkpoint commit.
+
+Plan revision note (2026-07-20 15:04Z): Reopened the plan for the requested architectural follow-up, chose a navigation-only physical-range target over a global index-identity change, and added synchronization plus guided-review milestones.
+
+Plan revision note (2026-07-20 15:32Z): Recorded the completed range-aware navigation milestone, the C++ replacement-range root cause, new same-file call/declaration-site/multi-body coverage, and passing focused all-feature suites before checkpointing.

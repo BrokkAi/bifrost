@@ -88,6 +88,10 @@ class App { void invoke(Runner runner) { runner.<java_call>run(); } }
             "app.cpp",
             "#include \"service.h\"\nvoid invoke(ns::Service& service) { service.<cpp_call>run(); }\n",
         )
+        .file(
+            "same_file.cpp",
+            "void <cpp_same_declaration>local();\nvoid <cpp_same_definition>local() {}\nvoid invoke_local() { <cpp_same_call>local(); }\n",
+        )
         .file("duplicate.h", "void duplicate();\n")
         .file(
             "duplicate_a.cpp",
@@ -132,6 +136,24 @@ type Selected = <LocalRustRunner as RustRunner>::<rust_qualified>Output;
                 ClickExpectation::Locations(&["cpp_definition"]),
             ),
             ClickCase::new(
+                "cpp same-file declaration uses prototype range",
+                "cpp_same_call",
+                ClickOperation::Declaration,
+                ClickExpectation::Locations(&["cpp_same_declaration"]),
+            ),
+            ClickCase::new(
+                "cpp same-file definition uses body range",
+                "cpp_same_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["cpp_same_definition"]),
+            ),
+            ClickCase::new(
+                "cpp same-file prototype navigates to body",
+                "cpp_same_declaration",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["cpp_same_definition"]),
+            ),
+            ClickCase::new(
                 "cpp prototype is not its own definition",
                 "cpp_declaration",
                 ClickOperation::Definition,
@@ -164,7 +186,7 @@ type Selected = <LocalRustRunner as RustRunner>::<rust_qualified>Output;
         ],
     );
 
-    assert_timing_summary("declaration_definition_navigation", &timings, 8);
+    assert_timing_summary("declaration_definition_navigation", &timings, 11);
 }
 
 #[test]
