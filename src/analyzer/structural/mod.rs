@@ -22,6 +22,7 @@
 
 pub(crate) mod adapter_helpers;
 pub(crate) mod capabilities;
+pub(crate) mod execution;
 pub mod extract;
 pub mod facts;
 pub mod kinds;

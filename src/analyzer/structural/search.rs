@@ -6,15 +6,22 @@
 //! `limit` matches with captures, enclosing symbols, and capability
 //! diagnostics.
 
+use super::execution::plan::{
+    LogicalQueryOperator, LogicalQueryPlan, PhysicalQueryNodeId, PhysicalQueryOperator,
+    PhysicalQueryPlan,
+};
+use super::execution::profile::{
+    QueryExecutionProfile, QueryOperatorDisposition, QueryOperatorProfile,
+};
 use super::facts::{FileFacts, Span};
 use super::kinds::{NormalizedKind, Role};
 use super::matcher::FactMatch;
 use super::planner::QueryPlan;
 use super::query::schema::{reference_kind_label, usage_proof_label};
 use super::query::{
-    CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery, CodeQueryPlan,
-    CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed, HierarchyTraversal, QueryStep,
-    ReferenceTraversalFilter, SetOperator,
+    CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
+    CodeQueryResultDetail, CodeQuerySeed, HierarchyTraversal, QueryStep, ReferenceTraversalFilter,
+    SetOperator,
 };
 use crate::analyzer::reference_candidates::{
     ReferenceCandidateRanges, reference_candidate_ranges, reference_candidate_ranges_cancellable,
@@ -50,6 +57,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Longest match/capture snippet reported inline; full content is always
 /// reachable via the returned line range.
@@ -1060,6 +1068,7 @@ pub(crate) struct DetailedCodeQueryResult {
     pub result: CodeQueryResult,
     pub work: CodeQueryExecutionWork,
     pub evidence: Vec<DetailedCodeQueryEvidence>,
+    pub profile: Option<QueryExecutionProfile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1211,12 +1220,16 @@ struct QueryExecutionState<'a> {
     reference_cache: ReferenceTraversalCache,
     call_cache: CallTraversalCache,
     import_graph: Option<DirectImportGraph>,
+    profile: Option<QueryExecutionProfile>,
 }
 
 struct PlanExecution {
     rows: Vec<PipelineRow>,
     truncated: bool,
     cancelled: bool,
+    /// An intermediate authored pipeline step exhausted its budget, so the
+    /// remaining steps in that same suffix must not run.
+    pipeline_halted: bool,
 }
 
 #[doc(hidden)]
@@ -1243,7 +1256,7 @@ pub(crate) fn execute_code_query_detailed(
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DetailedCodeQueryResult {
-    execute_internal(analyzer, query, limits, cancellation, None)
+    execute_internal(analyzer, query, limits, cancellation, None, false)
 }
 
 #[cfg(test)]
@@ -1258,6 +1271,7 @@ fn execute_with_receiver_budget_for_test(
         CodeQueryExecutionLimits::default(),
         None,
         Some(receiver_budget),
+        false,
     )
     .result
 }
@@ -1268,6 +1282,7 @@ fn execute_internal(
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
+    capture_profile: bool,
 ) -> DetailedCodeQueryResult {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return detailed_result_without_evidence(
@@ -1275,22 +1290,26 @@ fn execute_internal(
             CodeQueryExecutionBudget::default(),
         );
     }
-    if let Err(error) = query.validate_steps() {
-        return detailed_result_without_evidence(
-            CodeQueryResult {
-                results: Vec::new(),
-                truncated: false,
-                diagnostics: vec![CodeQueryDiagnostic {
-                    code: CodeQueryDiagnosticCode::InvalidPlan,
-                    impact: CodeQueryDiagnosticImpact::Invalid,
-                    branch: Vec::new(),
-                    language: "workspace",
-                    message: error.to_string(),
-                }],
-            },
-            CodeQueryExecutionBudget::default(),
-        );
-    }
+    let logical_plan = match LogicalQueryPlan::lower(query) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return detailed_result_without_evidence(
+                CodeQueryResult {
+                    results: Vec::new(),
+                    truncated: false,
+                    diagnostics: vec![CodeQueryDiagnostic {
+                        code: CodeQueryDiagnosticCode::InvalidPlan,
+                        impact: CodeQueryDiagnosticImpact::Invalid,
+                        branch: Vec::new(),
+                        language: "workspace",
+                        message: error.to_string(),
+                    }],
+                },
+                CodeQueryExecutionBudget::default(),
+            );
+        }
+    };
+    let physical_plan = PhysicalQueryPlan::select(logical_plan);
     let mut diagnostics = Vec::new();
     let mut state = QueryExecutionState {
         analyzer,
@@ -1302,27 +1321,20 @@ fn execute_internal(
         reference_cache: ReferenceTraversalCache::default(),
         call_cache: CallTraversalCache::default(),
         import_graph: None,
+        profile: capture_profile.then(|| QueryExecutionProfile::sequential(&physical_plan)),
     };
+    let mut profile_branch = state.profile.as_ref().map(|_| Vec::new());
     let mut execution = execute_plan(
-        &query.plan,
+        &physical_plan,
+        physical_plan.root(),
         &mut state,
         limits,
-        Some(query.limit.saturating_add(1)),
+        None,
         &mut diagnostics,
+        &mut profile_branch,
     );
-    let mut cancelled =
-        execution.cancelled || cancellation.is_some_and(CancellationToken::is_cancelled);
-    if cancelled {
-        execution.truncated = true;
-        push_cancelled_diagnostic(&mut diagnostics);
-    }
-
-    let terminal_truncated = execution.rows.len() > query.limit;
-    if terminal_truncated {
-        push_truncation_diagnostic(&mut diagnostics, &state.budget, query.limit);
-        execution.rows.truncate(query.limit);
-    }
-    let mut truncated = terminal_truncated || execution.truncated;
+    let mut cancelled = execution.cancelled;
+    let mut truncated = execution.truncated;
     // Preserve the pre-composition response shape for a plain structural
     // query. Set plans retain their seed-only traces because the branch path
     // is meaningful provenance even when no semantic step follows the set.
@@ -1377,14 +1389,17 @@ fn execute_internal(
             &mut render_cache,
         ));
     }
+    let work = execution_work(state.budget);
+    let profile = state.profile;
     let detailed = DetailedCodeQueryResult {
         result: CodeQueryResult {
             results,
             truncated: truncated || cancelled,
             diagnostics,
         },
-        work: execution_work(state.budget),
+        work,
         evidence,
+        profile,
     };
     detailed.assert_invariants();
     detailed
@@ -1392,6 +1407,16 @@ fn execute_internal(
 
 impl DetailedCodeQueryResult {
     fn assert_invariants(&self) {
+        if let Some(profile) = &self.profile {
+            assert!(
+                profile.peak_concurrency >= 1,
+                "an executed CodeQuery profile must observe at least one active operator"
+            );
+            assert!(
+                !profile.operators.is_empty(),
+                "an executed CodeQuery profile must contain operator observations"
+            );
+        }
         assert_eq!(
             self.result.results.len(),
             self.evidence.len(),
@@ -1529,6 +1554,7 @@ fn detailed_result_without_evidence(
         result,
         work: execution_work(budget),
         evidence: Vec::new(),
+        profile: None,
     };
     detailed.assert_invariants();
     detailed
@@ -2225,80 +2251,231 @@ fn canonical_ast_candidate(seed: &SeedMatch) -> Option<CodeQueryStableOwnerCandi
 }
 
 fn execute_plan(
-    plan: &CodeQueryPlan,
+    plan: &PhysicalQueryPlan,
+    node_id: PhysicalQueryNodeId,
     state: &mut QueryExecutionState<'_>,
     limits: CodeQueryExecutionLimits,
     terminal_cap: Option<usize>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    profile_branch: &mut Option<Vec<usize>>,
 ) -> PlanExecution {
-    if state
-        .cancellation
-        .is_some_and(CancellationToken::is_cancelled)
-    {
-        return PlanExecution {
-            rows: Vec::new(),
-            truncated: true,
-            cancelled: true,
-        };
-    }
+    let mut started = state.profile.as_ref().map(|_| Instant::now());
+    let physical_node = plan.node(node_id);
+    let physical_operator = physical_node.operator();
+    let logical_operator = plan.logical_node(node_id).operator();
+    let mut input_rows = 0;
+    let mut disposition = QueryOperatorDisposition::Completed;
+    let mut self_truncated = false;
 
-    let mut execution = match &plan.source {
-        CodeQueryPlanSource::Seed(seed) => execute_seed(
-            seed,
-            if plan.steps.is_empty() {
-                terminal_cap
+    let execution = match (physical_operator, logical_operator) {
+        (PhysicalQueryOperator::SeedScan, LogicalQueryOperator::Seed(seed)) => {
+            if state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                disposition = QueryOperatorDisposition::Skipped;
+                cancelled_plan_execution()
             } else {
-                None
-            },
-            state,
-            limits,
-            diagnostics,
-        ),
-        CodeQueryPlanSource::Set { op, branches } => {
-            let mut branch_rows = Vec::with_capacity(branches.len());
-            let mut truncated = false;
-            for (index, branch) in branches.iter().enumerate() {
-                let branch_limits =
-                    fair_branch_limits(&state.budget, limits, branches.len().saturating_sub(index));
-                let diagnostic_start = diagnostics.len();
-                let mut child = execute_plan(branch, state, branch_limits, None, diagnostics);
-                prefix_branch_rows(&mut child.rows, index);
-                prefix_branch_diagnostics(&mut diagnostics[diagnostic_start..], index);
-                truncated |= child.truncated;
-                if child.cancelled {
-                    return child;
+                let execution = execute_seed(seed, terminal_cap, state, limits, diagnostics);
+                self_truncated = execution.truncated;
+                if execution.cancelled {
+                    disposition = QueryOperatorDisposition::Cancelled;
                 }
-                branch_rows.push(child.rows);
-            }
-            PlanExecution {
-                rows: combine_set_rows(*op, branch_rows),
-                truncated,
-                cancelled: false,
+                execution
             }
         }
+        (
+            PhysicalQueryOperator::PipelineStep,
+            LogicalQueryOperator::Step {
+                step,
+                final_in_authored_suffix,
+                ..
+            },
+        ) => {
+            let dependency = physical_node.dependencies()[0];
+            let child = execute_plan(
+                plan,
+                dependency,
+                state,
+                limits,
+                None,
+                diagnostics,
+                profile_branch,
+            );
+            input_rows = child.rows.len();
+            if started.is_some() {
+                started = Some(Instant::now());
+            }
+            if child.cancelled {
+                disposition = QueryOperatorDisposition::Skipped;
+                child
+            } else if child.pipeline_halted {
+                disposition = QueryOperatorDisposition::Skipped;
+                PlanExecution {
+                    pipeline_halted: !final_in_authored_suffix,
+                    ..child
+                }
+            } else {
+                let mut stepped = apply_plan_step(
+                    step,
+                    *final_in_authored_suffix,
+                    child.rows,
+                    state,
+                    limits,
+                    terminal_cap,
+                    diagnostics,
+                );
+                self_truncated = stepped.truncated;
+                if stepped.cancelled {
+                    disposition = QueryOperatorDisposition::Cancelled;
+                }
+                stepped.truncated |= child.truncated;
+                stepped
+            }
+        }
+        (
+            PhysicalQueryOperator::SequentialUnion
+            | PhysicalQueryOperator::SequentialIntersection
+            | PhysicalQueryOperator::SequentialExcept,
+            LogicalQueryOperator::Set { op, .. },
+        ) => {
+            if state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                disposition = QueryOperatorDisposition::Skipped;
+                cancelled_plan_execution()
+            } else {
+                debug_assert_eq!(
+                    physical_operator,
+                    match op {
+                        SetOperator::Union => PhysicalQueryOperator::SequentialUnion,
+                        SetOperator::Intersect => PhysicalQueryOperator::SequentialIntersection,
+                        SetOperator::Except => PhysicalQueryOperator::SequentialExcept,
+                    }
+                );
+                let dependencies = physical_node.dependencies();
+                let mut branch_rows = Vec::with_capacity(dependencies.len());
+                let mut cancelled_child = None;
+                let mut truncated = false;
+                for (index, dependency) in dependencies.iter().copied().enumerate() {
+                    let branch_limits = fair_branch_limits(
+                        &state.budget,
+                        limits,
+                        dependencies.len().saturating_sub(index),
+                    );
+                    let diagnostic_start = diagnostics.len();
+                    if let Some(branch) = profile_branch.as_mut() {
+                        branch.push(index);
+                    }
+                    let mut child = execute_plan(
+                        plan,
+                        dependency,
+                        state,
+                        branch_limits,
+                        None,
+                        diagnostics,
+                        profile_branch,
+                    );
+                    if let Some(branch) = profile_branch.as_mut() {
+                        let popped = branch.pop();
+                        debug_assert_eq!(popped, Some(index));
+                    }
+                    input_rows = input_rows.saturating_add(child.rows.len());
+                    prefix_branch_rows(&mut child.rows, index);
+                    prefix_branch_diagnostics(&mut diagnostics[diagnostic_start..], index);
+                    truncated |= child.truncated;
+                    if child.cancelled {
+                        cancelled_child = Some(child);
+                        break;
+                    }
+                    branch_rows.push(child.rows);
+                }
+                if started.is_some() {
+                    started = Some(Instant::now());
+                }
+                if let Some(child) = cancelled_child {
+                    disposition = QueryOperatorDisposition::Skipped;
+                    child
+                } else {
+                    let mut rows = combine_set_rows(*op, branch_rows);
+                    if let Some(cap) = terminal_cap
+                        && rows.len() > cap
+                    {
+                        self_truncated = true;
+                        rows.truncate(cap);
+                    }
+                    PlanExecution {
+                        rows,
+                        truncated,
+                        cancelled: false,
+                        pipeline_halted: false,
+                    }
+                }
+            }
+        }
+        (PhysicalQueryOperator::Limit, LogicalQueryOperator::Limit { count, .. }) => {
+            let dependency = physical_node.dependencies()[0];
+            let mut child = execute_plan(
+                plan,
+                dependency,
+                state,
+                limits,
+                Some(count.saturating_add(1)),
+                diagnostics,
+                profile_branch,
+            );
+            input_rows = child.rows.len();
+            if started.is_some() {
+                started = Some(Instant::now());
+            }
+            let dependency_cancelled = child.cancelled;
+            let token_cancelled = state
+                .cancellation
+                .is_some_and(CancellationToken::is_cancelled);
+            if dependency_cancelled || token_cancelled {
+                if token_cancelled && !dependency_cancelled {
+                    disposition = QueryOperatorDisposition::Cancelled;
+                }
+                child.cancelled = true;
+                child.truncated = true;
+                push_cancelled_diagnostic(diagnostics);
+            }
+            if child.rows.len() > *count {
+                self_truncated = true;
+                push_truncation_diagnostic(diagnostics, &state.budget, *count);
+                child.rows.truncate(*count);
+                child.truncated = true;
+            }
+            child
+        }
+        _ => unreachable!("physical operator must implement its logical query node"),
     };
 
-    if execution.cancelled {
-        return execution;
-    }
-    if !plan.steps.is_empty() {
-        let (rows, truncated, cancelled) = apply_plan_steps(
-            &plan.steps,
-            execution.rows,
-            state,
-            limits,
-            terminal_cap,
-            diagnostics,
-        );
-        execution.rows = rows;
-        execution.truncated |= truncated;
-        execution.cancelled = cancelled;
-    } else if let Some(cap) = terminal_cap
-        && execution.rows.len() > cap
-    {
-        execution.rows.truncate(cap);
+    if let (Some(profile), Some(started)) = (&mut state.profile, started) {
+        profile.record(QueryOperatorProfile {
+            node: node_id,
+            branch: profile_branch.as_deref().unwrap_or_default().to_vec(),
+            operator: physical_operator,
+            disposition,
+            elapsed_ns: u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            input_rows,
+            output_rows: execution.rows.len(),
+            operator_truncated: self_truncated,
+            result_truncated: execution.truncated,
+            result_cancelled: execution.cancelled,
+        });
     }
     execution
+}
+
+fn cancelled_plan_execution() -> PlanExecution {
+    PlanExecution {
+        rows: Vec::new(),
+        truncated: true,
+        cancelled: true,
+        pipeline_halted: false,
+    }
 }
 
 fn execute_seed(
@@ -2328,6 +2505,7 @@ fn execute_seed(
             rows,
             truncated,
             cancelled: false,
+            pipeline_halted: false,
         };
     }
     if desired_rows == 0 {
@@ -2336,6 +2514,7 @@ fn execute_seed(
             rows: Vec::new(),
             truncated: true,
             cancelled: false,
+            pipeline_halted: false,
         };
     }
 
@@ -2358,6 +2537,7 @@ fn execute_seed(
                 rows: Vec::new(),
                 truncated: true,
                 cancelled: true,
+                pipeline_halted: false,
             };
         }
         let language = crate::analyzer::common::language_for_file(&file);
@@ -2436,6 +2616,7 @@ fn execute_seed(
                 rows: Vec::new(),
                 truncated: true,
                 cancelled: true,
+                pipeline_halted: false,
             };
         }
         let Some(source) = provider.structural_source(&file) else {
@@ -2531,6 +2712,7 @@ fn execute_seed(
         rows,
         truncated,
         cancelled: false,
+        pipeline_halted: false,
     }
 }
 
@@ -2552,107 +2734,121 @@ fn push_seed_provider_omission(
     });
 }
 
-fn apply_plan_steps(
-    steps: &[QueryStep],
-    mut rows: Vec<PipelineRow>,
+fn apply_plan_step(
+    step: &QueryStep,
+    final_in_authored_suffix: bool,
+    rows: Vec<PipelineRow>,
     state: &mut QueryExecutionState<'_>,
     limits: CodeQueryExecutionLimits,
     terminal_cap: Option<usize>,
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
-) -> (Vec<PipelineRow>, bool, bool) {
+) -> PlanExecution {
     let mut truncated = false;
-    for (step_index, step) in steps.iter().enumerate() {
-        if state
-            .cancellation
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            return (Vec::new(), true, true);
-        }
-        if !rows.is_empty() && matches!(step, QueryStep::ImportsOf | QueryStep::ImportersOf) {
-            let graph = state
-                .import_graph
-                .get_or_insert_with(|| DirectImportGraph::new(state.analyzer));
-            let graph_exhausted = if step == &QueryStep::ImportersOf {
-                ensure_complete_import_graph(
-                    state.analyzer,
-                    graph,
-                    limits.max_scanned_files,
-                    limits.max_pipeline_rows,
-                )
-            } else {
-                let mut frontier = rows
-                    .iter()
-                    .filter_map(|row| match &row.value {
-                        PipelineValue::File(file) => Some(file.clone()),
-                        PipelineValue::StructuralMatch(_)
-                        | PipelineValue::Declaration(_)
-                        | PipelineValue::ReferenceSite(_)
-                        | PipelineValue::CallSite(_)
-                        | PipelineValue::ExpressionSite(_)
-                        | PipelineValue::ReceiverAnalysis(_) => None,
-                    })
-                    .collect::<Vec<_>>();
-                frontier.sort_by_key(rel_path_string);
-                frontier.dedup();
-                ensure_forward_import_edges(
-                    state.analyzer,
-                    graph,
-                    &frontier,
-                    limits.max_scanned_files,
-                    limits.max_pipeline_rows,
-                )
-            };
-            if graph_exhausted {
-                truncated = true;
-                push_import_graph_budget_diagnostic(diagnostics, graph);
-            }
-        }
-        let last = step_index + 1 == steps.len();
-        let max_step_outputs = if last {
-            terminal_cap.unwrap_or(limits.max_pipeline_rows)
-        } else {
-            limits.max_pipeline_rows
+    if state
+        .cancellation
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        return PlanExecution {
+            rows: Vec::new(),
+            truncated: true,
+            cancelled: true,
+            pipeline_halted: false,
         };
-        let (next, exhausted, step_truncated) = apply_pipeline_step(
-            state.analyzer,
-            step,
-            rows,
-            state.import_graph.as_ref(),
-            Some(&mut state.indexed_declarations),
-            &mut state.reference_cache,
-            &mut state.call_cache,
-            &mut state.budget,
-            limits,
-            max_step_outputs,
-            state.cancellation,
-            diagnostics,
-            state.receiver_budget_override,
-        );
-        truncated |= step_truncated;
-        rows = next;
-        if state
-            .cancellation
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            // A partially produced row is usable only after the final step:
-            // before then its value belongs to an intermediate domain and
-            // cannot satisfy the query's validated terminal contract.
-            return (if last { rows } else { Vec::new() }, true, true);
-        }
-        if exhausted {
+    }
+    if !rows.is_empty() && matches!(step, QueryStep::ImportsOf | QueryStep::ImportersOf) {
+        let graph = state
+            .import_graph
+            .get_or_insert_with(|| DirectImportGraph::new(state.analyzer));
+        let graph_exhausted = if step == &QueryStep::ImportersOf {
+            ensure_complete_import_graph(
+                state.analyzer,
+                graph,
+                limits.max_scanned_files,
+                limits.max_pipeline_rows,
+            )
+        } else {
+            let mut frontier = rows
+                .iter()
+                .filter_map(|row| match &row.value {
+                    PipelineValue::File(file) => Some(file.clone()),
+                    PipelineValue::StructuralMatch(_)
+                    | PipelineValue::Declaration(_)
+                    | PipelineValue::ReferenceSite(_)
+                    | PipelineValue::CallSite(_)
+                    | PipelineValue::ExpressionSite(_)
+                    | PipelineValue::ReceiverAnalysis(_) => None,
+                })
+                .collect::<Vec<_>>();
+            frontier.sort_by_key(rel_path_string);
+            frontier.dedup();
+            ensure_forward_import_edges(
+                state.analyzer,
+                graph,
+                &frontier,
+                limits.max_scanned_files,
+                limits.max_pipeline_rows,
+            )
+        };
+        if graph_exhausted {
             truncated = true;
-            if state.budget.pipeline_rows >= limits.max_pipeline_rows
-                || state.budget.provenance_steps >= limits.max_pipeline_rows
-            {
-                push_pipeline_budget_diagnostic(diagnostics, &state.budget);
-            }
-            if !last {
-                rows.clear();
-            }
-            break;
+            push_import_graph_budget_diagnostic(diagnostics, graph);
         }
     }
-    (rows, truncated, false)
+    let max_step_outputs = if final_in_authored_suffix {
+        terminal_cap.unwrap_or(limits.max_pipeline_rows)
+    } else {
+        limits.max_pipeline_rows
+    };
+    let (mut rows, exhausted, step_truncated) = apply_pipeline_step(
+        state.analyzer,
+        step,
+        rows,
+        state.import_graph.as_ref(),
+        Some(&mut state.indexed_declarations),
+        &mut state.reference_cache,
+        &mut state.call_cache,
+        &mut state.budget,
+        limits,
+        max_step_outputs,
+        state.cancellation,
+        diagnostics,
+        state.receiver_budget_override,
+    );
+    truncated |= step_truncated;
+    if state
+        .cancellation
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        // A partially produced row is usable only after the final step:
+        // before then its value belongs to an intermediate domain and
+        // cannot satisfy the query's validated terminal contract.
+        if !final_in_authored_suffix {
+            rows.clear();
+        }
+        return PlanExecution {
+            rows,
+            truncated: true,
+            cancelled: true,
+            pipeline_halted: false,
+        };
+    }
+    if exhausted {
+        truncated = true;
+        if state.budget.pipeline_rows >= limits.max_pipeline_rows
+            || state.budget.provenance_steps >= limits.max_pipeline_rows
+        {
+            push_pipeline_budget_diagnostic(diagnostics, &state.budget);
+        }
+        if !final_in_authored_suffix {
+            rows.clear();
+        }
+    }
+    PlanExecution {
+        rows,
+        truncated,
+        cancelled: false,
+        pipeline_halted: exhausted && !final_in_authored_suffix,
+    }
 }
 
 fn fair_branch_limits(
@@ -7324,6 +7520,187 @@ mod tests {
     }
 
     #[test]
+    fn sequential_profile_replays_a_shared_seed_for_each_union_branch() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+            .write("export function shared() {}\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let branch = json!({ "match": { "kind": "function", "name": "shared" } });
+        let query = CodeQuery::from_json(&json!({
+            "union": [branch.clone(), branch],
+            "limit": 10
+        }))
+        .expect("query");
+
+        let detailed = execute_internal(
+            &analyzer,
+            &query,
+            CodeQueryExecutionLimits::default(),
+            None,
+            None,
+            true,
+        );
+
+        assert_eq!(detailed.result.results.len(), 1);
+        let profile = detailed
+            .profile
+            .expect("valid execution should be profiled");
+        assert_eq!(profile.peak_concurrency, 1);
+        assert_eq!(
+            profile
+                .operators
+                .iter()
+                .filter(|observation| {
+                    observation.operator == PhysicalQueryOperator::SequentialUnion
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            profile
+                .operators
+                .iter()
+                .filter(|observation| observation.operator == PhysicalQueryOperator::Limit)
+                .count(),
+            1
+        );
+        let seed_observations = profile
+            .operators
+            .iter()
+            .filter(|observation| observation.operator == PhysicalQueryOperator::SeedScan)
+            .collect::<Vec<_>>();
+        assert_eq!(seed_observations.len(), 2);
+        assert_eq!(seed_observations[0].node, seed_observations[1].node);
+        assert_eq!(seed_observations[0].branch, vec![0]);
+        assert_eq!(seed_observations[1].branch, vec![1]);
+        assert!(
+            seed_observations.iter().all(|observation| {
+                observation.disposition == QueryOperatorDisposition::Completed
+            })
+        );
+    }
+
+    #[test]
+    fn profile_attributes_root_limit_probe_to_the_limit_operator() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+            .write(
+                "function one() {}\nfunction two() {}\nfunction three() {}\nfunction four() {}\n",
+            )
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let branch = json!({ "match": { "kind": "function" } });
+        let query = CodeQuery::from_json(&json!({
+            "union": [branch.clone(), branch],
+            "limit": 2
+        }))
+        .expect("query");
+
+        let detailed = execute_internal(
+            &analyzer,
+            &query,
+            CodeQueryExecutionLimits::default(),
+            None,
+            None,
+            true,
+        );
+
+        assert_eq!(detailed.result.results.len(), 2);
+        assert!(detailed.result.truncated);
+        let profile = detailed.profile.expect("profile");
+        let limit = profile
+            .operators
+            .iter()
+            .find(|observation| observation.operator == PhysicalQueryOperator::Limit)
+            .expect("limit observation");
+        assert!(limit.branch.is_empty());
+        assert_eq!(limit.disposition, QueryOperatorDisposition::Completed);
+        assert_eq!(limit.input_rows, 3);
+        assert_eq!(limit.output_rows, 2);
+        assert!(limit.operator_truncated);
+        assert!(limit.result_truncated);
+        assert!(!limit.result_cancelled);
+        let union = profile
+            .operators
+            .iter()
+            .find(|observation| observation.operator == PhysicalQueryOperator::SequentialUnion)
+            .expect("union observation");
+        assert_eq!(union.input_rows, 8);
+        assert_eq!(union.output_rows, 3);
+        assert!(union.operator_truncated);
+        assert!(!union.result_truncated);
+    }
+
+    #[test]
+    fn skipped_set_profile_forwards_cancellation_safe_partial_cardinality() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+            .write(
+                "function one() { sink(); }\nfunction two() { sink(); }\nfunction three() { sink(); }\n",
+            )
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let branch = json!({
+            "match": { "kind": "call" },
+            "steps": [{ "op": "enclosing_decl" }]
+        });
+        let query = CodeQuery::from_json(&json!({
+            "union": [branch.clone(), branch]
+        }))
+        .expect("query");
+
+        let detailed = (2..256)
+            .find_map(|checks| {
+                let cancellation = CancellationToken::cancel_after_checks_for_test(checks);
+                let detailed = execute_internal(
+                    &analyzer,
+                    &query,
+                    CodeQueryExecutionLimits::default(),
+                    Some(&cancellation),
+                    None,
+                    true,
+                );
+                let profile = detailed.profile.as_ref()?;
+                let union = profile.operators.iter().find(|observation| {
+                    observation.operator == PhysicalQueryOperator::SequentialUnion
+                })?;
+                let limit = profile
+                    .operators
+                    .iter()
+                    .find(|observation| observation.operator == PhysicalQueryOperator::Limit)?;
+                (union.disposition == QueryOperatorDisposition::Skipped
+                    && union.output_rows > 0
+                    && union.output_rows == limit.input_rows)
+                    .then_some(detailed)
+            })
+            .expect("cancellation should interrupt a final branch step after a partial row");
+
+        let profile = detailed.profile.expect("profile");
+        let union = profile
+            .operators
+            .iter()
+            .find(|observation| observation.operator == PhysicalQueryOperator::SequentialUnion)
+            .expect("union observation");
+        let limit = profile
+            .operators
+            .iter()
+            .find(|observation| observation.operator == PhysicalQueryOperator::Limit)
+            .expect("limit observation");
+        assert_eq!(union.disposition, QueryOperatorDisposition::Skipped);
+        assert!(union.result_cancelled);
+        assert_eq!(union.output_rows, limit.input_rows);
+        assert!(limit.result_cancelled);
+        assert_eq!(detailed.result.completion(), CodeQueryCompletion::Cancelled);
+    }
+
+    #[test]
     fn detailed_execution_aligns_evidence_hashes_owners_and_direct_work() {
         let source = r#"export function handler(input: string) {
     sink(input);
@@ -7349,6 +7726,10 @@ mod tests {
         );
 
         assert_eq!(detailed.result.results.len(), 1);
+        assert!(
+            detailed.profile.is_none(),
+            "ordinary detailed execution should not pay profiling overhead"
+        );
         assert_eq!(detailed.evidence.len(), 1);
         let evidence = &detailed.evidence[0];
         assert_eq!(evidence.result_index, 0);
