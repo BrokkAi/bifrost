@@ -638,6 +638,11 @@ fn warm_multilanguage_cpp_include_query_is_candidate_bounded() {
         "target.h",
         "namespace ns { class Service { public: void run(); }; }\n",
     );
+    write_file(
+        root,
+        "target.cpp",
+        "#include \"target.h\"\nvoid ns::Service::run() {}\n",
+    );
     let caller = "#include \"target.h\"\nvoid handle(ns::Service service) { service.run(); }\n";
     write_file(root, "app.cpp", caller);
     write_file(root, "other.py", "def unrelated():\n    return 1\n");
@@ -718,10 +723,10 @@ fn warm_cpp_partial_specialization_dispatch_matches_cold_analysis() {
         "choice.h",
         r#"namespace persist {
 template <typename T, typename U = T*> class choice {
- public: int pick() const;
+ public: int pick() const { return 1; }
 };
 template <typename T> class choice<T, T*> {
- public: long pick() const;
+ public: long pick() const { return 2; }
 };
 }
 "#,

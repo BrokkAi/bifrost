@@ -114,7 +114,7 @@ fn declaration_source_identifier(code_unit: &CodeUnit) -> &str {
 /// nodes share that exact span, return the deepest one. The shallow wrapper
 /// often carries no `name` field, so returning it would defeat declaration-name
 /// resolution.
-fn node_for_exact_range<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
+pub(crate) fn node_for_exact_range<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
     let mut best: Option<Node<'tree>> = None;
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {

@@ -69,6 +69,7 @@ impl RustDefinitionProvider for AnalyzerRustDefinitionProvider<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_rust(
     analyzer: &dyn IAnalyzer,
     support: &dyn RustDefinitionProvider,
@@ -120,7 +121,7 @@ pub(super) fn resolve_rust(
     }
     if let Some(tree) = tree
         && let Some(outcome) = rust_impl_associated_type_declaration_outcome(
-            analyzer, support, file, source, tree, site, operation,
+            rust, support, file, source, tree, site, operation,
         )
     {
         return outcome;
@@ -553,7 +554,7 @@ fn rust_role_accepts_current_module(
 }
 
 fn rust_impl_associated_type_declaration_outcome(
-    analyzer: &dyn IAnalyzer,
+    rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -572,25 +573,13 @@ fn rust_impl_associated_type_declaration_outcome(
     }
     let impl_item = rust_enclosing_ancestor(type_item, "impl_item")?;
     if operation == Some(NavigationOperation::Definition) {
-        let mut candidates: Vec<_> = analyzer
-            .declarations(file)
-            .into_iter()
-            .filter(CodeUnit::is_field)
-            .filter(|candidate| candidate.identifier() == associated_type)
-            .filter(|candidate| {
-                analyzer.ranges(candidate).into_iter().any(|range| {
-                    range.start_byte == type_item.start_byte()
-                        && range.end_byte == type_item.end_byte()
-                })
-            })
-            .collect();
-        sort_units(&mut candidates);
-        candidates.dedup();
-        return (!candidates.is_empty()).then(|| candidates_outcome(candidates));
+        let candidate =
+            rust.rust_associated_type_declaration_for_exact_node(file, type_item, associated_type)?;
+        return Some(candidates_outcome(vec![candidate]));
     }
     let trait_type = impl_item.child_by_field_name("trait")?;
     let trait_fqn = rust_resolve_type_node_fqn(
-        analyzer,
+        rust,
         support,
         file,
         source,
@@ -610,6 +599,7 @@ fn rust_impl_associated_type_declaration_outcome(
     Some(candidates_outcome(candidates))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rust_qualified_associated_type_navigation_outcome(
     rust: &RustAnalyzer,
     analyzer: &dyn IAnalyzer,

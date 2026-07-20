@@ -1162,7 +1162,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None);
+        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None, None);
 
         assert!(outcomes.iter().all(|outcome| {
             outcome.status == DefinitionLookupStatus::Resolved
@@ -1198,7 +1198,7 @@ mod tests {
             })
             .collect();
 
-        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None);
+        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None, None);
 
         assert!(outcomes.iter().all(|outcome| {
             outcome.status == DefinitionLookupStatus::Resolved
@@ -1321,6 +1321,7 @@ mod tests {
                 end_byte: Some(start_byte + "run".len()),
             }],
             None,
+            None,
         );
 
         assert_eq!(outcomes[0].status, DefinitionLookupStatus::Resolved);
@@ -1375,7 +1376,7 @@ mod tests {
             })
             .collect();
 
-        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None);
+        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None, None);
 
         assert_eq!(
             outcomes[0].definitions[0].fq_name(),
@@ -1428,7 +1429,7 @@ mod tests {
             })
             .collect();
 
-        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None);
+        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None, None);
 
         assert_eq!(
             outcomes[0].definitions[0].fq_name(),
@@ -1488,7 +1489,7 @@ mod tests {
             })
             .collect();
 
-        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None);
+        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None, None);
 
         assert_eq!(outcomes[0].definitions[0].fq_name(), "service.Service.run");
         assert_eq!(outcomes[1].definitions[0].fq_name(), "other.Other.stop");
@@ -1529,7 +1530,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut context = DefinitionBatchContext::new(&analyzer, true);
 
-        let outcomes = resolve_definition_requests(&analyzer, &mut context, requests, None);
+        let outcomes = resolve_definition_requests(&analyzer, &mut context, requests, None, None);
 
         assert_eq!(outcomes.len(), REFERENCE_COUNT);
         assert!(outcomes.iter().all(|outcome| {

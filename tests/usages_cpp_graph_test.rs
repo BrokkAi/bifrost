@@ -2142,8 +2142,8 @@ class Consumer {
                 .iter()
                 .map(|definition| definition.path.as_str())
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["types.h", "types_def.h"]),
-            "forward lookup must retain both compatible physical Box targets: {forward:#?}"
+            BTreeSet::from(["types_def.h"]),
+            "definition navigation must retain only the physical Box body: {forward:#?}"
         );
     }
     let provider =
@@ -4410,7 +4410,7 @@ void run(void) {
         .count()
         + 1;
     let column = source[line_start..valid_start].chars().count() + 1;
-    let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+    let forward = brokk_bifrost::searchtools::get_declarations_by_location(
         &analyzer,
         brokk_bifrost::searchtools::GetDefinitionParams {
             references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
@@ -4424,7 +4424,7 @@ void run(void) {
     assert_eq!("resolved", forward_result.status, "{forward_result:#?}");
     assert!(
         forward_result
-            .definitions
+            .declarations
             .iter()
             .any(|definition| definition.fqn.as_deref() == Some("trace")),
         "forward lookup should resolve the variadic header declaration: {forward_result:#?}"
@@ -9877,7 +9877,7 @@ void exercise(Base& direct, Derived* pointer, Derived value, Override override_v
             .count()
             + 1;
         let column = source[line_start..*start].chars().count() + 1;
-        let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+        let forward = brokk_bifrost::searchtools::get_declarations_by_location(
             &analyzer,
             brokk_bifrost::searchtools::GetDefinitionParams {
                 references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
@@ -9893,7 +9893,7 @@ void exercise(Base& direct, Derived* pointer, Derived value, Override override_v
         );
         assert!(
             forward.results[0]
-                .definitions
+                .declarations
                 .iter()
                 .any(|definition| definition.fqn.as_deref() == Some("demo.Base.run")),
             "positive receiver run token {start}..{end} must resolve to Base.run: {forward:#?}"
@@ -9983,7 +9983,7 @@ void Derived::inherited() {
             .count()
             + 1;
         let column = source[line_start..*start].chars().count() + 1;
-        let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+        let forward = brokk_bifrost::searchtools::get_declarations_by_location(
             &analyzer,
             brokk_bifrost::searchtools::GetDefinitionParams {
                 references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
@@ -9999,7 +9999,7 @@ void Derived::inherited() {
         );
         assert!(
             forward.results[0]
-                .definitions
+                .declarations
                 .iter()
                 .any(|definition| definition.fqn.as_deref() == Some("demo.Base.collide")),
             "bare collide token {start}..{end} must resolve to Base.collide: {forward:#?}"
@@ -10210,15 +10210,16 @@ void ambiguous_imports() {
             },
         );
         assert_eq!(
-            "resolved", forward.results[0].status,
-            "positive ordinary using token {start}..{end} must resolve: {forward:#?}"
+            "ambiguous", forward.results[0].status,
+            "duplicate physical definitions must remain ambiguous for token {start}..{end}: {forward:#?}"
         );
         assert!(
-            forward.results[0]
-                .definitions
-                .iter()
-                .any(|definition| definition.fqn.as_deref() == Some("alpha.Imported")),
-            "positive ordinary using token {start}..{end} must resolve to alpha.Imported: {forward:#?}"
+            !forward.results[0].definitions.is_empty()
+                && forward.results[0]
+                    .definitions
+                    .iter()
+                    .all(|definition| definition.fqn.as_deref() == Some("alpha.Imported")),
+            "positive ordinary using token {start}..{end} must retain only alpha.Imported bodies: {forward:#?}"
         );
     }
 
@@ -10946,7 +10947,7 @@ void exercise(base::HistogramTester& tester, base::WrongOwner& wrong) {
             .count()
             + 1;
         let column = source[line_start..start].chars().count() + 1;
-        brokk_bifrost::searchtools::get_definitions_by_location(
+        brokk_bifrost::searchtools::get_declarations_by_location(
             &analyzer,
             brokk_bifrost::searchtools::GetDefinitionParams {
                 references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
@@ -10967,18 +10968,18 @@ void exercise(base::HistogramTester& tester, base::WrongOwner& wrong) {
         "ExpectUniqueSample",
     );
     let forward = forward_at(production_like.0);
-    assert_eq!("resolved", forward.status, "{forward:#?}");
+    assert_eq!("ambiguous", forward.status, "{forward:#?}");
     let matching_forward = forward
-        .definitions
+        .declarations
         .iter()
         .filter(|definition| {
             definition.fqn.as_deref() == Some("base.HistogramTester.ExpectUniqueSample")
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        3,
+        2,
         matching_forward.len(),
-        "forward lookup must retain both header declarations and the out-of-line definition: {forward:#?}"
+        "declaration navigation must retain both applicable header declarations: {forward:#?}"
     );
 
     let provider =
@@ -11054,11 +11055,11 @@ void exercise(base::HistogramTester& tester, base::WrongOwner& wrong) {
     assert_eq!("resolved", select_forward.status, "{select_forward:#?}");
     assert_eq!(
         1,
-        select_forward.definitions.len(),
+        select_forward.declarations.len(),
         "the commented int call must select exactly one overload: {select_forward:#?}"
     );
     assert!(
-        select_forward.definitions.iter().all(|definition| {
+        select_forward.declarations.iter().all(|definition| {
             definition.fqn.as_deref() == Some("base.HistogramTester.Select")
                 && definition
                     .signature
@@ -11111,7 +11112,7 @@ void exercise(Context* first, Context* second) {
             .count()
             + 1;
         let column = source[line_start..start].chars().count() + 1;
-        brokk_bifrost::searchtools::get_definitions_by_location(
+        brokk_bifrost::searchtools::get_declarations_by_location(
             &analyzer,
             brokk_bifrost::searchtools::GetDefinitionParams {
                 references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
@@ -11163,7 +11164,7 @@ void exercise(Context* first, Context* second) {
         assert_eq!("resolved", forward.status, "{forward:#?}");
         assert!(
             forward
-                .definitions
+                .declarations
                 .iter()
                 .any(|definition| definition.fqn.as_deref() == Some(name)),
             "public forward lookup must resolve the positive {name} call: {forward:#?}"
@@ -12036,7 +12037,7 @@ struct Holder {
             .count()
             + 1;
         let column = source[line_start..start].chars().count() + 1;
-        brokk_bifrost::searchtools::get_definitions_by_location(
+        brokk_bifrost::searchtools::get_declarations_by_location(
             &analyzer,
             brokk_bifrost::searchtools::GetDefinitionParams {
                 references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
@@ -12061,9 +12062,9 @@ struct Holder {
         let forward = forward_at(reference.0);
         assert_eq!("resolved", forward.status, "{forward:#?}");
         assert!(
-            !forward.definitions.is_empty()
+            !forward.declarations.is_empty()
                 && forward
-                    .definitions
+                    .declarations
                     .iter()
                     .all(|definition| definition.fqn.as_deref() == Some(expected_fqn.as_str())),
             "receiver template arguments must select {expected_fqn}: {forward:#?}"
@@ -12363,7 +12364,7 @@ int ambiguous_cross(composite::cross<int*, int> value) {
             .count()
             + 1;
         let column = source[line_start..start].chars().count() + 1;
-        brokk_bifrost::searchtools::get_definitions_by_location(
+        brokk_bifrost::searchtools::get_declarations_by_location(
             &analyzer,
             brokk_bifrost::searchtools::GetDefinitionParams {
                 references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
@@ -12385,8 +12386,8 @@ int ambiguous_cross(composite::cross<int*, int> value) {
         let forward = forward_at(range.0);
         assert_eq!("resolved", forward.status, "{forward:#?}");
         assert!(
-            !forward.definitions.is_empty()
-                && forward.definitions.iter().all(|definition| {
+            !forward.declarations.is_empty()
+                && forward.declarations.iter().all(|definition| {
                     definition.fqn.as_deref() == Some(expected.fq_name().as_str())
                 }),
             "composite specialization must select {}: {forward:#?}",
@@ -12403,7 +12404,7 @@ int ambiguous_cross(composite::cross<int*, int> value) {
         let ambiguous_line_start = ambiguous_source[..ambiguous_range.0]
             .rfind('\n')
             .map_or(0, |newline| newline + 1);
-        let ambiguous = brokk_bifrost::searchtools::get_definitions_by_location(
+        let ambiguous = brokk_bifrost::searchtools::get_declarations_by_location(
             &analyzer,
             brokk_bifrost::searchtools::GetDefinitionParams {
                 references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
@@ -12429,7 +12430,7 @@ int ambiguous_cross(composite::cross<int*, int> value) {
         .next()
         .expect("one ambiguous forward result");
         assert!(
-            ambiguous.status != "resolved" || ambiguous.definitions.is_empty(),
+            ambiguous.status != "resolved" || ambiguous.declarations.is_empty(),
             "incomparable partial specializations must fail closed for {marker}: {ambiguous:#?}"
         );
     }
@@ -12699,7 +12700,7 @@ void* construct_without_default_exact() { return new Gadget(1, 2); }
     let source = file.read_to_string().expect("source");
     let forward_at = |start: usize| {
         let line_start = source[..start].rfind('\n').map_or(0, |newline| newline + 1);
-        brokk_bifrost::searchtools::get_definitions_by_location(
+        brokk_bifrost::searchtools::get_declarations_by_location(
             &analyzer,
             brokk_bifrost::searchtools::GetDefinitionParams {
                 references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
@@ -12739,10 +12740,10 @@ void* construct_without_default_exact() { return new Gadget(1, 2); }
         ),
     ] {
         let forward = forward_at(range.0);
-        assert_eq!(forward.status, "resolved", "{forward:#?}");
+        assert_eq!(forward.status, "ambiguous", "{forward:#?}");
         assert!(
             forward
-                .definitions
+                .declarations
                 .iter()
                 .any(|definition| definition.fqn.as_deref() == Some(expected_fqn)),
             "forward lookup must select the logical callable before its definition-only inverse query: {forward:#?}"
@@ -13310,7 +13311,7 @@ void wrong_namespace() {
         let line_start = file_source[..start]
             .rfind('\n')
             .map_or(0, |newline| newline + 1);
-        brokk_bifrost::searchtools::get_definitions_by_location(
+        brokk_bifrost::searchtools::get_declarations_by_location(
             &analyzer,
             brokk_bifrost::searchtools::GetDefinitionParams {
                 references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
@@ -13418,7 +13419,7 @@ void wrong_namespace() {
         assert_eq!("resolved", result.status, "{line}: {result:#?}");
         assert!(
             result
-                .definitions
+                .declarations
                 .iter()
                 .any(|definition| definition.fqn.as_deref() == Some(expected_fqn.as_str())),
             "{line} should resolve to {expected_fqn}: {result:#?}"
@@ -13615,7 +13616,7 @@ void wrong_namespace() {
     );
     assert!(
         block_local_forward
-            .definitions
+            .declarations
             .iter()
             .all(|definition| definition.fqn.as_deref()
                 != Some(block_scoped_class.fq_name().as_str())),
@@ -13635,7 +13636,7 @@ void wrong_namespace() {
         "Guarded",
     );
     assert_eq!("resolved", guarded_forward.status, "{guarded_forward:#?}");
-    assert!(guarded_forward.definitions.iter().any(|definition| {
+    assert!(guarded_forward.declarations.iter().any(|definition| {
         definition.fqn.as_deref() == Some(guarded_function.fq_name().as_str())
     }));
     assert!(
@@ -13677,7 +13678,7 @@ void wrong_namespace() {
     let member_call = fixture_token_range(&member_source, member_line, "NamespaceName");
     let member_forward = forward_in("member.cc", &member_source, member_line, "NamespaceName");
     assert_eq!("resolved", member_forward.status, "{member_forward:#?}");
-    assert!(member_forward.definitions.iter().any(|definition| {
+    assert!(member_forward.declarations.iter().any(|definition| {
         definition.fqn.as_deref() == Some(inherited_member.fq_name().as_str())
     }));
     assert!(
@@ -13732,7 +13733,7 @@ void wrong_namespace() {
         assert_ne!("resolved", forward.status, "{line}: {forward:#?}");
         assert!(
             forward
-                .definitions
+                .declarations
                 .iter()
                 .all(|definition| definition.fqn.as_deref() != Some(expected_fqn.as_str())),
             "unknown arity must not produce an exact forward target: {forward:#?}"
@@ -14030,7 +14031,7 @@ Imported before_external; // positive-local-before-external-donor
         let line_start = source[..focus_start]
             .rfind('\n')
             .map_or(0, |newline| newline + 1);
-        let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+        let forward = brokk_bifrost::searchtools::get_declarations_by_location(
             &analyzer,
             brokk_bifrost::searchtools::GetDefinitionParams {
                 references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
@@ -14047,7 +14048,7 @@ Imported before_external; // positive-local-before-external-donor
             },
         );
         let forward_match = forward.results[0]
-            .definitions
+            .declarations
             .iter()
             .any(|definition| definition.fqn.as_deref() == Some(target.fq_name().as_str()));
         let targeted = authoritative_exact_ranges(&analyzer, std::slice::from_ref(target), &file)

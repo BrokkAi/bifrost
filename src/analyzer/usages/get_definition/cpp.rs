@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::declaration_range::node_for_exact_range;
 use crate::analyzer::resolve_include_targets_with_index;
 use crate::analyzer::usages::cpp_call_match::{
     CppArgType, cpp_filter_candidates_by_args, cpp_literal_type_name, cpp_parameter_type_text,
@@ -12,6 +13,7 @@ enum CppNavigationKind {
     DeclarationOnly,
     Definition,
     Both,
+    Unknown,
 }
 
 pub(super) fn select_navigation_outcome(
@@ -44,7 +46,10 @@ pub(super) fn select_navigation_outcome(
                     true
                 }
             }
-            NavigationOperation::Definition => *kind != CppNavigationKind::DeclarationOnly,
+            NavigationOperation::Definition => matches!(
+                *kind,
+                CppNavigationKind::Definition | CppNavigationKind::Both
+            ),
         })
         .map(|(candidate, _)| candidate.clone())
         .collect();
@@ -52,6 +57,16 @@ pub(super) fn select_navigation_outcome(
         .diagnostics
         .retain(|diagnostic| diagnostic.kind != CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC);
     if operation == NavigationOperation::Definition {
+        if classified
+            .iter()
+            .any(|(_, kind)| *kind == CppNavigationKind::Unknown)
+        {
+            outcome.diagnostics.push(DefinitionLookupDiagnostic {
+                kind: "cpp_navigation_structure_unavailable".to_string(),
+                message: "one or more C/C++ candidates could not be classified from indexed syntax"
+                    .to_string(),
+            });
+        }
         let body_sources: HashSet<_> = classified
             .iter()
             .filter(|(candidate, kind)| {
@@ -68,6 +83,9 @@ pub(super) fn select_navigation_outcome(
         }
     }
     if outcome.definitions.is_empty() {
+        outcome
+            .diagnostics
+            .retain(|diagnostic| diagnostic.kind != "ambiguous_definition");
         outcome.status = DefinitionLookupStatus::NoDefinition;
         outcome.diagnostics.push(DefinitionLookupDiagnostic {
             kind: "no_definition".to_string(),
@@ -86,7 +104,7 @@ fn cpp_navigation_kind(
         return CppNavigationKind::Both;
     }
     let Some(tree) = context.cpp_indexed_tree(candidate.source()) else {
-        return CppNavigationKind::Both;
+        return CppNavigationKind::Unknown;
     };
     let root = tree.root_node();
     let ranges = analyzer.ranges(candidate);
@@ -128,24 +146,12 @@ fn cpp_navigation_kind(
     match (has_split_declaration, has_definition) {
         (true, false) => CppNavigationKind::DeclarationOnly,
         (false, true) | (true, true) => CppNavigationKind::Definition,
-        (false, false) => CppNavigationKind::Both,
+        (false, false) => CppNavigationKind::Unknown,
     }
 }
 
 fn cpp_declaration_node_for_range<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
-    let mut best = None;
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
-            continue;
-        }
-        if node.start_byte() == range.start_byte && node.end_byte() == range.end_byte {
-            best = Some(node);
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
-    }
-    best.or_else(|| {
+    node_for_exact_range(root, range).or_else(|| {
         root.descendant_for_byte_range(range.start_byte, range.end_byte)
             .and_then(|mut node| {
                 while node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {

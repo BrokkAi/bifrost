@@ -88,6 +88,19 @@ class App { void invoke(Runner runner) { runner.<java_call>run(); } }
             "app.cpp",
             "#include \"service.h\"\nvoid invoke(ns::Service& service) { service.<cpp_call>run(); }\n",
         )
+        .file("duplicate.h", "void duplicate();\n")
+        .file(
+            "duplicate_a.cpp",
+            "#include \"duplicate.h\"\nvoid <cpp_duplicate_a>duplicate() {}\n",
+        )
+        .file(
+            "duplicate_b.cpp",
+            "#include \"duplicate.h\"\nvoid <cpp_duplicate_b>duplicate() {}\n",
+        )
+        .file(
+            "duplicate_app.cpp",
+            "#include \"duplicate.h\"\nvoid invoke_duplicate() { <cpp_duplicate_call>duplicate(); }\n",
+        )
         .file(
             "lib.rs",
             r#"trait RustRunner { type <rust_trait>Output; }
@@ -125,6 +138,12 @@ type Selected = <LocalRustRunner as RustRunner>::<rust_qualified>Output;
                 ClickExpectation::Empty,
             ),
             ClickCase::new(
+                "cpp ambiguous definitions return every body",
+                "cpp_duplicate_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["cpp_duplicate_a", "cpp_duplicate_b"]),
+            ),
+            ClickCase::new(
                 "rust impl associated type declaration uses trait",
                 "rust_impl",
                 ClickOperation::Declaration,
@@ -145,7 +164,7 @@ type Selected = <LocalRustRunner as RustRunner>::<rust_qualified>Output;
         ],
     );
 
-    assert_timing_summary("declaration_definition_navigation", &timings, 7);
+    assert_timing_summary("declaration_definition_navigation", &timings, 8);
 }
 
 #[test]
@@ -774,10 +793,10 @@ object AmbiguousImports:
                 ClickExpectation::Empty,
             ),
             ClickCase::new(
-                "conflicting inherited trait members return empty definition",
+                "conflicting inherited trait members return all definitions",
                 "ambiguous_id_call",
                 ClickOperation::Definition,
-                ClickExpectation::Empty,
+                ClickExpectation::Locations(&["primary_id_decl", "secondary_id_decl"]),
             ),
             ClickCase::new(
                 "trait default method resolves through inherited receiver",

@@ -15,8 +15,8 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
 - [x] (2026-07-20 12:21Z) Added passing Java, C++, and Rust inline-project navigation contract coverage, including serialized operations.
 - [x] (2026-07-20 12:41Z) Exposed declaration navigation through MCP, path normalization, Python models/client/exports, and public documentation, with distinct serialized result fields and operations.
 - [x] (2026-07-20 12:42Z) Advertised and dispatched LSP declaration navigation through the shared selector and extended the click-test harness with declaration operations.
-- [ ] Run focused tests, Python tests, formatting, clippy, full feature tests, and `git diff --check`.
-- [ ] Run the guided specialist review, address required findings, rerun affected gates, and record the reviewed outcome.
+- [x] (2026-07-20 14:27Z) Ran the focused Rust suites, all 44 Python client tests, formatting, all-target/all-feature clippy, the complete all-feature Rust suite including doc tests, and `git diff --check`.
+- [x] (2026-07-20 14:27Z) Completed the five guided specialist reviews, addressed the high/medium findings within scope, reran affected tests and full gates, and recorded the one range-model follow-up below.
 
 ## Surprises & Discoveries
 
@@ -26,10 +26,16 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
   Evidence: `RustAnalyzer::rust_trait_member_implementations` in `src/analyzer/rust/graph_support.rs` and the declaration-building logic added by commits `d8482b3f` and `bee5b084` provide the relations needed for structured qualified-associated-type selection.
 - Observation: Tree-sitter Rust represents `<LocalRunner as Runner>` as a `qualified_type` whose trait contract is the `alias` field, wrapped by a `bracketed_type` in the enclosing `scoped_type_identifier` path.
   Evidence: The focused contract test initially returned `unresolvable_import_boundary`; inspecting the parsed S-expression showed `path: (bracketed_type (qualified_type type: ... alias: ...))`, after which field-based selection passed.
-- Observation: Direct `cargo test --features nlp,python` linking in this shell currently lacks Python symbols on macOS.
-  Evidence: The first focused all-feature invocation compiled but failed linking `libbrokk_bifrost.dylib` with undefined `Py*` symbols. Non-Python Rust contract tests pass; the repository Python script and prescribed final gates remain pending.
+- Observation: Direct `cargo test --features nlp,python` linking in this shell needs the same macOS dynamic-lookup linker flag used by CI for the PyO3 extension module.
+  Evidence: The first focused all-feature invocation failed linking `libbrokk_bifrost.dylib` with undefined `Py*` symbols; rerunning with `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup'` passed all named focused suites and the complete suite.
 - Observation: The first Python-suite run encountered two transient analyzer-store EOF failures in unrelated temporary Python fixtures, but an immediate isolated rerun passed all 44 tests.
   Evidence: `classify_test_files` and `usage_graph` initially failed while hydrating temporary `.py` files; the unchanged rerun completed `Ran 44 tests ... OK`.
+- Observation: The local PATH mixes rustup `cargo`/`rustc` (LLVM 22.1.2) with Homebrew `rustdoc`/`clippy-driver` (LLVM 22.1.6), despite all reporting Rust 1.96.0.
+  Evidence: Unpinned clippy and rustdoc reported incompatible crate metadata. Pinning the full Homebrew toolchain for clippy and the rustup `rustdoc` for tests made both isolated gates pass.
+- Observation: The full suite contained legacy C++ tests that used definition navigation as a broad forward-resolution oracle for declaration-only fixtures.
+  Evidence: Persistence, clangd parity, macro-arity, and usage-graph tests initially expected prototypes in `definitions`. Fixtures that intended body navigation now contain bodies; usage tests that intentionally target prototypes use declaration navigation; multi-target explicit navigation now asserts `ambiguous`.
+- Observation: Same-file C++ prototype/body pairs are collapsed by the current per-file `CodeUnit` replacement identity before navigation selection receives them.
+  Evidence: Specialist review traced `replace_code_unit` and the range-only result model: the selector can separate header/source physical candidates, but cannot return different ranges for a prototype and body represented by one same-file `CodeUnit`.
 
 ## Decision Log
 
@@ -48,16 +54,38 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
 - Decision: Preserve declaration-site self navigation except when C++ AST classification proves the site is a declaration-only callable or type during definition navigation.
   Rationale: Existing LSP no-movement behavior remains useful for fields, aliases, and other indivisible declarations, while a C++ prototype must not masquerade as an implementation body.
   Date/Author: 2026-07-20 / Codex
+- Decision: Return every operation-filtered candidate through LSP for both `Resolved` and `Ambiguous` outcomes.
+  Rationale: LSP location arrays can represent ambiguity, and discarding a valid ambiguous set contradicted the public navigation contract.
+  Date/Author: 2026-07-20 / Codex
+- Decision: Treat unclassifiable C++ callable/type candidates as `Unknown` and exclude them from definition navigation with an explicit diagnostic.
+  Rationale: Failing closed avoids presenting an unproven prototype as an implementation body while preserving structured diagnostics for missing indexed syntax.
+  Date/Author: 2026-07-20 / Codex
+- Decision: Defer same-file C++ prototype/body separation to a range-aware navigation-target or index-identity follow-up.
+  Rationale: Fixing it here would require changing the analyzer's declaration identity or returning operation-specific ranges, a larger architectural change than the approved cross-file candidate selector. Header/source separation—the issue contract—is fully implemented.
+  Date/Author: 2026-07-20 / Codex
 
 ## Outcomes & Retrospective
 
-Implementation is in progress. At completion this section will summarize the protocol surface, language-specific navigation behavior, validation evidence, specialist-review findings, and any remaining follow-up work.
+Implementation and review are complete on the current issue branch. The branch adds a shared `NavigationOperation`, explicit analyzer selection layered over the unchanged broad resolver, the `get_declarations_by_location` MCP/Python surface, operation-tagged declaration/definition result models, and `textDocument/declaration` LSP support. Java interface calls, C++ prototype/body selection and genuine multi-body ambiguity, and Rust trait/implementation associated-type navigation are covered end to end.
 
 Milestone 1 produced an explicit analyzer navigation path and the initial MCP location surface. Four focused contract tests pass: Java interface declaration selection, C++ prototype/body separation, C++ multi-body ambiguity, and Rust trait/implementation associated-type selection including qualified paths. Broad resolver entry points remain operation-free.
 
 Milestone 2 completed the public MCP and Python surface. MCP discovery, schema limits, line-number visibility, and live dispatch pass in 17 integration tests; the Python client exposes typed declaration and definition models and passes all 44 client tests. Public MCP and Python documentation now describes operation-specific fields and statuses while leaving reference-based definition lookup unchanged.
 
 Milestone 3 completed LSP support. Initialization advertises `declarationProvider`, both declaration and definition requests use the explicit analyzer selector, and the click harness covers Java, C++, and Rust distinctions. All 187 LSP server tests and 17 non-stress click-around tests pass; the C++ click contract also proves a prototype is not returned as its own definition.
+
+The guided review ran security, DevOps, duplication, architecture, and senior-engineering specialists. Security and DevOps reported no findings. Review fixes consolidated LSP target construction, reused shared C++ exact-range and Rust associated-type helpers, returned ambiguous LSP candidates instead of discarding them, made unknown C++ structure fail closed, narrowed stale ambiguity-diagnostic cleanup to C++, and extended C++ multi-body and wrong-arity coverage. The sole deferred finding is same-file C++ prototype/body range separation described above.
+
+Final validation passed:
+
+    focused all-feature Rust suites: 187 LSP, 18 MCP, 523 analyzer, 17 click tests passed; 2 stress tests ignored
+    scripts/test_python.sh: 44 passed
+    cargo fmt --all: clean
+    all-target/all-feature clippy: clean in an isolated target
+    complete cargo test --features nlp,python: passed in an isolated target, including 0 doc-test failures
+    git diff --check: clean
+
+The final issue diff from the branch base is 34 files, 1,480 insertions, and 201 deletions. No UsageBench files were changed, and no branch switch, rebase, push, or pull request was performed.
 
 ## Context and Orientation
 
@@ -119,7 +147,16 @@ Initial repository state:
     upstream matched after git fetch
     worktree clean
 
-The final review artifact will record changed-file count, diff size, consolidated severity-ranked findings, fixes taken, and post-review validation.
+Final review artifact:
+
+    base: 3fdaa7196951688c3829fbd06de9ef265c3aba92
+    issue diff: 34 files, +1480/-201 before the final plan bookkeeping line changes
+    reviewers: security, DevOps, duplication, architecture, senior engineering
+    critical findings: 0
+    high findings: 1 fixed (ambiguous LSP results were discarded)
+    medium findings: shared-helper duplication fixed; unknown C++ classification fixed; same-file C++ range separation deferred
+    lower findings: stale C++ ambiguity diagnostic fixed; focused regressions added
+    final gates: focused Rust, Python, fmt, clippy, complete all-feature Rust including doc tests, diff check
 
 ## Interfaces and Dependencies
 
@@ -139,3 +176,5 @@ Plan revision note (2026-07-20 12:21Z): Recorded milestone 1 implementation, foc
 Plan revision note (2026-07-20 12:41Z): Recorded the completed MCP/Python/documentation milestone, its passing integration evidence, and the transient analyzer-store failure that disappeared on isolated rerun before checkpointing.
 
 Plan revision note (2026-07-20 12:42Z): Recorded the completed LSP milestone, including explicit declaration dispatch, operation-aware declaration-site fallback, and passing server/click-around evidence before checkpointing.
+
+Plan revision note (2026-07-20 14:27Z): Recorded the completed specialist review, fixes and deferred same-file range-model follow-up, compatibility updates to legacy C++ tests, coherent-toolchain validation commands, and final passing gates before the reviewed checkpoint commit.

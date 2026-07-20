@@ -15668,6 +15668,24 @@ fn cpp_typed_receiver_method_wrong_arity_returns_overload_definitions() {
         result["definitions"][1]["signature"], "(DataReader &)",
         "{value}"
     );
+
+    let definition = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
+            column_of(line, "load_model")
+        ),
+    );
+    let result = &definition["results"][0];
+    assert_eq!(result["status"], "no_definition", "{definition}");
+    assert!(
+        result["diagnostics"]
+            .as_array()
+            .is_none_or(|diagnostics| diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic["kind"] != "ambiguous_definition")),
+        "{definition}"
+    );
 }
 
 #[test]
