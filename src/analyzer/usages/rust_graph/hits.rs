@@ -83,7 +83,16 @@ fn record_scoped_target_segment_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     };
     let path_text = node_text(path, ctx.source);
     if matches!(path.kind(), "identifier" | "type_identifier") {
-        let resolved_root = resolve_rust_path_fqn(ctx.rust, ctx.refs, ctx.file, path_text);
+        let resolved_root = ctx
+            .refs
+            .resolve_bare(path_text)
+            .map(str::to_string)
+            .or_else(|| ctx.refs.resolve_scoped_owner(path_text))
+            .or_else(|| {
+                ctx.target_is_module
+                    .then(|| ctx.rust.resolve_module_package(ctx.file, path_text))
+                    .flatten()
+            });
         let direct_binding_matches = ctx.matches_identifier(path_text, path.start_byte())
             && !ctx.name_shadowed_at(path_text, path.start_byte());
         if resolved_root.as_deref() == Some(ctx.target_fqn) || direct_binding_matches {

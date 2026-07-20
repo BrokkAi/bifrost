@@ -242,10 +242,13 @@ impl ScanCtx<'_> {
             return false;
         }
         let binder = lexical_scope::visible_import_binder_in_tree(self.root, self.source, byte);
-        self.rust
-            .resolve_imported_export_from_binder_forward(self.file, &binder, text)
-            .into_iter()
-            .any(|binding| seeds.identities().contains(&binding))
+        let bindings = self
+            .rust
+            .resolve_imported_export_from_binder_forward(self.file, &binder, text);
+        !bindings.is_empty()
+            && bindings
+                .iter()
+                .all(|binding| seeds.identities().contains(binding))
     }
 
     pub(super) fn matches_qualified_name(&self, text: &str) -> bool {
@@ -310,15 +313,15 @@ fn self_reference_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     else {
         return false;
     };
-    rust_resolve_type_node_fqn(
+    let resolved = rust_resolve_type_node_fqn(
         ctx.analyzer,
         ctx.support,
         ctx.file,
         ctx.source,
         type_node,
         Some(type_node.start_byte()),
-    )
-    .is_some_and(|fqn| fqn_matches_owner(ctx.rust, &fqn, ctx.target))
+    );
+    resolved.is_some_and(|fqn| fqn_matches_owner(ctx.rust, ctx.support, &fqn, ctx.target))
 }
 
 fn record_use_import_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -395,9 +398,9 @@ pub(super) fn scan_files_for_member_target(
     let member_name = target.identifier().to_string();
     let hits = Mutex::new(BTreeSet::new());
     let unproven_hits = Mutex::new(BTreeSet::new());
-    let constructor_returns = self_like_constructor_returns(rust, &owner);
-    let self_like_constructors = self_like_constructor_seeds(rust, &owner, &constructor_returns);
     let support = analyzer.global_usage_definition_index();
+    let constructor_returns = self_like_constructor_returns(rust, support, &owner);
+    let self_like_constructors = self_like_constructor_seeds(rust, &owner, &constructor_returns);
 
     files.par_iter().for_each(|file| {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -973,7 +976,7 @@ fn receiver_owner_proof(
         receiver.start_byte(),
         ctx.type_lookup_cache,
     ) {
-        if !ctx.target_owner_is_trait && fqn_matches_owner(ctx.rust, &fqn, ctx.owner) {
+        if !ctx.target_owner_is_trait && fqn_matches_owner(ctx.rust, ctx.support, &fqn, ctx.owner) {
             return ReceiverOwnerProof::Structured;
         }
         if let Some(matches) = receiver_type_matches_requested_dispatch(&fqn, ctx) {
@@ -1129,11 +1132,24 @@ fn resolved_type_matches_owner(type_node: Node<'_>, ctx: &MemberScanCtx<'_>) -> 
     ) else {
         return false;
     };
-    fqn_matches_owner(ctx.rust, &fqn, ctx.owner)
+    fqn_matches_owner(ctx.rust, ctx.support, &fqn, ctx.owner)
 }
 
-fn fqn_matches_owner(rust: &RustAnalyzer, fqn: &str, owner: &CodeUnit) -> bool {
-    rust.definitions(fqn).any(|unit| &unit == owner)
+fn fqn_matches_owner(
+    rust: &RustAnalyzer,
+    support: &GlobalUsageDefinitionIndex,
+    fqn: &str,
+    owner: &CodeUnit,
+) -> bool {
+    let candidates = support.fqn(fqn);
+    let canonical: Option<BTreeSet<_>> = candidates
+        .into_iter()
+        .map(|unit| rust.canonical_rust_hierarchy_type(unit))
+        .collect();
+    let Some(canonical) = canonical else {
+        return false;
+    };
+    canonical.len() == 1 && canonical.first().is_some_and(|unit| unit == owner)
 }
 
 fn field_declared_type_matches_receiver(member: &CodeUnit, ctx: &MemberScanCtx<'_>) -> bool {
@@ -1302,7 +1318,9 @@ fn self_static_owner_matches_target(owner_node: Node<'_>, ctx: &MemberScanCtx<'_
                             type_node,
                             Some(type_node.start_byte()),
                         )
-                        .is_some_and(|fqn| fqn_matches_owner(ctx.rust, &fqn, &requested_owner))
+                        .is_some_and(|fqn| {
+                            fqn_matches_owner(ctx.rust, ctx.support, &fqn, &requested_owner)
+                        })
                     });
                 }
                 let owner = if ctx.target_owner_is_trait {
@@ -1325,6 +1343,7 @@ fn self_static_owner_matches_target(owner_node: Node<'_>, ctx: &MemberScanCtx<'_
 
 fn self_like_constructor_returns(
     rust: &RustAnalyzer,
+    support: &GlobalUsageDefinitionIndex,
     owner: &CodeUnit,
 ) -> HashMap<String, ConstructorReturn> {
     let Ok(source) = owner.source().read_to_string() else {
@@ -1354,6 +1373,7 @@ fn self_like_constructor_returns(
             let return_type = function_return_type_node(function)?;
             let ctx = ConstructorReturnCtx {
                 rust,
+                support,
                 file: code_unit.source(),
                 source: &source,
                 owner,
@@ -1366,6 +1386,7 @@ fn self_like_constructor_returns(
 
 struct ConstructorReturnCtx<'a> {
     rust: &'a RustAnalyzer,
+    support: &'a GlobalUsageDefinitionIndex,
     file: &'a ProjectFile,
     source: &'a str,
     owner: &'a CodeUnit,
@@ -1469,7 +1490,7 @@ fn type_node_matches_constructor_owner(
     }
     constructor_type_node_fqn(type_node, ctx)
         .as_deref()
-        .is_some_and(|fqn| fqn_matches_owner(ctx.rust, fqn, ctx.owner))
+        .is_some_and(|fqn| fqn_matches_owner(ctx.rust, ctx.support, fqn, ctx.owner))
 }
 
 fn constructor_type_node_fqn(
@@ -1644,7 +1665,7 @@ fn resolved_owner_receiver_names(
                 type_node,
                 Some(type_node.start_byte()),
             )
-            .is_some_and(|fqn| fqn_matches_owner(rust, &fqn, owner))
+            .is_some_and(|fqn| fqn_matches_owner(rust, support, &fqn, owner))
         {
             receivers.push(name);
         }

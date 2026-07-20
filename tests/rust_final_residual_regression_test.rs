@@ -23,6 +23,18 @@ fn definition(analyzer: &RustAnalyzer, fq_name: &str) -> CodeUnit {
         .unwrap_or_else(|| panic!("missing definition for {fq_name}"))
 }
 
+fn definition_in_file(
+    analyzer: &RustAnalyzer,
+    file: &brokk_bifrost::ProjectFile,
+    name: &str,
+) -> CodeUnit {
+    analyzer
+        .declarations(file)
+        .into_iter()
+        .find(|unit| unit.identifier() == name)
+        .unwrap_or_else(|| panic!("missing definition {name} in {file}"))
+}
+
 fn member(analyzer: &RustAnalyzer, owner: &str, name: &str) -> CodeUnit {
     let file = analyzer
         .get_analyzed_files()
@@ -42,6 +54,24 @@ fn hits(analyzer: &RustAnalyzer, target: CodeUnit) -> Vec<UsageHit> {
         .expect("Rust inverse lookup")
         .into_iter()
         .collect()
+}
+
+fn authoritative_hits(
+    analyzer: &RustAnalyzer,
+    target: CodeUnit,
+    candidates: HashSet<brokk_bifrost::ProjectFile>,
+) -> BTreeSet<UsageHit> {
+    let provider = ExplicitCandidateProvider::new(Arc::new(candidates));
+    match UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(analyzer, &[target], Some(&provider), 1, 100)
+        .result
+    {
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => hits_by_overload.into_values().flatten().collect(),
+        other => panic!("expected authoritative Rust usage success, got {other:#?}"),
+    }
 }
 
 #[test]
@@ -190,17 +220,7 @@ fn shadowed(filter_as_usize: fn(&Option<Level>) -> usize) -> usize {
     let candidates: HashSet<_> = [project.file("tracing-core/src/metadata.rs")]
         .into_iter()
         .collect();
-    let provider = ExplicitCandidateProvider::new(Arc::new(candidates));
-    let found: BTreeSet<_> = match UsageFinder::new()
-        .with_authoritative_scope(true)
-        .query_with_provider(&analyzer, &[target], Some(&provider), 1, 100)
-        .result
-    {
-        FuzzyResult::Success {
-            hits_by_overload, ..
-        } => hits_by_overload.into_values().flatten().collect(),
-        other => panic!("expected authoritative Rust usage success, got {other:#?}"),
-    };
+    let found = authoritative_hits(&analyzer, target, candidates);
     let expected: Vec<_> = source
         .match_indices("filter_as_usize")
         .skip(1)
@@ -214,4 +234,145 @@ fn shadowed(filter_as_usize: fn(&Option<Level>) -> usize) -> usize {
             .iter()
             .any(|hit| (hit.start_offset, hit.end_offset) == range)
     }));
+}
+
+#[test]
+fn inverse_rust_usages_resolve_nested_self_crate_import_through_private_module_reexport() {
+    let consumer = r#"
+fn main() {
+    use demo::{Arena, Options};
+    let _arena = Arena;
+    let _options = Options::default();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            "mod parser;\npub struct Arena;\npub use parser::Options;\n",
+        )
+        .file(
+            "src/parser/mod.rs",
+            "pub mod options;\npub use crate::parser::options::Options;\n",
+        )
+        .file(
+            "src/parser/options.rs",
+            "#[derive(Default)]\npub struct Options;\n",
+        )
+        .file("src/main.rs", "pub struct Options;\n")
+        .file("build.rs", "pub struct Options;\n")
+        .file("examples/client.rs", consumer)
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "parser.options.Options");
+    let candidates = [project.file("examples/client.rs")].into_iter().collect();
+    let found = authoritative_hits(&analyzer, target, candidates);
+    let expected = consumer
+        .rfind("Options")
+        .map(|start| (start, start + "Options".len()))
+        .expect("Options constructor reference");
+
+    assert!(
+        found
+            .iter()
+            .any(|hit| (hit.start_offset, hit.end_offset) == expected),
+        "nested import must resolve through the public re-export chain: {found:#?}"
+    );
+
+    for decoy_file in [project.file("src/main.rs"), project.file("build.rs")] {
+        let decoy = definition_in_file(&analyzer, &decoy_file, "Options");
+        let candidates = [project.file("examples/client.rs")].into_iter().collect();
+        let decoy_hits = authoritative_hits(&analyzer, decoy, candidates);
+        assert!(
+            decoy_hits.is_empty(),
+            "the crate-name import must route only to the Cargo library root: {decoy_hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn inverse_rust_usages_canonicalize_self_owner_through_type_alias() {
+    let consumer = r#"
+use demo::{ListStyleType, options};
+
+impl From<ListStyleType> for options::ListStyleType {
+    fn from(_: ListStyleType) -> Self {
+        Self::Plus
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            "mod parser;\npub use parser::options;\npub type ListStyleType = parser::options::ListStyleType;\n",
+        )
+        .file("src/parser/mod.rs", "pub mod options;\n")
+        .file(
+            "src/parser/options.rs",
+            "pub enum ListStyleType { Plus, Dash }\n",
+        )
+        .file("src/main.rs", consumer)
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "parser.options.ListStyleType");
+    let candidates = [project.file("src/main.rs")].into_iter().collect();
+    let found = authoritative_hits(&analyzer, target, candidates);
+    let expected = consumer
+        .rfind("Self")
+        .map(|start| (start, start + "Self".len()))
+        .expect("Self variant owner reference");
+
+    assert!(
+        found
+            .iter()
+            .any(|hit| (hit.start_offset, hit.end_offset) == expected),
+        "Self must resolve through the root type alias to the physical enum: {found:#?}"
+    );
+}
+
+#[test]
+fn inverse_rust_usages_reject_ambiguous_self_owner_alias() {
+    let consumer = r#"
+pub enum ListStyleType { Plus }
+
+impl From<ListStyleType> for ListStyleType {
+    fn from(_: ListStyleType) -> Self {
+        Self::Plus
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            "mod parser;\npub type ListStyleType = parser::ListStyleType;\n",
+        )
+        .file("src/parser.rs", "pub enum ListStyleType { Plus, Dash }\n")
+        .file("src/main.rs", consumer)
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+    let physical = definition(&analyzer, "parser.ListStyleType");
+    let candidates = [project.file("src/main.rs")].into_iter().collect();
+    let found = authoritative_hits(&analyzer, physical, candidates);
+    let self_range = consumer
+        .rfind("Self")
+        .map(|start| (start, start + "Self".len()))
+        .expect("Self variant owner reference");
+
+    assert!(
+        found
+            .iter()
+            .all(|hit| (hit.start_offset, hit.end_offset) != self_range),
+        "ambiguous root owner identity must not canonicalize to the physical enum: {found:#?}"
+    );
 }
