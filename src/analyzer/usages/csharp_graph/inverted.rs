@@ -24,7 +24,8 @@ use super::extractor::{
 use super::resolver::{
     UnqualifiedMethodGroupResolution, argument_count, class_unit_for_fq_name,
     extension_visibility_site_key, first_type_child, is_member_variable_declaration,
-    is_type_reference_node, nearest_member_candidates_for_owner, node_text, reference_type_text,
+    is_type_reference_node, nearest_member_candidates_for_owner, node_text,
+    object_initializer_for_label, object_initializer_owner_type_node, reference_type_text,
     resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner, same_node,
     unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
     usage_class_field_receiver_type, usage_member_declared_type_fq_name,
@@ -39,7 +40,7 @@ use crate::analyzer::{
     CSharpAnalyzer, CSharpMemberName, CallableArity, CodeUnit, IAnalyzer, ProjectFile,
     csharp_attribute_type_names, csharp_callable_arity, csharp_conditional_member_access,
     csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver, csharp_member_name,
-    csharp_type_leftmost_identifier, csharp_type_reference_root,
+    csharp_nameof_type_candidates, csharp_type_leftmost_identifier, csharp_type_reference_root,
     csharp_unqualified_invocation_for_name,
 };
 use crate::hash::{HashMap, HashSet};
@@ -288,6 +289,12 @@ fn record_reference(
     if let Some(receiver) = csharp_member_access_type_receiver(node) {
         record_structured_type_candidate(receiver, true, ctx, bindings);
     }
+    if let Some((operand, qualified_owner)) = csharp_nameof_type_candidates(node, ctx.source)
+        && !record_structured_type_candidate(operand, true, ctx, bindings)
+        && let Some(owner) = qualified_owner
+    {
+        record_structured_type_candidate(owner, true, ctx, bindings);
+    }
     if let Some(root) = csharp_type_reference_root(node)
         && same_node(root, node)
     {
@@ -311,6 +318,20 @@ fn record_reference(
         // node. `new Foo()`'s type child is itself a type reference, so it is
         // covered here without a separate object-creation case.
         "identifier" | "type" => {
+            if node.kind() == "identifier"
+                && let Some(initializer) = object_initializer_for_label(node)
+            {
+                let name = node_text(node, ctx.source);
+                if let Some(type_node) = object_initializer_owner_type_node(initializer)
+                    && let Some(owner) = ctx
+                        .resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node)
+                {
+                    ctx.record_nearest_member(&owner, name, node, None, None);
+                } else {
+                    ctx.record_unproven(name, node);
+                }
+                return;
+            }
             if node.kind() == "identifier"
                 && let Some((invocation, explicit_generic_arity)) =
                     csharp_unqualified_invocation_for_name(node)
@@ -437,10 +458,10 @@ fn record_structured_type_candidate(
     reject_value_receiver: bool,
     ctx: &mut CsScan<'_, '_>,
     bindings: &LocalInferenceEngine<String>,
-) {
+) -> bool {
     if reject_value_receiver {
         let Some(leftmost) = csharp_type_leftmost_identifier(candidate) else {
-            return;
+            return false;
         };
         let name = node_text(leftmost, ctx.source);
         if !bindings.resolve_symbol(name).is_unknown()
@@ -455,12 +476,15 @@ fn record_structured_type_candidate(
             )
             .is_unknown()
         {
-            return;
+            return false;
         }
     }
     let reference = reference_type_text(candidate, ctx.source);
     if let Some(fqn) = ctx.resolve_type_fqn_at(&reference, candidate) {
         ctx.record(fqn, candidate);
+        true
+    } else {
+        false
     }
 }
 

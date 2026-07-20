@@ -4,12 +4,12 @@ use crate::analyzer::usages::csharp_graph::resolver::{
     class_unit_for_fq_name, enclosing_declared_type, extension_visibility_site_key,
     first_type_child, is_type_reference_node, member_name_is_locally_bound,
     nearest_member_candidates_for_owner, node_text, normalize_type_text,
-    object_initializer_for_label, receiver_targets_owner, reference_type_text,
-    resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner, resolves_to_target,
-    resolves_to_target_at, same_node, seed_visible_bindings_at, type_identity_matches,
-    unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
-    unqualified_member_resolves_to_owner, usage_class_field_receiver_type,
-    usage_visible_extension_method_candidates,
+    object_initializer_for_label, object_initializer_owner_type_node, receiver_targets_owner,
+    reference_type_text, resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner,
+    resolves_to_target, resolves_to_target_at, same_node, seed_visible_bindings_at,
+    type_identity_matches, unqualified_member_has_local_binding,
+    unqualified_member_has_structured_shadow, unqualified_member_resolves_to_owner,
+    usage_class_field_receiver_type, usage_visible_extension_method_candidates,
 };
 use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::SymbolResolution;
@@ -19,8 +19,8 @@ use crate::analyzer::{
     CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, csharp_attribute_terminal_name,
     csharp_attribute_type_names, csharp_callable_arity, csharp_conditional_member_access,
     csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver, csharp_member_name,
-    csharp_type_leftmost_identifier, csharp_type_reference_root, csharp_type_terminal_identifier,
-    csharp_unqualified_invocation_for_name,
+    csharp_nameof_type_candidates, csharp_type_leftmost_identifier, csharp_type_reference_root,
+    csharp_type_terminal_identifier, csharp_unqualified_invocation_for_name,
 };
 use crate::hash::HashMap;
 use crate::text_utils::compute_line_starts;
@@ -133,6 +133,7 @@ enum TargetMemberResolution {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TypeCandidateRole {
     Ordinary,
+    Nameof,
     Pattern,
     Receiver,
 }
@@ -166,10 +167,16 @@ fn scan_type_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if let Some(candidate) = csharp_constant_pattern_type_candidate(node) {
-        scan_structured_type_candidate(candidate, TypeCandidateRole::Pattern, ctx);
+        scan_structured_type_candidate(candidate, TypeCandidateRole::Pattern, true, ctx);
     }
     if let Some(receiver) = csharp_member_access_type_receiver(node) {
-        scan_structured_type_candidate(receiver, TypeCandidateRole::Receiver, ctx);
+        scan_structured_type_candidate(receiver, TypeCandidateRole::Receiver, true, ctx);
+    }
+    if let Some((operand, qualified_owner)) = csharp_nameof_type_candidates(node, ctx.source)
+        && !scan_structured_type_candidate(operand, TypeCandidateRole::Nameof, false, ctx)
+        && let Some(owner) = qualified_owner
+    {
+        scan_structured_type_candidate(owner, TypeCandidateRole::Nameof, false, ctx);
     }
     let Some(root) = csharp_type_reference_root(node) else {
         return;
@@ -177,30 +184,32 @@ fn scan_type_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !same_node(root, node) || is_declaration_name(root) {
         return;
     }
-    scan_structured_type_candidate(root, TypeCandidateRole::Ordinary, ctx);
+    scan_structured_type_candidate(root, TypeCandidateRole::Ordinary, true, ctx);
 }
 
 fn scan_structured_type_candidate(
     candidate: Node<'_>,
     role: TypeCandidateRole,
+    filter_by_target_name: bool,
     ctx: &mut ScanCtx<'_>,
-) {
+) -> bool {
     let Some(terminal) = csharp_type_terminal_identifier(candidate) else {
-        return;
+        return false;
     };
     let raw_name = normalize_type_text(node_text(terminal, ctx.source));
-    if raw_name != ctx.spec.member_name
+    if filter_by_target_name
+        && raw_name != ctx.spec.member_name
         && !ctx
             .csharp
             .using_aliases_of(ctx.file)
             .contains_key(&raw_name)
     {
-        return;
+        return false;
     }
 
     if role != TypeCandidateRole::Ordinary {
         let Some(leftmost) = csharp_type_leftmost_identifier(candidate) else {
-            return;
+            return false;
         };
         let left_name = normalize_type_text(node_text(leftmost, ctx.source));
         let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -224,7 +233,7 @@ fn scan_structured_type_candidate(
             )
             .is_unknown()
         {
-            return;
+            return false;
         }
     }
 
@@ -239,10 +248,55 @@ fn scan_structured_type_candidate(
     ) {
         Some(resolved) if type_identity_matches(&resolved, &ctx.spec.target.fq_name()) => {
             push_hit(candidate, ctx);
+            true
         }
-        None if role == TypeCandidateRole::Receiver => push_unproven_hit(candidate, ctx),
-        Some(_) | None => {}
+        Some(resolved)
+            if role == TypeCandidateRole::Receiver
+                && csharp_receiver_member_selects_visible_target(
+                    candidate, &reference, &resolved, ctx,
+                ) =>
+        {
+            push_hit(candidate, ctx);
+            true
+        }
+        Some(_) => true,
+        None if role == TypeCandidateRole::Receiver => {
+            push_unproven_hit(candidate, ctx);
+            false
+        }
+        None => false,
     }
+}
+
+fn csharp_receiver_member_selects_visible_target(
+    receiver: Node<'_>,
+    reference: &str,
+    resolved_fqn: &str,
+    ctx: &mut ScanCtx<'_>,
+) -> bool {
+    let Some(visible) = ctx.csharp.resolve_usage_visible_type(ctx.file, reference) else {
+        return false;
+    };
+    if !type_identity_matches(&visible.fq_name(), &ctx.spec.target.fq_name()) {
+        return false;
+    }
+    let Some(access) = receiver.parent().filter(|parent| {
+        parent.kind() == "member_access_expression"
+            && member_access_receiver(*parent).is_some_and(|node| same_node(node, receiver))
+    }) else {
+        return false;
+    };
+    let Some(member) = member_access_name(access).and_then(csharp_member_name) else {
+        return false;
+    };
+    let member = node_text(member.identifier, ctx.source);
+    let Some(resolved_owner) = class_unit_for_fq_name(ctx.csharp, resolved_fqn) else {
+        return false;
+    };
+    nearest_member_candidates_for_owner(ctx.analyzer, ctx.csharp, &resolved_owner, member, None)
+        .is_empty()
+        && !nearest_member_candidates_for_owner(ctx.analyzer, ctx.csharp, &visible, member, None)
+            .is_empty()
 }
 
 fn scan_attribute_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -775,16 +829,7 @@ fn object_initializer_label_owner_resolution(
     let Some(initializer) = object_initializer_for_label(node) else {
         return LabelOwnerResolution::NotLabel;
     };
-    let Some(object_creation) = initializer.parent() else {
-        return LabelOwnerResolution::Unknown;
-    };
-    if object_creation.kind() != "object_creation_expression" {
-        return LabelOwnerResolution::Unknown;
-    }
-    let Some(type_node) = object_creation
-        .child_by_field_name("type")
-        .or_else(|| first_type_child(object_creation))
-    else {
+    let Some(type_node) = object_initializer_owner_type_node(initializer) else {
         return LabelOwnerResolution::Unknown;
     };
     let Some(receiver_fqn) = resolve_type_fq_name_at(

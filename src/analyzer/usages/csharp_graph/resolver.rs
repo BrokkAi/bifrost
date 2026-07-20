@@ -1725,7 +1725,15 @@ pub(super) fn usage_class_field_receiver_type(
         return SymbolResolution::Unknown;
     };
     let candidates =
-        nearest_member_candidates_for_owner(analyzer, csharp, &enclosing, receiver, None);
+        nearest_member_candidates_for_owner(analyzer, csharp, &enclosing, receiver, None)
+            .into_iter()
+            .filter(|candidate| {
+                !(candidate.is_function()
+                    && analyzer.parent_of(candidate).is_some_and(|owner| {
+                        candidate.identifier() == csharp_source_identifier(&owner)
+                    }))
+            })
+            .collect::<Vec<_>>();
     if candidates.is_empty() {
         return SymbolResolution::Unknown;
     }
@@ -1819,6 +1827,11 @@ fn nearest_member_candidates_for_owner_inner(
                 candidates
                     .into_iter()
                     .filter(|candidate: &CodeUnit| candidate.identifier() == name)
+                    .filter(|candidate| {
+                        analyzer
+                            .parent_of(candidate)
+                            .is_some_and(|parent| parent.fq_name() == current.fq_name())
+                    })
                     .filter(|candidate| {
                         explicit_generic_arity.is_none_or(|arity| {
                             candidate.is_function()
@@ -2101,6 +2114,72 @@ pub(in crate::analyzer::usages) fn object_initializer_for_label(
     .then_some(initializer)
 }
 
+pub(in crate::analyzer::usages) fn object_initializer_owner_type_node(
+    initializer: Node<'_>,
+) -> Option<Node<'_>> {
+    let object_creation = initializer.parent()?;
+    match object_creation.kind() {
+        "object_creation_expression" => object_creation
+            .child_by_field_name("type")
+            .or_else(|| first_type_child(object_creation))
+            .or_else(|| implicit_object_creation_declarator_type(object_creation)),
+        "implicit_object_creation_expression" => {
+            implicit_object_creation_declarator_type(object_creation)
+        }
+        _ => None,
+    }
+}
+
+fn implicit_object_creation_declarator_type(object_creation: Node<'_>) -> Option<Node<'_>> {
+    let mut current = object_creation;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "equals_value_clause" | "parenthesized_expression" | "checked_expression" => {
+                current = parent;
+            }
+            "ERROR" => {
+                if let Some(type_node) = error_recovered_implicit_declarator_type(parent, current) {
+                    return Some(type_node);
+                }
+                current = parent;
+            }
+            "variable_declarator" => {
+                let initializer = variable_declarator_initializer(parent)?;
+                if initializer.start_byte() > object_creation.start_byte()
+                    || object_creation.end_byte() > initializer.end_byte()
+                {
+                    return None;
+                }
+                let declaration = parent.parent()?;
+                return declaration
+                    .child_by_field_name("type")
+                    .or_else(|| first_type_child(declaration));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn error_recovered_implicit_declarator_type<'tree>(
+    error: Node<'tree>,
+    value: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let mut cursor = error.walk();
+    let children = error.named_children(&mut cursor).collect::<Vec<_>>();
+    let value_index = children.iter().position(|child| same_node(*child, value))?;
+    let name = value_index
+        .checked_sub(1)
+        .and_then(|index| children.get(index))?;
+    if !matches!(name.kind(), "identifier" | "implicit_parameter") {
+        return None;
+    }
+    let type_node = value_index
+        .checked_sub(2)
+        .and_then(|index| children.get(index))?;
+    is_type_syntax_kind(type_node.kind()).then_some(*type_node)
+}
+
 fn count_named_children_of_kind(node: Node<'_>, kind: &str) -> usize {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
@@ -2110,17 +2189,15 @@ fn count_named_children_of_kind(node: Node<'_>, kind: &str) -> usize {
 
 pub(in crate::analyzer::usages) fn first_type_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
-    node.named_children(&mut cursor).find(|child| {
-        matches!(
-            child.kind(),
-            "identifier"
-                | "qualified_name"
-                | "generic_name"
-                | "nullable_type"
-                | "array_type"
-                | "type"
-        )
-    })
+    node.named_children(&mut cursor)
+        .find(|child| is_type_syntax_kind(child.kind()))
+}
+
+fn is_type_syntax_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier" | "qualified_name" | "generic_name" | "nullable_type" | "array_type" | "type"
+    )
 }
 
 fn first_named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {

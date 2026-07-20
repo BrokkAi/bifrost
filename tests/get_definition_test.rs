@@ -15510,6 +15510,52 @@ public class Runner {
 }
 
 #[test]
+fn csharp_nongeneric_static_receiver_beats_same_named_generic_type() {
+    let source = r#"namespace Demo;
+
+[System.Runtime.CompilerServices.CollectionBuilder(
+    typeof(ImmutableEquatableArray),
+    nameof(ImmutableEquatableArray.Create))]
+public sealed class ImmutableEquatableArray<T>
+{
+    public ImmutableEquatableArray(T value) {}
+}
+
+public static class ImmutableEquatableArray
+{
+    public static ImmutableEquatableArray<T> Create<T>(T value) => new(value);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("ImmutableEquatableArray.cs", source)
+        .build();
+    let receiver = source
+        .find("ImmutableEquatableArray.Create")
+        .expect("nameof receiver");
+    for (start, expected_fqn) in [
+        (receiver, "Demo.ImmutableEquatableArray"),
+        (
+            receiver + "ImmutableEquatableArray.".len(),
+            "Demo.ImmutableEquatableArray.Create",
+        ),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference("ImmutableEquatableArray.cs", source, start),
+        );
+
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"].as_array().unwrap().len(),
+            1,
+            "{value}"
+        );
+        assert_eq!(result["definitions"][0]["fqn"], expected_fqn, "{value}");
+    }
+}
+
+#[test]
 fn csharp_typed_receiver_method_wrong_arity_returns_overload_definitions() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

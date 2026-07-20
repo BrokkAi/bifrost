@@ -880,6 +880,67 @@ fn csharp_is_structured_type_role(parent: Node<'_>, node: Node<'_>) -> bool {
     })
 }
 
+/// Return the expression that can denote a type in a `nameof(...)` operand.
+///
+/// C# parses `nameof(Type)` in expression position, so the identifier does not
+/// carry one of the ordinary syntax-tree type roles handled by
+/// [`csharp_type_reference_root`]. A qualified operand may itself be a type
+/// (`nameof(Namespace.Type)`); otherwise its receiver may be the type owner
+/// (`nameof(Type.Member)`). Resolution remains responsible for choosing the
+/// first valid interpretation and rejecting locals, fields, and other value
+/// expressions with the same shape.
+pub(crate) fn csharp_nameof_type_candidates<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, Option<Node<'tree>>)> {
+    if node.kind() != "invocation_expression" {
+        return None;
+    }
+    let function = node
+        .child_by_field_name("function")
+        .or_else(|| node.named_child(0))?;
+    if function.kind() != "identifier"
+        || source.get(function.start_byte()..function.end_byte())? != "nameof"
+    {
+        return None;
+    }
+    let arguments = node.child_by_field_name("arguments").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| child.kind() == "argument_list")
+    })?;
+    if arguments.named_child_count() != 1 {
+        return None;
+    }
+    let argument = arguments.named_child(0)?;
+    let operand = if argument.kind() == "argument" {
+        argument
+            .child_by_field_name("value")
+            .or_else(|| argument.child_by_field_name("expression"))
+            .or_else(|| argument.named_child(0))?
+    } else {
+        argument
+    };
+    let qualified_owner = if operand.kind() == "member_access_expression" {
+        Some(
+            operand
+                .child_by_field_name("expression")
+                .or_else(|| operand.named_child(0))?,
+        )
+    } else {
+        None
+    };
+    matches!(
+        operand.kind(),
+        "identifier"
+            | "qualified_name"
+            | "alias_qualified_name"
+            | "generic_name"
+            | "member_access_expression"
+    )
+    .then_some((operand, qualified_owner))
+}
+
 pub(crate) fn csharp_constant_pattern_type_candidate(node: Node<'_>) -> Option<Node<'_>> {
     if node.kind() != "constant_pattern" {
         return None;
