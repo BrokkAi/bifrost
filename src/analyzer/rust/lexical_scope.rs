@@ -89,12 +89,20 @@ pub(crate) fn insert_rust_import_binding(binder: &mut ImportBinder, import: &Imp
 }
 
 pub(crate) fn visible_import_binder_at(source: &str, reference_byte: usize) -> ImportBinder {
-    let mut binder = ImportBinder::empty();
     let Some(tree) = parse_rust_tree(source) else {
-        return binder;
+        return ImportBinder::empty();
     };
+    visible_import_binder_in_tree(tree.root_node(), source, reference_byte)
+}
+
+pub(crate) fn visible_import_binder_in_tree(
+    root: Node<'_>,
+    source: &str,
+    reference_byte: usize,
+) -> ImportBinder {
+    let mut binder = ImportBinder::empty();
     let mut imports = Vec::new();
-    collect_visible_use_statements(tree.root_node(), reference_byte, &mut imports);
+    collect_visible_use_statements(root, reference_byte, &mut imports);
     for import in imports
         .into_iter()
         .flat_map(|node| rust_imports_from_use_declaration(node, source))

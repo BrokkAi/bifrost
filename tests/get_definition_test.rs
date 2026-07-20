@@ -4695,6 +4695,192 @@ where
 }
 
 #[test]
+fn rust_explicit_type_import_beats_same_named_enclosing_type() {
+    let source = r#"
+mod tracing_core {
+    pub trait Subscriber {}
+}
+
+pub struct Subscriber;
+
+pub fn use_local(_: Subscriber) {}
+
+mod format {
+    use crate::tracing_core::Subscriber;
+
+    pub trait FormatEvent<S>
+    where
+        S: Subscriber,
+    {}
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    let imported = source.rfind("S: Subscriber").expect("imported type use") + "S: ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, imported),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "tracing_core.Subscriber",
+        "{value}"
+    );
+
+    let enclosing = source.find("_: Subscriber").unwrap() + "_: ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, enclosing),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "Subscriber",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_self_in_impl_of_scoped_type_alias_resolves_physical_owner() {
+    let main = r#"
+use comrak::options;
+
+enum ListStyle {
+    Plus,
+}
+
+impl From<ListStyle> for options::ListStyleType {
+    fn from(style: ListStyle) -> Self {
+        match style {
+            ListStyle::Plus => Self::Plus,
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"comrak\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+pub mod parser;
+pub use parser::options;
+
+#[deprecated]
+pub type ListStyleType = parser::options::ListStyleType;
+"#,
+        )
+        .file("src/parser/mod.rs", "pub mod options;\n")
+        .file(
+            "src/parser/options.rs",
+            r#"
+pub enum ListStyleType {
+    Dash,
+    Plus,
+    Star,
+}
+"#,
+        )
+        .file("src/main.rs", main)
+        .build();
+
+    for (start, expected_fqn, expected_kind) in [
+        (
+            main.find("-> Self").expect("bare Self return type") + "-> ".len(),
+            "parser.options.ListStyleType",
+            "class",
+        ),
+        (
+            main.find("Self::Plus").expect("associated owner"),
+            "parser.options.ListStyleType",
+            "class",
+        ),
+        (
+            main.find("Self::Plus").expect("associated item") + "Self::".len(),
+            "parser.options.ListStyleType.Plus",
+            "field",
+        ),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference("src/main.rs", main, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"].as_array().expect("definitions").len(),
+            1,
+            "{value}"
+        );
+        assert_eq!(result["definitions"][0]["fqn"], expected_fqn, "{value}");
+        assert_eq!(
+            result["definitions"][0]["path"], "src/parser/options.rs",
+            "{value}"
+        );
+        assert_eq!(result["definitions"][0]["kind"], expected_kind, "{value}");
+    }
+}
+
+#[test]
+fn rust_scoped_factory_call_preserves_owner_during_receiver_inference() {
+    let source = r#"
+struct AContext {
+    span: usize,
+}
+
+impl AContext {
+    fn parse() -> Result<Self, ()> { todo!() }
+
+    fn exercise() -> Result<(), ()> {
+        let root = ZFactory::parse()?;
+        root.span();
+        Ok(())
+    }
+
+    fn unresolved() -> Result<(), ()> {
+        let root = MissingFactory::parse()?;
+        root.span();
+        Ok(())
+    }
+}
+
+struct Wrapped;
+impl Wrapped {
+    fn span(&self) {}
+}
+
+struct ZFactory;
+impl ZFactory {
+    fn parse() -> Result<Wrapped, ()> { todo!() }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", source)
+        .build();
+
+    let proven = source.find("root.span();").expect("proven method") + "root.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("lib.rs", source, proven),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Wrapped.span", "{value}");
+    assert_eq!(result["definitions"][0]["kind"], "function", "{value}");
+
+    let unresolved = source.rfind("root.span();").expect("unresolved method") + "root.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("lib.rs", source, unresolved),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn rust_scoped_owner_resolution_preserves_namespace_and_canonical_identity() {
     let source = r#"
 mod format {
@@ -5351,6 +5537,38 @@ fn fit_to_json(fit: &ModelFit) {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "ModelFit.model", "{value}");
+}
+
+#[test]
+fn rust_qualified_macro_path_focus_resolves_each_exact_segment() {
+    let source = r#"
+pub struct EventInfo;
+impl EventInfo { pub fn default() -> Self { Self } }
+
+fn run() {
+    let _ = vec![EventInfo::default(), EventInfo::default()];
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", source)
+        .build();
+    let expression = "EventInfo::default()";
+    let first = source.find(expression).expect("first macro path");
+
+    for (offset, expected) in [
+        (first, "EventInfo"),
+        (first + "EventInfo::".len(), "EventInfo.default"),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference("lib.rs", source, offset),
+        );
+        assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+        assert_eq!(
+            value["results"][0]["definitions"][0]["fqn"], expected,
+            "{value}"
+        );
+    }
 }
 
 #[test]

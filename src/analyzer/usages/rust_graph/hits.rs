@@ -84,15 +84,34 @@ fn record_scoped_target_segment_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let path_text = node_text(path, ctx.source);
     if matches!(path.kind(), "identifier" | "type_identifier") {
         let resolved_root = resolve_rust_path_fqn(ctx.rust, ctx.refs, ctx.file, path_text);
-        if resolved_root.as_deref() == Some(ctx.target_fqn) {
+        let direct_binding_matches = ctx.matches_identifier(path_text, path.start_byte())
+            && !ctx.name_shadowed_at(path_text, path.start_byte());
+        if resolved_root.as_deref() == Some(ctx.target_fqn) || direct_binding_matches {
             record_target_segment(path, ctx);
         }
+    }
+    if ctx.matches_qualified_name(node_text(node, ctx.source))
+        && scoped_path_binding_visible(node, ctx)
+    {
+        record_target_segment(name, ctx);
+        return;
     }
     if !scoped_node_resolves_to_target(node, ctx) {
         return;
     }
 
     record_target_segment(name, ctx);
+}
+
+fn scoped_path_binding_visible(mut node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    while matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier") {
+        let Some(path) = node.child_by_field_name("path") else {
+            break;
+        };
+        node = path;
+    }
+    let root = node_text(node, ctx.source);
+    !root.is_empty() && !ctx.name_shadowed_at(root, node.start_byte())
 }
 
 fn scoped_node_resolves_to_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {

@@ -296,7 +296,7 @@ impl RustHierarchyIndex {
 }
 
 impl RustAnalyzer {
-    fn canonical_rust_hierarchy_type(&self, unit: CodeUnit) -> Option<CodeUnit> {
+    pub(crate) fn canonical_rust_hierarchy_type(&self, unit: CodeUnit) -> Option<CodeUnit> {
         if !self.is_rust_type_alias_declaration(&unit) {
             return Some(unit);
         }
