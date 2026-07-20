@@ -22,6 +22,7 @@ pub(super) enum TargetKind {
 
 pub(super) struct TargetSpec {
     pub(super) target: CodeUnit,
+    pub(super) targets: HashSet<CodeUnit>,
     pub(super) kind: TargetKind,
     pub(super) owner: CodeUnit,
     pub(super) receiver_owner_fq_names: HashSet<String>,
@@ -33,6 +34,7 @@ pub(super) struct TargetSpec {
 impl TargetSpec {
     pub(super) fn from_targets(analyzer: &JavaAnalyzer, targets: &[CodeUnit]) -> Option<Self> {
         let mut spec = Self::from_target(analyzer, targets.first()?)?;
+        spec.targets.extend(targets.iter().cloned());
         if let Some(arities) = spec.callable_arities.as_mut() {
             for target in &targets[1..] {
                 if target.fq_name() == spec.target.fq_name() && target.is_function() {
@@ -48,6 +50,7 @@ impl TargetSpec {
             let fq_name = target.fq_name();
             return Some(Self {
                 target: target.clone(),
+                targets: HashSet::from_iter([target.clone()]),
                 kind: TargetKind::Type,
                 owner: target.clone(),
                 receiver_owner_fq_names: [fq_name.clone()].into_iter().collect(),
@@ -70,6 +73,7 @@ impl TargetSpec {
 
         Some(Self {
             target: target.clone(),
+            targets: HashSet::from_iter([target.clone()]),
             kind,
             receiver_owner_fq_names: owner_sets.receiver,
             declaration_owner_fq_names: owner_sets.declarations,
@@ -79,6 +83,22 @@ impl TargetSpec {
             owner,
         })
     }
+}
+
+/// Return the receiver type of a constructor method reference such as
+/// `Request::new`. Tree-sitter models `new` as an unnamed keyword child, so it
+/// cannot be recovered through the named-child method-reference helper used for
+/// ordinary `Type::method` references.
+pub(super) fn constructor_method_reference_receiver(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "method_reference" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.children(&mut cursor).collect();
+    if !children.iter().any(|child| child.kind() == "new") {
+        return None;
+    }
+    children.into_iter().find(|child| child.is_named())
 }
 
 struct TargetOwnerSets {

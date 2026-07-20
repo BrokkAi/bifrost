@@ -172,6 +172,54 @@ class Consumer {
 }
 
 #[test]
+fn constructor_calls_and_method_references_edge_to_the_constructor() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "app/Request.java",
+            "package app; public class Request { public Request(String value) {} }\n",
+        )
+        .file(
+            "app/Other.java",
+            "package app; public class Other { public Other(String value) {} }\n",
+        )
+        .file(
+            "app/Consumer.java",
+            r#"
+package app;
+
+class Consumer {
+    Request direct(String value) {
+        return new Request(value);
+    }
+
+    java.util.function.Function<String, Request> factory() {
+        return Request::new;
+    }
+
+    java.util.function.Function<String, Other> otherFactory() {
+        return Other::new;
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    for caller in ["app.Consumer.direct", "app.Consumer.factory"] {
+        assert!(
+            find_edge(&value, caller, "app.Request.Request").is_some(),
+            "expected {caller} to edge to Request's constructor: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        find_edge(&value, "app.Consumer.otherFactory", "app.Request.Request").is_none(),
+        "wrong-owner constructor reference must not edge to Request: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn untyped_local_named_like_a_type_produces_no_static_edge() {
     let value = usage_graph();
 
