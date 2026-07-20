@@ -1,7 +1,7 @@
 use super::inverted::{
     BareMemberResolution, FieldResolution, MemberReturnResolution, NameResolver, ProjectTypes,
-    TypeApplicationResolution, TypeApplicationRole, callable_alternative_is_candidate,
-    callable_alternative_matches,
+    ScalaValueOwner, TypeApplicationResolution, TypeApplicationRole,
+    callable_alternative_is_candidate, callable_alternative_matches,
 };
 use super::method_call_arity_applies;
 use crate::analyzer::scala::imports::scala_import_infos_from_node;
@@ -615,7 +615,7 @@ fn seed_owner_field_definition(node: Node<'_>, owner: &CodeUnit, ctx: &mut ScanC
     let receiver_declaration = node
         .child_by_field_name("type")
         .and_then(|type_node| resolve_type_declaration_node(type_node, ctx));
-    let receiver_type = receiver_declaration
+    let receiver = receiver_declaration
         .is_none()
         .then(|| value_definition_receiver_type(node, ctx))
         .flatten();
@@ -628,12 +628,7 @@ fn seed_owner_field_definition(node: Node<'_>, owner: &CodeUnit, ctx: &mut ScanC
                 ctx.bindings,
             );
         } else {
-            seed_scala_binding(
-                name,
-                receiver_type.clone(),
-                Some(owner.clone()),
-                ctx.bindings,
-            );
+            seed_value_owner(name, receiver.clone(), Some(owner.clone()), ctx.bindings);
         }
     }
 }
@@ -802,33 +797,70 @@ fn seed_value_definition(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         return;
     }
-    let receiver_type = value_definition_receiver_type(node, ctx);
-    if receiver_type.is_none() {
+    let receiver = value_definition_receiver_type(node, ctx);
+    if receiver.is_none() {
+        if let Some(value) = node.child_by_field_name("value")
+            && matches!(value.kind(), "call_expression" | "instance_expression")
+        {
+            for name in scala_pattern_binder_names(pattern, ctx.source) {
+                seed_value_owner(name, None, None, ctx.bindings);
+            }
+            return;
+        }
         seed_value_definition_from_text(node_text(node, ctx.source), ctx);
         return;
     }
     for name in scala_pattern_binder_names(pattern, ctx.source) {
-        seed_scala_binding(name, receiver_type.clone(), None, ctx.bindings);
+        seed_value_owner(name, receiver.clone(), None, ctx.bindings);
     }
 }
 
-fn value_definition_receiver_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
+fn value_definition_receiver_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<ScalaValueOwner> {
     let value = node.child_by_field_name("value");
     node.child_by_field_name("type")
         .and_then(|type_node| resolve_type_node(type_node, ctx))
+        .map(ScalaValueOwner::Logical)
         .or_else(|| value.and_then(|value| constructed_or_applied_type_owner(value, ctx)))
-        .or_else(|| value.and_then(|value| call_initializer_return_owner(value, ctx)))
+        .or_else(|| {
+            value
+                .and_then(|value| call_initializer_return_owner(value, ctx))
+                .map(ScalaValueOwner::Logical)
+        })
         .or_else(|| {
             let type_name = node
                 .child_by_field_name("type")
                 .map(|type_node| node_text(type_node, ctx.source).trim());
             let value_name = value
+                .filter(|value_node| {
+                    !matches!(value_node.kind(), "call_expression" | "instance_expression")
+                })
                 .and_then(|value_node| constructor_type_name(node_text(value_node, ctx.source)));
             type_name
                 .or(value_name)
                 .and_then(|name| ctx.visibility.receiver_type_fq_name_for(name))
                 .map(str::to_string)
+                .map(ScalaValueOwner::Logical)
         })
+}
+
+fn seed_value_owner(
+    name: &str,
+    receiver: Option<ScalaValueOwner>,
+    declaration_owner: Option<CodeUnit>,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
+) {
+    match receiver {
+        Some(ScalaValueOwner::Exact(receiver)) => seed_scala_binding_with_receiver_declaration(
+            name,
+            receiver,
+            declaration_owner,
+            bindings,
+        ),
+        Some(ScalaValueOwner::Logical(receiver)) => {
+            seed_scala_binding(name, Some(receiver), declaration_owner, bindings)
+        }
+        None => seed_scala_binding(name, None, declaration_owner, bindings),
+    }
 }
 
 fn constructed_type_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
@@ -841,31 +873,32 @@ fn constructed_type_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
         .and_then(|type_node| resolve_type_node(type_node, ctx))
 }
 
-fn constructed_or_applied_type_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
-    constructed_type_owner(node, ctx).or_else(|| {
-        if node.kind() != "call_expression" {
-            return None;
-        }
-        let mut function = node.child_by_field_name("function")?;
-        while function.kind() == "call_expression" {
-            function = function.child_by_field_name("function")?;
-        }
-        if !matches!(function.kind(), "identifier" | "type_identifier") {
-            return None;
-        }
-        let name = node_text(function, ctx.source).trim();
-        if name.is_empty() {
-            return None;
-        }
-        resolve_unqualified_type_application(
-            function,
-            name,
-            TypeApplicationRole::BareApplication,
-            ctx,
-        )
-        .and_then(|resolution| resolution.type_target)
-        .map(|target| target.fq_name())
-    })
+fn constructed_or_applied_type_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<ScalaValueOwner> {
+    constructed_type_owner(node, ctx)
+        .map(ScalaValueOwner::Logical)
+        .or_else(|| {
+            if node.kind() != "call_expression" {
+                return None;
+            }
+            let mut function = node.child_by_field_name("function")?;
+            while function.kind() == "call_expression" {
+                function = function.child_by_field_name("function")?;
+            }
+            if !matches!(function.kind(), "identifier" | "type_identifier") {
+                return None;
+            }
+            let name = node_text(function, ctx.source).trim();
+            if name.is_empty() {
+                return None;
+            }
+            resolve_unqualified_type_application(
+                function,
+                name,
+                TypeApplicationRole::BareApplication,
+                ctx,
+            )
+            .and_then(|resolution| resolution.value_result)
+        })
 }
 
 fn constructed_receiver_type_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
@@ -942,10 +975,10 @@ fn refresh_assignment_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
     let declaration_owner =
         precise_scala_binding(ctx.bindings, name).and_then(|binding| binding.declaration_owner);
-    if let Some(receiver_type) = call_initializer_return_owner(right, ctx)
-        .or_else(|| constructed_or_applied_type_owner(right, ctx))
+    if let Some(receiver) = constructed_or_applied_type_owner(right, ctx)
+        .or_else(|| call_initializer_return_owner(right, ctx).map(ScalaValueOwner::Logical))
     {
-        seed_scala_binding(name, Some(receiver_type), declaration_owner, ctx.bindings);
+        seed_value_owner(name, Some(receiver), declaration_owner, ctx.bindings);
         return;
     }
     if matches!(right.kind(), "identifier" | "operator_identifier") {

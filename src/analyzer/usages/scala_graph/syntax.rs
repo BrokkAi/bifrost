@@ -13,6 +13,19 @@ pub(crate) struct ScalaSourceFacts {
     pub(crate) stable_owner_ranges: HashSet<(usize, usize)>,
     pub(crate) case_class_ranges: HashSet<(usize, usize)>,
     pub(crate) abstract_callable_ranges: HashSet<(usize, usize)>,
+    pub(crate) generic_owner_facts_by_range: HashMap<(usize, usize), ScalaGenericOwnerSourceFacts>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ScalaTypeExpressionPath {
+    pub(crate) segments: Vec<String>,
+    pub(crate) arguments: Vec<ScalaTypeExpressionPath>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ScalaGenericOwnerSourceFacts {
+    pub(crate) type_parameters: Vec<String>,
+    pub(crate) supertypes: Vec<ScalaTypeExpressionPath>,
 }
 
 #[derive(Clone)]
@@ -323,11 +336,16 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                         .case_class_ranges
                         .insert((node.start_byte(), node.end_byte()));
                 }
+                record_generic_owner_facts(node, source, &mut facts);
             }
             "object_definition" | "enum_definition" => {
                 facts
                     .stable_owner_ranges
                     .insert((node.start_byte(), node.end_byte()));
+                record_generic_owner_facts(node, source, &mut facts);
+            }
+            "trait_definition" => {
+                record_generic_owner_facts(node, source, &mut facts);
             }
             _ => {}
         }
@@ -335,6 +353,93 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
         stack.extend(node.named_children(&mut cursor));
     }
     Some(facts)
+}
+
+fn record_generic_owner_facts(node: Node<'_>, source: &str, facts: &mut ScalaSourceFacts) {
+    let type_parameters = node
+        .child_by_field_name("type_parameters")
+        .map(|parameters| {
+            let mut cursor = parameters.walk();
+            parameters
+                .named_children(&mut cursor)
+                .filter_map(|parameter| {
+                    let name = parameter.child_by_field_name("name").unwrap_or(parameter);
+                    matches!(
+                        name.kind(),
+                        "identifier" | "operator_identifier" | "type_identifier"
+                    )
+                    .then(|| node_text(name, source).trim().to_string())
+                    .filter(|name| !name.is_empty())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let supertypes = crate::analyzer::scala::scala_supertype_lookup_nodes(node)
+        .into_iter()
+        .filter_map(|(parent, _)| scala_type_expression_path(parent, source))
+        .collect::<Vec<_>>();
+    facts.generic_owner_facts_by_range.insert(
+        (node.start_byte(), node.end_byte()),
+        ScalaGenericOwnerSourceFacts {
+            type_parameters,
+            supertypes,
+        },
+    );
+}
+
+fn scala_type_expression_path(node: Node<'_>, source: &str) -> Option<ScalaTypeExpressionPath> {
+    if matches!(node.kind(), "generic_type" | "applied_constructor_type") {
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        let arguments = match children
+            .iter()
+            .copied()
+            .find(|child| child.kind() == "type_arguments")
+        {
+            Some(arguments) => {
+                let mut cursor = arguments.walk();
+                arguments
+                    .named_children(&mut cursor)
+                    .map(|argument| scala_type_expression_path(argument, source))
+                    .collect::<Option<Vec<_>>>()
+            }
+            None => Some(Vec::new()),
+        }?;
+        let constructor = children.into_iter().find(|child| {
+            !matches!(
+                child.kind(),
+                "type_arguments" | "arguments" | "annotation" | "structural_type"
+            )
+        })?;
+        let segments = scala_type_lookup_segments(constructor, source);
+        return (!segments.is_empty()).then_some(ScalaTypeExpressionPath {
+            segments,
+            arguments,
+        });
+    }
+    if matches!(node.kind(), "annotated_type") {
+        let mut cursor = node.walk();
+        return node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() != "annotation")
+            .and_then(|child| scala_type_expression_path(child, source));
+    }
+    if !matches!(
+        node.kind(),
+        "identifier"
+            | "operator_identifier"
+            | "type_identifier"
+            | "stable_type_identifier"
+            | "projected_type"
+            | "singleton_type"
+    ) {
+        return None;
+    }
+    let segments = scala_type_lookup_segments(node, source);
+    (!segments.is_empty()).then_some(ScalaTypeExpressionPath {
+        segments,
+        arguments: Vec::new(),
+    })
 }
 
 /// Return only the value binders introduced by a Scala pattern.

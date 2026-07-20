@@ -112,7 +112,8 @@ object ImportedFactories {
             r#"package model
 class EntityRef { def ask(): String = "ok" }
 class ClusterSharding { def entityRefFor(): EntityRef = new EntityRef }
-object ClusterSharding { def apply(system: String): ClusterSharding = new ClusterSharding }
+abstract class ExtensionId[T] { def apply(system: String): T }
+object ClusterSharding extends ExtensionId[ClusterSharding]
 class Graph { def buildTargets(): Int = 1 }
 object Graph { def apply(nodes: Set[Int])(edge: (Int, Int) => Boolean): Graph = new Graph }
 object Factories {
@@ -168,6 +169,205 @@ object Factories {
     assert_no_hit_line(
         &build_hits,
         line_of(imported_source, "negative-imported-same-shape"),
+    );
+}
+
+#[test]
+fn scala_inherited_generic_apply_substitutes_exact_result_owner_and_fails_closed() {
+    let use_source = r#"package app
+import model.*
+object Use {
+  val system = new System
+  val sharding = ClusterSharding(system) // inherited-factory-application
+  def akkaShape = {
+    val ref = sharding.entityRefFor()
+    ref.ask() // inherited-one-hop
+  }
+  def twoHop = {
+    val value = Service(system) // two-hop-factory-application
+    value.selected() // inherited-two-hop
+  }
+  def qualified = {
+    val value = QualifiedFactory(system)
+    value.qualifiedOnly() // qualified-result
+  }
+  def substitutedOther = {
+    val value = WrongFactory(system) // wrong-factory-application
+    value.otherOnly() // substituted-not-factory
+  }
+  def directWins = {
+    val value = DirectFactory(system) // direct-apply-application
+    value.directOnly() // direct-apply-authoritative
+  }
+  def directWithAmbiguousAncestor = {
+    val value = IndependentFactory(system) // ambiguous-ancestor-direct-application
+    value.independentOnly() // direct-apply-ignores-ambiguous-ancestor
+  }
+  def unresolved = {
+    val value = MissingFactory(system)
+    value.selected() // unresolved-argument
+  }
+  def badArity = {
+    val value = BadArityFactory(system)
+    value.selected() // mismatched-arity
+  }
+  def ambiguous = {
+    val value = AmbiguousFactory(system)
+    value.productOnly() // ambiguous-physical-result
+  }
+  def unknownDirect = {
+    val value = BlockingFactory(system)
+    value.otherOnly() // direct-unknown-blocks-inherited
+    value.blockingOnly() // direct-unknown-blocks-constructor
+  }
+  def conflicting = {
+    val value = ConflictFactory(system)
+    value.selected() // conflicting-direct-returns
+  }
+  def compound = {
+    val value = UnionFactory(system)
+    value.selected() // compound-type-argument
+    value.otherOnly() // compound-type-argument-other
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Factories.scala",
+            r#"package model
+class System
+abstract class Factory[T] { def apply(system: System): T }
+abstract class Mid[T] extends Factory[T]
+class EntityRef { def ask(): Unit = () }
+abstract class ClusterSharding { def entityRefFor(): EntityRef }
+object ClusterSharding extends Factory[ClusterSharding]
+class Service { def selected(): Unit = () }
+object Service extends Mid[Service]
+class Other { def otherOnly(): Unit = () }
+object WrongFactory extends Factory[Other]
+class DirectFactory { def directOnly(): Unit = () }
+object DirectFactory extends Factory[Other] {
+  override def apply(system: System): DirectFactory = new DirectFactory
+}
+object MissingFactory extends Factory[external.Missing]
+abstract class PairFactory[A, B] { def apply(system: System): A }
+object BadArityFactory extends PairFactory[Service]
+class BlockingFactory { def blockingOnly(): Unit = () }
+object BlockingFactory extends Factory[Other] {
+  override def apply(system: System) = new Service
+}
+object ConflictFactory {
+  def apply(system: System): Service = new Service
+  def apply(system: System): Other = new Other
+}
+object AmbiguousFactory extends Factory[dup.Product]
+class IndependentProduct { def independentOnly(): Unit = () }
+object IndependentFactory extends dup.Marker {
+  def apply(system: System): IndependentProduct = new IndependentProduct
+}
+object UnionFactory extends Factory[Service | Other]
+"#,
+        ),
+        (
+            "model/nested/Qualified.scala",
+            "package model.nested\nclass QualifiedProduct { def qualifiedOnly(): Unit = () }\n",
+        ),
+        (
+            "model/QualifiedFactory.scala",
+            "package model\nobject QualifiedFactory extends Factory[model.nested.QualifiedProduct]\n",
+        ),
+        (
+            "dup/jvm/Product.scala",
+            "package dup\ntrait Marker\nclass Product { def productOnly(): Unit = () }\n",
+        ),
+        (
+            "dup/js/Product.scala",
+            "package dup\ntrait Marker\nclass Product { def productOnly(): Unit = () }\n",
+        ),
+        ("app/Use.scala", use_source),
+    ]);
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = ScalaUsageGraphStrategy::new();
+
+    for (fqn, marker) in [
+        ("model.EntityRef.ask", "inherited-one-hop"),
+        ("model.Service.selected", "inherited-two-hop"),
+        (
+            "model.nested.QualifiedProduct.qualifiedOnly",
+            "qualified-result",
+        ),
+        ("model.Other.otherOnly", "substituted-not-factory"),
+        (
+            "model.DirectFactory.directOnly",
+            "direct-apply-authoritative",
+        ),
+        (
+            "model.IndependentProduct.independentOnly",
+            "direct-apply-ignores-ambiguous-ancestor",
+        ),
+    ] {
+        let target = definition(&analyzer, fqn);
+        let target_hits =
+            hits(strategy.find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 100));
+        assert_hit_line(&target_hits, line_of(use_source, marker));
+    }
+
+    for (fqn, markers) in [
+        (
+            "model.Service.selected",
+            &[
+                "unresolved-argument",
+                "mismatched-arity",
+                "conflicting-direct-returns",
+                "compound-type-argument",
+            ][..],
+        ),
+        (
+            "model.Other.otherOnly",
+            &[
+                "direct-unknown-blocks-inherited",
+                "compound-type-argument-other",
+            ][..],
+        ),
+        (
+            "model.BlockingFactory.blockingOnly",
+            &["direct-unknown-blocks-constructor"][..],
+        ),
+        (
+            "dup.Product.productOnly",
+            &["ambiguous-physical-result"][..],
+        ),
+    ] {
+        let target = definition(&analyzer, fqn);
+        let target_hits =
+            hits(strategy.find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 100));
+        for marker in markers {
+            assert_no_hit_line(&target_hits, line_of(use_source, marker));
+        }
+    }
+
+    let direct_apply = definition(&analyzer, "model.DirectFactory$.apply");
+    let direct_apply_hits = hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&direct_apply),
+        &candidates,
+        100,
+    ));
+    assert_hit_line(
+        &direct_apply_hits,
+        line_of(use_source, "direct-apply-application"),
+    );
+
+    let independent_apply = definition(&analyzer, "model.IndependentFactory$.apply");
+    let independent_apply_hits = hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&independent_apply),
+        &candidates,
+        100,
+    ));
+    assert_hit_line(
+        &independent_apply_hits,
+        line_of(use_source, "ambiguous-ancestor-direct-application"),
     );
 }
 

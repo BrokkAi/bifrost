@@ -37,10 +37,11 @@ use super::resolver::{
 use super::shared::ScalaEdgeGraph;
 use super::syntax::{
     ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableRole, ScalaCallableSiteRole,
-    ScalaCallableUsePolicy, ScalaFunctionParameterShape, ScalaImportContextIndex,
-    ScalaMethodValueContext, ScalaPackageContextIndex, ScalaParameterTypeIdentity,
-    ScalaQualifiedStableTypeRole, ScalaSourceFacts, call_arities_for_reference,
-    call_site_shape_for_reference, enclosing_template_declarations, invocation_function_reference,
+    ScalaCallableUsePolicy, ScalaFunctionParameterShape, ScalaGenericOwnerSourceFacts,
+    ScalaImportContextIndex, ScalaMethodValueContext, ScalaPackageContextIndex,
+    ScalaParameterTypeIdentity, ScalaQualifiedStableTypeRole, ScalaSourceFacts,
+    ScalaTypeExpressionPath, call_arities_for_reference, call_site_shape_for_reference,
+    enclosing_template_declarations, invocation_function_reference,
     is_bare_companion_method_value_reference, is_call_function_reference,
     is_constructor_like_reference, is_declaration_name, is_extractor_reference,
     is_infix_pattern_operator, is_scala_case_pattern_binder, is_scala_class_reference,
@@ -128,6 +129,29 @@ pub(super) enum TypeApplicationRole {
 pub(super) struct TypeApplicationResolution {
     pub(super) type_target: Option<CodeUnit>,
     pub(super) callable_targets: Vec<CodeUnit>,
+    pub(super) value_result: Option<ScalaValueOwner>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum ScalaValueOwner {
+    Exact(CodeUnit),
+    Logical(String),
+}
+
+struct ScalaCallableValueResolution {
+    callable_targets: Vec<CodeUnit>,
+    value_result: Option<ScalaValueOwner>,
+}
+
+enum ScalaCallableTierResolution {
+    NoApplicableCallable,
+    Applicable(Option<ScalaCallableValueResolution>),
+}
+
+enum ScalaApplyValueResolution {
+    NoDeclaration,
+    NoApplicableCallable,
+    Authoritative(Option<ScalaCallableValueResolution>),
 }
 
 /// Every type-namespace declaration the project exposes, indexed for the
@@ -1817,6 +1841,310 @@ impl ProjectTypes {
         }
 
         completed.remove(root).unwrap_or_else(|| vec![root.clone()])
+    }
+
+    fn generic_owner_source_facts(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+    ) -> Option<ScalaGenericOwnerSourceFacts> {
+        let source_facts = self.source_facts_for_file(scala, owner.source());
+        let mut matches = self
+            .declaration_ranges_for(scala, owner)
+            .into_iter()
+            .filter_map(|range| {
+                source_facts
+                    .generic_owner_facts_by_range
+                    .get(&(range.start_byte, range.end_byte))
+                    .cloned()
+            });
+        let first = matches.next()?;
+        matches.all(|facts| facts == first).then_some(first)
+    }
+
+    fn concrete_type_expression_owner(
+        &self,
+        scala: &ScalaAnalyzer,
+        declaration: &CodeUnit,
+        expression: &ScalaTypeExpressionPath,
+    ) -> Option<CodeUnit> {
+        let resolver = NameResolver::for_file_types(scala, declaration, self);
+        let fqn = self.resolve_type_in_callable_declaration_context(
+            scala,
+            &resolver,
+            declaration,
+            &expression.segments,
+        )?;
+        match self.exact_type_declaration_for_owner_context(&fqn, declaration) {
+            ScalaTypeNamespaceResolution::Resolved(owner) => Some(owner),
+            ScalaTypeNamespaceResolution::AuthoritativeMiss
+            | ScalaTypeNamespaceResolution::Ambiguous
+            | ScalaTypeNamespaceResolution::NoMatch => None,
+        }
+    }
+
+    fn generic_environments_for_linearization(
+        &self,
+        scala: &ScalaAnalyzer,
+        root: &CodeUnit,
+    ) -> Option<HashMap<CodeUnit, HashMap<String, CodeUnit>>> {
+        let mut environments = HashMap::<CodeUnit, HashMap<String, CodeUnit>>::default();
+        environments.insert(root.clone(), HashMap::default());
+        let mut pending = vec![root.clone()];
+        let mut expanded = HashSet::default();
+        while let Some(owner) = pending.pop() {
+            if !expanded.insert(owner.clone()) {
+                continue;
+            }
+            let environment = environments.get(&owner)?.clone();
+            let owner_facts = self.generic_owner_source_facts(scala, &owner)?;
+            let direct_ancestors = match self.exact_direct_ancestor_resolution(scala, &owner) {
+                ScalaDirectAncestorResolution::Resolved(ancestors) => ancestors,
+                ScalaDirectAncestorResolution::Ambiguous => return None,
+            };
+            for ancestor in direct_ancestors {
+                let mut matching_expressions = owner_facts.supertypes.iter().filter(|expression| {
+                    self.concrete_type_expression_owner(scala, &owner, expression)
+                        .as_ref()
+                        == Some(&ancestor)
+                });
+                let expression = matching_expressions.next()?;
+                if matching_expressions.next().is_some() {
+                    return None;
+                }
+                let ancestor_facts = self.generic_owner_source_facts(scala, &ancestor)?;
+                if ancestor_facts.type_parameters.len() != expression.arguments.len() {
+                    return None;
+                }
+                let mut ancestor_environment = HashMap::default();
+                for (parameter, argument) in ancestor_facts
+                    .type_parameters
+                    .iter()
+                    .zip(&expression.arguments)
+                {
+                    let value = if argument.arguments.is_empty()
+                        && argument.segments.len() == 1
+                        && owner_facts
+                            .type_parameters
+                            .iter()
+                            .any(|candidate| candidate == &argument.segments[0])
+                    {
+                        environment.get(&argument.segments[0]).cloned()
+                    } else {
+                        self.concrete_type_expression_owner(scala, &owner, argument)
+                    }?;
+                    ancestor_environment.insert(parameter.clone(), value);
+                }
+                if environments
+                    .get(&ancestor)
+                    .is_some_and(|existing| existing != &ancestor_environment)
+                {
+                    return None;
+                }
+                if environments
+                    .insert(ancestor.clone(), ancestor_environment)
+                    .is_none()
+                {
+                    pending.push(ancestor);
+                }
+            }
+        }
+        Some(environments)
+    }
+
+    fn callable_return_value_from_path(
+        &self,
+        scala: &ScalaAnalyzer,
+        method: &CodeUnit,
+        declaring_owner: &CodeUnit,
+        environment: &HashMap<String, CodeUnit>,
+        return_path: &[String],
+    ) -> Option<ScalaValueOwner> {
+        if return_path.len() == 1
+            && let Some(owner) = environment.get(&return_path[0])
+        {
+            return Some(ScalaValueOwner::Exact(owner.clone()));
+        }
+        let owner_facts = self.generic_owner_source_facts(scala, declaring_owner)?;
+        if return_path.len() == 1
+            && owner_facts
+                .type_parameters
+                .iter()
+                .any(|parameter| parameter == &return_path[0])
+        {
+            return None;
+        }
+        let resolver = NameResolver::for_file_types(scala, method, self);
+        let fqn = self.resolve_type_in_callable_declaration_context(
+            scala,
+            &resolver,
+            method,
+            return_path,
+        )?;
+        match self.exact_type_declaration_for_owner_context(&fqn, method) {
+            ScalaTypeNamespaceResolution::Resolved(owner) => Some(ScalaValueOwner::Exact(owner)),
+            ScalaTypeNamespaceResolution::NoMatch => Some(ScalaValueOwner::Logical(fqn)),
+            ScalaTypeNamespaceResolution::AuthoritativeMiss
+            | ScalaTypeNamespaceResolution::Ambiguous => None,
+        }
+    }
+
+    fn callable_value_resolution_for_members(
+        &self,
+        scala: &ScalaAnalyzer,
+        declaring_owner: &CodeUnit,
+        members: &[&CodeUnit],
+        call_shape: Option<&ScalaCallSiteShape>,
+        environment: &HashMap<String, CodeUnit>,
+    ) -> ScalaCallableTierResolution {
+        if members
+            .iter()
+            .any(|member| self.member_blocks_callable_lookup(scala, member))
+        {
+            return ScalaCallableTierResolution::NoApplicableCallable;
+        }
+        let mut source_candidates = Vec::new();
+        for method in members
+            .iter()
+            .copied()
+            .filter(|member| member.is_function())
+        {
+            let source_facts = self.source_facts_for_file(scala, method.source());
+            for range in self.declaration_ranges_for(scala, method) {
+                if let Some(alternative) = source_facts
+                    .callable_alternatives_by_range
+                    .get(&(range.start_byte, range.end_byte))
+                    .filter(|alternative| alternative.role == ScalaCallableRole::Ordinary)
+                {
+                    source_candidates.push((method, alternative.clone()));
+                }
+            }
+        }
+        let candidate_count = source_candidates
+            .iter()
+            .filter(|(_, alternative)| {
+                call_shape.is_none_or(|shape| {
+                    scala_callable_alternative_is_candidate(
+                        alternative.role,
+                        &alternative.shape,
+                        shape,
+                        ScalaCallableSiteRole::Ordinary,
+                    )
+                })
+            })
+            .count();
+        let unique_callable = candidate_count == 1;
+        let mut callable_targets = Vec::new();
+        let mut value_result = None;
+        let mut saw_unknown_return = false;
+        for (method, alternative) in source_candidates {
+            if !scala_callable_alternative_matches(
+                alternative.role,
+                &alternative.shape,
+                call_shape,
+                ScalaCallableSiteRole::Ordinary,
+                unique_callable,
+            ) {
+                continue;
+            }
+            let value = alternative
+                .return_type_path
+                .as_deref()
+                .and_then(|return_path| {
+                    self.callable_return_value_from_path(
+                        scala,
+                        method,
+                        declaring_owner,
+                        environment,
+                        return_path,
+                    )
+                });
+            let Some(value) = value else {
+                callable_targets.push(method.clone());
+                saw_unknown_return = true;
+                continue;
+            };
+            if value_result
+                .as_ref()
+                .is_some_and(|resolved| resolved != &value)
+            {
+                return ScalaCallableTierResolution::Applicable(None);
+            }
+            value_result = Some(value);
+            callable_targets.push(method.clone());
+        }
+        callable_targets.sort();
+        callable_targets.dedup();
+        if callable_targets.is_empty() {
+            return ScalaCallableTierResolution::NoApplicableCallable;
+        }
+        ScalaCallableTierResolution::Applicable(Some(ScalaCallableValueResolution {
+            callable_targets,
+            value_result: (!saw_unknown_return).then_some(value_result).flatten(),
+        }))
+    }
+
+    fn inherited_apply_value_resolution(
+        &self,
+        scala: &ScalaAnalyzer,
+        root: &CodeUnit,
+        call_shape: Option<&ScalaCallSiteShape>,
+    ) -> ScalaApplyValueResolution {
+        let root_members = self.members_for_exact_owner_unit(scala, root, "apply");
+        if !root_members.is_empty() {
+            // A direct declaration is authoritative without consulting an
+            // unrelated or ambiguous ancestor hierarchy. Objects cannot
+            // introduce type parameters of their own, so this tier starts
+            // with an empty substitution environment.
+            return match self.callable_value_resolution_for_members(
+                scala,
+                root,
+                &root_members,
+                call_shape,
+                &HashMap::default(),
+            ) {
+                ScalaCallableTierResolution::NoApplicableCallable => {
+                    ScalaApplyValueResolution::NoApplicableCallable
+                }
+                ScalaCallableTierResolution::Applicable(resolution) => {
+                    ScalaApplyValueResolution::Authoritative(resolution)
+                }
+            };
+        }
+        let mut declaring_tier = None;
+        for owner in self.linearized_owners(scala, root).into_iter().skip(1) {
+            let members = self.members_for_exact_owner_unit(scala, &owner, "apply");
+            if !members.is_empty() {
+                declaring_tier = Some((owner, members));
+                break;
+            }
+        }
+        let Some((owner, members)) = declaring_tier else {
+            return ScalaApplyValueResolution::NoDeclaration;
+        };
+        // The first declaring tier is authoritative even if its overloads,
+        // return type, or generic substitution cannot be proven.
+        let resolution = self
+            .generic_environments_for_linearization(scala, root)
+            .and_then(|environments| {
+                let environment = environments.get(&owner)?;
+                Some(self.callable_value_resolution_for_members(
+                    scala,
+                    &owner,
+                    &members,
+                    call_shape,
+                    environment,
+                ))
+            });
+        match resolution {
+            Some(ScalaCallableTierResolution::NoApplicableCallable) => {
+                ScalaApplyValueResolution::NoApplicableCallable
+            }
+            Some(ScalaCallableTierResolution::Applicable(resolution)) => {
+                ScalaApplyValueResolution::Authoritative(resolution)
+            }
+            None => ScalaApplyValueResolution::Authoritative(None),
+        }
     }
 
     pub(crate) fn member_return_type(
@@ -3864,6 +4192,7 @@ impl ProjectTypes {
                 type_target: type_target
                     .filter(|target| self.class_accepts_extractor_role(scala, target)),
                 callable_targets,
+                value_result: None,
             };
         }
 
@@ -3909,6 +4238,7 @@ impl ProjectTypes {
                 }
             });
             return TypeApplicationResolution {
+                value_result: type_target.clone().map(ScalaValueOwner::Exact),
                 type_target,
                 callable_targets,
             };
@@ -3941,37 +4271,59 @@ impl ProjectTypes {
                 same_file
             }
         };
-        let apply_targets = apply_owners
-            .iter()
-            .flat_map(|owner| {
-                let members = self.members_for_exact_owner_unit(scala, owner, "apply");
-                self.callable_declarations_for_members(
-                    scala,
-                    &members,
-                    call_shape,
-                    ScalaCallableSiteRole::Ordinary,
-                )
-            })
-            .collect::<Vec<_>>();
+        if apply_owners.len() > 1 {
+            return TypeApplicationResolution {
+                type_target: None,
+                callable_targets: Vec::new(),
+                value_result: None,
+            };
+        }
+        let apply_resolution = apply_owners
+            .first()
+            .map(|owner| self.inherited_apply_value_resolution(scala, owner, call_shape))
+            .unwrap_or(ScalaApplyValueResolution::NoDeclaration);
+        let apply_resolution = match apply_resolution {
+            ScalaApplyValueResolution::NoDeclaration
+            | ScalaApplyValueResolution::NoApplicableCallable => None,
+            ScalaApplyValueResolution::Authoritative(None) => {
+                return TypeApplicationResolution {
+                    type_target: None,
+                    callable_targets: Vec::new(),
+                    value_result: None,
+                };
+            }
+            ScalaApplyValueResolution::Authoritative(resolution) => resolution,
+        };
+        let apply_targets = apply_resolution
+            .as_ref()
+            .map(|resolution| resolution.callable_targets.clone())
+            .unwrap_or_default();
         match physical_callable_targets(scala, apply_targets) {
             PhysicalCallableTargets::Unique(mut apply_targets) => {
                 if !type_candidates.is_empty() {
                     let mut seen = HashSet::default();
                     apply_targets.retain(|target| seen.insert(target.clone()));
                 }
+                let value_result = apply_resolution.and_then(|resolution| resolution.value_result);
                 return TypeApplicationResolution {
                     type_target: type_target.filter(|target| {
-                        self.class_application_matches_with_shape(
-                            scala, resolver, target, call_shape,
-                        )
+                        value_result.as_ref().is_some_and(|value| match value {
+                            ScalaValueOwner::Exact(owner) => owner == target,
+                            ScalaValueOwner::Logical(fqn) => {
+                                scala_normalized_fq_name(fqn)
+                                    == scala_normalized_fq_name(&target.fq_name())
+                            }
+                        })
                     }),
                     callable_targets: apply_targets,
+                    value_result,
                 };
             }
             PhysicalCallableTargets::Ambiguous => {
                 return TypeApplicationResolution {
                     type_target: None,
                     callable_targets: Vec::new(),
+                    value_result: None,
                 };
             }
             PhysicalCallableTargets::NoCandidates => {}
@@ -3995,6 +4347,13 @@ impl ProjectTypes {
             .collect::<Vec<_>>();
         let callable_targets = physical_callable_targets(scala, callable_targets).into_unique();
         TypeApplicationResolution {
+            value_result: type_target
+                .as_ref()
+                .filter(|target| {
+                    self.class_application_matches_with_shape(scala, resolver, target, call_shape)
+                })
+                .cloned()
+                .map(ScalaValueOwner::Exact),
             type_target: type_target.filter(|target| {
                 self.class_application_matches_with_shape(scala, resolver, target, call_shape)
             }),
@@ -6935,10 +7294,14 @@ fn refresh_assignment_binding(
         );
         return;
     }
-    let receiver_type = constructed_or_applied_type(right, ctx)
-        .or_else(|| call_result_type(right, ctx, bindings))
-        .or_else(|| source_binding.and_then(|binding| binding.receiver_type));
-    seed_scala_binding(name, receiver_type, declaration_owner, bindings);
+    let receiver = constructed_or_applied_type(right, ctx)
+        .or_else(|| call_result_type(right, ctx, bindings).map(ScalaValueOwner::Logical))
+        .or_else(|| {
+            source_binding
+                .and_then(|binding| binding.receiver_type)
+                .map(ScalaValueOwner::Logical)
+        });
+    seed_value_owner(name, receiver, declaration_owner, bindings);
 }
 
 fn record_override_declaration(node: Node<'_>, ctx: &mut ScalaScan<'_, '_>) {
@@ -7120,6 +7483,7 @@ fn seed_value_definition_with_owner(
         .child_by_field_name("type")
         .filter(|_| receiver_declaration.is_none())
         .and_then(|type_node| resolve_receiver_type_node(type_node, ctx))
+        .map(ScalaValueOwner::Logical)
         .or_else(|| {
             node.child_by_field_name("value")
                 .and_then(|value| constructed_or_applied_type(value, ctx))
@@ -7127,6 +7491,7 @@ fn seed_value_definition_with_owner(
         .or_else(|| {
             node.child_by_field_name("value")
                 .and_then(|value| call_result_type(value, ctx, bindings))
+                .map(ScalaValueOwner::Logical)
         });
     let Some(pattern) = node.child_by_field_name("pattern") else {
         return;
@@ -7140,7 +7505,7 @@ fn seed_value_definition_with_owner(
                 bindings,
             );
         } else {
-            seed_binding(name, resolved.clone(), declaration_owner.clone(), bindings);
+            seed_value_owner(name, resolved.clone(), declaration_owner.clone(), bindings);
         }
     }
 }
@@ -7193,40 +7558,41 @@ fn constructed_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
         .map(|target| target.fq_name())
 }
 
-fn constructed_or_applied_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
-    constructed_type(node, ctx).or_else(|| {
-        if node.kind() != "call_expression" {
-            return None;
-        }
-        let mut function = node.child_by_field_name("function")?;
-        while function.kind() == "call_expression" {
-            function = function.child_by_field_name("function")?;
-        }
-        if !matches!(function.kind(), "identifier" | "type_identifier") {
-            return None;
-        }
-        let name = node_text(function, ctx.source).trim();
-        if name.is_empty() {
-            return None;
-        }
-        let class_fqn = ctx.visible_type(function, name);
-        let object_fqn = ctx
-            .lexically_visible_object(function.start_byte(), name)
-            .or_else(|| ctx.resolver.resolve_object(name));
-        ctx.types
-            .resolve_type_application(
-                ctx.scala,
-                &ctx.resolver,
-                class_fqn.as_deref(),
-                object_fqn.as_deref(),
-                name,
-                call_site_shape_for_reference(function).as_ref(),
-                TypeApplicationRole::BareApplication,
-                Some(ctx.source_file),
-            )
-            .type_target
-            .map(|target| target.fq_name())
-    })
+fn constructed_or_applied_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<ScalaValueOwner> {
+    constructed_type(node, ctx)
+        .map(ScalaValueOwner::Logical)
+        .or_else(|| {
+            if node.kind() != "call_expression" {
+                return None;
+            }
+            let mut function = node.child_by_field_name("function")?;
+            while function.kind() == "call_expression" {
+                function = function.child_by_field_name("function")?;
+            }
+            if !matches!(function.kind(), "identifier" | "type_identifier") {
+                return None;
+            }
+            let name = node_text(function, ctx.source).trim();
+            if name.is_empty() {
+                return None;
+            }
+            let class_fqn = ctx.visible_type(function, name);
+            let object_fqn = ctx
+                .lexically_visible_object(function.start_byte(), name)
+                .or_else(|| ctx.resolver.resolve_object(name));
+            ctx.types
+                .resolve_type_application(
+                    ctx.scala,
+                    &ctx.resolver,
+                    class_fqn.as_deref(),
+                    object_fqn.as_deref(),
+                    name,
+                    call_site_shape_for_reference(function).as_ref(),
+                    TypeApplicationRole::BareApplication,
+                    Some(ctx.source_file),
+                )
+                .value_result
+        })
 }
 
 fn call_result_type(
@@ -7352,6 +7718,26 @@ fn seed_binding(
     bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
     seed_scala_binding(name, receiver_type, declaration_owner, bindings);
+}
+
+fn seed_value_owner(
+    name: &str,
+    receiver: Option<ScalaValueOwner>,
+    declaration_owner: Option<CodeUnit>,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
+) {
+    match receiver {
+        Some(ScalaValueOwner::Exact(receiver)) => seed_scala_binding_with_receiver_declaration(
+            name,
+            receiver,
+            declaration_owner,
+            bindings,
+        ),
+        Some(ScalaValueOwner::Logical(receiver)) => {
+            seed_binding(name, Some(receiver), declaration_owner, bindings)
+        }
+        None => seed_binding(name, None, declaration_owner, bindings),
+    }
 }
 
 fn exact_owner_field_binding(

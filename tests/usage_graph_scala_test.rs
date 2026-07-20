@@ -53,7 +53,8 @@ fn scala_inverted_local_inference_keeps_field_identity_and_value_type_distinct()
             r#"package model
 class EntityRef { def ask(): String = "ok" }
 class ClusterSharding { def entityRefFor(): EntityRef = new EntityRef }
-object ClusterSharding { def apply(system: String): ClusterSharding = new ClusterSharding }
+abstract class ExtensionId[T] { def apply(system: String): T }
+object ClusterSharding extends ExtensionId[ClusterSharding]
 class Graph { def buildTargets(): Int = 1 }
 object Graph { def apply(nodes: Set[Int])(edge: (Int, Int) => Boolean): Graph = new Graph }
 object Factories {
@@ -144,6 +145,175 @@ object ImportedFactories {
         "same-shape imported overload returns must fail closed: {}",
         value["edges"]
     );
+}
+
+#[test]
+fn scala_inverted_inherited_generic_apply_substitutes_exact_result_owner_and_fails_closed() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Factories.scala",
+            r#"package model
+class System
+abstract class Factory[T] { def apply(system: System): T }
+abstract class Mid[T] extends Factory[T]
+class EntityRef { def ask(): Unit = () }
+abstract class ClusterSharding { def entityRefFor(): EntityRef }
+object ClusterSharding extends Factory[ClusterSharding]
+class Service { def selected(): Unit = () }
+object Service extends Mid[Service]
+class Other { def otherOnly(): Unit = () }
+object WrongFactory extends Factory[Other]
+class DirectFactory { def directOnly(): Unit = () }
+object DirectFactory extends Factory[Other] {
+  override def apply(system: System): DirectFactory = new DirectFactory
+}
+object MissingFactory extends Factory[external.Missing]
+abstract class PairFactory[A, B] { def apply(system: System): A }
+object BadArityFactory extends PairFactory[Service]
+class BlockingFactory { def blockingOnly(): Unit = () }
+object BlockingFactory extends Factory[Other] {
+  override def apply(system: System) = new Service
+}
+object ConflictFactory {
+  def apply(system: System): Service = new Service
+  def apply(system: System): Other = new Other
+}
+object AmbiguousFactory extends Factory[dup.Product]
+class IndependentProduct { def independentOnly(): Unit = () }
+object IndependentFactory extends dup.Marker {
+  def apply(system: System): IndependentProduct = new IndependentProduct
+}
+object UnionFactory extends Factory[Service | Other]
+"#,
+        )
+        .file(
+            "model/nested/Qualified.scala",
+            "package model.nested\nclass QualifiedProduct { def qualifiedOnly(): Unit = () }\n",
+        )
+        .file(
+            "model/QualifiedFactory.scala",
+            "package model\nobject QualifiedFactory extends Factory[model.nested.QualifiedProduct]\n",
+        )
+        .file(
+            "dup/jvm/Product.scala",
+            "package dup\ntrait Marker\nclass Product { def productOnly(): Unit = () }\n",
+        )
+        .file(
+            "dup/js/Product.scala",
+            "package dup\ntrait Marker\nclass Product { def productOnly(): Unit = () }\n",
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+import model.*
+object Use {
+  val system = new System
+  val sharding = ClusterSharding(system)
+  def akkaShape = {
+    val ref = sharding.entityRefFor()
+    ref.ask()
+  }
+  def twoHop = {
+    val value = Service(system)
+    value.selected()
+  }
+  def qualified = {
+    val value = QualifiedFactory(system)
+    value.qualifiedOnly()
+  }
+  def substitutedOther = {
+    val value = WrongFactory(system)
+    value.otherOnly()
+  }
+  def directWins = {
+    val value = DirectFactory(system)
+    value.directOnly()
+  }
+  def directWithAmbiguousAncestor = {
+    val value = IndependentFactory(system)
+    value.independentOnly()
+  }
+  def unresolved = {
+    val value = MissingFactory(system)
+    value.selected()
+  }
+  def badArity = {
+    val value = BadArityFactory(system)
+    value.selected()
+  }
+  def ambiguous = {
+    val value = AmbiguousFactory(system)
+    value.productOnly()
+  }
+  def unknownDirect = {
+    val value = BlockingFactory(system)
+    value.otherOnly()
+    value.blockingOnly()
+  }
+  def conflicting = {
+    val value = ConflictFactory(system)
+    value.selected()
+  }
+  def compound = {
+    val value = UnionFactory(system)
+    value.selected()
+    value.otherOnly()
+  }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    for (caller, callee) in [
+        ("app.Use$.akkaShape", "model.EntityRef.ask"),
+        ("app.Use$.twoHop", "model.Service.selected"),
+        (
+            "app.Use$.qualified",
+            "model.nested.QualifiedProduct.qualifiedOnly",
+        ),
+        ("app.Use$.substitutedOther", "model.Other.otherOnly"),
+        ("app.Use$.directWins", "model.DirectFactory.directOnly"),
+        (
+            "app.Use$.directWithAmbiguousAncestor",
+            "model.IndependentProduct.independentOnly",
+        ),
+        ("app.Use$.twoHop", "model.Factory.apply"),
+        ("app.Use$.substitutedOther", "model.Factory.apply"),
+        ("app.Use$.directWins", "model.DirectFactory$.apply"),
+        (
+            "app.Use$.directWithAmbiguousAncestor",
+            "model.IndependentFactory$.apply",
+        ),
+    ] {
+        assert!(
+            has_edge(&value, caller, callee),
+            "missing inherited-factory edge {caller} -> {callee}: {}",
+            value["edges"]
+        );
+    }
+
+    for (caller, callee) in [
+        ("app.Use$.unresolved", "model.Service.selected"),
+        ("app.Use$.badArity", "model.Service.selected"),
+        ("app.Use$.conflicting", "model.Service.selected"),
+        ("app.Use$.compound", "model.Service.selected"),
+        ("app.Use$.compound", "model.Other.otherOnly"),
+        ("app.Use$.unknownDirect", "model.Other.otherOnly"),
+        (
+            "app.Use$.unknownDirect",
+            "model.BlockingFactory.blockingOnly",
+        ),
+        ("app.Use$.ambiguous", "dup.Product.productOnly"),
+        ("app.Use$.directWins", "model.Factory.apply"),
+        ("app.Use$.unknownDirect", "model.Factory.apply"),
+    ] {
+        assert!(
+            !has_edge(&value, caller, callee),
+            "imprecise inherited-factory edge {caller} -> {callee}: {}",
+            value["edges"]
+        );
+    }
 }
 
 #[test]
