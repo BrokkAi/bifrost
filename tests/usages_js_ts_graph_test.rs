@@ -506,6 +506,97 @@ fn identifier_occurrence_range(
 }
 
 #[test]
+fn js_window_global_property_finds_bare_global_without_widening_members() {
+    let source = r#"window.Promise = makePromise();
+function readGlobal() { return typeof Promise; }
+function readExplicit() { return window.Promise; }
+function shadowed(Promise) { return typeof Promise; }
+function shadowedWindow(window) { return window.Promise; }
+function readOther() { return other.Promise; }
+other.Promise = makeOtherPromise();
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("polyfills.js", source).build());
+    let file = project.file("polyfills.js");
+    let target = find_js_target(&analyzer, &file, |unit| {
+        unit.is_field() && unit.fq_name() == "window.Promise"
+    });
+
+    let hits = authoritative_js_hits(&analyzer, &target, file);
+    let ranges: BTreeSet<_> = hits
+        .iter()
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect();
+
+    assert_eq!(
+        BTreeSet::from([
+            identifier_occurrence_range(source, "Promise", 2),
+            identifier_occurrence_range(source, "Promise", 3),
+        ]),
+        ranges,
+        "only exact explicit and unshadowed bare browser globals should resolve: {hits:#?}"
+    );
+}
+
+#[test]
+fn js_window_global_property_rejects_named_expression_receiver_bindings() {
+    for source in [
+        r#"const holder = function* window() {
+  window.Promise = makePromise();
+  return typeof Promise;
+};
+"#,
+        r#"const Holder = class window {
+  readGlobal() {
+    window.Promise = makePromise();
+    return typeof Promise;
+  }
+};
+"#,
+    ] {
+        let (project, analyzer) = js_inline_analyzer(|p| p.file("polyfills.js", source).build());
+        let file = project.file("polyfills.js");
+        let target = find_js_target(&analyzer, &file, |unit| {
+            unit.is_field() && unit.fq_name() == "window.Promise"
+        });
+
+        let hits = authoritative_js_hits(&analyzer, &target, file);
+        assert!(
+            hits.is_empty(),
+            "a named expression's self-binding is not the browser global: {hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn js_window_global_property_respects_later_lexical_bindings() {
+    for source in [
+        r#"window.Promise = makePromise();
+function readBeforeFileBinding() { return typeof Promise; }
+const Promise = makeLocalPromise();
+"#,
+        r#"window.Promise = makePromise();
+function readBeforeFunctionBinding() {
+    const before = typeof Promise;
+    var Promise;
+    return before;
+}
+"#,
+    ] {
+        let (project, analyzer) = js_inline_analyzer(|p| p.file("polyfills.js", source).build());
+        let file = project.file("polyfills.js");
+        let target = find_js_target(&analyzer, &file, |unit| {
+            unit.is_field() && unit.fq_name() == "window.Promise"
+        });
+
+        let hits = authoritative_js_hits(&analyzer, &target, file);
+        assert!(
+            hits.is_empty(),
+            "TDZ and var-hoisted bindings must shadow earlier reads: {hits:#?}"
+        );
+    }
+}
+
+#[test]
 fn authoritative_js_usage_counts_assignment_pattern_default_rhs() {
     let source = r#"const UNKNOWN = 0;
 class Path {
@@ -1244,6 +1335,128 @@ fn ts_namespace_import_resolves_member_reference() {
     );
 
     assert_eq!(1, hits.len());
+}
+
+#[test]
+fn ts_qualified_type_references_resolve_exact_owners() {
+    let consumer_source = r#"
+import * as helper from "./options";
+
+enum EntityType { SECURITY_SERVICE }
+enum OtherEntityType { SECURITY_SERVICE }
+
+export function select(value: EntityType.SECURITY_SERVICE): helper.PageOptions {
+  return { enabled: true };
+}
+
+export function otherType(value: OtherEntityType.SECURITY_SERVICE): void {}
+export function runtime(helper: { PageOptions: number }, value: OtherEntityType) {
+  return helper.PageOptions + value.SECURITY_SERVICE;
+}
+"#;
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "options.ts",
+            "export interface PageOptions { enabled: boolean }\n",
+        )
+        .file("consumer.ts", consumer_source)
+        .build()
+    });
+    let consumer = project.file("consumer.ts");
+
+    let enum_member = find_ts_target(&analyzer, &consumer, |cu| {
+        cu.identifier() == "SECURITY_SERVICE"
+            && cu.is_field()
+            && analyzer
+                .parent_of(cu)
+                .is_some_and(|parent| parent.identifier() == "EntityType")
+    });
+    let enum_hits = authoritative_ts_hits(&analyzer, &enum_member, consumer.clone());
+    let enum_start = consumer_source
+        .find("EntityType.SECURITY_SERVICE):")
+        .expect("enum-member discriminant")
+        + "EntityType.".len();
+    assert_eq!(
+        BTreeSet::from([(enum_start, enum_start + "SECURITY_SERVICE".len())]),
+        enum_hits
+            .iter()
+            .filter(|hit| hit.kind == UsageHitKind::Reference)
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect(),
+        "the enum owner must distinguish the discriminant from the other type and ordinary member expression: {enum_hits:#?}"
+    );
+
+    let page_options = find_ts_target(&analyzer, &project.file("options.ts"), |cu| {
+        cu.identifier() == "PageOptions" && cu.is_class()
+    });
+    let option_hits = authoritative_ts_hits(&analyzer, &page_options, consumer);
+    let option_start = consumer_source
+        .find("helper.PageOptions {")
+        .expect("namespace-qualified imported type")
+        + "helper.".len();
+    assert_eq!(
+        BTreeSet::from([(option_start, option_start + "PageOptions".len())]),
+        option_hits
+            .iter()
+            .filter(|hit| hit.kind == UsageHitKind::Reference)
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect(),
+        "a shadowed ordinary member expression must not match the namespace-qualified imported type: {option_hits:#?}"
+    );
+}
+
+#[test]
+fn ts_ambient_companion_preserves_merged_type_references() {
+    let source = r#"
+declare namespace interop { interface StructType<T> {} }
+interface Packet { value: number }
+declare var Packet: interop.StructType<Packet>;
+declare var PacketConstructor: { prototype: Packet };
+
+function consume(value: Packet): Packet { return value; }
+
+function valueShadow() {
+  const Packet = 1;
+  let value: Packet;
+  return value;
+}
+
+function typeShadow() {
+  type Packet = { local: true };
+  let value: Packet;
+  return value;
+}
+"#;
+    let (project, analyzer) = ts_inline_analyzer(|p| p.file("ambient.d.ts", source).build());
+    let file = project.file("ambient.d.ts");
+    let target = find_ts_target(&analyzer, &file, |cu| {
+        cu.identifier() == "Packet" && cu.is_class()
+    });
+
+    let hits = authoritative_ts_hits(&analyzer, &target, file);
+    let range_after = |anchor: &str, prefix: &str| {
+        let start = source.find(anchor).expect("reference anchor") + prefix.len();
+        (start, start + "Packet".len())
+    };
+    let expected = BTreeSet::from([
+        range_after("interop.StructType<Packet>", "interop.StructType<"),
+        range_after("prototype: Packet", "prototype: "),
+        range_after("consume(value: Packet", "consume(value: "),
+        range_after("Packet): Packet", "Packet): "),
+        range_after(
+            "let value: Packet;\n  return value;\n}\n\nfunction typeShadow",
+            "let value: ",
+        ),
+    ]);
+    let actual = hits
+        .iter()
+        .filter(|hit| hit.kind == UsageHitKind::Reference)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect();
+    assert_eq!(
+        expected, actual,
+        "the ambient value companion and an ordinary value shadow must preserve type-space Packet, while the nested type alias must suppress it: {hits:#?}"
+    );
 }
 
 #[test]

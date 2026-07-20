@@ -1,7 +1,8 @@
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{
     CallableArity, CodeUnit, CodeUnitType, ParameterMetadata, ProjectFile, SignatureMetadata,
-    csharp_type_node_identity,
+    csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver,
+    csharp_type_node_identity, csharp_type_reference_root,
 };
 use crate::hash::HashSet;
 use tree_sitter::{Node, Tree};
@@ -430,100 +431,26 @@ fn collect_csharp_type_identifiers(
         {
             identifiers.extend(super::csharp_attribute_type_names(name, source));
         }
-        if is_csharp_type_position_node(node)
-            && !is_nested_type_reference_component(node)
-            && matches!(
-                node.kind(),
-                "identifier"
-                    | "qualified_name"
-                    | "generic_name"
-                    | "nullable_type"
-                    | "array_type"
-                    | "type"
-            )
-        {
-            let text = super::csharp_type_node_identity(node, source);
+        if let Some(root) = csharp_type_reference_root(node) {
+            let text = csharp_type_node_identity(root, source);
+            if !text.is_empty() {
+                identifiers.insert(text);
+            }
+        }
+        if let Some(candidate) = csharp_constant_pattern_type_candidate(node) {
+            let text = csharp_type_node_identity(candidate, source);
+            if !text.is_empty() {
+                identifiers.insert(text);
+            }
+        }
+        if let Some(receiver) = csharp_member_access_type_receiver(node) {
+            let text = csharp_type_node_identity(receiver, source);
             if !text.is_empty() {
                 identifiers.insert(text);
             }
         }
         WalkControl::Continue
     });
-}
-
-fn is_nested_type_reference_component(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        matches!(
-            parent.kind(),
-            "qualified_name"
-                | "alias_qualified_name"
-                | "generic_name"
-                | "nullable_type"
-                | "array_type"
-                | "pointer_type"
-                | "type"
-                | "simple_base_type"
-                | "primary_constructor_base_type"
-        ) && is_csharp_type_position_node(parent)
-    })
-}
-
-fn is_csharp_type_position_node(mut node: Node<'_>) -> bool {
-    while let Some(parent) = node.parent() {
-        if super::csharp_as_expression_type_operand(parent, node) {
-            return true;
-        }
-        if parent
-            .child_by_field_name("type")
-            .is_some_and(|type_node| same_cs_node(type_node, node))
-            || parent
-                .child_by_field_name("return_type")
-                .is_some_and(|type_node| same_cs_node(type_node, node))
-        {
-            return true;
-        }
-        if parent.kind() == "type" {
-            return true;
-        }
-        if parent.kind() == "object_creation_expression" {
-            return true;
-        }
-        if super::csharp_using_directive_is_static(parent) {
-            return true;
-        }
-        if matches!(
-            parent.kind(),
-            "class_declaration"
-                | "interface_declaration"
-                | "struct_declaration"
-                | "enum_declaration"
-                | "record_declaration"
-                | "record_struct_declaration"
-        ) && !parent
-            .child_by_field_name("name")
-            .is_some_and(|name| same_cs_node(name, node))
-        {
-            return true;
-        }
-        if matches!(
-            parent.kind(),
-            "qualified_name"
-                | "generic_name"
-                | "nullable_type"
-                | "array_type"
-                | "type_argument_list"
-                | "base_list"
-        ) {
-            node = parent;
-            continue;
-        }
-        return false;
-    }
-    false
-}
-
-fn same_cs_node(left: Node<'_>, right: Node<'_>) -> bool {
-    left.start_byte() == right.start_byte() && left.end_byte() == right.end_byte()
 }
 
 fn cs_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {

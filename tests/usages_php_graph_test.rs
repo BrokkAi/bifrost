@@ -720,6 +720,51 @@ function consume(): void {
 }
 
 #[test]
+fn php_graph_resolves_owner_relative_class_references() {
+    let (_project, analyzer) = php_analyzer_with_files(&[(
+        "RelativeTypes.php",
+        r#"<?php
+namespace App;
+class Base {
+    public static function inherited(): void {}
+}
+class Target extends Base {
+    public static function buildSelf(): self { return new self(); }
+    public function buildLate(): static { return new static(); }
+    public function accepts(mixed $value): bool { return $value instanceof self; }
+    public function buildParent(): parent { return new parent(); }
+    public static function callRelative(): void {
+        self::buildSelf();
+        parent::inherited();
+    }
+}
+"#,
+    )]);
+
+    let target_hits = graph_hits(&analyzer, "App.Target");
+    for expected in [
+        ": self",
+        "new self()",
+        ": static",
+        "new static()",
+        "instanceof self",
+        "self::buildSelf()",
+    ] {
+        assert!(
+            target_hits.iter().any(|hit| hit.snippet.contains(expected)),
+            "expected `{expected}` to resolve to Target: {target_hits:#?}"
+        );
+    }
+    let base_hits = graph_hits(&analyzer, "App.Base");
+    for expected in [": parent", "new parent()", "parent::inherited()"] {
+        assert!(
+            base_hits.iter().any(|hit| hit.snippet.contains(expected)),
+            "expected `{expected}` to resolve to Base: {base_hits:#?}"
+        );
+    }
+}
+
+#[test]
 fn php_graph_finds_aliased_static_method_and_property_usages() {
     let (_project, analyzer) = php_analyzer_with_files(&[
         (
@@ -1725,6 +1770,137 @@ function mixed(Target $target): void {
     ]);
 
     assert_eq!(2, graph_hits(&analyzer, "App.Target.run").len());
+}
+
+#[test]
+fn php_graph_visits_self_reassignment_rhs_before_mutating_receiver() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "Target.php",
+            r#"<?php
+namespace App;
+class Replacement {}
+class Target {
+    public function replace(): Replacement { return new Replacement(); }
+}
+"#,
+        ),
+        (
+            "Consumer.php",
+            r#"<?php
+namespace App;
+function consume(Target $target): void {
+    $target = $target->replace();
+}
+"#,
+        ),
+    ]);
+
+    let hits = graph_hits(&analyzer, "App.Target.replace");
+    assert_eq!(
+        1,
+        hits.len(),
+        "self-reassignment RHS must retain its incoming receiver: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("$target = $target->replace()")),
+        "expected exact self-reassignment RHS hit: {hits:#?}"
+    );
+}
+
+#[test]
+fn php_graph_infers_self_static_and_parent_factory_assignment_results() {
+    let (_project, analyzer) = php_analyzer_with_files(&[(
+        "Factories.php",
+        r#"<?php
+namespace App;
+class Product {
+    public function consume(): void {}
+}
+class BaseFactory {
+    protected static function fromParent(): Product { return new Product(); }
+}
+class Factory extends BaseFactory {
+    private static function fromSelf(): Product { return new Product(); }
+
+    public function run(): void {
+        $selfProduct = self::fromSelf();
+        $selfProduct->consume();
+        $staticProduct = static::fromSelf();
+        $staticProduct->consume();
+        $parentProduct = parent::fromParent();
+        $parentProduct->consume();
+    }
+}
+"#,
+    )]);
+
+    let hits = graph_hits(&analyzer, "App.Product.consume");
+    assert_eq!(
+        3,
+        hits.len(),
+        "all relative static scopes must seed the declared Product result: {hits:#?}"
+    );
+}
+
+#[test]
+fn php_graph_follows_call_receiver_types_and_nullsafe_members() {
+    let (_project, analyzer) = php_analyzer_with_files(&[(
+        "Chains.php",
+        r#"<?php
+namespace App;
+class Reply {
+    public function finish(): void {}
+}
+class Request {
+    public function reply(): Reply { return new Reply(); }
+}
+class Cache {
+    public function fetch(): Reply { return new Reply(); }
+}
+class BaseController {
+    public function request(): Request { return new Request(); }
+}
+class Controller extends BaseController {
+    public Cache $cache;
+}
+class Consumer {
+    private ?Cache $cache;
+    public function controller(): Controller { return new Controller(); }
+    public function chain(): void {
+        $this->controller()->request()->reply()->finish();
+    }
+    public function fieldChain(): void {
+        $this->controller()->cache->fetch();
+    }
+    public function nullsafe(): void {
+        $this->cache?->fetch();
+    }
+}
+"#,
+    )]);
+
+    for target in [
+        "App.BaseController.request",
+        "App.Request.reply",
+        "App.Reply.finish",
+        "App.Controller.cache",
+    ] {
+        let hits = graph_hits(&analyzer, target);
+        assert_eq!(
+            1,
+            hits.len(),
+            "expected one structured chain hit for {target}: {hits:#?}"
+        );
+    }
+
+    let fetch_hits = graph_hits(&analyzer, "App.Cache.fetch");
+    assert_eq!(
+        2,
+        fetch_hits.len(),
+        "ordinary field-chain and nullsafe calls should both resolve: {fetch_hits:#?}"
+    );
 }
 
 #[test]

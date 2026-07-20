@@ -6,7 +6,8 @@ use crate::analyzer::usages::cpp_graph::CppAuthoritativeUsageBatch;
 #[cfg(test)]
 use crate::analyzer::usages::cpp_graph::cpp_type_owner_for_test;
 use crate::analyzer::usages::get_definition::{
-    DefinitionLookupRequest, DefinitionLookupStatus, resolve_definition_batch_with_source,
+    DefinitionLookupRequest, DefinitionLookupStatus, PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND,
+    resolve_definition_batch_with_source,
 };
 use crate::analyzer::usages::{
     ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitKind,
@@ -206,6 +207,10 @@ pub enum ReferenceDifferentialProgress {
     },
     InverseTarget {
         completed: usize,
+        total: usize,
+        target: String,
+    },
+    InverseTargetStarted {
         total: usize,
         target: String,
     },
@@ -695,6 +700,10 @@ fn forward_resolve_file(
         resolve_definition_batch_with_source(analyzer, requests, file.clone(), Arc::clone(&source));
     for (site, outcome) in sites.iter().cloned().zip(outcomes) {
         forward.increment(outcome.status);
+        let partial_selector_chain = outcome
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND);
         let csharp_nameof_member = outcome.status == DefinitionLookupStatus::Resolved
             && site.csharp_nameof_argument
             && !outcome.definitions.is_empty()
@@ -735,6 +744,11 @@ fn forward_resolve_file(
             },
             note: if csharp_nameof_member {
                 Some("C# nameof member navigation is excluded from runtime usage".to_string())
+            } else if partial_selector_chain {
+                Some(
+                    "forward lookup returned incomplete partial_selector_chain evidence"
+                        .to_string(),
+                )
             } else {
                 (outcome.status != DefinitionLookupStatus::Resolved)
                     .then(|| format!("forward lookup returned {}", outcome.status.as_str()))
@@ -746,11 +760,11 @@ fn forward_resolve_file(
             let mut targets = outcome.definitions;
             targets.sort();
             targets.dedup();
-            if targets.is_empty() {
+            if csharp_nameof_member || partial_selector_chain {
+                continue;
+            } else if targets.is_empty() {
                 records[record_index].note =
                     Some("resolved forward lookup returned no targets".to_string());
-            } else if csharp_nameof_member {
-                continue;
             } else if analyzer
                 .enclosing_code_unit(file, &site.range)
                 .is_some_and(|enclosing| targets.contains(&enclosing))
@@ -936,6 +950,10 @@ fn compare_inverse(
             let _scope = crate::profiling::scope(format!(
                 "reference_differential::inverse_target[{target}]"
             ));
+            progress(ReferenceDifferentialProgress::InverseTargetStarted {
+                total,
+                target: target.clone(),
+            });
             let result =
                 if let Some(batch) =
                     cpp_batch.as_ref().filter(|_| {
@@ -1490,6 +1508,71 @@ mod tests {
                 fixture.corpus_language
             );
         }
+    }
+
+    #[test]
+    fn partial_selector_forward_evidence_remains_inconclusive() {
+        let fixture = RoundTripFixture {
+            corpus_language: "go",
+            analyzer_language: Language::Go,
+            file_name: "partial_selector.go",
+            source: r#"package main
+
+type Leaf struct {
+    Value string
+}
+
+type Container struct {
+    Leaf Leaf
+}
+
+func read(container Container) {
+    _ = container.Leaf.Missing
+}
+"#,
+            call_line: "_ = container.Leaf.Missing",
+        };
+
+        let report = audit_fixture(&fixture);
+        let site = report
+            .sites
+            .iter()
+            .find(|site| {
+                site.text.ends_with("Missing")
+                    && site.source_evidence.contains(fixture.call_line)
+                    && site
+                        .diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.kind == PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND)
+            })
+            .unwrap_or_else(|| panic!("partial selector site was not sampled: {report:#?}"));
+
+        assert_eq!(site.forward_status, "resolved", "{site:#?}");
+        assert_eq!(
+            site.classification,
+            ReferenceClassification::Inconclusive,
+            "{site:#?}"
+        );
+        assert_eq!(
+            site.note.as_deref(),
+            Some("forward lookup returned incomplete partial_selector_chain evidence")
+        );
+        assert!(
+            site.targets
+                .iter()
+                .any(|target| target.fq_name.ends_with("Container.Leaf")),
+            "partial target should remain visible: {site:#?}"
+        );
+        assert!(
+            site.diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.kind == PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND }),
+            "partial diagnostic should remain visible: {site:#?}"
+        );
+        assert!(site.source_evidence.contains(fixture.call_line));
+        assert!(site.inverse_hit.is_none(), "{site:#?}");
+        assert_eq!(report.summary.classifications.missing, 0, "{report:#?}");
+        assert!(!report.has_actionable_findings(), "{report:#?}");
     }
 
     #[test]

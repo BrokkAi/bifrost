@@ -44,14 +44,21 @@ pub(in crate::analyzer::usages) use receiver_analysis::{
 pub(crate) use resolver::{
     JsTsUsageIndex, build_jsts_usage_index, build_jsts_usage_index_with_cancellation,
 };
+pub(in crate::analyzer::usages) use resolver::{
+    browser_global_property_shape, unbound_browser_global_property,
+};
 
+use crate::analyzer::js_ts::syntax::{direct_property_definitions, slice};
 use crate::analyzer::usages::common::analyzed_files_for_language;
 use crate::analyzer::usages::js_ts_graph::extractor::scan_files_for_seeds;
 use crate::analyzer::usages::js_ts_graph::resolver::{
-    combine_jsts_usage_indices, is_static_member, target_language,
+    combine_jsts_usage_indices, is_static_member, member_name, target_language,
 };
-use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface, UsageProof};
+use crate::analyzer::usages::model::{
+    ExportEntry, FuzzyResult, UsageHit, UsageHitSurface, UsageProof,
+};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
+use crate::analyzer::usages::parsed_tree::js_ts_tree_sitter_language_for_file;
 use crate::analyzer::usages::traits::{
     UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver, UsageScanScope,
 };
@@ -63,6 +70,7 @@ use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use tree_sitter::Parser;
 
 pub(in crate::analyzer::usages) use crate::analyzer::js_ts::syntax::compute_import_binder as compute_jsts_import_binder;
 use crate::analyzer::usages::inverted_edges::CallSite;
@@ -180,12 +188,17 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
         let owner_seed_allowed = is_static_member(target)
             || !target.short_name().contains('.')
             || analyzer.parent_of(target).is_some();
-        let seeds = index.seeds_for_target(
+        let exported_local_property_root =
+            declared_default_export_local_property_root(analyzer, index.as_ref(), target, language);
+        let mut seeds = index.seeds_for_target(
             target.source(),
             &target_seed,
             target.short_name(),
             owner_seed_allowed,
         );
+        if exported_local_property_root.is_some() {
+            seeds.insert((target.source().clone(), "default".to_string()));
+        }
         let scan_hits = if seeds.is_empty() {
             let mut scan_files: HashSet<ProjectFile> =
                 scan_scope.candidate_files().iter().cloned().collect();
@@ -200,6 +213,7 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
                 target,
                 &BTreeSet::new(),
                 language,
+                exported_local_property_root.as_deref(),
                 scan_scope.cancellation(),
             )
         } else {
@@ -218,6 +232,7 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
                 target,
                 &seeds,
                 language,
+                exported_local_property_root.as_deref(),
                 scan_scope.cancellation(),
             )
         };
@@ -462,6 +477,54 @@ fn target_seed_identifier(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> String
         return owner_name.to_string();
     }
     target.identifier().trim_end_matches("$static").to_string()
+}
+
+fn declared_default_export_local_property_root(
+    analyzer: &dyn IAnalyzer,
+    index: &JsTsUsageIndex,
+    target: &CodeUnit,
+    language: Language,
+) -> Option<String> {
+    if language != Language::JavaScript
+        || !target.is_field()
+        || analyzer.parent_of(target).is_some()
+    {
+        return None;
+    }
+    let exported_root = match index
+        .exports_by_file
+        .get(target.source())?
+        .exports_by_name
+        .get("default")?
+    {
+        ExportEntry::Default {
+            local_name: Some(local_name),
+        } => local_name,
+        ExportEntry::Default { local_name: None }
+        | ExportEntry::Local { .. }
+        | ExportEntry::ReexportedNamed { .. } => return None,
+    };
+    if !analyzer.declarations(target.source()).contains(target) {
+        return None;
+    }
+    let target_member = member_name(target)?;
+    let source = target.source().read_to_string().ok()?;
+    let mut parser = Parser::new();
+    let parser_language = js_ts_tree_sitter_language_for_file(target.source(), language)?;
+    parser.set_language(&parser_language).ok()?;
+    let tree = parser.parse(source.as_str(), None)?;
+    direct_property_definitions(
+        tree.root_node(),
+        source.as_str(),
+        &analyzer.ranges(target),
+        &target_member,
+    )
+    .into_iter()
+    .any(|definition| {
+        definition.receiver.members.is_empty()
+            && slice(definition.receiver.root, source.as_str()) == exported_root
+    })
+    .then(|| exported_root.clone())
 }
 
 impl UsageAnalyzer for JsTsExportUsageGraphStrategy {

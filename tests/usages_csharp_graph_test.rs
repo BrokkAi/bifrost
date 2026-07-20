@@ -3,7 +3,9 @@ mod common;
 use brokk_bifrost::usages::{
     CSharpUsageGraphStrategy, ExplicitCandidateProvider, FuzzyResult, UsageAnalyzer, UsageFinder,
 };
-use brokk_bifrost::{CSharpAnalyzer, CodeUnit, CodeUnitType, IAnalyzer, Language};
+use brokk_bifrost::{
+    AnalyzerConfig, CSharpAnalyzer, CodeUnit, CodeUnitType, IAnalyzer, Language, WorkspaceAnalyzer,
+};
 use common::{InlineTestProject, call_search_tool_json, csharp_nested_partial_cacheinfo_project};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -1267,6 +1269,168 @@ namespace Demo {
                 && chained_start + "ResultOnly".len() <= hit.end_offset
         }),
         "persisted type-parameter metadata must retain chained return inference: {persisted_hits:#?}"
+    );
+}
+
+#[test]
+fn persisted_csharp_inverse_reuses_one_definition_index_without_candidate_queries() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("Demo/GlobalUsings.cs", "global using Demo;\n")
+        .file(
+            "Demo/Widget.Part1.cs",
+            r#"
+namespace Demo {
+    public partial class Widget<T> {
+        public void Touch() {}
+    }
+}
+"#,
+        )
+        .file(
+            "Demo/Widget.Part2.cs",
+            r#"
+namespace Demo {
+    public partial class Widget<T> {
+        public void Touch() {}
+    }
+}
+"#,
+        )
+        .file(
+            "Consumers/AliasConsumer.cs",
+            r#"
+using Alias = Demo.Widget<int>;
+namespace Consumers {
+    public class AliasConsumer {
+        public void Run() {
+            Alias value = new Alias();
+            value.Touch();
+        }
+    }
+}
+"#,
+        )
+        .file(
+            "Consumers/GlobalConsumer.cs",
+            r#"
+namespace Consumers {
+    public class GlobalConsumer {
+        public void Run() {
+            Widget<string> value = new Widget<string>();
+            value.Touch();
+        }
+    }
+}
+"#,
+        )
+        .file(
+            "Consumers/UnrelatedConsumer.cs",
+            r#"
+namespace Other {
+    public class Widget<T> {
+        public void Touch() {}
+    }
+}
+namespace Consumers {
+    public class UnrelatedConsumer {
+        public void Run() {
+            Other.Widget<int> value = new Other.Widget<int>();
+            value.Touch();
+        }
+    }
+}
+"#,
+        )
+        .build();
+    let workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("persisted C# analyzer should build");
+    let analyzer = workspace.analyzer();
+    let declarations = analyzer.get_all_declarations();
+    let mut targets = declarations
+        .iter()
+        .filter(|unit| unit.is_function() && unit.identifier() == "Touch")
+        .filter(|unit| {
+            analyzer
+                .parent_of(unit)
+                .is_some_and(|owner| owner.package_name() == "Demo")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    assert_eq!(
+        2,
+        targets.len(),
+        "expected both physical partial members: {declarations:#?}"
+    );
+
+    analyzer.reset_global_usage_definition_index_build_count_for_test();
+    analyzer.reset_definition_candidates_query_count_for_test();
+    let target_fqn = targets[0].fq_name();
+    assert!(targets.iter().all(|target| target.fq_name() == target_fqn));
+    let forward = analyzer.definitions(&target_fqn).collect::<Vec<_>>();
+    assert_eq!(2, forward.len(), "persisted forward lookup parity");
+    assert_eq!(
+        0,
+        analyzer.global_usage_definition_index_build_count_for_test(),
+        "ordinary forward definitions must not hydrate the global usage index"
+    );
+    assert!(
+        analyzer.definition_candidates_query_count_for_test() > 0,
+        "the forward assertion must exercise bounded persisted candidate SQL"
+    );
+
+    let alias_consumer = project.file("Consumers/AliasConsumer.cs");
+    let global_consumer = project.file("Consumers/GlobalConsumer.cs");
+    let unrelated_consumer = project.file("Consumers/UnrelatedConsumer.cs");
+    let candidate_files = Arc::new(
+        [
+            alias_consumer.clone(),
+            global_consumer.clone(),
+            unrelated_consumer.clone(),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let provider = ExplicitCandidateProvider::new(Arc::clone(&candidate_files));
+    analyzer.reset_definition_candidates_query_count_for_test();
+    for attempt in 0..2 {
+        let hits = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                analyzer,
+                &targets,
+                Some(&provider),
+                candidate_files.len(),
+                100,
+            )
+            .result
+            .into_either()
+            .expect("partial member inverse query should resolve");
+        assert_eq!(2, hits.len(), "attempt {attempt}: {hits:#?}");
+        assert!(
+            hits.iter().any(|hit| hit.file == alias_consumer),
+            "attempt {attempt}: alias-qualified consumer missing: {hits:#?}"
+        );
+        assert!(
+            hits.iter().any(|hit| hit.file == global_consumer),
+            "attempt {attempt}: global-using consumer missing: {hits:#?}"
+        );
+        assert!(
+            hits.iter().all(|hit| hit.file != unrelated_consumer),
+            "attempt {attempt}: same-named unrelated owner leaked: {hits:#?}"
+        );
+    }
+    assert_eq!(
+        1,
+        analyzer.global_usage_definition_index_build_count_for_test(),
+        "the generation-scoped inverse definition index should be shared"
+    );
+    assert_eq!(
+        0,
+        analyzer.definition_candidates_query_count_for_test(),
+        "inverse resolution must not return to persisted definition-candidate SQL after build"
     );
 }
 
@@ -2767,6 +2931,614 @@ fn csharp_default_candidates_keep_generic_reference_arity() {
 }
 
 #[test]
+fn csharp_default_candidates_cover_each_namespace_declared_in_one_file() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Targets/First.cs",
+            "namespace First { public class FirstTarget {} }\n",
+        )
+        .file(
+            "Targets/Second.cs",
+            "namespace Second { public class SecondTarget {} }\n",
+        )
+        .file(
+            "Consumers/MultiNamespace.cs",
+            r#"
+namespace First {
+    public class FirstConsumer {
+        FirstTarget value;
+    }
+}
+
+namespace Second {
+    public class SecondConsumer {
+        SecondTarget value;
+    }
+}
+"#,
+        )
+        .build();
+    let workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("persisted multi-namespace C# project should build");
+    let analyzer = workspace.analyzer();
+    let target = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .find(|unit| unit.is_class() && unit.fq_name() == "Second.SecondTarget")
+        .expect("second namespace target declaration");
+    let consumer = project.file("Consumers/MultiNamespace.cs");
+
+    let referencing = analyzer
+        .import_analysis_provider()
+        .expect("C# import analysis")
+        .referencing_files_of(target.source());
+    assert!(
+        referencing.contains(&consumer),
+        "multi-namespace reverse index omitted the second namespace: {referencing:#?}"
+    );
+
+    let query = UsageFinder::new().query(analyzer, &[target], 1000, 1000);
+    assert!(
+        query.candidate_files.contains(&consumer),
+        "default routing omitted the second namespace: {:#?}",
+        query.candidate_files
+    );
+    let hits = query
+        .result
+        .into_either()
+        .expect("multi-namespace type query should resolve");
+    assert_eq!(1, hits.len(), "{hits:#?}");
+    let hit = hits.iter().next().expect("one multi-namespace usage");
+    assert_eq!(consumer, hit.file);
+    assert!(hit.snippet.contains("SecondTarget value"), "{hit:#?}");
+}
+
+#[test]
+fn csharp_issue701_persisted_inverse_fallback_preserves_arity_and_physical_types() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Collections/ICollection.First.cs",
+            "namespace System.Collections { public partial interface ICollection { void CopyTo(); } }\n",
+        )
+        .file(
+            "Collections/ICollection.Second.cs",
+            "namespace System.Collections { public partial interface ICollection { int Count { get; } } }\n",
+        )
+        .file(
+            "Collections/GenericICollection.cs",
+            "namespace System.Collections.Generic { public interface ICollection<T> { } }\n",
+        )
+        .file(
+            "Contracts/Nested.First.cs",
+            "namespace Contracts { public partial class Outer { public partial class Nested { } } }\n",
+        )
+        .file(
+            "Contracts/Nested.Second.cs",
+            "namespace Contracts { public partial class Outer { public partial class Nested { } } }\n",
+        )
+        .file(
+            "Consumers/RuntimeShape.cs",
+            r#"
+using System.Collections;
+using System.Collections.Generic;
+namespace App {
+    public class RuntimeShape : ICollection {
+        void ICollection.CopyTo() { }
+        public ICollection Echo(ICollection value) => value;
+        public ICollection<int> Generic;
+    }
+}
+"#,
+        )
+        .file(
+            "Consumers/MonoShape.cs",
+            r#"
+using System.Collections;
+namespace System.Collections.Generic {
+    public class MonoShape : ICollection {
+        void ICollection.CopyTo() { }
+    }
+}
+"#,
+        )
+        .file(
+            "Consumers/NestedShape.cs",
+            "namespace App { public class NestedShape { Contracts.Outer.Nested Value; } }\n",
+        )
+        .build();
+    let workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("persisted arity project should build");
+    let analyzer = workspace.analyzer();
+    let declarations = analyzer.get_all_declarations();
+    let targets = |fq_name: &str| {
+        declarations
+            .iter()
+            .filter(|unit| unit.is_class() && unit.fq_name() == fq_name)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    let nongeneric = targets("System.Collections.ICollection");
+    assert_eq!(2, nongeneric.len(), "physical partial declarations");
+    let generic = targets("System.Collections.Generic.ICollection`1");
+    assert_eq!(1, generic.len(), "generic collision declaration");
+    let nested = targets("Contracts.Outer$Nested");
+    assert_eq!(2, nested.len(), "physical dotted nested declarations");
+
+    let runtime = project.file("Consumers/RuntimeShape.cs");
+    let mono = project.file("Consumers/MonoShape.cs");
+    let nested_consumer = project.file("Consumers/NestedShape.cs");
+    let candidate_files = Arc::new(
+        [runtime.clone(), mono.clone(), nested_consumer.clone()]
+            .into_iter()
+            .collect(),
+    );
+    let provider = ExplicitCandidateProvider::new(Arc::clone(&candidate_files));
+    let query = |query_targets: &[CodeUnit]| {
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                analyzer,
+                query_targets,
+                Some(&provider),
+                candidate_files.len(),
+                1000,
+            )
+            .result
+            .into_either()
+            .expect("persisted inverse query should resolve")
+    };
+
+    let nongeneric_hits = query(&nongeneric);
+    assert!(
+        nongeneric_hits
+            .iter()
+            .any(|hit| hit.file == runtime && hit.snippet.contains("ICollection Echo")),
+        "runtime-shaped imports should resolve the nongeneric type: {nongeneric_hits:#?}"
+    );
+    assert!(
+        nongeneric_hits
+            .iter()
+            .any(|hit| hit.file == mono && hit.snippet.contains(": ICollection")),
+        "the current generic namespace must fall through to the nongeneric using: {nongeneric_hits:#?}"
+    );
+    assert!(
+        {
+            let source = runtime.read_to_string().expect("runtime consumer source");
+            let start = source.find("ICollection<int>").expect("generic reference");
+            nongeneric_hits.iter().all(|hit| {
+                !(hit.file == runtime
+                    && hit.start_offset <= start
+                    && start + "ICollection<int>".len() <= hit.end_offset)
+            })
+        },
+        "generic references must not collide with nongeneric targets: {nongeneric_hits:#?}"
+    );
+
+    let generic_hits = query(&generic);
+    assert_eq!(1, generic_hits.len(), "{generic_hits:#?}");
+    assert!(
+        generic_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("ICollection<int>"))
+    );
+
+    let nested_hits = query(&nested);
+    assert_eq!(1, nested_hits.len(), "{nested_hits:#?}");
+    assert!(nested_hits.iter().all(|hit| hit.file == nested_consumer));
+
+    let default_query = UsageFinder::new().query(analyzer, &nested, 1000, 1000);
+    assert!(
+        default_query.candidate_files.contains(&nested_consumer),
+        "dotted nested identity should route its consumer: {:#?}",
+        default_query.candidate_files
+    );
+}
+
+#[test]
+fn csharp_issue701_structured_type_roles_cover_alias_receivers_and_patterns_without_values() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Types.cs",
+            r#"
+namespace Demo {
+    public interface Marker { void Touch(); }
+    public class PatternType { }
+    public class OtherType { }
+    public class InheritedPattern { }
+    public enum Mode { Enabled }
+    public class Generic<T> { public static int Value; }
+    public class Holder { public int Nested; }
+    public class InheritedOuter { public class Nested { public static int Value; } }
+    public class Outer { public class Nested { public static int Value; } }
+}
+namespace Other {
+    public class Outer { public class Nested { public static int Value; } }
+}
+namespace App {
+    public class Constants { public class Globals { public static int Value; } }
+}
+namespace Imported {
+    public class ImportedOwner { public class Nested { public static int Value; } }
+}
+namespace Imported.System {
+    public class String { }
+}
+namespace System {
+    public class String { }
+}
+"#,
+        ),
+        (
+            "Consumer.cs",
+            r#"
+using Alias = Demo.Outer.Nested;
+using Nested = Demo.OtherType;
+using Demo;
+using Imported;
+namespace App {
+    public class Base {
+        protected Holder InheritedOuter;
+        protected const int InheritedPattern = 1;
+    }
+    public class Consumer : Base, Marker {
+        private Holder Outer;
+        public const int LocalConstant = 2;
+        public Marker Echo(Marker value, object member) {
+            var aliasValue = Alias.Value;
+            var nestedValue = Demo.Outer.Nested.Value;
+            var genericValue = Generic<int>.Value;
+            var relativeNestedValue = Constants.Globals.Value;
+            var importedNestedValue = ImportedOwner.Nested.Value;
+            System.String globalString = null;
+            var unrelated = Other.Outer.Nested.Value;
+            var unresolved = Missing.Nested.Value;
+            var fieldValue = Outer.Nested;
+            if (member is PatternType || member is OtherType) { }
+            return value;
+        }
+        void Marker.Touch() { }
+        public bool Shadowed(object member, int PatternType) => member is PatternType;
+        public bool Switched(object member) => member switch { PatternType => true, _ => false };
+        public bool Constant(object member) => member is Mode.Enabled;
+        public bool BareConstant(object member) => member is LocalConstant;
+        public bool Inherited(object member) {
+            var value = InheritedOuter.Nested;
+            return member is InheritedPattern;
+        }
+        public int Local(Holder Outer) => Outer.Nested;
+    }
+}
+"#,
+        ),
+    ]);
+    let consumer = project.file("Consumer.cs");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = |target: CodeUnit| {
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(&analyzer, &[target], Some(&provider), 1, 1000)
+            .result
+            .into_either()
+            .expect("structured type query should resolve")
+    };
+    let nested = definition_by(&analyzer, |unit| {
+        unit.is_class() && unit.fq_name() == "Demo.Outer$Nested"
+    });
+    let nested_hits = query(nested.clone());
+    let source = consumer.read_to_string().expect("consumer source");
+    let alias_lhs = source.find("Nested = Demo.OtherType").expect("alias lhs");
+    assert!(
+        nested_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("using Alias")),
+        "alias RHS should count: {nested_hits:#?}"
+    );
+    assert!(
+        nested_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("Alias.Value")),
+        "alias receiver should count: {nested_hits:#?}"
+    );
+    assert!(
+        nested_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("Demo.Outer.Nested.Value")),
+        "intermediate nested receiver should count: {nested_hits:#?}"
+    );
+    assert!(
+        nested_hits
+            .iter()
+            .all(|hit| !(hit.start_offset <= alias_lhs
+                && alias_lhs + "Nested".len() <= hit.end_offset)),
+        "alias LHS must not count: {nested_hits:#?}"
+    );
+    assert!(
+        [
+            source
+                .find("Other.Outer.Nested.Value")
+                .expect("unrelated nested receiver")
+                + "Other.Outer.".len(),
+            source
+                .find("var fieldValue = Outer.Nested;")
+                .expect("field receiver")
+                + "var fieldValue = Outer.".len(),
+            source
+                .rfind("=> Outer.Nested;")
+                .expect("parameter receiver")
+                + "=> Outer.".len(),
+        ]
+        .into_iter()
+        .all(|start| nested_hits.iter().all(|hit| {
+            !(hit.start_offset <= start && start + "Nested".len() <= hit.end_offset)
+        })),
+        "unrelated and value receivers must not count: {nested_hits:#?}"
+    );
+    let raw_result = CSharpUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&nested),
+        &std::iter::once(consumer.clone()).collect(),
+        1000,
+    );
+    let unresolved_start = source
+        .find("Missing.Nested.Value")
+        .expect("unresolved receiver");
+    match raw_result {
+        FuzzyResult::Success {
+            unproven_by_overload,
+            ..
+        } => assert!(
+            unproven_by_overload.values().flatten().any(|hit| {
+                hit.start_offset <= unresolved_start
+                    && unresolved_start + "Missing.Nested".len() <= hit.end_offset
+            }),
+            "an unresolved structured receiver should retain unproven completeness evidence"
+        ),
+        other => panic!("structured receiver query should succeed: {other:#?}"),
+    }
+
+    let generic = type_definition(&analyzer, "Demo.Generic`1");
+    let generic_hits = query(generic);
+    assert_eq!(1, generic_hits.len(), "{generic_hits:#?}");
+    assert!(
+        generic_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("Generic<int>.Value"))
+    );
+
+    let relative_nested = type_definition(&analyzer, "App.Constants$Globals");
+    let relative_nested_hits = query(relative_nested.clone());
+    assert_eq!(1, relative_nested_hits.len(), "{relative_nested_hits:#?}");
+    assert!(
+        relative_nested_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("Constants.Globals.Value")),
+        "a dotted nested type must resolve relative to the file namespace: {relative_nested_hits:#?}"
+    );
+
+    let imported_nested = type_definition(&analyzer, "Imported.ImportedOwner$Nested");
+    let imported_nested_hits = query(imported_nested);
+    assert_eq!(1, imported_nested_hits.len(), "{imported_nested_hits:#?}");
+    assert!(
+        imported_nested_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("ImportedOwner.Nested.Value")),
+        "a using namespace should expose a nested type whose outer type is declared directly in that namespace: {imported_nested_hits:#?}"
+    );
+
+    let global_string = type_definition(&analyzer, "System.String");
+    let global_string_hits = query(global_string);
+    assert_eq!(1, global_string_hits.len(), "{global_string_hits:#?}");
+    assert!(
+        global_string_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("System.String globalString")),
+        "a using namespace must not import a same-named child namespace: {global_string_hits:#?}"
+    );
+    let imported_child_string = type_definition(&analyzer, "Imported.System.String");
+    assert!(
+        query(imported_child_string).is_empty(),
+        "using Imported must not make Imported.System visible as System"
+    );
+
+    let pattern = type_definition(&analyzer, "Demo.PatternType");
+    let pattern_hits = query(pattern);
+    assert!(
+        pattern_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("is PatternType ||")),
+        "constant-pattern binary left spine should count: {pattern_hits:#?}"
+    );
+    assert!(
+        pattern_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("switch { PatternType")),
+        "switch constant pattern should count: {pattern_hits:#?}"
+    );
+    assert!(
+        {
+            let start = source
+                .rfind("member is PatternType")
+                .expect("shadowed pattern")
+                + "member is ".len();
+            pattern_hits.iter().all(|hit| {
+                !(hit.start_offset <= start && start + "PatternType".len() <= hit.end_offset)
+            })
+        },
+        "value-shadowed pattern must not count: {pattern_hits:#?}"
+    );
+
+    let marker = type_definition(&analyzer, "Demo.Marker");
+    let marker_hits = query(marker);
+    assert!(
+        marker_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("Base, Marker"))
+    );
+    assert!(
+        marker_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("Marker Echo"))
+    );
+    assert!(
+        marker_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("Echo(Marker"))
+    );
+    assert!(
+        marker_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("Marker.Touch"))
+    );
+
+    let enabled = definition_by(&analyzer, |unit| {
+        unit.is_field() && unit.fq_name() == "Demo.Mode.Enabled"
+    });
+    let enabled_hits = query(enabled);
+    assert_eq!(1, enabled_hits.len(), "{enabled_hits:#?}");
+    assert!(
+        enabled_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("member is Mode.Enabled")),
+        "qualified constant patterns should retain direct field hits: {enabled_hits:#?}"
+    );
+
+    let local_constant = definition_by(&analyzer, |unit| {
+        unit.is_field() && unit.fq_name() == "App.Consumer.LocalConstant"
+    });
+    let local_constant_hits = CSharpUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&local_constant),
+            &std::iter::once(consumer.clone()).collect(),
+            1000,
+        )
+        .all_hits_including_imports();
+    assert_eq!(1, local_constant_hits.len(), "{local_constant_hits:#?}");
+    assert!(
+        local_constant_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("member is LocalConstant")),
+        "bare constant patterns should retain direct self-field hits: {local_constant_hits:#?}"
+    );
+
+    let inherited_constant = definition_by(&analyzer, |unit| {
+        unit.is_field() && unit.fq_name() == "App.Base.InheritedPattern"
+    });
+    let inherited_constant_hits = query(inherited_constant);
+    assert_eq!(
+        1,
+        inherited_constant_hits.len(),
+        "{inherited_constant_hits:#?}"
+    );
+    assert!(
+        inherited_constant_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("member is InheritedPattern")),
+        "bare inherited constants should retain direct field hits: {inherited_constant_hits:#?}"
+    );
+
+    let inherited_nested = type_definition(&analyzer, "Demo.InheritedOuter$Nested");
+    let inherited_nested_hits = query(inherited_nested);
+    assert!(
+        inherited_nested_hits
+            .iter()
+            .all(|hit| !hit.snippet.contains("InheritedOuter.Nested")),
+        "an inherited field receiver must not become a type hit: {inherited_nested_hits:#?}"
+    );
+    let inherited_pattern = type_definition(&analyzer, "Demo.InheritedPattern");
+    let inherited_pattern_hits = query(inherited_pattern);
+    assert!(
+        inherited_pattern_hits
+            .iter()
+            .all(|hit| !hit.snippet.contains("member is InheritedPattern")),
+        "an inherited constant must not become a type hit: {inherited_pattern_hits:#?}"
+    );
+
+    let default_query = UsageFinder::new().query(&analyzer, &[nested], 1000, 1000);
+    assert!(
+        default_query.candidate_files.contains(&consumer),
+        "shared declaration routing should retain expression receiver candidates"
+    );
+    let relative_default_query =
+        UsageFinder::new().query(&analyzer, &[relative_nested], 1000, 1000);
+    assert!(
+        relative_default_query.candidate_files.contains(&consumer),
+        "shared declaration routing should retain relative nested receiver candidates"
+    );
+}
+
+#[test]
+fn csharp_issue701_constant_pattern_matches_all_physical_partial_type_declarations() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "TypeBuilderInstantiation.cs",
+            "namespace System.Reflection.Emit { internal sealed partial class TypeBuilderInstantiation { } }\n",
+        )
+        .file(
+            "TypeBuilderInstantiation.Mono.cs",
+            "namespace System.Reflection.Emit { internal partial class TypeBuilderInstantiation { } }\n",
+        )
+        .file(
+            "RuntimeModuleBuilder.Mono.cs",
+            r#"
+namespace System.Reflection.Emit {
+    internal class RuntimeModuleBuilder {
+        internal bool IsTransient(object member) {
+            if (member is TypeBuilderInstantiation || member is OtherType)
+                return true;
+            return false;
+        }
+    }
+    internal class OtherType { }
+}
+"#,
+        )
+        .build();
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    let targets = analyzer
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| {
+            unit.is_class() && unit.fq_name() == "System.Reflection.Emit.TypeBuilderInstantiation"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(2, targets.len(), "{targets:#?}");
+    let consumer = project.file("RuntimeModuleBuilder.Mono.cs");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let hits = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(analyzer, &targets, Some(&provider), 1, 1000)
+        .result
+        .into_either()
+        .expect("partial type pattern query should resolve");
+    assert_eq!(1, hits.len(), "{hits:#?}");
+    assert!(
+        hits.iter()
+            .all(|hit| hit.snippet.contains("member is TypeBuilderInstantiation")),
+        "the constant pattern should resolve to the logical partial type: {hits:#?}"
+    );
+    let default_query = UsageFinder::new().query(analyzer, &targets, 1000, 1000);
+    assert!(
+        default_query.candidate_files.contains(&consumer),
+        "the is-expression type role should route the consumer by default"
+    );
+    assert_eq!(
+        1,
+        default_query
+            .result
+            .into_either()
+            .expect("default partial pattern query should resolve")
+            .len()
+    );
+}
+
+#[test]
 fn csharp_graph_distinguishes_generic_and_nongeneric_constructor_owners() {
     let (_project, analyzer) = csharp_analyzer_with_files(&[
         (
@@ -3544,6 +4316,403 @@ namespace Domain {
 }
 
 #[test]
+fn usage_finder_csharp_finds_same_class_field_initializer_reads_across_physical_owners() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Reference/Options.cs",
+            r#"
+namespace Runtime;
+
+public static class Options {
+    public const int Tick = 1;
+    public static readonly int Minute = Tick;
+    public const int Counter = Tick;
+}
+"#,
+        )
+        .file(
+            "Implementation/Options.cs",
+            r#"
+namespace Runtime;
+
+public static class Options {
+    public const int Tick = 1;
+    public static readonly int Minute = Tick;
+    public const int Counter = Tick;
+}
+"#,
+        )
+        .build();
+    let analyzer = CSharpAnalyzer::from_project(project.project().clone());
+    let mut targets = analyzer
+        .get_all_declarations()
+        .iter()
+        .filter(|unit| unit.is_field() && unit.fq_name() == "Runtime.Options.Tick")
+        .cloned()
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    assert_eq!(2, targets.len(), "expected duplicate physical fields");
+
+    let candidate_files = Arc::new(analyzer.get_analyzed_files().into_iter().collect());
+    let provider = ExplicitCandidateProvider::new(Arc::clone(&candidate_files));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            &targets,
+            Some(&provider),
+            candidate_files.len(),
+            100,
+        );
+    let hits = query
+        .result
+        .into_either()
+        .expect("same-class field initializer query should resolve");
+    assert_eq!(
+        4,
+        hits.len(),
+        "each physical owner has two structured field reads: {hits:#?}"
+    );
+    assert!(
+        hits.iter().all(|hit| hit.snippet.contains("= Tick")),
+        "declaration names must not be counted as reads: {hits:#?}"
+    );
+}
+
+#[test]
+fn usage_finder_csharp_finds_precise_local_and_intermediate_field_receivers() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Reference/List.cs",
+            r#"
+namespace System.Collections.Generic;
+
+public class List<T> {
+    public T[] ToArray() => null;
+    public void Reverse() {}
+}
+"#,
+        )
+        .file(
+            "Implementation/List.cs",
+            r#"
+namespace System.Collections.Generic;
+
+public class List<T> {
+    public T[] ToArray() => null;
+    public void Reverse() {}
+}
+"#,
+        )
+        .file(
+            "RuntimeTests/Regression/List.cs",
+            r#"
+public class List<T> {}
+"#,
+        )
+        .file(
+            "RuntimeTests/Loader/List.cs",
+            r#"
+public class List<T> {}
+"#,
+        )
+        .file(
+            "Reference/NodeFactory.cs",
+            r#"
+namespace Runtime;
+
+public class TargetDetails { public int Architecture { get; } }
+public class OtherTargetDetails { public int Architecture { get; } }
+public class NodeFactory { public TargetDetails Target { get; } }
+public class ConflictingFactory { public TargetDetails Target { get; } }
+"#,
+        )
+        .file(
+            "Implementation/NodeFactory.cs",
+            r#"
+namespace Runtime;
+
+public class TargetDetails { public int Architecture { get; } }
+public class OtherTargetDetails { public int Architecture { get; } }
+public class NodeFactory { public TargetDetails Target { get; } }
+public class ConflictingFactory { public OtherTargetDetails Target { get; } }
+"#,
+        )
+        .file(
+            "Consumer.cs",
+            r#"
+using System.Collections.Generic;
+using Runtime;
+
+public class Consumer {
+    private NodeFactory factory;
+
+    public void UseList() {
+        var parts = new List<string>();
+        List<string> argNames = new List<string>();
+        string[] values = argNames.ToArray();
+        parts.Reverse();
+    }
+
+    public int UseTarget(NodeFactory factory) => factory.Target.Architecture;
+    public int UseConflicting(ConflictingFactory conflict) => conflict.Target.Architecture;
+    public int UseShadowed(TargetDetails factory) => factory.Target.Architecture;
+
+    public int UseUnknownShadow() {
+        var factory = MissingFactory();
+        return factory.Target.Architecture;
+    }
+}
+"#,
+        )
+        .build();
+    let workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("persisted C# receiver project should build");
+    let analyzer = workspace.analyzer();
+    let declarations = analyzer.get_all_declarations();
+    let targets_for = |fq_name: &str| {
+        let mut targets = declarations
+            .iter()
+            .filter(|unit| unit.fq_name() == fq_name)
+            .cloned()
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets.dedup();
+        assert_eq!(2, targets.len(), "expected duplicate physical {fq_name}");
+        targets
+    };
+    let candidate_files = Arc::new(analyzer.get_analyzed_files().into_iter().collect());
+    let provider = ExplicitCandidateProvider::new(Arc::clone(&candidate_files));
+    let expected = [
+        ("System.Collections.Generic.List`1.ToArray", "ToArray"),
+        ("System.Collections.Generic.List`1.Reverse", "Reverse"),
+        ("Runtime.NodeFactory.Target", "Target"),
+        ("Runtime.TargetDetails.Architecture", "Architecture"),
+    ];
+
+    analyzer.reset_global_usage_definition_index_build_count_for_test();
+    analyzer.reset_definition_candidates_query_count_for_test();
+    for (fq_name, snippet) in expected {
+        let targets = targets_for(fq_name);
+        let hits = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                analyzer,
+                &targets,
+                Some(&provider),
+                candidate_files.len(),
+                100,
+            )
+            .result
+            .into_either()
+            .unwrap_or_else(|error| panic!("{fq_name} query should resolve: {error}"));
+        assert_eq!(1, hits.len(), "{fq_name}: {hits:#?}");
+        assert!(
+            hits.iter().all(|hit| hit.snippet.contains(snippet)),
+            "{fq_name}: {hits:#?}"
+        );
+    }
+    assert_eq!(
+        1,
+        analyzer.global_usage_definition_index_build_count_for_test(),
+        "all receiver queries should share the generation-scoped definition index"
+    );
+    assert_eq!(
+        0,
+        analyzer.definition_candidates_query_count_for_test(),
+        "inverse receiver resolution must not fall back to persisted candidate SQL"
+    );
+}
+
+#[test]
+fn usage_finder_csharp_persisted_imported_constructor_beats_global_list_collision() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Collections/List.cs",
+            r#"
+namespace System.Collections.Generic;
+
+public class List<T> {
+    public List() {}
+    public List(int capacity) {}
+}
+"#,
+        )
+        .file(
+            "RuntimeTests/GlobalList.cs",
+            r#"
+public class List<T> {
+    public List() {}
+}
+
+public class List {
+    public List() {}
+}
+
+public class Fallback<T> {
+    public Fallback() {}
+}
+"#,
+        )
+        .file(
+            "Xml/Fallback.cs",
+            r#"
+namespace System.Xml;
+
+public class Fallback<T> {
+    public Fallback() {}
+}
+"#,
+        )
+        .file(
+            "Xml/Consumer.cs",
+            r#"
+using System.Collections.Generic;
+
+namespace System.Xml.Serialization {
+    public class Consumer {
+        public void Run() {
+            var importedZero = new List<string>();
+            var importedOne = new List<string>(4);
+            var wrongArity = new List<string>(4, 8);
+            var globalGeneric = new global::List<string>();
+            var globalOrdinary = new global::List();
+            var enclosingFallback = new Fallback<string>();
+            var globalFallback = new global::Fallback<string>();
+        }
+    }
+}
+"#,
+        )
+        .build();
+    {
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+                .expect("persisted constructor precedence project should build");
+        assert!(
+            workspace
+                .analyzer()
+                .get_all_declarations()
+                .iter()
+                .any(|unit| unit.fq_name() == "System.Collections.Generic.List`1.List"),
+            "persisted workspace should contain the imported generic constructors"
+        );
+    }
+
+    let reopened =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("persisted constructor precedence project should reopen");
+    let analyzer = reopened.analyzer();
+    let declarations = analyzer.get_all_declarations();
+    let constructor = |owner: &str, name: &str, arity: usize| {
+        declarations
+            .iter()
+            .find(|unit| {
+                unit.kind() == CodeUnitType::Function
+                    && unit.identifier() == name
+                    && unit.signature().is_some_and(|signature| {
+                        if arity == 0 {
+                            signature == "()"
+                        } else {
+                            count_signature_parameters(signature) == arity
+                        }
+                    })
+                    && analyzer
+                        .parent_of(unit)
+                        .is_some_and(|parent| parent.fq_name() == owner)
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("missing persisted {owner}.{name} constructor with arity {arity}")
+            })
+    };
+    let imported_zero = constructor("System.Collections.Generic.List`1", "List", 0);
+    let imported_one = constructor("System.Collections.Generic.List`1", "List", 1);
+    let global_generic = constructor("List`1", "List", 0);
+    let global_ordinary = constructor("List", "List", 0);
+    let enclosing_fallback = constructor("System.Xml.Fallback`1", "Fallback", 0);
+    let global_fallback = constructor("Fallback`1", "Fallback", 0);
+    let graph_hits = |target: &CodeUnit| {
+        let candidates = analyzer.get_analyzed_files().into_iter().collect();
+        CSharpUsageGraphStrategy::new()
+            .find_usages(analyzer, std::slice::from_ref(target), &candidates, 1000)
+            .into_either()
+            .expect("persisted constructor usage query should resolve")
+    };
+
+    let imported_zero_hits = graph_hits(&imported_zero);
+    assert_eq!(1, imported_zero_hits.len(), "{imported_zero_hits:#?}");
+    assert!(
+        imported_zero_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("new List<string>()")),
+        "the global generic constructor and wrong-arity call must not match: {imported_zero_hits:#?}"
+    );
+    let routed_imported_zero = UsageFinder::new()
+        .find_usages_default(analyzer, std::slice::from_ref(&imported_zero))
+        .into_either()
+        .expect("default imported constructor query should resolve");
+    assert_eq!(
+        imported_zero_hits, routed_imported_zero,
+        "default routing must retain the namespace-imported constructor site"
+    );
+
+    let imported_one_hits = graph_hits(&imported_one);
+    assert_eq!(1, imported_one_hits.len(), "{imported_one_hits:#?}");
+    assert!(
+        imported_one_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("new List<string>(4)")),
+        "only the imported one-argument constructor should match: {imported_one_hits:#?}"
+    );
+
+    let global_generic_hits = graph_hits(&global_generic);
+    assert_eq!(1, global_generic_hits.len(), "{global_generic_hits:#?}");
+    assert!(
+        global_generic_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("new global::List<string>()")),
+        "unqualified generic construction must remain on the imported owner: {global_generic_hits:#?}"
+    );
+
+    let global_ordinary_hits = graph_hits(&global_ordinary);
+    assert_eq!(1, global_ordinary_hits.len(), "{global_ordinary_hits:#?}");
+    assert!(
+        global_ordinary_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("new global::List()")),
+        "generic and nongeneric global constructors must remain distinct: {global_ordinary_hits:#?}"
+    );
+
+    let enclosing_fallback_hits = graph_hits(&enclosing_fallback);
+    assert_eq!(
+        1,
+        enclosing_fallback_hits.len(),
+        "{enclosing_fallback_hits:#?}"
+    );
+    assert!(
+        enclosing_fallback_hits.iter().all(|hit| hit
+            .snippet
+            .lines()
+            .any(|line| { line.trim() == "var enclosingFallback = new Fallback<string>();" })),
+        "the nearest enclosing namespace must beat the global fallback: {enclosing_fallback_hits:#?}"
+    );
+
+    let global_fallback_hits = graph_hits(&global_fallback);
+    assert_eq!(1, global_fallback_hits.len(), "{global_fallback_hits:#?}");
+    assert!(
+        global_fallback_hits
+            .iter()
+            .all(|hit| hit.snippet.lines().any(|line| {
+                line.trim() == "var globalFallback = new global::Fallback<string>();"
+            })),
+        "explicit global qualification must bypass the enclosing namespace: {global_fallback_hits:#?}"
+    );
+}
+
+#[test]
 fn usage_finder_csharp_finds_unique_private_method_group_argument() {
     let (project, analyzer) = csharp_analyzer_with_files(&[(
         "Demo/Command.cs",
@@ -3679,6 +4848,104 @@ namespace Demo {
         }),
         "inverse lookup should follow transparent method-group wrappers: {hits:#?}"
     );
+}
+
+#[test]
+fn usage_finder_csharp_follows_null_forgiving_method_group_arguments() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "Runtime/VolatileEnlistmentMultiplexing.cs",
+        r#"
+namespace Runtime;
+
+public delegate void WaitCallback(object state);
+
+public sealed class VolatileEnlistmentMultiplexing {
+    private void PoolableCommit(object state) {}
+    private void Accept(WaitCallback callback) {}
+
+    public void Run() {
+        Accept(new WaitCallback(PoolableCommit!));
+    }
+
+    public void RunParenthesized() {
+        Accept((PoolableCommit!));
+    }
+
+    public void RunShadowed(WaitCallback PoolableCommit) {
+        Accept(new WaitCallback(PoolableCommit!));
+    }
+}
+
+public sealed class AmbiguousMultiplexing {
+    private void PoolableCommit(object state) {}
+    private void PoolableCommit(string state) {}
+    private void Accept(WaitCallback callback) {}
+
+    public void Run() {
+        Accept(PoolableCommit!);
+    }
+}
+"#,
+    )]);
+    let consumer = project.file("Runtime/VolatileEnlistmentMultiplexing.cs");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let unique = member_function_with_signature(
+        &analyzer,
+        "Runtime.VolatileEnlistmentMultiplexing",
+        "PoolableCommit",
+        "(object)",
+    );
+    let hits = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&unique),
+            Some(&provider),
+            1,
+            100,
+        )
+        .result
+        .into_either()
+        .expect("unique null-forgiving method group should resolve");
+    assert_eq!(
+        2,
+        hits.len(),
+        "shadowed argument must be excluded: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| hit.snippet.contains("PoolableCommit!"))
+    );
+
+    let ambiguous = member_function_with_signature(
+        &analyzer,
+        "Runtime.AmbiguousMultiplexing",
+        "PoolableCommit",
+        "(object)",
+    );
+    let result = CSharpUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&ambiguous),
+        &analyzer.get_analyzed_files().into_iter().collect(),
+        100,
+    );
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } => {
+            assert!(
+                hits_by_overload
+                    .get(&ambiguous)
+                    .is_none_or(|hits| hits.is_empty()),
+                "ambiguous overload must not be proven"
+            );
+            assert_eq!(Some(&1), unproven_total_by_overload.get(&ambiguous));
+        }
+        other => panic!("expected ambiguous method group evidence, got {other:#?}"),
+    }
 }
 
 #[test]

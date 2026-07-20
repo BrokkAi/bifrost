@@ -209,6 +209,62 @@ public sealed class HiddenCommand : BaseCommand {
 }
 
 #[test]
+fn inverted_graph_resolves_null_forgiving_method_groups() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Demo.cs",
+            r#"
+namespace Demo;
+
+public delegate void WaitCallback(object state);
+
+public sealed class Command {
+    private void PoolableCommit(object state) {}
+    private void Accept(WaitCallback callback) {}
+
+    public void Run() {
+        Accept(new WaitCallback(PoolableCommit!));
+    }
+
+    public void RunParenthesized() {
+        Accept((PoolableCommit!));
+    }
+
+    public void RunShadowed(WaitCallback PoolableCommit) {
+        Accept(new WaitCallback(PoolableCommit!));
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "Demo.Command.Run", "Demo.Command.PoolableCommit"),
+        "null-forgiving method group should produce an inverted edge: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "Demo.Command.RunParenthesized",
+            "Demo.Command.PoolableCommit"
+        ),
+        "parenthesized null-forgiving method group should produce an inverted edge: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(
+            &value,
+            "Demo.Command.RunShadowed",
+            "Demo.Command.PoolableCommit"
+        ),
+        "same-named parameter must remain a structured shadow: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn inverted_graph_resolves_inherited_members_at_the_nearest_declaring_type() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
@@ -648,6 +704,167 @@ fn nested_partial_type_references_edge_to_nested_type() {
             "Dapper.SqlMapper$CacheInfo"
         ),
         "bare nested type references in a partial sibling file should edge to CacheInfo: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn csharp_issue701_structured_expression_type_roots_have_inverted_graph_parity() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Types.cs",
+            r#"
+namespace Demo {
+    public class PatternType { }
+    public class OtherType { }
+    public class InheritedPattern { }
+    public enum Mode { Enabled }
+    public class Generic<T> { public static int Value; }
+    public class Holder { public int Nested; }
+    public class InheritedOuter { public class Nested { public static int Value; } }
+    public class Outer { public class Nested { public static int Value; } }
+}
+namespace Other {
+    public class Outer { public class Nested { public static int Value; } }
+}
+namespace App {
+    public class Constants { public class Globals { public static int Value; } }
+}
+namespace Imported {
+    public class ImportedOwner { public class Nested { public static int Value; } }
+}
+namespace Imported.System {
+    public class String { }
+}
+namespace System {
+    public class String { }
+}
+"#,
+        )
+        .file(
+            "Consumer.cs",
+            r#"
+using Alias = Demo.Outer.Nested;
+using Demo;
+using Imported;
+namespace App;
+public class Base {
+    protected Holder InheritedOuter;
+    protected const int InheritedPattern = 1;
+}
+public class Consumer : Base {
+    private Holder Outer;
+    public void Receivers() {
+        var aliasValue = Alias.Value;
+        var nestedValue = Demo.Outer.Nested.Value;
+        var genericValue = Generic<int>.Value;
+        var relativeNestedValue = Constants.Globals.Value;
+        var importedNestedValue = ImportedOwner.Nested.Value;
+        System.String globalString = null;
+        var unrelated = Other.Outer.Nested.Value;
+        var fieldValue = Outer.Nested;
+    }
+    public bool Patterns(object member) {
+        if (member is PatternType || member is OtherType) { }
+        return member switch { PatternType => true, _ => false };
+    }
+    public bool Constant(object member) => member is Mode.Enabled;
+    public bool Inherited(object member) {
+        var value = InheritedOuter.Nested;
+        return member is InheritedPattern;
+    }
+    public bool Shadowed(object member, int PatternType) => member is PatternType;
+    public int Local(Holder Outer) => Outer.Nested;
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    for callee in ["Demo.Outer$Nested", "Demo.Generic`1"] {
+        assert!(
+            has_edge(&value, "App.Consumer.Receivers", callee),
+            "structured receiver should edge to {callee}: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        has_edge(&value, "App.Consumer.Receivers", "App.Constants$Globals"),
+        "a dotted nested type should resolve relative to the file namespace: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "App.Consumer.Receivers",
+            "Imported.ImportedOwner$Nested"
+        ),
+        "a using namespace should expose nested types declared directly in it: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "App.Consumer.Receivers", "System.String"),
+        "a dotted global type should remain visible after rejecting imported child namespaces: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "App.Consumer.Receivers", "Imported.System.String"),
+        "using Imported must not make Imported.System visible as System: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "App.Consumer.Patterns", "Demo.PatternType"),
+        "is/switch pattern type roots should be recorded: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "App.Consumer.Constant", "Demo.Mode"),
+        "a qualified constant pattern should retain its receiver type edge: {}",
+        value["edges"]
+    );
+    for callee in ["Demo.InheritedOuter$Nested", "Demo.InheritedPattern"] {
+        assert!(
+            !has_edge(&value, "App.Consumer.Inherited", callee),
+            "an inherited value member must shadow visible type {callee}: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        !has_edge(&value, "App.Consumer.Shadowed", "Demo.PatternType"),
+        "a parameter-shadowed constant pattern must remain a value: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "App.Consumer.Local", "Demo.Outer$Nested"),
+        "a parameter receiver must not become a type edge: {}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn csharp_issue701_is_expression_edges_to_logical_partial_type() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "TypeBuilderInstantiation.cs",
+            "namespace System.Reflection.Emit { internal sealed partial class TypeBuilderInstantiation { } }\n",
+        )
+        .file(
+            "TypeBuilderInstantiation.Mono.cs",
+            "namespace System.Reflection.Emit { internal partial class TypeBuilderInstantiation { } }\n",
+        )
+        .file(
+            "RuntimeModuleBuilder.Mono.cs",
+            "namespace System.Reflection.Emit { internal class RuntimeModuleBuilder { internal bool IsTransient(object member) => member is TypeBuilderInstantiation; } }\n",
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(
+            &value,
+            "System.Reflection.Emit.RuntimeModuleBuilder.IsTransient",
+            "System.Reflection.Emit.TypeBuilderInstantiation"
+        ),
+        "an is-expression should edge to its logical partial type: {}",
         value["edges"]
     );
 }

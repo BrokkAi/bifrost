@@ -15,8 +15,11 @@ pub struct GlobalUsageDefinitionIndex {
     direct_children_by_fqn: HashMap<String, Vec<CodeUnit>>,
     direct_children_by_normalized_fqn: HashMap<String, Vec<CodeUnit>>,
     by_file_identifier: HashMap<(ProjectFile, String), Vec<CodeUnit>>,
+    by_identifier: HashMap<String, Vec<CodeUnit>>,
     packages: HashSet<String>,
     files_by_package: HashMap<String, Vec<ProjectFile>>,
+    package_languages: HashMap<String, HashSet<Language>>,
+    child_packages_by_parent: HashMap<String, HashSet<String>>,
     by_normalized_fqn: HashMap<String, Vec<CodeUnit>>,
     types_by_package_simple: HashMap<(String, String), Vec<CodeUnit>>,
 }
@@ -314,11 +317,34 @@ impl GlobalUsageDefinitionIndex {
     {
         let fqn = unit.fq_name();
         let normalized_fqn = normalize(&fqn);
-        self.packages.insert(unit.package_name().to_string());
+        let package = unit.package_name();
+        let language = language_for_file(unit.source());
+        self.packages.insert(package.to_string());
         self.files_by_package
-            .entry(unit.package_name().to_string())
+            .entry(package.to_string())
             .or_default()
             .push(unit.source().clone());
+        self.package_languages
+            .entry(package.to_string())
+            .or_default()
+            .insert(language);
+        if !package.is_empty() {
+            let mut child = package;
+            while let Some(parent) = package_parent_name(language, child) {
+                self.child_packages_by_parent
+                    .entry(parent.to_string())
+                    .or_default()
+                    .insert(child.to_string());
+                self.package_languages
+                    .entry(parent.to_string())
+                    .or_default()
+                    .insert(language);
+                if parent.is_empty() {
+                    break;
+                }
+                child = parent;
+            }
+        }
         self.by_normalized_fqn
             .entry(normalized_fqn.clone())
             .or_default()
@@ -344,6 +370,10 @@ impl GlobalUsageDefinitionIndex {
             .entry((unit.source().clone(), unit.identifier().to_string()))
             .or_default()
             .push(unit.clone());
+        self.by_identifier
+            .entry(unit.identifier().to_string())
+            .or_default()
+            .push(unit.clone());
     }
 
     pub(crate) fn sort_entries(&mut self) {
@@ -352,6 +382,10 @@ impl GlobalUsageDefinitionIndex {
         }
         for units in self.by_file_identifier.values_mut() {
             sort_units(units);
+        }
+        for units in self.by_identifier.values_mut() {
+            sort_units(units);
+            units.dedup();
         }
         for units in self.by_normalized_fqn.values_mut() {
             sort_units(units);
@@ -410,6 +444,13 @@ impl GlobalUsageDefinitionIndex {
             .get(&(file.clone(), ident.to_string()))
             .cloned()
             .unwrap_or_default()
+    }
+
+    pub(crate) fn identifier(&self, ident: &str) -> &[CodeUnit] {
+        self.by_identifier
+            .get(ident)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     #[doc(hidden)]
@@ -475,28 +516,66 @@ impl GlobalUsageDefinitionIndex {
             .is_some_and(|files| files.iter().any(|file| language_for_file(file) == language))
     }
 
-    /// Files belonging to the package `prefix` exactly, or to any package nested
-    /// under `prefix/` (slash-separated, mirroring the recursion of a filesystem
-    /// directory target). Lets an import path such as
-    /// `github.com/cli/cli/v2/internal/skills/discovery` resolve to its package's
-    /// files. Returns sorted, deduped files.
-    pub(crate) fn package_files_with_prefix(&self, prefix: &str) -> Vec<ProjectFile> {
-        let nested = format!("{prefix}/");
-        let mut out = Vec::new();
-        for (package, files) in &self.files_by_package {
-            if package == prefix || package.starts_with(&nested) {
-                out.extend(files.iter().cloned());
+    pub(crate) fn package_container_exists(&self, package: &str) -> bool {
+        self.packages.contains(package) || self.child_packages_by_parent.contains_key(package)
+    }
+
+    pub(crate) fn package_files(&self, package: &str) -> &[ProjectFile] {
+        self.files_by_package
+            .get(package)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub(crate) fn package_languages(&self, package: &str) -> Vec<Language> {
+        let mut languages: Vec<_> = self
+            .package_languages
+            .get(package)
+            .into_iter()
+            .flat_map(|languages| languages.iter().copied())
+            .collect();
+        if let Some(children) = self.child_packages_by_parent.get(package) {
+            for child in children {
+                languages.extend(
+                    self.package_languages
+                        .get(child)
+                        .into_iter()
+                        .flat_map(|languages| languages.iter().copied()),
+                );
             }
         }
-        out.sort_by_key(rel_path_string);
-        out.dedup();
-        out
+        languages.sort();
+        languages.dedup();
+        languages
+    }
+
+    pub(crate) fn child_packages(&self, package: &str) -> Vec<String> {
+        let mut children: Vec<_> = self
+            .child_packages_by_parent
+            .get(package)
+            .into_iter()
+            .flat_map(|children| children.iter().cloned())
+            .collect();
+        children.sort();
+        children
     }
 
     pub(crate) fn fqn_prefix_exists(&self, prefix: &str) -> bool {
         let prefix = format!("{prefix}.");
         self.by_fqn.keys().any(|fqn| fqn.starts_with(&prefix))
     }
+}
+
+fn package_parent_name(language: Language, package: &str) -> Option<&str> {
+    let separator = match language {
+        Language::Go => "/",
+        Language::Cpp => "::",
+        _ => ".",
+    };
+    package
+        .rsplit_once(separator)
+        .map(|(parent, _)| parent)
+        .or(Some(""))
 }
 
 fn sort_units(units: &mut [CodeUnit]) {
@@ -524,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn package_files_with_prefix_matches_exact_and_nested_packages() {
+    fn package_catalog_keeps_exact_files_and_direct_children() {
         let root = std::env::temp_dir().join("bifrost-defindex-test");
         let units = vec![
             unit(
@@ -556,9 +635,7 @@ mod tests {
             unit.identifier().to_string()
         });
 
-        // Exact package match returns only that package's files, deduped.
-        let exact =
-            index.package_files_with_prefix("github.com/cli/cli/v2/internal/skills/discovery");
+        let exact = index.package_files("github.com/cli/cli/v2/internal/skills/discovery");
         let exact_paths: Vec<_> = exact.iter().map(rel_path_string).collect();
         assert_eq!(
             exact_paths,
@@ -568,20 +645,44 @@ mod tests {
             ]
         );
 
-        // Parent prefix recurses into nested packages (discovery + registry), not `other`.
-        let nested = index.package_files_with_prefix("github.com/cli/cli/v2/internal/skills");
-        let nested_paths: Vec<_> = nested.iter().map(rel_path_string).collect();
         assert_eq!(
-            nested_paths,
+            index.child_packages("github.com/cli/cli/v2/internal/skills"),
             vec![
-                "internal/skills/discovery/a.go".to_string(),
-                "internal/skills/discovery/b.go".to_string(),
-                "internal/skills/registry/c.go".to_string(),
+                "github.com/cli/cli/v2/internal/skills/discovery".to_string(),
+                "github.com/cli/cli/v2/internal/skills/registry".to_string(),
             ]
         );
+        assert!(index.package_container_exists("github.com/cli/cli/v2/internal/skills"));
+        assert!(!index.package_container_exists("does/not/exist"));
+        assert_eq!(
+            index.package_languages("github.com/cli/cli/v2/internal/skills"),
+            vec![Language::Go]
+        );
+    }
 
-        // A non-package string resolves to nothing.
-        assert!(index.package_files_with_prefix("does/not/exist").is_empty());
+    #[test]
+    fn package_catalog_uses_language_specific_parent_separators() {
+        let root = std::env::temp_dir().join("bifrost-defindex-package-parent-test");
+        let units = vec![
+            unit(&root, "src/A.java", "com.example.api", "A"),
+            unit(&root, "src/B.java", "com.example.impl", "B"),
+            unit(&root, "src/c.cpp", "base::android::ui", "C"),
+        ];
+        let index = GlobalUsageDefinitionIndex::from_declarations(&units, str::to_string, |unit| {
+            unit.identifier().to_string()
+        });
+
+        assert_eq!(
+            index.child_packages("com.example"),
+            vec![
+                "com.example.api".to_string(),
+                "com.example.impl".to_string()
+            ]
+        );
+        assert_eq!(
+            index.child_packages("base::android"),
+            vec!["base::android::ui".to_string()]
+        );
     }
 
     #[test]
