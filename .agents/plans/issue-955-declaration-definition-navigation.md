@@ -22,7 +22,8 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
 - [x] (2026-07-20 15:27Z) Ran the named guided specialist review against the synchronized `master` merge base and prepared a deduplicated findings index for interactive triage.
 - [x] (2026-07-20 15:29Z) Merged the one additional master cache-isolation commit that landed during review, reran all 187 LSP integration tests, and confirmed the reviewed issue diff and seven findings are unchanged against the refreshed base.
 - [x] (2026-07-20 16:18Z) Applied all seven guided-review findings: restored broad LSP ambiguity behavior, isolated physical C++ navigation occurrences from general ranges, centralized physical selection/status/diagnostics, retained later declarations, bounded target expansion, and cached LSP rendering inputs.
-- [ ] Rerun focused and complete validation, checkpoint the reviewed repair, refresh `origin/master`, and publish a ready-for-review pull request.
+- [x] (2026-07-20 19:21Z) Reran focused and complete validation after the seven-finding repair: 188 LSP, 18 MCP, 538 analyzer navigation, and 17 click tests passed; all 44 Python tests, formatting, isolated all-feature clippy, the complete isolated all-feature Rust suite, doc tests, and diff checks passed.
+- [ ] Refresh and merge current `origin/master`, rerun the affected gates, checkpoint the synchronized result, and publish a ready-for-review pull request.
 
 ## Surprises & Discoveries
 
@@ -52,6 +53,8 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
   Evidence: A bounded request-time `CppNavigationIndex` can re-run the existing structured declaration visitor over the cached indexed source/tree, retain prototype/body occurrences separately, and leave `get_symbol_locations`, summaries, and `get_definitions_by_reference` definition-oriented.
 - Observation: The public location request limit bounds references but not the number of physical targets produced by each reference.
   Evidence: A generated file containing 300 repeated prototypes expanded into 300 navigation targets before this repair. Per-result and per-batch budgets now cap the response at 256 and 1,024 targets respectively and serialize `navigation_targets_truncated`.
+- Observation: Several full-suite tests that spawn subprocesses, invoke the Python sidecar, or create signed Git commits cannot run inside the workspace sandbox even though the implementation is sound.
+  Evidence: The first isolated full-suite run passed 1,456 library tests but reported six permission/GPG environment failures. The unchanged privileged rerun passed the library suite (1,462 passed, 4 ignored), every integration suite, and doc tests with exit code 0, then removed its isolated Cargo target.
 
 ## Decision Log
 
@@ -108,14 +111,14 @@ Post-repair focused validation passes with 188 LSP server tests, 18 MCP tests, 5
 
 Final validation passed:
 
-    focused all-feature Rust suites: 187 LSP, 18 MCP, 523 analyzer, 17 click tests passed; 2 stress tests ignored
+    focused all-feature Rust suites: 188 LSP, 18 MCP, 538 analyzer, 17 click tests passed; 2 stress tests ignored
     scripts/test_python.sh: 44 passed
     cargo fmt --all: clean
     all-target/all-feature clippy: clean in an isolated target
-    complete cargo test --features nlp,python: passed in an isolated target, including 0 doc-test failures
+    complete cargo test --features nlp,python: passed in a privileged isolated target, including 1,462 library tests and 0 doc-test failures
     git diff --check: clean
 
-The final issue diff from the branch base is 34 files, 1,480 insertions, and 201 deletions. No UsageBench files were changed, and no branch switch, rebase, push, or pull request was performed.
+Before the final master refresh, the issue diff from the merge base is 37 files, 2,354 insertions, and 247 deletions. No UsageBench files were changed, and no branch switch or rebase was performed.
 
 ## Context and Orientation
 
@@ -224,3 +227,5 @@ Plan revision note (2026-07-20 15:29Z): Recorded the final master cache-isolatio
 Plan revision note (2026-07-20 15:42Z): Queued all seven guided-review findings at the user's direction and reopened implementation/validation/publication milestones for a ready pull request.
 
 Plan revision note (2026-07-20 16:18Z): Recorded all seven review findings as applied, the request-time physical-occurrence architecture, bounded target and cached LSP rendering behavior, and the passing post-repair focused suites before checkpointing.
+
+Plan revision note (2026-07-20 19:21Z): Recorded final post-repair validation, including the sandbox-only subprocess/GPG failures and clean privileged rerun, current focused counts, formatting, Python, clippy, full-suite, doc-test, and diff-check evidence before the synchronization/publication milestone.
