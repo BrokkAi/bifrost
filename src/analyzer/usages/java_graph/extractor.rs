@@ -8,8 +8,8 @@ use crate::analyzer::usages::java_graph::resolver::{
     bare_method_context_matches_target, constructor_method_reference_receiver,
     has_proven_static_import, infer_type_from_value, is_declaration_name, is_ignored_type_context,
     java_method_signatures_match, nested_type_for_owner, node_text, receiver_matches_target,
-    resolve_non_nested_type_from_node, resolve_type_from_node, resolve_type_segments,
-    same_owner_context, seed_class_binding,
+    resolve_field_access_type, resolve_non_nested_type_from_node, resolve_type_from_node,
+    resolve_type_segments, same_owner_context, seed_class_binding,
 };
 use crate::analyzer::usages::java_graph::return_type::{FileReturnCache, MethodReturnCache};
 use crate::analyzer::usages::local_inference::{
@@ -581,6 +581,22 @@ fn method_reference_owner_fq_names(receiver: Node<'_>, ctx: &mut ScanCtx<'_>) ->
                     .map(|unit| vec![unit.fq_name()])
                     .unwrap_or_default()
             }),
+        "field_access" => resolve_field_access_type(
+            receiver,
+            ctx.source,
+            |base| {
+                let name = node_text(base, ctx.source);
+                if ctx.bindings.is_shadowed(name) {
+                    Err(())
+                } else {
+                    Ok(resolve_type_from_node(base, ctx))
+                }
+            },
+            |qualified| ctx.java.resolve_usage_type_name(ctx.file, qualified),
+            |owner, name| nested_type_for_owner(owner, name, ctx),
+        )
+        .map(|owner| vec![owner.fq_name()])
+        .unwrap_or_default(),
         _ => resolve_type_from_node(receiver, ctx)
             .map(|unit| vec![unit.fq_name()])
             .unwrap_or_default(),

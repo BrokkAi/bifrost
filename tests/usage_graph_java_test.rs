@@ -225,6 +225,66 @@ class Consumer {
 }
 
 #[test]
+fn nested_type_method_reference_edges_to_the_exact_owner() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "app/Settings.java",
+            r#"
+package app;
+
+class Settings {
+    static class Basic {
+        boolean enabled() { return true; }
+    }
+
+    static class OtherBasic {
+        boolean enabled() { return false; }
+    }
+}
+"#,
+        )
+        .file(
+            "app/Consumer.java",
+            r#"
+package app;
+
+class Consumer {
+    java.util.function.Function<Settings.Basic, Boolean> reference() {
+        return Settings.Basic::enabled;
+    }
+
+    java.util.function.Function<Settings.OtherBasic, Boolean> wrongOwner() {
+        return Settings.OtherBasic::enabled;
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        find_edge(
+            &value,
+            "app.Consumer.reference",
+            "app.Settings.Basic.enabled"
+        )
+        .is_some(),
+        "nested method reference should edge to its exact owner: {}",
+        value["edges"]
+    );
+    assert!(
+        find_edge(
+            &value,
+            "app.Consumer.wrongOwner",
+            "app.Settings.Basic.enabled"
+        )
+        .is_none(),
+        "wrong nested owner must not edge to Basic.enabled: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn untyped_local_named_like_a_type_produces_no_static_edge() {
     let value = usage_graph();
 

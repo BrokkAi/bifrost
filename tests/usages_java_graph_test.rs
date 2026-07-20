@@ -2527,6 +2527,56 @@ public class Consumer {
 }
 
 #[test]
+fn java_graph_strategy_resolves_nested_type_method_reference_receivers() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "app/Settings.java",
+            r#"
+package app;
+
+public class Settings {
+    public static class Basic {
+        public boolean enabled() { return true; }
+    }
+
+    public static class OtherBasic {
+        public boolean enabled() { return false; }
+    }
+}
+"#,
+        ),
+        (
+            "app/Consumer.java",
+            r#"
+package app;
+
+public class Consumer {
+    java.util.function.Function<Settings.Basic, Boolean> reference() {
+        return Settings.Basic::enabled; // positive-nested-reference
+    }
+
+    java.util.function.Function<Settings.OtherBasic, Boolean> wrongOwner() {
+        return Settings.OtherBasic::enabled; // negative-wrong-nested-owner
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "app.Settings.Basic.enabled");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let nested_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    ));
+
+    assert_hit_contains(&nested_hits, "positive-nested-reference");
+    assert_no_hit_contains(&nested_hits, "negative-wrong-nested-owner");
+}
+
+#[test]
 fn java_graph_strategy_matches_this_and_super_method_references_selector_accurately() {
     let (_project, analyzer) = java_analyzer_with_files(&[
         (

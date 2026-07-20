@@ -594,6 +594,77 @@ where
     segments
 }
 
+/// Resolve a method-reference receiver that tree-sitter represents as a
+/// `field_access`, such as `Settings.Basic` in `Settings.Basic::enabled`.
+/// Components come exclusively from AST identifier fields. Resolution must
+/// establish a real type prefix and then a declaration-backed nested type for
+/// every remaining component, so ordinary dotted value expressions do not
+/// become static type references.
+pub(super) fn resolve_field_access_type<ResolveBase, ResolveQualified, ResolveNested>(
+    node: Node<'_>,
+    source: &str,
+    mut resolve_base: ResolveBase,
+    mut resolve_qualified: ResolveQualified,
+    mut resolve_nested: ResolveNested,
+) -> Option<CodeUnit>
+where
+    ResolveBase: FnMut(Node<'_>) -> Result<Option<CodeUnit>, ()>,
+    ResolveQualified: FnMut(&str) -> Option<CodeUnit>,
+    ResolveNested: FnMut(&CodeUnit, &str) -> Option<CodeUnit>,
+{
+    if node.kind() != "field_access" {
+        return None;
+    }
+
+    let mut components = Vec::new();
+    let mut current = node;
+    while current.kind() == "field_access" {
+        let field = current.child_by_field_name("field")?;
+        if field.kind() != "identifier" {
+            return None;
+        }
+        components.push(field);
+        current = current.child_by_field_name("object")?;
+    }
+    if !matches!(current.kind(), "identifier" | "type_identifier") {
+        return None;
+    }
+    components.push(current);
+    components.reverse();
+
+    let mut qualified = node_text(components[0], source).to_string();
+    if qualified.is_empty() {
+        return None;
+    }
+    let mut owner = resolve_base(components[0]).ok()?;
+    let mut consumed = 1;
+    if owner.is_none() {
+        for (index, component) in components[1..].iter().enumerate() {
+            let name = node_text(*component, source);
+            if name.is_empty() {
+                return None;
+            }
+            qualified.push('.');
+            qualified.push_str(name);
+            if let Some(resolved) = resolve_qualified(&qualified) {
+                owner = Some(resolved);
+                consumed = index + 2;
+                break;
+            }
+        }
+    }
+
+    let mut owner = owner?;
+    for component in &components[consumed..] {
+        let name = node_text(*component, source);
+        if name.is_empty() {
+            return None;
+        }
+        owner = resolve_nested(&owner, name)?;
+    }
+    Some(owner)
+}
+
 fn nominal_type_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
