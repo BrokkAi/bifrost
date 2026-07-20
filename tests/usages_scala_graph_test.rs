@@ -4886,6 +4886,207 @@ object Outer {
 }
 
 #[test]
+fn scala_file_major_scan_emits_each_structured_invocation_and_stable_prefix_event() {
+    let source = r#"package parity
+
+object Stable {
+  val mapping: Map[String, Int] = Map("key" -> 1)
+  def ordinary(value: Int): Int = value
+  def generic[A](value: A): A = value
+  def parameterless: Int = 1
+}
+
+enum Mode { case Live, Idle }
+
+opaque type Choice[A] = A
+object Choice { def apply[A](value: A): Choice[A] = value }
+
+object Dual {
+  type Factory = Int
+  val Factory: Array[Int] = Array(1)
+}
+
+object Syntax {
+  extension (value: String) def decorated: String = value
+}
+
+class Ops { infix def combine(value: Int): Int = value }
+
+class Use {
+  val indexed: Array[Int] = Array(1)
+  var remapped: Map[String, Int] = Map("key" -> 2)
+
+  def indexedValue: Int = indexed(0) // positive-applied-val
+  def remappedValue: Int = remapped("key") // positive-applied-var
+  def qualifiedField: Int = Stable.mapping("key") // positive-qualified-applied-field
+  def ordinaryCall: Int = Stable.ordinary(1) // positive-ordinary-call
+  def genericCall: String = Stable.generic[String]("value") // positive-type-argument-call
+  def parameterlessCall: Int = Stable.parameterless // positive-parameterless-call
+  def extensionCall: String = {
+    import Syntax.*
+    "value".decorated // positive-extension-call
+  }
+  def infixCall(ops: Ops): Int = ops combine 1 // positive-infix-call
+  def stableRoot: Int = Stable.ordinary(2) // positive-stable-root
+  def enumRoot: Mode = Mode.Live // positive-enum-root
+  def dualNamespaceApply: Choice[Int] = Choice(1) // positive-dual-namespace-apply
+  def importedDualRoleField: Int = {
+    import Dual.Factory
+    Factory(0) // positive-imported-dual-role-field
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("parity/Use.scala", source),
+        (
+            "external/External.scala",
+            r#"package external
+class External
+trait Factory { def parameterless[A]: Int }
+object External extends Factory { def parameterless[A]: Int = 1 }
+"#,
+        ),
+        (
+            "external/Use.scala",
+            r#"package externaluse
+import external.*
+object Use {
+  val parameterless: Int = 0
+  def value: Int = External.parameterless // positive-wildcard-parameterless-call
+}
+"#,
+        ),
+        (
+            "collision/Foo.scala",
+            r#"package collision
+class Foo { val bar: Array[Int] = Array(1) }
+object Foo { val bar: Array[Int] = Array(2) }
+object Use {
+  import Foo.bar
+  val value = bar(0) // positive-companion-imported-field
+}
+"#,
+        ),
+    ]);
+
+    for (target_fqn, marker) in [
+        ("parity.Use.indexed", "positive-applied-val"),
+        ("parity.Use.remapped", "positive-applied-var"),
+        ("parity.Stable$.mapping", "positive-qualified-applied-field"),
+        ("parity.Stable$.ordinary", "positive-ordinary-call"),
+        ("parity.Stable$.generic", "positive-type-argument-call"),
+        (
+            "parity.Stable$.parameterless",
+            "positive-parameterless-call",
+        ),
+        ("parity.Syntax$.decorated", "positive-extension-call"),
+        ("parity.Ops.combine", "positive-infix-call"),
+        ("parity.Stable$", "positive-stable-root"),
+        ("parity.Mode", "positive-enum-root"),
+        ("parity.Choice$.apply", "positive-dual-namespace-apply"),
+        ("parity.Dual$.Factory", "positive-imported-dual-role-field"),
+        (
+            "external.External$.parameterless",
+            "positive-wildcard-parameterless-call",
+        ),
+        ("collision.Foo$.bar", "positive-companion-imported-field"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&target_hits, marker);
+    }
+
+    let enclosing_field = definition(&analyzer, "externaluse.Use$.parameterless");
+    let enclosing_field_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&enclosing_field)),
+    );
+    assert_no_hit_contains(
+        &enclosing_field_hits,
+        "positive-wildcard-parameterless-call",
+    );
+
+    let instance_field = definition(&analyzer, "collision.Foo.bar");
+    let instance_field_hits = hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&instance_field)),
+    );
+    assert_no_hit_contains(&instance_field_hits, "positive-companion-imported-field");
+}
+
+#[test]
+fn scala_file_major_applied_fields_and_stable_roots_keep_physical_identity() {
+    let replica = |marker: &str| {
+        format!(
+            r#"package replica
+class Holder {{
+  val indexed: Array[Int] = Array(1)
+  def use: Int = indexed(0) // {marker}-applied-field
+}}
+object Stable {{
+  val value: Int = 1
+  def use: Int = Stable.value // {marker}-stable-root
+}}
+object Dual {{
+  type Factory = Int
+  val Factory: Array[Int] = Array(1)
+}}
+"#
+        )
+    };
+    let jvm = replica("jvm");
+    let js = replica("js");
+    let ambiguous = r#"package app
+import replica.Stable
+object Consumer {
+  val value = Stable.value // negative-ambiguous-stable-root
+  import replica.Dual.Factory
+  val factory = Factory(0) // negative-ambiguous-imported-field
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("jvm/replica/Defs.scala", &jvm),
+        ("js/replica/Defs.scala", &js),
+        ("app/Consumer.scala", ambiguous),
+    ]);
+
+    for (platform, path) in [
+        ("jvm", "jvm/replica/Defs.scala"),
+        ("js", "js/replica/Defs.scala"),
+    ] {
+        for fqn in ["replica.Holder.indexed", "replica.Stable$"] {
+            let target = analyzer
+                .get_definitions(fqn)
+                .into_iter()
+                .find(|unit| rel_path_string(unit.source()) == path)
+                .unwrap_or_else(|| panic!("missing exact {fqn} in {path}"));
+            let target_hits = hits(
+                UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+            );
+            let marker = if fqn.ends_with("indexed") {
+                format!("{platform}-applied-field")
+            } else {
+                format!("{platform}-stable-root")
+            };
+            assert_hit_contains(&target_hits, &marker);
+            let other = if platform == "jvm" { "js" } else { "jvm" };
+            assert_no_hit_contains(&target_hits, &format!("{other}-"));
+            assert_no_hit_contains(&target_hits, "negative-ambiguous-stable-root");
+        }
+
+        let imported_field = analyzer
+            .get_definitions("replica.Dual$.Factory")
+            .into_iter()
+            .find(|unit| rel_path_string(unit.source()) == path)
+            .unwrap_or_else(|| panic!("missing exact replica.Dual$.Factory in {path}"));
+        let imported_field_hits = hits(
+            UsageFinder::new()
+                .find_usages_default(&analyzer, std::slice::from_ref(&imported_field)),
+        );
+        assert_no_hit_contains(&imported_field_hits, "negative-ambiguous-imported-field");
+    }
+}
+
+#[test]
 fn scala_unqualified_calls_resolve_through_lexical_owner_tiers() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "app/Owners.scala",

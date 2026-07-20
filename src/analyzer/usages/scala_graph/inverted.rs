@@ -43,15 +43,15 @@ use super::syntax::{
     ScalaTypeExpressionPath, call_arities_for_reference, call_site_shape_for_reference,
     enclosing_template_declarations, invocation_function_reference,
     is_bare_companion_method_value_reference, is_call_function_reference,
-    is_constructor_like_reference, is_declaration_name, is_extractor_reference, is_identifier_node,
-    is_infix_pattern_operator, is_owner_qualified_this, is_scala_case_pattern_binder,
-    is_scala_class_reference, is_scala_named_argument_assignment, is_scala_object_reference,
-    is_semantic_call_argument, is_terminal_stable_field_reference, named_argument_invocation_owner,
-    node_text, parenthesized_arity, qualified_stable_type_reference,
-    resolve_stable_object_expression, scala_callable_alternative_is_candidate,
-    scala_callable_alternative_matches, scala_callable_shape_matches,
-    scala_import_is_visible_at_byte, scala_pattern_binder_names, scala_source_facts,
-    scala_union_type_alternative_paths, stable_identifier_prefix_reference,
+    is_constructor_like_reference, is_declaration_name, is_extractor_reference,
+    is_field_expression_value, is_identifier_node, is_infix_pattern_operator,
+    is_owner_qualified_this, is_scala_case_pattern_binder, is_scala_class_reference,
+    is_scala_named_argument_assignment, is_scala_object_reference, is_semantic_call_argument,
+    is_terminal_stable_field_reference, named_argument_invocation_owner, node_text,
+    parenthesized_arity, qualified_stable_type_reference, resolve_stable_object_expression,
+    scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
+    scala_callable_shape_matches, scala_import_is_visible_at_byte, scala_pattern_binder_names,
+    scala_source_facts, scala_union_type_alternative_paths, stable_identifier_prefix_reference,
     stable_identifier_reference, template_direct_term_member_named, template_self_type,
     terminal_invocation_owner_name,
 };
@@ -425,6 +425,19 @@ impl ProjectTypes {
                     .bulk_file_state(unit.source())
                     .and_then(|state| state.signatures.get(unit))
                     .is_some_and(|signatures| signatures.len() > 1))
+    }
+
+    fn is_exclusive_type_alias(&self, unit: &CodeUnit) -> bool {
+        self.type_aliases.contains(unit) && !self.has_term_field_declaration(unit)
+    }
+
+    fn term_field_declaration_is_globally_unique(&self, unit: &CodeUnit) -> bool {
+        self.index
+            .by_fqn(&unit.fq_name())
+            .iter()
+            .filter(|candidate| self.has_term_field_declaration(candidate))
+            .count()
+            == 1
     }
 
     fn is_type_namespace_declaration(&self, unit: &CodeUnit) -> bool {
@@ -3449,11 +3462,34 @@ impl ProjectTypes {
         values
     }
 
-    fn member_by_normalized_fqn(&self, normalized_fqn: &str) -> Option<&CodeUnit> {
-        self.index
+    fn importable_member_by_normalized_fqn(
+        &self,
+        scala: &ScalaAnalyzer,
+        normalized_fqn: &str,
+    ) -> Option<&CodeUnit> {
+        let candidates = self
+            .index
             .by_normalized_fqn(normalized_fqn)
             .iter()
-            .find(|unit| unit.is_function() || unit.is_field())
+            .filter(|unit| unit.is_function() || unit.is_field())
+            .collect::<Vec<_>>();
+        if let [candidate] = candidates.as_slice() {
+            return Some(*candidate);
+        }
+        let stable_members = self
+            .index
+            .by_normalized_fqn(normalized_fqn)
+            .iter()
+            .filter(|unit| unit.is_function() || unit.is_field())
+            .filter(|unit| {
+                self.exact_structural_parent(scala, unit)
+                    .is_some_and(|owner| owner.is_class() && owner.short_name().ends_with('$'))
+            })
+            .collect::<Vec<_>>();
+        let [candidate] = stable_members.as_slice() else {
+            return None;
+        };
+        Some(*candidate)
     }
 
     fn exact_field(
@@ -5568,7 +5604,9 @@ impl NameResolver {
                 );
             }
             let normalized = scala_normalized_fq_name(&tier.candidate);
-            if include_members && let Some(member) = types.member_by_normalized_fqn(&normalized) {
+            if include_members
+                && let Some(member) = types.importable_member_by_normalized_fqn(scala, &normalized)
+            {
                 member_names.add_declaration(local_name.clone(), member, 192);
                 for method in types.direct_extension_method(scala, &normalized) {
                     direct_extension_methods
@@ -6686,6 +6724,27 @@ fn record_reference(
                         let Some(call_shape) = call_site_shape_for_reference(field) else {
                             return;
                         };
+                        let exact_owner = receiver_type_declaration(receiver, ctx, bindings);
+                        let field_resolution = exact_owner.as_ref().map_or_else(
+                            || ctx.types.field_for_owner_member(ctx.scala, &owner, name),
+                            |owner| ctx.types.field_for_owner_unit(ctx.scala, owner, name),
+                        );
+                        match field_resolution {
+                            FieldResolution::Resolved(resolved) => {
+                                // A selected value remains a reference to that exact field even
+                                // when Scala immediately applies/indexes the returned value. The
+                                // terminal `call_expression` owns this event because its child is
+                                // deliberately suppressed below to preserve shaped-call safety.
+                                ctx.record_exact(
+                                    resolved.declaration,
+                                    ScalaReferenceRole::Field,
+                                    field,
+                                );
+                                return;
+                            }
+                            FieldResolution::Unresolved => return,
+                            FieldResolution::NoMatch => {}
+                        }
                         let method_value_shape =
                             match companion_method_value_context(node, ctx, bindings) {
                                 ScalaMethodValueContext::Function(shape) => Some(shape),
@@ -6698,27 +6757,26 @@ fn record_reference(
                             .iter()
                             .map(|list| list.arity)
                             .collect::<Vec<_>>();
-                        let resolution = receiver_type_declaration(receiver, ctx, bindings)
-                            .map_or_else(
-                                || {
-                                    ctx.types
-                                        .effective_method_declarations_for_owner_with_shape(
-                                            ctx.scala,
-                                            &owner,
-                                            name,
-                                            &call_shape,
-                                        )
-                                },
-                                |exact_owner| {
-                                    ctx.types
-                                        .effective_method_declarations_for_exact_owner_with_shape(
-                                            ctx.scala,
-                                            &exact_owner,
-                                            name,
-                                            &call_shape,
-                                        )
-                                },
-                            );
+                        let resolution = exact_owner.as_ref().map_or_else(
+                            || {
+                                ctx.types
+                                    .effective_method_declarations_for_owner_with_shape(
+                                        ctx.scala,
+                                        &owner,
+                                        name,
+                                        &call_shape,
+                                    )
+                            },
+                            |exact_owner| {
+                                ctx.types
+                                    .effective_method_declarations_for_exact_owner_with_shape(
+                                        ctx.scala,
+                                        exact_owner,
+                                        name,
+                                        &call_shape,
+                                    )
+                            },
+                        );
                         match resolution {
                             BareMemberResolution::Resolved(methods) => {
                                 for method in methods {
@@ -6781,14 +6839,45 @@ fn record_reference(
                             | ScalaMethodValueContext::Incompatible => None,
                         };
                     let call_shape = call_shape.with_method_value_shape(method_value_shape);
+                    if record_unqualified_applied_field(function, name, ctx, bindings) {
+                        return;
+                    }
                     if !bindings.resolve_symbol(name).is_unknown() || bindings.is_shadowed(name) {
                         return;
                     }
                     if record_lexically_visible_call(function, name, &call_shape, ctx) {
                         return;
                     }
-                    let imported_units = ctx.resolver.resolve_member_units(name);
+                    let resolved_member_units = ctx.resolver.resolve_member_units(name);
+                    let imported_type_alias_only = !resolved_member_units.is_empty()
+                        && resolved_member_units
+                            .iter()
+                            .all(|unit| ctx.types.is_exclusive_type_alias(unit));
+                    let imported_units = resolved_member_units
+                        .into_iter()
+                        .filter(|unit| {
+                            unit.is_function() || ctx.types.has_term_field_declaration(unit)
+                        })
+                        .collect::<Vec<_>>();
                     if !imported_units.is_empty() {
+                        let imported_fields = imported_units
+                            .iter()
+                            .filter(|unit| ctx.types.has_term_field_declaration(unit))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if !imported_fields.is_empty() {
+                            if let [field] = imported_fields.as_slice()
+                                && (field.source() == ctx.source_file
+                                    || ctx.types.term_field_declaration_is_globally_unique(field))
+                            {
+                                ctx.record_exact(
+                                    field.clone(),
+                                    ScalaReferenceRole::Field,
+                                    function,
+                                );
+                            }
+                            return;
+                        }
                         let imported_refs = imported_units.iter().collect::<Vec<_>>();
                         for target in ctx.types.method_declarations_for_members_with_shape(
                             ctx.scala,
@@ -6799,7 +6888,9 @@ fn record_reference(
                         }
                         return;
                     }
-                    if let Some(imported) = ctx.resolver.resolve_member(name) {
+                    if !imported_type_alias_only
+                        && let Some(imported) = ctx.resolver.resolve_member(name)
+                    {
                         for target in ctx.types.imported_member_targets_with_shape(
                             ctx.scala,
                             &imported,
@@ -6889,6 +6980,19 @@ fn record_reference(
             {
                 return;
             }
+            // A stable selection's root is an independently meaningful term
+            // reference. Resolve it before class/type handling consumes the same
+            // spelling, so `Flag` in `Flag.values` is attributed to the exact
+            // companion object while `Flag` in a type position still resolves to
+            // the class/enum namespace below.
+            if is_field_expression_value(node)
+                && bindings.resolve_symbol(name).is_unknown()
+                && !bindings.is_shadowed(name)
+                && let Some(target) = ctx.visible_object_reference(node.start_byte(), name)
+            {
+                ctx.record_resolved(target, ScalaReferenceRole::StableObject, node);
+                return;
+            }
             let bare_companion_method_value = is_bare_companion_method_value_reference(node);
             if (is_extractor_reference(node) || is_infix_pattern_operator(node))
                 && let Some(fqn) = (bindings.resolve_symbol(name).is_unknown()
@@ -6910,7 +7014,9 @@ fn record_reference(
                 ctx.record_resolved(target, ScalaReferenceRole::Type, node);
                 return;
             }
-            if let Some(owner) = exact_owner_field_binding(bindings, name) {
+            if !is_terminal_stable_field_reference(node)
+                && let Some(owner) = exact_owner_field_binding(bindings, name)
+            {
                 match ctx.types.field_for_exact_owner(ctx.scala, &owner, name) {
                     FieldResolution::Resolved(field) => {
                         ctx.record_exact(field.declaration, ScalaReferenceRole::Field, node);
@@ -6954,9 +7060,10 @@ fn record_reference(
                     return;
                 }
             }
-            if ctx
-                .lexically_visible_object(node.start_byte(), name)
-                .is_none()
+            if !is_terminal_stable_field_reference(node)
+                && ctx
+                    .lexically_visible_object(node.start_byte(), name)
+                    .is_none()
             {
                 for declaration in enclosing_template_declarations(node) {
                     if let Some(owner) = ctx
@@ -7073,7 +7180,9 @@ fn record_reference(
                     ctx.record_exact(object, ScalaReferenceRole::StableObject, node);
                     return;
                 }
-                if reference.segments.len() > 1 {
+                // A terminal selection still has exact receiver dispatch below;
+                // a stable-path miss must not consume parameterless methods.
+                if reference.segments.len() > 1 && !is_terminal_stable_field_reference(node) {
                     return;
                 }
             }
@@ -7295,6 +7404,54 @@ fn record_qualified_package_call(field: Node<'_>, ctx: &mut ScalaScan<'_, '_>) -
         ctx.record_exact_callable(method, field);
     }
     true
+}
+
+/// Record an unqualified owner field used as an application/indexing function.
+///
+/// Tree-sitter gives `values(index)` to the enclosing `call_expression`; the
+/// identifier child is intentionally not revisited because doing so would lose
+/// callable shape. Preserve that ownership while still emitting the exact field
+/// selection before ordinary method/type-application dispatch. Local parameters
+/// and local values remain authoritative shadows.
+fn record_unqualified_applied_field(
+    function: Node<'_>,
+    name: &str,
+    ctx: &mut ScalaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
+) -> bool {
+    if let Some(owner) = exact_owner_field_binding(bindings, name) {
+        match ctx.types.field_for_exact_owner(ctx.scala, &owner, name) {
+            FieldResolution::Resolved(field) => {
+                ctx.record_exact(field.declaration, ScalaReferenceRole::Field, function);
+            }
+            FieldResolution::NoMatch => {
+                ctx.record_exact_owner_member(owner, name, ScalaReferenceRole::Field, function);
+            }
+            FieldResolution::Unresolved => {}
+        }
+        return true;
+    }
+    if bindings.is_shadowed(name) {
+        return false;
+    }
+    if let Some(owner) = ctx.enclosing_class_unit(function.start_byte()).cloned() {
+        match ctx.types.field_for_owner_unit(ctx.scala, &owner, name) {
+            FieldResolution::Resolved(field) => {
+                ctx.record_exact(field.declaration, ScalaReferenceRole::Field, function);
+                return true;
+            }
+            FieldResolution::Unresolved => return true,
+            FieldResolution::NoMatch => {}
+        }
+    }
+    if let Some(target) = ctx.resolver.resolve_member_unit(name)
+        && ctx.types.has_term_field_declaration(&target)
+        && !ctx.types.is_type_alias(ctx.scala, &target)
+    {
+        ctx.record_exact(target, ScalaReferenceRole::Field, function);
+        return true;
+    }
+    false
 }
 
 /// Calls and infix expressions resolve callable shape at their owning AST
@@ -8027,16 +8184,24 @@ fn receiver_type_declaration(
             if name == "this" {
                 return ctx.enclosing_class_unit(receiver.start_byte()).cloned();
             }
-            let binding = precise_scala_binding(bindings, name)?;
-            if let Some(declaration) = binding.receiver_declaration {
-                return Some(declaration);
+            if let Some(binding) = precise_scala_binding(bindings, name) {
+                if let Some(declaration) = binding.receiver_declaration {
+                    return Some(declaration);
+                }
+                let receiver_type = binding.receiver_type?;
+                return exact_receiver_type_declaration(
+                    &receiver_type,
+                    ctx.enclosing_class_unit(receiver.start_byte())?,
+                    ctx,
+                );
             }
-            let receiver_type = binding.receiver_type?;
-            exact_receiver_type_declaration(
-                &receiver_type,
-                ctx.enclosing_class_unit(receiver.start_byte())?,
-                ctx,
-            )
+            if bindings.is_shadowed(name) || !is_field_expression_value(receiver) {
+                return None;
+            }
+            match ctx.visible_object_reference(receiver.start_byte(), name) {
+                Some(ScalaResolvedReference::Exact(object)) => Some(object),
+                Some(ScalaResolvedReference::Logical(_)) | None => None,
+            }
         }
         "field_expression" => {
             let value = receiver.child_by_field_name("value")?;
@@ -8110,6 +8275,17 @@ fn receiver_type_fqn(
                         FieldResolution::Resolved(field) => field.declared_type,
                         FieldResolution::NoMatch | FieldResolution::Unresolved => None,
                     }
+                })
+                .or_else(|| {
+                    (!bindings.is_shadowed(name) && is_field_expression_value(receiver)).then(
+                        || {
+                            ctx.visible_object_reference(receiver.start_byte(), name)
+                                .map(|reference| match reference {
+                                    ScalaResolvedReference::Exact(object) => object.fq_name(),
+                                    ScalaResolvedReference::Logical(fqn) => fqn,
+                                })
+                        },
+                    )?
                 })
                 .or_else(|| {
                     (!bindings.is_shadowed(name)).then(|| {
