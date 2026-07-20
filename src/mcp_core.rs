@@ -85,7 +85,7 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
         ),
         tool_descriptor(
             "get_summaries",
-            "Summarize matching source files, globs, classes, or modules with line ranges. Use before repeated read_file/grep calls when you need a compact map of related code before choosing exact definitions to inspect. If full summaries exceed the response budget, the result is marked degraded and returns compact_symbols declaration outlines instead. Example targets: [\"src/auth/**/*.rs\"], [\"crates/polars-core/src/frame/**/*.rs\"], [\"MyClass\"].",
+            "Summarize matching source files, globs, classes, or modules with line ranges. Directory targets list immediate child directories and files; language package/import targets list direct child packages and top-level types in the exact package. Use before repeated read_file/grep calls when you need a compact map of related code before choosing exact definitions to inspect. If ordinary summaries exceed the response budget, the result is marked degraded and returns compact_symbols declaration outlines instead; oversized container listings are truncated with a total count. Example targets: [\"src/auth/**/*.rs\"], [\"src/auth\"], [\"com.example.auth\"], [\"MyClass\"].",
             summaries_schema(),
         ),
         scan_descriptor,

@@ -1,7 +1,9 @@
 use brokk_bifrost::{
     GoAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language, RustAnalyzer, ScalaAnalyzer,
     TestProject, TypescriptAnalyzer,
-    searchtools::{SummariesParams, SummaryElement, get_summaries},
+    searchtools::{
+        ContainerKind, ContainerListingEntry, SummariesParams, SummaryElement, get_summaries,
+    },
     searchtools_render::{RenderOptions, RenderText},
 };
 
@@ -150,6 +152,117 @@ fn get_summaries_accepts_mixed_file_and_class_targets() {
             .iter()
             .any(|summary| summary.label == "A.AInner" && summary.path == "A.java")
     );
+}
+
+#[test]
+fn get_summaries_lists_immediate_directory_children() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/App.java", "class App {}\n")
+        .file("src/config.properties", "enabled=true\n")
+        .file("src/internal/Helper.java", "class Helper {}\n")
+        .file("tests/AppTest.java", "class AppTest {}\n")
+        .build();
+    let analyzer = JavaAnalyzer::from_project(project.project().clone());
+
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["src".to_string()],
+        },
+    );
+
+    assert!(result.summaries.is_empty(), "{result:#?}");
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert_eq!(1, result.listings.len(), "{result:#?}");
+    let listing = &result.listings[0];
+    assert_eq!(ContainerKind::Directory, listing.kind);
+    assert_eq!("src", listing.target);
+    assert_eq!(3, listing.total_entries);
+    assert!(matches!(
+        &listing.entries[0],
+        ContainerListingEntry::Directory { name, path }
+            if name == "internal" && path == "src/internal"
+    ));
+    assert!(listing.entries.iter().any(|entry| matches!(
+        entry,
+        ContainerListingEntry::File { path, .. } if path == "src/App.java"
+    )));
+    assert!(listing.entries.iter().any(|entry| matches!(
+        entry,
+        ContainerListingEntry::File { path, .. } if path == "src/config.properties"
+    )));
+    assert!(
+        !result
+            .render_text(RenderOptions::default())
+            .contains("tests/AppTest.java")
+    );
+}
+
+#[test]
+fn get_summaries_lists_package_types_and_direct_child_packages() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/com/example/Types.java",
+            r#"package com.example;
+
+class Alpha {
+    class Inner {}
+}
+
+class Helper {}
+"#,
+        )
+        .file(
+            "src/com/example/deep/Beta.java",
+            "package com.example.deep;\nclass Beta {}\n",
+        )
+        .build();
+    let analyzer = JavaAnalyzer::from_project(project.project().clone());
+
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["com.example".to_string(), "com".to_string()],
+        },
+    );
+
+    assert!(result.summaries.is_empty(), "{result:#?}");
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert_eq!(2, result.listings.len(), "{result:#?}");
+    let concrete = result
+        .listings
+        .iter()
+        .find(|listing| listing.target == "com.example")
+        .expect("concrete package listing");
+    assert_eq!(ContainerKind::Package, concrete.kind);
+    assert_eq!(vec!["java"], concrete.languages);
+    assert!(concrete.entries.iter().any(|entry| matches!(
+        entry,
+        ContainerListingEntry::Package { qualified_name, languages, .. }
+            if qualified_name == "com.example.deep" && languages == &["java"]
+    )));
+    let symbols = concrete
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            ContainerListingEntry::Type { symbol, .. } => Some(symbol.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(vec!["com.example.Alpha", "com.example.Helper"], symbols);
+
+    let virtual_parent = result
+        .listings
+        .iter()
+        .find(|listing| listing.target == "com")
+        .expect("virtual package listing");
+    assert_eq!(vec!["java"], virtual_parent.languages);
+    assert_eq!(1, virtual_parent.entries.len());
+    assert!(matches!(
+        &virtual_parent.entries[0],
+        ContainerListingEntry::Package { qualified_name, languages, .. }
+            if qualified_name == "com.example" && languages == &["java"]
+    ));
 }
 
 #[test]
@@ -327,7 +440,7 @@ fn get_summaries_symbol_target_reports_selector_ambiguity_for_duplicate_function
 }
 
 #[test]
-fn get_summaries_reports_directory_targets_as_not_found() {
+fn get_summaries_lists_fixture_directory_target() {
     let analyzer = go_fixture_analyzer();
     let result = get_summaries(
         &analyzer,
@@ -336,13 +449,18 @@ fn get_summaries_reports_directory_targets_as_not_found() {
         },
     );
 
-    assert_eq!(vec!["anotherpkg"], not_found_inputs(&result));
+    assert!(result.not_found.is_empty(), "{result:#?}");
     assert!(result.ambiguous.is_empty(), "{:?}", result.ambiguous);
     assert!(result.summaries.is_empty(), "{:?}", result.summaries);
+    assert_eq!(1, result.listings.len(), "{result:#?}");
+    assert!(matches!(
+        &result.listings[0].entries[..],
+        [ContainerListingEntry::File { path, .. }] if path == "anotherpkg/another.go"
+    ));
 }
 
 #[test]
-fn get_summaries_reports_workspace_root_directory_target_as_not_found() {
+fn get_summaries_lists_workspace_root_directory_target() {
     let analyzer = go_fixture_analyzer();
     let result = get_summaries(
         &analyzer,
@@ -351,9 +469,19 @@ fn get_summaries_reports_workspace_root_directory_target_as_not_found() {
         },
     );
 
-    assert_eq!(vec!["."], not_found_inputs(&result));
+    assert!(result.not_found.is_empty(), "{result:#?}");
     assert!(result.ambiguous.is_empty(), "{:?}", result.ambiguous);
     assert!(result.summaries.is_empty(), "{:?}", result.summaries);
+    assert_eq!(1, result.listings.len(), "{result:#?}");
+    assert_eq!(".", result.listings[0].target);
+    assert!(result.listings[0].entries.iter().any(|entry| matches!(
+        entry,
+        ContainerListingEntry::Directory { path, .. } if path == "anotherpkg"
+    )));
+    assert!(result.listings[0].entries.iter().any(|entry| matches!(
+        entry,
+        ContainerListingEntry::File { path, .. } if path == "declarations.go"
+    )));
 }
 
 #[test]

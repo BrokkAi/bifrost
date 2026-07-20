@@ -1,11 +1,12 @@
 use crate::model_context;
 use crate::path_utils::AmbiguousPathInput;
 use crate::searchtools::{
-    AmbiguousSymbol, MostRelevantFilesResult, NotFoundInput, ScanUsagesEntry, ScanUsagesInput,
-    ScanUsagesResult, ScanUsagesStatus, SearchSymbolHit, SearchSymbolsFile, SearchSymbolsResult,
-    SkimFile, SkimFilesResult, SourceBlock, SummaryBlock, SummaryElement, SummaryResult,
-    SymbolAncestors, SymbolAncestorsResult, SymbolLocation, SymbolLocationsResult,
-    SymbolSourcesResult, UsageFileGroup, UsageGraphResult, UsageLocation, scan_usages_target_label,
+    AmbiguousSymbol, ContainerKind, ContainerListing, ContainerListingEntry,
+    MostRelevantFilesResult, NotFoundInput, ScanUsagesEntry, ScanUsagesInput, ScanUsagesResult,
+    ScanUsagesStatus, SearchSymbolHit, SearchSymbolsFile, SearchSymbolsResult, SkimFile,
+    SkimFilesResult, SourceBlock, SummaryBlock, SummaryElement, SummaryResult, SymbolAncestors,
+    SymbolAncestorsResult, SymbolLocation, SymbolLocationsResult, SymbolSourcesResult,
+    UsageFileGroup, UsageGraphResult, UsageLocation, scan_usages_target_label,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +164,11 @@ impl RenderText for SummaryResult {
             .iter()
             .map(|summary| summary.render_text(options))
             .collect();
+        blocks.extend(
+            self.listings
+                .iter()
+                .map(|listing| render_container_listing(listing, options)),
+        );
         if !self.not_found.is_empty() {
             blocks.push(format!(
                 "Not found: {}",
@@ -177,6 +183,70 @@ impl RenderText for SummaryResult {
             "No matching summaries found.".to_string()
         } else {
             blocks.join("\n\n")
+        }
+    }
+}
+
+fn render_container_listing(listing: &ContainerListing, options: RenderOptions) -> String {
+    let label = match listing.kind {
+        ContainerKind::Directory => "Directory",
+        ContainerKind::Package => "Package",
+    };
+    let languages = if listing.languages.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", listing.languages.join(", "))
+    };
+    let mut lines = vec![format!("{label} {}{languages}", listing.target)];
+    lines.extend(
+        listing
+            .entries
+            .iter()
+            .map(|entry| render_container_listing_entry(entry, options)),
+    );
+    if listing.entries.is_empty() {
+        lines.push("(empty)".to_string());
+    }
+    if listing.truncated {
+        lines.push(format!(
+            "[showing {} of {} entries]",
+            listing.entries.len(),
+            listing.total_entries
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_container_listing_entry(entry: &ContainerListingEntry, options: RenderOptions) -> String {
+    match entry {
+        ContainerListingEntry::Directory { path, .. } => format!("[directory] {path}"),
+        ContainerListingEntry::File { path, .. } => format!("[file] {path}"),
+        ContainerListingEntry::Package {
+            qualified_name,
+            languages,
+            ..
+        } => {
+            let languages = if languages.is_empty() {
+                String::new()
+            } else {
+                format!("; {}", languages.join(", "))
+            };
+            format!("[package{languages}] {qualified_name}")
+        }
+        ContainerListingEntry::Type {
+            symbol,
+            language,
+            path,
+            start_line,
+            end_line,
+            ..
+        } => {
+            let location = if options.render_line_numbers {
+                format!("{path}:{start_line}..{end_line}")
+            } else {
+                path.clone()
+            };
+            format!("[type; {language}] {symbol}: {location}")
         }
     }
 }

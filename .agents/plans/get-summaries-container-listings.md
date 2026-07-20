@@ -10,10 +10,10 @@ After this change, a caller can use `get_summaries` as a code-aware directory li
 
 - [x] (2026-07-20 16:00Z) Researched the existing summary router, package index, MCP augmentation, Python model, and scoped BrokkBench callers.
 - [x] (2026-07-20 16:00Z) Settled the public result contract and caller compatibility rules with the user.
-- [ ] Implement the Bifrost container index, target routing, result types, and rendering.
-- [ ] Remove the obsolete unresolved-target/list_symbols container augmentation.
-- [ ] Update Python models, MCP budgeting, descriptors, and documentation.
-- [ ] Add behavior-focused Rust, MCP, and Python tests.
+- [x] (2026-07-20 18:05Z) Implemented the Bifrost container index, target routing, result types, and rendering.
+- [x] (2026-07-20 18:05Z) Removed the obsolete unresolved-target/list_symbols container augmentation.
+- [x] (2026-07-20 18:05Z) Updated Python models, MCP budgeting, descriptors, and documentation.
+- [ ] Add behavior-focused Rust, MCP, and Python tests. Focused analyzer, service, MCP-budget, and Python model tests pass; MCP process tests and full suites remain.
 - [ ] Audit and update root-level, `p2t/**/*.py`, and `localizer/**/*.py` BrokkBench callers.
 - [ ] Run required validation and commit both repositories independently.
 
@@ -23,6 +23,10 @@ After this change, a caller can use `get_summaries` as a code-aware directory li
   Evidence: `src/get_summaries_output.rs` and `src/mcp_common.rs` both contain `maybe_add_directory_inventory`; `src/searchtools.rs::get_summaries` explicitly appends directory inputs to `not_found`.
 - Observation: the sibling caller directory named by the user as `ptr` is actually the tracked `p2t` directory.
   Evidence: `/home/jonathan/Projects/brokkbench/ptr` is absent and `/home/jonathan/Projects/brokkbench/p2t` contains the P2T implementation and tests.
+- Observation: virtual package language metadata must be propagated through every ancestor during index insertion.
+  Evidence: an immediate child package may itself be virtual and therefore have no exact-package language entry to contribute when its parent listing is rendered.
+- Observation: recursive filesystem-directory expansion is still used by file-pattern APIs outside `get_summaries`.
+  Evidence: `resolve_file_patterns` calls `resolve_directory_target`; the helper remains, but its former semantic package-prefix fallback was removed because packages are now a first-class `get_summaries` result.
 
 ## Decision Log
 
@@ -44,7 +48,7 @@ After this change, a caller can use `get_summaries` as a code-aware directory li
 
 ## Outcomes & Retrospective
 
-Implementation has not started.
+The Bifrost producer contract is implemented and focused tests pass. Directory and package results are first-class listings across Rust, MCP, and Python; the old container-to-`compact_symbols` augmentation is removed. BrokkBench caller updates and full validation remain.
 
 ## Context and Orientation
 
