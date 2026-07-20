@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const DROP_SHUTDOWN_ID: u64 = 999_999;
-const DROP_CLEANUP_GRACE: Duration = Duration::from_secs(15);
+const DROP_CLEANUP_GRACE: Duration = Duration::from_secs(60);
 
 /// Build an LSP-correct `file://` URI for `path`. Delegates to the crate's
 /// `path_to_uri_string`, which handles drive letters, percent-encoding, and the
