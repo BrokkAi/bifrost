@@ -17,6 +17,7 @@ use growable_bloom_filter::GrowableBloom;
 pub type Result<T> = std::result::Result<T, String>;
 
 pub const CACHE_DIR_NAME: &str = ".brokk";
+pub const CACHE_DIR_ENV: &str = "BIFROST_CACHE_DIR";
 
 /// Discover the repository containing `root`, if any.
 pub fn discover(root: &Path) -> Option<Repository> {
@@ -45,6 +46,9 @@ pub fn primary_repo_root(repo: &Repository) -> Option<PathBuf> {
 /// Resolve the unified cache database path under `.brokk` at the primary repo
 /// root. Non-git roots fall back to the provided workspace root.
 pub fn cache_db_path(workspace_root: &Path) -> PathBuf {
+    if let Some(cache_dir) = std::env::var_os(CACHE_DIR_ENV).filter(|value| !value.is_empty()) {
+        return PathBuf::from(cache_dir).join(crate::cache_db::CACHE_DB_FILE_NAME);
+    }
     let primary_root = discover(workspace_root)
         .as_ref()
         .and_then(primary_repo_root)
