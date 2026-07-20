@@ -61,6 +61,17 @@ where
     Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
 }
 
+pub(in crate::analyzer::usages) fn rust_usage_candidate_files(
+    analyzer: &dyn IAnalyzer,
+    target: &CodeUnit,
+) -> HashSet<ProjectFile> {
+    let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
+        return HashSet::default();
+    };
+    let seeds = infer_graph_seeds(rust, target).seeds;
+    rust.usage_importers(&seeds)
+}
+
 pub(crate) struct RustQueryResolver<'a> {
     rust: &'a RustAnalyzer,
 }

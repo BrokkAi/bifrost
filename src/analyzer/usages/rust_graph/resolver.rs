@@ -341,7 +341,12 @@ fn infer_export_graph_seeds(
             .exports_by_name
             .contains_key(target.identifier())
         {
-            seeds.insert((parent.source().clone(), target.identifier().to_string()));
+            let resolved = analyzer.usage_seeds(target.source(), target.identifier());
+            if resolved.is_empty() {
+                seeds.insert((parent.source().clone(), target.identifier().to_string()));
+            } else {
+                seeds.extend(resolved);
+            }
         }
     }
 
