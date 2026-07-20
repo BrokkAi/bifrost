@@ -681,6 +681,16 @@ pub(super) fn resolve_scala(
         file,
         source,
     };
+    if let Some(outcome) = resolve_scala_focused_qualified_path(
+        ctx,
+        &resolver,
+        root,
+        node,
+        site.focus_start_byte,
+        site.focus_end_byte,
+    ) {
+        return outcome;
+    }
     if let Some(outcome) = resolve_scala_parser_proven_term_role(ctx, &resolver, root, node) {
         return outcome;
     }
@@ -787,6 +797,252 @@ pub(super) fn resolve_scala(
                 node.kind()
             ),
         ),
+    }
+}
+
+struct ScalaFocusedQualifiedPath<'tree> {
+    segments: Vec<(Node<'tree>, String)>,
+    focus_index: usize,
+}
+
+/// Preserve the parser's segment boundaries for a qualified path. The generic
+/// string lookup helper intentionally flattens a complete type, which is right
+/// when resolving its terminal declaration but loses which prefix the caller
+/// selected in `Outer.Middle.Terminal`.
+fn scala_focused_qualified_path<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    focus_start_byte: usize,
+    focus_end_byte: usize,
+) -> Option<ScalaFocusedQualifiedPath<'tree>> {
+    let mut path = node;
+    while let Some(parent) = path.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "field_expression"
+                | "stable_identifier"
+                | "stable_type_identifier"
+                | "projected_type"
+                | "singleton_type"
+                | "generic_type"
+                | "applied_constructor_type"
+                | "annotated_type"
+        )
+    }) {
+        path = parent;
+    }
+
+    let mut nodes = Vec::new();
+    let mut stack = vec![path];
+    while let Some(current) = stack.pop() {
+        match current.kind() {
+            "identifier" | "operator_identifier" | "type_identifier" | "this" => {
+                let segment = scala_node_text(current, source).trim();
+                if !segment.is_empty() {
+                    nodes.push((current, segment.to_string()));
+                }
+            }
+            "type_arguments" | "arguments" | "annotation" | "structural_type" => {}
+            _ => {
+                let mut cursor = current.walk();
+                let mut children = current.named_children(&mut cursor).collect::<Vec<_>>();
+                children.reverse();
+                stack.extend(children);
+            }
+        }
+    }
+    if nodes.len() <= 1 {
+        return None;
+    }
+    let focus_index = nodes.iter().position(|(segment, _)| {
+        segment.start_byte() <= focus_start_byte && focus_end_byte <= segment.end_byte()
+    })?;
+    Some(ScalaFocusedQualifiedPath {
+        segments: nodes,
+        focus_index,
+    })
+}
+
+fn resolve_scala_focused_qualified_path(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver<'_>,
+    root: Node<'_>,
+    node: Node<'_>,
+    focus_start_byte: usize,
+    focus_end_byte: usize,
+) -> Option<DefinitionLookupOutcome> {
+    let path = scala_focused_qualified_path(node, ctx.source, focus_start_byte, focus_end_byte)?;
+    let names = path
+        .segments
+        .iter()
+        .map(|(_, name)| name.as_str())
+        .collect::<Vec<_>>();
+
+    // An owner-qualified self type denotes a child of the exact physical
+    // enclosing declaration. A global FQN lookup is insufficient when JVM/JS
+    // source sets contain identical rendered owner names.
+    if path.focus_index + 1 == names.len() && names.len() >= 3 && names[names.len() - 2] == "this" {
+        let owner_name = names[names.len() - 3];
+        let member = names[names.len() - 1];
+        let owner = scala_enclosing_class(
+            ctx.analyzer,
+            ctx.support,
+            ctx.file,
+            path.segments[path.focus_index].0.start_byte(),
+        )?;
+        if owner.identifier().trim_end_matches('$') != owner_name {
+            return Some(no_definition(
+                "no_indexed_definition",
+                format!(
+                    "`{}` is not a child of the enclosing Scala owner",
+                    names.join(".")
+                ),
+            ));
+        }
+        let mut candidates = ctx
+            .support
+            .fqn_direct_children(&owner.fq_name())
+            .into_iter()
+            .filter(|unit| unit.identifier().trim_end_matches('$') == member)
+            .filter(|unit| unit.source() == owner.source())
+            .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(&owner))
+            .filter(|unit| unit.is_class() || ctx.scala.is_type_alias(unit))
+            .collect::<Vec<_>>();
+        sort_units(&mut candidates);
+        candidates.dedup();
+        return Some(match candidates.as_slice() {
+            [_] => candidates_outcome(candidates),
+            [] => no_definition(
+                "no_indexed_definition",
+                format!("`{member}` is not an indexed child of `{owner_name}.this`"),
+            ),
+            _ => no_definition(
+                "ambiguous_scala_type",
+                format!("`{owner_name}.this.{member}` has multiple physical child declarations"),
+            ),
+        });
+    }
+
+    // Terminal resolution must continue through the normal field/type role so
+    // a missing child cannot silently return its successfully resolved owner.
+    if path.focus_index + 1 == names.len() {
+        return None;
+    }
+    let root_name = names[0];
+    let bindings = scala_bindings_before(ctx, resolver, root, focus_start_byte);
+    if bindings.is_shadowed(root_name)
+        || scala_lexical_binding_declares_name_before(root, ctx.source, root_name, focus_start_byte)
+    {
+        return Some(no_definition(
+            "local_variable_reference",
+            format!("`{root_name}` is a local Scala value"),
+        ));
+    }
+    let prefix = names[..=path.focus_index]
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    let display = prefix.join(".");
+    match scala_exact_enclosing_singleton_path(ctx, focus_start_byte, &prefix) {
+        ScalaExactMemberResolution::Found(candidates) => {
+            return Some(candidates_outcome(candidates));
+        }
+        ScalaExactMemberResolution::Ambiguous => {
+            return Some(no_definition(
+                "ambiguous_scala_type",
+                format!("`{display}` resolves to multiple physical Scala owners"),
+            ));
+        }
+        ScalaExactMemberResolution::NoMatch => {}
+    }
+    let singleton = resolver.resolve_owner_segments(&prefix, ScalaOwnerKind::SingletonObject);
+    let missing_singleton_import = singleton == ScalaNameResolution::MissingExplicitImport;
+    match singleton {
+        ScalaNameResolution::Resolved(owner) => {
+            return Some(scala_fqn_outcome(ctx.support, &owner.fqn, &display));
+        }
+        ScalaNameResolution::Ambiguous => {
+            return Some(no_definition(
+                "ambiguous_scala_type",
+                format!("`{display}` resolves to multiple physical Scala owners"),
+            ));
+        }
+        ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Unresolved => {}
+    }
+    Some(
+        match resolver.resolve_owner_segments(&prefix, ScalaOwnerKind::Class) {
+            ScalaNameResolution::Resolved(owner) => {
+                scala_fqn_outcome(ctx.support, &owner.fqn, &display)
+            }
+            ScalaNameResolution::Ambiguous => no_definition(
+                "ambiguous_scala_type",
+                format!("`{display}` resolves to multiple physical Scala owners"),
+            ),
+            ScalaNameResolution::MissingExplicitImport => boundary(format!(
+                "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
+            )),
+            ScalaNameResolution::Unresolved if missing_singleton_import => boundary(format!(
+                "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
+            )),
+            ScalaNameResolution::Unresolved => no_definition(
+                "no_indexed_definition",
+                format!("`{display}` did not resolve to an indexed Scala owner"),
+            ),
+        },
+    )
+}
+
+fn scala_exact_enclosing_singleton_path(
+    ctx: ScalaLookupCtx<'_>,
+    focus_start_byte: usize,
+    segments: &[String],
+) -> ScalaExactMemberResolution {
+    let Some(mut lexical_owner) =
+        scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, focus_start_byte)
+    else {
+        return ScalaExactMemberResolution::NoMatch;
+    };
+    loop {
+        let mut owner = lexical_owner.clone();
+        let mut index = 0;
+        if owner.identifier().trim_end_matches('$') == segments[0] && owner.fq_name().ends_with('$')
+        {
+            index = 1;
+        }
+        let mut matched = index > 0;
+        while index < segments.len() {
+            let segment = &segments[index];
+            let mut children = ctx
+                .support
+                .fqn_direct_children(&owner.fq_name())
+                .into_iter()
+                .filter(|unit| unit.is_class() && unit.fq_name().ends_with('$'))
+                .filter(|unit| unit.identifier().trim_end_matches('$') == segment)
+                .filter(|unit| unit.source() == owner.source())
+                .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(&owner))
+                .collect::<Vec<_>>();
+            sort_units(&mut children);
+            children.dedup();
+            match children.as_slice() {
+                [child] => {
+                    owner = child.clone();
+                    matched = true;
+                }
+                [] => {
+                    matched = false;
+                    break;
+                }
+                [_, _, ..] => return ScalaExactMemberResolution::Ambiguous,
+            }
+            index += 1;
+        }
+        if matched && index == segments.len() {
+            return ScalaExactMemberResolution::Found(vec![owner]);
+        }
+        let Some(parent) = ctx.scala.structural_parent_of(&lexical_owner) else {
+            return ScalaExactMemberResolution::NoMatch;
+        };
+        lexical_owner = parent;
     }
 }
 

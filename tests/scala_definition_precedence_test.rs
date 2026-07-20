@@ -617,6 +617,165 @@ object Consumer {
 }
 
 #[test]
+fn scala_focused_qualified_paths_resolve_only_the_selected_prefix() {
+    let source = r#"package app
+
+object Structure {
+  object Value {
+    final case class Record(value: Int)
+  }
+}
+
+object Outer
+trait Box { type Item }
+object Cache {
+  object internal {
+    opaque type Slot = Int
+    object Slot { val locked = 1 }
+    val held = Slot.locked
+  }
+}
+
+object Consumer {
+  def read(input: Any): Int = input match {
+    case Structure.Value.Record(value) => value
+  }
+  val numeric: scala.math.Numeric.Short.type = scala.math.Numeric.Short
+  val boxed: Box#Item = null
+  val missing: Outer.Missing = null
+}
+"#;
+    let ambiguous = r#"package consumer
+
+import duplicate.Structure
+
+object Consumer {
+  val record = Structure.Value.Record
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/App.scala", source)
+        .file(
+            "scala/math/Numeric.scala",
+            "package scala.math\nobject Numeric { object Short }\n",
+        )
+        .file(
+            "jvm/duplicate/Structure.scala",
+            "package duplicate\nobject Structure { object Value { object Record } }\n",
+        )
+        .file(
+            "js/duplicate/Structure.scala",
+            "package duplicate\nobject Structure { object Value { object Record } }\n",
+        )
+        .file("consumer/Consumer.scala", ambiguous)
+        .build();
+    let path = source
+        .find("Structure.Value.Record")
+        .expect("qualified path");
+    let missing = source
+        .find("Outer.Missing")
+        .expect("missing qualified path");
+    let numeric = source
+        .find("scala.math.Numeric.Short")
+        .expect("fully qualified singleton path")
+        + "scala.math.".len();
+    let projected = source.find("Box#Item").expect("projected class path");
+    let stable_companion = source
+        .find("Slot.locked")
+        .expect("stable companion qualifier");
+    let ambiguous_path = ambiguous
+        .find("Structure.Value.Record")
+        .expect("ambiguous qualified path")
+        + "Structure.".len();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({
+            "references": [
+                location_at(source, path),
+                location_at(source, path + "Structure.".len()),
+                location_at(source, numeric),
+                location_at(source, projected),
+                location_at(source, stable_companion),
+                location_at(source, missing + "Outer.".len()),
+                location_in("consumer/Consumer.scala", ambiguous, ambiguous_path),
+            ]
+        })
+        .to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    for (result, expected) in results[..5].iter().zip([
+        "app.Structure$",
+        "app.Structure$.Value$",
+        "scala.math.Numeric$",
+        "app.Box",
+        "app.Cache$.internal$.Slot$",
+    ]) {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+    assert_eq!(results[5]["status"], "no_definition", "{value}");
+    assert_eq!(results[6]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn scala_owner_qualified_self_type_uses_the_exact_physical_child() {
+    let schema = r#"package app
+
+trait Schema[A] {
+  type Focused
+  def narrow: Schema[A] { type Focused = Schema.this.Focused } = null
+}
+"#;
+    let duplicate = r#"package app
+
+trait Schema[A] {
+  type Focused
+}
+"#;
+    let external = r#"package consumer
+
+object Consumer {
+  val ambiguous: app.Schema[Int]#Focused = null
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("jvm/app/Schema.scala", schema)
+        .file("js/app/Schema.scala", duplicate)
+        .file("consumer/Consumer.scala", external)
+        .build();
+    let self_reference = schema
+        .find("Schema.this.Focused")
+        .expect("owner-qualified self type")
+        + "Schema.this.".len();
+    let ambiguous = external.find("Focused").expect("external projected type");
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({
+            "references": [
+                location_in("jvm/app/Schema.scala", schema, self_reference),
+                location_in("consumer/Consumer.scala", external, ambiguous),
+            ]
+        })
+        .to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[0]["definitions"][0]["fqn"], "app.Schema.Focused",
+        "{value}"
+    );
+    assert_eq!(
+        results[0]["definitions"][0]["path"], "jvm/app/Schema.scala",
+        "{value}"
+    );
+    assert_eq!(results[1]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn scala_qualified_constructor_prefers_active_outer_package_over_root_decoy() {
     let source = r#"package scala.collection.immutable
 package test
