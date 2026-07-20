@@ -847,12 +847,6 @@ impl RustAnalyzer {
         })
     }
 
-    pub(crate) fn is_rust_cfg_test_declaration(&self, code_unit: &CodeUnit) -> bool {
-        self.rust_declaration_node_is(code_unit, |node, source| {
-            rust_declaration_has_cfg_test_attribute(node, source)
-        })
-    }
-
     /// Whether the declaration's own visibility makes it part of the crate's
     /// exported surface (`pub` / `pub(crate)`), unlike the looser
     /// [`Self::is_rust_public_like_declaration`] which also accepts module-private
@@ -1119,66 +1113,6 @@ fn is_export_visibility(visibility: &str) -> bool {
         .filter(|ch| !ch.is_whitespace())
         .collect();
     compact == "pub" || compact == "pub(crate)" || compact.starts_with("pub(incrate")
-}
-
-fn rust_declaration_has_cfg_test_attribute(node: Node<'_>, source: &str) -> bool {
-    node.named_children(&mut node.walk())
-        .any(|child| child.kind() == "attribute_item" && rust_attribute_is_cfg_test(child, source))
-        || contiguous_outer_attributes(node)
-            .into_iter()
-            .any(|attribute| rust_attribute_is_cfg_test(attribute, source))
-}
-
-fn contiguous_outer_attributes(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut attributes = Vec::new();
-    let mut previous = node.prev_named_sibling();
-    while let Some(sibling) = previous {
-        if sibling.kind() != "attribute_item" {
-            break;
-        }
-        attributes.push(sibling);
-        previous = sibling.prev_named_sibling();
-    }
-    attributes
-}
-
-fn rust_attribute_is_cfg_test(attribute: Node<'_>, source: &str) -> bool {
-    let mut stack = vec![attribute];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "attribute"
-            && node
-                .child_by_field_name("path")
-                .is_some_and(|path| node_text(path, source) == "cfg")
-            && node
-                .child_by_field_name("arguments")
-                .is_some_and(|arguments| rust_cfg_arguments_are_exact_test(arguments, source))
-        {
-            return true;
-        }
-
-        if node.kind() == "attribute_item"
-            && node
-                .child_by_field_name("name")
-                .is_some_and(|name| node_text(name, source) == "cfg")
-            && node
-                .child_by_field_name("arguments")
-                .is_some_and(|arguments| rust_cfg_arguments_are_exact_test(arguments, source))
-        {
-            return true;
-        }
-
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
-    }
-    false
-}
-
-fn rust_cfg_arguments_are_exact_test(arguments: Node<'_>, source: &str) -> bool {
-    let identifiers = named_descendants_of_kind(arguments, "identifier")
-        .into_iter()
-        .map(|identifier| node_text(identifier, source))
-        .collect::<Vec<_>>();
-    identifiers == ["test"]
 }
 
 fn named_descendants_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {

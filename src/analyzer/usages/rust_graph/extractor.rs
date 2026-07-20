@@ -1,6 +1,8 @@
+use crate::analyzer::rust::RustBindingSeeds;
 use crate::analyzer::rust::field_roles::rust_struct_field_references;
 use crate::analyzer::rust::lexical_scope::{self, RustLexicalScopeIndex};
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
+use crate::analyzer::usages::ImportKind;
 use crate::analyzer::usages::common::{TreeWalkAction, same_node, walk_tree_iterative};
 use crate::analyzer::usages::get_definition::{
     RustTypeLookupCache, rust_expression_type_definition_fqn_cached, rust_resolve_type_node_fqn,
@@ -13,8 +15,8 @@ use crate::analyzer::usages::rust_graph::hits::{
     record_hit, record_import_hit, record_module_qualified_hits,
 };
 use crate::analyzer::usages::rust_graph::resolver::{
-    is_trait_owner, resolve_scoped_associated_item_matching, rust_token_path_segment_is_qualified,
-    trait_member_for_impl_member,
+    is_trait_owner, resolve_rust_path_fqn, resolve_scoped_associated_item_matching,
+    rust_token_path_segment_is_qualified, trait_member_for_impl_member,
 };
 use crate::analyzer::usages::traits::UsageScanScope;
 use crate::analyzer::{
@@ -62,7 +64,7 @@ pub(super) fn effective_scan_files(
     analyzer: &RustAnalyzer,
     scan_scope: &UsageScanScope<'_>,
     target: &CodeUnit,
-    seeds: &BTreeSet<(ProjectFile, String)>,
+    seeds: &RustBindingSeeds,
 ) -> HashSet<ProjectFile> {
     let candidate_files = scan_scope.candidate_files();
     let analyzed = analyzer.get_analyzed_files();
@@ -84,7 +86,11 @@ pub(super) fn effective_scan_files(
         return filtered_candidates;
     }
 
-    let seed_names: HashSet<&str> = seeds.iter().map(|(_, name)| name.as_str()).collect();
+    let seed_names: HashSet<&str> = seeds
+        .identities()
+        .iter()
+        .map(|(_, name)| name.as_str())
+        .collect();
     let textual_candidates = analyzed.into_iter().filter(|file| {
         if scan_scope.is_cancelled() {
             return false;
@@ -109,13 +115,15 @@ pub(super) fn effective_scan_files(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn scan_files_for_target(
     analyzer: &dyn IAnalyzer,
     rust: &RustAnalyzer,
     graph: &RustProjectGraph,
     files: HashSet<ProjectFile>,
     target: &CodeUnit,
-    seeds: Option<&BTreeSet<(ProjectFile, String)>>,
+    seeds: Option<&RustBindingSeeds>,
+    allow_lexical_import_bindings: bool,
     cancellation: Option<&CancellationToken>,
 ) -> BTreeSet<UsageHit> {
     let target_short = target.identifier().to_string();
@@ -145,7 +153,7 @@ pub(super) fn scan_files_for_target(
         let line_starts = prepared.line_starts();
         let lexical_scope = RustLexicalScopeIndex::new(tree.root_node(), source);
         let refs = rust.reference_context_of(file);
-        let (mut direct_names, _namespace_names) = match seeds {
+        let (mut direct_names, qualified_names) = match seeds {
             Some(seeds) => rust.usage_binding_names(file, seeds),
             None => (HashSet::default(), HashSet::default()),
         };
@@ -154,7 +162,7 @@ pub(super) fn scan_files_for_target(
         // local import binding. Treat any seed rooted in this file as a direct name
         // so those in-module references resolve.
         if let Some(seeds) = seeds {
-            for (seed_file, seed_name) in seeds {
+            for (seed_file, seed_name) in seeds.identities() {
                 if seed_file == file {
                     direct_names.insert(seed_name.clone());
                 }
@@ -172,12 +180,16 @@ pub(super) fn scan_files_for_target(
             rust,
             refs: &refs,
             support,
+            seeds,
+            allow_lexical_import_bindings,
+            root: tree.root_node(),
             target,
             target_fqn: &target_fqn,
             target_is_path_qualifier: target.is_class() || rust.is_type_alias(target),
             target_is_module: target.is_module(),
             target_short: &target_short,
             direct_names: &direct_names,
+            qualified_names: &qualified_names,
             lexical_scope: &lexical_scope,
             target_self_file,
             hits: &mut local_hits,
@@ -202,20 +214,42 @@ pub(super) struct ScanCtx<'a> {
     pub(super) rust: &'a RustAnalyzer,
     pub(super) refs: &'a RustReferenceContext,
     pub(super) support: &'a GlobalUsageDefinitionIndex,
+    seeds: Option<&'a RustBindingSeeds>,
+    allow_lexical_import_bindings: bool,
+    root: Node<'a>,
     target: &'a CodeUnit,
     pub(super) target_fqn: &'a str,
     pub(super) target_is_path_qualifier: bool,
     pub(super) target_is_module: bool,
     pub(super) target_short: &'a str,
     direct_names: &'a HashSet<String>,
+    qualified_names: &'a HashSet<String>,
     lexical_scope: &'a RustLexicalScopeIndex,
     target_self_file: bool,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
 }
 
 impl ScanCtx<'_> {
-    fn matches_identifier(&self, text: &str) -> bool {
-        self.direct_names.contains(text) || (self.target_self_file && text == self.target_short)
+    pub(super) fn matches_identifier(&self, text: &str, byte: usize) -> bool {
+        if self.direct_names.contains(text) || (self.target_self_file && text == self.target_short)
+        {
+            return true;
+        }
+        let Some(seeds) = self.seeds else {
+            return false;
+        };
+        if !self.allow_lexical_import_bindings {
+            return false;
+        }
+        let binder = lexical_scope::visible_import_binder_in_tree(self.root, self.source, byte);
+        self.rust
+            .resolve_imported_export_from_binder_forward(self.file, &binder, text)
+            .into_iter()
+            .any(|binding| seeds.identities().contains(&binding))
+    }
+
+    pub(super) fn matches_qualified_name(&self, text: &str) -> bool {
+        self.qualified_names.contains(text)
     }
 
     pub(super) fn name_shadowed_at(&self, name: &str, byte: usize) -> bool {
@@ -243,7 +277,7 @@ fn scan_node(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     let matching_self_type =
                         text == "Self" && self_reference_matches_target(node, ctx);
                     let matching_identifier = !identifier_is_scoped_path_part(node)
-                        && ctx.matches_identifier(text)
+                        && ctx.matches_identifier(text, node.start_byte())
                         && !is_shadowed_identifier(text, node, ctx);
                     if matching_self_type || matching_identifier {
                         record_hit(node, ctx);
@@ -352,7 +386,7 @@ pub(super) fn scan_files_for_member_target(
     files: HashSet<ProjectFile>,
     target: &CodeUnit,
     requested_target: &CodeUnit,
-    seeds: &BTreeSet<(ProjectFile, String)>,
+    seeds: &RustBindingSeeds,
     cancellation: Option<&CancellationToken>,
 ) -> RustMemberScanResult {
     let Some(owner) = rust.parent_of(target) else {
@@ -383,6 +417,7 @@ pub(super) fn scan_files_for_member_target(
             return;
         }
         let line_starts = prepared.line_starts();
+        let lexical_scope_index = RustLexicalScopeIndex::new(tree.root_node(), source);
         let refs = rust.reference_context_of(file);
         let mut owner_local_names: HashSet<String> = if file == target.source() {
             [owner.identifier().to_string()].into_iter().collect()
@@ -437,6 +472,7 @@ pub(super) fn scan_files_for_member_target(
             source,
             root: tree.root_node(),
             line_starts,
+            lexical_scope: &lexical_scope_index,
             owner: &owner,
             member_name: &member_name,
             scan_target: target,
@@ -491,6 +527,7 @@ struct MemberScanCtx<'a> {
     source: &'a str,
     root: Node<'a>,
     line_starts: &'a [usize],
+    lexical_scope: &'a RustLexicalScopeIndex,
     owner: &'a CodeUnit,
     member_name: &'a str,
     scan_target: &'a CodeUnit,
@@ -514,6 +551,9 @@ fn scan_member_node(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
             record_token_tree_static_member_hits(node, ctx);
         }
         "scoped_identifier" | "scoped_type_identifier" => record_static_member_hit(node, ctx),
+        "tuple_struct_pattern" if ctx.target_is_enum_variant => {
+            record_unqualified_tuple_variant_pattern_hit(node, ctx)
+        }
         "struct_expression" | "struct_pattern" if ctx.target_is_field => {
             record_struct_field_hits(node, ctx)
         }
@@ -523,6 +563,102 @@ fn scan_member_node(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         scan_member_node(child, ctx);
+    }
+}
+
+fn record_unqualified_tuple_variant_pattern_hit(pattern: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+    let Some(name) = pattern.child_by_field_name("type") else {
+        return;
+    };
+    if name.kind() != "identifier"
+        || simple_node_text(name, ctx.source).as_deref() != Some(ctx.member_name)
+        || ctx
+            .lexical_scope
+            .name_bound_at(ctx.member_name, name.start_byte())
+        || ctx
+            .lexical_scope
+            .item_bound_at(ctx.member_name, name.start_byte())
+    {
+        return;
+    }
+
+    let binder =
+        lexical_scope::visible_import_binder_in_tree(ctx.root, ctx.source, name.start_byte());
+    let mut candidates = BTreeSet::new();
+    if let Some(binding) = binder.bindings.get(ctx.member_name) {
+        // An explicit binding is authoritative over all glob imports. Only a
+        // named enum-variant import can prove this unqualified pattern.
+        if binding.kind != ImportKind::Named {
+            return;
+        }
+        let imported_name = binding.imported_name.as_deref().unwrap_or(ctx.member_name);
+        collect_enum_variant_candidates(
+            &binding.module_specifier,
+            imported_name,
+            ctx,
+            &mut candidates,
+        );
+    } else {
+        // Ordinary module globs and re-export globs are already represented by
+        // the import graph. Enum globs (`use Enum::*`) name a type rather than a
+        // module, so resolve that owner through the same Rust reference context.
+        for (target_file, target_name) in
+            ctx.rust
+                .resolve_imported_export_from_binder_forward(ctx.file, &binder, ctx.member_name)
+        {
+            for candidate in ctx.support.file_identifier(&target_file, &target_name) {
+                insert_enum_variant_candidate(candidate, ctx, &mut candidates);
+            }
+        }
+        for binding in binder
+            .bindings
+            .values()
+            .filter(|binding| binding.kind == ImportKind::Glob)
+        {
+            collect_enum_variant_candidates(
+                &binding.module_specifier,
+                ctx.member_name,
+                ctx,
+                &mut candidates,
+            );
+        }
+    }
+
+    if candidates.len() == 1
+        && candidates.first().is_some_and(|candidate| {
+            same_rust_declaration_identity(candidate, ctx.requested_target)
+        })
+    {
+        record_static_member_name_hit(name, ctx);
+    }
+}
+
+fn collect_enum_variant_candidates(
+    owner_path: &str,
+    variant_name: &str,
+    ctx: &MemberScanCtx<'_>,
+    candidates: &mut BTreeSet<CodeUnit>,
+) {
+    let Some(owner_fqn) = resolve_rust_path_fqn(ctx.rust, ctx.refs, ctx.file, owner_path) else {
+        return;
+    };
+    for candidate in ctx.support.fqn(&format!("{owner_fqn}.{variant_name}")) {
+        insert_enum_variant_candidate(candidate, ctx, candidates);
+    }
+}
+
+fn insert_enum_variant_candidate(
+    candidate: CodeUnit,
+    ctx: &MemberScanCtx<'_>,
+    candidates: &mut BTreeSet<CodeUnit>,
+) {
+    if candidate.is_field()
+        && ctx
+            .rust
+            .parent_of(&candidate)
+            .is_some_and(|owner| ctx.rust.is_rust_enum_declaration(&owner))
+    {
+        candidates.insert(candidate);
     }
 }
 
@@ -1153,6 +1289,22 @@ fn self_static_owner_matches_target(owner_node: Node<'_>, ctx: &MemberScanCtx<'_
     while let Some(node) = current {
         match node.kind() {
             "impl_item" => {
+                if ctx.scan_target != ctx.requested_target
+                    && let Some(requested_owner) = ctx.rust.parent_of(ctx.requested_target)
+                    && !ctx.rust.is_rust_trait_declaration(&requested_owner)
+                {
+                    return node.child_by_field_name("type").is_some_and(|type_node| {
+                        rust_resolve_type_node_fqn(
+                            ctx.analyzer,
+                            ctx.support,
+                            ctx.file,
+                            ctx.source,
+                            type_node,
+                            Some(type_node.start_byte()),
+                        )
+                        .is_some_and(|fqn| fqn_matches_owner(ctx.rust, &fqn, &requested_owner))
+                    });
+                }
                 let owner = if ctx.target_owner_is_trait {
                     node.child_by_field_name("trait")
                 } else {
@@ -1370,11 +1522,12 @@ fn self_like_constructor_seeds(
     rust: &RustAnalyzer,
     owner: &CodeUnit,
     constructor_returns: &HashMap<String, ConstructorReturn>,
-) -> HashMap<String, BTreeSet<(ProjectFile, String)>> {
+) -> HashMap<String, RustBindingSeeds> {
     constructor_returns
         .keys()
         .map(|name| {
             let seeds = rust.usage_seeds(owner.source(), name);
+            let seeds = rust.usage_binding_seeds(&seeds);
             (name.clone(), seeds)
         })
         .collect()
@@ -1383,13 +1536,14 @@ fn self_like_constructor_seeds(
 fn visible_bare_constructor_names(
     rust: &RustAnalyzer,
     file: &ProjectFile,
-    constructors: &HashMap<String, BTreeSet<(ProjectFile, String)>>,
+    constructors: &HashMap<String, RustBindingSeeds>,
 ) -> HashSet<String> {
     let mut visible = HashSet::default();
     for (constructor, seeds) in constructors {
         let (direct_names, _) = rust.usage_binding_names(file, seeds);
         if direct_names.contains(constructor)
             || seeds
+                .identities()
                 .iter()
                 .any(|(seed_file, seed_name)| seed_file == file && seed_name == constructor)
         {

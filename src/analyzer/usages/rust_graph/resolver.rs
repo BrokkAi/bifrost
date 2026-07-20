@@ -181,7 +181,7 @@ fn resolve_token_path_segment_fqn(
 fn rust_token_path_segment(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
-        "identifier" | "type_identifier" | "crate" | "self" | "super"
+        "identifier" | "type_identifier" | "crate" | "self" | "super" | "default"
     )
 }
 
@@ -207,15 +207,6 @@ pub(crate) fn rust_token_path_segment_is_qualified(node: Node<'_>) -> bool {
 
 fn rust_token_call_arguments(node: &Node<'_>) -> bool {
     node.kind() == "token_tree" && node.child(0).is_some_and(|open| open.kind() == "(")
-}
-
-pub(super) fn supports_same_file_local_scan(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
-    target.is_function()
-        && analyzer
-            .parent_of(target)
-            .is_none_or(|parent| parent.is_module())
-        && (!is_public_like_declaration(analyzer, target)
-            || analyzer.is_rust_cfg_test_declaration(target))
 }
 
 pub(super) fn is_member_target(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
@@ -525,6 +516,17 @@ fn infer_export_graph_seeds(
     target: &CodeUnit,
 ) -> BTreeSet<(ProjectFile, String)> {
     let mut seeds = BTreeSet::new();
+    // A module-scope constant is represented as a parentless field. Its own
+    // declaration remains a valid import origin even when a public-like
+    // visibility produces additional export seeds through the crate graph.
+    // Retain that structured origin so `use crate::module::CONST` bindings are
+    // matched without treating the constant as a type member.
+    if target.is_field()
+        && analyzer.parent_of(target).is_none()
+        && is_local_declaration(analyzer, target)
+    {
+        seeds.insert((target.source().clone(), target.identifier().to_string()));
+    }
     let nested_module_target = analyzer
         .parent_of(target)
         .is_some_and(|parent| parent.is_module());
