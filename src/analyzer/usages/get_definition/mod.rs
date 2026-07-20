@@ -309,6 +309,39 @@ pub(crate) fn resolve_definition_batch_with_source(
     resolve_definition_requests(analyzer, &mut context, requests, None, None)
 }
 
+pub(crate) fn resolve_navigation_batch_with_source(
+    analyzer: &dyn IAnalyzer,
+    requests: Vec<DefinitionLookupRequest>,
+    file: ProjectFile,
+    source: Arc<String>,
+    operation: NavigationOperation,
+) -> Vec<DefinitionLookupOutcome> {
+    let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
+    context.sources.insert(file, Ok(source));
+    resolve_definition_requests(analyzer, &mut context, requests, None, Some(operation))
+}
+
+pub(crate) fn navigation_declaration_site_target(
+    analyzer: &dyn IAnalyzer,
+    candidate: CodeUnit,
+    operation: NavigationOperation,
+) -> Option<CodeUnit> {
+    if language_for_file(candidate.source()) != Language::Cpp {
+        return Some(candidate);
+    }
+    let mut context = DefinitionBatchContext::new(analyzer, false);
+    let outcome = cpp::select_navigation_outcome(
+        analyzer,
+        &mut context,
+        candidates_outcome(vec![candidate]),
+        operation,
+    );
+    finalize_navigation_outcome(outcome, operation)
+        .definitions
+        .into_iter()
+        .next()
+}
+
 pub(crate) fn resolve_definition_batch_with_source_and_cancellation(
     analyzer: &dyn IAnalyzer,
     requests: Vec<DefinitionLookupRequest>,

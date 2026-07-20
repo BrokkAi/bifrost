@@ -5,12 +5,14 @@ use lsp_types::{Position, Uri};
 use crate::analyzer::declaration_range::code_unit_declaration_name_range;
 use crate::analyzer::lexical_definitions::LexicalDefinition;
 use crate::analyzer::usages::get_definition::{
-    DefinitionLookupRequest, DefinitionLookupStatus, resolve_definition_batch_with_source,
+    DefinitionLookupRequest, DefinitionLookupStatus, navigation_declaration_site_target,
+    resolve_definition_batch_with_source, resolve_navigation_batch_with_source,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Project, ProjectFile, Range as ByteRange};
 use crate::lsp::conversion::position_to_byte_offset;
 use crate::lsp::handlers::import_ambiguity::is_ambiguous_imported_reference;
 use crate::lsp::handlers::util::{identifier_span_at_offset, read_document_for_uri};
+use crate::navigation::NavigationOperation;
 
 pub(super) struct BroadSymbolTarget {
     pub(super) file: ProjectFile,
@@ -56,6 +58,61 @@ pub(super) fn broad_symbol_target_at_position(
                 end_byte,
             )
         })?;
+
+    Some(BroadSymbolTarget {
+        file,
+        content,
+        line_starts,
+        start_byte,
+        end_byte,
+        declaration_site,
+        candidates,
+        lexical_definition,
+    })
+}
+
+pub(super) fn navigation_target_at_position(
+    analyzer: &dyn IAnalyzer,
+    project: &dyn Project,
+    uri: &Uri,
+    position: &Position,
+    operation: NavigationOperation,
+) -> Option<BroadSymbolTarget> {
+    let (file, content, line_starts) = read_document_for_uri(project, uri)?;
+    let byte_offset = position_to_byte_offset(&content, &line_starts, position);
+    let (start_byte, end_byte) = identifier_span_at_offset(&content, byte_offset)?;
+    let selected = ByteRange {
+        start_byte,
+        end_byte,
+        start_line: 0,
+        end_line: 0,
+    };
+    let identifier = content.get(start_byte..end_byte)?;
+    if is_ambiguous_imported_reference(analyzer, &file, identifier) {
+        return None;
+    }
+    let resolved = resolved_navigation_target(
+        analyzer,
+        &file,
+        Arc::new(content.clone()),
+        start_byte,
+        end_byte,
+        operation,
+    );
+    let declaration =
+        selected_code_unit_declaration_at_cursor(analyzer, &file, &content, &selected, |_| true);
+    let (candidates, lexical_definition, declaration_site) = match resolved {
+        Some((candidates, lexical_definition)) => (candidates, lexical_definition, false),
+        None => (
+            vec![navigation_declaration_site_target(
+                analyzer,
+                declaration?,
+                operation,
+            )?],
+            None,
+            true,
+        ),
+    };
 
     Some(BroadSymbolTarget {
         file,
@@ -135,6 +192,37 @@ fn resolved_reference_target(
         }],
         file.clone(),
         content,
+    )
+    .into_iter()
+    .next()?;
+    if outcome.status != DefinitionLookupStatus::Resolved
+        || (outcome.definitions.is_empty() && outcome.lexical_definition.is_none())
+    {
+        return None;
+    }
+    Some((outcome.definitions, outcome.lexical_definition))
+}
+
+fn resolved_navigation_target(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    content: Arc<String>,
+    start_byte: usize,
+    end_byte: usize,
+    operation: NavigationOperation,
+) -> Option<(Vec<CodeUnit>, Option<LexicalDefinition>)> {
+    let outcome = resolve_navigation_batch_with_source(
+        analyzer,
+        vec![DefinitionLookupRequest {
+            file: file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(start_byte),
+            end_byte: Some(end_byte),
+        }],
+        file.clone(),
+        content,
+        operation,
     )
     .into_iter()
     .next()?;

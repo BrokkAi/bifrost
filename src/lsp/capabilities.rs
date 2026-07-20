@@ -1,6 +1,6 @@
 use lsp_types::{
     ClientCapabilities, CodeActionKind, CodeActionOptions, CodeActionProviderCapability,
-    CompletionClientCapabilities, CompletionOptions, DiagnosticOptions,
+    CompletionClientCapabilities, CompletionOptions, DeclarationCapability, DiagnosticOptions,
     DiagnosticServerCapabilities, DocumentFormattingOptions, FoldingRangeProviderCapability,
     HoverProviderCapability, ImplementationProviderCapability, OneOf, ReferencesOptions,
     RenameOptions, SemanticTokensFullOptions, SemanticTokensOptions,
@@ -37,6 +37,7 @@ pub fn server_capabilities(client_capabilities: &ClientCapabilities) -> ServerCa
             work_done_progress_options: WorkDoneProgressOptions::default(),
         }),
         definition_provider: Some(OneOf::Left(true)),
+        declaration_provider: Some(DeclarationCapability::Simple(true)),
         type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
         implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
         document_highlight_provider: Some(OneOf::Left(true)),

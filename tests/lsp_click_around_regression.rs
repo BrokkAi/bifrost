@@ -67,6 +67,88 @@ fn milestone_0_harness_smoke_definition_references_and_null() {
 }
 
 #[test]
+fn declaration_and_definition_navigation_contracts() {
+    let fixture = ClickFixture::new("declaration_definition_navigation")
+        .file(
+            "Runner.java",
+            r#"interface Runner { void <java_interface>run(); }
+class LocalRunner implements Runner { public void run() {} }
+class App { void invoke(Runner runner) { runner.<java_call>run(); } }
+"#,
+        )
+        .file(
+            "service.h",
+            "namespace ns { class Service { public: void <cpp_declaration>run(); }; }\n",
+        )
+        .file(
+            "service.cpp",
+            "#include \"service.h\"\nnamespace ns { void Service::<cpp_definition>run() {} }\n",
+        )
+        .file(
+            "app.cpp",
+            "#include \"service.h\"\nvoid invoke(ns::Service& service) { service.<cpp_call>run(); }\n",
+        )
+        .file(
+            "lib.rs",
+            r#"trait RustRunner { type <rust_trait>Output; }
+struct LocalRustRunner;
+impl RustRunner for LocalRustRunner { type <rust_impl>Output = String; }
+type Selected = <LocalRustRunner as RustRunner>::<rust_qualified>Output;
+"#,
+        );
+
+    let timings = assert_click_cases(
+        fixture,
+        &[
+            ClickCase::new(
+                "java declaration uses interface contract",
+                "java_call",
+                ClickOperation::Declaration,
+                ClickExpectation::Locations(&["java_interface"]),
+            ),
+            ClickCase::new(
+                "cpp declaration uses header prototype",
+                "cpp_call",
+                ClickOperation::Declaration,
+                ClickExpectation::Locations(&["cpp_declaration"]),
+            ),
+            ClickCase::new(
+                "cpp definition uses source body",
+                "cpp_call",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["cpp_definition"]),
+            ),
+            ClickCase::new(
+                "cpp prototype is not its own definition",
+                "cpp_declaration",
+                ClickOperation::Definition,
+                ClickExpectation::Empty,
+            ),
+            ClickCase::new(
+                "rust impl associated type declaration uses trait",
+                "rust_impl",
+                ClickOperation::Declaration,
+                ClickExpectation::Locations(&["rust_trait"]),
+            ),
+            ClickCase::new(
+                "rust impl associated type definition stays on itself",
+                "rust_impl",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["rust_impl"]),
+            ),
+            ClickCase::new(
+                "rust qualified associated type definition uses concrete impl",
+                "rust_qualified",
+                ClickOperation::Definition,
+                ClickExpectation::Locations(&["rust_impl"]),
+            ),
+        ],
+    );
+
+    assert_timing_summary("declaration_definition_navigation", &timings, 7);
+}
+
+#[test]
 fn milestone_1_go_embedded_promotion_click_around() {
     let fixture = ClickFixture::new("milestone_1_go_embedded_promotion")
         .file("go.mod", "module example.com/app\n")
@@ -1256,25 +1338,25 @@ void run() {
                 "derived receiver resolves to out-of-line method",
                 "derived_tick_call",
                 ClickOperation::Definition,
-                ClickExpectation::Locations(&["derived_tick_decl", "derived_tick_def"]),
+                ClickExpectation::Locations(&["derived_tick_def"]),
             ),
             ClickCase::new(
                 "base receiver resolves to base out-of-line method",
                 "base_tick_call",
                 ClickOperation::Definition,
-                ClickExpectation::Locations(&["base_tick_decl", "base_tick_def"]),
+                ClickExpectation::Locations(&["base_tick_def"]),
             ),
             ClickCase::new(
                 "base pointer receiver resolves to base method",
                 "base_ptr_tick_call",
                 ClickOperation::Definition,
-                ClickExpectation::Locations(&["base_tick_decl", "base_tick_def"]),
+                ClickExpectation::Locations(&["base_tick_def"]),
             ),
             ClickCase::new(
                 "unrelated same-name method resolves to unrelated owner",
                 "other_tick_call",
                 ClickOperation::Definition,
-                ClickExpectation::Locations(&["other_tick_decl", "other_tick_def"]),
+                ClickExpectation::Locations(&["other_tick_def"]),
             ),
             ClickCase::new(
                 "derived field shadows base field for derived receiver",
@@ -1304,13 +1386,13 @@ void run() {
                 "factory call resolves to out-of-line free function",
                 "make_derived_call",
                 ClickOperation::Definition,
-                ClickExpectation::Locations(&["make_derived_decl", "make_derived_def"]),
+                ClickExpectation::Locations(&["make_derived_def"]),
             ),
             ClickCase::new(
                 "typed factory result receiver resolves to derived method",
                 "made_tick_call",
                 ClickOperation::Definition,
-                ClickExpectation::Locations(&["derived_tick_decl", "derived_tick_def"]),
+                ClickExpectation::Locations(&["derived_tick_def"]),
             ),
             ClickCase::new(
                 "free function declaration references call site",

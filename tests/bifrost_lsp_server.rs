@@ -231,6 +231,10 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
         "typeDefinitionProvider should be advertised while the handler is supported: {initialize}"
     );
     assert_eq!(
+        initialize["result"]["capabilities"]["declarationProvider"], true,
+        "declarationProvider should be advertised while the handler is supported: {initialize}"
+    );
+    assert_eq!(
         initialize["result"]["capabilities"]["implementationProvider"], true,
         "implementationProvider should be advertised while the handler is supported: {initialize}"
     );

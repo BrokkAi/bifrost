@@ -104,6 +104,7 @@ impl BuiltClickFixture {
 
 #[derive(Debug, Clone, Copy)]
 pub enum ClickOperation {
+    Declaration,
     Definition,
     References { include_declaration: bool },
     Implementation,
@@ -192,6 +193,12 @@ fn request_case(
 ) -> Result<Value, String> {
     let (uri, line, character) = fixture.marker_position(case.marker);
     let response = match case.operation {
+        ClickOperation::Declaration => server.text_document_position_response(
+            "textDocument/declaration",
+            &uri,
+            line,
+            character,
+        ),
         ClickOperation::Definition => {
             server.text_document_position_response("textDocument/definition", &uri, line, character)
         }
@@ -401,6 +408,7 @@ fn collect_location_starts(value: &Value, out: &mut Vec<(String, u64, u64)>) {
 
 fn operation_name(operation: ClickOperation) -> &'static str {
     match operation {
+        ClickOperation::Declaration => "declaration",
         ClickOperation::Definition => "definition",
         ClickOperation::References { .. } => "references",
         ClickOperation::Implementation => "implementation",

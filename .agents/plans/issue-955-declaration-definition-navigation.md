@@ -14,7 +14,7 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
 - [x] (2026-07-20 12:21Z) Implemented the shared navigation operation and operation-aware analyzer selector while preserving the broad resolver.
 - [x] (2026-07-20 12:21Z) Added passing Java, C++, and Rust inline-project navigation contract coverage, including serialized operations.
 - [x] (2026-07-20 12:41Z) Exposed declaration navigation through MCP, path normalization, Python models/client/exports, and public documentation, with distinct serialized result fields and operations.
-- [ ] Advertise and dispatch LSP declaration navigation and extend the click-test harness.
+- [x] (2026-07-20 12:42Z) Advertised and dispatched LSP declaration navigation through the shared selector and extended the click-test harness with declaration operations.
 - [ ] Run focused tests, Python tests, formatting, clippy, full feature tests, and `git diff --check`.
 - [ ] Run the guided specialist review, address required findings, rerun affected gates, and record the reviewed outcome.
 
@@ -45,6 +45,9 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
 - Decision: Keep `get_definitions_by_reference` unchanged and make no UsageBench edits.
   Rationale: Issue #955 explicitly limits the public addition to location navigation in Bifrost.
   Date/Author: 2026-07-20 / Codex
+- Decision: Preserve declaration-site self navigation except when C++ AST classification proves the site is a declaration-only callable or type during definition navigation.
+  Rationale: Existing LSP no-movement behavior remains useful for fields, aliases, and other indivisible declarations, while a C++ prototype must not masquerade as an implementation body.
+  Date/Author: 2026-07-20 / Codex
 
 ## Outcomes & Retrospective
 
@@ -53,6 +56,8 @@ Implementation is in progress. At completion this section will summarize the pro
 Milestone 1 produced an explicit analyzer navigation path and the initial MCP location surface. Four focused contract tests pass: Java interface declaration selection, C++ prototype/body separation, C++ multi-body ambiguity, and Rust trait/implementation associated-type selection including qualified paths. Broad resolver entry points remain operation-free.
 
 Milestone 2 completed the public MCP and Python surface. MCP discovery, schema limits, line-number visibility, and live dispatch pass in 17 integration tests; the Python client exposes typed declaration and definition models and passes all 44 client tests. Public MCP and Python documentation now describes operation-specific fields and statuses while leaving reference-based definition lookup unchanged.
+
+Milestone 3 completed LSP support. Initialization advertises `declarationProvider`, both declaration and definition requests use the explicit analyzer selector, and the click harness covers Java, C++, and Rust distinctions. All 187 LSP server tests and 17 non-stress click-around tests pass; the C++ click contract also proves a prototype is not returned as its own definition.
 
 ## Context and Orientation
 
@@ -132,3 +137,5 @@ Plan revision note (2026-07-20 12:06Z): Created the living ExecPlan from the use
 Plan revision note (2026-07-20 12:21Z): Recorded milestone 1 implementation, focused passing evidence, the structured Rust AST field discovery, and the local PyO3 linker constraint before checkpointing.
 
 Plan revision note (2026-07-20 12:41Z): Recorded the completed MCP/Python/documentation milestone, its passing integration evidence, and the transient analyzer-store failure that disappeared on isolated rerun before checkpointing.
+
+Plan revision note (2026-07-20 12:42Z): Recorded the completed LSP milestone, including explicit declaration dispatch, operation-aware declaration-site fallback, and passing server/click-around evidence before checkpointing.
