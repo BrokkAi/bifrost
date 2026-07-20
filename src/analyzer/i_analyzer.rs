@@ -167,6 +167,16 @@ pub trait IAnalyzer: Send + Sync + Any {
     fn scala_project_types_build_count_for_test(&self) -> usize {
         0
     }
+    #[doc(hidden)]
+    fn reset_scala_query_scan_counts_for_test(&self) {}
+    #[doc(hidden)]
+    fn scala_query_parse_count_for_test(&self) -> usize {
+        0
+    }
+    #[doc(hidden)]
+    fn scala_query_walk_count_for_test(&self) -> usize {
+        0
+    }
     fn usage_facts_index(&self) -> &UsageFactsIndex {
         static EMPTY: OnceLock<UsageFactsIndex> = OnceLock::new();
         EMPTY.get_or_init(UsageFactsIndex::default)

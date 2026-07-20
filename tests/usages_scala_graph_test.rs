@@ -3152,6 +3152,63 @@ def compute(value: String): String = value
 }
 
 #[test]
+fn scala_file_major_query_scans_one_candidate_once_for_many_physical_targets() {
+    const REPLICA_COUNT: usize = 128;
+    let mut builder = InlineTestProject::with_language(Language::Scala);
+    for index in 0..REPLICA_COUNT {
+        builder = builder.file(
+            format!("replicas/{index:03}/Target.scala"),
+            format!(
+                "package replica\nclass Target {{\n  def hit(): Int = {index}\n  def call(): Int = hit() // physical-{index:03}\n}}\n"
+            ),
+        );
+    }
+    let project = builder.build();
+    let analyzer = ScalaAnalyzer::from_project(project.project().clone());
+    let mut targets = analyzer.get_definitions("replica.Target.hit");
+    targets.sort_by(|left, right| left.source().cmp(right.source()));
+    assert_eq!(targets.len(), REPLICA_COUNT);
+
+    let selected = targets
+        .iter()
+        .find(|target| target.source().rel_path() == "replicas/127/Target.scala")
+        .expect("selected physical target")
+        .clone();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new([selected.source().clone()].into_iter().collect()));
+    analyzer.reset_scala_query_scan_counts_for_test();
+
+    let result = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(&analyzer, &targets, Some(&provider), REPLICA_COUNT + 1, 100)
+        .result;
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = result
+    else {
+        panic!("expected exact physical query success");
+    };
+    assert_eq!(hits_by_overload.len(), REPLICA_COUNT);
+    for target in &targets {
+        let bucket = hits_by_overload
+            .get(target)
+            .unwrap_or_else(|| panic!("missing physical bucket for {target:?}"));
+        if target == &selected {
+            assert_eq!(
+                bucket.len(),
+                1,
+                "selected physical bucket must own its call"
+            );
+            assert_hit_contains(&bucket.iter().cloned().collect::<Vec<_>>(), "physical-127");
+        } else {
+            assert!(bucket.is_empty(), "physical replica leaked into {target:?}");
+        }
+    }
+    assert_eq!(analyzer.scala_query_parse_count_for_test(), 1);
+    assert_eq!(analyzer.scala_query_walk_count_for_test(), 1);
+}
+
+#[test]
 fn scala_inherited_class_method_usages_preserve_target_buckets_and_cap() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "app/Services.scala",

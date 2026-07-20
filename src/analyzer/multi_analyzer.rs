@@ -655,6 +655,26 @@ impl IAnalyzer for MultiAnalyzer {
             .sum()
     }
 
+    fn reset_scala_query_scan_counts_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate.analyzer().reset_scala_query_scan_counts_for_test();
+        }
+    }
+
+    fn scala_query_parse_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| delegate.analyzer().scala_query_parse_count_for_test())
+            .sum()
+    }
+
+    fn scala_query_walk_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| delegate.analyzer().scala_query_walk_count_for_test())
+            .sum()
+    }
+
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         match self.delegate_for_code_unit(code_unit) {
             Some(delegate) => delegate.analyzer().direct_children(code_unit),

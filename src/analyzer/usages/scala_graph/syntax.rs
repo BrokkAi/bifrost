@@ -11,6 +11,7 @@ pub(crate) struct ScalaSourceFacts {
         HashMap<(usize, usize), ScalaCallableSourceAlternative>,
     pub(crate) field_type_paths_by_range: HashMap<(usize, usize), Vec<String>>,
     pub(crate) stable_owner_ranges: HashSet<(usize, usize)>,
+    pub(crate) enum_ranges: HashSet<(usize, usize)>,
     pub(crate) case_class_ranges: HashSet<(usize, usize)>,
     pub(crate) abstract_callable_ranges: HashSet<(usize, usize)>,
     pub(crate) generic_owner_facts_by_range: HashMap<(usize, usize), ScalaGenericOwnerSourceFacts>,
@@ -342,6 +343,11 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                 facts
                     .stable_owner_ranges
                     .insert((node.start_byte(), node.end_byte()));
+                if node.kind() == "enum_definition" {
+                    facts
+                        .enum_ranges
+                        .insert((node.start_byte(), node.end_byte()));
+                }
                 record_generic_owner_facts(node, source, &mut facts);
             }
             "trait_definition" => {
@@ -1315,6 +1321,46 @@ pub(crate) fn stable_identifier_reference<'tree>(
     Some(ScalaStableIdentifierReference { segments })
 }
 
+/// Return the shortest parser-backed stable path ending at `node`. Unlike
+/// `stable_identifier_reference`, this preserves intermediate selections in a
+/// nested chain so a file-major walk can emit every field edge exactly once.
+pub(crate) fn stable_identifier_prefix_reference<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<ScalaStableIdentifierReference> {
+    let mut expression = node
+        .parent()
+        .filter(|parent| parent.kind() == "stable_identifier")?;
+    loop {
+        let mut leaves = Vec::new();
+        let mut stack = vec![expression];
+        while let Some(current) = stack.pop() {
+            if matches!(current.kind(), "identifier" | "operator_identifier") {
+                leaves.push(current);
+                continue;
+            }
+            if current.kind() != "stable_identifier" {
+                return None;
+            }
+            for index in (0..current.named_child_count()).rev() {
+                stack.push(current.named_child(index)?);
+            }
+        }
+        if leaves.last().copied() == Some(node) {
+            let segments = leaves
+                .into_iter()
+                .map(|leaf| node_text(leaf, source).trim().to_string())
+                .collect::<Vec<_>>();
+            if segments.len() >= 2 && segments.iter().all(|segment| !segment.is_empty()) {
+                return Some(ScalaStableIdentifierReference { segments });
+            }
+        }
+        expression = expression
+            .parent()
+            .filter(|parent| parent.kind() == "stable_identifier")?;
+    }
+}
+
 fn is_bare_term_reference(node: Node<'_>) -> bool {
     if node.kind() != "identifier" {
         return false;
@@ -1377,10 +1423,6 @@ pub(crate) fn field_expression_for_member(node: Node<'_>) -> Option<Node<'_>> {
     } else {
         None
     }
-}
-
-pub(crate) fn has_member_qualifier(node: Node<'_>) -> bool {
-    field_expression_for_member(node).is_some()
 }
 
 pub(crate) fn member_qualifier_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -1713,13 +1755,6 @@ pub(crate) fn scala_callable_shape_is_candidate(
                     .is_some_and(|arity| next_explicit_arity.accepts(arity))
         }
     }
-}
-
-pub(crate) fn infix_receiver_for_operator(node: Node<'_>) -> Option<Node<'_>> {
-    let parent = node.parent()?;
-    (parent.kind() == "infix_expression" && parent.child_by_field_name("operator") == Some(node))
-        .then(|| parent.child_by_field_name("left"))
-        .flatten()
 }
 
 pub(crate) fn named_argument_invocation_owner(node: Node<'_>) -> Option<Node<'_>> {

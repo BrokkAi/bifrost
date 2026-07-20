@@ -151,6 +151,8 @@ pub struct ScalaAnalyzer {
     /// analyzer generation and reset on `update`/`update_all`.
     project_types: Arc<OnceLock<Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes>>>,
     project_types_build_count: Arc<AtomicUsize>,
+    scala_query_parse_count: Arc<AtomicUsize>,
+    scala_query_walk_count: Arc<AtomicUsize>,
     #[allow(dead_code)]
     type_relations: Arc<OnceLock<Vec<TypeRelation>>>,
 }
@@ -230,6 +232,8 @@ impl ScalaAnalyzer {
         clone.inner = clone.inner.clone_with_project(project);
         clone.project_types = Arc::new(OnceLock::new());
         clone.project_types_build_count = Arc::new(AtomicUsize::new(0));
+        clone.scala_query_parse_count = Arc::new(AtomicUsize::new(0));
+        clone.scala_query_walk_count = Arc::new(AtomicUsize::new(0));
         clone
     }
 
@@ -257,6 +261,8 @@ impl ScalaAnalyzer {
             direct_descendant_index: Arc::new(OnceLock::new()),
             project_types: Arc::new(OnceLock::new()),
             project_types_build_count: Arc::new(AtomicUsize::new(0)),
+            scala_query_parse_count: Arc::new(AtomicUsize::new(0)),
+            scala_query_walk_count: Arc::new(AtomicUsize::new(0)),
             type_relations: Arc::new(OnceLock::new()),
         }
     }
@@ -281,6 +287,14 @@ impl ScalaAnalyzer {
         self.initialize_project_types(|| {
             self.bulk_file_states(self.analyzed_files(), BulkFileStateSource::Omit)
         })
+    }
+
+    pub(crate) fn record_query_parse(&self) {
+        self.scala_query_parse_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_query_walk(&self) {
+        self.scala_query_walk_count.fetch_add(1, Ordering::Relaxed);
     }
 
     fn project_types_from_file_states(
@@ -507,6 +521,19 @@ impl IAnalyzer for ScalaAnalyzer {
 
     fn scala_project_types_build_count_for_test(&self) -> usize {
         self.project_types_build_count.load(Ordering::Relaxed)
+    }
+
+    fn reset_scala_query_scan_counts_for_test(&self) {
+        self.scala_query_parse_count.store(0, Ordering::Relaxed);
+        self.scala_query_walk_count.store(0, Ordering::Relaxed);
+    }
+
+    fn scala_query_parse_count_for_test(&self) -> usize {
+        self.scala_query_parse_count.load(Ordering::Relaxed)
+    }
+
+    fn scala_query_walk_count_for_test(&self) -> usize {
+        self.scala_query_walk_count.load(Ordering::Relaxed)
     }
 
     fn global_usage_definition_index(&self) -> &crate::analyzer::GlobalUsageDefinitionIndex {
