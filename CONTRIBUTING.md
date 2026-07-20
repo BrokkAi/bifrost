@@ -77,6 +77,7 @@ then run:
 
 ```bash
 node scripts/sync-release-version.mjs
+cargo about generate --offline --config licenses/about.toml --features python --locked --fail licenses/about.hbs -o licenses/THIRD_PARTY_LICENSES.html
 ```
 
 That script updates these committed version fields:
@@ -117,8 +118,8 @@ directory instead of hand-editing checksums.
 
 To cut a release:
 
-1. Bump `version` in `Cargo.toml`, run `node scripts/sync-release-version.mjs`,
-   review the generated metadata diff, and merge.
+1. Bump `version` in `Cargo.toml`, run the version-sync and `cargo about`
+   commands above, review the generated metadata and notice diff, and merge.
 2. If skills, agents, launcher files, MCP config, or plugin manifests changed,
    regenerate and validate the generated plugin bundles:
 
