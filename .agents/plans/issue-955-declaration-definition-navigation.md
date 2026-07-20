@@ -19,7 +19,7 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
 - [x] (2026-07-20 14:27Z) Completed the five guided specialist reviews, addressed the high/medium findings within scope, reran affected tests and full gates, and recorded the one range-model follow-up below.
 - [x] (2026-07-20 15:12Z) Extended explicit navigation outcomes with physical declaration ranges so same-file C++ prototypes and bodies remain distinct without changing broad `CodeUnit` identity.
 - [x] (2026-07-20 15:18Z) Merged current `origin/master`, confirmed the branch is zero commits behind, and passed focused Rust, Python, formatting, all-feature clippy, the complete isolated all-feature Rust suite, and diff checks.
-- [ ] Run the named guided specialist review against the synchronized `master` merge base and present its findings index for interactive triage.
+- [x] (2026-07-20 15:27Z) Ran the named guided specialist review against the synchronized `master` merge base and prepared a deduplicated findings index for interactive triage.
 
 ## Surprises & Discoveries
 
@@ -41,6 +41,10 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
   Evidence: Specialist review traced `replace_code_unit` and the range-only result model: the selector can separate header/source physical candidates, but cannot return different ranges for a prototype and body represented by one same-file `CodeUnit`.
 - Observation: The decisive information loss occurred when C++ indexing replaced a prototype `CodeUnit` with its body and deleted the prototype's previously indexed range.
   Evidence: The initial range-aware navigation regression still selected line 2 for declaration navigation. Updating the two C++ body-replacement paths to preserve prior ranges made declaration select line 1 and definition select line 2 while retaining one semantic `CodeUnit`.
+- Observation: The post-follow-up guided review found that storing preserved physical ranges in the general analyzer range collection leaks navigation-only semantics into existing definition-oriented tools.
+  Evidence: Existing consumers such as `get_symbol_locations` and `get_definitions_by_reference` choose the earliest general range, so a same-file prototype/body pair can now render the prototype where the pre-follow-up behavior rendered the body.
+- Observation: The physical-range layer exposed two older logical-selection assumptions that must now be removed rather than duplicated: broad LSP consumers should still fail closed on ambiguity, and C++ status/link-unit diagnostics must be derived from typed physical targets rather than raw target cardinality.
+  Evidence: The architecture, senior, and duplication reviewers independently traced these failures to `broad_symbol.rs`, the two selectors in `get_definition/cpp.rs`, and the second finalization pass in `get_definition/mod.rs`.
 
 ## Decision Log
 
@@ -87,6 +91,8 @@ The guided review ran security, DevOps, duplication, architecture, and senior-en
 The architectural follow-up is now implemented. C++ definition replacement preserves earlier physical declaration ranges, while a new navigation-only target pairs the semantic `CodeUnit` with the exact range chosen from tree-sitter structure. MCP and LSP render the identifier within that range. Same-file prototype/body calls, prototype-to-body declaration-site navigation, and multiple same-file bodies are covered; the focused all-feature suites pass with 187 LSP server tests, 18 MCP tests, 525 analyzer tests, and 17 click tests plus 2 ignored stress tests.
 
 The branch was then synchronized by merging current `origin/master` at `273dd103`; it is zero commits behind master. Post-merge focused suites pass with 187 LSP, 18 MCP, 532 analyzer, and 17 click tests plus 2 ignored stress tests. All 44 Python tests pass, formatting and diff checks are clean, isolated all-target/all-feature clippy passes, and the complete isolated `cargo test --features nlp,python` run passes including doc tests.
+
+The requested guided review has completed its security, duplication, senior-engineering, DevOps, and architecture passes over `master...HEAD`. After scoping and deduplication, the interactive index contains seven findings: two high, four medium, and one low. The high findings are a broad-LSP ambiguity regression and the leakage of preserved navigation ranges into existing definition-oriented tools. Medium findings cover duplicated physical/logical C++ selection, inconsistent status/link-unit diagnostics, declaration-after-definition indexing, and unbounded navigation target expansion with repeated LSP reparsing. The low finding covers duplicated quadratic range-merge logic. No critical issue, injection, path traversal, secret exposure, dependency risk, or infrastructure configuration issue was found. Triage and fixes intentionally wait for the guided-review menu choice.
 
 Final validation passed:
 
@@ -198,3 +204,5 @@ Plan revision note (2026-07-20 15:04Z): Reopened the plan for the requested arch
 Plan revision note (2026-07-20 15:12Z): Recorded the completed range-aware navigation milestone, the C++ replacement-range root cause, new same-file call/declaration-site/multi-body coverage, and passing focused all-feature suites before checkpointing.
 
 Plan revision note (2026-07-20 15:18Z): Recorded the clean `origin/master` merge, zero-behind state, post-merge focused and full validation evidence, and the clippy-driven LSP expression cleanup before checkpointing the synchronized state.
+
+Plan revision note (2026-07-20 15:27Z): Recorded the five-reviewer guided review against synchronized master, its deduplicated severity totals and principal findings, and the deliberate pause for interactive triage.
