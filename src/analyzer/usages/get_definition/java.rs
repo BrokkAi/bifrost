@@ -1033,7 +1033,8 @@ fn java_nested_type_from_context(
         {
             return Some(child);
         }
-        owner = analyzer.parent_of(&current);
+        // Packages are module parents in the analyzer graph, not lexical type scopes.
+        owner = analyzer.parent_of(&current).filter(CodeUnit::is_class);
     }
     None
 }

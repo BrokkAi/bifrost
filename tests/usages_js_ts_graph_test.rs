@@ -2261,6 +2261,73 @@ fn ts_typed_receivers_count_as_member_usages() {
 }
 
 #[test]
+fn ts_intersection_alias_object_receiver_has_exact_targeted_and_workspace_usages() {
+    let consumer_source = r#"import {
+  HookOutput,
+  SerializableHookOutput,
+  SerializableOtherOutput,
+} from './api';
+
+declare const hook: HookOutput;
+const sanitized: SerializableHookOutput = { ...hook, serializable: true };
+export const targetRead = sanitized.message;
+
+const other: SerializableOtherOutput = { message: 'other', serializable: true };
+export const unrelatedAliasRead = other.message;
+
+export function shadow(sanitized: SerializableOtherOutput) {
+  return sanitized.message;
+}
+
+const loose = { message: 'loose' };
+export const untypedRead = loose.message;
+"#;
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "api.ts",
+            r#"export interface HookOutput { message: string; }
+export interface OtherOutput { message: string; }
+interface SerializableMarker { serializable: true; }
+export type SerializableHookOutput = HookOutput & SerializableMarker;
+export type SerializableOtherOutput = OtherOutput & SerializableMarker;
+"#,
+        )
+        .file("consumer.ts", consumer_source)
+        .build()
+    });
+    let target = find_ts_target(&analyzer, &project.file("api.ts"), |unit| {
+        unit.fq_name() == "HookOutput.message" && unit.is_field()
+    });
+    let read_start = consumer_source
+        .find("sanitized.message")
+        .expect("target intersection-alias receiver read")
+        + "sanitized.".len();
+    let expected = BTreeSet::from([(read_start, read_start + "message".len())]);
+
+    let targeted = authoritative_ts_hits(&analyzer, &target, project.file("consumer.ts"))
+        .into_iter()
+        .filter(|hit| hit.kind == UsageHitKind::Reference)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        expected, targeted,
+        "targeted inverse lookup must expand the intersection alias without admitting unrelated aliases, same-named fields, a shadowed receiver, or an untyped object literal"
+    );
+
+    let workspace = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    )
+    .into_iter()
+    .filter(|hit| hit.file == project.file("consumer.ts") && hit.kind == UsageHitKind::Reference)
+    .map(|hit| (hit.start_offset, hit.end_offset))
+    .collect::<BTreeSet<_>>();
+    assert_eq!(
+        expected, workspace,
+        "whole-workspace inverse lookup must preserve the same exact receiver ownership"
+    );
+}
+
+#[test]
 fn ts_interface_property_usages_include_typed_reads_and_contextual_return_keys() {
     let (project, analyzer) = ts_inline_analyzer(|p| {
         p.file(

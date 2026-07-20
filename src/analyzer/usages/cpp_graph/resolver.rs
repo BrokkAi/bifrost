@@ -5102,11 +5102,10 @@ pub(in crate::analyzer::usages) fn is_declaration_name(node: Node<'_>) -> bool {
     let mut current = Some(parent);
     while let Some(ancestor) = current {
         let type_definition = ancestor.kind() == "type_definition";
+        let mut declarator_cursor = ancestor.walk();
         if ancestor
-            .child_by_field_name("declarator")
-            .is_some_and(|declarator| {
-                declarator_name_path_contains(declarator, node, type_definition)
-            })
+            .children_by_field_name("declarator", &mut declarator_cursor)
+            .any(|declarator| declarator_name_path_contains(declarator, node, type_definition))
         {
             return true;
         }

@@ -4713,6 +4713,107 @@ namespace System.Xml.Serialization {
 }
 
 #[test]
+fn usage_finder_csharp_finds_event_and_delegate_assignment_method_groups() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "Demo/Subscriber.cs",
+        r#"
+namespace Demo;
+
+public delegate void Handler(int value);
+
+public sealed class Source {
+    public event Handler Changed;
+}
+
+public sealed class Subscriber {
+    private Handler saved;
+
+    private void OnChanged(int value) {}
+
+    public void Wire(Source source) {
+        source.Changed += OnChanged;
+        saved = OnChanged;
+        Handler local = OnChanged;
+        Handler wrapped = ((Handler)OnChanged!);
+    }
+
+    public void WireShadowed(Source source, Handler OnChanged) {
+        source.Changed += OnChanged;
+        saved = OnChanged;
+    }
+}
+"#,
+    )]);
+
+    let target = member_function_with_arity(&analyzer, "Demo.Subscriber", "OnChanged", 1);
+    let consumer = project.file("Demo/Subscriber.cs");
+    let source = consumer.read_to_string().expect("consumer source");
+    let event_start = source
+        .find("source.Changed += OnChanged")
+        .expect("event method group")
+        + "source.Changed += ".len();
+    let forward = definition_lookup(
+        project.root(),
+        "Demo/Subscriber.cs",
+        event_start,
+        event_start + "OnChanged".len(),
+    );
+    assert_eq!(forward["results"][0]["status"], "resolved", "{forward}");
+    assert_eq!(
+        forward["results"][0]["definitions"][0]["fqn"], "Demo.Subscriber.OnChanged",
+        "{forward}"
+    );
+
+    let hits = graph_hits(&analyzer, &target);
+    assert_eq!(
+        4,
+        hits.len(),
+        "event, assignment, initializer, and wrapped initializer should resolve; shadowed values should not: {hits:#?}"
+    );
+    for expected_start in [
+        event_start,
+        source
+            .find("saved = OnChanged")
+            .expect("delegate assignment")
+            + "saved = ".len(),
+        source
+            .find("Handler local = OnChanged")
+            .expect("delegate initializer")
+            + "Handler local = ".len(),
+        source
+            .find("Handler wrapped = ((Handler)OnChanged!)")
+            .expect("wrapped delegate initializer")
+            + "Handler wrapped = ((Handler)".len(),
+    ] {
+        assert!(
+            hits.iter().any(|hit| {
+                hit.start_offset <= expected_start
+                    && expected_start + "OnChanged".len() <= hit.end_offset
+            }),
+            "missing inverse method-group hit at byte {expected_start}: {hits:#?}"
+        );
+    }
+    for shadowed_start in [
+        source
+            .rfind("source.Changed += OnChanged")
+            .expect("shadowed event method group")
+            + "source.Changed += ".len(),
+        source
+            .rfind("saved = OnChanged")
+            .expect("shadowed delegate assignment")
+            + "saved = ".len(),
+    ] {
+        assert!(
+            hits.iter().all(|hit| {
+                !(hit.start_offset <= shadowed_start
+                    && shadowed_start + "OnChanged".len() <= hit.end_offset)
+            }),
+            "parameter-shadowed method-group value must not count at byte {shadowed_start}: {hits:#?}"
+        );
+    }
+}
+
+#[test]
 fn usage_finder_csharp_finds_unique_private_method_group_argument() {
     let (project, analyzer) = csharp_analyzer_with_files(&[(
         "Demo/Command.cs",
@@ -6157,6 +6258,112 @@ public sealed class Dto {
             .all(|hit| hit.file == project.file("src/Service.cs")),
         "{dto_hits:#?}"
     );
+}
+
+#[test]
+fn usage_finder_csharp_finds_inherited_object_initializer_labels_in_all_scopes() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "src/Descriptors.cs",
+            r#"namespace Example;
+
+public record BaseDescriptor {
+    public string Kind { get; set; } = "";
+}
+public record GalleryDescriptor : BaseDescriptor;
+public record HidingDescriptor : BaseDescriptor {
+    public new string Kind { get; set; } = "";
+}
+public sealed class UnrelatedDescriptor {
+    public string Kind { get; set; } = "";
+}
+
+public class ExportFragment {
+    public string IntegrityTag { get; set; } = "";
+}
+public sealed class PassThroughFragment : ExportFragment;
+"#,
+        ),
+        (
+            "src/Consumers.cs",
+            r#"namespace Example;
+
+public static class Consumers {
+    public static void Build() {
+        var gallery = new GalleryDescriptor { Kind = "gallery" };
+        gallery.Kind = "ordinary assignment";
+        _ = new HidingDescriptor { Kind = "hidden" };
+        _ = new UnrelatedDescriptor { Kind = "unrelated" };
+        _ = new PassThroughFragment { IntegrityTag = "integrity" };
+    }
+}
+"#,
+        ),
+    ]);
+
+    let consumer = project.file("src/Consumers.cs");
+    let source = consumer.read_to_string().expect("consumer source");
+    let gallery_label = source.find("Kind = \"gallery\"").expect("gallery label");
+    let ordinary_assignment = source
+        .find("gallery.Kind")
+        .expect("ordinary inherited assignment")
+        + "gallery.".len();
+    let integrity_label = source
+        .find("IntegrityTag = \"integrity\"")
+        .expect("integrity label");
+    let hidden_label = source.find("Kind = \"hidden\"").expect("hidden label");
+
+    let base_kind = member_field(&analyzer, "Example.BaseDescriptor", "Kind");
+    let base_integrity = member_field(&analyzer, "Example.ExportFragment", "IntegrityTag");
+    let hidden_kind = member_field(&analyzer, "Example.HidingDescriptor", "Kind");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    for (target, expected_offsets) in [
+        (base_kind.clone(), vec![gallery_label, ordinary_assignment]),
+        (base_integrity, vec![integrity_label]),
+    ] {
+        let targeted = UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(
+                &analyzer,
+                std::slice::from_ref(&target),
+                Some(&provider),
+                1,
+                1000,
+            )
+            .result
+            .into_either()
+            .expect("targeted inherited initializer query should resolve");
+        let whole_workspace = UsageFinder::new()
+            .query(&analyzer, std::slice::from_ref(&target), 1000, 1000)
+            .result
+            .into_either()
+            .expect("whole-workspace inherited initializer query should resolve");
+
+        for hits in [&targeted, &whole_workspace] {
+            assert_eq!(hits.len(), expected_offsets.len(), "{target:#?}: {hits:#?}");
+            for expected in &expected_offsets {
+                assert!(
+                    hits.iter().any(|hit| {
+                        hit.file == consumer
+                            && hit.start_offset <= *expected
+                            && *expected + target.identifier().len() <= hit.end_offset
+                    }),
+                    "{} should include byte {expected}: {hits:#?}",
+                    target.fq_name()
+                );
+            }
+        }
+    }
+
+    let hidden_hits = graph_hits(&analyzer, &hidden_kind);
+    assert_eq!(hidden_hits.len(), 1, "{hidden_hits:#?}");
+    assert!(hidden_hits.iter().any(|hit| {
+        hit.file == consumer
+            && hit.start_offset <= hidden_label
+            && hidden_label + "Kind".len() <= hit.end_offset
+    }));
 }
 
 #[test]

@@ -1,10 +1,10 @@
 use crate::analyzer::usages::csharp_graph::hits::{push_hit, push_unproven_hit};
 use crate::analyzer::usages::csharp_graph::resolver::{
     TargetKind, TargetSpec, UnqualifiedMethodGroupResolution, argument_count, binding_scope_node,
-    class_unit_for_fq_name, enclosing_declared_type, expression_resolves_to_type,
-    extension_visibility_site_key, first_type_child, is_type_reference_node,
-    member_name_is_locally_bound, nearest_member_candidates_for_owner, node_text,
-    normalize_type_text, object_initializer_for_label, receiver_targets_owner, reference_type_text,
+    class_unit_for_fq_name, enclosing_declared_type, extension_visibility_site_key,
+    first_type_child, is_type_reference_node, member_name_is_locally_bound,
+    nearest_member_candidates_for_owner, node_text, normalize_type_text,
+    object_initializer_for_label, receiver_targets_owner, reference_type_text,
     resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner, resolves_to_target,
     resolves_to_target_at, same_node, seed_visible_bindings_at, type_identity_matches,
     unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
@@ -520,7 +520,7 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 TargetMemberResolution::NotFound => push_unproven_hit(node, ctx),
             }
         }
-        TargetKind::Method if is_unqualified_method_group_argument(node, ctx.source) => {
+        TargetKind::Method if is_unqualified_method_group_value(node, ctx.source) => {
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
             seed_visible_bindings_at(
                 binding_scope_node(node),
@@ -580,7 +580,7 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 ctx.source,
                 &mut bindings,
             );
-            match object_initializer_label_owner_resolution(node, ctx, &bindings) {
+            match object_initializer_label_owner_resolution(node, ctx) {
                 LabelOwnerResolution::MatchesTarget => {
                     push_hit(node, ctx);
                     return;
@@ -617,7 +617,7 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-pub(super) fn is_unqualified_method_group_argument(node: Node<'_>, source: &str) -> bool {
+pub(super) fn is_unqualified_method_group_value(node: Node<'_>, source: &str) -> bool {
     if node.kind() != "identifier"
         || is_declaration_name(node)
         || is_type_reference_node(node)
@@ -625,25 +625,37 @@ pub(super) fn is_unqualified_method_group_argument(node: Node<'_>, source: &str)
     {
         return false;
     }
-    let Some(argument) = containing_argument_through_transparent_expressions(node) else {
-        return false;
-    };
-    argument.child_by_field_name("name") != Some(node)
+    containing_method_group_value_context(node)
 }
 
-fn containing_argument_through_transparent_expressions(node: Node<'_>) -> Option<Node<'_>> {
+fn containing_method_group_value_context(node: Node<'_>) -> bool {
     let mut current = node;
     while let Some(parent) = current.parent() {
-        if parent.kind() == "argument" {
-            return Some(parent);
+        match parent.kind() {
+            "argument" => return parent.child_by_field_name("name") != Some(node),
+            "assignment_expression" => {
+                return parent.child_by_field_name("right") == Some(current)
+                    && parent
+                        .child_by_field_name("operator")
+                        .is_some_and(|operator| matches!(operator.kind(), "=" | "+=" | "-="));
+            }
+            "variable_declarator" => {
+                return parent.child_by_field_name("name") != Some(current)
+                    && parent.named_child(parent.named_child_count().saturating_sub(1))
+                        == Some(current);
+            }
+            "property_declaration" => {
+                return parent.child_by_field_name("value") == Some(current);
+            }
+            _ => {}
         }
         if transparent_expression_parent(current, parent) {
             current = parent;
         } else {
-            return None;
+            return false;
         }
     }
-    None
+    false
 }
 
 fn transparent_expression_parent(current: Node<'_>, parent: Node<'_>) -> bool {
@@ -758,8 +770,7 @@ enum LabelOwnerResolution {
 
 fn object_initializer_label_owner_resolution(
     node: Node<'_>,
-    ctx: &ScanCtx<'_>,
-    bindings: &LocalInferenceEngine<String>,
+    ctx: &mut ScanCtx<'_>,
 ) -> LabelOwnerResolution {
     let Some(initializer) = object_initializer_for_label(node) else {
         return LabelOwnerResolution::NotLabel;
@@ -776,44 +787,20 @@ fn object_initializer_label_owner_resolution(
     else {
         return LabelOwnerResolution::Unknown;
     };
-    match expression_resolves_to_type(
-        type_node,
-        &ctx.spec.owner,
+    let Some(receiver_fqn) = resolve_type_fq_name_at(
         ctx.csharp,
         ctx.file,
+        &ctx.class_ranges,
+        &reference_type_text(type_node, ctx.source),
+        type_node,
         ctx.source,
-        bindings,
-    ) {
-        crate::analyzer::usages::local_inference::SymbolResolution::Precise(_) => {
-            LabelOwnerResolution::MatchesTarget
-        }
-        crate::analyzer::usages::local_inference::SymbolResolution::Unknown
-            if resolves_to_target_at(
-                ctx.file,
-                &ctx.class_ranges,
-                &reference_type_text(type_node, ctx.source),
-                type_node,
-                ctx.source,
-                &ctx.spec.owner,
-                ctx.csharp,
-            ) =>
-        {
-            LabelOwnerResolution::MatchesTarget
-        }
-        crate::analyzer::usages::local_inference::SymbolResolution::Unknown
-            if ctx
-                .csharp
-                .resolve_usage_visible_type(ctx.file, &reference_type_text(type_node, ctx.source))
-                .is_some() =>
-        {
-            LabelOwnerResolution::KnownOther
-        }
-        crate::analyzer::usages::local_inference::SymbolResolution::Unknown => {
-            LabelOwnerResolution::Unknown
-        }
-        crate::analyzer::usages::local_inference::SymbolResolution::Ambiguous => {
-            LabelOwnerResolution::Unknown
-        }
+    ) else {
+        return LabelOwnerResolution::Unknown;
+    };
+    match receiver_fqn_target_member_resolution(&receiver_fqn, None, ctx) {
+        TargetMemberResolution::MatchesTarget => LabelOwnerResolution::MatchesTarget,
+        TargetMemberResolution::KnownOther => LabelOwnerResolution::KnownOther,
+        TargetMemberResolution::NotFound => LabelOwnerResolution::Unknown,
     }
 }
 

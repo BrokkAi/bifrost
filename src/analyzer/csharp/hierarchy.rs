@@ -162,11 +162,36 @@ impl CSharpAnalyzer {
     }
 
     pub(crate) fn usage_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner
-            .raw_supertypes_of(code_unit)
-            .iter()
-            .filter_map(|raw| self.resolve_usage_visible_type(code_unit.source(), raw))
-            .collect()
+        self.logical_direct_ancestors(code_unit, true)
+    }
+
+    fn logical_direct_ancestors(&self, code_unit: &CodeUnit, usage: bool) -> Vec<CodeUnit> {
+        let mut parts = if usage {
+            self.usage_partial_type_parts(code_unit)
+        } else {
+            self.partial_type_parts(code_unit)
+        };
+        if parts.is_empty() {
+            parts.push(code_unit.clone());
+        }
+
+        let mut ancestors = Vec::new();
+        for part in parts {
+            ancestors.extend(
+                self.inner
+                    .raw_supertypes_of(&part)
+                    .iter()
+                    .filter_map(|raw| {
+                        if usage {
+                            self.resolve_usage_visible_type(part.source(), raw)
+                        } else {
+                            self.resolve_visible_type(part.source(), raw)
+                        }
+                    }),
+            );
+        }
+        self.sort_dedup_type_candidates(&mut ancestors);
+        ancestors
     }
 }
 
@@ -176,12 +201,7 @@ impl TypeHierarchyProvider for CSharpAnalyzer {
             return (*cached).clone();
         }
 
-        let ancestors: Vec<_> = self
-            .inner
-            .raw_supertypes_of(code_unit)
-            .iter()
-            .filter_map(|raw| self.resolve_visible_type(code_unit.source(), raw))
-            .collect();
+        let ancestors = self.logical_direct_ancestors(code_unit, false);
         self.memo_caches
             .direct_ancestors
             .insert(code_unit.clone(), Arc::new(ancestors.clone()));
