@@ -21,7 +21,7 @@ const HTTP_ENDPOINT: &str =
 const ACQUIRE_ENDPOINT: &str =
     include_str!("fixtures/policy-cli/project/policies/endpoints/resource-acquire.rqlp");
 const INFERRED_ACQUIRE_ENDPOINT: &str =
-    include_str!("fixtures/policy-cli/project/policies/endpoints/resource-acquire-inferred.rqlp");
+    include_str!("fixtures/policy-cli/overrides/resource-acquire-inferred.rqlp");
 const CLOSE_ENDPOINT: &str =
     include_str!("fixtures/policy-cli/project/policies/endpoints/resource-close.rqlp");
 
