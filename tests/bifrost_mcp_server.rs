@@ -1727,17 +1727,17 @@ fn bifrost_mcp_get_summaries_remains_directory_aware() {
     let structured = &response["result"]["structuredContent"];
     assert_eq!(false, structured["degraded"], "{structured}");
     assert!(
-        structured["compact_symbols"]["files"]
+        structured["listings"][0]["entries"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|file| file["path"] == "A.java"),
+            .any(|entry| entry["kind"] == "file" && entry["path"] == "A.java"),
         "{structured}"
     );
     let text = response["result"]["content"][0]["text"]
         .as_str()
         .expect("tool text");
-    assert!(text.contains("A.java ("), "{text}");
+    assert!(text.contains("[file] A.java"), "{text}");
 
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
@@ -1745,7 +1745,7 @@ fn bifrost_mcp_get_summaries_remains_directory_aware() {
 }
 
 #[test]
-fn bifrost_mcp_get_summaries_mixed_targets_include_compact_symbols() {
+fn bifrost_mcp_get_summaries_mixed_targets_include_directory_listing() {
     let fixture_root = TempDir::new().expect("temp dir");
     fs::write(
         fixture_root.path().join("A.java"),
@@ -1785,18 +1785,18 @@ fn bifrost_mcp_get_summaries_mixed_targets_include_compact_symbols() {
     assert_eq!("A.java", structured["summaries"][0]["path"], "{structured}");
     assert_eq!(false, structured["degraded"], "{structured}");
     assert!(
-        structured["compact_symbols"]["files"]
+        structured["listings"][0]["entries"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|file| file["path"] == "A.java"),
+            .any(|entry| entry["kind"] == "file" && entry["path"] == "A.java"),
         "{structured}"
     );
     let text = response["result"]["content"][0]["text"]
         .as_str()
         .expect("tool text");
     assert!(text.contains("A.java"), "{text}");
-    assert!(text.contains("A.java ("), "{text}");
+    assert!(text.contains("Directory ."), "{text}");
 
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
@@ -1827,8 +1827,7 @@ fn bifrost_mcp_get_summaries_accepts_go_import_path() {
 
     initialize_session(&mut stdin, &mut reader, &mut stderr);
 
-    // The import/package path resolves to the package's files and rides the compact
-    // "directory inventory" rail, returning symbol outlines rather than full signatures.
+    // Import/package paths return direct child packages and exact-package top-level types.
     let response = round_trip(
         &mut stdin,
         &mut reader,
@@ -1846,7 +1845,6 @@ fn bifrost_mcp_get_summaries_accepts_go_import_path() {
     assert_eq!(response["result"]["isError"], false, "{response}");
     let structured = &response["result"]["structuredContent"];
     assert_eq!(false, structured["degraded"], "{structured}");
-    // Returns compact symbols (outlines), not full ranged `summaries` blocks.
     assert!(
         structured["summaries"]
             .as_array()
@@ -1854,21 +1852,17 @@ fn bifrost_mcp_get_summaries_accepts_go_import_path() {
             .unwrap_or(true),
         "{structured}"
     );
-    let files = structured["compact_symbols"]["files"]
+    let entries = structured["listings"][0]["entries"]
         .as_array()
-        .expect("compact_symbols files");
-    let pkg_file = files
+        .expect("package listing entries");
+    let package_type = entries
         .iter()
-        .find(|file| file["path"] == "internal/pkg/foo.go")
-        .unwrap_or_else(|| panic!("missing package file in {structured}"));
-    let lines = pkg_file["lines"]
-        .as_array()
-        .expect("file lines")
-        .iter()
-        .filter_map(|line| line.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(lines.contains("Foo"), "{structured}");
+        .find(|entry| {
+            entry["kind"] == "type" && entry["symbol"] == "example.com/m/internal/pkg.Bar"
+        })
+        .unwrap_or_else(|| panic!("missing package type in {structured}"));
+    assert_eq!("go", package_type["language"]);
+    assert_eq!("internal/pkg/foo.go", package_type["path"]);
 
     drop(stdin);
     let status = child.wait().expect("wait bifrost");

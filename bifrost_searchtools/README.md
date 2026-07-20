@@ -18,7 +18,7 @@ Index a project once, then ask fast structural questions:
 
 - **Symbol search:** find classes, functions, and fields by name pattern.
 - **Locations and sources:** jump to a symbol's definition or pull its source.
-- **Summaries:** get a signature-level outline of a file or directory.
+- **Summaries and listings:** get signature-level file/class outlines, immediate git-visible directory children, or package types and child packages.
 - **Usages and call graph:** scan references to a symbol, or build the
   whole-workspace caller/callee graph (feed it to PageRank for a code map).
 - **Most-relevant files:** rank the files most related to one or more seed files.
@@ -69,7 +69,7 @@ exposes:
 | `get_definitions_by_location([{"path": ..., "line": ..., "column": ...}])` | Resolve references at known file locations. |
 | `get_definitions_by_reference([{"symbol": ..., "context": ..., "target": ...}])` | Resolve copied references inside symbol source blocks. |
 | `get_type_by_location(path, *, line=..., column=...)` | Resolve the type of an expression or identifier at a known file location. |
-| `get_summaries(targets)` | Signature-level outline of files / classes / directories. |
+| `get_summaries(targets)` | Signature-level file/class outlines; immediate directory children; or exact-package types and direct child packages. |
 | `list_symbols(file_patterns)` | Skim the symbols declared in matching files. |
 | `scan_usages_by_reference(symbols, *, include_tests=False, paths=None)` | Find references to known symbols. |
 | `scan_usages_by_location(targets, *, include_tests=False, paths=None)` | Find references from declaration line/column targets. |

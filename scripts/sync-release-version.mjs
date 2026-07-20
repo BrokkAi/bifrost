@@ -53,6 +53,16 @@ const updates = [
     json.packages[""] ??= {};
     json.packages[""].version = version;
   }),
+  updateText("docs/src/content/docs/rust-library.md", (contents) => {
+    const pattern = /^brokk-bifrost = "[^"]+"$/gm;
+    const matches = contents.match(pattern) ?? [];
+    if (matches.length !== 1) {
+      throw new Error(
+        `Expected exactly one brokk-bifrost dependency example, found ${matches.length}`,
+      );
+    }
+    return contents.replace(pattern, `brokk-bifrost = "${version}"`);
+  }),
 ].filter(Boolean);
 
 if (checkOnly && updates.length > 0) {
@@ -97,6 +107,19 @@ function updateJson(relativePath, mutate) {
   const json = JSON.parse(original);
   mutate(json);
   const next = `${JSON.stringify(json, null, 2)}\n`;
+  if (next === original) {
+    return null;
+  }
+  if (!checkOnly) {
+    fs.writeFileSync(absolutePath, next);
+  }
+  return relativePath;
+}
+
+function updateText(relativePath, mutate) {
+  const absolutePath = path.join(repoRoot, relativePath);
+  const original = fs.readFileSync(absolutePath, "utf8");
+  const next = mutate(original);
   if (next === original) {
     return null;
   }

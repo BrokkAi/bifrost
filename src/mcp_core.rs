@@ -85,7 +85,7 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
         ),
         tool_descriptor(
             "get_summaries",
-            "Summarize matching source files, globs, classes, or modules with line ranges. Use before repeated read_file/grep calls when you need a compact map of related code before choosing exact definitions to inspect. If full summaries exceed the response budget, the result is marked degraded and returns compact_symbols declaration outlines instead. Example targets: [\"src/auth/**/*.rs\"], [\"crates/polars-core/src/frame/**/*.rs\"], [\"MyClass\"].",
+            "Summarize code or navigate containers. Use a directory target like an `ls` to list its immediate child directories and git-visible files (tracked or unignored), including non-source files; gitignored files are excluded. Use an OO namespace or language package/import target like a semantic `ls` to list direct child packages and top-level types declared in that exact package. Real filesystem directories win name collisions, and mixed target kinds are accepted in one call. Literal files, globs, classes, and modules return ranged summaries. Oversized ordinary summaries degrade to compact_symbols; oversized listings retain a total count and set truncated. Examples: [\"src/auth\"], [\"com.example.auth\"], [\"github.com/cli/cli/v2/internal/skills/discovery\"], [\"src/auth/**/*.rs\", \"MyClass\"].",
             summaries_schema(),
         ),
         scan_descriptor,

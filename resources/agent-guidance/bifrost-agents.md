@@ -4,8 +4,11 @@ When planning broad refactors, risky behavior changes, or edits to large classes
 or modules, use Bifrost's structured code-intelligence tools before proposing a
 plan or modifying code.
 
-- Start with `get_summaries` for the target files, directories, classes, or
-  modules so the plan is grounded in the actual API shape and neighboring code.
+- Start with `get_summaries` for target files, classes, or modules. Use it like
+  `ls` on a directory to see immediate child directories and git-visible files
+  (tracked or unignored; ignored files stay excluded), or on a language
+  package/import path to see direct child packages and exact-package top-level
+  types.
 - Use `search_symbols` to find relevant classes, functions, methods, fields, and
   modules by name before opening files manually.
 - Use `get_symbol_sources` when you need the exact body of a known symbol.

@@ -48,6 +48,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 const FILE_SEARCH_LIMIT: usize = 100;
@@ -452,10 +453,55 @@ pub struct DefinitionDiagnostic {
 #[derive(Debug, Clone, Serialize)]
 pub struct SummaryResult {
     pub summaries: Vec<SummaryBlock>,
+    pub listings: Vec<ContainerListing>,
     pub not_found: Vec<NotFoundInput>,
     pub ambiguous: Vec<AmbiguousSymbol>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerKind {
+    Directory,
+    Package,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContainerListing {
+    pub target: String,
+    pub kind: ContainerKind,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub languages: Vec<String>,
+    pub entries: Vec<ContainerListingEntry>,
+    pub total_entries: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContainerListingEntry {
+    Directory {
+        name: String,
+        path: String,
+    },
+    File {
+        name: String,
+        path: String,
+    },
+    Package {
+        name: String,
+        qualified_name: String,
+        languages: Vec<String>,
+    },
+    Type {
+        name: String,
+        symbol: String,
+        language: String,
+        path: String,
+        start_line: usize,
+        end_line: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2371,8 +2417,7 @@ fn ambiguous_symbol_selector_note(matches: &[String]) -> Option<String> {
 #[derive(Debug)]
 struct SummaryTargets {
     file_targets: Vec<ProjectFile>,
-    directory_targets: Vec<ProjectFile>,
-    directory_target_inputs: Vec<String>,
+    listings: Vec<ContainerListing>,
     unmatched_file_targets: Vec<String>,
     symbol_targets: Vec<String>,
     ambiguous_paths: Vec<AmbiguousPathInput>,
@@ -2393,9 +2438,10 @@ enum SourceLookupOutcome {
 fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> SummaryTargets {
     let _scope = profiling::scope("searchtools::route_summary_targets");
     let resolver = WorkspaceFileResolver::new(analyzer.project());
+    let workspace_files = analyzer.project().all_files().unwrap_or_default();
     let mut file_targets = BTreeSet::new();
-    let mut directory_targets = BTreeSet::new();
-    let mut directory_target_inputs = Vec::new();
+    let mut listings = Vec::new();
+    let mut listed_containers = HashSet::default();
     let mut unmatched_file_targets = Vec::new();
     let mut symbol_targets = Vec::new();
     let mut ambiguous_paths = Vec::new();
@@ -2425,10 +2471,11 @@ fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> Summar
             ResolvedFileInput::NotFound(_) => {}
         }
 
-        let directory_matches = resolve_directory_target(analyzer, target);
-        if !directory_matches.is_empty() {
-            directory_targets.extend(directory_matches);
-            directory_target_inputs.push(target.to_string());
+        if let Some(listing) = directory_listing(&workspace_files, target) {
+            let key = (listing.kind, listing.target.clone());
+            if listed_containers.insert(key) {
+                listings.push(listing);
+            }
             continue;
         }
 
@@ -2442,6 +2489,14 @@ fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> Summar
             continue;
         }
 
+        if let Some(listing) = package_listing(analyzer, target) {
+            let key = (listing.kind, listing.target.clone());
+            if listed_containers.insert(key) {
+                listings.push(listing);
+            }
+            continue;
+        }
+
         if looks_like_file_target(target) {
             unmatched_file_targets.push(target.to_string());
             continue;
@@ -2452,11 +2507,166 @@ fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> Summar
 
     SummaryTargets {
         file_targets: file_targets.into_iter().collect(),
-        directory_targets: directory_targets.into_iter().collect(),
-        directory_target_inputs,
+        listings,
         unmatched_file_targets,
         symbol_targets,
         ambiguous_paths,
+    }
+}
+
+fn directory_listing(files: &BTreeSet<ProjectFile>, target: &str) -> Option<ContainerListing> {
+    let normalized = normalize_pattern(target.trim());
+    let normalized = normalized.trim_end_matches('/');
+    let directory = if normalized.is_empty() || normalized == "." {
+        PathBuf::new()
+    } else {
+        workspace_rel_path(normalized)?
+    };
+
+    let mut entries_by_path = HashMap::default();
+    for file in files {
+        let Ok(remainder) = file.rel_path().strip_prefix(&directory) else {
+            continue;
+        };
+        let mut components = remainder.components();
+        let Some(first) = components.next() else {
+            continue;
+        };
+        let first_path = directory.join(first.as_os_str());
+        let path = stable_workspace_path(&first_path);
+        let name = first.as_os_str().to_string_lossy().into_owned();
+        let entry = if components.next().is_some() {
+            ContainerListingEntry::Directory {
+                name,
+                path: path.clone(),
+            }
+        } else {
+            ContainerListingEntry::File {
+                name,
+                path: path.clone(),
+            }
+        };
+        entries_by_path.insert(path, entry);
+    }
+    if entries_by_path.is_empty() {
+        return None;
+    }
+
+    let mut entries: Vec<_> = entries_by_path.into_values().collect();
+    sort_container_entries(&mut entries);
+    Some(ContainerListing {
+        target: if directory.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            stable_workspace_path(&directory)
+        },
+        kind: ContainerKind::Directory,
+        languages: Vec::new(),
+        total_entries: entries.len(),
+        entries,
+        truncated: false,
+    })
+}
+
+fn stable_workspace_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn package_listing(analyzer: &dyn IAnalyzer, target: &str) -> Option<ContainerListing> {
+    let package = target.trim().trim_end_matches('/');
+    if package.is_empty() {
+        return None;
+    }
+    let index = analyzer.global_usage_definition_index();
+    if !index.package_container_exists(package) {
+        return None;
+    }
+
+    let mut entries = Vec::new();
+    for child in index.child_packages(package) {
+        let languages = package_language_labels(index.package_languages(&child));
+        entries.push(ContainerListingEntry::Package {
+            name: package_leaf_name(&child).to_string(),
+            qualified_name: child,
+            languages,
+        });
+    }
+
+    let mut seen_types = HashSet::default();
+    for file in index.package_files(package) {
+        for unit in analyzer.top_level_declarations(file) {
+            if !unit.is_class() || unit.package_name() != package {
+                continue;
+            }
+            let language = language_for_file(unit.source()).config_label().to_string();
+            for range in analyzer.ranges(&unit) {
+                let path = rel_path_string(unit.source());
+                let symbol = unit.fq_name();
+                if !seen_types.insert((
+                    language.clone(),
+                    path.clone(),
+                    symbol.clone(),
+                    range.start_line,
+                    range.end_line,
+                )) {
+                    continue;
+                }
+                entries.push(ContainerListingEntry::Type {
+                    name: display_identifier_for_target(&unit),
+                    symbol,
+                    language: language.clone(),
+                    path,
+                    start_line: range.start_line,
+                    end_line: range.end_line,
+                });
+            }
+        }
+    }
+
+    sort_container_entries(&mut entries);
+    Some(ContainerListing {
+        target: package.to_string(),
+        kind: ContainerKind::Package,
+        languages: package_language_labels(index.package_languages(package)),
+        total_entries: entries.len(),
+        entries,
+        truncated: false,
+    })
+}
+
+fn package_language_labels(languages: Vec<Language>) -> Vec<String> {
+    languages
+        .into_iter()
+        .filter(|language| *language != Language::None)
+        .map(|language| language.config_label().to_string())
+        .collect()
+}
+
+fn package_leaf_name(package: &str) -> &str {
+    package
+        .rsplit_once("::")
+        .or_else(|| package.rsplit_once('/'))
+        .or_else(|| package.rsplit_once('.'))
+        .map(|(_, leaf)| leaf)
+        .unwrap_or(package)
+}
+
+fn sort_container_entries(entries: &mut [ContainerListingEntry]) {
+    entries.sort_by(|left, right| {
+        container_entry_sort_key(left).cmp(&container_entry_sort_key(right))
+    });
+}
+
+fn container_entry_sort_key(entry: &ContainerListingEntry) -> (u8, &str, &str) {
+    match entry {
+        ContainerListingEntry::Directory { name, path } => (0, name, path),
+        ContainerListingEntry::Package {
+            name,
+            qualified_name,
+            ..
+        } => (0, name, qualified_name),
+        ContainerListingEntry::File { name, path } => (1, name, path),
+        ContainerListingEntry::Type { name, symbol, .. } => (1, name, symbol),
     }
 }
 
@@ -2485,25 +2695,11 @@ fn summarize_symbol_targets(analyzer: &dyn IAnalyzer, targets: Vec<String>) -> S
 
     SummaryResult {
         summaries,
+        listings: Vec::new(),
         not_found,
         ambiguous,
         ambiguous_paths: Vec::new(),
     }
-}
-
-pub(crate) fn summarize_targets_with_directory_inventory(
-    analyzer: &dyn IAnalyzer,
-    targets: &[String],
-) -> (SummaryResult, Option<SkimFilesResult>, Vec<String>) {
-    let summary_targets = route_summary_targets(analyzer, targets);
-    let summary_result = summarize_routed_targets(analyzer, &summary_targets);
-    let directory_symbols = (!summary_targets.directory_targets.is_empty())
-        .then(|| skim_files_for_files(analyzer, summary_targets.directory_targets));
-    (
-        summary_result,
-        directory_symbols,
-        summary_targets.directory_target_inputs,
-    )
 }
 
 fn source_blocks_for_resolved_units(
@@ -2866,14 +3062,8 @@ pub fn get_symbol_sources(
 
 pub fn get_summaries(analyzer: &dyn IAnalyzer, params: SummariesParams) -> SummaryResult {
     let _scope = profiling::scope("searchtools::get_summaries");
-    let (mut summaries, _directory_symbols, directory_target_inputs) =
-        summarize_targets_with_directory_inventory(analyzer, &params.targets);
-    summaries.not_found.extend(
-        directory_target_inputs
-            .into_iter()
-            .map(renderable_not_found_input),
-    );
-    summaries
+    let targets = route_summary_targets(analyzer, &params.targets);
+    summarize_routed_targets(analyzer, &targets)
 }
 
 fn skim_files_for_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> SkimFilesResult {
@@ -2969,6 +3159,7 @@ pub(crate) fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>)
 
     SummaryResult {
         summaries,
+        listings: Vec::new(),
         not_found: Vec::new(),
         ambiguous: Vec::new(),
         ambiguous_paths: Vec::new(),
@@ -3109,6 +3300,7 @@ fn summarize_routed_targets(
     let symbol_output = summarize_symbol_targets(analyzer, summary_targets.symbol_targets.clone());
 
     file_output.summaries.extend(symbol_output.summaries);
+    file_output.listings = summary_targets.listings.clone();
     file_output.not_found.extend(
         summary_targets
             .unmatched_file_targets
@@ -5242,7 +5434,7 @@ fn filter_and_dedupe_hits(
         definition_ranges
             .entry(overload.source().clone())
             .or_default()
-            .extend(analyzer.ranges_of(overload));
+            .extend(external_usage_definition_ranges(analyzer, overload));
     }
 
     let mut rows: BTreeMap<(String, usize, String, UsageHitKind), UsageHitRow> = BTreeMap::new();
@@ -5296,6 +5488,28 @@ fn filter_and_dedupe_hits(
     FilteredUsageHits {
         hits,
         definition_sites_excluded,
+    }
+}
+
+fn external_usage_definition_ranges(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> Vec<Range> {
+    let ranges = analyzer.ranges_of(target);
+    let lookup_only_local_property = language_for_file(target.source()) == Language::JavaScript
+        && target.is_field()
+        && analyzer.parent_of(target).is_none()
+        && !analyzer.declarations(target.source()).contains(target);
+    if !lookup_only_local_property {
+        return ranges;
+    }
+
+    let Ok(source) = target.source().read_to_string() else {
+        return ranges;
+    };
+    let exact_ranges =
+        DeclarationNameRangeContext::new(target.source(), source).name_ranges(analyzer, target);
+    if exact_ranges.is_empty() {
+        ranges
+    } else {
+        exact_ranges
     }
 }
 
@@ -7335,23 +7549,11 @@ fn resolve_directory_target(analyzer: &dyn IAnalyzer, target: &str) -> Vec<Proje
     }
     let normalized = target.trim_end_matches('/');
     let prefix = format!("{normalized}/");
-    let fs_matches: Vec<_> = analyzer
+    analyzer
         .analyzed_files()
         .into_iter()
         .filter(|file| rel_path_string(file).starts_with(&prefix))
-        .collect();
-    if !fs_matches.is_empty() {
-        return fs_matches;
-    }
-
-    // No filesystem directory matched: treat the target as a language import/package
-    // path (e.g. `github.com/cli/cli/v2/internal/skills/discovery`) and resolve it to
-    // the package's files so it rides the same compact "directory inventory" rail as a
-    // filesystem directory. Filesystem matches win first, so workspace-relative paths
-    // never collide with import paths.
-    analyzer
-        .global_usage_definition_index()
-        .package_files_with_prefix(normalized)
+        .collect()
 }
 
 fn select_files_for_display(
@@ -7767,10 +7969,11 @@ fn language_name(language: Language) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ScanUsageRequest, ScanUsagesAbsenceCaveat, ScanUsagesCandidateFilesSample,
-        ScanUsagesStatus, ScanUsagesSurface, ScanUsagesWorkEntry, SourceBlock, SummaryElement,
-        SymbolUsageRenderState, UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering,
-        classify_scan_usages_entry, list_symbols, resolve_file_patterns, trim_summary_signature,
+        ContainerListingEntry, ScanUsageRequest, ScanUsagesAbsenceCaveat,
+        ScanUsagesCandidateFilesSample, ScanUsagesStatus, ScanUsagesSurface, ScanUsagesWorkEntry,
+        SourceBlock, SummaryElement, SymbolUsageRenderState, UsageFailureInfo, UsageHitKind,
+        UsageHitRow, UsageRendering, classify_scan_usages_entry, list_symbols,
+        resolve_file_patterns, trim_summary_signature,
     };
     use super::{function_like_macro_query, route_summary_targets, usage_failure_hint};
     use crate::analyzer::{
@@ -8063,7 +8266,7 @@ def gamma():
         let targets = route_summary_targets(&analyzer, &["nested/B.java".to_string()]);
 
         assert_eq!(vec!["nested/B.java"], rel_paths(&targets.file_targets));
-        assert!(targets.directory_targets.is_empty());
+        assert!(targets.listings.is_empty());
         assert_eq!(0, analyzer.analyzed_files_calls());
     }
 
@@ -8139,7 +8342,7 @@ def gamma():
     }
 
     #[test]
-    fn directory_targets_are_reported_as_not_found() {
+    fn directory_targets_return_immediate_file_listings() {
         let root = std::env::current_dir().unwrap();
         let rel_paths: Vec<_> = (0..25)
             .map(|index| format!("src/File{index}.java"))
@@ -8155,14 +8358,13 @@ def gamma():
         );
 
         assert!(result.summaries.is_empty());
-        assert_eq!(
-            vec!["src"],
-            result
-                .not_found
-                .iter()
-                .map(|item| item.input.as_str())
-                .collect::<Vec<_>>()
-        );
+        assert!(result.not_found.is_empty());
+        assert_eq!(1, result.listings.len());
+        assert_eq!(25, result.listings[0].entries.len());
+        assert!(result.listings[0].entries.iter().all(|entry| matches!(
+            entry,
+            ContainerListingEntry::File { path, .. } if path.starts_with("src/File")
+        )));
     }
 
     fn rel_paths(files: &[ProjectFile]) -> Vec<String> {

@@ -332,7 +332,7 @@ fn handle_tool_call(
     match service.call_tool_output(name, arguments.clone(), render_options) {
         Ok(output) => {
             let output = if name == "get_summaries" {
-                fit_get_summaries_output_to_budget(service, output, &arguments, render_options)
+                fit_get_summaries_output_to_budget(service, output, render_options)
                     .map_err(|err| map_service_error(err.code, err.message))?
             } else {
                 output
@@ -360,7 +360,6 @@ fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> (i64
 fn fit_get_summaries_output_to_budget(
     service: &SearchToolsService,
     output: ToolOutput,
-    arguments: &Value,
     render_options: RenderOptions,
 ) -> Result<ToolOutput, SearchToolsServiceError> {
     let ToolOutput::Structured {
@@ -371,86 +370,7 @@ fn fit_get_summaries_output_to_budget(
         return Ok(output);
     };
 
-    let mut compact_text =
-        maybe_add_directory_inventory(service, &mut structured, arguments, render_options)?;
-
-    let original_bytes = serialized_json_len(&structured);
-    let summaries_len = structured
-        .get("summaries")
-        .and_then(Value::as_array)
-        .map(|items| items.len())
-        .unwrap_or(0);
-    if original_bytes <= GET_SUMMARIES_RESPONSE_BUDGET_BYTES || summaries_len == 0 {
-        let rendered_text =
-            render_non_degraded_get_summaries_text(base_rendered_text, compact_text.take());
-        return Ok(ToolOutput::Structured {
-            structured,
-            rendered_text: Some(rendered_text),
-        });
-    }
-
-    let (budgeted, rendered_text) = degrade_get_summaries_value(
-        service,
-        structured,
-        compact_text,
-        original_bytes,
-        render_options,
-    )?;
-    Ok(ToolOutput::Structured {
-        structured: budgeted,
-        rendered_text: Some(rendered_text),
-    })
-}
-
-fn maybe_add_directory_inventory(
-    service: &SearchToolsService,
-    structured: &mut Value,
-    arguments: &Value,
-    render_options: RenderOptions,
-) -> Result<Option<String>, SearchToolsServiceError> {
-    let targets = arguments
-        .get("targets")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_string))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if targets.is_empty() {
-        return Ok(None);
-    }
-
-    let unresolved = unresolved_targets(&targets, structured);
-    if unresolved.is_empty() {
-        return Ok(None);
-    }
-
-    let compact_output = service.call_tool_output(
-        "list_symbols",
-        json!({ "file_patterns": unresolved }),
-        render_options,
-    )?;
-    let compact_text = rendered_text_for_output(&compact_output);
-    let ToolOutput::Structured {
-        structured: compact_structured,
-        ..
-    } = compact_output
-    else {
-        return Ok(compact_text);
-    };
-    let has_files = compact_structured
-        .get("files")
-        .and_then(Value::as_array)
-        .map(|files| !files.is_empty())
-        .unwrap_or(false);
-    if !has_files {
-        return Ok(compact_text);
-    }
-
     if let Some(object) = structured.as_object_mut() {
-        object.insert("compact_symbols".to_string(), compact_structured);
         object
             .entry("degraded".to_string())
             .or_insert_with(|| json!(false));
@@ -458,37 +378,37 @@ fn maybe_add_directory_inventory(
             .entry("degradation".to_string())
             .or_insert(Value::Null);
     }
-    Ok(compact_text)
-}
 
-fn unresolved_targets(targets: &[String], structured: &Value) -> Vec<String> {
-    let found_summary_paths: std::collections::HashSet<_> = structured
+    let original_bytes = serialized_json_len(&structured);
+    let summaries_len = structured
         .get("summaries")
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|summary| summary.get("path").and_then(Value::as_str))
-        .collect();
-    let not_found: std::collections::HashSet<_> = structured
-        .get("not_found")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(not_found_input_value)
-        .collect();
-    targets
-        .iter()
-        .filter(|target| {
-            not_found.contains(target.as_str()) && !found_summary_paths.contains(target.as_str())
-        })
-        .cloned()
-        .collect()
-}
+        .map(|items| items.len())
+        .unwrap_or(0);
+    if original_bytes <= GET_SUMMARIES_RESPONSE_BUDGET_BYTES {
+        return Ok(ToolOutput::Structured {
+            structured,
+            rendered_text: base_rendered_text,
+        });
+    }
 
-fn not_found_input_value(value: &Value) -> Option<&str> {
-    value
-        .as_str()
-        .or_else(|| value.get("input").and_then(Value::as_str))
+    if summaries_len == 0 {
+        mark_listing_budget_degradation(&mut structured, original_bytes);
+        let budgeted = shrink_get_summaries_value_to_budget(structured);
+        let rendered_text =
+            render_budgeted_get_summaries_text(&budgeted, None, render_options.render_line_numbers);
+        return Ok(ToolOutput::Structured {
+            structured: budgeted,
+            rendered_text: Some(rendered_text),
+        });
+    }
+
+    let (budgeted, rendered_text) =
+        degrade_get_summaries_value(service, structured, None, original_bytes, render_options)?;
+    Ok(ToolOutput::Structured {
+        structured: budgeted,
+        rendered_text: Some(rendered_text),
+    })
 }
 
 fn degrade_get_summaries_value(
@@ -551,8 +471,31 @@ fn degrade_get_summaries_value(
         }
     }
 
-    let text = render_budgeted_get_summaries_text(&structured, compact_text);
-    Ok((shrink_compact_symbols_value_to_budget(structured), text))
+    let structured = shrink_get_summaries_value_to_budget(structured);
+    let text = render_budgeted_get_summaries_text(
+        &structured,
+        compact_text,
+        render_options.render_line_numbers,
+    );
+    Ok((structured, text))
+}
+
+fn mark_listing_budget_degradation(structured: &mut Value, original_bytes: usize) {
+    let Some(object) = structured.as_object_mut() else {
+        return;
+    };
+    object.insert("degraded".to_string(), json!(true));
+    object.insert(
+        "degradation".to_string(),
+        json!({
+            "reason": "response_budget_exceeded",
+            "requested_format": "container_listing",
+            "returned_format": "truncated_container_listing",
+            "budget_bytes": GET_SUMMARIES_RESPONSE_BUDGET_BYTES,
+            "original_bytes": original_bytes,
+            "message": "The container listing exceeded the response budget and was truncated. Re-call get_summaries with a narrower directory or package target."
+        }),
+    );
 }
 
 fn summary_paths_for_compaction(structured: &Value) -> Vec<String> {
@@ -787,6 +730,55 @@ mod tests {
 
         assert!(compact_symbols_from_summaries(&structured).is_none());
     }
+
+    #[test]
+    fn oversized_container_listing_is_truncated_to_budget() {
+        let entries = (0..200)
+            .map(|index| {
+                json!({
+                    "kind": "file",
+                    "name": format!("generated_file_{index:03}.rs"),
+                    "path": format!("src/generated/generated_file_{index:03}.rs"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut structured = json!({
+            "summaries": [],
+            "listings": [{
+                "target": "src/generated",
+                "kind": "directory",
+                "entries": entries,
+                "total_entries": 200,
+                "truncated": false,
+            }],
+            "not_found": [],
+            "ambiguous": [],
+            "ambiguous_paths": [],
+            "degraded": false,
+            "degradation": null,
+        });
+        let original_bytes = serialized_json_len(&structured);
+
+        mark_listing_budget_degradation(&mut structured, original_bytes);
+        let structured = shrink_get_summaries_value_to_budget(structured);
+
+        assert!(
+            serialized_json_len(&structured) <= GET_SUMMARIES_RESPONSE_BUDGET_BYTES,
+            "{}",
+            serialized_json_len(&structured)
+        );
+        assert_eq!(true, structured["degraded"]);
+        assert_eq!(true, structured["listings"][0]["truncated"]);
+        assert_eq!(200, structured["listings"][0]["total_entries"]);
+        assert!(
+            structured["listings"][0]["entries"]
+                .as_array()
+                .is_some_and(|entries| entries.len() < 200)
+        );
+        let rendered = render_budgeted_get_summaries_text(&structured, None, true);
+        assert!(rendered.contains("Directory src/generated"), "{rendered}");
+        assert!(rendered.contains("of 200 entries"), "{rendered}");
+    }
 }
 
 fn shrink_compact_symbols_value_to_budget(mut structured: Value) -> Value {
@@ -820,19 +812,63 @@ fn shrink_compact_symbols_value_to_budget(mut structured: Value) -> Value {
     }
 }
 
-fn render_budgeted_get_summaries_text(structured: &Value, compact_text: Option<String>) -> String {
+fn shrink_get_summaries_value_to_budget(structured: Value) -> Value {
+    let mut structured = shrink_compact_symbols_value_to_budget(structured);
+    loop {
+        if serialized_json_len(&structured) <= GET_SUMMARIES_RESPONSE_BUDGET_BYTES {
+            return structured;
+        }
+        let Some(listings) = structured.get_mut("listings").and_then(Value::as_array_mut) else {
+            return structured;
+        };
+        let Some(index) = listings
+            .iter()
+            .enumerate()
+            .filter_map(|(index, listing)| {
+                let len = listing.get("entries")?.as_array()?.len();
+                (len > 0).then_some((index, len))
+            })
+            .max_by_key(|(_, len)| *len)
+            .map(|(index, _)| index)
+        else {
+            return structured;
+        };
+        let Some(listing) = listings[index].as_object_mut() else {
+            return structured;
+        };
+        if let Some(entries) = listing.get_mut("entries").and_then(Value::as_array_mut) {
+            entries.pop();
+        }
+        listing.insert("truncated".to_string(), json!(true));
+    }
+}
+
+fn render_budgeted_get_summaries_text(
+    structured: &Value,
+    compact_text: Option<String>,
+    render_line_numbers: bool,
+) -> String {
     let note = structured
         .get("degradation")
         .and_then(|value| value.get("message"))
         .and_then(Value::as_str)
         .map(|message| format!("Note: {message}"))
         .unwrap_or_default();
-    let compact_text = compact_text.unwrap_or_else(|| "No matching summaries found.".to_string());
-    let mut text = if note.is_empty() {
-        compact_text
-    } else {
-        format!("{note}\n\n{compact_text}")
-    };
+    let mut blocks = Vec::new();
+    if !note.is_empty() {
+        blocks.push(note);
+    }
+    if let Some(compact_text) = compact_text.filter(|text| !text.is_empty()) {
+        blocks.push(compact_text);
+    }
+    blocks.extend(render_container_listings_json(
+        structured,
+        render_line_numbers,
+    ));
+    if blocks.is_empty() {
+        blocks.push("No matching summaries found.".to_string());
+    }
+    let mut text = blocks.join("\n\n");
     if text.len() > GET_SUMMARIES_RESPONSE_BUDGET_BYTES {
         let suffix = "\n\n[truncated for MCP text budget; inspect structuredContent for full compact result]";
         let keep = GET_SUMMARIES_RESPONSE_BUDGET_BYTES.saturating_sub(suffix.len());
@@ -842,16 +878,96 @@ fn render_budgeted_get_summaries_text(structured: &Value, compact_text: Option<S
     text
 }
 
-fn render_non_degraded_get_summaries_text(
-    base_rendered_text: Option<String>,
-    compact_text: Option<String>,
-) -> String {
-    let base = base_rendered_text.unwrap_or_else(|| "No matching summaries found.".to_string());
-    match compact_text {
-        Some(compact) if base == "No matching summaries found." => compact,
-        Some(compact) => format!("{base}\n\n{compact}"),
-        None => base,
-    }
+fn render_container_listings_json(structured: &Value, render_line_numbers: bool) -> Vec<String> {
+    structured
+        .get("listings")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|listing| {
+            let target = listing.get("target")?.as_str()?;
+            let label = match listing.get("kind")?.as_str()? {
+                "directory" => "Directory",
+                "package" => "Package",
+                _ => return None,
+            };
+            let languages = listing
+                .get("languages")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            let language_suffix = if languages.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", languages.join(", "))
+            };
+            let mut lines = vec![format!("{label} {target}{language_suffix}")];
+            let entries = listing.get("entries")?.as_array()?;
+            lines.extend(entries.iter().filter_map(|entry| {
+                let kind = entry.get("kind")?.as_str()?;
+                match kind {
+                    "directory" => Some(format!("[directory] {}", entry.get("path")?.as_str()?)),
+                    "file" => Some(format!("[file] {}", entry.get("path")?.as_str()?)),
+                    "package" => {
+                        let languages = entry
+                            .get("languages")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>();
+                        let suffix = if languages.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; {}", languages.join(", "))
+                        };
+                        Some(format!(
+                            "[package{suffix}] {}",
+                            entry.get("qualified_name")?.as_str()?
+                        ))
+                    }
+                    "type" => {
+                        let path = entry.get("path")?.as_str()?;
+                        let location = if render_line_numbers {
+                            format!(
+                                "{path}:{}..{}",
+                                entry.get("start_line")?.as_u64()?,
+                                entry.get("end_line")?.as_u64()?
+                            )
+                        } else {
+                            path.to_string()
+                        };
+                        Some(format!(
+                            "[type; {}] {}: {location}",
+                            entry.get("language")?.as_str()?,
+                            entry.get("symbol")?.as_str()?
+                        ))
+                    }
+                    _ => None,
+                }
+            }));
+            if entries.is_empty() {
+                lines.push("(empty)".to_string());
+            }
+            if listing
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                lines.push(format!(
+                    "[showing {} of {} entries]",
+                    entries.len(),
+                    listing
+                        .get("total_entries")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(entries.len() as u64)
+                ));
+            }
+            Some(lines.join("\n"))
+        })
+        .collect()
 }
 
 fn rendered_text_for_output(output: &ToolOutput) -> Option<String> {
@@ -1002,7 +1118,7 @@ pub fn summaries_schema() -> Value {
             "targets": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Project-relative file paths, directory paths, glob patterns, class names, language import/package paths, or absolute paths/globs inside the active workspace. File and glob targets return detailed ranged summaries when they fit the response budget; oversized results are marked degraded and return compact_symbols declaration outlines. Directory targets and import/package paths (e.g. \"github.com/org/repo/internal/pkg\") return compact_symbols by design. Examples: \"src/auth/**/*.rs\", \"crates/polars-core/src/frame/**/*.rs\", \"MyClass\", \"github.com/cli/cli/v2/internal/skills/discovery\"."
+                "description": "Targets may be mixed in one call. Use a project-relative directory like an `ls`: it returns immediate child directories and git-visible files (tracked or unignored), including non-source files, without recursively flattening descendants; gitignored files are excluded. Use an OO namespace or language import/package path like a semantic `ls`: it returns direct child packages and top-level types declared in that exact package. A real filesystem directory wins if a target could mean either. Literal files, globs, and class/module symbols return ranged code summaries. Oversized ordinary summaries degrade to compact_symbols; oversized listings retain a total count and set truncated. Examples: \"src/auth\", \"com.example.auth\", \"github.com/cli/cli/v2/internal/skills/discovery\", \"src/auth/**/*.rs\", \"MyClass\"."
             }
         },
         "required": ["targets"]

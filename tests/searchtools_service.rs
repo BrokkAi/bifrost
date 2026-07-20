@@ -1125,21 +1125,21 @@ fn get_summaries_directory_target_stays_narrow_on_service_path() {
     let value: Value = serde_json::from_str(&payload).unwrap();
 
     assert!(
-        value["structured"].get("compact_symbols").is_some(),
-        "{value}"
+        value["structured"]["summaries"]
+            .as_array()
+            .unwrap()
+            .is_empty()
     );
-    assert_eq!(false, value["structured"]["degraded"], "{value}");
-    assert!(value["structured"]["degradation"].is_null(), "{value}");
     assert!(
         value["structured"]["not_found"]
             .as_array()
             .unwrap()
-            .iter()
-            .any(|item| item["input"] == "."),
-        "{value}"
+            .is_empty()
     );
+    assert_eq!("directory", value["structured"]["listings"][0]["kind"]);
+    assert_eq!(".", value["structured"]["listings"][0]["target"]);
     let rendered = value["rendered_text"].as_str().expect("rendered text");
-    assert!(rendered.contains("Not found: `.`"), "{rendered}");
+    assert!(rendered.contains("Directory ."), "{rendered}");
     assert!(rendered.contains("A.java"), "{rendered}");
 }
 
@@ -1160,17 +1160,12 @@ fn get_summaries_mixed_targets_stay_narrow_on_service_path() {
         value["structured"]["not_found"]
             .as_array()
             .unwrap()
-            .iter()
-            .any(|item| item["input"] == "."),
-        "{value}"
+            .is_empty()
     );
-    assert!(
-        value["structured"].get("compact_symbols").is_some(),
-        "{value}"
-    );
+    assert_eq!("directory", value["structured"]["listings"][0]["kind"]);
     let rendered = value["rendered_text"].as_str().expect("rendered text");
     assert!(rendered.contains("A.java"), "{rendered}");
-    assert!(rendered.contains("Not found: `.`"), "{rendered}");
+    assert!(rendered.contains("Directory ."), "{rendered}");
 }
 
 #[test]
@@ -4964,7 +4959,7 @@ fn scan_usages_location_recovers_lookup_only_local_assignment_property_reads() {
             r#"function selected(other) {
   const node = {};
   consume(node.operator);
-  node.operator = "=";
+  node.operator = normalize(node.operator);
   consume(node.operator);
   node.operator = "+";
   consume(other.operator);
@@ -5004,9 +4999,15 @@ function sibling() {
     assert_eq!("found", result["status"], "payload: {value}");
     assert_eq!("assignment.js#node.operator", result["symbol"], "{value}");
     assert_eq!(0, result["unproven_hits"], "payload: {value}");
-    assert_eq!(1, result["total_hits"], "payload: {value}");
+    assert_eq!(2, result["total_hits"], "payload: {value}");
     assert_eq!("assignment.js", result["files"][0]["path"], "{value}");
-    assert_eq!(5, result["files"][0]["hits"][0]["line"], "{value}");
+    let lines: BTreeSet<u64> = result["files"][0]["hits"]
+        .as_array()
+        .expect("hits array")
+        .iter()
+        .map(|hit| hit["line"].as_u64().expect("hit line"))
+        .collect();
+    assert_eq!(BTreeSet::from([4, 5]), lines, "payload: {value}");
 
     let unrelated_payload = service
         .call_tool_json(
