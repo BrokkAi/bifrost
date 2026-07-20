@@ -21,7 +21,10 @@
 //! `$`-encoded object). Receivers needing return-type inference (method chains)
 //! are an unhandled recall gap, not a wrong edge.
 
-use super::local::{ScalaLocalBinding, precise_scala_binding, seed_scala_binding};
+use super::local::{
+    ScalaLocalBinding, precise_scala_binding, seed_scala_binding,
+    seed_scala_binding_with_receiver_declaration,
+};
 use super::namespace::{
     ScalaDirectAncestorResolution, ScalaQualifiedTypeRootBinding, ScalaQualifiedTypeRootResolution,
     ScalaTypeNamespaceResolution, resolve_exact_lexical_type_namespace, scala_qualified_type_root,
@@ -1595,22 +1598,62 @@ impl ProjectTypes {
             return BareMemberResolution::Unresolved;
         }
 
+        self.effective_method_declarations_for_exact_owner_matching(scala, owner, member, call)
+    }
+
+    fn effective_method_declarations_for_exact_owner_with_shape(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+        member: &str,
+        call_shape: &ScalaCallSiteShape,
+    ) -> BareMemberResolution {
+        self.effective_method_declarations_for_exact_owner_matching(
+            scala,
+            owner,
+            member,
+            ScalaCallMatch::Shape(call_shape),
+        )
+    }
+
+    fn effective_method_declarations_for_exact_owner(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+        member: &str,
+        call_arities: Option<&[usize]>,
+    ) -> BareMemberResolution {
+        self.effective_method_declarations_for_exact_owner_matching(
+            scala,
+            owner,
+            member,
+            ScalaCallMatch::Arities(call_arities),
+        )
+    }
+
+    fn effective_method_declarations_for_exact_owner_matching(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+        member: &str,
+        call: ScalaCallMatch<'_>,
+    ) -> BareMemberResolution {
+        if !owner.is_class() {
+            return BareMemberResolution::NoMatch;
+        }
+
         let root_owner = owner.clone();
         let linearized = self.linearized_owners(scala, &root_owner);
         let mut abstract_trait_fallback = None;
         for owner in &linearized {
             if call.is_unapplied()
-                && self
-                    .exact_nested_object(scala, &owner.fq_name(), member)
-                    .is_some()
+                && !self
+                    .exact_nested_objects_for_owner(scala, owner, member)
+                    .is_empty()
             {
                 return BareMemberResolution::Unresolved;
             }
-            let members = self
-                .members_for_exact_owner_name(&owner.fq_name(), member)
-                .into_iter()
-                .filter(|unit| unit.source() == owner.source())
-                .collect::<Vec<_>>();
+            let members = self.members_for_exact_owner_unit(scala, owner, member);
             if members
                 .iter()
                 .any(|member| self.member_blocks_callable_lookup(scala, member))
@@ -1637,11 +1680,7 @@ impl ProjectTypes {
                     {
                         return true;
                     }
-                    let replica_members = self
-                        .members_for_exact_owner_name(&replica.fq_name(), member)
-                        .into_iter()
-                        .filter(|unit| unit.source() == replica.source())
-                        .collect::<Vec<_>>();
+                    let replica_members = self.members_for_exact_owner_unit(scala, replica, member);
                     if replica_members
                         .iter()
                         .any(|member| self.member_blocks_callable_lookup(scala, member))
@@ -5317,14 +5356,28 @@ fn record_reference(
                             .iter()
                             .map(|list| list.arity)
                             .collect::<Vec<_>>();
-                        match ctx
-                            .types
-                            .effective_method_declarations_for_owner_with_shape(
-                                ctx.scala,
-                                &owner,
-                                name,
-                                &call_shape,
-                            ) {
+                        let resolution = receiver_type_declaration(receiver, ctx, bindings)
+                            .map_or_else(
+                                || {
+                                    ctx.types
+                                        .effective_method_declarations_for_owner_with_shape(
+                                            ctx.scala,
+                                            &owner,
+                                            name,
+                                            &call_shape,
+                                        )
+                                },
+                                |exact_owner| {
+                                    ctx.types
+                                        .effective_method_declarations_for_exact_owner_with_shape(
+                                            ctx.scala,
+                                            &exact_owner,
+                                            name,
+                                            &call_shape,
+                                        )
+                                },
+                            );
+                        match resolution {
                             BareMemberResolution::Resolved(methods) => {
                                 for method in methods {
                                     ctx.record(method.fq_name(), field);
@@ -5416,14 +5469,25 @@ fn record_reference(
                 return;
             };
             let call_arities = call_arities_for_reference(operator);
-            if let BareMemberResolution::Resolved(methods) =
-                ctx.types.effective_method_declarations_for_owner(
-                    ctx.scala,
-                    &owner,
-                    member,
-                    call_arities.as_deref(),
-                )
-            {
+            let resolution = receiver_type_declaration(receiver, ctx, bindings).map_or_else(
+                || {
+                    ctx.types.effective_method_declarations_for_owner(
+                        ctx.scala,
+                        &owner,
+                        member,
+                        call_arities.as_deref(),
+                    )
+                },
+                |exact_owner| {
+                    ctx.types.effective_method_declarations_for_exact_owner(
+                        ctx.scala,
+                        &exact_owner,
+                        member,
+                        call_arities.as_deref(),
+                    )
+                },
+            );
+            if let BareMemberResolution::Resolved(methods) = resolution {
                 for method in methods {
                     ctx.record(method.fq_name(), operator);
                 }
@@ -6220,6 +6284,21 @@ fn template_supertype_owners(
 
 /// The fqn of a receiver expression's type, for the shapes that resolve without
 /// return-type inference.
+fn receiver_type_declaration(
+    receiver: Node<'_>,
+    ctx: &ScalaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
+) -> Option<CodeUnit> {
+    if receiver.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(receiver, ctx.source);
+    if name == "this" {
+        return ctx.enclosing_class_unit(receiver.start_byte()).cloned();
+    }
+    precise_scala_binding(bindings, name).and_then(|binding| binding.receiver_declaration)
+}
+
 fn receiver_type_fqn(
     receiver: Node<'_>,
     ctx: &ScalaScan<'_, '_>,
@@ -6336,16 +6415,24 @@ fn refresh_assignment_binding(
     }
     let declaration_owner =
         precise_scala_binding(bindings, name).and_then(|binding| binding.declaration_owner);
+    let source_binding = matches!(right.kind(), "identifier" | "operator_identifier")
+        .then(|| precise_scala_binding(bindings, node_text(right, ctx.source).trim()))
+        .flatten();
+    if let Some(receiver_declaration) = source_binding
+        .as_ref()
+        .and_then(|binding| binding.receiver_declaration.clone())
+    {
+        seed_scala_binding_with_receiver_declaration(
+            name,
+            receiver_declaration,
+            declaration_owner,
+            bindings,
+        );
+        return;
+    }
     let receiver_type = constructed_or_applied_type(right, ctx)
         .or_else(|| call_result_type(right, ctx, bindings))
-        .or_else(|| {
-            matches!(right.kind(), "identifier" | "operator_identifier")
-                .then(|| {
-                    precise_scala_binding(bindings, node_text(right, ctx.source).trim())
-                        .and_then(|binding| binding.receiver_type)
-                })
-                .flatten()
-        });
+        .or_else(|| source_binding.and_then(|binding| binding.receiver_type));
     seed_scala_binding(name, receiver_type, declaration_owner, bindings);
 }
 
@@ -6440,6 +6527,18 @@ fn seed_parameter(
     if binding_name.is_empty() {
         return;
     }
+    if let Some(receiver_declaration) = parameter
+        .child_by_field_name("type")
+        .and_then(|type_node| resolve_receiver_type_declaration_node(type_node, ctx))
+    {
+        seed_scala_binding_with_receiver_declaration(
+            binding_name,
+            receiver_declaration,
+            declaration_owner,
+            bindings,
+        );
+        return;
+    }
     let resolved = parameter
         .child_by_field_name("type")
         .and_then(|type_node| resolve_receiver_type_node(type_node, ctx));
@@ -6509,8 +6608,12 @@ fn seed_value_definition_with_owner(
 ) {
     // Prefer the declared type; otherwise infer from a `new Foo()` initializer
     // or a call with a declared factory return.
+    let receiver_declaration = node
+        .child_by_field_name("type")
+        .and_then(|type_node| resolve_receiver_type_declaration_node(type_node, ctx));
     let resolved = node
         .child_by_field_name("type")
+        .filter(|_| receiver_declaration.is_none())
         .and_then(|type_node| resolve_receiver_type_node(type_node, ctx))
         .or_else(|| {
             node.child_by_field_name("value")
@@ -6524,7 +6627,16 @@ fn seed_value_definition_with_owner(
         return;
     };
     for name in scala_pattern_binder_names(pattern, ctx.source) {
-        seed_binding(name, resolved.clone(), declaration_owner.clone(), bindings);
+        if let Some(receiver_declaration) = receiver_declaration.clone() {
+            seed_scala_binding_with_receiver_declaration(
+                name,
+                receiver_declaration,
+                declaration_owner.clone(),
+                bindings,
+            );
+        } else {
+            seed_binding(name, resolved.clone(), declaration_owner.clone(), bindings);
+        }
     }
 }
 
@@ -6764,6 +6876,18 @@ fn resolve_receiver_type_node(type_node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> O
                 .then(|| scala_builtin_type_name(&path[0]).map(str::to_string))
                 .flatten()
         })
+}
+
+fn resolve_receiver_type_declaration_node(
+    type_node: Node<'_>,
+    ctx: &ScalaScan<'_, '_>,
+) -> Option<CodeUnit> {
+    match ctx.exact_lexically_visible_type(type_node) {
+        ScalaTypeNamespaceResolution::Resolved(declaration) => Some(declaration),
+        ScalaTypeNamespaceResolution::AuthoritativeMiss
+        | ScalaTypeNamespaceResolution::Ambiguous
+        | ScalaTypeNamespaceResolution::NoMatch => None,
+    }
 }
 
 fn visible_extensions(

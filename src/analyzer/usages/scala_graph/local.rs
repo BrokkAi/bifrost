@@ -10,6 +10,14 @@ use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(in crate::analyzer::usages) struct ScalaLocalBinding {
     pub(in crate::analyzer::usages) receiver_type: Option<String>,
+    /// Parser-proven physical declaration for `receiver_type`, when the type
+    /// name resolved in this binding's lexical declaration context.
+    ///
+    /// Keeping this beside the logical FQN lets member dispatch remain exact
+    /// when a workspace contains multiple source replicas with the same FQN.
+    /// Bindings inferred only from logical return types intentionally leave it
+    /// absent so those ambiguous lookups continue to fail closed.
+    pub(in crate::analyzer::usages) receiver_declaration: Option<CodeUnit>,
     pub(in crate::analyzer::usages) declaration_owner: Option<CodeUnit>,
 }
 
@@ -27,6 +35,23 @@ pub(in crate::analyzer::usages) fn seed_scala_binding(
         name.to_string(),
         ScalaLocalBinding {
             receiver_type,
+            receiver_declaration: None,
+            declaration_owner,
+        },
+    );
+}
+
+pub(in crate::analyzer::usages) fn seed_scala_binding_with_receiver_declaration(
+    name: &str,
+    receiver_declaration: CodeUnit,
+    declaration_owner: Option<CodeUnit>,
+    bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
+) {
+    bindings.seed_symbol(
+        name.to_string(),
+        ScalaLocalBinding {
+            receiver_type: Some(receiver_declaration.fq_name()),
+            receiver_declaration: Some(receiver_declaration),
             declaration_owner,
         },
     );

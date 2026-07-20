@@ -14,6 +14,7 @@ use crate::analyzer::usages::scala_graph::hits::{
 };
 use crate::analyzer::usages::scala_graph::local::{
     ScalaLocalBinding, precise_scala_binding, seed_scala_binding,
+    seed_scala_binding_with_receiver_declaration,
 };
 use crate::analyzer::usages::scala_graph::namespace::{
     ScalaTypeNamespaceResolution, scala_qualified_type_root, scala_type_reference_is_singleton,
@@ -611,14 +612,29 @@ fn seed_owner_field_definition(node: Node<'_>, owner: &CodeUnit, ctx: &mut ScanC
     let Some(pattern) = node.child_by_field_name("pattern") else {
         return;
     };
-    let receiver_type = value_definition_receiver_type(node, ctx);
+    let receiver_declaration = node
+        .child_by_field_name("type")
+        .and_then(|type_node| resolve_type_declaration_node(type_node, ctx));
+    let receiver_type = receiver_declaration
+        .is_none()
+        .then(|| value_definition_receiver_type(node, ctx))
+        .flatten();
     for name in scala_pattern_binder_names(pattern, ctx.source) {
-        seed_scala_binding(
-            name,
-            receiver_type.clone(),
-            Some(owner.clone()),
-            ctx.bindings,
-        );
+        if let Some(receiver_declaration) = receiver_declaration.clone() {
+            seed_scala_binding_with_receiver_declaration(
+                name,
+                receiver_declaration,
+                Some(owner.clone()),
+                ctx.bindings,
+            );
+        } else {
+            seed_scala_binding(
+                name,
+                receiver_type.clone(),
+                Some(owner.clone()),
+                ctx.bindings,
+            );
+        }
     }
 }
 
@@ -681,6 +697,18 @@ fn seed_class_parameter_bindings(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             if class_parameter_is_field(parameter)
                 && let Some(owner) = enclosing_owner.as_ref()
             {
+                if let Some(receiver_declaration) = parameter
+                    .child_by_field_name("type")
+                    .and_then(|type_node| resolve_type_declaration_node(type_node, ctx))
+                {
+                    seed_scala_binding_with_receiver_declaration(
+                        name,
+                        receiver_declaration,
+                        Some(owner.clone()),
+                        ctx.bindings,
+                    );
+                    continue;
+                }
                 let receiver_type = parameter
                     .child_by_field_name("type")
                     .and_then(|type_node| resolve_type_node(type_node, ctx));
@@ -732,12 +760,19 @@ fn seed_parameter(parameter: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 name.to_string(),
                 owners.into_iter().map(|receiver_type| ScalaLocalBinding {
                     receiver_type: Some(receiver_type),
+                    receiver_declaration: None,
                     declaration_owner: None,
                 }),
             );
         } else {
             ctx.bindings.declare_shadow(name.to_string());
         }
+        return;
+    }
+    if let Some(owner) =
+        type_node.and_then(|type_node| resolve_type_declaration_node(type_node, ctx))
+    {
+        seed_scala_binding_with_receiver_declaration(name, owner, None, ctx.bindings);
         return;
     }
     if let Some(owner) = type_node.and_then(|type_node| resolve_type_node(type_node, ctx)) {
@@ -753,6 +788,20 @@ fn seed_value_definition(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         seed_value_definition_from_text(node_text(node, ctx.source), ctx);
         return;
     };
+    if let Some(receiver_declaration) = node
+        .child_by_field_name("type")
+        .and_then(|type_node| resolve_type_declaration_node(type_node, ctx))
+    {
+        for name in scala_pattern_binder_names(pattern, ctx.source) {
+            seed_scala_binding_with_receiver_declaration(
+                name,
+                receiver_declaration.clone(),
+                None,
+                ctx.bindings,
+            );
+        }
+        return;
+    }
     let receiver_type = value_definition_receiver_type(node, ctx);
     if receiver_type.is_none() {
         seed_value_definition_from_text(node_text(node, ctx.source), ctx);
@@ -867,6 +916,15 @@ fn resolve_type_node(type_node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
         })
 }
 
+fn resolve_type_declaration_node(type_node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
+    match exact_lexically_visible_type(type_node, ctx) {
+        ScalaTypeNamespaceResolution::Resolved(declaration) => Some(declaration),
+        ScalaTypeNamespaceResolution::AuthoritativeMiss
+        | ScalaTypeNamespaceResolution::Ambiguous
+        | ScalaTypeNamespaceResolution::NoMatch => None,
+    }
+}
+
 fn refresh_assignment_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let (Some(left), Some(right)) = (
         node.child_by_field_name("left"),
@@ -895,7 +953,16 @@ fn refresh_assignment_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         if !source_name.is_empty()
             && let Some(source) = precise_scala_binding(ctx.bindings, source_name)
         {
-            seed_scala_binding(name, source.receiver_type, declaration_owner, ctx.bindings);
+            if let Some(receiver_declaration) = source.receiver_declaration {
+                seed_scala_binding_with_receiver_declaration(
+                    name,
+                    receiver_declaration,
+                    declaration_owner,
+                    ctx.bindings,
+                );
+            } else {
+                seed_scala_binding(name, source.receiver_type, declaration_owner, ctx.bindings);
+            }
             return;
         }
     }
@@ -1786,6 +1853,26 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
         if !member_call_shape_matches(call_shape.as_ref(), ScalaCallableSiteRole::Ordinary, ctx) {
             return false;
         }
+        if let Some(owner) = structured_receiver_declaration(qualifier_node, ctx) {
+            let resolution = call_shape.as_ref().map_or_else(
+                || {
+                    ctx.types
+                        .ordinary_class_member_declarations_for_owner(ctx.scala, &owner, text, None)
+                },
+                |shape| {
+                    ctx.types
+                        .ordinary_class_member_declarations_for_owner_with_shape(
+                            ctx.scala, &owner, text, shape,
+                        )
+                },
+            );
+            return match resolution {
+                BareMemberResolution::Resolved(methods) => {
+                    methods_match_target_owner(&methods, ctx)
+                }
+                BareMemberResolution::NoMatch | BareMemberResolution::Unresolved => false,
+            };
+        }
         return call_shape.as_ref().map_or_else(
             || ordinary_class_owner_matches_target(&owner_fq_name, text, None, ctx),
             |shape| {
@@ -2480,6 +2567,20 @@ fn structured_receiver_type(receiver: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Str
         }),
         "call_expression" => call_initializer_return_owner(receiver, ctx),
         kind => scala_literal_type_name(kind).map(str::to_string),
+    }
+}
+
+fn structured_receiver_declaration(receiver: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
+    match receiver.kind() {
+        "identifier" => {
+            let name = node_text(receiver, ctx.source).trim();
+            if name == "this" {
+                return enclosing_owner(receiver, ctx);
+            }
+            precise_scala_binding(ctx.bindings, name)
+                .and_then(|binding| binding.receiver_declaration)
+        }
+        _ => None,
     }
 }
 

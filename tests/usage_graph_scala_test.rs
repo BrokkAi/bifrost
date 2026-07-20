@@ -370,6 +370,60 @@ object Ambiguous {
 }
 
 #[test]
+fn scala_inverted_typed_receivers_keep_exact_physical_owner_identity() {
+    let replica = |platform: &str, argument_type: &str, argument: &str| {
+        format!(
+            r#"package replica
+object RedBlackTree {{
+  final class Tree {{
+    def blackWithLeft(value: {argument_type}): Tree = this
+  }}
+  def {platform}Balance(tree: Tree): Tree = tree.blackWithLeft({argument})
+}}
+"#
+        )
+    };
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("jvm/replica/RedBlackTree.scala", replica("jvm", "Int", "1"))
+        .file(
+            "js/replica/RedBlackTree.scala",
+            replica("js", "String", "\"left\""),
+        )
+        .file(
+            "native/replica/RedBlackTree.scala",
+            replica("native", "Boolean", "true"),
+        )
+        .file(
+            "consumer/Ambiguous.scala",
+            r#"package consumer
+import replica.RedBlackTree.Tree
+object Ambiguous {
+  def balance(tree: Tree): Tree = tree.blackWithLeft(1)
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+    let callee = "replica.RedBlackTree$.Tree.blackWithLeft";
+    for caller in [
+        "replica.RedBlackTree$.jvmBalance",
+        "replica.RedBlackTree$.jsBalance",
+        "replica.RedBlackTree$.nativeBalance",
+    ] {
+        assert!(
+            has_edge(&value, caller, callee),
+            "exact physical receiver did not select its member for {caller}: {}",
+            value["edges"]
+        );
+    }
+    assert!(
+        !has_edge(&value, "consumer.Ambiguous$.balance", callee),
+        "an imported logical receiver with three physical declarations selected a replica: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn scala_inverted_typed_pattern_binders_activate_for_guard_and_body_only() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

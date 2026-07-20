@@ -8033,6 +8033,63 @@ class External extends Base {
 }
 
 #[test]
+fn scala_targeted_usage_keeps_typed_receivers_on_exact_physical_owner() {
+    let replica = |platform: &str, argument_type: &str, argument: &str| {
+        format!(
+            r#"package replica
+object RedBlackTree {{
+  final class Tree {{
+    def blackWithLeft(value: {argument_type}): Tree = this
+  }}
+  def balance(tree: Tree): Tree =
+    tree.blackWithLeft({argument}) // {platform}-exact-receiver
+}}
+"#
+        )
+    };
+    let jvm = replica("jvm", "Int", "1");
+    let js = replica("js", "String", "\"left\"");
+    let native = replica("native", "Boolean", "true");
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("jvm/replica/RedBlackTree.scala", &jvm),
+        ("js/replica/RedBlackTree.scala", &js),
+        ("native/replica/RedBlackTree.scala", &native),
+        (
+            "consumer/Ambiguous.scala",
+            r#"package consumer
+import replica.RedBlackTree.Tree
+object Ambiguous {
+  def balance(tree: Tree): Tree =
+    tree.blackWithLeft(1) // ambiguous-logical-receiver
+}
+"#,
+        ),
+    ]);
+
+    let fqn = "replica.RedBlackTree$.Tree.blackWithLeft";
+    for (platform, path) in [
+        ("jvm", "jvm/replica/RedBlackTree.scala"),
+        ("js", "js/replica/RedBlackTree.scala"),
+        ("native", "native/replica/RedBlackTree.scala"),
+    ] {
+        let target = analyzer
+            .get_definitions(fqn)
+            .into_iter()
+            .find(|unit| rel_path_string(unit.source()) == path)
+            .unwrap_or_else(|| panic!("missing {path} physical {fqn}"));
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        assert_hit_contains(&target_hits, &format!("{platform}-exact-receiver"));
+        for other in ["jvm", "js", "native"] {
+            if other != platform {
+                assert_no_hit_contains(&target_hits, &format!("{other}-exact-receiver"));
+            }
+        }
+        assert_no_hit_contains(&target_hits, "ambiguous-logical-receiver");
+    }
+}
+
+#[test]
 fn scala_usage_finder_handles_generic_companion_enum_roots_and_convergent_diamonds() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "app/Model.scala",
