@@ -5015,7 +5015,13 @@ fn method_value_parameter_types_match(
         return false;
     };
     let Some(list_index) = next_explicit_parameter_list_index(&alternative.shape, actual) else {
-        return false;
+        // A call that has consumed every explicit parameter list can itself
+        // produce a function value. The surrounding expected function shape
+        // then describes the return value, not another curried parameter list,
+        // so it must not reject an otherwise applicable callable. When an
+        // explicit list remains, the same shape continues to disambiguate a
+        // genuine partial application below.
+        return true;
     };
     let Some(declared) = alternative.parameter_types.get(list_index) else {
         return false;
@@ -7868,6 +7874,20 @@ fn record_qualified_stable_reference(
         return reference.role == ScalaQualifiedStableTypeRole::Type
             && !is_terminal_stable_field_reference(node);
     }
+    // In a qualified extractor such as `Domain.Continuous(value)`, the stable
+    // enum/type root is an independently meaningful reference in addition to
+    // the terminal extractor. Preserve the complete parser expression as the
+    // hit range so exact forward sites covering the qualified extractor round
+    // trip, while the resolver's exact-unit requirement keeps physical
+    // replicas ambiguous.
+    if reference.role == ScalaQualifiedStableTypeRole::Extractor
+        && reference.segments.len() > 1
+        && let Some(root) = reference.segments.first()
+        && let Some(target) = ctx.resolver.resolve_unit(root)
+        && ctx.types.type_is_stable_owner(ctx.scala, &target)
+    {
+        ctx.record_exact(target, ScalaReferenceRole::Type, reference.expression);
+    }
     let lexical_object_root = reference
         .segments
         .first()
@@ -9114,6 +9134,7 @@ fn constructed_or_applied_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Optio
             while function.kind() == "call_expression" {
                 function = function.child_by_field_name("function")?;
             }
+            function = invocation_function_reference(function);
             if !matches!(function.kind(), "identifier" | "type_identifier") {
                 return None;
             }

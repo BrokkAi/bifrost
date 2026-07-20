@@ -5553,6 +5553,142 @@ object Use extends Parent {
 }
 
 #[test]
+fn scala_file_major_scan_preserves_production_parity_event_shapes() {
+    let source = r#"package parity
+
+object Duration {
+  enum Units { case Days, Weeks }
+}
+import Duration.Units.*
+extension (value: Int) def week: Int = value + Weeks.ordinal // positive-nested-field
+
+object Ansi {
+  extension (value: String) def cyan: String = value
+}
+
+object Result {
+  def panic[E, A](value: Throwable): Either[E, A] = throw value
+}
+
+enum Domain { case Continuous(value: Double) }
+final case class Present(value: Domain)
+
+final class TestInboxImpl[T](val ref: T)
+object TestInboxImpl {
+  def apply[T](name: String): TestInboxImpl[T] = new TestInboxImpl[T](null.asInstanceOf[T])
+}
+
+final class NoArgTest
+final class OneArgTest
+trait Suite { protected def withFixture(value: NoArgTest, config: Int): Int }
+trait FixtureSuite extends Suite { protected def withFixture(value: OneArgTest): Int }
+
+trait Frame
+given Frame = new Frame {}
+
+import Ansi.*
+private def topLevelExtension: String = s"${"value".cyan}" // positive-interpolated-extension
+
+abstract class Use extends FixtureSuite {
+  import Ansi.*
+
+  private def consume(value: String => String): String = value("input")
+  private def consumeLines(stream: String, value: String => Unit)(onFailure: String => Unit)(using Frame): Unit = value(stream)
+  private def withOutputStream(metadata: Int)(value: String => Unit): Int = { value(metadata.toString); metadata }
+  private def elementProbeFailure(selector: String, message: String)(using Frame): String => String = value => selector + message + value
+  private def resolveVariantWire[A](schema: A)(using Frame): String => String = identity
+  private def processPullLine(line: String, image: String)(using Frame): Unit = ()
+  private def serialize(stream: String, value: Int): Unit = ()
+
+  val ordinary = consume(elementProbeFailure("selector", "message")) // positive-ordinary-call
+  val resolver = consume(resolveVariantWire("schema")) // positive-returning-function-call
+  val process = consumeLines("bytes", processPullLine(_, "image"))(identity) // positive-placeholder-partial
+  val serializer = withOutputStream(1)(serialize(_, 1)) // positive-placeholder-second
+  val inherited = withFixture(new OneArgTest) // positive-inherited-overload
+  val qualified = Result.panic[Nothing, Nothing](new RuntimeException) // positive-qualified-singleton-call
+  val extracted = Present(Domain.Continuous(1.0)) match {
+    case Present(Domain.Continuous(value)) => value // positive-extractor-root
+  }
+  def genericFactory[T]: T = {
+    val replyToInbox = TestInboxImpl[T]("replyTo")
+    replyToInbox.ref // positive-generic-factory-field
+  }
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("parity/Use.scala", source)]);
+
+    let mut missing = Vec::new();
+    for (target_fqn, marker) in [
+        ("parity.Duration$.Units$.Weeks", "positive-nested-field"),
+        ("parity.Use.elementProbeFailure", "positive-ordinary-call"),
+        (
+            "parity.Use.resolveVariantWire",
+            "positive-returning-function-call",
+        ),
+        ("parity.Use.processPullLine", "positive-placeholder-partial"),
+        ("parity.Use.serialize", "positive-placeholder-second"),
+        (
+            "parity.FixtureSuite.withFixture",
+            "positive-inherited-overload",
+        ),
+        ("parity.Ansi$.cyan", "positive-interpolated-extension"),
+        ("parity.Result$.panic", "positive-qualified-singleton-call"),
+        ("parity.Domain", "positive-extractor-root"),
+        ("parity.TestInboxImpl.ref", "positive-generic-factory-field"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        if !target_hits.iter().any(|hit| hit.snippet.contains(marker)) {
+            missing.push((target_fqn, marker, target_hits));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "missing production parity events: {missing:#?}"
+    );
+}
+
+#[test]
+fn scala_file_major_parity_callable_negatives_fail_closed() {
+    let source = r#"package paritynegative
+
+final class NoArgTest
+final class OneArgTest
+
+trait Suite { protected def withFixture(value: NoArgTest, config: Int): Int }
+trait FixtureSuite extends Suite { protected def withFixture(value: OneArgTest): Int }
+
+object Sibling {
+  def elementProbeFailure(selector: String, message: String): String = selector + message
+  val unrelated = elementProbeFailure("selector", "message") // negative-sibling-owner
+}
+
+abstract class Use extends FixtureSuite {
+  private def elementProbeFailure(selector: String, message: String): String = selector + message
+  val positive = elementProbeFailure("selector", "message") // positive-exact-owner
+  val wrongShape = elementProbeFailure("selector") // negative-wrong-call-shape
+  val inherited = withFixture(new OneArgTest) // positive-inherited-overload
+  val inheritedOther = withFixture(new NoArgTest, 1) // negative-inherited-overload
+}
+"#;
+    let (_project, analyzer) = scala_analyzer_with_files(&[("paritynegative/Use.scala", source)]);
+
+    let element = definition(&analyzer, "paritynegative.Use.elementProbeFailure");
+    let element_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&element)));
+    assert_hit_contains(&element_hits, "positive-exact-owner");
+    assert_no_hit_contains(&element_hits, "negative-wrong-call-shape");
+    assert_no_hit_contains(&element_hits, "negative-sibling-owner");
+
+    let inherited = definition(&analyzer, "paritynegative.FixtureSuite.withFixture");
+    let inherited_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&inherited)));
+    assert_hit_contains(&inherited_hits, "positive-inherited-overload");
+    assert_no_hit_contains(&inherited_hits, "negative-inherited-overload");
+}
+
+#[test]
 fn scala_unqualified_calls_resolve_through_lexical_owner_tiers() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "app/Owners.scala",

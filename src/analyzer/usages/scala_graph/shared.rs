@@ -632,12 +632,26 @@ impl ScalaReferenceSink for ScalaQueryHitSink<'_> {
         start: usize,
         end: usize,
     ) {
+        // An event for the queried physical callable has already passed the
+        // scanner's structured owner, overload, inheritance, extension, and
+        // complete call-shape resolution. Reapplying the query target's
+        // flattened shape loses contextual and placeholder method values.
+        // Exact descendant/override projections still need the secondary
+        // target filter: their event unit differs from the queried ancestor,
+        // and one physical override CodeUnit can represent several shapes.
+        let exact_target = match &target {
+            ScalaResolvedReference::Exact(unit) => Some(unit),
+            ScalaResolvedReference::Logical(_) => None,
+        };
         let target_ids = self
             .catalog
             .target_ids(&target, ScalaReferenceRole::Callable)
             .iter()
             .copied()
             .filter(|target_id| {
+                if exact_target.is_some_and(|unit| &self.catalog.targets[*target_id] == unit) {
+                    return true;
+                }
                 let spec = &self.catalog.specs[*target_id];
                 if spec.kind != TargetKind::Method || spec.callable_alternatives.is_empty() {
                     return true;
