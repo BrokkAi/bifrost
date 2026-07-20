@@ -117,6 +117,10 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if *ctx.limit_exceeded {
         return;
     }
+    if node.kind() == "try_with_resources_statement" {
+        scan_try_with_resources(node, ctx);
+        return;
+    }
     let enters_class_scope = node.kind() == "class_body";
     let enters_scope = enters_class_scope
         || matches!(
@@ -159,6 +163,44 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     if enters_scope {
         ctx.bindings.exit_scope();
+    }
+}
+
+fn scan_try_with_resources(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    ctx.bindings.enter_scope();
+    if let Some(resources) = node.child_by_field_name("resources") {
+        let mut cursor = resources.walk();
+        for resource in resources.named_children(&mut cursor) {
+            scan_node(resource, ctx);
+            if *ctx.limit_exceeded {
+                break;
+            }
+            if resource.kind() == "resource" {
+                seed_typed_binding(resource, ctx);
+            }
+        }
+    }
+    if !*ctx.limit_exceeded
+        && let Some(body) = node.child_by_field_name("body")
+    {
+        scan_node(body, ctx);
+    }
+    ctx.bindings.exit_scope();
+
+    if *ctx.limit_exceeded {
+        return;
+    }
+    let resources = node.child_by_field_name("resources");
+    let body = node.child_by_field_name("body");
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if Some(child) == resources || Some(child) == body {
+            continue;
+        }
+        scan_node(child, ctx);
+        if *ctx.limit_exceeded {
+            break;
+        }
     }
 }
 

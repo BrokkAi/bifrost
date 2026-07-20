@@ -10936,6 +10936,61 @@ public class UseTarget {
 }
 
 #[test]
+fn java_try_resource_receiver_shadows_same_named_imported_type() {
+    let source = r#"
+package app;
+
+import other.Indexer;
+
+public class SentenceSourceIndexer implements AutoCloseable {
+    private Indexer indexer;
+
+    public void execute() throws Exception {
+        try (SentenceSourceIndexer indexer = new SentenceSourceIndexer()) {
+            indexer.run(); // resource-receiver
+        }
+        indexer.run(); // field-receiver-after-try
+    }
+
+    public void run() {}
+    public void close() {}
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "other/Indexer.java",
+            "package other; public class Indexer { public void run() {} }\n",
+        )
+        .file("app/SentenceSourceIndexer.java", source)
+        .build();
+
+    for (marker, expected) in [
+        (
+            "indexer.run(); // resource-receiver",
+            "app.SentenceSourceIndexer.run",
+        ),
+        (
+            "indexer.run(); // field-receiver-after-try",
+            "other.Indexer.run",
+        ),
+    ] {
+        let start = source.find(marker).expect("receiver marker") + marker.find("run").unwrap();
+        let value = lookup(
+            project.root(),
+            &location_reference("app/SentenceSourceIndexer.java", source, start),
+        );
+        assert_eq!(
+            value["results"][0]["status"], "resolved",
+            "{marker}: {value}"
+        );
+        assert_eq!(
+            value["results"][0]["definitions"][0]["fqn"], expected,
+            "{marker}: {value}"
+        );
+    }
+}
+
+#[test]
 fn java_lombok_data_getter_resolves_to_backing_field() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

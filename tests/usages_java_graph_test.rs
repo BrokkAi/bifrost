@@ -4108,6 +4108,59 @@ public class JavaConsumer {
 }
 
 #[test]
+fn java_graph_strategy_types_try_resource_receivers_without_leaking_the_binding() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "other/Indexer.java",
+            "package other; public class Indexer { public void run() {} }\n",
+        ),
+        (
+            "app/SentenceSourceIndexer.java",
+            r#"
+package app;
+
+import other.Indexer;
+
+public class SentenceSourceIndexer implements AutoCloseable {
+    private Indexer indexer;
+
+    public void execute() throws Exception {
+        try (SentenceSourceIndexer indexer = new SentenceSourceIndexer()) {
+            indexer.run(); // resource-receiver
+        }
+        indexer.run(); // field-receiver-after-try
+    }
+
+    public void run() {}
+    public void close() {}
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let local_run = definition(&analyzer, "app.SentenceSourceIndexer.run");
+    let local_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&local_run),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&local_hits, "resource-receiver");
+    assert_no_hit_contains(&local_hits, "field-receiver-after-try");
+
+    let imported_run = definition(&analyzer, "other.Indexer.run");
+    let imported_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&imported_run),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&imported_hits, "field-receiver-after-try");
+    assert_no_hit_contains(&imported_hits, "resource-receiver");
+}
+
+#[test]
 fn java_graph_strategy_maps_lombok_accessor_usages_back_to_fields() {
     let (_project, analyzer) = java_analyzer_with_files(&[
         (
