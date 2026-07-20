@@ -3,7 +3,7 @@ name = "brokk-bifrost"
 # Single source of truth for both the crate and the Python wheel. The Python
 # package (`brokk-bifrost-searchtools`) inherits this version via maturin's
 # `dynamic = ["version"]` in pyproject.toml — keep it here, nowhere else.
-version = "0.8.4"
+version = "0.8.5"
 edition = "2024"
 description = "Tree-sitter-backed multi-language code analyzer with bundled LSP and MCP search-tool servers. Powers Brokk's `bifrost` binary."
 license = "LGPL-3.0-or-later"

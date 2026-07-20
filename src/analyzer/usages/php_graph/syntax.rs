@@ -84,6 +84,36 @@ pub(in crate::analyzer::usages) fn static_member_parts(
     Some((scope, name))
 }
 
+/// Resolve the class named by a PHP static scope. Unlike ordinary type syntax,
+/// `self`, `static`, and `parent` are relative to the lexically enclosing class.
+/// Keep that interpretation shared by the targeted and inverted usage walkers
+/// so return-type inference for assignments follows the same owner semantics as
+/// the static call edge itself.
+pub(in crate::analyzer::usages) fn static_scope_type_fq_name(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    raw: &str,
+    ctx: &crate::analyzer::PhpFileContext,
+    enclosing_owner: Option<&str>,
+) -> Option<String> {
+    match raw {
+        "self" | "static" => enclosing_owner.map(str::to_string),
+        "parent" => {
+            let enclosing_owner = enclosing_owner?;
+            let mut definitions = analyzer
+                .definitions(enclosing_owner)
+                .filter(CodeUnit::is_class);
+            let enclosing_class = definitions.next()?;
+            if definitions.next().is_some() {
+                return None;
+            }
+            php.direct_declared_class_parent(&enclosing_class)
+                .map(|parent| parent.fq_name())
+        }
+        _ => resolve_php_type(raw, ctx),
+    }
+}
+
 pub(in crate::analyzer::usages) fn variable_identifier<'a>(
     node: Node<'_>,
     source: &'a str,

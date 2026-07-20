@@ -22,8 +22,9 @@ use crate::analyzer::usages::{
     ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitKind, UsageHitSurface,
 };
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, DeclarationKind, GO_MODULE_SCOPE_SEGMENT, GoModuleRoot, IAnalyzer,
-    Language, ProjectFile, Range, SummaryFileProjection, go_module_roots,
+    AnalyzerDefinitionLookup, BoundedDefinitionLookup, CodeUnit, CodeUnitType, DeclarationKind,
+    GO_MODULE_SCOPE_SEGMENT, GoModuleRoot, IAnalyzer, Language, ProjectFile, Range,
+    SummaryFileProjection, go_module_roots,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::lsp::conversion::percent_decode;
@@ -4076,29 +4077,50 @@ fn resolve_scan_usages_target(
 
     let range_context = DeclarationNameRangeContext::new(&file, source);
 
-    let matching_units: Vec<(CodeUnit, usize)> = declarations_in_file(analyzer, &file)
-        .into_iter()
-        .filter_map(|unit| {
-            let selector_matches = selector.is_some_and(|symbol| {
-                unit.fq_name() == symbol
-                    || definition_selector(&unit) == symbol
-                    || display_symbol_for_target(&unit) == symbol
-            });
-            let ranges = if selector_matches && unit.is_module() {
-                analyzer.ranges_of(&unit)
-            } else if selector_matches || selector.is_none() {
-                range_context.name_ranges(analyzer, &unit)
-            } else {
-                return None;
-            };
-            let best_span = ranges
-                .into_iter()
-                .filter(|range| scan_usages_target_matches_range(selection, *range))
-                .map(|range| range.end_byte.saturating_sub(range.start_byte))
-                .min()?;
-            Some((unit, best_span))
-        })
-        .collect();
+    let matching_location_units = |units: Vec<CodeUnit>| {
+        units
+            .into_iter()
+            .filter_map(|unit| {
+                let selector_matches = selector.is_some_and(|symbol| {
+                    unit.fq_name() == symbol
+                        || definition_selector(&unit) == symbol
+                        || display_symbol_for_target(&unit) == symbol
+                });
+                let ranges = if selector_matches && unit.is_module() {
+                    analyzer.ranges_of(&unit)
+                } else if selector_matches || selector.is_none() {
+                    range_context.name_ranges(analyzer, &unit)
+                } else {
+                    return None;
+                };
+                let best_span = ranges
+                    .into_iter()
+                    .filter(|range| scan_usages_target_matches_range(selection, *range))
+                    .map(|range| range.end_byte.saturating_sub(range.start_byte))
+                    .min()?;
+                Some((unit, best_span))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut matching_units = matching_location_units(declarations_in_file(analyzer, &file));
+    if matching_units.is_empty()
+        && let Some(symbol) = selector
+    {
+        let declarations = analyzer.declarations(&file);
+        let lookup = AnalyzerDefinitionLookup::new(analyzer, language_for_file(&file));
+        let lookup_only_candidates = lookup
+            .fqn(symbol)
+            .into_iter()
+            .filter(|unit| {
+                unit.source() == &file
+                    && unit.is_field()
+                    && analyzer.parent_of(unit).is_none()
+                    && !declarations.contains(unit)
+            })
+            .collect();
+        matching_units = matching_location_units(lookup_only_candidates);
+    }
 
     if matching_units.is_empty() && selector.is_none() {
         return ScanUsageTargetResolution::NotFound(not_found_input(

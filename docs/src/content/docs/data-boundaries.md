@@ -38,6 +38,14 @@ The agent plugin does not bundle the Bifrost executable. Its launcher resolves, 
 
 Managed binaries are versioned under the launcher cache. The default root is `~/Library/Caches/bifrost-agent` on macOS, `%LOCALAPPDATA%/Bifrost/AgentPlugin` on Windows, and `$XDG_CACHE_HOME/bifrost-agent` or `~/.cache/bifrost-agent` on Linux. Set `BIFROST_LAUNCHER_CACHE_DIR` to relocate it or `BIFROST_LAUNCHER_AUTO_INSTALL=0` to prohibit automatic downloads.
 
+Run the package launcher's `doctor` command to inspect the required version,
+selected source, and cache path without modifying the cache or downloading
+anything. It executes the selected candidate with `--version`, so only inspect
+trusted binary locations. Run `prepare` to perform the same exact-version,
+checksum-verified resolution before starting an MCP host. Both commands accept
+`--json`. If preparation changes the available binary, start a fresh host task
+so the MCP tool list is negotiated again.
+
 ## Optional Semantic Model
 
 Semantic search is off by default and requires the `nlp` feature. When enabled without `BIFROST_EMBED_MODEL_DIR`, Bifrost resolves `BIFROST_EMBED_MODEL_ID` (by default `voyageai/voyage-4-nano`) through the Hugging Face cache, downloading missing configuration, tokenizer, and weight files. Set `BIFROST_EMBED_MODEL_DIR` to an approved local model directory for an offline or pre-audited setup.

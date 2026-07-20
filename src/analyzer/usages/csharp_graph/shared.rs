@@ -1,4 +1,4 @@
-use super::extractor::{ScanState, scan_file};
+use super::extractor::{ScanState, prepare_file, scan_prepared_file};
 use super::inverted;
 use super::resolver::TargetSpec;
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
@@ -67,11 +67,14 @@ impl<'a> UsageQueryResolver<'a> for CSharpQueryResolver<'a> {
             limit_exceeded: &mut limit_exceeded,
         };
         for file in files {
-            if scan_scope.is_cancelled() {
+            if scan_scope.is_cancelled() || *state.limit_exceeded {
                 break;
             }
+            let Some(prepared) = prepare_file(self.csharp, &file) else {
+                continue;
+            };
             for spec in &specs {
-                scan_file(self.csharp, analyzer, &file, spec, &mut state);
+                scan_prepared_file(self.csharp, analyzer, &file, &prepared, spec, &mut state);
                 if *state.limit_exceeded {
                     break;
                 }

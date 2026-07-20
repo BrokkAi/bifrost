@@ -33,7 +33,7 @@ use super::resolver::node_text;
 use super::syntax::{
     assignment_parts, declared_callable_return_type_fq_name, declared_field_type_fq_name,
     is_local_scope, object_creation_type, seed_parameter_types, static_member_parts,
-    variable_identifier,
+    static_scope_type_fq_name, variable_identifier,
 };
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdgeBuildOutput, build_edge_output,
@@ -113,13 +113,17 @@ fn walk(node: Node<'_>, scan: &mut PhpScan<'_, '_>, bindings: &mut LocalInferenc
         bindings.enter_scope();
         seed_parameters(node, scan, bindings);
     }
-    seed_assignment(node, scan, bindings);
     record_reference(node, scan, bindings);
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         walk(child, scan, bindings);
     }
+
+    // Assignment RHS expressions are evaluated against the incoming binding.
+    // Mutate the LHS only after every RHS reference has been recorded, so
+    // `$x = $x->method()` can still prove the receiver of `method`.
+    seed_assignment(node, scan, bindings);
 
     if enters_scope {
         bindings.exit_scope();
@@ -227,12 +231,13 @@ fn record_reference(
 /// type, or `self`/`static`/`parent` → the enclosing class.
 fn scope_class_fqn(scope: Node<'_>, scan: &PhpScan<'_, '_>) -> Option<String> {
     let text = node_text(scope, scan.source);
-    match text {
-        "self" | "static" | "parent" => {
-            scan.enclosing_class(scope.start_byte()).map(str::to_string)
-        }
-        _ => scan.resolve_type_fqn(text),
-    }
+    static_scope_type_fq_name(
+        scan.php,
+        scan.analyzer,
+        text,
+        &scan.ctx,
+        scan.enclosing_class(scope.start_byte()),
+    )
 }
 
 /// The fqn of an instance-call receiver's type. `$this` is the enclosing class; a

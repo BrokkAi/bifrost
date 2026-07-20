@@ -75,7 +75,7 @@ body:
     attributes:
       label: Bifrost version and environment
       description: Optionally include the Bifrost version or commit, interface, operating system, and relevant configuration.
-      placeholder: For example, Bifrost 0.8.4 via MCP on macOS
+      placeholder: For example, Bifrost 0.8.5 via MCP on macOS
 
   - type: textarea
     id: output

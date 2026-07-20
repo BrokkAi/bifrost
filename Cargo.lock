@@ -214,7 +214,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost"
-version = "0.8.4"
+version = "0.8.5"
 dependencies = [
  "bincode",
  "cap-fs-ext",

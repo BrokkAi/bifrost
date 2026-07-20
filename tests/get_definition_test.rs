@@ -3205,6 +3205,64 @@ fn csharp_global_qualified_simple_type_bypasses_current_namespace() {
 }
 
 #[test]
+fn csharp_dotted_type_lookup_allows_imported_nested_type() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Imported/ImportedOwner.cs",
+            "namespace Imported { public class ImportedOwner { public class Nested { } } }\n",
+        )
+        .file(
+            "App/Consumer.cs",
+            "using Imported;\nnamespace App { public class Consumer { public void Read(ImportedOwner.Nested input) { input.ToString(); } } }\n",
+        )
+        .build();
+    let line = "namespace App { public class Consumer { public void Read(ImportedOwner.Nested input) { input.ToString(); } } }";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Consumer.cs","line":2,"column":{}}}]}}"#,
+            column_of(line, "input.ToString")
+        ),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["types"][0]["fqn"], "Imported.ImportedOwner$Nested",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_dotted_type_lookup_does_not_import_child_namespace() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Imported/System/String.cs",
+            "namespace Imported.System { public class String { } }\n",
+        )
+        .file(
+            "System/String.cs",
+            "namespace System { public class String { } }\n",
+        )
+        .file(
+            "App/Consumer.cs",
+            "using Imported;\nnamespace App { public class Consumer { public void Read(System.String input) { input.ToString(); } } }\n",
+        )
+        .build();
+    let line = "namespace App { public class Consumer { public void Read(System.String input) { input.ToString(); } } }";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Consumer.cs","line":2,"column":{}}}]}}"#,
+            column_of(line, "input.ToString")
+        ),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["types"][0]["fqn"], "System.String",
+        "{value}"
+    );
+}
+
+#[test]
 fn csharp_type_lookup_preserves_partial_declaration_locations() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
@@ -7647,6 +7705,70 @@ function run(widget) {
 }
 
 #[test]
+fn javascript_commonjs_host_module_does_not_resolve_to_exported_module_property() {
+    let commonjs_source = r#"module.exports = {
+  module: { rules: [] },
+};
+"#;
+    let consumer_source = "const config = require('./webpack.config');\nconfig.module.rules;\n";
+    let local_source = "const module = { exports: null };\nmodule.exports = {};\nmodule;\n";
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("webpack.config.js", commonjs_source)
+        .file("consumer.js", consumer_source)
+        .file("local.js", local_source)
+        .build();
+
+    let host = lookup(
+        project.root(),
+        &location_reference("webpack.config.js", commonjs_source, 0),
+    );
+    assert_eq!(host["results"][0]["status"], "no_definition", "{host}");
+    assert_eq!(
+        host["results"][0]["diagnostics"][0]["kind"], "commonjs_host_binding",
+        "{host}"
+    );
+
+    let property = lookup(
+        project.root(),
+        &location_reference(
+            "consumer.js",
+            consumer_source,
+            consumer_source.find("module.rules").expect("module use"),
+        ),
+    );
+    assert_eq!(property["results"][0]["status"], "resolved", "{property}");
+    assert_eq!(
+        property["results"][0]["definitions"][0]["fqn"], "module",
+        "{property}"
+    );
+    assert_eq!(
+        property["results"][0]["definitions"][0]["path"], "webpack.config.js",
+        "{property}"
+    );
+
+    for local_reference in [
+        local_source
+            .find("module.exports")
+            .expect("local member use"),
+        local_source.rfind("module;").expect("local bare use"),
+    ] {
+        let local = lookup(
+            project.root(),
+            &location_reference("local.js", local_source, local_reference),
+        );
+        assert_eq!(local["results"][0]["status"], "resolved", "{local}");
+        assert_eq!(
+            local["results"][0]["definitions"][0]["path"], "local.js",
+            "{local}"
+        );
+        assert_eq!(
+            local["results"][0]["definitions"][0]["start_line"], 1,
+            "{local}"
+        );
+    }
+}
+
+#[test]
 fn javascript_same_file_object_literal_property_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
@@ -7745,6 +7867,142 @@ bench.start();
     assert_eq!(
         bench["results"][0]["definitions"][0]["fqn"], "app.js.bench",
         "{bench}"
+    );
+}
+
+#[test]
+fn javascript_bare_function_beats_same_named_member() {
+    let source = r#"const holder = {};
+holder.foo = undefined;
+function foo() {}
+foo();
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", source)
+        .build();
+    let call = source.rfind("foo();").expect("bare foo call");
+    let value = lookup(project.root(), &location_reference("app.js", source, call));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "foo", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 3, "{value}");
+}
+
+#[test]
+fn javascript_recovered_top_level_function_never_resolves_unrelated_member() {
+    let source = r#"var __v_0 = [1, 2, 3];
+__v_0.foo = undefined;
+function foo() {}
+%OptimizeFunctionOnNextCall(foo);
+foo();
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("recovered.js", source)
+        .build();
+    let call = source.rfind("foo();").expect("recovered bare foo call");
+    let value = lookup(
+        project.root(),
+        &location_reference("recovered.js", source, call),
+    );
+
+    let result = &value["results"][0];
+    if result["status"] == "resolved" {
+        assert_eq!(result["definitions"][0]["fqn"], "foo", "{value}");
+    } else {
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert!(result["definitions"].is_null(), "{value}");
+    }
+}
+
+#[test]
+fn javascript_hoisted_declarations_block_member_fallback() {
+    let source = r#"member.pause = function() {};
+member.generator = function() {};
+member.LocalClass = function() {};
+member.unrelated = function() {};
+
+function outer() {
+  pause();
+  generator();
+  LocalClass;
+  function pause() {}
+  function* generator() {}
+  class LocalClass {}
+}
+
+member.pause();
+unrelated();
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", source)
+        .build();
+
+    for marker in ["  pause();", "  generator();", "  LocalClass;"] {
+        let start = source.find(marker).expect("nested declaration reference") + 2;
+        let value = lookup(project.root(), &location_reference("app.js", source, start));
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert_eq!(result["diagnostics"][0]["kind"], "local_binding", "{value}");
+    }
+
+    let qualified = source.rfind("member.pause").expect("qualified member call");
+    let value = lookup(
+        project.root(),
+        &location_reference("app.js", source, qualified + "member.".len()),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "member.pause", "{value}");
+
+    let unrelated = source.rfind("unrelated();").expect("bare unrelated call");
+    let value = lookup(
+        project.root(),
+        &location_reference("app.js", source, unrelated),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn javascript_bare_import_and_browser_global_resolution_remain_exact() {
+    let app = r#"import { helper } from "./util.js";
+window.Promise = function Promise() {};
+
+function imported() { helper(); }
+function globalRead() { return Promise.resolve(); }
+function shadowed(Promise) { return Promise; }
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("util.js", "export function helper() {}\n")
+        .file("app.js", app)
+        .build();
+
+    let helper = app.find("helper();").expect("imported helper call");
+    let value = lookup(project.root(), &location_reference("app.js", app, helper));
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "helper",
+        "{value}"
+    );
+    assert_eq!(
+        value["results"][0]["definitions"][0]["path"], "util.js",
+        "{value}"
+    );
+
+    let promise = app.find("Promise.resolve").expect("bare global Promise");
+    let value = lookup(project.root(), &location_reference("app.js", app, promise));
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "window.Promise",
+        "{value}"
+    );
+
+    let shadow = app.rfind("return Promise").expect("shadowed Promise read") + "return ".len();
+    let value = lookup(project.root(), &location_reference("app.js", app, shadow));
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert!(
+        value["results"][0]["definitions"][0].get("fqn").is_none(),
+        "{value}"
     );
 }
 

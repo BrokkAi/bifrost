@@ -1206,6 +1206,7 @@ pub struct TreeSitterAnalyzer<A> {
     full_hydration_count: Arc<AtomicUsize>,
     bulk_hydration_count: Arc<AtomicUsize>,
     sql_definitions_query_count: Arc<AtomicUsize>,
+    definition_candidates_query_count: Arc<AtomicUsize>,
     enclosing_code_unit_query_count: Arc<AtomicUsize>,
     full_declaration_scan_count: Arc<AtomicUsize>,
     global_usage_definition_index_build_count: Arc<AtomicUsize>,
@@ -1242,6 +1243,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             full_hydration_count: Arc::clone(&self.full_hydration_count),
             bulk_hydration_count: Arc::clone(&self.bulk_hydration_count),
             sql_definitions_query_count: Arc::clone(&self.sql_definitions_query_count),
+            definition_candidates_query_count: Arc::clone(&self.definition_candidates_query_count),
             enclosing_code_unit_query_count: Arc::clone(&self.enclosing_code_unit_query_count),
             full_declaration_scan_count: Arc::clone(&self.full_declaration_scan_count),
             global_usage_definition_index_build_count: Arc::clone(
@@ -1412,6 +1414,7 @@ where
             full_hydration_count: Arc::new(AtomicUsize::new(0)),
             bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
             sql_definitions_query_count: Arc::new(AtomicUsize::new(0)),
+            definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
             enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
@@ -1554,6 +1557,7 @@ where
             full_hydration_count: Arc::new(AtomicUsize::new(0)),
             bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
             sql_definitions_query_count: Arc::new(AtomicUsize::new(0)),
+            definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
             enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
@@ -3749,6 +3753,18 @@ where
     }
 
     #[doc(hidden)]
+    pub fn reset_definition_candidates_query_count_for_test(&self) {
+        self.definition_candidates_query_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn definition_candidates_query_count_for_test(&self) -> usize {
+        self.definition_candidates_query_count
+            .load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
     pub fn reset_full_declaration_scan_count_for_test(&self) {
         self.full_declaration_scan_count.store(0, Ordering::Relaxed);
     }
@@ -4162,6 +4178,8 @@ where
         fq_name: &str,
         include_definition_lookup_units: bool,
     ) -> std::result::Result<Vec<CodeUnit>, StoreError> {
+        self.definition_candidates_query_count
+            .fetch_add(1, Ordering::Relaxed);
         let normalized = self.adapter.normalize_full_name(fq_name);
         let langs = self.storage_language_keys_for_queries();
         let candidate_names = self.definition_candidate_short_names(fq_name);
@@ -5334,6 +5352,14 @@ where
 
     fn global_usage_definition_index_build_count_for_test(&self) -> usize {
         TreeSitterAnalyzer::global_usage_definition_index_build_count_for_test(self)
+    }
+
+    fn reset_definition_candidates_query_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_definition_candidates_query_count_for_test(self);
+    }
+
+    fn definition_candidates_query_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::definition_candidates_query_count_for_test(self)
     }
 
     fn reset_full_declaration_scan_count_for_test(&self) {

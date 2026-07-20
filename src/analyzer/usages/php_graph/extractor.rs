@@ -11,7 +11,8 @@ use crate::analyzer::usages::php_graph::resolver::{
 use crate::analyzer::usages::php_graph::syntax::{
     assignment_parts, declared_callable_return_type_fq_name, declared_field_type_fq_name,
     is_local_scope, literal_member_identifier, object_creation_type, seed_parameter_types,
-    static_member_parts, static_property_identifier, variable_identifier,
+    static_member_parts, static_property_identifier, static_scope_type_fq_name,
+    variable_identifier,
 };
 use crate::analyzer::{
     IAnalyzer, PhpAnalyzer, PhpFileContext, ProjectFile, resolve_php_constant,
@@ -399,13 +400,33 @@ fn scan_member_scope<'tree>(
     scopes: &mut Vec<(Node<'tree>, bool)>,
     hits: &mut BTreeSet<UsageHit>,
 ) {
-    let mut stack: Vec<Node<'tree>> = vec![root];
-    while let Some(node) = stack.pop() {
+    enum Visit<'tree> {
+        Node(Node<'tree>),
+        ApplyAssignment(Node<'tree>),
+    }
+
+    let mut stack = vec![Visit::Node(root)];
+    while let Some(visit) = stack.pop() {
+        let node = match visit {
+            Visit::Node(node) => node,
+            Visit::ApplyAssignment(node) => {
+                apply_receiver_assignment(
+                    node,
+                    php,
+                    analyzer,
+                    file,
+                    source,
+                    line_starts,
+                    ctx,
+                    engine,
+                );
+                continue;
+            }
+        };
         if node != root && is_local_scope(node) {
             scopes.push((node, true));
             continue;
         }
-        apply_receiver_assignment(node, php, analyzer, source, ctx, engine);
         record_member_hit(
             node,
             analyzer,
@@ -420,7 +441,12 @@ fn scan_member_scope<'tree>(
             engine,
             hits,
         );
-        push_named_children(node, &mut stack);
+        if assignment_parts(node).is_some() {
+            stack.push(Visit::ApplyAssignment(node));
+        }
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.named_children(&mut cursor).collect();
+        stack.extend(children.into_iter().rev().map(Visit::Node));
     }
 }
 
@@ -469,11 +495,14 @@ fn seed_parameter_receivers(
     seed_parameter_types(node, source, engine, |raw| resolve_php_type(raw, ctx));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_receiver_assignment(
     node: Node<'_>,
     php: &PhpAnalyzer,
     analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
     source: &str,
+    line_starts: &[usize],
     ctx: &PhpFileContext,
     engine: &mut LocalInferenceEngine<String>,
 ) {
@@ -487,7 +516,7 @@ fn apply_receiver_assignment(
     if lhs.is_empty() {
         return;
     }
-    let resolved = assignment_receiver_type(right, php, analyzer, source, ctx);
+    let resolved = assignment_receiver_type(right, php, analyzer, file, source, line_starts, ctx);
     match resolved {
         Some(fq) => engine.seed_symbol(lhs.to_string(), fq),
         None => {
@@ -507,7 +536,9 @@ fn assignment_receiver_type(
     node: Node<'_>,
     php: &PhpAnalyzer,
     analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
     source: &str,
+    line_starts: &[usize],
     ctx: &PhpFileContext,
 ) -> Option<String> {
     match node.kind() {
@@ -528,7 +559,20 @@ fn assignment_receiver_type(
         }
         "scoped_call_expression" => {
             let (scope, name) = static_member_parts(node)?;
-            let owner = resolve_php_type(node_text(scope, source), ctx)?;
+            let enclosing_owner = enclosing_owner_fq_name_at(
+                analyzer,
+                file,
+                scope.start_byte(),
+                scope.end_byte(),
+                line_starts,
+            );
+            let owner = static_scope_type_fq_name(
+                php,
+                analyzer,
+                node_text(scope, source),
+                ctx,
+                enclosing_owner.as_deref(),
+            )?;
             let method = node_text(name, source);
             if method.is_empty() {
                 return None;
@@ -543,9 +587,9 @@ fn assignment_receiver_type(
             }
             declared_callable_return_type_fq_name(php, analyzer, &callable)
         }
-        "parenthesized_expression" => node
-            .named_child(0)
-            .and_then(|inner| assignment_receiver_type(inner, php, analyzer, source, ctx)),
+        "parenthesized_expression" => node.named_child(0).and_then(|inner| {
+            assignment_receiver_type(inner, php, analyzer, file, source, line_starts, ctx)
+        }),
         _ => None,
     }
 }
