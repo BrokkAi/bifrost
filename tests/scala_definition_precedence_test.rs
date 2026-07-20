@@ -541,6 +541,365 @@ object Consumer {
 }
 
 #[test]
+fn scala_qualified_type_paths_preserve_absolute_and_external_namespaces() {
+    let source = r#"package app
+
+object Use {
+  val boolean: _root_.scala.Boolean = null
+  val integer: _root_.scala.Int = null
+  val string: _root_.scala.Predef.String = null
+  val double: java.lang.Double = null
+  val long: java.lang.Long = null
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "scala/Types.scala",
+            "package scala\nclass Boolean\nclass Int\nobject Predef { class String }\n",
+        )
+        .file("java/lang/Types.scala", "package java.lang\nclass Double\n")
+        .file(
+            "Decoys.scala",
+            "class Boolean\nclass Int\nclass String\nclass Double\nclass Long\n",
+        )
+        .file("app/Use.scala", source)
+        .build();
+    let references = [
+        ("Boolean =", "scala.Boolean"),
+        ("Int =", "scala.Int"),
+        ("String =", "scala.Predef$.String"),
+        ("Double =", "java.lang.Double"),
+        ("Long =", "java.lang.Long"),
+    ]
+    .into_iter()
+    .map(|(needle, _)| location_in("app/Use.scala", source, source.find(needle).unwrap()))
+    .collect::<Vec<_>>();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    for (result, (_, expected)) in results[..4].iter().zip([
+        ("Boolean", "scala.Boolean"),
+        ("Int", "scala.Int"),
+        ("String", "scala.Predef$.String"),
+        ("Double", "java.lang.Double"),
+    ]) {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+    assert_eq!(results[4]["status"], "no_definition", "{value}");
+    assert!(results[4]["definitions"].is_null(), "{value}");
+}
+
+#[test]
+fn scala_qualified_type_resolves_exact_nested_export_target() {
+    let fields = r#"package kyo
+object Fields {
+  object Pin {
+    opaque type Pin[+N <: String] = Unit
+  }
+  export Pin.*
+}
+"#;
+    let source = r#"package app
+import kyo.*
+object Routes {
+  def request[N <: String](using Fields.Pin[N]): Unit = ()
+  def response[N <: String](using Fields.Pin[N]): Unit = ()
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("kyo/Fields.scala", fields)
+        .file(
+            "decoy/Fields.scala",
+            "package decoy\nobject Fields { class Pin[N] }\n",
+        )
+        .file("app/Routes.scala", source)
+        .build();
+    let references = [
+        source.find("Fields.Pin").unwrap(),
+        source.rfind("Fields.Pin").unwrap(),
+    ]
+    .into_iter()
+    .map(|start| location_in("app/Routes.scala", source, start + "Fields.".len()))
+    .collect::<Vec<_>>();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+
+    for result in value["results"].as_array().expect("definition results") {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], "kyo.Fields$.Pin$.Pin",
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn scala_exported_type_selectors_preserve_exclusions_renames_and_external_misses() {
+    let exports = r#"package library
+object Facade {
+  object Core {
+    class kept
+    class hidden
+    class original
+  }
+  export Core.{hidden as _, original as renamed, *}
+}
+object ExternalFacade {
+  export absent.Owner.*
+}
+"#;
+    let source = r#"package app
+import library.*
+object Use {
+  val kept: Facade.kept = null
+  val renamed: Facade.renamed = null
+  val hidden: Facade.hidden = null
+  val external: ExternalFacade.Missing = null
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("library/Exports.scala", exports)
+        .file("app/Use.scala", source)
+        .build();
+    let references = [
+        "Facade.kept",
+        "Facade.renamed",
+        "Facade.hidden",
+        "ExternalFacade.Missing",
+    ]
+    .into_iter()
+    .map(|needle| {
+        location_in(
+            "app/Use.scala",
+            source,
+            source.find(needle).unwrap() + needle.rfind('.').unwrap() + 1,
+        )
+    })
+    .collect::<Vec<_>>();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for (result, expected) in results[..2].iter().zip([
+        "library.Facade$.Core$.kept",
+        "library.Facade$.Core$.original",
+    ]) {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+    assert_eq!(results[2]["status"], "no_definition", "{value}");
+    assert_eq!(results[3]["status"], "no_definition", "{value}");
+    assert_ne!(
+        results[3]["diagnostics"][0]["kind"], "unresolved_scala_export",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_implicit_scala_package_type_precedes_unrelated_fixture_type() {
+    let source = r#"package scala.quoted
+object Expr {
+  def fromSeq(seq: Seq[Int]): Unit = ()
+  def extract(value: Any): Int = value match {
+    case Seq(a, b, c, d, e, f, g) => a
+    case _ => 0
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "scala/Seq.scala",
+            "package scala\nclass Seq[A]\nobject Seq { def unapplySeq(value: Any): Option[Seq[Int]] = None }\nclass Int\n",
+        )
+        .file("fixtures/Expr.scala", "object Expr { class Seq[A] }\n")
+        .file("scala/quoted/Expr.scala", source)
+        .build();
+    let references = [
+        source
+            .find("Seq[Int]")
+            .expect("implicit scala package type"),
+        source
+            .rfind("Seq(a")
+            .expect("implicit scala package extractor"),
+    ]
+    .into_iter()
+    .map(|start| location_in("scala/quoted/Expr.scala", source, start))
+    .collect::<Vec<_>>();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+
+    for (result, expected) in value["results"]
+        .as_array()
+        .expect("definition results")
+        .iter()
+        .zip(["scala.Seq", "scala.Seq$.unapplySeq"])
+    {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn scala_same_file_package_types_precede_global_same_named_types() {
+    let source = r#"package compat
+class A
+class B
+class C
+object Api {
+  type AA = A
+  def mixed(value: A with B): C = new C
+  type Refined = A { type Member <: A }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("Decoys.scala", "object Z { class A; class C }\n")
+        .file("compat/Api.scala", source)
+        .build();
+    let references = ["= A\n", "value: A", "): C", "= new C", "= A {", "<: A"]
+        .into_iter()
+        .map(|needle| {
+            let start = source.find(needle).expect("same-file type")
+                + needle.find(|ch: char| ch.is_ascii_uppercase()).unwrap();
+            location_in("compat/Api.scala", source, start)
+        })
+        .collect::<Vec<_>>();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+    let expected = [
+        "compat.A", "compat.A", "compat.C", "compat.C", "compat.A", "compat.A",
+    ];
+    for (result, expected) in value["results"]
+        .as_array()
+        .expect("definition results")
+        .iter()
+        .zip(expected)
+    {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn scala_explicit_member_import_from_typed_local_owner_is_exact() {
+    let source = r#"package app
+final class Shape(val in: Int, val out: Int)
+final class Stage(shape: Shape) {
+  import shape.{in, out}
+  val inlet = in
+  val outlet = out
+}
+"#;
+    let ambiguous = r#"package app
+final class Ambiguous(shape: Shape) {
+  import shape.{in, out}
+  val inlet = in
+  val outlet = out
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "replica/app/Shape.scala",
+            "package app\nfinal class Shape(val in: Int, val out: Int)\n",
+        )
+        .file("decoy/out.scala", "package decoy\nobject out\n")
+        .file("primary/app/Stage.scala", source)
+        .file("consumer/app/Ambiguous.scala", ambiguous)
+        .build();
+    let references = [
+        location_in(
+            "primary/app/Stage.scala",
+            source,
+            source.rfind("= in").unwrap() + 2,
+        ),
+        location_in(
+            "primary/app/Stage.scala",
+            source,
+            source.rfind("= out").unwrap() + 2,
+        ),
+        location_in(
+            "consumer/app/Ambiguous.scala",
+            ambiguous,
+            ambiguous.rfind("= in").unwrap() + 2,
+        ),
+        location_in(
+            "consumer/app/Ambiguous.scala",
+            ambiguous,
+            ambiguous.rfind("= out").unwrap() + 2,
+        ),
+    ];
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    for (result, expected) in results[..2].iter().zip(["app.Shape.in", "app.Shape.out"]) {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+        assert_eq!(
+            result["definitions"][0]["path"], "primary/app/Stage.scala",
+            "{value}"
+        );
+    }
+    for result in &results[2..] {
+        assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    }
+}
+
+#[test]
+fn scala_typed_constructor_field_precedes_same_named_package_object() {
+    let source = r#"package app
+final class Jobs { def poll(): Int = 1 }
+final class BspSession(private val jobs: Jobs) {
+  def next: Int = jobs.poll()
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/jobs.scala", "package app\nobject jobs\n")
+        .file("app/BspSession.scala", source)
+        .build();
+    let start = source
+        .rfind("jobs.poll")
+        .expect("constructor field receiver");
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": [location_in("app/BspSession.scala", source, start)]}).to_string(),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["name"], "jobs",
+        "{value}"
+    );
+    assert_eq!(
+        value["results"][0]["definitions"][0]["kind"], "parameter",
+        "{value}"
+    );
+    assert!(
+        value["results"][0]["definitions"][0].get("fqn").is_none(),
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_qualified_owner_paths_preserve_nested_and_namespace_identity() {
     let source = r#"package app
 

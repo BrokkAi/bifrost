@@ -1,12 +1,14 @@
 use super::*;
 use crate::analyzer::scala::{
-    ScalaSupertypeLookupPath, ScalaWildcardImportEnvironment, ScalaWildcardOwnerFacts,
-    resolve_scala_wildcard_import_environment, scala_enclosing_package_root_candidates,
-    scala_import_path, scala_import_path_candidates, scala_import_visible_at,
-    scala_lexical_scope_path_at, scala_package_prefixes_at, scala_type_lookup_segments,
+    ScalaExportSelector, ScalaSupertypeLookupPath, ScalaWildcardImportEnvironment,
+    ScalaWildcardOwnerFacts, resolve_scala_wildcard_import_environment,
+    scala_enclosing_package_root_candidates, scala_import_path, scala_import_path_candidates,
+    scala_import_visible_at, scala_lexical_scope_path_at, scala_package_prefixes_at,
+    scala_type_lookup_segments,
 };
 use crate::analyzer::usages::scala_graph::local::{
     ScalaLocalBinding, precise_scala_binding, seed_scala_binding,
+    seed_scala_binding_with_receiver_declaration,
 };
 use crate::analyzer::usages::scala_graph::namespace::{
     ScalaDirectAncestorResolution, ScalaTypeNamespaceResolution,
@@ -200,6 +202,13 @@ impl<'a> ForwardScalaNameResolver<'a> {
         if segments.is_empty() {
             return ScalaNameResolution::Unresolved;
         }
+        if segments.first().is_some_and(|segment| segment == "_root_") {
+            return if segments.len() == 1 {
+                ScalaNameResolution::Unresolved
+            } else {
+                self.resolve_absolute_owner_segments(&segments[1..], kind)
+            };
+        }
         match self.resolve_explicit_owner_segments(segments, kind) {
             ScalaNameResolution::Unresolved => {}
             outcome => return outcome,
@@ -254,6 +263,20 @@ impl<'a> ForwardScalaNameResolver<'a> {
             }
         }
 
+        // `scala.*` is imported by every Scala compilation unit. Keep this
+        // below explicit, wildcard, current-package, and qualified-package
+        // tiers, but above the root namespace so an unrelated workspace
+        // fixture cannot capture an ordinary `Seq`/`List` type or companion.
+        if segments.len() == 1 {
+            let outcome = self.resolve_candidate_tier(
+                scala_nested_type_candidates("scala".to_string(), segments, false),
+                kind,
+            );
+            if outcome != ScalaNameResolution::Unresolved {
+                return outcome;
+            }
+        }
+
         if segments.len() > 1 || self.package_prefixes.iter().all(String::is_empty) {
             return self.resolve_candidate_tier(
                 scala_nested_type_candidates(String::new(), segments, false),
@@ -261,6 +284,30 @@ impl<'a> ForwardScalaNameResolver<'a> {
             );
         }
         ScalaNameResolution::Unresolved
+    }
+
+    fn resolve_absolute_owner_segments(
+        &self,
+        segments: &[String],
+        kind: ScalaOwnerKind,
+    ) -> ScalaNameResolution {
+        for package_len in (1..segments.len()).rev() {
+            let package = segments[..package_len].join(".");
+            if !self.support.package_exists(&package) {
+                continue;
+            }
+            let outcome = self.resolve_candidate_tier(
+                scala_nested_type_candidates(package, &segments[package_len..], false),
+                kind,
+            );
+            if outcome != ScalaNameResolution::Unresolved {
+                return outcome;
+            }
+        }
+        self.resolve_candidate_tier(
+            scala_nested_type_candidates(String::new(), segments, false),
+            kind,
+        )
     }
 
     fn resolve_explicit_owner_segments(
@@ -737,6 +784,11 @@ pub(super) fn resolve_scala(
                     format!("`{text}` is a local Scala value"),
                 );
             }
+            if let Some(outcome) =
+                scala_explicit_local_member_import_outcome(ctx, &resolver, root, identifier, text)
+            {
+                return outcome;
+            }
             if let Some(fqn) = resolver.resolve_member(text) {
                 return scala_fqn_outcome(support, &fqn, text);
             }
@@ -1044,6 +1096,153 @@ fn scala_exact_enclosing_singleton_path(
         };
         lexical_owner = parent;
     }
+}
+
+/// Resolve a qualified type member supplied by a parser-recorded Scala 3
+/// `export`. Export aliases have no declaration of their own, so return the
+/// original exact declaration behind the export while retaining physical
+/// owner/source identity throughout the nested-owner walk.
+fn scala_exact_exported_qualified_type(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver<'_>,
+    node: Node<'_>,
+) -> ScalaTypeNamespaceResolution {
+    let segments = scala_type_lookup_segments(node, ctx.source);
+    let Some((member, owner_segments)) = segments.split_last() else {
+        return ScalaTypeNamespaceResolution::NoMatch;
+    };
+    if owner_segments.is_empty() {
+        return ScalaTypeNamespaceResolution::NoMatch;
+    }
+
+    let exporter =
+        match scala_exact_enclosing_singleton_path(ctx, node.start_byte(), owner_segments) {
+            ScalaExactMemberResolution::Found(mut candidates) if candidates.len() == 1 => {
+                candidates.remove(0)
+            }
+            ScalaExactMemberResolution::Found(_) | ScalaExactMemberResolution::Ambiguous => {
+                return ScalaTypeNamespaceResolution::NoMatch;
+            }
+            ScalaExactMemberResolution::NoMatch => {
+                match resolver
+                    .resolve_owner_segments(owner_segments, ScalaOwnerKind::SingletonObject)
+                {
+                    ScalaNameResolution::Resolved(owner) => owner._declaration,
+                    ScalaNameResolution::Ambiguous => return ScalaTypeNamespaceResolution::NoMatch,
+                    ScalaNameResolution::MissingExplicitImport
+                    | ScalaNameResolution::Unresolved => {
+                        return ScalaTypeNamespaceResolution::NoMatch;
+                    }
+                }
+            }
+        };
+
+    if ctx.scala.export_infos_for_owner(&exporter).is_empty() {
+        return ScalaTypeNamespaceResolution::NoMatch;
+    }
+    let direct_fqn = format!("{}.{member}", exporter.fq_name());
+    let mut direct = ctx
+        .support
+        .fqn(&direct_fqn)
+        .into_iter()
+        .filter(|unit| unit.fq_name() == direct_fqn)
+        .filter(|unit| unit.source() == exporter.source())
+        .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(&exporter))
+        .filter(|unit| unit.is_class() || ctx.scala.is_type_alias(unit))
+        .collect::<Vec<_>>();
+    sort_units(&mut direct);
+    direct.dedup();
+    match direct.as_slice() {
+        [declaration] => {
+            return ScalaTypeNamespaceResolution::Resolved(declaration.clone());
+        }
+        [_, _, ..] => return ScalaTypeNamespaceResolution::Ambiguous,
+        [] => {}
+    }
+
+    let mut declarations = Vec::new();
+    let mut matched_export = false;
+    for export in ctx.scala.export_infos_for_owner(&exporter) {
+        let named_sources = export
+            .selectors
+            .iter()
+            .filter_map(|selector| match selector {
+                ScalaExportSelector::Named { source_name, .. } => Some(source_name.clone()),
+                ScalaExportSelector::Wildcard | ScalaExportSelector::GivenWildcard => None,
+            })
+            .collect::<HashSet<_>>();
+        let Some(source_owner) =
+            scala_exact_nested_singleton_owner(ctx, &exporter, &export.owner_path)
+        else {
+            // A parser-proven export may target an external owner which is
+            // absent from this workspace. That is not evidence that a
+            // declaration behind the export is missing or ambiguous.
+            continue;
+        };
+        matched_export |= named_sources.contains(member);
+        for selector in export.selectors {
+            let source_name = match selector {
+                ScalaExportSelector::Wildcard if !named_sources.contains(member) => member.clone(),
+                ScalaExportSelector::Named {
+                    source_name,
+                    visible_name: Some(visible_name),
+                } if visible_name == *member => source_name,
+                ScalaExportSelector::GivenWildcard
+                | ScalaExportSelector::Wildcard
+                | ScalaExportSelector::Named {
+                    visible_name: None, ..
+                }
+                | ScalaExportSelector::Named { .. } => continue,
+            };
+            matched_export = true;
+            let target_fqn = format!("{}.{source_name}", source_owner.fq_name());
+            declarations.extend(
+                ctx.support
+                    .fqn(&target_fqn)
+                    .into_iter()
+                    .filter(|unit| unit.fq_name() == target_fqn)
+                    .filter(|unit| unit.source() == source_owner.source())
+                    .filter(|unit| {
+                        ctx.scala.structural_parent_of(unit).as_ref() == Some(&source_owner)
+                    })
+                    .filter(|unit| unit.is_class() || ctx.scala.is_type_alias(unit)),
+            );
+        }
+    }
+    sort_units(&mut declarations);
+    declarations.dedup();
+    match declarations.as_slice() {
+        [declaration] => ScalaTypeNamespaceResolution::Resolved(declaration.clone()),
+        [_, _, ..] => ScalaTypeNamespaceResolution::Ambiguous,
+        [] if matched_export => ScalaTypeNamespaceResolution::AuthoritativeMiss,
+        [] => ScalaTypeNamespaceResolution::NoMatch,
+    }
+}
+
+fn scala_exact_nested_singleton_owner(
+    ctx: ScalaLookupCtx<'_>,
+    exporter: &CodeUnit,
+    path: &[String],
+) -> Option<CodeUnit> {
+    let mut owner = exporter.clone();
+    for segment in path {
+        let nested_fqn = format!("{}.{segment}$", owner.fq_name());
+        let mut candidates = ctx
+            .support
+            .fqn(&nested_fqn)
+            .into_iter()
+            .filter(|unit| unit.is_class() && unit.fq_name() == nested_fqn)
+            .filter(|unit| unit.source() == owner.source())
+            .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(&owner))
+            .collect::<Vec<_>>();
+        sort_units(&mut candidates);
+        candidates.dedup();
+        let [candidate] = candidates.as_slice() else {
+            return None;
+        };
+        owner = candidate.clone();
+    }
+    Some(owner)
 }
 
 fn resolve_scala_parser_proven_term_role(
@@ -1774,6 +1973,26 @@ fn resolve_scala_type(
             return no_definition(
                 "ambiguous_scala_type",
                 format!("`{text}` resolves to multiple exact Scala type declarations"),
+            );
+        }
+        ScalaTypeNamespaceResolution::NoMatch => {}
+    }
+    match scala_exact_exported_qualified_type(ctx, resolver, node) {
+        ScalaTypeNamespaceResolution::Resolved(declaration) => {
+            return candidates_outcome(vec![declaration]);
+        }
+        ScalaTypeNamespaceResolution::AuthoritativeMiss => {
+            return no_definition(
+                "unresolved_scala_export",
+                format!(
+                    "`{text}` is exported by an indexed Scala owner, but its source type is unavailable"
+                ),
+            );
+        }
+        ScalaTypeNamespaceResolution::Ambiguous => {
+            return no_definition(
+                "ambiguous_scala_type",
+                format!("`{text}` resolves through multiple Scala export targets"),
             );
         }
         ScalaTypeNamespaceResolution::NoMatch => {}
@@ -2514,6 +2733,92 @@ enum ScalaExactMemberResolution {
     Found(Vec<CodeUnit>),
     NoMatch,
     Ambiguous,
+}
+
+fn scala_explicit_local_member_import_outcome(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver<'_>,
+    root: Node<'_>,
+    reference: Node<'_>,
+    visible_name: &str,
+) -> Option<DefinitionLookupOutcome> {
+    let bindings = scala_bindings_before(ctx, resolver, root, reference.start_byte());
+    let mut matched_local_import = false;
+    let mut candidates = Vec::new();
+    for import in resolver
+        .visible_imports()
+        .filter(|import| !import.is_wildcard)
+    {
+        if import
+            .identifier
+            .as_deref()
+            .is_none_or(|identifier| identifier != visible_name)
+        {
+            continue;
+        }
+        let Some(path) = import.path.as_ref() else {
+            continue;
+        };
+        let Some((member, owner_path)) = path.segments.split_last() else {
+            continue;
+        };
+        let Some(root_name) = owner_path.first() else {
+            continue;
+        };
+        if !bindings.is_shadowed(root_name) {
+            continue;
+        }
+        matched_local_import = true;
+        let Some(binding) = precise_scala_binding(&bindings, root_name) else {
+            continue;
+        };
+        let mut owners = if let Some(declaration) = binding.receiver_declaration {
+            vec![declaration]
+        } else if let Some(owner_fqn) = binding.receiver_type {
+            ctx.support
+                .fqn(&owner_fqn)
+                .into_iter()
+                .filter(|unit| unit.is_class() && unit.fq_name() == owner_fqn)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        sort_units(&mut owners);
+        owners.dedup();
+        let [owner] = owners.as_slice() else {
+            if owners.len() > 1 {
+                return Some(no_definition(
+                    "ambiguous_scala_local_import_owner",
+                    format!("local import owner `{root_name}` has multiple physical definitions"),
+                ));
+            }
+            continue;
+        };
+        let Some(owner) = scala_exact_nested_singleton_owner(ctx, owner, &owner_path[1..]) else {
+            continue;
+        };
+        match scala_exact_owner_member_candidate_units(ctx, &owner, member, false) {
+            ScalaExactMemberResolution::Found(found) => candidates.extend(found),
+            ScalaExactMemberResolution::Ambiguous => {
+                return Some(no_definition(
+                    "ambiguous_scala_local_import_member",
+                    format!("imported local member `{visible_name}` has multiple definitions"),
+                ));
+            }
+            ScalaExactMemberResolution::NoMatch => {}
+        }
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    if !candidates.is_empty() {
+        Some(candidates_outcome(candidates))
+    } else if matched_local_import {
+        Some(boundary(format!(
+            "`{visible_name}` is imported from a local Scala value whose exact member is unavailable"
+        )))
+    } else {
+        None
+    }
 }
 
 fn scala_exact_owner_member_candidate_units(
@@ -3502,7 +3807,73 @@ fn scala_resolve_visible_type_node(
         | ScalaTypeNamespaceResolution::Ambiguous => return None,
         ScalaTypeNamespaceResolution::NoMatch => {}
     }
+    match scala_exact_exported_qualified_type(ctx, resolver, node) {
+        ScalaTypeNamespaceResolution::Resolved(declaration) => {
+            return Some(declaration.fq_name());
+        }
+        ScalaTypeNamespaceResolution::AuthoritativeMiss
+        | ScalaTypeNamespaceResolution::Ambiguous => return None,
+        ScalaTypeNamespaceResolution::NoMatch => {}
+    }
     scala_resolve_visible_type_node_after_lexical_miss(ctx, resolver, node)
+}
+
+fn scala_resolve_visible_type_declaration(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver<'_>,
+    node: Node<'_>,
+) -> Option<CodeUnit> {
+    match scala_exact_lexical_type_namespace(ctx, node) {
+        ScalaTypeNamespaceResolution::Resolved(declaration) => return Some(declaration),
+        ScalaTypeNamespaceResolution::AuthoritativeMiss
+        | ScalaTypeNamespaceResolution::Ambiguous => return None,
+        ScalaTypeNamespaceResolution::NoMatch => {}
+    }
+    match scala_exact_exported_qualified_type(ctx, resolver, node) {
+        ScalaTypeNamespaceResolution::Resolved(declaration) => return Some(declaration),
+        ScalaTypeNamespaceResolution::AuthoritativeMiss
+        | ScalaTypeNamespaceResolution::Ambiguous => return None,
+        ScalaTypeNamespaceResolution::NoMatch => {}
+    }
+
+    let segments = scala_type_lookup_segments(node, ctx.source);
+    let kind = scala_type_node_owner_kind(node);
+    if !segments.is_empty() {
+        let package = scala_package_name_of(ctx.scala, ctx.file).unwrap_or_default();
+        let mut same_file = scala_nested_type_candidates(package, &segments, false)
+            .into_iter()
+            .flat_map(|candidate| {
+                let fqn = match kind {
+                    ScalaOwnerKind::Class => candidate.trim_end_matches('$').to_string(),
+                    ScalaOwnerKind::SingletonObject if candidate.ends_with('$') => candidate,
+                    ScalaOwnerKind::SingletonObject => format!("{candidate}$"),
+                    ScalaOwnerKind::TypeNamespace => candidate,
+                };
+                ctx.support.fqn(&fqn).into_iter().filter(move |unit| {
+                    unit.fq_name() == fqn
+                        && unit.source() == ctx.file
+                        && (unit.is_class()
+                            || (kind == ScalaOwnerKind::TypeNamespace
+                                && ctx.scala.is_type_alias(unit)))
+                })
+            })
+            .collect::<Vec<_>>();
+        sort_units(&mut same_file);
+        same_file.dedup();
+        if let [declaration] = same_file.as_slice() {
+            return Some(declaration.clone());
+        }
+        if same_file.len() > 1 {
+            return None;
+        }
+    }
+
+    match resolver.resolve_type_node(node, ctx.source, kind) {
+        ScalaNameResolution::Resolved(owner) => Some(owner._declaration),
+        ScalaNameResolution::MissingExplicitImport
+        | ScalaNameResolution::Ambiguous
+        | ScalaNameResolution::Unresolved => None,
+    }
 }
 
 fn scala_resolve_visible_type_node_after_lexical_miss(
@@ -3529,6 +3900,10 @@ fn scala_resolve_visible_type_node_after_lexical_miss(
     match resolver.resolve_type_node(node, ctx.source, kind) {
         ScalaNameResolution::Resolved(owner) => Some(owner.fqn),
         ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous => None,
+        // A structured qualified path is authoritative. Falling back to its
+        // terminal spelling would allow `java.lang.Long` or
+        // `_root_.scala.Boolean` to bind an unrelated root-level fixture.
+        ScalaNameResolution::Unresolved if segments.len() > 1 => None,
         ScalaNameResolution::Unresolved => scala_resolve_visible_type_annotation(
             ctx,
             resolver,
@@ -3690,15 +4065,17 @@ fn scala_resolve_enclosing_qualified_type(
                 ScalaNameResolution::Unresolved => {}
             }
         }
-        match resolver.resolve_candidate_tier(
-            scala_nested_type_candidates(String::new(), &candidate, false),
-            kind,
-        ) {
-            ScalaNameResolution::Resolved(owner) => return Some(owner.fqn),
-            ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous => {
-                return None;
+        if resolver.package_prefixes.iter().all(String::is_empty) {
+            match resolver.resolve_candidate_tier(
+                scala_nested_type_candidates(String::new(), &candidate, false),
+                kind,
+            ) {
+                ScalaNameResolution::Resolved(owner) => return Some(owner.fqn),
+                ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous => {
+                    return None;
+                }
+                ScalaNameResolution::Unresolved => {}
             }
-            ScalaNameResolution::Unresolved => {}
         }
     }
     None
@@ -4113,13 +4490,19 @@ fn scala_seed_parameter(
     if binding_name.is_empty() {
         return;
     }
-    let resolved = parameter
+    let type_node = parameter
         .child_by_field_name("type")
-        .filter(|type_node| type_node.end_byte() <= cutoff_start)
-        .and_then(|type_node| {
-            let type_text = scala_node_text(type_node, ctx.source);
-            scala_resolve_receiver_type_annotation(ctx, resolver, type_text, type_node.start_byte())
-        });
+        .filter(|type_node| type_node.end_byte() <= cutoff_start);
+    if let Some(declaration) = type_node
+        .and_then(|type_node| scala_resolve_visible_type_declaration(ctx, resolver, type_node))
+    {
+        seed_scala_binding_with_receiver_declaration(binding_name, declaration, None, bindings);
+        return;
+    }
+    let resolved = type_node.and_then(|type_node| {
+        let type_text = scala_node_text(type_node, ctx.source);
+        scala_resolve_receiver_type_annotation(ctx, resolver, type_text, type_node.start_byte())
+    });
     scala_seed_typed(binding_name, resolved, false, bindings);
 }
 
