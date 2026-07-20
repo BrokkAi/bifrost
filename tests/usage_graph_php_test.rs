@@ -371,3 +371,60 @@ class Broken {
         value["edges"]
     );
 }
+
+#[test]
+fn inverted_graph_preserves_rhs_bindings_and_resolves_relative_factories() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "Graph.php",
+            r#"<?php
+namespace App;
+class Replacement {}
+class Target {
+    public function replace(): Replacement { return new Replacement(); }
+}
+class Product {
+    public function consume(): void {}
+}
+class BaseFactory {
+    protected static function fromParent(): Product { return new Product(); }
+}
+class Factory extends BaseFactory {
+    private static function fromSelf(): Product { return new Product(); }
+
+    public function run(Target $target): void {
+        $target = $target->replace();
+        $selfProduct = self::fromSelf();
+        $selfProduct->consume();
+        $staticProduct = static::fromSelf();
+        $staticProduct->consume();
+        $parentProduct = parent::fromParent();
+        $parentProduct->consume();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "App.Factory.run", "App.Target.replace"),
+        "self-reassignment RHS should keep its incoming Target binding: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "App.Factory.run", "App.Product.consume"),
+        "relative factory results should seed Product receivers: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "App.Factory.run", "App.BaseFactory.fromParent"),
+        "parent:: must edge to the declared parent owner: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "App.Factory.run", "App.Factory.fromParent"),
+        "parent:: must not be attributed to the child owner: {}",
+        value["edges"]
+    );
+}
