@@ -5428,7 +5428,7 @@ fn filter_and_dedupe_hits(
         definition_ranges
             .entry(overload.source().clone())
             .or_default()
-            .extend(analyzer.ranges_of(overload));
+            .extend(external_usage_definition_ranges(analyzer, overload));
     }
 
     let mut rows: BTreeMap<(String, usize, String, UsageHitKind), UsageHitRow> = BTreeMap::new();
@@ -5482,6 +5482,28 @@ fn filter_and_dedupe_hits(
     FilteredUsageHits {
         hits,
         definition_sites_excluded,
+    }
+}
+
+fn external_usage_definition_ranges(analyzer: &dyn IAnalyzer, target: &CodeUnit) -> Vec<Range> {
+    let ranges = analyzer.ranges_of(target);
+    let lookup_only_local_property = language_for_file(target.source()) == Language::JavaScript
+        && target.is_field()
+        && analyzer.parent_of(target).is_none()
+        && !analyzer.declarations(target.source()).contains(target);
+    if !lookup_only_local_property {
+        return ranges;
+    }
+
+    let Ok(source) = target.source().read_to_string() else {
+        return ranges;
+    };
+    let exact_ranges =
+        DeclarationNameRangeContext::new(target.source(), source).name_ranges(analyzer, target);
+    if exact_ranges.is_empty() {
+        ranges
+    } else {
+        exact_ranges
     }
 }
 

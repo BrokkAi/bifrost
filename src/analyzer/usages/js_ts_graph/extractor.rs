@@ -261,7 +261,7 @@ struct LocalPropertyDefinition {
     receiver_root: String,
     receiver_members: Vec<String>,
     scope: JsTsLexicalBindingScope,
-    range: Range,
+    property_range: Range,
 }
 
 fn collect_local_property_definitions(
@@ -292,15 +292,11 @@ fn collect_local_property_definitions(
                     .map(|member| slice(member, source).to_string())
                     .collect(),
                 scope,
-                range: fact.range,
+                property_range: fact.property_range,
             };
             Some(definition)
         })
         .collect()
-}
-
-fn range_contains_node(range: &Range, node: Node<'_>) -> bool {
-    range.start_byte <= node.start_byte() && node.end_byte() <= range.end_byte
 }
 
 fn local_property_read_matches(
@@ -327,8 +323,7 @@ fn local_property_read_matches(
                 .zip(&receiver.members)
                 .all(|(expected, actual)| expected == slice(*actual, source))
             && definition.scope == scope
-            && definition.range.start_byte < property.start_byte()
-            && !range_contains_node(&definition.range, property)
+            && definition.property_range.end_byte <= property.start_byte()
     })
 }
 
