@@ -32,10 +32,13 @@ pub fn run_searchtools_stdio_server(
 }
 
 pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
-    let definition_descriptor = if render_line_numbers {
-        get_definitions_by_location_descriptor()
+    let navigation_descriptors = if render_line_numbers {
+        vec![
+            get_declarations_by_location_descriptor(),
+            get_definitions_by_location_descriptor(),
+        ]
     } else {
-        get_definitions_by_reference_descriptor()
+        vec![get_definitions_by_reference_descriptor()]
     };
     let scan_descriptor = if render_line_numbers {
         scan_usages_by_location_descriptor()
@@ -89,10 +92,9 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
             summaries_schema(),
         ),
         scan_descriptor,
-        definition_descriptor,
     ];
+    descriptors.extend(navigation_descriptors);
     if render_line_numbers {
-        descriptors.push(get_declarations_by_location_descriptor());
         descriptors.push(get_type_by_location_descriptor());
     }
     descriptors.push(rename_symbol_descriptor());

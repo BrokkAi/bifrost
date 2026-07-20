@@ -13,7 +13,7 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
 - [x] (2026-07-20 12:06Z) Re-read repository instructions, inspected the clean issue branch, fetched `origin`, and confirmed HEAD matches its upstream at `3fdaa719`.
 - [x] (2026-07-20 12:21Z) Implemented the shared navigation operation and operation-aware analyzer selector while preserving the broad resolver.
 - [x] (2026-07-20 12:21Z) Added passing Java, C++, and Rust inline-project navigation contract coverage, including serialized operations.
-- [ ] Expose declaration navigation through MCP, path normalization, Python models/client/exports, and public documentation (completed: Rust MCP models, descriptor, registry, dispatch, and path normalization; remaining: MCP test expansion, Python, and docs).
+- [x] (2026-07-20 12:41Z) Exposed declaration navigation through MCP, path normalization, Python models/client/exports, and public documentation, with distinct serialized result fields and operations.
 - [ ] Advertise and dispatch LSP declaration navigation and extend the click-test harness.
 - [ ] Run focused tests, Python tests, formatting, clippy, full feature tests, and `git diff --check`.
 - [ ] Run the guided specialist review, address required findings, rerun affected gates, and record the reviewed outcome.
@@ -28,6 +28,8 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
   Evidence: The focused contract test initially returned `unresolvable_import_boundary`; inspecting the parsed S-expression showed `path: (bracketed_type (qualified_type type: ... alias: ...))`, after which field-based selection passed.
 - Observation: Direct `cargo test --features nlp,python` linking in this shell currently lacks Python symbols on macOS.
   Evidence: The first focused all-feature invocation compiled but failed linking `libbrokk_bifrost.dylib` with undefined `Py*` symbols. Non-Python Rust contract tests pass; the repository Python script and prescribed final gates remain pending.
+- Observation: The first Python-suite run encountered two transient analyzer-store EOF failures in unrelated temporary Python fixtures, but an immediate isolated rerun passed all 44 tests.
+  Evidence: `classify_test_files` and `usage_graph` initially failed while hydrating temporary `.py` files; the unchanged rerun completed `Ran 44 tests ... OK`.
 
 ## Decision Log
 
@@ -49,6 +51,8 @@ The behavior is observable through analyzer contract tests, MCP response JSON, P
 Implementation is in progress. At completion this section will summarize the protocol surface, language-specific navigation behavior, validation evidence, specialist-review findings, and any remaining follow-up work.
 
 Milestone 1 produced an explicit analyzer navigation path and the initial MCP location surface. Four focused contract tests pass: Java interface declaration selection, C++ prototype/body separation, C++ multi-body ambiguity, and Rust trait/implementation associated-type selection including qualified paths. Broad resolver entry points remain operation-free.
+
+Milestone 2 completed the public MCP and Python surface. MCP discovery, schema limits, line-number visibility, and live dispatch pass in 17 integration tests; the Python client exposes typed declaration and definition models and passes all 44 client tests. Public MCP and Python documentation now describes operation-specific fields and statuses while leaving reference-based definition lookup unchanged.
 
 ## Context and Orientation
 
@@ -126,3 +130,5 @@ Expose an analyzer entry point shaped like `resolve_navigation_batch(analyzer, r
 Plan revision note (2026-07-20 12:06Z): Created the living ExecPlan from the user-approved issue #955 implementation contract so work can be resumed from this file alone.
 
 Plan revision note (2026-07-20 12:21Z): Recorded milestone 1 implementation, focused passing evidence, the structured Rust AST field discovery, and the local PyO3 linker constraint before checkpointing.
+
+Plan revision note (2026-07-20 12:41Z): Recorded the completed MCP/Python/documentation milestone, its passing integration evidence, and the transient analyzer-store failure that disappeared on isolated rerun before checkpointing.

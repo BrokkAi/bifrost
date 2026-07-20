@@ -15,6 +15,19 @@ fn lookup_declaration(root: &std::path::Path, args: &str) -> Value {
     call_search_tool_json(root, "get_declarations_by_location", args)
 }
 
+fn lookup_declaration_with_definition_key(root: &std::path::Path, args: &str) -> Value {
+    let mut value = lookup_declaration(root, args);
+    for result in value["results"].as_array_mut().into_iter().flatten() {
+        if let Some(declarations) = result
+            .as_object_mut()
+            .and_then(|object| object.remove("declarations"))
+        {
+            result["definitions"] = declarations;
+        }
+    }
+    value
+}
+
 fn lookup_reference(root: &std::path::Path, args: &str) -> Value {
     call_search_tool_json(root, "get_definitions_by_reference", args)
 }
@@ -1610,7 +1623,7 @@ pub fn run_via_trait() -> String {
     );
 
     let assoc_line = "    type Output = String;";
-    let assoc = lookup(
+    let assoc = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"src/lib.rs","line":13,"column":{}}}]}}"#,
@@ -13076,7 +13089,7 @@ namespace Demo {
 }
 
 #[test]
-fn csharp_attribute_two_successful_alias_spellings_to_same_type_are_ambiguous() {
+fn csharp_attribute_two_successful_alias_spellings_to_same_type_resolve_once() {
     let source = r#"
 using Marker = Attributes.SharedAttribute;
 using MarkerAttribute = Attributes.SharedAttribute;
@@ -13105,10 +13118,7 @@ namespace Demo {
     );
 
     let result = &value["results"][0];
-    assert_eq!(
-        result["status"], "ambiguous",
-        "both successful attribute-name spellings are ambiguous even when they name the same logical type: {value}"
-    );
+    assert_eq!(result["status"], "resolved", "{value}");
     assert!(
         result["definitions"]
             .as_array()
@@ -13162,7 +13172,7 @@ namespace Demo {
     );
 
     let result = &value["results"][0];
-    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["status"], "ambiguous", "{value}");
     let mut paths = result["definitions"]
         .as_array()
         .expect("partial attribute definitions")
@@ -14519,7 +14529,7 @@ fn csharp_typed_receiver_method_wrong_arity_returns_overload_definitions() {
     );
 
     let result = &value["results"][0];
-    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["status"], "ambiguous", "{value}");
     assert_eq!(
         result["definitions"].as_array().unwrap().len(),
         2,
@@ -15001,7 +15011,7 @@ fn cpp_exact_fqn_candidate_ordering_does_not_hydrate_hidden_duplicate_files() {
         },
     );
     let result = &value.results[0];
-    assert_eq!(result.status, "resolved", "lookup result: {result:#?}");
+    assert_eq!(result.status, "ambiguous", "lookup result: {result:#?}");
     assert_eq!(
         result.definitions.len(),
         EXACT_CANDIDATES,
@@ -15418,7 +15428,7 @@ fn cpp_constructor_call_resolves_to_header_constructor_declaration() {
         .build();
 
     let line = "namespace example { Service::Service(Repository& repository) {} Service build_service(Repository& repository) { return Service(repository); } }";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"service.cpp","line":2,"column":{}}}]}}"#,
@@ -15449,7 +15459,7 @@ fn cpp_braced_constructor_call_resolves_to_matching_constructor_declaration() {
         .build();
 
     let line = "namespace ns { Target make() { return Target{1}; } }";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
@@ -15573,6 +15583,20 @@ fn cpp_definition_navigation_keeps_multiple_bodies_ambiguous() {
 }
 
 #[test]
+fn cpp_definition_navigation_does_not_fall_back_to_a_prototype() {
+    let source = "void run();\nvoid invoke() { run(); }\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+    let call = source.rfind("run").expect("function call");
+    let value = lookup(project.root(), &location_reference("app.cpp", source, call));
+
+    assert_eq!(value["results"][0]["operation"], "definition");
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert!(value["results"][0].get("definitions").is_none(), "{value}");
+}
+
+#[test]
 fn cpp_typed_receiver_method_filters_overloads_by_call_arity() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -15586,7 +15610,7 @@ fn cpp_typed_receiver_method_filters_overloads_by_call_arity() {
         .build();
 
     let line = "void handle(ns::Net& net, const ns::DataReader& dr) { net.load_model(dr); }";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
@@ -15620,7 +15644,7 @@ fn cpp_typed_receiver_method_wrong_arity_returns_overload_definitions() {
         .build();
 
     let line = "void handle(ns::Net& net, const ns::DataReader& dr) { net.load_model(dr, dr); }";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
@@ -15629,7 +15653,7 @@ fn cpp_typed_receiver_method_wrong_arity_returns_overload_definitions() {
     );
 
     let result = &value["results"][0];
-    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["status"], "ambiguous", "{value}");
     assert_eq!(
         result["definitions"].as_array().unwrap().len(),
         2,
@@ -15660,7 +15684,7 @@ fn cpp_typed_receiver_method_filters_overloads_by_argument_type() {
         .build();
 
     let line = "void bind(Net& net, DataReaderFromMemoryCopy& dr) { net.load_model(dr); }";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":4,"column":{}}}]}}"#,
@@ -15767,13 +15791,8 @@ fn assert_cpp_format_overload_definitions(value: &Value, expected_signature_frag
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     let definitions = result["definitions"].as_array().unwrap();
-    assert_eq!(definitions.len(), 2, "{value}");
-    let mut paths = definitions
-        .iter()
-        .map(|definition| definition["path"].as_str().unwrap_or_default().to_string())
-        .collect::<Vec<_>>();
-    paths.sort();
-    assert_eq!(paths, vec!["include/parity.h", "src/parity.cpp"], "{value}");
+    assert_eq!(definitions.len(), 1, "{value}");
+    assert_eq!(definitions[0]["path"], "src/parity.cpp", "{value}");
     assert!(
         definitions.iter().all(|definition| {
             definition["fqn"] == "parity.format"
@@ -15799,7 +15818,7 @@ fn cpp_typed_receiver_method_wrong_argument_type_returns_overload_definitions() 
         .build();
 
     let line = "void bind(Net& net, Other& other) { net.load_model(other); }";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":3,"column":{}}}]}}"#,
@@ -15808,7 +15827,7 @@ fn cpp_typed_receiver_method_wrong_argument_type_returns_overload_definitions() 
     );
 
     let result = &value["results"][0];
-    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["status"], "ambiguous", "{value}");
     assert_eq!(
         result["definitions"].as_array().unwrap().len(),
         2,
@@ -15842,7 +15861,7 @@ fn cpp_typed_receiver_method_filters_pointer_overload_by_argument_indirection() 
         .build();
 
     let line = "void bind(Sink& sink, Widget* wp) { sink.accept(wp); }";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":3,"column":{}}}]}}"#,
@@ -15880,7 +15899,7 @@ fn cpp_typed_receiver_method_filters_value_overload_by_argument_indirection() {
         .build();
 
     let line = "void bind(Sink& sink, Widget w) { sink.accept(w); }";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":3,"column":{}}}]}}"#,
@@ -15991,7 +16010,7 @@ void run() {
         .build();
 
     let resize = "    img.resize();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":13,"column":{}}},{{"path":"app.cpp","line":14,"column":{}}}]}}"#,
@@ -16058,7 +16077,7 @@ void run() {
         .build();
 
     let line = "    second.use();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":7,"column":{}}}]}}"#,
@@ -16099,7 +16118,7 @@ void run() {
         )
         .build();
 
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         r#"{"references":[{"path":"app.cpp","line":17,"column":9},{"path":"app.cpp","line":18,"column":9}]}"#,
     );
@@ -16137,7 +16156,7 @@ void run() {
         .build();
 
     let line = "    raw.use();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":10,"column":{}}}]}}"#,
@@ -16173,7 +16192,7 @@ void run() {
         .build();
 
     let line = "    raw.use();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":10,"column":{}}}]}}"#,
@@ -16209,7 +16228,7 @@ void run() {
         .build();
 
     let line = "    second.use();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":10,"column":{}}}]}}"#,
@@ -16245,7 +16264,7 @@ void run() {
         .build();
 
     let line = "    second.use();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":10,"column":{}}}]}}"#,
@@ -16281,7 +16300,7 @@ void run() {
         .build();
 
     let line = "    second->use();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":10,"column":{}}}]}}"#,
@@ -16443,7 +16462,7 @@ fn cpp_export_macro_class_recovery_handles_header_variants() {
             .build();
 
         let line = "void handle(Service& service) { service.run(); }";
-        let value = lookup(
+        let value = lookup_declaration_with_definition_key(
             project.root(),
             &format!(
                 r#"{{"references":[{{"path":"src/app.cpp","line":3,"column":{}}}]}}"#,
@@ -16850,7 +16869,7 @@ void Parser::run() {
         .build();
 
     let line = "    if (log_.atErrorLimit()) {}";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"parser.cpp","line":5,"column":{}}}]}}"#,
@@ -16905,7 +16924,7 @@ bool Parser::run() {
         .build();
 
     let line = "    return this->right();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"parser.cpp","line":6,"column":{}}}]}}"#,
@@ -16950,7 +16969,7 @@ bool Visitor::run() {
         .build();
 
     let line = "    return this->traverse();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"visitor.cpp","line":5,"column":{}}}]}}"#,
@@ -17012,7 +17031,7 @@ bool Visitor::run(const ast::TernaryOperator* tern) {
         .build();
 
     let line = "    return tern->condition();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"visitor.cpp","line":6,"column":{}}}]}}"#,
@@ -17319,7 +17338,7 @@ void run() {
         .build();
 
     let line = "    board.SetPowerSaveLevel();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":9,"column":{}}}]}}"#,
@@ -17359,7 +17378,7 @@ void run(NodeDefPtr nodeDef) {
         .build();
 
     let line = "    nodeDef->getActiveOutputs();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":13,"column":{}}}]}}"#,
