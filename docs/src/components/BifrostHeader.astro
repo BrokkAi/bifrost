@@ -1,0 +1,201 @@
+---
+import LanguageSelect from '@astrojs/starlight/components/LanguageSelect.astro';
+import Search from '@astrojs/starlight/components/Search.astro';
+import SiteTitle from '@astrojs/starlight/components/SiteTitle.astro';
+import SocialIcons from '@astrojs/starlight/components/SocialIcons.astro';
+import ThemeSelect from '@astrojs/starlight/components/ThemeSelect.astro';
+import type { StarlightRouteData } from '@astrojs/starlight/route-data';
+
+const { siteTitleHref } = (Astro.locals as { starlightRoute: StarlightRouteData }).starlightRoute;
+const root = siteTitleHref.endsWith('/') ? siteTitleHref : `${siteTitleHref}/`;
+const navItems = [
+	{ label: 'Overview', slug: 'overview/' },
+	{ label: 'Capabilities', slug: 'capabilities/' },
+	{ label: 'MCP', slug: 'mcp/' },
+	{ label: 'LSP', slug: 'lsp/' },
+	{ label: 'Querying', slug: 'code-querying/' },
+];
+const currentPath = Astro.url.pathname.replace(/\/+$/, '/');
+---
+
+<div class="bifrost-header-shell">
+	<div class="bifrost-brand sl-flex">
+		<span class="brand-signal" aria-hidden="true"><i></i><i></i><i></i></span>
+		<SiteTitle />
+	</div>
+	<nav class="bifrost-primary-nav print:hidden" aria-label="Primary">
+		{
+			navItems.map(({ label, slug }) => {
+				const href = `${root}${slug}`;
+				return (
+					<a href={href} aria-current={currentPath === href ? 'page' : undefined}>
+						{label}
+					</a>
+				);
+			})
+		}
+	</nav>
+	<div class="bifrost-header-search sl-flex print:hidden"><Search /></div>
+	<div class="bifrost-header-tools sl-hidden md:sl-flex print:hidden">
+		<div class="sl-flex social-icons"><SocialIcons /></div>
+		<ThemeSelect />
+		<LanguageSelect />
+	</div>
+</div>
+
+<style>
+	@layer starlight.user {
+		.bifrost-header-shell {
+			display: grid;
+			grid-template-columns: auto minmax(8rem, 22rem) auto;
+			align-items: center;
+			gap: clamp(0.65rem, 1.5vw, 1.35rem);
+			height: 100%;
+			max-width: 92rem;
+			margin-inline: auto;
+			padding: 0.45rem 0.55rem 0.45rem 0.8rem;
+			border: 1px solid rgb(255 255 255 / 0.11);
+			border-radius: 0.65rem;
+			background:
+				linear-gradient(180deg, rgb(255 255 255 / 0.055), transparent),
+				rgb(9 9 9 / 0.9);
+			box-shadow:
+				0 18px 42px rgb(0 0 0 / 0.34),
+				inset 0 1px rgb(255 255 255 / 0.025);
+			backdrop-filter: blur(18px) saturate(125%);
+		}
+
+		.bifrost-brand {
+			align-items: center;
+			gap: 0.65rem;
+			min-width: 0;
+		}
+
+		.brand-signal {
+			display: grid;
+			flex: 0 0 1.3rem;
+			width: 1.3rem;
+			height: 1.3rem;
+			place-items: center;
+		}
+
+		.brand-signal i {
+			position: absolute;
+			width: 0.68rem;
+			height: 0.68rem;
+			border: 1px solid #f4f1ec;
+			transform: rotate(45deg);
+		}
+
+		.brand-signal i:nth-child(1) {
+			transform: translate(-0.32rem, 0.25rem) rotate(45deg);
+			opacity: 0.38;
+		}
+
+		.brand-signal i:nth-child(2) {
+			border-color: #eb3f33;
+			box-shadow: 0 0 12px rgb(235 63 51 / 0.56);
+		}
+
+		.brand-signal i:nth-child(3) {
+			transform: translate(0.32rem, -0.25rem) rotate(45deg);
+			opacity: 0.62;
+		}
+
+		.bifrost-brand :global(.site-title) {
+			color: #f4f1ec;
+			font-family: var(--sl-font);
+			font-size: 0.95rem;
+			font-weight: 700;
+			letter-spacing: 0.035em;
+			text-transform: uppercase;
+		}
+
+		.bifrost-primary-nav {
+			display: none;
+			align-items: center;
+			justify-content: center;
+			gap: 0.12rem;
+		}
+
+		.bifrost-primary-nav a {
+			position: relative;
+			padding: 0.48rem 0.66rem;
+			color: #948b7e;
+			font-family: var(--sl-font-mono);
+			font-size: 0.67rem;
+			font-weight: 500;
+			letter-spacing: 0.055em;
+			text-decoration: none;
+			text-transform: uppercase;
+			transition: color 140ms ease, background-color 140ms ease;
+		}
+
+		.bifrost-primary-nav a::after {
+			position: absolute;
+			inset-inline: 0.65rem;
+			inset-block-end: 0.24rem;
+			height: 1px;
+			background: #eb3f33;
+			box-shadow: 0 0 8px #eb3f33;
+			content: '';
+			transform: scaleX(0);
+			transition: transform 140ms ease;
+		}
+
+		.bifrost-primary-nav a:hover,
+		.bifrost-primary-nav a:focus-visible,
+		.bifrost-primary-nav a[aria-current='page'] {
+			color: #f4f1ec;
+			background: rgb(255 255 255 / 0.035);
+		}
+
+		.bifrost-primary-nav a[aria-current='page']::after {
+			transform: scaleX(1);
+		}
+
+		.bifrost-header-search {
+			justify-self: end;
+			min-width: 0;
+		}
+
+		.bifrost-header-tools {
+			align-items: center;
+			gap: 0.72rem;
+		}
+
+		.social-icons {
+			align-items: center;
+			gap: 0.65rem;
+		}
+
+		.social-icons::after {
+			width: 1px;
+			height: 1.45rem;
+			background: rgb(255 255 255 / 0.12);
+			content: '';
+		}
+
+		@media (min-width: 50rem) {
+			.bifrost-header-shell {
+				grid-template-columns: minmax(11rem, auto) minmax(11rem, 22rem) auto;
+			}
+		}
+
+		@media (min-width: 72rem) {
+			.bifrost-header-shell {
+				grid-template-columns: minmax(11rem, auto) 1fr minmax(10rem, 20rem) auto;
+			}
+
+			.bifrost-primary-nav {
+				display: flex;
+			}
+		}
+
+		@media (max-width: 49.99rem) {
+			.bifrost-header-shell {
+				grid-template-columns: minmax(0, 1fr) auto;
+			}
+		}
+	}
+</style>
