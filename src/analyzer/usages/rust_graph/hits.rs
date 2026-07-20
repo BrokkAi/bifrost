@@ -43,7 +43,7 @@ fn record_scoped_identifier_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if has_ancestor_kind(node, "use_declaration") {
         return;
     }
-    if ctx.target_is_module || ctx.target_is_class {
+    if ctx.target_is_module || ctx.target_is_path_qualifier {
         record_scoped_target_segment_hit(node, ctx);
         return;
     }

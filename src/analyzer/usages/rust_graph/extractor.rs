@@ -12,7 +12,8 @@ use crate::analyzer::usages::rust_graph::hits::{
     record_hit, record_import_hit, record_module_qualified_hits,
 };
 use crate::analyzer::usages::rust_graph::resolver::{
-    is_trait_owner, resolve_scoped_associated_item, rust_token_path_segment_is_qualified,
+    is_trait_owner, resolve_scoped_associated_item_matching, rust_token_path_segment_is_qualified,
+    trait_member_for_impl_member,
 };
 use crate::analyzer::usages::traits::UsageScanScope;
 use crate::analyzer::{
@@ -204,7 +205,7 @@ pub(super) fn scan_files_for_target(
             support,
             target,
             target_fqn: &target_fqn,
-            target_is_class: target.is_class(),
+            target_is_path_qualifier: target.is_class() || rust.is_type_alias(target),
             target_is_module: target.is_module(),
             target_short: &target_short,
             direct_names: &direct_names,
@@ -234,7 +235,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) support: &'a GlobalUsageDefinitionIndex,
     target: &'a CodeUnit,
     pub(super) target_fqn: &'a str,
-    pub(super) target_is_class: bool,
+    pub(super) target_is_path_qualifier: bool,
     pub(super) target_is_module: bool,
     pub(super) target_short: &'a str,
     direct_names: &'a HashSet<String>,
@@ -1139,7 +1140,7 @@ fn record_static_member_name_hit(name: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
 }
 
 fn static_member_role_matches_target(is_call: bool, ctx: &MemberScanCtx<'_>) -> bool {
-    ctx.target_is_enum_variant || ctx.target_is_field != is_call
+    ctx.target_is_enum_variant || !ctx.target_is_field || !is_call
 }
 
 fn node_in_use_declaration(mut node: Node<'_>) -> bool {
@@ -1158,29 +1159,62 @@ fn scoped_static_member_matches_target(
     ctx: &MemberScanCtx<'_>,
 ) -> bool {
     if owner_name == "Self" {
-        return enclosing_impl_item(owner_node)
-            .and_then(|impl_item| impl_item.child_by_field_name("type"))
-            .is_some_and(|type_node| resolved_type_matches_owner(type_node, ctx));
+        return self_static_owner_matches_target(owner_node, ctx);
     }
 
-    match resolve_scoped_associated_item(
+    let item_matches = if ctx.target_is_field {
+        CodeUnit::is_field
+    } else {
+        CodeUnit::is_function
+    };
+    match resolve_scoped_associated_item_matching(
         ctx.rust,
         ctx.support,
         ctx.refs,
         ctx.file,
         owner_name,
         ctx.member_name,
+        item_matches,
     ) {
         ReceiverAnalysisOutcome::Precise(candidates) => candidates.into_iter().any(|candidate| {
-            candidate.fq_name() == ctx.requested_target.fq_name()
-                && candidate.source() == ctx.requested_target.source()
-                && candidate.kind() == ctx.requested_target.kind()
+            same_rust_declaration_identity(&candidate, ctx.requested_target)
+                || (ctx
+                    .rust
+                    .is_rust_trait_impl_member_declaration(&candidate)
+                    && trait_member_for_impl_member(ctx.rust, &candidate)
+                        .as_ref()
+                        .is_some_and(|trait_member| {
+                            same_rust_declaration_identity(trait_member, ctx.requested_target)
+                        }))
         }),
         ReceiverAnalysisOutcome::Ambiguous(_)
         | ReceiverAnalysisOutcome::Unknown
         | ReceiverAnalysisOutcome::Unsupported { .. }
         | ReceiverAnalysisOutcome::ExceededBudget { .. } => false,
     }
+}
+
+fn self_static_owner_matches_target(owner_node: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
+    let mut current = Some(owner_node);
+    while let Some(node) = current {
+        match node.kind() {
+            "impl_item" => {
+                let owner = if ctx.target_owner_is_trait {
+                    node.child_by_field_name("trait")
+                } else {
+                    node.child_by_field_name("type")
+                };
+                return owner.is_some_and(|owner| resolved_type_matches_owner(owner, ctx));
+            }
+            "trait_item" => {
+                return node
+                    .child_by_field_name("name")
+                    .is_some_and(|name| resolved_type_matches_owner(name, ctx));
+            }
+            _ => current = node.parent(),
+        }
+    }
+    false
 }
 
 fn self_like_constructor_returns(

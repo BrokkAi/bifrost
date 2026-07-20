@@ -145,6 +145,7 @@ pub(crate) fn resolve_rust_token_tree_paths<'tree>(
     resolved
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_token_path_segment_fqn(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
@@ -251,7 +252,7 @@ pub(super) fn is_graph_visible_member_target(rust: &RustAnalyzer, target: &CodeU
         return false;
     }
 
-    (rust.is_rust_trait_declaration(&owner) && target.is_function())
+    (rust.is_rust_trait_declaration(&owner) && (target.is_function() || target.is_field()))
         || (rust.is_rust_enum_declaration(&owner) && target.is_field())
         || is_trait_impl_member_target(rust, target, &owner)
 }
@@ -271,7 +272,7 @@ pub(super) fn trait_member_for_impl_member(
 }
 
 fn is_trait_impl_member_target(rust: &RustAnalyzer, target: &CodeUnit, owner: &CodeUnit) -> bool {
-    if !target.is_function() || rust.is_rust_trait_declaration(owner) {
+    if !(target.is_function() || target.is_field()) || rust.is_rust_trait_declaration(owner) {
         return false;
     }
     if rust.is_rust_trait_impl_member_declaration(target) {
@@ -333,6 +334,54 @@ pub(crate) fn resolve_scoped_associated_item(
     }
 
     resolve_trait_associated_item(rust, support, refs, file, &owner_fqn, method_name)
+}
+
+pub(crate) fn resolve_scoped_associated_item_matching(
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    refs: &RustReferenceContext,
+    file: &ProjectFile,
+    path: &str,
+    item_name: &str,
+    item_matches: fn(&CodeUnit) -> bool,
+) -> ReceiverAnalysisOutcome<CodeUnit> {
+    if let Some(direct) = refs.resolve_scoped(path, item_name) {
+        let candidates: Vec<_> = support
+            .fqn(&direct)
+            .into_iter()
+            .filter(|candidate| item_matches(candidate) && candidate.identifier() == item_name)
+            .collect();
+        if !candidates.is_empty() {
+            return ReceiverAnalysisOutcome::Precise(candidates);
+        }
+    }
+
+    let Some(owner_fqn) = refs.resolve_scoped_owner(path) else {
+        return ReceiverAnalysisOutcome::Unknown;
+    };
+    let direct = if owner_fqn.is_empty() {
+        item_name.to_string()
+    } else {
+        format!("{owner_fqn}.{item_name}")
+    };
+    let candidates: Vec<_> = support
+        .fqn(&direct)
+        .into_iter()
+        .filter(|candidate| item_matches(candidate) && candidate.identifier() == item_name)
+        .collect();
+    if !candidates.is_empty() {
+        return ReceiverAnalysisOutcome::Precise(candidates);
+    }
+
+    resolve_trait_associated_item_matching(
+        rust,
+        support,
+        refs,
+        file,
+        &owner_fqn,
+        item_name,
+        item_matches,
+    )
 }
 
 /// Compiler-style trait-candidate step for an owner type already resolved to
