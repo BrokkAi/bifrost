@@ -83,12 +83,25 @@ pub fn format_rqlp_source_with_options(
         max_width: options.max_width,
     };
     let lines = formatter.render_expr(&expr, 0, 0);
+    let line_ending = source_line_ending(source);
 
     let mut output = String::with_capacity(source.len());
     output.push_str(&source[..expr.range.start]);
-    output.push_str(&lines.join("\n"));
+    output.push_str(&lines.join(line_ending));
     output.push_str(&source[expr.range.end..]);
     Ok(output)
+}
+
+fn source_line_ending(source: &str) -> &'static str {
+    let bytes = source.as_bytes();
+    let Some(index) = bytes.iter().position(|byte| *byte == b'\n') else {
+        return "\n";
+    };
+    if index > 0 && bytes[index - 1] == b'\r' {
+        "\r\n"
+    } else {
+        "\n"
+    }
 }
 
 fn parse_for_formatting(source: &str) -> Result<Expr, PolicySourceError> {

@@ -20,6 +20,8 @@ const HTTP_ENDPOINT: &str =
     include_str!("fixtures/policy-cli/project/policies/endpoints/http-request-parameter.rqlp");
 const ACQUIRE_ENDPOINT: &str =
     include_str!("fixtures/policy-cli/project/policies/endpoints/resource-acquire.rqlp");
+const INFERRED_ACQUIRE_ENDPOINT: &str =
+    include_str!("fixtures/policy-cli/project/policies/endpoints/resource-acquire-inferred.rqlp");
 const CLOSE_ENDPOINT: &str =
     include_str!("fixtures/policy-cli/project/policies/endpoints/resource-close.rqlp");
 
@@ -256,12 +258,9 @@ fn strict_versions_endpoint_roots_and_unsupported_runs_are_status_two_reports() 
     );
     assert_eq!(report["runs"][0]["completion"]["type"], "unsupported");
 
-    let inferred_endpoint = ACQUIRE_ENDPOINT
-        .replace("  :schema-version 1\n", "")
-        .replace("      :schema-version 2\n", "");
     let dependency_project = policy_project(&[(
         "policies/endpoints/resource-acquire.rqlp",
-        inferred_endpoint,
+        INFERRED_ACQUIRE_ENDPOINT.to_string(),
     )]);
     let strict_dependency = run(
         dependency_project.root(),

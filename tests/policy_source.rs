@@ -578,6 +578,23 @@ fn formatter_is_lossless_for_comments_unicode_and_in_progress_schema_errors() {
 }
 
 #[test]
+fn formatter_preserves_crlf_without_creating_mixed_line_endings() {
+    let source = "; before\r\n(policy :id \"p\" :name \"P\" :message \"M\" :severity warning :analysis (analysis :type match :selector (rql (call :callee (name \"eval\")))))\r\n; after\r\n";
+    let options = PolicyFormatOptions::new(80).unwrap();
+    let once = format_rqlp_source_with_options(source, &options).unwrap();
+    let without_crlf = once.replace("\r\n", "");
+
+    assert!(once.contains("\r\n  :analysis"), "{once:?}");
+    assert!(once.ends_with("\r\n; after\r\n"), "{once:?}");
+    assert!(!without_crlf.contains(['\r', '\n']), "{once:?}");
+    assert_eq!(
+        format_rqlp_source_with_options(&once, &options).unwrap(),
+        once,
+        "CRLF formatting must be idempotent",
+    );
+}
+
+#[test]
 fn complete_document_formatting_matches_width_golds_and_is_idempotent() {
     let source = fixture_source("endpoints/http-request-parameter.rqlp");
     for width in [80, 100, 120] {

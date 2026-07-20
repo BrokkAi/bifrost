@@ -395,6 +395,8 @@ fn marked_examples(path: &Path, contents: &str) -> Vec<MarkedExample> {
 
 fn read(path: impl AsRef<Path>) -> String {
     let path = path.as_ref();
-    fs::read_to_string(path)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+    normalize_line_endings(
+        &fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display())),
+    )
 }
