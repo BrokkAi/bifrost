@@ -504,6 +504,114 @@ class Runner:
 }
 
 #[test]
+fn python_dead_code_targeted_graph_preserves_expensive_member_resolution_paths() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Command:
+    def call_result_target(self):
+        return 1
+
+    def keyword_target(self):
+        return 2
+
+class Noise:
+    def irrelevant(self):
+        return 3
+
+def build() -> Command:
+    return Command()
+
+def noise() -> Noise:
+    return Noise()
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Command, Noise, build, noise
+
+def run():
+    build().call_result_target()
+    Command(keyword_target=1)
+    noise().irrelevant()
+    Noise(unrelated=2)
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let call_result_target = python_definition(&analyzer, "service.Command.call_result_target");
+    let keyword_target = python_definition(&analyzer, "service.Command.keyword_target");
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["service.py".to_string(), "consumer.py".to_string()],
+            fq_names: vec![call_result_target.fq_name(), keyword_target.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    for target in [
+        "service.Command.call_result_target",
+        "service.Command.keyword_target",
+    ] {
+        assert!(result.report.contains(target), "{}", result.report);
+    }
+    assert_eq!(
+        2,
+        result
+            .report
+            .matches("one workspace inbound edge from consumer.run")
+            .count(),
+        "{}",
+        result.report
+    );
+}
+
+#[test]
+fn python_dead_code_targeted_graph_preserves_namespace_reexport_aliases() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "proto/modules.py",
+            "def define_module():\n    return None\n",
+        )
+        .file(
+            "proto/__init__.py",
+            "from .modules import define_module as module\n",
+        )
+        .file(
+            "consumer.py",
+            "import proto\n\ndef build():\n    first = proto.module()\n    return proto.module()\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = python_definition(&analyzer, "proto.modules.define_module");
+
+    let result = report_dead_code_and_unused_abstraction_smells(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec![
+                "proto/modules.py".to_string(),
+                "proto/__init__.py".to_string(),
+                "consumer.py".to_string(),
+            ],
+            fq_names: vec![target.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result
+            .report
+            .contains("No dead code or unused abstraction smells met minScore 8."),
+        "{}",
+        result.report
+    );
+}
+
+#[test]
 fn js_dead_code_smell_reports_unused_export() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(

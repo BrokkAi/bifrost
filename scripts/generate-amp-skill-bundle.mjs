@@ -45,7 +45,7 @@ const INCLUDED_TOOLS = [
 export function buildAmpSkillBundleFiles(repoRoot = REPO_ROOT) {
   const canonicalSections = CANONICAL_SKILLS.map(({ dir, title }) => {
     const sourcePath = path.join(repoRoot, PACKAGE_ROOT, "skills", dir, "SKILL.md");
-    const source = fs.readFileSync(sourcePath, "utf8");
+    const source = normalizeLineEndings(fs.readFileSync(sourcePath, "utf8"));
     return {
       dir,
       title,
@@ -55,8 +55,12 @@ export function buildAmpSkillBundleFiles(repoRoot = REPO_ROOT) {
 
   const skill = buildSkillMarkdown(canonicalSections);
   const mcp = buildMcpJson();
-  const launcher = fs.readFileSync(path.join(repoRoot, PACKAGE_ROOT, "bin/bifrost-launcher.mjs"), "utf8");
-  const releaseMetadata = fs.readFileSync(path.join(repoRoot, PACKAGE_ROOT, "bifrost-release.json"), "utf8");
+  const launcher = normalizeLineEndings(
+    fs.readFileSync(path.join(repoRoot, PACKAGE_ROOT, "bin/bifrost-launcher.mjs"), "utf8"),
+  );
+  const releaseMetadata = normalizeLineEndings(
+    fs.readFileSync(path.join(repoRoot, PACKAGE_ROOT, "bifrost-release.json"), "utf8"),
+  );
 
   return new Map([
     ["SKILL.md", skill],
@@ -64,6 +68,10 @@ export function buildAmpSkillBundleFiles(repoRoot = REPO_ROOT) {
     ["bin/bifrost-launcher.mjs", launcher],
     ["bifrost-release.json", releaseMetadata],
   ]);
+}
+
+function normalizeLineEndings(content) {
+  return content.replace(/\r\n?/g, "\n");
 }
 
 export function writeAmpSkillBundle(repoRoot = REPO_ROOT) {

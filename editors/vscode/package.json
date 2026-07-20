@@ -2,15 +2,15 @@
   "name": "bifrost-vscode",
   "displayName": "Bifrost: Multi-Language LSP & MCP Server",
   "description": "Tree-sitter-backed code intelligence for definitions, references, symbols, hierarchy, rename, diagnostics, and MCP workflows.",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "bifrost": {
-    "binaryVersion": "0.8.4",
+    "binaryVersion": "0.8.5",
     "archiveSha256": {
-      "aarch64-pc-windows-msvc": "0b6f39af681ebc554bb5b6352d8c1ff2fae7201c14abe8e3fc91c5f310626d10",
-      "aarch64-unknown-linux-gnu": "13afc4f3f4ca38ad145de403c5e5287050ba824400eda5f7fe888d217a6996f3",
-      "universal-apple-darwin": "8983ab2efe4be69d387a9d6f79619f93e71d275ea6eb8aa30b9a889c4ff0b605",
-      "x86_64-pc-windows-msvc": "51cc7c733d98dcbf7cf6c312a3d529fa40c6298a2af7e9358acb09a325541613",
-      "x86_64-unknown-linux-gnu": "4248c1ebb350229a3d22b3bae90623b0bb3e542359f265d77443263190c40922"
+      "aarch64-pc-windows-msvc": "affc2f83cc2197ee366e96bc2db11edef2866a0f93ce415686625922f50ccefb",
+      "aarch64-unknown-linux-gnu": "dbd0895107a4310195b44c987a722b9256738c303e2588c09296173de484cd67",
+      "universal-apple-darwin": "8d47d1d7603bf190ed11467ce91688bfc42d88321cc2ff0ce550530ad91e3dc1",
+      "x86_64-pc-windows-msvc": "1551d011bcfc76663e71cf53bda25845690dc48e3a566e5a881632f7b9c3a22f",
+      "x86_64-unknown-linux-gnu": "59a34fb3dadb74868a63e48eceebe799ab8dfc7247220deeea7b298966709eca"
     }
   },
   "publisher": "brokk",
@@ -42,6 +42,7 @@
     "onLanguage:php",
     "onLanguage:scala",
     "onLanguage:bifrost-rql",
+    "onLanguage:bifrost-rql-policy",
     "onLanguage:bifrost-rune-ir"
   ],
   "main": "./out/extension.js",
@@ -60,6 +61,21 @@
         "icon": {
           "light": "./icons/bifrost-rql.png",
           "dark": "./icons/bifrost-rql.png"
+        }
+      },
+      {
+        "id": "bifrost-rql-policy",
+        "aliases": [
+          "Bifrost RQL Policy",
+          "bifrost-rql-policy"
+        ],
+        "extensions": [
+          ".rqlp"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/bifrost-rql-policy.svg",
+          "dark": "./icons/bifrost-rql-policy.svg"
         }
       },
       {
@@ -83,6 +99,11 @@
         "language": "bifrost-rql",
         "scopeName": "source.bifrost-rql",
         "path": "./syntaxes/bifrost-rql.tmLanguage.json"
+      },
+      {
+        "language": "bifrost-rql-policy",
+        "scopeName": "source.bifrost-rql-policy",
+        "path": "./syntaxes/bifrost-rql-policy.tmLanguage.json"
       },
       {
         "language": "bifrost-rune-ir",

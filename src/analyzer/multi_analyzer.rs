@@ -62,6 +62,40 @@ impl AnalyzerDelegate {
         }
     }
 
+    pub(crate) fn language(&self) -> Language {
+        match self {
+            Self::Java(_) => Language::Java,
+            Self::CSharp(_) => Language::CSharp,
+            Self::Cpp(_) => Language::Cpp,
+            Self::Go(_) => Language::Go,
+            Self::JavaScript(_) => Language::JavaScript,
+            Self::Php(_) => Language::Php,
+            Self::Python(_) => Language::Python,
+            Self::TypeScript(_) => Language::TypeScript,
+            Self::Rust(_) => Language::Rust,
+            Self::Scala(_) => Language::Scala,
+            Self::Ruby(_) => Language::Ruby,
+        }
+    }
+
+    pub(crate) fn program_semantics_provider(
+        &self,
+    ) -> &dyn crate::analyzer::semantic::ProgramSemanticsProvider {
+        match self {
+            Self::Java(analyzer) => analyzer,
+            Self::CSharp(analyzer) => analyzer,
+            Self::Cpp(analyzer) => analyzer,
+            Self::Go(analyzer) => analyzer,
+            Self::JavaScript(analyzer) => analyzer,
+            Self::Php(analyzer) => analyzer,
+            Self::Python(analyzer) => analyzer,
+            Self::TypeScript(analyzer) => analyzer,
+            Self::Rust(analyzer) => analyzer,
+            Self::Scala(analyzer) => analyzer,
+            Self::Ruby(analyzer) => analyzer,
+        }
+    }
+
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         match self {
             Self::Java(analyzer) => Self::Java(analyzer.clone_with_project(project)),
@@ -272,8 +306,16 @@ impl MultiAnalyzer {
             .any(|context| context.store_error().is_some())
     }
 
-    fn delegate_for_file(&self, file: &ProjectFile) -> Option<&AnalyzerDelegate> {
+    pub(crate) fn delegate_for_file(&self, file: &ProjectFile) -> Option<&AnalyzerDelegate> {
         self.delegates.get(&language_for_file(file))
+    }
+
+    pub(crate) fn program_semantics_provider_for_file(
+        &self,
+        file: &ProjectFile,
+    ) -> Option<&dyn crate::analyzer::semantic::ProgramSemanticsProvider> {
+        self.delegate_for_file(file)
+            .map(AnalyzerDelegate::program_semantics_provider)
     }
 
     fn delegate_for_code_unit(&self, code_unit: &CodeUnit) -> Option<&AnalyzerDelegate> {

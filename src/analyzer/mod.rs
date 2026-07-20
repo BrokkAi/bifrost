@@ -19,6 +19,7 @@ pub(crate) mod lexical_definitions;
 mod model;
 mod multi_analyzer;
 mod php;
+pub mod policy;
 mod pool_memo;
 mod project;
 mod python;
@@ -100,7 +101,7 @@ pub use model::{
     TestAssertionSmell, TestAssertionWeights, metrics_from_declarations,
 };
 pub(crate) use model::{
-    CppTemplateAliasTargetMetadata, CppTemplateExpression, CppTemplateMetadata,
+    CallableLinkage, CppTemplateAliasTargetMetadata, CppTemplateExpression, CppTemplateMetadata,
     CppTemplateParameterKind, CppTemplateParameterMetadata, CppTemplateTerm, SemanticDiagnostic,
 };
 pub(crate) use multi_analyzer::resolve_analyzer;
@@ -116,7 +117,8 @@ pub(crate) use php::{
 pub(crate) use pool_memo::PoolSafeMemo;
 pub use project::{
     DEFAULT_MAX_OVERLAY_BYTES, FileSetProject, FilesystemProject, MultiRootProject, OverlayProject,
-    Project, TestProject, collect_workspace_files,
+    OverlayRevision, Project, ProjectSourceOrigin, ProjectSourceSnapshot, TestProject,
+    collect_workspace_files,
 };
 pub use python::PythonAnalyzer;
 pub(crate) use python::{

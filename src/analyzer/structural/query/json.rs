@@ -11,13 +11,24 @@ impl CodeQuery {
     /// debugging and by tests asserting that both frontends parse to the same
     /// query (`parse(json).to_canonical_json() == parse(sexp).to_canonical_json()`).
     pub fn to_canonical_json(&self) -> Value {
-        let mut object = plan_to_json(&self.plan);
-        object.insert("schema_version".to_string(), json!(self.schema_version));
+        let Value::Object(mut object) = self.to_canonical_query_plan_json() else {
+            unreachable!("canonical query plans are JSON objects");
+        };
         object.insert("limit".to_string(), json!(self.limit));
         object.insert(
             "result_detail".to_string(),
             json!(self.result_detail.label()),
         );
+        Value::Object(object)
+    }
+
+    /// Canonical typed query-plan meaning without execution/output controls.
+    ///
+    /// Policy selectors use this projection because policy evaluation owns its
+    /// result budget and detail level independently of the authored selector.
+    pub(crate) fn to_canonical_query_plan_json(&self) -> Value {
+        let mut object = plan_to_json(&self.plan);
+        object.insert("schema_version".to_string(), json!(self.schema_version));
         Value::Object(object)
     }
 }

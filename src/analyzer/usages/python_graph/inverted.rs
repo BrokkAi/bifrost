@@ -38,14 +38,25 @@ pub(super) fn build_python_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
     py: &PythonAnalyzer,
     nodes: &HashSet<String>,
+    targets: &HashSet<String>,
     keep_file: F,
 ) -> Output
 where
     Output: UsageEdgeBuildOutput<String>,
     F: Fn(&ProjectFile) -> bool + Sync,
 {
+    // `nodes` remains the complete caller/callee graph domain. `targets` is the
+    // subset whose inbound references this build must resolve and retain.
+    debug_assert!(targets.is_subset(nodes));
     let files: Vec<ProjectFile> = py.get_analyzed_files().into_iter().collect();
     let language = tree_sitter_python::LANGUAGE.into();
+    let mut targets_by_terminal: HashMap<String, Vec<String>> = HashMap::default();
+    for target in targets {
+        targets_by_terminal
+            .entry(target.rsplit('.').next().unwrap_or(target).to_string())
+            .or_default()
+            .push(target.clone());
+    }
     let canonical_namespace_candidates: Mutex<HashMap<String, Arc<Vec<String>>>> =
         Mutex::new(HashMap::default());
     build_edge_output(&files, keep_file, |file| {
@@ -111,7 +122,8 @@ where
             let mut ctx = PyScan {
                 analyzer,
                 py,
-                nodes,
+                targets,
+                targets_by_terminal: &targets_by_terminal,
                 file,
                 source,
                 named,
@@ -129,7 +141,8 @@ where
 struct PyScan<'a, 'b> {
     analyzer: &'a dyn IAnalyzer,
     py: &'a PythonAnalyzer,
-    nodes: &'a HashSet<String>,
+    targets: &'a HashSet<String>,
+    targets_by_terminal: &'a HashMap<String, Vec<String>>,
     file: &'a ProjectFile,
     source: &'a str,
     named: HashMap<String, String>,
@@ -183,6 +196,9 @@ impl PyScan<'_, '_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
+        if !self.targets.contains(&callee) {
+            return;
+        }
         self.collector.record_kind(
             callee,
             classify_reference_node(node),
@@ -192,8 +208,13 @@ impl PyScan<'_, '_> {
     }
 
     fn record_unproven_name(&mut self, name: &str, node: Node<'_>) {
-        self.collector
-            .record_unproven_name(name, node.start_byte(), node.end_byte());
+        let Some(targets) = self.targets_by_terminal.get(name) else {
+            return;
+        };
+        for target in targets {
+            self.collector
+                .record_unproven(target.clone(), node.start_byte(), node.end_byte());
+        }
     }
 
     fn canonical_namespace_candidates(&self, direct: &str) -> Arc<Vec<String>> {
@@ -352,17 +373,17 @@ fn handle_attribute<'a>(
     if object_text.is_empty() || attribute_text.is_empty() {
         return;
     }
-    if object.kind() == "call" {
+    if object.kind() == "call" && ctx.targets_by_terminal.contains_key(attribute_text) {
         for class in call_result_types(ctx.analyzer, ctx.py, ctx.file, ctx.source, object) {
             let direct = format!("{}.{attribute_text}", class.fq_name());
-            if ctx.nodes.contains(&direct) {
+            if ctx.targets.contains(&direct) {
                 ctx.record(direct, attribute);
                 continue;
             }
             if let Some(provider) = ctx.analyzer.type_hierarchy_provider() {
                 for ancestor in provider.get_ancestors(&class) {
                     let inherited = format!("{}.{attribute_text}", ancestor.fq_name());
-                    if ctx.nodes.contains(&inherited) {
+                    if ctx.targets.contains(&inherited) {
                         ctx.record(inherited, attribute);
                     }
                 }
@@ -377,14 +398,19 @@ fn handle_attribute<'a>(
     {
         let module = binding.module.clone();
         let workspace_module = binding.workspace_module;
-        if ctx.nodes.contains(&module) {
+        if ctx.targets.contains(&module) {
             ctx.record(module.clone(), object);
         }
         let direct = format!("{module}.{attribute_text}");
-        if ctx.nodes.contains(&direct) {
+        if ctx.targets.contains(&direct) {
             ctx.record(direct, attribute);
             return;
         }
+        // A re-export alias can change the terminal name (`proto.module` may
+        // canonically resolve to `proto.modules.define_module`), so terminal-name
+        // filtering is not sound here. Namespace imports are already a narrow,
+        // structured subset of attributes; resolve their workspace candidates
+        // and let `record` retain only requested targets.
         if workspace_module {
             for resolved in ctx.canonical_namespace_candidates(&direct).iter() {
                 ctx.record(resolved.clone(), attribute);
@@ -398,7 +424,9 @@ fn handle_attribute<'a>(
     // for a proven edge, but they are structured evidence that a same-named
     // member may be reachable, so bulk dead-code treats the candidate as
     // inconclusive instead of dead.
-    if let Some(facts) = facts {
+    if let Some(facts) = facts
+        && ctx.targets_by_terminal.contains_key(attribute_text)
+    {
         if let Some(type_fqn) = ctx.receiver_type_fqn(facts, object_text) {
             ctx.record(format!("{type_fqn}.{attribute_text}"), attribute);
         } else if object.kind() == "identifier"
@@ -429,7 +457,7 @@ fn handle_keyword_argument(node: Node<'_>, ctx: &mut PyScan<'_, '_>, scopes: &[F
         return;
     };
     let member = slice(name, ctx.source);
-    if member.is_empty() {
+    if member.is_empty() || !ctx.targets_by_terminal.contains_key(member) {
         return;
     }
     let classes = if function.kind() == "identifier" && slice(function, ctx.source) == "cls" {
@@ -444,14 +472,14 @@ fn handle_keyword_argument(node: Node<'_>, ctx: &mut PyScan<'_, '_>, scopes: &[F
     };
     for class in classes {
         let direct = format!("{}.{member}", class.fq_name());
-        if ctx.nodes.contains(&direct) {
+        if ctx.targets.contains(&direct) {
             ctx.record(direct, name);
             continue;
         }
         if let Some(provider) = ctx.analyzer.type_hierarchy_provider() {
             for ancestor in provider.get_ancestors(&class) {
                 let inherited = format!("{}.{member}", ancestor.fq_name());
-                if ctx.nodes.contains(&inherited) {
+                if ctx.targets.contains(&inherited) {
                     ctx.record(inherited, name);
                 }
             }

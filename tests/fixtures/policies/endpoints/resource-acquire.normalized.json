@@ -1,0 +1,32 @@
+{
+  "binding": {
+    "type": "return_value"
+  },
+  "categories": [
+    "resource.acquire",
+    "resource.lifecycle"
+  ],
+  "display_name": "acquired resource",
+  "id": "bifrost.resources.acquire",
+  "name": "Resource acquisition",
+  "role": "source",
+  "schema_version": 1,
+  "selector": {
+    "query": {
+      "languages": [
+        "python"
+      ],
+      "match": {
+        "callee": {
+          "name": "open_resource"
+        },
+        "kind": "call"
+      },
+      "schema_version": 2
+    },
+    "schema_version": 2,
+    "type": "inline"
+  },
+  "supersedes": [],
+  "type": "endpoint"
+}

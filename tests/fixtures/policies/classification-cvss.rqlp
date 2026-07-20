@@ -1,0 +1,39 @@
+; Classification and CVSS rules enrich a finding after the match policy has
+; produced evidence. Metric-rule order is intentional and therefore retained.
+(policy
+  :id "bifrost.security.network-input"
+  :name "Network input"
+  :message "Network input reaches a sensitive operation"
+  :severity (cvss-severity :when-unscored unrated)
+  :analysis
+    (analysis
+      :type match
+      :selector (rql (language python (call :callee (name "network_input")))))
+  :classification
+    (classification
+      :fallback
+        (classification-id
+          :taxonomy "Bifrost"
+          :id "NETWORK-INPUT")
+      :refinements [
+        (refinement
+          :when (analysis-type :is match)
+          :add [
+            (classification-id
+              :taxonomy "CWE"
+              :id "CWE-20"
+              :name "Improper Input Validation")])]
+      :cvss
+        (cvss
+          :version "4.0"
+          :emit when-base-complete
+          :metric-rules [
+            (metric
+              :name AV
+              :value N
+              :when (analysis-type :is match)
+              :basis policy-assertion
+              :scope vulnerable-system
+              :evidence-refs [policy:self]
+              :rationale "Input reaches the vulnerable system over the network"
+              :assumptions ["The operation is remotely reachable"])])))

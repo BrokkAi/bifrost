@@ -1156,11 +1156,18 @@ impl RustTypeLookupCache {
 }
 
 fn rust_field_expression_member_kind(field_expression: Node<'_>) -> RustMemberKind {
-    if let Some(parent) = field_expression.parent()
+    let mut function = field_expression;
+    while let Some(parent) = function.parent()
+        && parent.kind() == "generic_function"
+        && parent.child_by_field_name("function") == Some(function)
+    {
+        function = parent;
+    }
+    if let Some(parent) = function.parent()
         && parent.kind() == "call_expression"
         && parent
             .child_by_field_name("function")
-            .is_some_and(|function| function.id() == field_expression.id())
+            .is_some_and(|callee| callee.id() == function.id())
     {
         RustMemberKind::Function
     } else {

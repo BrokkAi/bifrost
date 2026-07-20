@@ -1,0 +1,32 @@
+{
+  "binding": {
+    "type": "receiver"
+  },
+  "categories": [
+    "resource.close",
+    "resource.lifecycle"
+  ],
+  "display_name": "resource close",
+  "id": "bifrost.resources.close",
+  "name": "Resource close",
+  "role": "sink",
+  "schema_version": 1,
+  "selector": {
+    "query": {
+      "languages": [
+        "python"
+      ],
+      "match": {
+        "callee": {
+          "name": "close"
+        },
+        "kind": "call"
+      },
+      "schema_version": 2
+    },
+    "schema_version": 2,
+    "type": "inline"
+  },
+  "supersedes": [],
+  "type": "endpoint"
+}

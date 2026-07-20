@@ -32,6 +32,7 @@ impl GraphUsageOutcome {
             GraphUsageOutcome::FallbackSafe(diagnostic)
             | GraphUsageOutcome::TerminalFailure(diagnostic) => FuzzyResult::Failure {
                 fq_name: diagnostic.fq_name,
+                reason_kind: diagnostic.reason_kind,
                 reason: diagnostic.reason,
             },
         }

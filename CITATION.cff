@@ -9,8 +9,8 @@ authors:
 contact:
   - name: "Brokk, Inc."
     website: "https://brokk.ai"
-version: "0.8.4"
-date-released: "2026-07-16"
+version: "0.8.5"
+date-released: "2026-07-20"
 repository-code: "https://github.com/BrokkAi/bifrost"
 repository-artifact: "https://github.com/BrokkAi/bifrost/releases"
 url: "https://brokkai.github.io/bifrost/"

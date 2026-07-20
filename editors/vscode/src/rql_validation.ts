@@ -2,7 +2,11 @@ import { RQL_LANGUAGE_ID } from "./rql_query";
 
 export const VALIDATE_RQL_QUERY_METHOD = "bifrost/validateQuery";
 export const RQL_QUERY_HOVER_METHOD = "bifrost/queryHover";
+export const RQL_POLICY_LANGUAGE_ID = "bifrost-rql-policy";
+export const VALIDATE_RQL_POLICY_METHOD = "bifrost/validatePolicy";
+export const RQL_POLICY_HOVER_METHOD = "bifrost/policyHover";
 export const RQL_VALIDATION_DELAY_MS = 300;
+export const RQL_SOURCE_LANGUAGE_IDS = [RQL_LANGUAGE_ID, RQL_POLICY_LANGUAGE_ID] as const;
 
 export interface WirePosition {
   line: number;
@@ -41,7 +45,10 @@ export interface CancellationSource<Token = unknown> {
 }
 
 export interface RqlValidationDependencies<Token = unknown> {
-  validate(query: string, token: Token): Promise<{ diagnostics: WireDiagnostic[] }>;
+  validate(
+    document: RqlValidationDocument,
+    token: Token
+  ): Promise<{ diagnostics: WireDiagnostic[] }>;
   publish(uri: string, diagnostics: WireDiagnostic[]): void;
   clear(uri: string): void;
   isCurrent(document: RqlValidationDocument): boolean;
@@ -66,7 +73,7 @@ export class RqlValidationController<Token = unknown> {
   ) {}
 
   schedule(document: RqlValidationDocument): void {
-    if (document.languageId !== RQL_LANGUAGE_ID) {
+    if (!isRqlSourceLanguage(document.languageId)) {
       this.close(document.uri);
       return;
     }
@@ -104,7 +111,7 @@ export class RqlValidationController<Token = unknown> {
     const cancellation = this.dependencies.createCancellationSource();
     state.cancellation = cancellation;
     try {
-      const response = await this.dependencies.validate(document.text, cancellation.token);
+      const response = await this.dependencies.validate(document, cancellation.token);
       const current = this.states.get(document.uri);
       if (current?.generation === generation && this.dependencies.isCurrent(document)) {
         this.dependencies.publish(document.uri, response.diagnostics);
@@ -149,6 +156,79 @@ export function queryHoverParams(
   position: WirePosition
 ): { query: string; position: WirePosition } {
   return { query, position };
+}
+
+export function policyHoverParams(
+  source: string,
+  position: WirePosition
+): { source: string; position: WirePosition } {
+  return { source, position };
+}
+
+export function isRqlSourceLanguage(languageId: string): boolean {
+  return RQL_SOURCE_LANGUAGE_IDS.some((candidate) => candidate === languageId);
+}
+
+/** Shared selectors for custom hover and standard LSP formatting/completion. */
+export function rqlFileDocumentSelectors(): Array<{
+  scheme: "file";
+  language: (typeof RQL_SOURCE_LANGUAGE_IDS)[number];
+}> {
+  return RQL_SOURCE_LANGUAGE_IDS.map((language) => ({ scheme: "file", language }));
+}
+
+export type RqlValidationRequest =
+  | { method: typeof VALIDATE_RQL_QUERY_METHOD; params: { query: string } }
+  | { method: typeof VALIDATE_RQL_POLICY_METHOD; params: { source: string } };
+
+export function validationRequest(
+  document: RqlValidationDocument
+): RqlValidationRequest | undefined {
+  switch (document.languageId) {
+    case RQL_LANGUAGE_ID:
+      return {
+        method: VALIDATE_RQL_QUERY_METHOD,
+        params: { query: document.text }
+      };
+    case RQL_POLICY_LANGUAGE_ID:
+      return {
+        method: VALIDATE_RQL_POLICY_METHOD,
+        params: { source: document.text }
+      };
+    default:
+      return undefined;
+  }
+}
+
+export type RqlHoverRequest =
+  | {
+      method: typeof RQL_QUERY_HOVER_METHOD;
+      params: ReturnType<typeof queryHoverParams>;
+    }
+  | {
+      method: typeof RQL_POLICY_HOVER_METHOD;
+      params: ReturnType<typeof policyHoverParams>;
+    };
+
+export function hoverRequest(
+  languageId: string,
+  source: string,
+  position: WirePosition
+): RqlHoverRequest | undefined {
+  switch (languageId) {
+    case RQL_LANGUAGE_ID:
+      return {
+        method: RQL_QUERY_HOVER_METHOD,
+        params: queryHoverParams(source, position)
+      };
+    case RQL_POLICY_LANGUAGE_ID:
+      return {
+        method: RQL_POLICY_HOVER_METHOD,
+        params: policyHoverParams(source, position)
+      };
+    default:
+      return undefined;
+  }
 }
 
 /** Clear pending work and published diagnostics when the LSP connection dies. */

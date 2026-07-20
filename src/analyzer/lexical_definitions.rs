@@ -78,10 +78,8 @@ pub(crate) fn formal_parameter_slots(
     root: Node<'_>,
     source: &str,
     declaration_range: &Range,
-) -> FormalParameterLayout {
-    let Some(owner) = parameter_owner_for_range(language, root, declaration_range) else {
-        return FormalParameterLayout::default();
-    };
+) -> Option<FormalParameterLayout> {
+    let owner = parameter_owner_for_range(language, root, declaration_range)?;
     let python_binding = (language == Language::Python)
         .then(|| python_method_binding(owner, source, declaration_range));
     let lambda = is_lambda_owner(language, owner.kind());
@@ -133,10 +131,10 @@ pub(crate) fn formal_parameter_slots(
         });
     }
 
-    FormalParameterLayout {
+    Some(FormalParameterLayout {
         slots,
         python_binding,
-    }
+    })
 }
 
 fn python_method_binding(

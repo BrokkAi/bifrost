@@ -234,7 +234,11 @@ fn expand_reference_expression(
         break;
     }
     loop {
-        if right + 2 <= bytes.len() && &bytes[right..right + 2] == b"::" {
+        if right + 2 < bytes.len()
+            && &bytes[right..right + 2] == b"::"
+            && (is_ident_byte(bytes[right + 2], allow_at_ident)
+                || matches!(bytes[right + 2], b'{' | b'*'))
+        {
             right += 2;
             while right < bytes.len() && is_ident_byte(bytes[right], allow_at_ident) {
                 right += 1;
@@ -306,6 +310,41 @@ mod tests {
             expand_reference_expression(source, start, end, false),
             (start, end)
         );
+    }
+
+    #[test]
+    fn expand_reference_expression_does_not_absorb_rust_turbofish_separator() {
+        let source = "leaf::<Item>()";
+        let start = source.find("leaf").expect("free function");
+        let end = start + "leaf".len();
+
+        assert_eq!(
+            expand_reference_expression(source, start, end, false),
+            (start, end)
+        );
+
+        let source = "Type::make::<Item>()";
+        let start = source.find("make").expect("associated function");
+        let end = start + "make".len();
+
+        assert_eq!(
+            &source[{
+                let (start, end) = expand_reference_expression(source, start, end, false);
+                start..end
+            }],
+            "Type::make"
+        );
+    }
+
+    #[test]
+    fn expand_reference_expression_retains_grouped_and_glob_path_separators() {
+        for source in ["workflow::{job}", "workflow::*"] {
+            let start = source.find("workflow").expect("path prefix");
+            let end = start + "workflow".len();
+            let (expanded_start, expanded_end) =
+                expand_reference_expression(source, start, end, false);
+            assert_eq!(&source[expanded_start..expanded_end], "workflow::");
+        }
     }
 
     #[test]

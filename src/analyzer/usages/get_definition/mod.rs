@@ -104,9 +104,11 @@ mod rust;
 mod scala;
 
 pub(crate) use call_sites::{
-    CallSiteSyntax, CallSyntaxKind, call_reference_ranges_in_tree, call_signature_context,
-    call_site_syntax_for_reference, is_call_reference_range_in_tree,
+    CallSiteSyntax, CallSyntaxKind, ExactCallReference, ExactCallReferenceGap,
+    call_reference_ranges_in_tree, call_reference_requires_point_lookup, call_signature_context,
+    call_site_syntax_for_reference, exact_call_reference_for_call, is_call_reference_range_in_tree,
 };
+pub(crate) use cpp::CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC;
 pub(crate) use csharp::{CSharpTypeLookupResolution, csharp_type_lookup_resolution};
 pub(crate) use go::{
     AnalyzerGoDefinitionProvider, GoDefinitionProvider, GoTypeLookupResolutionKind,

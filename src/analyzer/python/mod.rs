@@ -5,6 +5,7 @@ mod declarations;
 mod diagnostics;
 mod hierarchy;
 mod imports;
+mod semantic;
 pub(crate) mod structural;
 mod syntax;
 mod tests;

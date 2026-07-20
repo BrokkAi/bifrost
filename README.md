@@ -2,7 +2,7 @@
 
 <p align="center">
   <a href="https://brokkai.github.io/bifrost/">
-    <img src="docs/src/assets/bifrost-social-card.svg" alt="Bifrost — static analysis built for code intelligence" width="720">
+    <img src="docs/src/assets/bifrost-social-card.svg" alt="Bifrost — code intelligence for AI, with structural queries and multi-language analysis designed for repository-scale use" width="720">
   </a>
 </p>
 

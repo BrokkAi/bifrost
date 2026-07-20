@@ -10,7 +10,7 @@ Bifrost already answers structural, reference, call, and bounded receiver questi
 
 After the first vertical slice, a rule author should be able to describe a finite-state resource protocol once, select relevant program entities through `CodeQuery` or RQL, run the protocol across matched calls and returns in TypeScript and Java, and receive a bounded source-backed may finding that says which facts and summaries supported it and whether ambiguity or budgets made the analysis incomplete. A trivial one-state client should use the same substrate for direct and indirect data flow, and a source/sink/sanitizer client should use it for taint-style propagation.
 
-The public policy model must also avoid the narrow-rule trap of enumerating every source/sink pair as a separate vulnerability rule and solver run. A taint policy declares sets of attacker-controlled source classes and security-sensitive sink classes, runs one multi-source/multi-sink propagation, and reports a meeting whenever a compatible reached source label arrives at a sink. Specific CWE classifications refine that broad security finding; failure to select a narrow CWE must not suppress the generic vulnerability. Procedure summaries describe propagation independently of concrete seed/sink lists so policies and classifications can reuse the same dynamic-programming work.
+The public policy model must also avoid the narrow-rule trap of enumerating every source/sink pair as a separate vulnerability rule and solver run. Human-authored diagnostic-neutral endpoint leaves attach typed bindings, opaque categories, display phrases, and source/sink semantics to native RQL matches. A taint policy explicitly selects endpoint sets by category or exact identity, runs one multi-source/multi-sink propagation, and reports a meeting whenever a compatible reached source label arrives at a sink. One uniquely dominant intentional combination may replace the fixed generated source-to-sink presentation; otherwise the broad finding remains. Specific CWE classifications refine rather than create that finding. Procedure summaries describe propagation independently of concrete seed/sink lists, categories, messages, and classifications so policies can reuse the same dynamic-programming work.
 
 The initial target is meet-over-valid-interprocedural-paths analysis. “Valid” means call and return edges are matched rather than traversed as unrelated graph edges. The first solver accepts finite distributive may problems whose reachable facts join with set union, plus bounded-height IDE edge values that satisfy the laws specified below. A must claim requires a separately defined and validated problem; it is not obtained by relabeling a may result. The first platform does not use SMT to prove arbitrary branch feasibility.
 
@@ -30,9 +30,33 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [x] (2026-07-16 15:32+02:00) Implemented #814's identities, capabilities, outcomes/budgets, immutable artifact/procedure IR, invariant validation, scoped handles, bounded renderer, and TypeScript/Java contract fixtures.
 - [x] (2026-07-16 18:01+02:00) Completed #814 after specialist review and final invariant audits; all focused tests, the complete `nlp,python` suite, all-target/all-feature clippy, formatting, and diff checks passed, and the reviewed implementation was checkpointed as `296c1de1` after rebasing onto current `master`.
 - [x] (2026-07-16 19:20+02:00) Addressed all guided-review findings in `1faf8b9b`, including converged typed continuations, targetless uncertain callable creation, and shared bounded-renderer/registry utilities; all repository gates passed.
-- [ ] Complete #815 and the first adapter children: build equivalent per-callable CFGs for TypeScript and Java.
+- [x] (2026-07-17 10:10+02:00) Started #815 execution with the focused living plan `.agents/plans/all-language-cfg-icfg-rollout.md`, spanning callable CFGs, the #816 dispatch prerequisite, one #818 ICFG, all eleven analyzable-language adapters, and the evidence-gated CFG/ICFG slice of #817.
+- [x] (2026-07-17 11:40+02:00) Completed #815 Milestone 1a: canonical rich control-edge IDs, immutable bidirectional adjacency, storage-independent predecessor/successor traversal, corruption validation, bounded schema-v2 rendering, shared CFG contract tests, full repository gates, and post-milestone specialist review are green.
+- [x] (2026-07-17 14:34+02:00) Completed #815 Milestones 1b and 1c: the atomic file/dialect-aware provider, bounded exact source snapshots, complete-only semantic cache, private iterative CFG builder, real TypeScript/TSX callable lowering, source-backed adjacency harness, full repository gates, and specialist review are green.
+- [x] (2026-07-17 16:05+02:00) Completed the TypeScript/TSX and Java reference callable-CFG checkpoints under #815, including the shared inline topology harness, typed advanced-feature gaps, differential cases, representation benchmark, strict repository gates, and post-milestone reviews. The all-language #815 rollout remains open behind the reference ICFG contract.
+- [x] (2026-07-17 16:54+02:00) Completed the #816 dispatch prerequisite and #818 TypeScript/Java vertical slice: exact whole-call resolution, one bounded context-bearing ICFG, matched normal/exceptional returns, typed incomplete boundaries, source-generation validation, shared inline assertions, and post-milestone review are complete. The shared adapter contract is frozen for the remaining #815 languages.
+- [x] (2026-07-17 17:00+02:00) Created and natively attached the nine remaining #815 rollout children: #887 JavaScript/JSX, #886 C#, #888 Python, #889 Go, #891 Rust, #890 PHP, #892 Scala, #893 Ruby, and #894 C/C++, each cross-linked to #816 and #818.
+- [x] (2026-07-18 10:45+02:00) Completed #815 Milestone 4a: JavaScript and JSX now share the structured TypeScript lowering core behind exact flavor identities and pass the common direct-call CFG/ICFG conformance contract with point-scoped advanced-feature gaps.
+- [x] (2026-07-18 11:52+02:00) Completed #815 Milestone 4b: C# now supplies real callable CFGs and direct matched-return ICFGs through the frozen shared provider, builder, dispatch, and snapshot boundary; independent review fixed indexed-call evaluation, target-typed object-initializer order, and conditional-compilation gaps before checkpoint validation.
+- [x] (2026-07-18 12:06+02:00) Validated the reviewed C# checkpoint with formatting, diff checks, strict all-target/all-feature clippy, and the complete host-access `nlp,python` repository suite (1,053 library tests passed, 4 ignored, plus every binary, integration, and doc-test target).
+- [x] (2026-07-18 13:11+02:00) Completed and validated #815 Milestone 4c: Python now supplies real callable CFGs and direct matched-return ICFGs through the shared engine, with deferred coroutine/generator invocation modeled explicitly; specialist review fixes, 37 CFG, 17 ICFG, 28 language-conformance, 11 provider tests, strict clippy, and the complete host-access feature suite are green.
+- [x] (2026-07-18 14:17+02:00) Completed and validated #815 Milestone 4d: Go now supplies real callable CFGs and matched-return ICFGs through the shared engine; specialist review made selected-call omissions and partially unspecified evaluation order explicit, proved shadowed `panic`/`recover` dispatch, and passed 37 CFG, 17 ICFG, 37 language-conformance, 11 provider tests, strict clippy, and the complete host-access feature suite.
+- [x] (2026-07-18 15:52+02:00) Completed and validated #815 Milestone 4e: Rust now supplies real callable CFGs and matched-return ICFGs through the shared engine; specialist review made parameter, lexical, pattern-binding, assignment-replacement, and abrupt-path RAII/Drop omissions exact, prevented fabricated try-block and macro control, exposed implicit trait-call gaps, corrected labeled-block break routing and generic dispatch, and passed 39 CFG, 17 ICFG, 55 language-conformance, 11 provider, and 483 definition tests plus strict clippy and the complete host-access feature suite.
+- [x] (2026-07-18 17:20+02:00) Completed and validated #815 Milestone 4f: PHP now supplies real callable CFGs and matched-return ICFGs through the shared engine; specialist review corrected whole-chain nullsafe and nullish control, loop and switch grammar, first-class callable classification, method-return dispatch, bounded candidate selection, zero-target ambiguity, and exact `finally` routing, then passed 39 CFG, 18 ICFG, 10 semantic-IR, 73 language-conformance, 11 provider, and 486 definition tests plus strict clippy and the complete host-access feature suite.
+- [x] (2026-07-18 19:00+02:00) Completed #815 Milestone 4g: Scala now supplies real callable CFGs and matched-return ICFGs through the shared engine; specialist review corrected partial-function and initializer ownership, non-local closure return, curried constructor collapse, parameter-list arity and primary-constructor shape, generic wrapper and operator dispatch, nested-call pruning, structured-argument cardinality, and by-name/implicit-operation gaps, then passed 39 CFG, 18 ICFG, 10 semantic-IR, 93 language-conformance, 11 provider, and 497 definition tests plus focused call-site/call-relation suites.
+- [x] (2026-07-18 19:12+02:00) Validated the final reviewed #815 Milestone 4g tree with formatting, diff checks, strict all-target/all-feature clippy, and the complete host-access `nlp,python` suite across every library, binary, integration, and doc-test target.
+- [x] (2026-07-18 21:27+02:00) Completed #815 Milestone 4h: Ruby now supplies real callable CFGs and matched-return ICFGs through the shared engine; specialist review corrected pattern evaluation, callable-table mutation, destructured writers, bounded collection, non-local cleanup, operator and callable-object dispatch, lifecycle-block ownership, and parser-ordered local activation and closure capture, then passed 39 CFG, 18 ICFG, 10 semantic-IR, 111 language-conformance, 11 provider, 497 definition, and 17 Ruby library/dispatch tests.
+- [x] (2026-07-18 21:46+02:00) Validated the final reviewed #815 Milestone 4h tree with formatting, diff checks, strict all-target/all-feature clippy, and the complete host-access `nlp,python` suite (1,079 library tests passed, 4 ignored, plus every binary, integration, and doc-test target).
+- [x] (2026-07-19 00:48+02:00) Completed #815 Milestone 4i and the all-language adapter rollout: C and C++ now supply real callable CFGs and matched-return ICFGs through the same shared engine as the other nine rollout targets; C/C++ and cross-language specialist reviews closed with no P0/P1 findings after correcting structured linkage, implicit-object and late-static dispatch, path-sensitive return evidence, unresolved-boundary quality, and caller-side implicit evaluation gaps.
+- [x] (2026-07-19 00:48+02:00) Passed the reviewed all-language focused gates: 39 CFG, 25 ICFG, 129 language-conformance, 10 semantic-IR, 11 provider, 9 ICFG-unit, 14 call-relation-unit, and 498 definition tests.
+- [x] (2026-07-19 01:06+02:00) Validated the final reviewed #815 Milestone 4i tree with formatting, diff checks, strict all-target/all-feature clippy, and the complete host-access `nlp,python` suite (1,094 library tests passed, 4 ignored, plus every binary, integration, and doc-test target). The focused #817 persistence measurement remains open.
+- [x] (2026-07-20 09:23+02:00) Completed the focused #817 semantic/CFG lifecycle slice with nine-process release matrices over generated graphs, inline TypeScript/Java fixtures, pinned VS Code, and pinned Spring PetClinic. Bidirectional edge-ID rows remain the hot layout; production SQLite is a measured no-go because the optimistic packed control/call projection failed the VS Code absolute write-overhead gate. Later value-flow, solver, and summary lifecycle decisions remain open under #817.
+- [x] (2026-07-20 09:23+02:00) Completed a post-rollout semantic architecture audit. It confirmed one shared language-neutral ICFG, identified repeated point/effect/call emission and procedure-driver mechanics across adapters, and recommended a dedicated no-semantic-change extraction before #816 value/heap and data-dependence work; no source refactor is implicitly authorized by this planning observation.
+- [x] (2026-07-20 09:59+02:00) Validated the exact final #815/#817 tree with focused representation and persistence tests, formatting and diff checks, strict isolated all-target/all-feature clippy, and the complete host-access `nlp,python` repository suite (1,094 library tests passed, 4 ignored, plus every binary, integration, and doc-test target).
+- [x] (2026-07-17 10:18+02:00) Diagnosed #709 and added `.agents/plans/issue-709-static-analysis-policy-format.md`, selecting a distinct S-expression `.rqlp` authoring language with native versioned RQL selectors and canonical JSON only as generated interchange.
+- [x] (2026-07-17 15:14+02:00) Synchronized compatible omitted policy/RQL versions, diagnostic-neutral categorized endpoint leaves, explicit match-directory manifests, generated/default versus superseding combination presentation, and resolved endpoint-driven typestate terminal expectations from the clarified #709 workflow.
 - [ ] Complete #816 in parallel: expose reusable dispatch, value, heap, and bounded access-path oracles for the reference languages.
-- [ ] Complete #818: stitch CFG fragments through existing call relations into a demand-materialized ICFG.
+- [x] Complete #818's internal TypeScript/Java control-topology slice: stitch CFG fragments through existing call relations into a demand-materialized ICFG. Public query exposure and value/heap transfers remain in their owning issues.
 - [ ] Complete #819 as needed: add iterative reachability, reverse postorder, SCC, and loop utilities; add dominators only after a named client justifies them.
 - [ ] Complete #820: implement an iterative, summary-driven IFDS/IDE-shaped solver with budgets, cancellation, uncertainty, and witnesses.
 - [ ] Complete #821 and #822: prove simple data-flow/taint reuse, then add the finite-state protocol IR and typestate client.
@@ -41,7 +65,7 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [ ] Complete #824: expose typed, bounded CFG/data-flow/taint/typestate domains through `CodeQuery` and RQL, then adapt diagnostic-neutral findings to #709's policy boundary.
 - [ ] Complete #825: deliver and benchmark one TypeScript/Java resource-lifecycle protocol through internal, query, `.rqlp`, human, and SARIF paths.
 - [ ] Complete #826 only after #825: decide, with evidence, whether WPDS weights or synchronized call/field pushdown precision should be implemented.
-- [ ] Open per-language rollout children under #815 and #816 only after the reference adapters stabilize the neutral contracts.
+- [x] Opened and natively attached per-language rollout children under #815 after the reference CFG/ICFG contract stabilized; their ordered implementation remains tracked in the focused rollout plan.
 
 ## Surprises & Discoveries
 
@@ -78,6 +102,69 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - Observation: GitHub supports native subissues in this repository, so #814 through #826 can be attached directly to #813 while retaining explicit dependency text in each body.
   Evidence: the live `subIssues` query for #813 returned all thirteen children.
 
+- Observation: #815's predecessor/successor contract requires a rich-edge graph shape that the existing payloadless compact graph cannot directly supply.
+  Evidence: semantic CFGs preserve parallel source-target edges with different kinds or evidence, so one canonical `ControlEdge` table plus edge-ID adjacency is required. The focused implementation and rollout are tracked in `.agents/plans/all-language-cfg-icfg-rollout.md`.
+
+- Observation: #815 Milestone 1a validated the initial bidirectional shape without freezing later adapter or ICFG boundaries.
+  Evidence: schema-v2 `ControlFlowGraph` introduced canonical rich edges, outgoing offsets, and incoming edge-ID rows; exact traversal and rendering are deterministic under permuted construction and corrupted incoming order is rejected. At that checkpoint, TypeScript/Java lowering and the provider boundary remained intentionally deferred to the next focused milestones.
+
+- Observation: #815 Milestones 1b and 1c proved that exact source identity, publication, and dead-code isolation are part of the semantic contract rather than adapter conveniences.
+  Evidence: the provider atomically snapshots bounded disk or overlay content with dialect and monotonic overlay revision, caches only complete immutable artifacts by retained bytes, and lowers TypeScript/TSX through an iterative builder whose reachability seal preserves dead internal topology without permitting dead-to-live or dead-to-exit reconnections.
+
+- Observation: the TypeScript/Java differential checkpoint forced one additional neutral completion kind but did not require language-specific CFG storage or a universal syntax-lowering IR.
+  Evidence: Java switch-expression `yield` now uses a shared cleanup-safe yieldable continuation, while Java syntax still maps structured tree-sitter fields directly into the private sequence, branch, loop, call, handler, cleanup, and abrupt-completion builder operations. Java executable initializer fragments are real procedures with scoped deferred-scheduling gaps rather than fabricated constructor flow.
+
+- Observation: bidirectional adjacency remains the measured hot layout even though outgoing-only CSR saves 22-30% retained bytes in representative cases.
+  Evidence: the release matrix measured reverse traversal rising from roughly one millisecond to 6.5-8.5 seconds on 100k-edge synthetic graphs and by 5-7x on TypeScript/Java corpus artifacts. Flat edges made both directions linear scans. The canonical edge table plus outgoing offsets plus incoming edge-ID rows therefore survives the Milestone 2 representation gate.
+
+- Observation: the TypeScript/Java ICFG slice requires context-bearing snapshot nodes even though callable CFG nodes remain context-free.
+  Evidence: two call sites entering one callee share the immutable procedure artifact, but their callee exits must return to different continuations. Interning `(program point, exact bounded call stack)` in the ephemeral snapshot preserves that distinction without cloning or persisting the base CFG.
+
+- Observation: the first post-reference rollout did not require a second adapter engine or ICFG implementation.
+  Evidence: JavaScript/JSX reuse the TypeScript structured lowerer with explicit grammar-flavor branches and unchanged TypeScript fingerprints, while the existing location-first dispatch facade and context-bearing `WorkspaceIcfgProvider` materialize their cross-file calls without language-specific stitching.
+
+- Observation: the first independently implemented post-reference adapter also fit the frozen graph and dispatch boundary, while exposing why conformance must exercise grammar-specific evaluation shapes.
+  Evidence: C# direct calls use the existing dispatch oracle and shared ICFG unchanged. Review-driven tests were still needed to prove indexed delegate evaluation, conditional element binding, target-typed object initializers, and terminal configuration-dependent `#if` boundaries, because those shapes use different tree-sitter fields than superficially similar member and object-creation expressions.
+
+- Observation: async and generator flags are insufficient to determine call-to-body control across languages.
+  Evidence: Python coroutine/generator calls, JavaScript generators, and C# iterators create suspended objects, while JavaScript and C# async calls begin synchronously. The common procedure contract now records invocation timing independently, and the single ICFG represents deferred targets as typed boundaries with explicit caller-continuation models rather than false body entry.
+
+- Observation: deterministic semantic topology and language-defined evaluation order are separate contracts.
+  Evidence: Go fully orders calls, method calls, receives, and logical operations but leaves some surrounding operands and composite-literal elements unordered. The Go adapter retains deterministic source-order rows for identity and rendering while attaching source-backed control gaps to the exact parents whose relative order is incomplete.
+
+- Observation: scheduled or selected calls can be syntactically identifiable without being valid immediate ICFG transfers.
+  Evidence: Go `defer` and `go` evaluate function values and arguments immediately but schedule the outer call for later or concurrent execution; `select` evaluates communication operands before choosing one case. Omitting only the non-immediate or selected-only calls and reporting typed call/scheduling gaps preserves known evaluation without fabricating control.
+
+- Observation: a shared cleanup-continuation stack can represent language-specific destructor uncertainty without inventing destructor bodies or calls.
+  Evidence: Rust parameter, lexical, and pattern scopes use opaque cleanup markers so normal and abrupt exits carry exact cleanup/resource/call/exception gaps at real transfer points, while assignment replacement has its own point-scoped omissions and shared CFG/ICFG destinations remain unchanged.
+
+- Observation: conservative structured lowering sometimes requires suppressing apparently traversable syntax.
+  Evidence: lowering `?` inside an unsupported Rust try block through the procedure completion scope fabricated a return. Treating the try block and macro expansion as terminal typed boundaries is more accurate than plausible-looking inner topology, while operators, indexing, autoderef, and await retain known prefixes with implicit-call gaps.
+
+- Observation: language-local short-circuit scope can be broader than one AST operator node.
+  Evidence: PHP's nullsafe operator skips the remainder of one complete access chain, including later calls, properties, arguments, dynamic names, and subscripts, but nested subexpressions start independent nullsafe scopes. An adapter-owned chain continuation expresses that rule without changing common graph or ICFG mechanics.
+
+- Observation: exact call-expression identity is sufficient for an incomplete dispatch outcome even when no separate callee-leaf span exists.
+  Evidence: unresolved and bounded ambiguous PHP sites retain exact call handles but may have no publishable leaf. Requiring every completed dispatch to retain a target or typed boundary preserves the outcome without fabricated syntax; intermediate nullsafe properties remain definition candidates but no longer consume immediate-call budgets.
+
+- Observation: Scala callable ownership and call completeness cannot be inferred from a node kind or argument delimiter alone.
+  Evidence: standalone `case_block`s are deferred partial-function bodies while match/catch cases execute immediately; initializer subtrees own nested closures but not member methods; parentheses do not prove strict parameters and braces do not prove by-name parameters. The adapter therefore keys partial execution by the current procedure body, preserves synthetic initializer ownership only through executable subtrees, retains one actual per structured argument, and publishes exact deferred/implicit-call/exception gaps whenever signatures or runtime protocols are unresolved.
+
+- Observation: Ruby local-versus-call classification requires a parser-ordered binding timeline, including the source position where each nested callable is created.
+  Evidence: a bare name before its first structured assignment is a call while the same name after that assignment is local; assignment targets activate before their right-hand side, and closures inherit only outer bindings already active at their syntax position. Exact semantic dispatch can apply this timeline, while legacy outgoing-call discovery remains intentionally narrow until it shares the same callable context.
+
+- Observation: the final C/C++ adapter did not require a second graph or ICFG, but it did require link-unit identity and caller-side uncertainty to remain separate from control topology.
+  Evidence: compatible declarations and definitions coalesce through structured C/C++ resolution while configuration, default arguments, implicit conversions/calls, temporaries, RAII, exceptions, spawn, coroutines, and `noexcept` remain exact gaps. The same location-first oracle and context-bearing ICFG then preserve proven targets with partial transfer evidence where appropriate.
+
+- Observation: context-matched return topology alone does not prove complete completion transfer.
+  Evidence: reachable cleanup, exceptional, or non-local gaps on a callee entry-to-exit path can alter whether or how that exit is reached. A bounded iterative forward/reverse path mask now weakens only affected returns, so disconnected omissions no longer contaminate an otherwise exact call while every unresolved dispatch boundary remains incompatible with a complete snapshot.
+
+- Observation: the focused #817 benchmark distinguishes traversal layout from persistence lifecycle and rejects promotion on the conjunction of predeclared gates.
+  Evidence: bidirectional rows traverse the generated 100k branch graph in 0.566/0.566 ms versus outgoing-only 0.559/4,467.02 ms and flat 4,450.98/4,438.78 ms. The optimistic SQLite projection hydrated pinned VS Code in 207.05 ms versus a 24,614.13 ms rebuild and pinned Spring PetClinic in 0.79 ms versus 58.21 ms, but VS Code build-plus-write added 1,275.69 ms and failed the 250 ms absolute-overhead gate. Production storage therefore remains unchanged for this artifact slice.
+
+- Observation: the eleven language adapters share graph and ICFG mechanics but still duplicate a lower-level semantic emission substrate.
+  Evidence: `src/analyzer/semantic/icfg.rs` owns the one generic ICFG, while the language `semantic.rs` modules repeat point allocation, source/evidence mapping, values, effects, gaps, call scaffolding, budget staging, and finalization. The highest-value cleanup is a source-anchor-aware `ProcedureLoweringSession` plus a shared call scaffold and procedure batch driver, not a universal syntax visitor. The generic ICFG also contains two C++-specific gap checks that should become typed gap-impact metadata before value/heap work expands the dependency surface.
+
 ## Decision Log
 
 - Decision: target meet-over-valid-interprocedural-paths analysis rather than SMT-backed path feasibility.
@@ -108,6 +195,62 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
   Rationale: this matches the successful compact structural snapshot pattern from PR #802 and avoids persisting query-specific product states or maintaining rich and compact duplicate graphs.
   Date: 2026-07-16.
 
+- Decision: execute #815, the dispatch slice of #816, #818, and all remaining language adapters through one focused living plan while retaining issue-sized checkpoint reviews.
+  Rationale: TypeScript and Java must pressure-test both intraprocedural lowering and matched interprocedural transfers before the contract freezes, while one continuous record keeps all-language capability gaps and the CFG/ICFG lifecycle slice of #817 coherent. Later value-flow, solver, and summary persistence decisions remain in the broader roadmap. The implementation still preserves issue ownership and excludes public query, solver, value/heap, and typestate work.
+  Date: 2026-07-17.
+
+- Decision: publish semantic artifacts only from one bounded, origin- and overlay-revision-aware syntax snapshot, and cache only complete values by conservative retained bytes with per-key single flight.
+  Rationale: key/artifact races, entry-count-only memory bounds, duplicate concurrent lowering, and reuse of cancelled or partial work would all undermine later ICFG and solver correctness. Exact complete artifacts may be reused across analyzer updates when their full source identity is unchanged.
+  Date: 2026-07-17.
+
+- Decision: enforce dead-source isolation with a shared iterative CFG seal after language lowering.
+  Rationale: language adapters retain syntactically present unreachable points for diagnostics and analysis, but those points must never reconnect to entry-reachable control or either real exit. Enforcing the invariant at the graph boundary keeps future adapters honest without replacing their structured completion semantics.
+  Date: 2026-07-17.
+
+- Decision: keep Java switch-expression `yield` distinct from procedure return and loop/switch break in the neutral completion vocabulary.
+  Rationale: yield targets the nearest switch-expression merge and must preserve that destination through intervening cleanup. A dedicated completion kind prevents cross-return and avoids mislabeling language semantics while remaining dormant for adapters that do not emit it.
+  Date: 2026-07-17.
+
+- Decision: retain canonical bidirectional control-edge rows after the TypeScript/Java representation benchmark.
+  Rationale: outgoing-only storage achieved meaningful memory savings but failed the reverse-traversal contract decisively; rebuilding or lazily retaining a reverse index would either reintroduce the same state or make traversal latency unpredictable. Flat storage failed both directions. Persistence remains a separate #817 lifecycle decision.
+  Date: 2026-07-17.
+
+- Decision: confirm bidirectional control-edge rows with the final generated and representative-corpus matrix, and record a no-go for production persistence of the current semantic/CFG control-and-call slice.
+  Rationale: both traversal directions remain hot contractual APIs, and the final matrix reproduced the reverse-traversal penalty of leaner layouts at corpus scale. Although an optimistic packed SQLite DTO demonstrated large hydration savings, it failed the predeclared VS Code absolute write-overhead gate; a fuller equivalent artifact would add payload and invalidation cost. Per-file semantic artifacts remain immutable and byte-bounded in memory, ICFG stitches remain generation-local, and bounded snapshots remain ephemeral. This does not prejudge later value-flow or reusable-summary persistence candidates.
+  Date: 2026-07-20.
+
+- Decision: freeze one exact-location dispatch facade and one context-bearing demand-materialized ICFG as the cross-language control boundary.
+  Rationale: existing query and LSP resolution remains authoritative for candidate discovery, while the ICFG provider alone owns invoke-scaffold suppression, bounded call contexts, matched returns, typed incomplete boundaries, and dense traversal snapshots. This prevents each language adapter from inventing a second resolver or ICFG.
+  Date: 2026-07-17.
+
+- Decision: reuse the JavaScript/TypeScript structured lowering core through flavor-specific semantic providers while preserving separate durable adapter/configuration fingerprints.
+  Rationale: shared control mechanics eliminate drift, but exact prepared-language validation and JavaScript-specific fields, resource declarations, and JSX gaps keep each grammar honest. JSX remains a JavaScript source flavor rather than a new persisted semantic dialect.
+  Date: 2026-07-18.
+
+- Decision: keep C# as a structured language adapter over the shared iterative CFG/ICFG mechanics, and represent unavailable conditional-compilation selection as a terminal source-backed control gap.
+  Rationale: C# callable identity and syntax require an adapter, not another graph or resolver. Selecting a preprocessor arm without compilation symbols would fabricate control, while silently filtering the node would hide incompleteness; the typed boundary preserves both the common contract and honest uncertainty.
+  Date: 2026-07-18.
+
+- Decision: keep Go on the shared CFG/ICFG boundary by modeling `defer`, `go`, and `select` as exact known prefixes plus typed incomplete points, and by qualifying deterministic source-order linearization wherever Go leaves relative operand order unspecified.
+  Rationale: an outer `defer` or goroutine call is not an immediate call-to-entry transfer, a selected case cannot be chosen statically, and nondeterministic graph construction would destabilize identities. Existing scheduling, call, control, cleanup, spawn, and exceptional capability gaps preserve these distinctions without a Go-specific ICFG or false topology.
+  Date: 2026-07-18.
+
+- Decision: keep Rust on the shared CFG/ICFG boundary by using opaque cleanup markers for unknown Drop behavior, terminal boundaries for unsupported try blocks and macros, and point-scoped gaps for implicit trait calls.
+  Rationale: these constructs pressure completion scope, cleanup, and hidden-call completeness but do not justify Rust-specific graph or ICFG mechanics. Known evaluation prefixes remain structured; unknown destructor, residual, expansion, autoderef, operator, and polling behavior is never fabricated.
+  Date: 2026-07-18.
+
+- Decision: keep PHP on the shared CFG/ICFG boundary with adapter-owned chain-scoped nullsafe control and a dispatch invariant based on retained targets or typed boundaries rather than optional callee-leaf spans.
+  Rationale: complete-chain skipping and nullish coalescing are PHP syntax semantics, while unresolved or bounded exact calls are shared dispatch outcomes. Keeping both distinctions explicit prevents false control and silent loss without introducing a PHP graph, resolver, or ICFG.
+  Date: 2026-07-18.
+
+- Decision: keep Scala on the shared CFG/ICFG boundary with adapter-owned callable-body identity and parameter-list metadata, while treating unproven grouping, strictness, and implicit operations as scoped incompleteness.
+  Rationale: partial functions, synthetic initializers, curried applications, right-associative operators, by-name parameters, extractors, auto-application, and interpolation need Scala syntax mapping but not another graph or ICFG. Known evaluation and dispatch use the common builder and oracle; compound infix precedence, prefix dispatch breadth, implicit protocols, and deferred timing remain exact typed boundaries.
+  Date: 2026-07-18.
+
+- Decision: keep Ruby on the shared CFG/ICFG boundary with adapter-owned parser-ordered binding activation and exact dynamic-operation gaps, while leaving legacy outgoing-call discovery conservative.
+  Rationale: bare identifiers, implicit returns, non-local block control, `ensure`, safe navigation, callable-table mutation, and overrideable operators require Ruby syntax and scope mapping but not another graph or ICFG. Exact semantic sites have the callable and source-position context needed for sound call classification; broadening the older outgoing path without that context would fabricate local reads as calls.
+  Date: 2026-07-18.
+
 - Decision: keep language-semantic summaries separate from rule-specific protocol summaries.
   Rationale: adapter/call/value effects can be reused by several clients, while a protocol summary must include its rule hash and map incoming client state to outgoing client state and effects.
   Date: 2026-07-16.
@@ -128,9 +271,21 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
   Rationale: sources, sinks, sanitizers, protocol automata, and structural-match reporting have different required fields and validation laws. A tagged public union keeps these requirements explicit while lowering each type into diagnostic-neutral internal services.
   Date: 2026-07-16.
 
+- Decision: author `.rqlp` in a separate S-expression grammar with native independently versioned RQL child expressions; retain canonical JSON only as generated machine interchange and hashing input.
+  Rationale: the shared byte-spanned parser, formatter, comments, and direct AST-to-CodeQuery lowering give precise nested diagnostics without quoted selector strings, YAML block-scalar offset maps, indentation sensitivity, aliases, or implicit typing. One file contains either a runnable `(policy ...)` or diagnostic-neutral `(endpoint ...)` document. Policy/endpoint and RQL `:schema-version` fields are optional conveniences resolved through separate compiled-in source-and-semantic-compatible lineages; explicit values remain exact pins. `.agents/plans/issue-709-static-analysis-policy-format.md` owns the exact syntax, resolution, and implementation contract. Generated JSON is never accepted `.rqlp` authoring.
+  Date: 2026-07-17.
+
+- Decision: compose human-authored reusable matches as diagnostic-neutral endpoint leaves selected from explicit capability-rooted directories or by exact ID.
+  Rationale: each endpoint leaf has one source/sink role, stable identity/hash, RQL selector, typed matched-value/receiver/return/argument binding, exact categories, display phrase, optional taint semantics, and explicit `supersedes` IDs. Endpoint matches are dependencies rather than findings. Directory traversal occurs only for an authored match-directory reference, is bounded/transactional/manifested, and never becomes ambient project scanning. #824 alone decides same-semantic-event dominance after binding resolution; neither RQL textual shape nor file order implies specificity.
+  Date: 2026-07-17.
+
 - Decision: evaluate taint policies as sets, not as a Cartesian product of one-source/one-sink rules.
-  Rationale: one solver run can seed every selected source, propagate finite source-class label sets, and observe every selected sink. A meeting is reported when reached labels intersect the sink's accepted labels after sanitizer semantics. This captures broad attacker-controlled-to-sensitive-operation vulnerabilities, shares work, and still retains bounded source-class/origin provenance for classification and witnesses.
+  Rationale: one solver run can seed every selected source, propagate finite source-class label sets, and observe every selected sink. A meeting is reported when reached labels intersect the sink's accepted labels after sanitizer semantics. #709 then projects actual endpoint pairs: a unique explicit superseding combination replaces the fixed generated `{source display} can reach {sink display}` presentation, otherwise the generated default remains. Specificity is an explicit acyclic relation, not RQL/file order, and never creates a second solver run.
   Date: 2026-07-16.
+
+- Decision: let typestate policies reuse resolved endpoint leaves for subjects, events, and explicit terminal observations while retaining distinct implicit normal/exceptional exit expectations.
+  Rationale: known API receiver/return/argument positions belong on reusable endpoint definitions. #709 composes and stores a complete `ResolvedTypestatePolicySpec`; #824 lowers it into semantic binding classes and #822's protocol. An unmet terminal expectation is distinct from an error transition. Categories, directories, display phrases, messages, and presentation precedence never enter protocol/summary keys.
+  Date: 2026-07-17.
 
 - Decision: keep `TaintTransferSummary` symbolic and independent of concrete source selectors, sink selectors, policy IDs, classification rules, and CVSS configuration.
   Rationale: the reusable result is how taint on interface/heap positions and classes moves through a procedure, including sanitization and uncertainty. Concrete seeds, sink observers, finding aggregation, CWE refinement, and scoring are cheap run/presentation overlays. Summary keys include propagation/sanitizer semantics and taxonomy versions only when they change transfer behavior.
@@ -168,6 +323,18 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
   Rationale: invalid input or I/O is not program ambiguity; adversarial payload must respect finite budgets; and two partial materializations of one durable key must not alias.
   Date: 2026-07-16.
 
+- Decision: complete the all-language CFG/ICFG contract with one C/C++ adapter family and one shared ICFG, retaining dialect, linkage, preprocessing, lifetime, and implicit-evaluation uncertainty as typed adapter or dispatch evidence.
+  Rationale: these are real C/C++ semantic distinctions, but none requires different graph mechanics. Structured declaration/definition coalescing plus exact gaps preserves what is known without inventing a whole-program linker, preprocessor configuration, destructor schedule, or implicit call graph.
+  Date: 2026-07-19.
+
+- Decision: let matched-return evidence describe complete completion transfer, not merely the conditional exit-to-continuation mapping, and calculate that evidence from bounded path-relevant gaps.
+  Rationale: callers need to know whether all modeled behavior on the callee path is represented. Cleanup, exceptional, and non-local gaps on the relevant path therefore make the edge partial; dead disconnected gaps do not. Every unresolved dispatch arm also makes the enclosing snapshot non-complete, with its exact capability preserved.
+  Date: 2026-07-19.
+
+- Decision: tolerate conservative dynamic-dispatch false-partials until #816 exposes explicit closed-dispatch proof.
+  Rationale: current Java, Go, C#, and related receiver adapters cannot always distinguish final, static, nonvirtual, or otherwise closed calls at the semantic-adapter boundary. A false partial is preferable to false completeness; precision tests should assert closure directly once resolver metadata supports it.
+  Date: 2026-07-19.
+
 ## Outcomes & Retrospective
 
 The planning milestone produced root epic #813, thirteen native subissues, and this repository-local ExecPlan. The issue tree now separates the critical path from parallel and evidence-gated work:
@@ -190,6 +357,28 @@ The planning milestone produced root epic #813, thirteen native subissues, and t
 Issue #814 is the first completed implementation milestone. Checkpoint `296c1de1` plus guided-review fixes `1faf8b9b` provide the immutable language-neutral IR/event contract, durable and dense identities, total capabilities, typed outcomes and errors, finite budgets, provider boundary, invariant validation, scoped handles, and bounded renderer. TypeScript and Java remained the right contract fixtures, but they intentionally build neutral artifacts rather than claiming real adapters. The file-level artifact and procedure-local row model survived review without prematurely selecting CSR/CSC or persistence.
 
 The handoff remains narrow: #815 builds real TypeScript/Java callable CFG adapters, #816 refines dynamic dispatch plus value/heap targets, #818 adds matched ICFG call/return edges, and #817 measures lifecycle/storage before persisting anything. Review made this boundary stricter by introducing typed unavailable continuations, exact invoke/suspend outgoing topology, exact gap/evidence correlations, constrained partial local targets, bounded atomic construction, streaming rendering, and materialization-scoped handles.
+
+All nine post-reference rollout checkpoints validate that boundary from reuse and independent-adapter directions. JavaScript/JSX share the TypeScript lowering family; C#, Python, Go, Rust, PHP, Scala, Ruby, and C/C++ map their own structured syntax into the same builder, exact-location dispatch oracle, and context-bearing ICFG. Python and Rust use orthogonal invocation timing so deferred coroutine/generator construction never becomes false immediate body entry. Go keeps scheduled and selected work distinct from immediate calls, Rust uses shared cleanup markers to expose unknown Drop behavior without fabricating destructor topology, PHP owns whole-chain nullsafe continuations, Scala preserves partial-function and curried-application distinctions, Ruby uses parser-ordered binding activation, and C/C++ adds structured link-unit identity plus caller-side implicit-evaluation gaps without changing graph mechanics. Conformance now covers direct calls, common control, nested callables, handlers and cleanup, advanced-feature gaps, grammar-specific evaluation order, deferred call boundaries, scheduling boundaries, destructor uncertainty, nullish flow, chain-scoped short circuiting, expression-valued control, parameter-list dispatch, and matched-return evidence across every analyzable language without adding language-specific graph services.
+
+#815 Milestone 4e completes the Rust adapter checkpoint. Functions, associated and nested functions, closures, async and generator bodies, common control, labels, match guards, calls, semicolonless tails, `?`, await, yield, and dead syntax now use the same immutable CFG, exact-location dispatch, and context-bearing ICFG as the previous languages. Rust-specific uncertainty remains explicit through deferred invocation, terminal try/macro boundaries, implicit-trait gaps, and RAII/Drop gaps for parameter, lexical, pattern-bound, replaced, normal, and abrupt values. Generic free and method calls resolve through the shared oracle, including turbofish syntax, without regressing grouped imports. Focused validation passes 39 CFG, 17 ICFG, 55 language-conformance, 11 provider, and 483 definition tests.
+
+#815 Milestone 4f completes the PHP adapter checkpoint. Functions, methods, constructors, nested functions, closures, arrows, property hooks, common control, numeric break/continue, switch, match, nullish and full-chain nullsafe flow, calls, explicit throw, and cleanup now use the same immutable CFG, exact-location dispatch, and context-bearing ICFG as the previous languages. PHP-specific uncertainty remains explicit for generator suspension, include/require, goto, resource behavior, implicit calls and exceptions, and dynamic runtime protocols. Review proves matched free, typed-method, and nullsafe cross-file returns plus exact normal, handled, and unmatched `finally` paths. Focused validation passes 39 CFG, 18 ICFG, 10 semantic-IR, 73 language-conformance, 11 provider, and 486 definition tests.
+
+#815 Milestone 4g completes the Scala adapter checkpoint. Functions, methods, local definitions, primary and secondary constructors, lambdas, partial functions, givens, synthetic initializers, expression-valued control, ordered guarded match, generic and curried calls, constructors, infix/postfix operators, explicit throw, and cleanup now use the same immutable CFG, exact-location dispatch, and context-bearing ICFG as the previous languages. Scala-specific uncertainty remains explicit for by-name timing, `for` desugaring, implicit selection/pattern/interpolation behavior, non-local return propagation, compound infix grouping, and prefix-operator dispatch breadth. Review proves nested callable ownership, one-site curried returns, fail-closed arity, matched cross-file calls, and braced or Scala 3 indented cleanup. Focused validation passes 39 CFG, 18 ICFG, 10 semantic-IR, 93 language-conformance, 11 provider, and 497 definition tests plus 25 call-site and 5 call-relation unit tests.
+
+#815 Milestone 4h completes the Ruby adapter checkpoint. Top-level and type initializers, instance and singleton methods, constructors, lambdas, attached blocks, common control, implicit returns, `case`, calls, safe navigation, explicit throw, rescue/else/ensure, retry, yield, and non-local block completion now use the same immutable CFG, exact-location dispatch, and context-bearing ICFG as the previous languages. Ruby-specific uncertainty remains explicit for metaprogramming, callable-table mutation, implicit pattern/operator protocols, resources, fibers, threads, ractors, generators, and dynamic invocation. Review proves parser-ordered local activation, creation-time closure capture, exact cleanup routing, matched bare and singleton calls, and typed callable-object boundaries. Focused validation passes 39 CFG, 18 ICFG, 10 semantic-IR, 111 language-conformance, 11 provider, 497 definition, and 17 Ruby library/dispatch tests.
+
+#815 Milestone 4i completes the C/C++ checkpoint and therefore the eleven-language adapter rollout. C and C++ functions, methods, constructors, destructors, operators, lambdas, common control, switch fallthrough, goto, calls, C VLA bounds, explicit throw, handlers, and known cleanup now use the same immutable CFG, exact-location dispatch, and context-bearing ICFG as every other analyzable language. Structured declaration/definition and template-qualified resolution preserve exact cross-file transfers; preprocessing, linkage uncertainty, default arguments, conversions, temporary/RAII cleanup, implicit calls and exceptions, spawn, coroutines, `noexcept`, evaluation-order latitude, and platform extensions remain exact gaps. Cross-language review also made matched-return evidence path-sensitive and budgeted, made every unresolved boundary non-complete, and preserved exact unsupported capabilities. Focused validation passes 39 CFG, 25 ICFG, 10 semantic-IR, 129 language-conformance, 11 provider, 9 ICFG-unit, 14 call-relation-unit, and 498 definition tests.
+
+The focused #817 lifecycle slice now also completes the all-language rollout ExecPlan. Provenance-recorded release matrices retain bidirectional edge-ID rows and reject production SQLite for the current control/call artifact even though packed hydration is much faster: the large TypeScript corpus failed the absolute build-plus-write gate. `.agents/docs/semantic-cfg-lifecycle-benchmark-2026-07-20.md` preserves every retained sample, median, retained size, gate, and provenance record. Production keeps immutable byte-bounded per-file artifacts, generation-local ICFG stitching, and ephemeral bounded slices. The broader roadmap still owns value/heap oracles, data dependence, solver tables, and reusable summary measurements. A read-only architecture audit found one shared ICFG rather than per-language implementations, but also found roughly 4,000-6,000 lines of conservatively removable adapter substrate; the recommended next planning checkpoint is a shared lowering-session/call-scaffold extraction plus a generic dispatch-oracle/ICFG-stitcher split before those layers widen.
+
+#815 Milestone 1a is the first implementation checkpoint after #814. It preserves the rich edge payload once, assigns canonical procedure-local edge IDs, and supplies exact outgoing and incoming views without selecting persistence or exposing query vocabulary. Specialist review corrected topology counting for provenance-parallel edges, made invalid procedure-local point IDs fail explicitly, required canonical incoming hydration order, and strengthened renderer-schema assertions. The complete feature suite and strict all-feature clippy pass; production semantic lowering remains the next checkpoint rather than an implied capability of this graph substrate.
+
+#815 Milestones 1b and 1c provide the first production semantic materialization path and real language adapter. The provider routes exact files through analyzer delegates, atomically snapshots bounded disk or overlay source with dialect identity, publishes only validated artifacts, and retains complete values in a byte-weighted cancellation-aware single-flight cache. TypeScript and TSX now lower callable-local control, expression-level calls, handlers and cleanup, supported async flow, and disconnected dead source through an iterative builder; unsupported advanced semantics remain capability- and point-scoped. The multiline graph harness asserts source-backed predecessor/successor topology and bounded deterministic rendering. Focused tests, strict clippy, the complete `nlp,python` suite, and post-milestone review pass. Java remains the second reference adapter before dispatch and matched ICFG stitching freeze the shared contract.
+
+#815 Milestone 2 completes the second reference adapter. Java lowers methods, constructors, lambdas, executable field/interface/enum initializers, branches, loops, calls, switch statements and expressions, explicit throw, catch/finally, and cleanup relays, while try-with-resources, monitor behavior, implicit exceptions, initializer scheduling, and other omissions remain typed and point-scoped. The differential suite introduced a neutral cleanup-safe switch-yield channel and verified label-equivalent TypeScript/Java core topology. A provenance-recorded release benchmark kept bidirectional edge-ID rows: outgoing-only storage saved memory but made reverse traversal orders of magnitude slower at scale, and flat rows made both directions unacceptable. All focused tests, strict all-feature clippy, the complete `nlp,python` suite, and specialist review pass. The next contract pressure is the location-first dispatch slice and one matched TypeScript/Java ICFG.
+
+#815/#818 Milestone 3 completes that contract pressure. Exact whole-call source locations now flow through the established call resolver, preserving every proof and incomplete outcome. One generation-local provider lazily materializes callees and builds bounded dense slices whose nodes carry exact call-site contexts, so two callers of one procedure and recursive calls return only to their own normal or exceptional continuations. Root and target source identities are checked atomically, unknown calls terminate at typed boundaries, and limits cannot publish orphan graph nodes. The inline harness asserts predecessor/successor topology using source aliases and call contexts rather than dense IDs. Focused tests, strict clippy, the complete `nlp,python` repository suite, and specialist review pass. Remaining language adapters now depend on this frozen boundary rather than creating per-language ICFGs.
 
 ## Context and Orientation
 
@@ -249,13 +438,15 @@ The first may client applies these conservative rules:
 
 The set-oriented taint client adds these rules:
 
+- A selected endpoint/query match is a diagnostic-neutral candidate. Source/sink co-presence never establishes that one can reach the other; only a complete or explicitly partial structured propagation meeting can support that relation.
 - Compile all source selectors into one finite seed set and all sink selectors into one finite observer set. Do not schedule a separate solver run for each pair.
 - Propagate finite source-class label sets with union. Retain concrete source-origin IDs only in a bounded provenance side table used for witnesses and grouping.
 - A sink meeting is a may finding when reached labels intersect the sink's accepted labels. Ambiguous dispatch or incomplete propagation may still produce a partial meeting, but the overall completion remains `inconclusive`.
 - A sink definition identifies the exact dangerous operand or receiver. A database call is not one undifferentiated sink: SQL structure, a safely bound value parameter, a connection selector, and an options object have different semantics.
 - Sanitizers and barriers are typed transfer functions over declared label classes. An unrecognized or partially modeled sanitizer cannot erase taint optimistically.
-- The diagnostic-neutral client aggregates by sink event, semantic scenario, reached source classes, and completion. It does not depend on CWE or CVSS. #824 later projects compatible semantic scenarios into classification/assessment variants and retains bounded contributing origins plus at least one witness per materially distinct class.
+- The diagnostic-neutral client aggregates by sink event, semantic scenario, reached source classes, and completion. It does not depend on CWE or CVSS. #824 supplies exact typed scenario/evidence projection facts plus bounded origins/witnesses; #709's generic reducer alone turns those inputs into classification/CVSS assessment variants.
 - A broad `attacker_controlled` to `security_sensitive` meeting is reportable even if no more specific CWE rule matches. Specific classification refines rather than creates the underlying security finding.
+- Project each actual meeting through resolved endpoint identity. One uniquely dominant explicit combination may replace the generated presentation for that pair; the generic presentation is suppressed only for that same pair inside that aggregate policy. Incomparable winners are configuration failure, and unrelated policies are never globally suppressed.
 - CVSS Base metrics that are not supported by structured evidence or explicit catalog/policy declarations remain unknown. Unknown Base metrics prevent a numerical score; they do not suppress the vulnerability finding.
 - Incomplete source discovery, sink discovery, dispatch, external-call modeling, or transfer propagation makes an empty result `inconclusive`. A complete superset run can answer a subset policy only when it retained the required source classes and sink observations without lossy truncation.
 - Solver completeness and witness/provenance budgets are independent. Truncating stored origins or a displayed path never changes reachability, suppresses a finding, or licenses a complete negative.
@@ -384,9 +575,9 @@ This finite class-set domain does not express relational rules such as “two di
 
 ### Milestone 5: compile finite-state protocols and compose summaries (#822, #823)
 
-Create `src/analyzer/typestate/mod.rs`, `protocol.rs`, `client.rs`, and `summary.rs`. The protocol IR is versioned and canonically hashable. It defines states, initial states, accepting/error states, semantic event predicates, guarded transitions limited to structured facts, object/fact binding, and finding behavior. Validation rejects duplicate or missing states, invalid transitions, unreachable states where required, unstable identities, and unsupported event selectors.
+Create `src/analyzer/typestate/mod.rs`, `protocol.rs`, `client.rs`, and `summary.rs`. The protocol IR is versioned and canonically hashable. It defines states, initial states, non-absorbing accepting/error states, semantic event predicates, guarded transitions limited to structured facts, object/fact binding, typed at-match/before-call/normal-return/exceptional-return observations, explicit terminal observations, distinct implicit normal/exceptional analysis-root exit expectations, and diagnostic-neutral violation kinds. Terminal expected-state sets are non-empty subsets of accepting states, but entering an accepting state does not stop tracking. Validation rejects duplicate or missing states, invalid binding/phase combinations, invalid transitions/expectations, unreachable states where required, unstable identities, and unsupported event selectors. A helper/factory return is an interprocedural transfer rather than an implicit terminal; escape beyond the analysis root is inconclusive. An unmet terminal expectation is not lowered as a fake transition to an error state.
 
-The first protocol is a resource lifecycle with states such as `unallocated`, `open`, and `closed`. It binds events to resolved allocations and receiver calls. It defines conservative behavior for unknown dispatch, escapes, exceptions, and incomplete analysis. The same protocol runs over TypeScript and Java.
+The first protocol is a resource lifecycle with states such as `unallocated`, `open`, and `closed`. #824 binds #709's resolved categorized subject/source and call/sink endpoint sets—including their receiver/return/argument positions and observation phases—to neutral allocation/event classes. A close-like explicit endpoint can transition to `closed`; a same-phase terminal expectation observes the post-transition state, while normal and exceptional analysis-root exit can require an accepting state. #824 resolves same-site endpoint dominance and pair restrictions before computing the compiled binding-plan hash. The protocol defines conservative behavior for unknown dispatch, escapes, cleanup, exceptions, and incomplete analysis. The same protocol runs over TypeScript and Java.
 
 The typestate client adds protocol state to interned facts or associates an equivalent client value through the solver interface. It does not add language branches to the kernel. A degenerate protocol should collapse naturally to reachability/data flow.
 
@@ -466,14 +657,14 @@ Every persisted artifact uses a packed versioned DTO, generation/content validat
 
 #709 owns:
 
-- the versioned `.rqlp` document, explicit workspace-safe loading, and policy identity/metadata;
-- `PolicyDefinition`, a tagged `PolicyAnalysis` boundary selected by the public `analysis.type` field, plus authoring types such as `TaintPolicySpec` and `TypestatePolicySpec`, designed without exposing solver/client storage types;
+- the compatibility-resolved `.rqlp` policy/endpoint document union, explicit workspace-safe file/directory loading, and policy/endpoint/category identities, manifests, and metadata;
+- `PolicyDefinition`, diagnostic-neutral `MatchEndpointDefinition`, a tagged `PolicyAnalysis` boundary selected by the public `analysis.type` field, stored `ResolvedTaintPolicySpec`/`ResolvedTypestatePolicySpec`, explicit supersedes/presentation rules, generated messages, and authoring types designed without exposing solver/client storage types;
 - `PolicyFinding`, broad and refined classifications, optional evidence-backed CVSS assessment, stable locations and related locations, result completeness, and human/SARIF rendering;
 - the rule that a `CodeQueryMatch`, `FlowFinding`, `TaintFinding`, or `TypestateFinding` is not itself a diagnostic.
 
-#821 owns the internal set-oriented `TaintAnalysisPlan`, `TaintFinding`, and transfer semantics. #823 owns symbolic `TaintTransferSummary`. #824 owns `TaintPolicyCompiler` and finding classification: it expands versioned source/sink catalogs and inline selectors, constructs one bounded seed/observer plan, and maps meeting-point findings into #709's public classification/CVSS model without rerunning propagation per classification.
+#821 owns the internal set-oriented `TaintAnalysisPlan`, `TaintFinding`, and transfer semantics. #823 owns symbolic `TaintTransferSummary`. #709 owns typed catalog/endpoint registration, category/directory content identity, deterministic authoring-level composition and presentation precedence, complete public endpoint-pair projection inputs, and the generic classification/CVSS reducer. #824 owns `TaintPolicyCompiler`: it resolves composed catalog/local/endpoint selectors and typed bindings, proves same-event endpoint dominance, constructs one bounded plan, supplies complete analysis-specific projection evidence, and maps meeting-point findings into #709's public model without rerunning propagation per endpoint pair or classification.
 
-#822 owns the versioned internal `ProtocolSpec`, automaton compilation, and `TypestateFinding`. #824 owns `TypestatePolicyCompiler`, typed query domains, and adapters from analysis services to query rows and policy findings. The compiler lowers #709's author-facing `TypestatePolicySpec` into #822's internal `ProtocolSpec`; neither model embeds the other. #824 may build internal result domains before #709 closes, but it cannot declare the policy-facing wire shape stable until the #709 envelope and finding model are accepted. #825 requires both paths: diagnostic-neutral query exploration and `.rqlp` policy execution.
+#822 owns the versioned internal `ProtocolSpec`, automaton/terminal-expectation compilation, and diagnostic-neutral error-transition/terminal-expectation findings. #824 owns `TypestatePolicyCompiler`, typed query domains, endpoint binding classes, and adapters from analysis services to query rows and complete #709 projection facts. The compiler consumes #709's stored `ResolvedTypestatePolicySpec` without rescanning and lowers it into #822's internal `ProtocolSpec`; neither model embeds the other. #824 may build internal result domains before #709 closes, but it cannot declare the policy-facing wire shape stable until the #709 envelope and finding model are accepted. #825 requires both paths: diagnostic-neutral query exploration and `.rqlp` policy execution.
 
 Extend `QueryValueKind` and the declarative query schema with source-backed `procedure`, `program_point`, `flow_endpoint`, `taint_finding`, `typestate_finding`, `taint_witness`, `typestate_witness`, and `flow_witness` domains. The initial operations are fixed by this plan:
 
@@ -492,172 +683,23 @@ Actual/formal/receiver/return bindings appear in flow provenance and solver tran
 Keep these canonical fixtures:
 
 - `tests/fixtures/typestate/resource-lifecycle.protocol.json` contains only #822's internal `ProtocolSpec` and can be tested before #709 exists.
-- `tests/fixtures/policies/resource-lifecycle.rqlp` contains #709's public policy envelope, an RQL structural selector, and a public `TypestatePolicySpec`. A #824 conformance test lowers the public rule and requires it to compile to the same internal protocol hash as the #822 fixture without requiring their serialized shapes to match.
-- `tests/fixtures/policies/attacker-controlled-to-sensitive-sinks.rqlp` contains one public `TaintPolicySpec` with source/sink catalog sets plus inline entries. It must compile to one `TaintAnalysisPlan`, not a Cartesian product of pair plans.
+- `tests/fixtures/policies/resource-lifecycle.rqlp` contains #709's public policy envelope, categorized endpoint subject/event sets, transitions, and explicit/implicit terminal expectations. A #824 conformance test lowers the resolved public rule and requires it to compile to the same internal protocol/binding-plan hash as the #822 fixture without requiring their serialized shapes to match.
+- `tests/fixtures/policies/attacker-controlled-to-sensitive-sinks.rqlp` contains one public `TaintPolicySpec` with source/sink catalog, endpoint-directory, exact endpoint, and local sets plus generated/default and explicit combination presentation. It must compile to one `TaintAnalysisPlan`, not a Cartesian product of pair plans.
+- `tests/fixtures/policies/endpoints/` contains one diagnostic-neutral source or sink `(endpoint ...)` leaf per file with categories, display phrase, selector, typed binding, optional taint semantics, and explicit supersedes IDs.
 
-The `.rqlp` pilot contract is JSON with RQL used for structural selection. Parsing lowers each variant's selectors into canonical `CodeQuery` IR stored inside its `PolicyAnalysis` value; the evaluator never reparses selector text during analysis. #709 may choose a different serialization only through its own reviewed schema decision and a corresponding Decision Log update here. The typestate public shape is:
+The `.rqlp` pilot authoring contract is the S-expression grammar specified normatively by `.agents/plans/issue-709-static-analysis-policy-format.md`, with native `(rql [:schema-version N] QUERY)` or workspace-safe `(rql-file ...)` selectors. Policy/endpoint and RQL omissions resolve independently through compatible implicit lineages; explicit values pin. Parsing/loading lowers each selector once into canonical `CodeQuery` IR and stores resolved schema/dependency manifests; evaluators never reparse or rescan during analysis. This umbrella deliberately does not mirror a pseudo-wire JSON shape: checked fixtures are exact authoring examples, and the issue-specific plan owns generated canonical JSON.
 
-```json
-{
-  "schema_version": 1,
-  "policy": {
-    "id": "bifrost.test.resource-lifecycle",
-    "severity": "error",
-    "message": "Resource is used outside its open lifecycle"
-  },
-  "analysis": {
-    "type": "typestate",
-    "selector": {
-      "rql": "(call :callee \"open\")"
-    },
-    "subject": {"bind": "return_value"},
-    "mode": "may",
-    "uncertainty": {
-      "unknown_call": "inconclusive",
-      "escape": "inconclusive"
-    },
-    "automaton": {
-      "initial": "unallocated",
-      "error": ["error"],
-      "events": {
-        "acquire": {
-          "calls": {
-            "languages": ["typescript", "java"],
-            "match": {"kind": "method", "name": "open"},
-            "inside": {"kind": "class", "name": "Resource"},
-            "steps": [{"op": "enclosing_decl"}]
-          },
-          "subject": "return_value"
-        },
-        "use": {
-          "calls": {
-            "languages": ["typescript", "java"],
-            "match": {"kind": "method", "name": "use"},
-            "inside": {"kind": "class", "name": "Resource"},
-            "steps": [{"op": "enclosing_decl"}]
-          },
-          "subject": "receiver"
-        },
-        "close": {
-          "calls": {
-            "languages": ["typescript", "java"],
-            "match": {"kind": "method", "name": "close"},
-            "inside": {"kind": "class", "name": "Resource"},
-            "steps": [{"op": "enclosing_decl"}]
-          },
-          "subject": "receiver"
-        },
-        "scope_exit": {"semantic_event": "procedure_exit", "subject": "tracked_object"}
-      },
-      "transitions": {
-        "unallocated": {"acquire": "open", "use": "error", "close": "error"},
-        "open": {"use": "open", "close": "closed", "scope_exit": "error"},
-        "closed": {"use": "error", "close": "error", "scope_exit": "closed"}
-      }
-    }
-  },
-  "report": {
-    "witness": {"max_steps": 64, "max_bytes": 16384}
-  }
-}
-```
+This is a public resolved typestate authoring specification, not a serialized `ProtocolSpec`. `TypestatePolicyCompiler` validates state/event/expectation names, consumes already selected endpoint dependencies, resolves exact indexed declarations and receiver/return/argument bindings into semantic event classes, preserves normal versus exceptional terminal events, lowers uncertainty choices, and produces #822's canonical `ProtocolSpec`. A same-name method outside the resolved endpoint, an unresolved call, or a name-only guess never fires a transition.
 
-This is a public `TypestatePolicySpec`, not a serialized `ProtocolSpec`. `TypestatePolicyCompiler` infers and validates the public state/event names, resolves each `calls` selector to exact indexed declarations, lowers author-facing subject bindings and uncertainty choices to typed internal events, and produces #822's canonical `ProtocolSpec`. A same-name method outside `Resource`, an unresolved call, or a name-only guess never fires an exact transition.
+`PolicyRegistry` loads explicitly requested runnable `.rqlp` paths/bytes and any endpoint dependency directories/IDs named by those policies. Endpoint traversal is workspace-rooted, bounded, transactional, symlink-free, manifestable, and never ambient. The registry rejects paths outside the workspace, duplicate/colliding policy or endpoint IDs, oversized files/closures, changed directory snapshots, and parse/validation/precedence errors. It stores complete `ResolvedTaintPolicySpec`/`ResolvedTypestatePolicySpec` values before compiler capability exists; evaluation then returns `unsupported`, not a partly interpreted rule or an adapter-side rescan.
 
-`PolicyRegistry` loads only explicitly requested `.rqlp` paths or bytes supplied by an embedding application. It rejects paths outside the workspace, duplicate policy IDs, oversized files, and parse/validation errors. It can parse and retain a typestate analysis before the compiler capability exists; evaluation then returns `unsupported`, not a partly interpreted rule.
+When the typestate capability is present, #824 lowers the resolved public rule and registers the internal automaton/binding plan by canonical hash in `ProtocolRegistry`, receiving an execution-scoped `ProtocolHandle`. `QueryAnalysisContext` maps a human-readable `ProtocolRef` to that handle. A policy uses `policy:<policy-id>`; embeddings may register an explicitly namespaced reference. Registering the same reference with a different hash is an error, while different references may share one compiled hash. Handle slots are never serialized or used as summary keys. Only #709's explicit capability-rooted match-directory surface loads endpoint leaves; `CodeQuery`/RQL cannot load arbitrary endpoint or protocol paths.
 
-When the typestate capability is present, #824 lowers the public rule and registers the internal automaton by canonical hash in `ProtocolRegistry`, receiving an execution-scoped `ProtocolHandle`. `QueryAnalysisContext` maps a human-readable `ProtocolRef` to that handle. A policy uses `policy:<policy-id>`; embeddings may register an explicitly namespaced reference. Registering the same reference with a different hash is an error, while different references may share one compiled hash. Handle slots are never serialized or used as summary keys. There is no implicit directory scan, and `CodeQuery`/RQL cannot load arbitrary protocol paths.
+The taint public shape uses the same policy envelope but declares sets rather than a source/sink pair. The checked `attacker-controlled-to-sensitive-sinks.rqlp` fixture and the issue-specific #709 plan are the exact authoring/schema examples; generated JSON appears only in #709 conformance golds, never as a competing roadmap sketch.
 
-The taint public shape uses the same policy envelope but declares sets rather than a source/sink pair:
+`include_sets` names versioned source, sink, and sanitizer catalogs; `include_matches` selects explicit endpoint directories or IDs; `entries` adds policy-local structured selectors. A reusable model pack may be source-only, sink-only, sanitizer-only, or mixed, but a policy composes those packs explicitly and its resolved source and sink sets must both be non-empty. #709's authoring-level composition is deterministic, records schema/catalog/endpoint/directory manifests and precedence, and rejects duplicate/cyclic/ambiguous definitions. #824's compiler resolves composed selectors and bindings to semantic identities before propagation; a same-name text guess never becomes a seed, sink, or sanitizer. Analysis keys use endpoint projection hashes and behavior semantics, not directory/category/display/message data. Every sink names its dangerous receiver or operand, so an SQL-structure argument is not confused with a safe bound-value parameter.
 
-```json
-{
-  "schema_version": 1,
-  "policy": {
-    "id": "bifrost.security.attacker-controlled-to-sensitive-sinks",
-    "message": "Attacker-controlled data reaches {{sink.label}}",
-    "severity": {"type": "cvss", "when_unscored": "unrated"}
-  },
-  "analysis": {
-    "type": "taint",
-    "mode": "may",
-    "sources": {
-      "include_sets": ["bifrost.sources.attacker-controlled"],
-      "entries": [
-        {
-          "id": "http-request-parameters",
-          "selector": {"rql": "(call :callee \"requestParameter\")"},
-          "bind": "return_value",
-          "labels": ["attacker_controlled"],
-          "evidence": {
-            "trust_boundary": "external",
-            "system_entry": "vulnerable_system.network_stack"
-          }
-        }
-      ]
-    },
-    "sinks": {
-      "include_sets": [
-        "bifrost.sinks.persistent-data-write",
-        "bifrost.sinks.control-influence"
-      ],
-      "entries": [
-        {
-          "id": "sql-execute",
-          "selector": {"rql": "(call :callee \"execute\")"},
-          "dangerous_operand": {"argument": 0},
-          "accepts": ["attacker_controlled"],
-          "tags": ["security_sensitive", "sql_execution"],
-          "impacts": ["vulnerable_system.integrity"]
-        }
-      ]
-    },
-    "sanitizers": {
-      "include_sets": ["bifrost.sanitizers.default"]
-    },
-    "report_when": {
-      "source_labels": {"any": ["attacker_controlled"]},
-      "sink_tags": {"any": ["security_sensitive"]}
-    }
-  },
-  "classification": {
-    "fallback": {"id": "untrusted-data-to-sensitive-operation"},
-    "refinements": [
-      {
-        "when": {"sink_tags": {"all": ["sql_execution"]}},
-        "cwe": ["CWE-89"]
-      }
-    ],
-    "cvss": {
-      "version": "4.0",
-      "emit": "when_base_complete",
-      "metric_rules": [
-        {
-          "metric": "AV",
-          "value": "N",
-          "when": {
-            "source_evidence": {
-              "system_entry": "vulnerable_system.network_stack"
-            }
-          },
-          "basis": "policy_assertion",
-          "scope": "vulnerable_system",
-          "evidence_refs": ["source:http-request-parameters"],
-          "rationale": "The vulnerable system itself receives the input through its network stack"
-        }
-      ]
-    }
-  },
-  "report": {
-    "witness": {"max_steps": 64, "max_bytes": 16384},
-    "origins_per_finding": 8
-  }
-}
-```
-
-`include_sets` names versioned source, sink, and sanitizer catalogs; `entries` adds policy-local structured selectors. A reusable model pack may be source-only, sink-only, sanitizer-only, or mixed, but a policy composes those packs explicitly and its resolved source and sink sets must both be non-empty. Catalog expansion is deterministic, its version/hash participates in `TaintAnalysisPlan` identity, and duplicate IDs with different definitions are errors unless a versioned precedence rule resolves them. The compiler resolves selectors and bindings to semantic identities before propagation; a same-name text guess never becomes a seed, sink, or sanitizer. Every sink names its dangerous receiver or operand, so an SQL-structure argument is not confused with a safe bound-value parameter.
-
-`TaintCatalogRegistry` owns versioned source, sink, sanitizer/transform, and external-model documents. Built-in catalogs have stable names and content hashes; embedding applications explicitly register bytes or workspace-safe paths under a namespace. There is no implicit directory scan or network load. Canonical composition records catalog versions and content hashes, rejects identity collisions and incompatible class semantics, and produces the exact `TaintPropagationEventMatchKey` and `TaintSinkObserverMatchKey` inputs. A catalog may legitimately omit one or more categories; the non-empty-both-sides requirement applies only after a taint policy is compiled.
+`TaintCatalogRegistry` owns versioned machine source, sink, sanitizer/transform, and external-model documents. Built-in catalogs have stable names and content hashes; embedding applications explicitly register bytes or workspace-safe paths under a namespace. Human endpoint traversal occurs only through an authored match-directory; there is no ambient scan or network load. Canonical composition records catalog versions, endpoint IDs/hashes, and directory manifests, rejects identity collisions/incompatible class semantics, and produces `ResolvedTaintPolicySpec`, not solver keys. #824's `TaintPolicyCompiler` produces the exact `TaintPropagationEventMatchKey` and `TaintSinkObserverMatchKey` inputs. A catalog/directory may legitimately omit a role; the non-empty-both-sides requirement applies after authoring-level composition and is rechecked during compilation.
 
 `TaintPolicyCompiler` creates one plan containing all seeds, sinks, sanitizer transfers, label IDs, catalog hashes, budgets, and completeness. It must not emit one plan per source/sink pair. The solver propagates compact label sets and consults each procedure's `TaintTransferSummary`; sink observers do not change transfer summaries. Adding a sink or changing CWE/CVSS classification can reuse existing propagation summaries. Changing a sanitizer or label-transfer rule invalidates affected taint summaries because it changes flow semantics.
 
@@ -669,43 +711,9 @@ CVSS assessment happens after the meeting and classification. The engine accepts
 
 Static evidence may support some metrics but does not get to infer the rest. `AV:N` requires evidence that the vulnerable system itself is bound to a network stack; content delivered as a downloaded file or malicious document does not become `AV:N` merely because a network transported it. A sink may establish which security property can be affected, but does not establish Low/High magnitude, exploit prerequisites, or the vulnerable-versus-subsequent-system boundary without evidence. Conflicting evidence produces explicit assessment variants when each scenario is coherent, otherwise `Unscored`; provider order never silently resolves a conflict.
 
-The CVSS v4.0 Base metrics are `AV`, `AC`, `AT`, `PR`, `UI`, `VC`, `VI`, `VA`, `SC`, `SI`, and `SA`. They have no “Not Defined” value. The result algebra is therefore:
+The CVSS v4.0 Base metrics are `AV`, `AC`, `AT`, `PR`, `UI`, `VC`, `VI`, `VA`, `SC`, `SI`, and `SA`; they have no “Not Defined” value. The exact assessment/variant/evidence/provenance wire algebra lives only in the #709 ExecPlan. At the architecture level, a scored assessment publishes the canonical vector/nomenclature and every applicable B/BT/BE/BTE component result, while the complete report/evidence graph preserves scorer version, assessment time, system boundary, affected configuration, policy/content/analyzer hashes, bounded witnesses, assumptions, and FIRST attribution in their #709-owned fields. The engine canonicalizes the vector and recomputes scores; a supplied vector/score mismatch is rejected.
 
-    struct CvssAssessmentSet {
-        variants: Vec<CvssAssessmentVariant>,
-        selected_for_display: Option<CvssAssessmentVariantId>,
-        selection_rationale: Option<String>,
-    }
-
-    struct CvssAssessmentVariant {
-        id: CvssAssessmentVariantId,
-        vulnerability_identity: VulnerabilityIdentity,
-        source_scenarios: Vec<SourceScenarioId>,
-        witness_refs: Vec<WitnessId>,
-        assessment: CvssAssessment,
-    }
-
-    enum CvssAssessment {
-        Scored {
-            version: CvssVersion,
-            nomenclature: CvssNomenclature,
-            vector: String,
-            components: Vec<CvssComponentResult>,
-            metrics: Vec<CvssMetricEvidence>,
-            provenance: CvssAssessmentProvenance,
-        },
-        Unscored {
-            version: CvssVersion,
-            established: Vec<CvssMetricEvidence>,
-            missing_base_metrics: Vec<CvssBaseMetric>,
-            reasons: Vec<IncompleteReason>,
-            provenance: CvssAssessmentProvenance,
-        },
-    }
-
-A scored assessment publishes the canonical vector and nomenclature plus every applicable component result: Base score/severity, Base+Threat when non-default Threat metrics are supplied, and Environmental/final score/severity when Environmental metrics are supplied. `CvssAssessmentProvenance` records scorer/algorithm version, assessment timestamp, system-of-interest boundary, affected configuration, policy/content/analyzer hashes, selected witnesses, assumptions, and FIRST attribution. The engine canonicalizes the vector and recomputes its scores; a supplied vector/score mismatch is rejected.
-
-Unknown Base metrics yield `Unscored`, not `None` metric values or worst-case guesses. `X`/Not Defined is accepted only for the Threat, Environmental/Modified, and Supplemental metrics for which CVSS v4.0 defines it, using the specified defaults; it is rejected for Base metrics. Missing or non-comprehensive threat intelligence remains `E:X`, never `E:U` just because a feed has no match. Threat and Environmental evidence is a time/environment-scoped overlay and never enters reusable flow-summary keys. A reportable affected vulnerability with all vulnerable/subsequent-system impact metrics at None and a computed Base score of 0.0 is contradictory evidence: return a diagnostic `Unscored` assessment or revisit the security classification rather than silently publishing it. CVSS severity, analyzer certainty, and organization-specific risk remain separate fields.
+Unknown Base metrics yield `Unscored`, not `None` metric values or worst-case guesses. `X`/Not Defined is accepted only for the Threat, Environmental/Modified, and Supplemental metrics for which CVSS v4.0 defines it, using the specified defaults; it is rejected for Base metrics. Missing or non-comprehensive threat intelligence remains `E:X`, never `E:U` just because a feed has no match. Threat and Environmental evidence is a time/environment-scoped overlay and never enters reusable flow-summary keys. A complete assessment whose vulnerable/subsequent-system impact metrics are all `None` is a valid scored `0.0`/CVSS-None result; preserve the policy finding, map CVSS-derived report severity to `note`, and do not reinterpret it as contradictory or unscored. CVSS severity, analyzer certainty, and organization-specific risk remain separate fields.
 
 When several source classes reach one sink, group scenarios only when they represent the same vulnerability identity and their system boundary, prerequisite evidence, completion, classification, and complete CVSS vector match; retain all contributing source classes and bounded witnesses. Different metric vectors remain assessment variants. Never union CIA impacts across mutually incompatible witnesses, sum or average scores, or splice exploitability metrics from one path with impacts from an incompatible path. An explicit vulnerability chain preserves its component vulnerability identities. If a UI displays one score, it may select the highest defensible complete variant while preserving every variant and identifying the supporting witness and assumptions.
 
@@ -808,7 +816,7 @@ Record true/false positives and negatives, abstention, cold construction, warm i
 
 #826 then evaluates two separate questions. First, whether WPDS-style weights materially improve summary or proof composition. Second, whether a synchronized field/call pushdown component materially improves access-path precision beyond #816. The legitimate outcome is “not yet”; no extension is accepted without exact correctness and resource evidence, and baseline clients must not pay a material disabled cost.
 
-After the pilot, open adapter rollout children under #815 and #816 using the stabilized conformance contract. Do not make every language a prerequisite for shipping the first useful typestate analysis.
+After the TypeScript/Java CFG and ICFG reference contract passes its focused review, begin the per-language #815/#816 rollout recorded in `.agents/plans/all-language-cfg-icfg-rollout.md`. That rollout may proceed alongside the solver and TypeScript/Java typestate pilot: all languages are required by the focused CFG/ICFG plan, but they do not block shipping the first useful TypeScript/Java typestate analysis.
 
 ## Concrete Steps
 
@@ -907,7 +915,7 @@ For #709 and #824:
 
     cargo test --test static_analysis_policy --test taint_policy_sets --test cvss_classification --test code_query_taint --test policy_taint_integration --test code_query_typestate --test policy_typestate_integration
 
-Expected: `test result: ok`; the policy envelope and `PolicyFinding` contract pass independently, `analysis.type` selects `match`, `taint`, or `typestate`, and the schema-version-3 JSON and RQL examples lower to diagnostic-neutral queries. The taint fixture compiles to one plan, keeps a broad finding when no CWE refinement matches, rejects missing/conflicting catalog sides and ambiguous sink operands, maps incomplete Base evidence to `Unscored`, computes scores rather than accepting authored numbers, and preserves metric provenance and compatible assessment variants in matching human/SARIF findings.
+Expected: `test result: ok`; the policy envelope and `PolicyFinding` contract pass independently, `analysis.type` selects `match`, `taint`, or `typestate`, compatible omitted/pinned RQLP versions resolve exactly as specified, and #824's schema-version-3 JSON/RQL analysis examples lower to diagnostic-neutral queries. The taint fixture compiles to one plan, keeps a broad finding when no CWE refinement matches, rejects missing/conflicting catalog sides and ambiguous sink operands, maps incomplete Base evidence to `Unscored`, computes scores rather than accepting authored numbers, and preserves metric provenance and compatible assessment variants in matching human/SARIF findings.
 
 For #825:
 
@@ -1077,57 +1085,7 @@ The solver returns findings separately from run completion:
 
 `Complete` plus non-empty `findings` renders as `complete_finding`. `Complete` plus empty `findings` renders as `complete_no_finding`. The other variants render as specified in the soundness contract and may include partial findings.
 
-#709 establishes the public policy boundary independently of any one analysis client:
-
-    struct PolicyDefinition {
-        schema_version: PolicySchemaVersion,
-        metadata: PolicyMetadata,
-        analysis: PolicyAnalysis,
-        classification: Option<PolicyClassificationSpec>,
-        report: PolicyReportOptions,
-    }
-
-    enum PolicyAnalysis {
-        Match(MatchPolicySpec),
-        Taint(TaintPolicySpec),
-        Typestate(TypestatePolicySpec),
-    }
-
-    struct PolicyRun {
-        policy_id: PolicyId,
-        completion: AnalysisCompletion,
-        findings: Vec<PolicyFinding>,
-        diagnostics: Vec<PolicyDiagnostic>,
-        work: WorkReport,
-    }
-
-    struct PolicyFinding {
-        policy_id: PolicyId,
-        severity: FindingSeverity,
-        message: String,
-        analysis_type: PolicyAnalysisType,
-        classification: FindingClassification,
-        analysis_evidence: PolicyFindingEvidence,
-        cvss: Option<CvssAssessmentSet>,
-        certainty: FindingCertainty,
-        organizational_risk: Option<OrganizationalRiskAssessment>,
-        primary: SourceLocation,
-        related: Vec<RelatedLocation>,
-        proof: ProofMetadata,
-        completeness: FindingCompleteness,
-        witness: Option<BoundedWitness>,
-    }
-
-    trait PolicyEvaluator {
-        fn evaluate(
-            &self,
-            policy: &PolicyDefinition,
-            context: &AnalysisContext,
-            budget: &mut PolicyBudget,
-        ) -> PolicyRun;
-    }
-
-`PolicyAnalysis` is serialized as an internally tagged union selected by exactly `analysis.type`; variant-specific selectors stay inside `MatchPolicySpec`, `TaintPolicySpec`, or `TypestatePolicySpec`. `classification` is optional: taint policies normally supply fallback/refinement/scoring rules, while structural or typestate policies may use only fixed reporting metadata. `FindingSeverity` is either a fixed policy severity, a severity derived from the selected complete CVSS variant, or `Unrated`. It never stores analyzer certainty or organizational risk. `PolicyFindingEvidence::Taint` retains the stable sink event, reached source classes, bounded contributing origins, semantic scenario identities, and witness references used by classification and scoring.
+#709 establishes the public policy boundary independently of any one analysis client. The exact, versioned `PolicyDefinition`, `LoadedPolicy`, `PolicyReportDocument`, `PolicyRun`, `PolicyFinding`, evidence, identity, budget, and evaluator types live only in `.agents/plans/issue-709-static-analysis-policy-format.md`; this umbrella intentionally does not mirror them. That plan requires `analysis.type` to select the tagged public variant, one canonical report document for every renderer, and context-requiring evaluation against a fully resolved `LoadedPolicy`. #824 consumes those public contracts and must not create renamed or reduced copies.
 
 The #821/#823/#824 taint bridge is also explicit:
 
@@ -1166,8 +1124,8 @@ The #821/#823/#824 taint bridge is also explicit:
     trait TaintPolicyCompiler {
         fn compile(
             &self,
-            policy_id: &PolicyId,
-            spec: &TaintPolicySpec,
+            policy: &LoadedPolicy,
+            spec: &ResolvedTaintPolicySpec,
             context: &mut QueryAnalysisContext,
             budget: &mut SemanticBudget,
         ) -> AnalysisOutcome<CompiledTaintPolicy>;
@@ -1180,46 +1138,47 @@ The #821/#823/#824 taint bridge is also explicit:
         ) -> AnalysisOutcome<Vec<TaintBatchPartition>>;
     }
 
-`CompiledTaintPolicy` contains one policy's set-oriented plan plus its compatibility, classification, scoring, and reporting projection. `TaintBatchPlanner` groups equal propagation-semantics keys only when workspace snapshot, scope, and completeness-affecting budgets are also compatible, unions seeds/observers while preserving stable class and event identities, and returns a projection map from each batch meeting to the policies it can answer. It does not union incompatible sanitizer, transform, heap, access-path, context, external-model, exceptional, unknown-call, scope, or completion semantics.
+`CompiledTaintPolicy` contains one policy's set-oriented plan plus compatibility and the exact typed scenario/evidence projection metadata needed by #709's generic classification/CVSS/report reducer. `TaintBatchPlanner` groups equal propagation-semantics keys only when workspace snapshot, scope, and completeness-affecting budgets are also compatible, unions seeds/observers while preserving stable class and event identities, and returns a projection map from each batch meeting to the policies it can answer. It does not union incompatible sanitizer, transform, heap, access-path, context, external-model, exceptional, unknown-call, scope, or completion semantics.
 
 The #824 bridge between the public and internal typestate models is explicit:
 
     struct CompiledPolicyProtocol {
         reference: ProtocolRef,
         handle: ProtocolHandle,
-        hash: [u8; 32],
+        protocol_hash: TypestateProtocolHash,
+        binding_plan_hash: TypestateBindingPlanHash,
     }
 
     trait TypestatePolicyCompiler {
         fn compile(
             &self,
-            policy_id: &PolicyId,
-            spec: &TypestatePolicySpec,
+            policy: &LoadedPolicy,
+            spec: &ResolvedTypestatePolicySpec,
             context: &mut QueryAnalysisContext,
             budget: &mut SemanticBudget,
         ) -> AnalysisOutcome<CompiledPolicyProtocol>;
     }
 
-`ProtocolHandle` is opaque and valid only for one `QueryAnalysisContext`; it contains a context generation, dense slot, and canonical hash. Registration atomically binds `ProtocolRef("policy:<policy-id>")` to the handle and rejects an existing reference with a different hash. Protocol summaries and persisted artifacts key on the hash plus solver/configuration inputs, never the reference or dense slot.
+`ResolvedTypestatePolicySpec` carries only #709's pre-semantic authoring-projection hash. `TypestatePolicyCompiler` resolves exact event/binding classes and same-site endpoint dominance, remaps dominated subject/event/expectation and pair-restriction identities to their unique live winners, and computes `TypestateBindingPlanHash` only after that normalization. `ProtocolHandle` is opaque and valid only for one `QueryAnalysisContext`; it contains a context generation, dense slot, and the canonical compiled protocol/binding-plan hashes. Registration atomically binds `ProtocolRef("policy:<policy-id>")` to that pair and rejects an existing reference with a different pair. Protocol summaries and persisted artifacts key on the compiled hashes plus matcher/compiler version, workspace/analyzer snapshot, solver configuration, and completeness-affecting semantics, never the pre-semantic authoring hash, reference, dense slot, categories, directory paths, display names, messages, or classifications.
 
-The initial #709 implementation may execute only `PolicyAnalysis::Match`, but it parses and retains versioned public `TaintPolicySpec` and `TypestatePolicySpec` values without importing `TaintAnalysisPlan`/`ProtocolSpec` or inventing solver semantics. #824 supplies the compilers above plus adapters from `AnalysisRun<FlowFinding>`, `AnalysisRun<TaintFinding>`, and `AnalysisRun<TypestateFinding>` after those clients exist. There is no context-free conversion from `CodeQueryMatch` or an analysis finding into `PolicyFinding`: evaluation always requires a `PolicyDefinition`. Human and SARIF renderers consume only `PolicyRun`/`PolicyFinding`.
+The initial #709 implementation may execute only `PolicyAnalysis::Match`, but it parses compatible-versioned policy/endpoint documents and retains public taint/typestate authoring values without importing `TaintAnalysisPlan`/`ProtocolSpec` or inventing solver semantics. It resolves catalog/endpoint/category/manifest/precedence composition into stored `ResolvedTaintPolicySpec` and `ResolvedTypestatePolicySpec` values before producing `LoadedPolicy`. #824 supplies the compilers above plus adapters from `AnalysisRun<FlowFinding>`, `AnalysisRun<TaintFinding>`, and `AnalysisRun<TypestateFinding>` after those clients exist. Compilers consume already-lowered selectors, exact endpoint bindings/hashes, behavior rules, and policy identity without reopening files or duplicating #709's generic precedence/classification/report reducer. Adapters produce complete endpoint-pair or typestate-violation projection facts before report truncation. There is no context-free conversion from `CodeQueryMatch`, endpoint match, or analysis finding into `PolicyFinding`: evaluation always requires a `LoadedPolicy`. Human, canonical JSON, and SARIF renderers consume only one `PolicyReportDocument`, whose descriptors preserve metadata and schema manifests even for failed or zero-finding runs.
 
-The semantic adapter boundary materializes a mounted source artifact once and resolves procedures inside it:
+The semantic adapter boundary materializes a mounted source artifact once from one prepared syntax snapshot and resolves procedures inside it:
 
     trait ProgramSemanticsProvider {
-        fn language(&self) -> SemanticLanguage;
-        fn capabilities(&self) -> &SemanticCapabilities;
-        fn artifact_key(
+        fn materialize(
             &self,
             file: &ProjectFile,
-            budget: &mut SemanticBudget,
-        ) -> Result<SemanticOutcome<SemanticArtifactKey>, SemanticProviderError>;
-        fn artifact(
-            &self,
-            key: &SemanticArtifactKey,
-            budget: &mut SemanticBudget,
+            request: &mut SemanticRequest<'_>,
         ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError>;
     }
+
+    struct SemanticRequest<'a> {
+        budget: &'a mut SemanticBudget,
+        cancellation: &'a CancellationToken,
+    }
+
+The provider derives the source revision, dialect-sensitive artifact key, parsed tree, and lowered artifact from the same `TreeSitterAnalyzer::prepared_syntax` value. This atomic operation replaces the earlier split key/artifact sketch, which could race a source or overlay update. Complete artifacts alone enter the bounded per-analyzer cache; cancellation and incomplete outcomes remain explicit and are never cached as complete.
 
 `SemanticArtifact` owns a dense procedure table. `ProcedureHandle` retains an `Arc<SemanticArtifact>` plus its artifact-local `ProcedureId`; local value, point, call, and memory IDs cross provider/oracle boundaries only together with that procedure scope. `ProcedureSemantics` owns dense local IDs, source mappings, semantic effects, and an immutable CFG. It does not own solver facts or protocol states.
 
@@ -1389,8 +1348,46 @@ Public query changes depend on the declarative schema registry in `src/analyzer/
 
 Plan revision note (2026-07-16): Initial roadmap written after auditing the post-PR-#802 codebase and creating epic #813 with native subissues #814–#826. The initial plan deliberately makes TypeScript/Java the reference pair, IFDS/IDE the baseline solver shape, compact memory plus selective SQLite the lifecycle policy, dominance optional, and WPDS/SPDS evidence-gated. Draft PR #828 is the current publication thread for the initial checkpoint and subsequent revisions. A later same-day revision made #709 the early public policy/API gate, separated `.rqlp`/`PolicyFinding` from the internal protocol and analysis result models, and required the #825 pilot to validate query, human, and SARIF surfaces from one analysis result. This revision also made `analysis.type: taint` set-oriented end to end: one compatible multi-source/multi-sink batch, stable class-set propagation with bounded origins, symbolic taint summaries and exact cache layers, broad findings before CWE refinement, and evidence-backed CVSS v4.0 variants that never fabricate a score from incomplete Base evidence.
 
+Plan revision note (2026-07-17): Reconciled the roadmap with the detailed #709 plan. `.rqlp` is explicitly authored as a separate S-expression policy language with native versioned RQL selectors. A later same-day adversarial pass removed the temporary conceptual JSON sketches entirely so this roadmap cannot be mistaken for a second wire contract.
+
 Plan revision note (2026-07-16): Issue #814 diagnosis corrected the original procedure-shaped artifact sketch. A semantic artifact now owns one mounted source snapshot and an artifact-local procedure table; procedure rows own their block, point, value, call, memory, capture, provenance, evidence, and gap IDs. Provider and oracle interfaces use scoped procedure handles. The same revision records nested callable bodies as separate procedures, callable references and captures as creation-time semantics rather than eager calls, and byte-authoritative source positions with explicit zero-based display coordinates. The focused implementation plan is `.agents/plans/issue-814-semantic-ir-contract.md`.
 
 Plan revision note (2026-07-16): Completed #814 at reviewed checkpoint `648a9fec`. The final contract uses typed continuations and exact outgoing topology, bidirectional subject-scoped gaps/evidence, direct-child unmaterialized targets, separate provider errors and semantic outcomes, atomic total-payload budgets, indexed validation, streaming bounded rendering, portable shared language/path identity, and materialization-scoped handles. Validation passed 59 semantic unit tests, 10 TypeScript/Java contract tests, the complete `nlp,python` suite, all-target/all-feature clippy with warnings denied, formatting, and diff checks. #815, #816, and #818 retain adapter/CFG, oracle/refinement, and matched-ICFG ownership respectively.
 
+Plan revision note (2026-07-17): Synchronized the #709 boundary with its detailed ExecPlan: `.rqlp` authoring is S-expression-only, JSON is generated interchange, #709 owns syntactic catalog composition and the generic classification/CVSS reducer, and #824 consumes resolved `LoadedPolicy` inputs for semantic compilation/adaptation. Removed non-normative JSON pseudo-wire examples and the stale duplicate public report type mirror so the issue-specific plan is the single policy wire contract.
+
 Plan revision note (2026-07-16): Guided review against rebased `origin/master` produced and resolved four findings in `1faf8b9b`. Edge-typed normal and exceptional arms may now converge; recognized callable creation retains typed target uncertainty without requiring a locator; balanced bounded rendering is shared with Rune IR; and registry counting is centralized. The corrected complete `nlp,python` suite and all-feature clippy passed before publication.
+
+Plan revision note (2026-07-17): Began #815 implementation through `.agents/plans/all-language-cfg-icfg-rollout.md`. The focused plan carries the TypeScript/Java CFG reference slice through the dispatch prerequisite, one matched-return ICFG, all eleven analyzable-language adapters, and a measured CFG/ICFG lifecycle decision under #817 while keeping public query, solver, value/heap, and typestate layers outside its scope.
+
+Plan revision note (2026-07-17): Pre-checkpoint review clarified that remaining adapter children begin after the TypeScript/Java CFG/ICFG contract review and may run alongside later solver/pilot work, rather than waiting until after #825. This preserves the focused plan's all-language endpoint without making that rollout a prerequisite for the first TypeScript/Java typestate release.
+
+Plan revision note (2026-07-17): Recorded completion of #815 Milestone 1a. The language-neutral semantic contract now includes canonical procedure-local rich-edge IDs, immutable outgoing/incoming adjacency, exact traversal, defensive hydration checks, scoped handles, and bounded schema-v2 rendering. This is only the CFG storage substrate; the file-aware provider, iterative builder, TypeScript/TSX lowering, Java differential contract, and shared ICFG remain tracked in the focused all-language plan.
+
+Plan revision note (2026-07-17): Recorded completion of #815 Milestones 1b and 1c. Semantic materialization now uses one bounded exact source snapshot with disk/overlay origin, overlay revision, and dialect identity; complete artifacts alone enter a retained-byte single-flight cache. The private iterative builder and first real TypeScript/TSX adapter cover the common callable-control core, preserve dead source behind a generic isolation seal, and expose source-backed predecessor/successor tests. Java, layout measurement, dispatch, and the shared ICFG remain in the focused rollout plan.
+
+Plan revision note (2026-07-17): Recorded completion of #815 Milestone 2. The Java reference adapter now passes the common and extended differential CFG contract, including cleanup-safe switch yield and executable initializer fragments with exact gaps. The measured hot representation remains one canonical edge table with outgoing offsets and incoming edge-ID rows; outgoing-only memory savings did not justify multi-second reverse traversal. Location-first dispatch and the matched TypeScript/Java ICFG are now the next focused checkpoint.
+
+Plan revision note (2026-07-17): Recorded completion of the #816 dispatch prerequisite and #818 TypeScript/Java internal control slice. Exact call expressions reuse the existing resolver, while one bounded context-bearing provider owns generation validation, invoke expansion, matched returns, typed boundaries, and dense predecessor/successor snapshots. The reviewed cross-language adapter boundary is frozen; value/heap transfer, public query exposure, and solver work remain outside the focused rollout.
+
+Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4a. JavaScript and JSX now pass the same source-backed callable CFG and matched-return ICFG contract as the reference pair through a flavor-aware shared JS/TS lowerer. JavaScript resource management, generator suspension, and JSX uncertainty remain exact point-scoped gaps; the remaining adapters continue in the focused rollout plan.
+
+Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4b after specialist review. C# now passes the shared callable-CFG and matched-return ICFG contract with structured control, handlers, cleanup, async points, nested callable identity, and exact advanced-feature gaps. Review corrected grammar-sensitive indexed-call, target-typed-initializer, and conditional-compilation omissions; Python is the next adapter checkpoint in the focused rollout plan.
+
+Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4c after specialist review. Python now passes the shared callable-CFG and matched-return ICFG contract with exact loop-else, nested callable ownership, handlers and cleanup, typed protocol gaps, and deferred coroutine/generator invocation. Review corrected comprehension eager evaluation, comparison short-circuiting, assertion failure routing, loop-target evaluation, and truth-protocol gaps; Go is the next adapter checkpoint in the focused rollout plan.
+
+Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4d after specialist review. Go now passes the shared callable-CFG and matched-return ICFG contract across functions, methods, literals, branches, loops, calls, range, channel operands, deferred calls, and goroutine creation. Review made selected-only call omissions and partially unspecified evaluation order explicit and proved shadowed `panic`/`recover` dispatch; Rust is the next adapter checkpoint in the focused rollout plan.
+
+Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4e after specialist review. Rust now passes the shared callable-CFG and matched-return ICFG contract across functions, methods, nested callables, labels, match, loops, calls, semicolonless tails, `?`, await, and generators. Review made parameter, lexical, pattern-binding, assignment-replacement, and abrupt-path RAII omissions exact; stopped unsupported try blocks and macros at typed boundaries; exposed implicit trait calls; corrected labeled-block break routing; and enabled generic/turbofish dispatch without regressing grouped imports. PHP is the next adapter checkpoint in the focused rollout plan.
+
+Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4f after specialist review. PHP now passes the shared callable-CFG and matched-return ICFG contract across functions, methods, nested callables, branches, loops, numeric control, nullish and nullsafe flow, switch, match, calls, explicit throw, handlers, and cleanup. Review corrected chain-scoped skipping, coalescing, grammar-sensitive loop and switch behavior, first-class callable recognition, method-return inference, bounded call selection, ambiguous boundaries, and cleanup specialization; Scala is the next adapter checkpoint in the focused rollout plan.
+
+Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4g after specialist review. Scala now passes the shared callable-CFG and matched-return ICFG contract across functions, methods, constructors, nested callables, expression-valued branches, loops, match, curried and generic application, operators, explicit throw, handlers, and cleanup. Review corrected callable ownership, non-local closure return, constructor/arity shape, wrapper resolution, nested-call pruning, structured-argument cardinality, and by-name or implicit-call completeness; Ruby is the next adapter checkpoint in the focused rollout plan.
+
+Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4h after specialist review. Ruby now passes the shared callable-CFG and matched-return ICFG contract across methods, initializers, lambdas, attached blocks, common control, implicit returns, calls, safe navigation, explicit throw, handlers, cleanup, and non-local block completion. Review corrected pattern evaluation, callable-table mutation, destructured writers, bounded binding collection, cleanup routing, overrideable dispatch, lifecycle blocks, dynamic callable boundaries, and parser-ordered binding/capture semantics; C/C++ is the final adapter checkpoint in the focused rollout plan.
+
+Plan revision note (2026-07-19): Recorded completion of #815 Milestone 4i after C/C++ and all-language specialist review. Every analyzable language now supplies source-backed callable CFGs and matched calls through one exact-location dispatch facade and one context-bearing ICFG. C/C++ adds structured link-unit identity and caller-side implicit-evaluation gaps without introducing another graph or resolver, while shared return evidence is path-relevant and every unresolved boundary is non-complete.
+
+Plan revision note (2026-07-20): Recorded completion of the focused #817 semantic/CFG lifecycle measurement. Fresh-process release matrices over generated shapes and pinned TypeScript/Java repositories confirm bidirectional rows and produce a measured SQLite no-go because the optimistic control/call projection misses the large-corpus absolute write-overhead gate. Aggregate schema v5 separates sample-time Bifrost identity, aggregation-time recommendation identity, and per-dataset repository identity. The same pass recorded the post-rollout architecture audit: preserve adapter-owned syntax semantics, extract their repeated emission and call scaffold into a shared lowering session, replace language checks in the generic ICFG with typed gap impacts, and separate workspace dispatch from language-neutral stitching before value/heap and data-dependence implementation. This is a recommendation for a dedicated follow-up ExecPlan, not an unreviewed source refactor.
+
+Plan revision note (2026-07-17): Refined #709 around the intended reusable-model workflow. Omitted policy and RQL schema versions now select only a compiled-in source-and-semantics-compatible lineage head, while explicit pins remain exact. Diagnostic-neutral categorized endpoint leaves compose through authored bounded directory/ID references; actual taint meetings receive either the fixed generated presentation or one explicitly dominant combination. Resolved endpoint bindings are also the public inputs to typestate subject/event selection, accepting states, and distinct explicit/normal-exit/exceptional-exit terminal expectations. Presentation metadata remains outside propagation, protocol, and summary keys.

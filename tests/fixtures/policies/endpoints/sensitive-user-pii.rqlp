@@ -1,0 +1,16 @@
+; A reusable sensitive sink. The display phrase is used by generated findings.
+(endpoint
+  :id "bifrost.sinks.sensitive-user-pii"
+  :name "Sensitive user PII"
+  :display-name "sensitive user PII"
+  :role sink
+  :categories [data.pii data.sensitive]
+  :selector
+    (rql
+      (language python
+        (call :callee (name "store_user_profile"))))
+  :binding (argument :index 0)
+  :taint
+    (sink-semantics
+      :accepts [attacker-controlled])
+  :supersedes [])

@@ -1,7 +1,9 @@
 use super::*;
 use crate::analyzer::ImportInfo;
-use crate::analyzer::scala::ScalaSupertypeLookupPath;
-use crate::analyzer::usages::scala_graph::syntax::call_arity_for_reference;
+use crate::analyzer::scala::{ScalaSupertypeLookupPath, scala_type_lookup_segments};
+use crate::analyzer::usages::scala_graph::syntax::{
+    call_arities_for_reference, call_arity_for_reference, scala_source_facts,
+};
 use crate::analyzer::usages::scala_graph::{
     method_call_arity_applies, method_signature_arity, resolved_extension_receiver_type,
 };
@@ -753,6 +755,12 @@ fn scala_reference_node(node: Node<'_>) -> Option<ScalaReferenceNode<'_>> {
             current = parent;
             continue;
         }
+        if parent.kind() == "generic_function"
+            && parent.child_by_field_name("function") == Some(current)
+        {
+            current = parent;
+            continue;
+        }
         if parent.kind() == "infix_expression"
             && parent.child_by_field_name("operator") == Some(current)
         {
@@ -772,7 +780,15 @@ fn scala_reference_node(node: Node<'_>) -> Option<ScalaReferenceNode<'_>> {
             current = parent;
             continue;
         }
-        if parent.kind() == "stable_identifier" {
+        if matches!(
+            parent.kind(),
+            "stable_identifier"
+                | "stable_type_identifier"
+                | "generic_type"
+                | "annotated_type"
+                | "applied_constructor_type"
+                | "projected_type"
+        ) {
             current = parent;
             continue;
         }
@@ -784,12 +800,31 @@ fn scala_reference_node(node: Node<'_>) -> Option<ScalaReferenceNode<'_>> {
         "infix_expression" => Some(ScalaReferenceNode::InfixCall(current)),
         "postfix_expression" => Some(ScalaReferenceNode::PostfixCall(current)),
         "instance_expression" => Some(ScalaReferenceNode::Constructor(current)),
+        "generic_function" => scala_unapplied_generic_reference(current),
         "field_expression" => Some(ScalaReferenceNode::Field(current)),
         "stable_identifier" => Some(ScalaReferenceNode::StableIdentifier(current)),
-        "type_identifier" | "stable_type_identifier" | "generic_type" => {
-            Some(ScalaReferenceNode::Type(current))
-        }
+        "type_identifier"
+        | "stable_type_identifier"
+        | "generic_type"
+        | "annotated_type"
+        | "applied_constructor_type"
+        | "projected_type" => Some(ScalaReferenceNode::Type(current)),
         "identifier" | "operator_identifier" => Some(ScalaReferenceNode::Identifier(current)),
+        _ => None,
+    }
+}
+
+fn scala_unapplied_generic_reference(mut node: Node<'_>) -> Option<ScalaReferenceNode<'_>> {
+    while node.kind() == "generic_function" {
+        node = node.child_by_field_name("function")?;
+    }
+    match node.kind() {
+        "call_expression" => Some(ScalaReferenceNode::Call(node)),
+        "infix_expression" => Some(ScalaReferenceNode::InfixCall(node)),
+        "postfix_expression" => Some(ScalaReferenceNode::PostfixCall(node)),
+        "field_expression" => Some(ScalaReferenceNode::Field(node)),
+        "stable_identifier" => Some(ScalaReferenceNode::StableIdentifier(node)),
+        "identifier" | "operator_identifier" => Some(ScalaReferenceNode::Identifier(node)),
         _ => None,
     }
 }
@@ -856,6 +891,12 @@ fn resolve_scala_type(
             format!("`{text}` is a local Scala value"),
         );
     }
+    let structured_path = scala_type_lookup_segments(node, ctx.source);
+    if let ScalaNameResolution::Resolved(owner) =
+        resolver.resolve_owner_segments(&structured_path, ScalaOwnerKind::Class)
+    {
+        return scala_fqn_outcome(ctx.support, &owner.fqn, text);
+    }
     if let Some(fqn) = scala_resolve_visible_type_annotation(ctx, resolver, text, node.start_byte())
     {
         return scala_fqn_outcome(ctx.support, &fqn, text);
@@ -914,6 +955,13 @@ fn resolve_scala_call(
     let Some(function) = call.child_by_field_name("function") else {
         return no_definition("no_function_name", "Scala call expression has no function");
     };
+    let Some(function) = scala_direct_application_target(function) else {
+        return no_definition(
+            SCALA_UNSUPPORTED_CALL_TARGET_SHAPE,
+            "Scala direct application chain has no structured terminal callable",
+        );
+    };
+    let call_arities = call_arities_for_reference(function);
     match function.kind() {
         "instance_expression" => resolve_scala_constructor(ctx, resolver, function),
         "field_expression" => resolve_scala_field(ctx, resolver, root, function),
@@ -934,7 +982,21 @@ fn resolve_scala_call(
                 );
             }
             if let Some(fqn) = resolver.resolve_member(name) {
-                return scala_fqn_outcome(ctx.support, &fqn, name);
+                let candidates = ctx
+                    .support
+                    .fqn(&fqn)
+                    .into_iter()
+                    .filter(|unit| {
+                        scala_callable_unit_accepts_arities(
+                            ctx.scala,
+                            unit,
+                            call_arities.as_deref(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if !candidates.is_empty() {
+                    return candidates_outcome(candidates);
+                }
             }
             if let Some(unit) = resolve_in_enclosing_scopes(
                 ctx.analyzer,
@@ -942,7 +1004,8 @@ fn resolve_scala_call(
                 name,
                 function.start_byte(),
                 |unit| unit.is_function(),
-            ) {
+            ) && scala_callable_unit_accepts_arities(ctx.scala, &unit, call_arities.as_deref())
+            {
                 return candidates_outcome(vec![unit]);
             }
             if function.kind() == "identifier"
@@ -955,19 +1018,35 @@ fn resolve_scala_call(
                 && owner.identifier() != name
             {
                 let mut candidates =
-                    scala_member_candidate_units(ctx, &owner.fq_name(), name, false);
+                    scala_member_candidate_units(ctx, &owner.fq_name(), name, false)
+                        .into_iter()
+                        .filter(|unit| {
+                            scala_callable_unit_accepts_arities(
+                                ctx.scala,
+                                unit,
+                                call_arities.as_deref(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
                 if candidates.is_empty() {
-                    candidates = scala_source_ancestor_member_units(ctx, resolver, function, name);
+                    candidates = scala_source_ancestor_member_units(ctx, resolver, function, name)
+                        .into_iter()
+                        .filter(|unit| {
+                            scala_callable_unit_accepts_arities(
+                                ctx.scala,
+                                unit,
+                                call_arities.as_deref(),
+                            )
+                        })
+                        .collect();
                 }
                 if !candidates.is_empty() {
                     return candidates_outcome(candidates);
                 }
             }
-            if let Some(imported_member) = scala_wildcard_imported_member_outcome(
-                ctx,
-                name,
-                call_arity_for_reference(function),
-            ) {
+            if let Some(imported_member) =
+                scala_wildcard_imported_member_outcome(ctx, name, call_arities.as_deref())
+            {
                 return imported_member;
             }
             if let Some(owner_fqn) = resolver.resolve_singleton(name).or_else(|| {
@@ -995,6 +1074,15 @@ fn resolve_scala_call(
     }
 }
 
+fn scala_direct_application_target(mut function: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        function = match function.kind() {
+            "call_expression" | "generic_function" => function.child_by_field_name("function")?,
+            _ => return Some(function),
+        };
+    }
+}
+
 fn resolve_scala_infix_call(
     ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
@@ -1004,16 +1092,25 @@ fn resolve_scala_infix_call(
     let Some(operator) = call.child_by_field_name("operator") else {
         return no_definition("no_function_name", "Scala infix expression has no operator");
     };
-    let Some(receiver) = call.child_by_field_name("left") else {
-        return no_definition(
-            SCALA_UNSUPPORTED_RECEIVER,
-            "Scala infix expression has no receiver",
-        );
-    };
     let name = scala_node_text(operator, ctx.source).trim();
     if name.is_empty() {
         return no_definition("no_function_name", "Scala infix operator is blank");
     }
+    if scala_is_compound_infix_call(call) {
+        return no_definition(
+            SCALA_UNSUPPORTED_RECEIVER,
+            format!(
+                "compound Scala infix member `{name}` requires precedence-aware receiver reconstruction"
+            ),
+        );
+    }
+    let receiver_field = if name.ends_with(':') { "right" } else { "left" };
+    let Some(receiver) = call.child_by_field_name(receiver_field) else {
+        return no_definition(
+            SCALA_UNSUPPORTED_RECEIVER,
+            "Scala infix expression has no semantic receiver",
+        );
+    };
     if let Some(owner) =
         scala_receiver_type_fqn(ctx, resolver, root, receiver, operator.start_byte())
     {
@@ -1031,6 +1128,14 @@ fn resolve_scala_infix_call(
         SCALA_UNSUPPORTED_RECEIVER,
         format!("receiver for Scala infix member `{name}` is not resolved"),
     )
+}
+
+fn scala_is_compound_infix_call(call: Node<'_>) -> bool {
+    call.child_by_field_name("left")
+        .is_some_and(|left| left.kind() == "infix_expression")
+        || call.parent().is_some_and(|parent| {
+            parent.kind() == "infix_expression" && parent.child_by_field_name("left") == Some(call)
+        })
 }
 
 fn resolve_scala_postfix_call(
@@ -1102,11 +1207,39 @@ fn resolve_scala_constructor(
         );
     };
     let member = scala_constructor_member_name(&owner_fqn);
-    let candidates = ctx.support.fqn(&format!("{owner_fqn}.{member}"));
+    let call_arities =
+        scala_constructor_type_node(constructor).and_then(call_arities_for_reference);
+    let constructor_candidates = ctx.support.fqn(&format!("{owner_fqn}.{member}"));
+    let had_constructor_candidates = !constructor_candidates.is_empty();
+    let candidates = constructor_candidates
+        .into_iter()
+        .filter(|unit| {
+            scala_callable_unit_accepts_arities(ctx.scala, unit, call_arities.as_deref())
+        })
+        .collect::<Vec<_>>();
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
+    if had_constructor_candidates && let Some(call_arities) = call_arities.as_deref() {
+        return no_definition(
+            "scala_constructor_arity_mismatch",
+            format!(
+                "Scala constructor `{owner_fqn}` has no indexed overload accepting argument-list arities {call_arities:?}"
+            ),
+        );
+    }
     scala_fqn_outcome(ctx.support, &owner_fqn, member)
+}
+
+fn scala_constructor_type_node(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "instance_expression" {
+        return None;
+    }
+    let arguments = node.child_by_field_name("arguments");
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).find(|child| {
+        Some(*child) != arguments && !matches!(child.kind(), "arguments" | "template_body")
+    })
 }
 
 fn scala_constructor_member_name(owner_fqn: &str) -> &str {
@@ -1146,14 +1279,21 @@ fn resolve_scala_field(
             field.start_byte(),
             &owner,
         );
-        let call_arity = call_arity_for_reference(field_node);
+        let call_arities = call_arities_for_reference(field_node);
         let candidates = scala_applicable_member_candidate_units(
             ctx,
             &owner,
             member,
             include_companion,
-            call_arity,
-        );
+            call_arities
+                .as_deref()
+                .and_then(|arities| arities.first().copied()),
+        )
+        .into_iter()
+        .filter(|unit| {
+            scala_callable_unit_accepts_arities(ctx.scala, unit, call_arities.as_deref())
+        })
+        .collect::<Vec<_>>();
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
         }
@@ -1308,6 +1448,70 @@ fn scala_member_unit_applies(
     }
 }
 
+fn scala_callable_unit_accepts_arities(
+    scala: &ScalaAnalyzer,
+    unit: &CodeUnit,
+    call_arities: Option<&[usize]>,
+) -> bool {
+    if unit.is_field() {
+        return true;
+    }
+    if !unit.is_callable() {
+        return false;
+    }
+    let Some(call_arities) = call_arities else {
+        return scala_member_unit_applies(scala, unit, None);
+    };
+
+    let source_facts = scala
+        .indexed_source(unit.source())
+        .as_deref()
+        .and_then(scala_source_facts);
+    let mut found_structured_shape = false;
+    if let Some(source_facts) = source_facts {
+        let mut declaration_ranges = scala.ranges_of(unit);
+        if let Some(owner_fqn) = scala_constructor_owner_fqn(unit) {
+            declaration_ranges.extend(
+                scala
+                    .definitions(&owner_fqn)
+                    .filter(|owner| owner.is_class() && owner.source() == unit.source())
+                    .flat_map(|owner| scala.ranges_of(&owner)),
+            );
+        }
+        for range in declaration_ranges {
+            let Some(alternative) = source_facts
+                .callable_alternatives_by_range
+                .get(&(range.start_byte, range.end_byte))
+            else {
+                continue;
+            };
+            found_structured_shape = true;
+            if call_arities.len() <= alternative.shape.len()
+                && call_arities
+                    .iter()
+                    .zip(&alternative.shape)
+                    .all(|(actual, declared)| declared.accepts(*actual))
+            {
+                return true;
+            }
+        }
+    }
+    if found_structured_shape {
+        return false;
+    }
+
+    let [call_arity] = call_arities else {
+        return false;
+    };
+    scala_member_unit_applies(scala, unit, Some(*call_arity))
+}
+
+fn scala_constructor_owner_fqn(unit: &CodeUnit) -> Option<String> {
+    let fqn = unit.fq_name();
+    let (owner, member) = fqn.rsplit_once('.')?;
+    (scala_constructor_member_name(owner) == member).then(|| owner.to_string())
+}
+
 fn scala_extension_candidates(
     ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
@@ -1361,7 +1565,7 @@ fn scala_extension_receiver_matches(
 fn scala_wildcard_imported_member_outcome(
     ctx: ScalaLookupCtx<'_>,
     member: &str,
-    call_arity: Option<usize>,
+    call_arities: Option<&[usize]>,
 ) -> Option<DefinitionLookupOutcome> {
     let file_package = scala_package_name_of(ctx.scala, ctx.file).unwrap_or_default();
     let mut contributing_imports = 0_usize;
@@ -1376,7 +1580,7 @@ fn scala_wildcard_imported_member_outcome(
         let import_candidates =
             scala_wildcard_imported_member_units(ctx.support, &path, &file_package, member)
                 .into_iter()
-                .filter(|unit| scala_member_candidate_applies(ctx, unit, call_arity))
+                .filter(|unit| scala_callable_unit_accepts_arities(ctx.scala, unit, call_arities))
                 .collect::<Vec<_>>();
         if !import_candidates.is_empty() {
             contributing_imports += 1;

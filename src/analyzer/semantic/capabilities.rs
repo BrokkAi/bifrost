@@ -54,11 +54,17 @@ semantic_capabilities! {
     StaticMemory => "static_memory",
     IndexMemory => "index_memory",
     Calls => "calls",
+    DynamicDispatch => "dynamic_dispatch",
     NormalCallContinuation => "normal_call_continuation",
     ExceptionalCallContinuation => "exceptional_call_continuation",
     Captures => "captures",
     CallableReferences => "callable_references",
     AsyncSuspendResume => "async_suspend_resume",
+    GeneratorSuspension => "generator_suspension",
+    DeferredExecution => "deferred_execution",
+    ConcurrentSpawn => "concurrent_spawn",
+    NonLocalControl => "non_local_control",
+    ResourceManagement => "resource_management",
 }
 
 /// Whether an adapter completely, partially, or not at all supports a feature.
@@ -220,6 +226,7 @@ mod tests {
             (SemanticCapability::StaticMemory, "static_memory"),
             (SemanticCapability::IndexMemory, "index_memory"),
             (SemanticCapability::Calls, "calls"),
+            (SemanticCapability::DynamicDispatch, "dynamic_dispatch"),
             (
                 SemanticCapability::NormalCallContinuation,
                 "normal_call_continuation",
@@ -236,6 +243,17 @@ mod tests {
             (
                 SemanticCapability::AsyncSuspendResume,
                 "async_suspend_resume",
+            ),
+            (
+                SemanticCapability::GeneratorSuspension,
+                "generator_suspension",
+            ),
+            (SemanticCapability::DeferredExecution, "deferred_execution"),
+            (SemanticCapability::ConcurrentSpawn, "concurrent_spawn"),
+            (SemanticCapability::NonLocalControl, "non_local_control"),
+            (
+                SemanticCapability::ResourceManagement,
+                "resource_management",
             ),
         ];
         let capabilities = SemanticCapabilities::default();

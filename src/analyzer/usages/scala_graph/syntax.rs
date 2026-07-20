@@ -50,21 +50,22 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
             }
             "class_definition" => {
                 let mut cursor = node.walk();
-                let lists = node
+                let mut lists = node
                     .named_children(&mut cursor)
                     .filter(|child| child.kind() == "class_parameters")
                     .map(callable_arity_for_parameters)
                     .collect::<Vec<_>>();
-                if !lists.is_empty() {
-                    facts.callable_alternatives_by_range.insert(
-                        (node.start_byte(), node.end_byte()),
-                        ScalaCallableSourceAlternative {
-                            shape: lists,
-                            extension_receiver_type_path: None,
-                            return_type_path: None,
-                        },
-                    );
+                if lists.is_empty() {
+                    lists.push(CallableArity::exact(0));
                 }
+                facts.callable_alternatives_by_range.insert(
+                    (node.start_byte(), node.end_byte()),
+                    ScalaCallableSourceAlternative {
+                        shape: lists,
+                        extension_receiver_type_path: None,
+                        return_type_path: None,
+                    },
+                );
             }
             "object_definition" | "enum_definition" => {
                 facts
@@ -391,9 +392,13 @@ pub(crate) fn call_arities_for_reference(node: Node<'_>) -> Option<Vec<usize>> {
         return Some(vec![1]);
     }
     let mut expression = field_expression_for_member(node).unwrap_or(node);
-    if expression.parent().is_some_and(|generic| {
-        generic.kind() == "generic_function"
-            && generic.child_by_field_name("function") == Some(expression)
+    while expression.parent().is_some_and(|generic| {
+        matches!(generic.kind(), "generic_function" | "generic_type")
+            && generic.child_by_field_name(if generic.kind() == "generic_function" {
+                "function"
+            } else {
+                "type"
+            }) == Some(expression)
     }) {
         expression = expression.parent()?;
     }
@@ -407,9 +412,8 @@ pub(crate) fn call_arities_for_reference(node: Node<'_>) -> Option<Vec<usize>> {
             instance
                 .named_children(&mut cursor)
                 .find(|child| child.kind() == "arguments")
-        })?;
-        let mut cursor = arguments.walk();
-        arities.push(arguments.named_children(&mut cursor).count());
+        });
+        arities.push(arguments.map(argument_list_arity).unwrap_or(0));
         expression = instance;
     }
     while let Some(call) = expression.parent() {
@@ -419,11 +423,18 @@ pub(crate) fn call_arities_for_reference(node: Node<'_>) -> Option<Vec<usize>> {
             break;
         }
         let arguments = call.child_by_field_name("arguments")?;
-        let mut cursor = arguments.walk();
-        arities.push(arguments.named_children(&mut cursor).count());
+        arities.push(argument_list_arity(arguments));
         expression = call;
     }
     (!arities.is_empty()).then_some(arities)
+}
+
+fn argument_list_arity(arguments: Node<'_>) -> usize {
+    if matches!(arguments.kind(), "block" | "case_block" | "colon_argument") {
+        return 1;
+    }
+    let mut cursor = arguments.walk();
+    arguments.named_children(&mut cursor).count()
 }
 
 pub(crate) fn infix_receiver_for_operator(node: Node<'_>) -> Option<Node<'_>> {

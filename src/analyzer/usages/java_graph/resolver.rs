@@ -3,8 +3,8 @@ use crate::analyzer::usages::java_graph::extractor::ScanCtx;
 use crate::analyzer::usages::java_graph::hits::enclosing_context;
 use crate::analyzer::usages::java_graph::return_type::{
     FileReturnCache, JavaReturnTypeContext, LexicalTypeResolution, METHOD_RECEIVER_CHAIN_LIMIT,
-    MethodReturnCache, java_lexical_type_from_node, java_type_name_from_node,
-    method_return_type_for_owner_fqns,
+    MethodReturnCache, is_java_nominal_type_node, java_lexical_type_from_node,
+    java_type_name_from_node, method_return_type_for_owner_fqns,
 };
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
@@ -473,6 +473,13 @@ pub(super) fn resolve_type_from_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> Optio
         return Some(resolved);
     }
 
+    resolve_non_nested_type_from_node(node, ctx)
+}
+
+pub(super) fn resolve_non_nested_type_from_node(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> Option<CodeUnit> {
     match java_lexical_type_from_node(ctx.java, ctx.analyzer, ctx.file, ctx.source, node) {
         LexicalTypeResolution::Resolved(unit) => return Some(unit),
         LexicalTypeResolution::Blocked => return None,
@@ -481,6 +488,116 @@ pub(super) fn resolve_type_from_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> Optio
 
     let type_name = java_type_name_from_node(node, ctx.source)?;
     ctx.java.resolve_usage_type_name(ctx.file, &type_name)
+}
+
+/// Resolves each semantic class segment in a Java type reference, preserving the
+/// exact token that named that segment. For example, `Service.Repository`
+/// yields the `Service` token paired with `example.Service`, followed by the
+/// `Repository` token paired with `example.Service.Repository`.
+///
+/// Package components deliberately do not appear: they cannot resolve to a
+/// class identity on their own. Callers provide their resolution context so the
+/// forward scanner and persisted edge builder use the same structured walk.
+pub(super) fn resolve_type_segments<'tree, ResolveNode, ResolveNested>(
+    node: Node<'tree>,
+    source: &str,
+    mut resolve_node: ResolveNode,
+    mut resolve_nested: ResolveNested,
+) -> Vec<(CodeUnit, Node<'tree>)>
+where
+    ResolveNode: FnMut(Node<'tree>) -> Option<CodeUnit>,
+    ResolveNested: FnMut(&CodeUnit, &str) -> Option<CodeUnit>,
+{
+    let mut prefixes = Vec::new();
+    let mut current = node;
+    loop {
+        while matches!(
+            current.kind(),
+            "array_type" | "annotated_type" | "generic_type"
+        ) {
+            let Some(nominal) = nominal_type_child(current) else {
+                return Vec::new();
+            };
+            current = nominal;
+        }
+        match current.kind() {
+            "identifier" | "type_identifier" => {
+                prefixes.push((current, current));
+                break;
+            }
+            "scoped_identifier" | "scoped_type_identifier" => {
+                let mut cursor = current.walk();
+                let typed_children: Vec<_> = current
+                    .named_children(&mut cursor)
+                    .filter(|child| is_java_nominal_type_node(child.kind()))
+                    .collect();
+                let Some((name, qualifier)) = typed_children.split_last() else {
+                    return Vec::new();
+                };
+                let Some(terminal) = terminal_type_node(*name) else {
+                    return Vec::new();
+                };
+                prefixes.push((current, terminal));
+                let Some(qualifier) = qualifier.last().copied() else {
+                    break;
+                };
+                current = qualifier;
+            }
+            _ => return Vec::new(),
+        }
+    }
+    prefixes.reverse();
+
+    let mut segments = Vec::new();
+    for (prefix, terminal) in prefixes {
+        let name = node_text(terminal, source);
+        if name.is_empty() {
+            continue;
+        }
+        let resolved = segments
+            .last()
+            .and_then(|(owner, _)| resolve_nested(owner, name))
+            .or_else(|| resolve_node(prefix));
+        if let Some(resolved) = resolved {
+            if segments.last().is_none_or(|(owner, _)| *owner != resolved) {
+                segments.push((resolved, terminal));
+            }
+        } else if !segments.is_empty() {
+            // Initial unresolved prefixes may be package components (for
+            // example, `app` in `app.Service.Repository`), but an unresolved
+            // segment after a class identity invalidates the remaining nested
+            // path. Continuing would let a later name resolve from the stale
+            // owner and create a false edge.
+            break;
+        }
+    }
+    segments
+}
+
+fn nominal_type_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| is_java_nominal_type_node(child.kind()))
+}
+
+fn terminal_type_node(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "identifier" | "type_identifier" => return Some(current),
+            "array_type" | "annotated_type" | "generic_type" => {
+                current = nominal_type_child(current)?;
+            }
+            "scoped_identifier" | "scoped_type_identifier" => {
+                let mut cursor = current.walk();
+                current = current
+                    .named_children(&mut cursor)
+                    .filter(|child| is_java_nominal_type_node(child.kind()))
+                    .last()?;
+            }
+            _ => return None,
+        }
+    }
 }
 
 fn resolve_nested_type_from_scoped_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
@@ -506,18 +623,34 @@ fn resolve_nested_type_from_scoped_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> Op
         return None;
     }
 
-    let nested = |owner: &CodeUnit| {
-        ctx.analyzer
+    nested_type_for_owner(&qualifier_type, name, ctx)
+}
+
+pub(super) fn nested_type_for_owner(
+    owner: &CodeUnit,
+    name: &str,
+    ctx: &ScanCtx<'_>,
+) -> Option<CodeUnit> {
+    resolve_nested_type_for_owner(ctx.analyzer, owner, name)
+}
+
+pub(super) fn resolve_nested_type_for_owner(
+    analyzer: &dyn IAnalyzer,
+    owner: &CodeUnit,
+    name: &str,
+) -> Option<CodeUnit> {
+    let nested = |candidate: &CodeUnit| {
+        analyzer
             .global_usage_definition_index()
-            .by_fqn(&format!("{}.{}", owner.fq_name(), name))
+            .by_fqn(&format!("{}.{}", candidate.fq_name(), name))
             .iter()
             .find(|unit| unit.is_class())
             .cloned()
     };
-    nested(&qualifier_type).or_else(|| {
-        ctx.analyzer
+    nested(owner).or_else(|| {
+        analyzer
             .type_hierarchy_provider()?
-            .get_ancestors(&qualifier_type)
+            .get_ancestors(owner)
             .into_iter()
             .find_map(|ancestor| nested(&ancestor))
     })

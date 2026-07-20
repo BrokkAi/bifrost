@@ -96,6 +96,7 @@ dense_ids! {
     ProcedureId,
     BlockId,
     ProgramPointId,
+    ControlEdgeId,
     ValueId,
     AllocationId,
     CallSiteId,
@@ -178,11 +179,19 @@ typed_digests! {
     WorkspaceMountId,
 }
 
+impl WorkspaceMountId {
+    /// Derive the mount identity used by every semantic producer for one
+    /// normalized workspace root.
+    pub fn from_root(root: &Path) -> Self {
+        Self::hash_bytes(root.as_os_str().as_encoded_bytes())
+    }
+}
+
 /// Domain separator for the language-neutral semantic IR schema fingerprint.
 pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic-ir";
 
 /// Current language-neutral semantic IR schema revision.
-pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 1;
+pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 3;
 
 impl SemanticIrVersion {
     /// The contract-owned fingerprint shared by every language adapter that
@@ -922,11 +931,17 @@ mod tests {
     #[test]
     fn dense_ids_are_fixed_width_checked_and_not_interchangeable() {
         let procedure = ProcedureId::try_from_index(17).unwrap();
+        let control_edge = ControlEdgeId::try_from_index(17).unwrap();
         assert_eq!(procedure.get(), 17);
         assert_eq!(procedure.index(), 17);
         assert_eq!(procedure.to_string(), "17");
         assert_eq!(std::mem::size_of::<ProcedureId>(), 4);
+        assert_eq!(std::mem::size_of::<ControlEdgeId>(), 4);
         assert_ne!(format!("{procedure:?}"), format!("{:?}", BlockId::new(17)));
+        assert_ne!(
+            format!("{control_edge:?}"),
+            format!("{:?}", ProgramPointId::new(17))
+        );
 
         #[cfg(target_pointer_width = "64")]
         assert_eq!(
@@ -1050,10 +1065,10 @@ mod tests {
         let current = SemanticIrVersion::current();
         assert_eq!(
             current.to_string(),
-            "c8a782f30e4b3d05460e191490eedfac3f0e166b012a4fa451ee2cd42c82db32"
+            "8779704a8642ebd38ff6bb268ba626265a79fdcae9f794dd4affc221cdfbc542"
         );
         assert_ne!(current.as_bytes(), &[0_u8; 32]);
-        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 1);
+        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 3);
     }
 
     fn digest(label: &str) -> StableDigest {

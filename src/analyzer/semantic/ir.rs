@@ -10,12 +10,13 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use crate::compact_graph::CompactRows;
 use crate::hash::{HashMap, HashSet};
 
 use super::capabilities::{CapabilitySupport, SemanticCapabilities, SemanticCapability};
 use super::ids::{
-    AllocationId, BlockId, CallSiteId, CaptureId, DeclarationSegmentKind, EvidenceId,
-    MemoryLocationId, ProcedureId, ProgramPointId, SemanticArtifactKey, SemanticGapId,
+    AllocationId, BlockId, CallSiteId, CaptureId, ControlEdgeId, DeclarationSegmentKind,
+    EvidenceId, MemoryLocationId, ProcedureId, ProgramPointId, SemanticArtifactKey, SemanticGapId,
     SemanticLocator, SemanticRole, SourceMappingId, ValueId,
 };
 use super::provider::{SemanticBudget, SemanticBudgetExceeded, SemanticWork};
@@ -223,6 +224,30 @@ impl ProcedureKind {
     }
 }
 
+/// Whether invoking a callable begins executing its body immediately.
+///
+/// Some languages publish callable bodies whose invocation only creates a
+/// suspended object. Python coroutine and generator functions, JavaScript
+/// generators, and Rust async functions are examples. Keeping this separate
+/// from `is_async` and `is_generator` avoids incorrectly applying one
+/// language's call semantics to another language with the same surface
+/// property.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProcedureInvocationKind {
+    #[default]
+    Immediate,
+    Deferred,
+}
+
+impl ProcedureInvocationKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Immediate => "immediate",
+            Self::Deferred => "deferred",
+        }
+    }
+}
+
 /// Orthogonal properties that should not be encoded in [`ProcedureKind`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcedureProperties {
@@ -230,6 +255,7 @@ pub struct ProcedureProperties {
     pub is_generator: bool,
     pub is_static: bool,
     pub is_synthetic: bool,
+    pub invocation: ProcedureInvocationKind,
 }
 
 /// The semantic role of a value row.
@@ -951,6 +977,361 @@ pub struct ControlEdge {
     pub evidence: EvidenceId,
 }
 
+/// Immutable intraprocedural control-flow topology.
+///
+/// Edge IDs are procedure-local indices into one canonical rich-edge table.
+/// Outgoing rows are contiguous ranges in that source-sorted table, while
+/// incoming rows retain edge IDs so both directions share the same payload.
+#[derive(Debug, Clone)]
+pub struct ControlFlowGraph {
+    edges: Box<[ControlEdge]>,
+    outgoing_row_offsets: Box<[u32]>,
+    incoming: CompactRows<ControlEdgeId>,
+}
+
+impl ControlFlowGraph {
+    fn try_from_edges(
+        procedure: ProcedureId,
+        point_count: usize,
+        mut edges: Vec<ControlEdge>,
+    ) -> Result<Self, SemanticIrError> {
+        let edge_count = u32::try_from(edges.len()).map_err(|_| {
+            SemanticIrError::procedure(
+                procedure,
+                SemanticIrErrorKind::ResourceLimit,
+                format!(
+                    "control-edge count {} cannot be represented by compact u32 row offsets",
+                    edges.len()
+                ),
+            )
+        })?;
+        for edge in &edges {
+            if edge.source_point.index() >= point_count || edge.target_point.index() >= point_count
+            {
+                return Err(SemanticIrError::procedure(
+                    procedure,
+                    SemanticIrErrorKind::ControlFlowContract,
+                    format!(
+                        "{} edge {} -> {} cannot be frozen for {point_count} program points",
+                        edge.kind.label(),
+                        edge.source_point,
+                        edge.target_point
+                    ),
+                ));
+            }
+        }
+
+        edges.sort_unstable_by_key(control_edge_sort_key);
+
+        let row_capacity = point_count.checked_add(1).ok_or_else(|| {
+            SemanticIrError::procedure(
+                procedure,
+                SemanticIrErrorKind::ResourceLimit,
+                "control-flow row count overflows usize",
+            )
+        })?;
+        let mut outgoing_row_offsets = Vec::with_capacity(row_capacity);
+        outgoing_row_offsets.push(0);
+        let mut cursor = 0usize;
+        for source in 0..point_count {
+            while cursor < edges.len() && edges[cursor].source_point.index() == source {
+                cursor += 1;
+            }
+            outgoing_row_offsets.push(u32::try_from(cursor).map_err(|_| {
+                SemanticIrError::procedure(
+                    procedure,
+                    SemanticIrErrorKind::ResourceLimit,
+                    "control-flow outgoing offset does not fit in u32",
+                )
+            })?);
+        }
+        if cursor != edges.len() {
+            return Err(SemanticIrError::procedure(
+                procedure,
+                SemanticIrErrorKind::ControlFlowContract,
+                "canonical control-edge table contains an out-of-range source row",
+            ));
+        }
+
+        let mut incoming_counts = vec![0_u32; point_count];
+        for edge in &edges {
+            let count = &mut incoming_counts[edge.target_point.index()];
+            *count = count.checked_add(1).ok_or_else(|| {
+                SemanticIrError::procedure(
+                    procedure,
+                    SemanticIrErrorKind::ResourceLimit,
+                    format!(
+                        "incoming edge count for program point {} does not fit in u32",
+                        edge.target_point
+                    ),
+                )
+            })?;
+        }
+        let mut incoming_offsets = Vec::with_capacity(row_capacity);
+        incoming_offsets.push(0);
+        let mut incoming_total = 0_u32;
+        for count in incoming_counts {
+            incoming_total = incoming_total.checked_add(count).ok_or_else(|| {
+                SemanticIrError::procedure(
+                    procedure,
+                    SemanticIrErrorKind::ResourceLimit,
+                    "control-flow incoming offsets do not fit in u32",
+                )
+            })?;
+            incoming_offsets.push(incoming_total);
+        }
+        debug_assert_eq!(incoming_total, edge_count);
+
+        let mut incoming_cursors = incoming_offsets[..point_count].to_vec();
+        let mut incoming_edge_ids = vec![ControlEdgeId::default(); edges.len()];
+        for (index, edge) in edges.iter().enumerate() {
+            let target = edge.target_point.index();
+            let destination = incoming_cursors[target] as usize;
+            incoming_edge_ids[destination] =
+                ControlEdgeId::try_from_index(index).map_err(|error| {
+                    SemanticIrError::procedure(
+                        procedure,
+                        SemanticIrErrorKind::ResourceLimit,
+                        error.to_string(),
+                    )
+                })?;
+            incoming_cursors[target] = incoming_cursors[target]
+                .checked_add(1)
+                .expect("validated incoming edge count cannot overflow");
+        }
+
+        Self::try_from_parts(
+            procedure,
+            point_count,
+            edges,
+            outgoing_row_offsets,
+            incoming_offsets,
+            incoming_edge_ids,
+        )
+    }
+
+    fn try_from_parts(
+        procedure: ProcedureId,
+        point_count: usize,
+        edges: Vec<ControlEdge>,
+        outgoing_row_offsets: Vec<u32>,
+        incoming_offsets: Vec<u32>,
+        incoming_edge_ids: Vec<ControlEdgeId>,
+    ) -> Result<Self, SemanticIrError> {
+        let incoming =
+            CompactRows::try_from_parts(incoming_offsets, incoming_edge_ids).map_err(|detail| {
+                SemanticIrError::procedure(
+                    procedure,
+                    SemanticIrErrorKind::ControlFlowContract,
+                    format!("invalid incoming control-flow rows: {detail}"),
+                )
+            })?;
+        let graph = Self {
+            edges: edges.into_boxed_slice(),
+            outgoing_row_offsets: outgoing_row_offsets.into_boxed_slice(),
+            incoming,
+        };
+        graph.validate(procedure, point_count)?;
+        Ok(graph)
+    }
+
+    fn validate(&self, procedure: ProcedureId, point_count: usize) -> Result<(), SemanticIrError> {
+        let expected_offset_count = point_count.checked_add(1).ok_or_else(|| {
+            SemanticIrError::procedure(
+                procedure,
+                SemanticIrErrorKind::ResourceLimit,
+                "control-flow row count overflows usize",
+            )
+        })?;
+        if self.outgoing_row_offsets.len() != expected_offset_count
+            || self.outgoing_row_offsets.first().copied() != Some(0)
+            || self
+                .outgoing_row_offsets
+                .last()
+                .copied()
+                .map(|offset| offset as usize)
+                != Some(self.edges.len())
+            || !self
+                .outgoing_row_offsets
+                .windows(2)
+                .all(|pair| pair[0] <= pair[1])
+        {
+            return Err(SemanticIrError::procedure(
+                procedure,
+                SemanticIrErrorKind::ControlFlowContract,
+                "outgoing control-flow row offsets are not a complete monotonic edge partition",
+            ));
+        }
+        if self.incoming.rows() != point_count {
+            return Err(SemanticIrError::procedure(
+                procedure,
+                SemanticIrErrorKind::ControlFlowContract,
+                format!(
+                    "incoming control-flow row count {} does not match {point_count} program points",
+                    self.incoming.rows()
+                ),
+            ));
+        }
+        if self
+            .edges
+            .windows(2)
+            .any(|pair| control_edge_sort_key(&pair[0]) > control_edge_sort_key(&pair[1]))
+        {
+            return Err(SemanticIrError::procedure(
+                procedure,
+                SemanticIrErrorKind::ControlFlowContract,
+                "control-edge table is not in canonical order",
+            ));
+        }
+        if self.edges.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(SemanticIrError::procedure(
+                procedure,
+                SemanticIrErrorKind::DuplicateEdge,
+                "control-edge table contains an exact duplicate rich edge",
+            ));
+        }
+
+        for point in 0..point_count {
+            let start = self.outgoing_row_offsets[point] as usize;
+            let end = self.outgoing_row_offsets[point + 1] as usize;
+            for edge in &self.edges[start..end] {
+                if edge.source_point.index() != point {
+                    return Err(SemanticIrError::procedure(
+                        procedure,
+                        SemanticIrErrorKind::ControlFlowContract,
+                        format!(
+                            "outgoing row {point} contains edge {} -> {} owned by source row {}",
+                            edge.source_point, edge.target_point, edge.source_point
+                        ),
+                    ));
+                }
+                if edge.target_point.index() >= point_count {
+                    return Err(SemanticIrError::procedure(
+                        procedure,
+                        SemanticIrErrorKind::ControlFlowContract,
+                        format!(
+                            "edge {} -> {} has an out-of-range target",
+                            edge.source_point, edge.target_point
+                        ),
+                    ));
+                }
+            }
+        }
+
+        let mut incoming_seen = vec![false; self.edges.len()];
+        for point in 0..point_count {
+            let incoming_row = self.incoming.row(point);
+            if incoming_row.windows(2).any(|pair| pair[0] >= pair[1]) {
+                return Err(SemanticIrError::procedure(
+                    procedure,
+                    SemanticIrErrorKind::ControlFlowContract,
+                    format!(
+                        "incoming row {point} is not in canonical increasing control-edge order"
+                    ),
+                ));
+            }
+            for edge_id in incoming_row {
+                let Some(edge) = self.edges.get(edge_id.index()) else {
+                    return Err(SemanticIrError::procedure(
+                        procedure,
+                        SemanticIrErrorKind::ControlFlowContract,
+                        format!("incoming row {point} references out-of-range edge {edge_id}"),
+                    ));
+                };
+                if incoming_seen[edge_id.index()] {
+                    return Err(SemanticIrError::procedure(
+                        procedure,
+                        SemanticIrErrorKind::ControlFlowContract,
+                        format!("incoming rows reference edge {edge_id} more than once"),
+                    ));
+                }
+                incoming_seen[edge_id.index()] = true;
+                if edge.target_point.index() != point {
+                    return Err(SemanticIrError::procedure(
+                        procedure,
+                        SemanticIrErrorKind::ControlFlowContract,
+                        format!(
+                            "incoming row {point} references edge {edge_id} targeting {}",
+                            edge.target_point
+                        ),
+                    ));
+                }
+            }
+        }
+        if let Some(missing) = incoming_seen.iter().position(|seen| !seen) {
+            return Err(SemanticIrError::procedure(
+                procedure,
+                SemanticIrErrorKind::ControlFlowContract,
+                format!("incoming rows do not reference edge {missing}"),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn edges(&self) -> &[ControlEdge] {
+        &self.edges
+    }
+
+    pub fn edge(&self, id: ControlEdgeId) -> Option<&ControlEdge> {
+        self.edges.get(id.index())
+    }
+
+    pub fn successor_edges(
+        &self,
+        point: ProgramPointId,
+    ) -> impl ExactSizeIterator<Item = (ControlEdgeId, &ControlEdge)> + '_ {
+        let point = point.index();
+        assert!(
+            point < self.incoming.rows(),
+            "program point {point} is outside this control-flow graph"
+        );
+        let start = self.outgoing_row_offsets[point] as usize;
+        let end = self.outgoing_row_offsets[point + 1] as usize;
+        self.edges[start..end]
+            .iter()
+            .enumerate()
+            .map(move |(offset, edge)| {
+                let id = ControlEdgeId::try_from_index(start + offset)
+                    .expect("validated control-edge index fits in u32");
+                (id, edge)
+            })
+    }
+
+    pub fn predecessor_edges(
+        &self,
+        point: ProgramPointId,
+    ) -> impl ExactSizeIterator<Item = (ControlEdgeId, &ControlEdge)> + '_ {
+        let point = point.index();
+        assert!(
+            point < self.incoming.rows(),
+            "program point {point} is outside this control-flow graph"
+        );
+        let edge_ids = self.incoming.row(point);
+        edge_ids.iter().copied().map(|id| {
+            let edge = &self.edges[id.index()];
+            (id, edge)
+        })
+    }
+}
+
+fn control_edge_sort_key(
+    edge: &ControlEdge,
+) -> (
+    ProgramPointId,
+    &'static str,
+    ProgramPointId,
+    SourceMappingId,
+    EvidenceId,
+) {
+    (
+        edge.source_point,
+        edge.kind.label(),
+        edge.target_point,
+        edge.source,
+        edge.evidence,
+    )
+}
+
 /// Mutable construction parts.  Once accepted by [`SemanticArtifact::try_new`],
 /// every collection is boxed and only shared immutably.
 #[derive(Debug, Clone)]
@@ -1026,20 +1407,22 @@ pub struct ProcedureSemantics {
     gaps: Box<[SemanticGap]>,
     blocks: Box<[BasicBlock]>,
     points: Box<[ProgramPoint]>,
-    control_edges: Box<[ControlEdge]>,
+    cfg: ControlFlowGraph,
     entry_point: ProgramPointId,
     normal_exit_point: ProgramPointId,
     exceptional_exit_point: ProgramPointId,
 }
 
 impl ProcedureSemantics {
-    fn from_parts(
+    fn try_from_parts(
         parts: ProcedureSemanticsParts,
         entry_point: ProgramPointId,
         normal_exit_point: ProgramPointId,
         exceptional_exit_point: ProgramPointId,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, SemanticIrError> {
+        let cfg =
+            ControlFlowGraph::try_from_edges(parts.id, parts.points.len(), parts.control_edges)?;
+        Ok(Self {
             id: parts.id,
             locator: parts.locator,
             lexical_parent: parts.lexical_parent,
@@ -1057,11 +1440,11 @@ impl ProcedureSemantics {
             gaps: parts.gaps.into_boxed_slice(),
             blocks: parts.blocks.into_boxed_slice(),
             points: parts.points.into_boxed_slice(),
-            control_edges: parts.control_edges.into_boxed_slice(),
+            cfg,
             entry_point,
             normal_exit_point,
             exceptional_exit_point,
-        }
+        })
     }
 
     pub const fn id(&self) -> ProcedureId {
@@ -1132,8 +1515,31 @@ impl ProcedureSemantics {
         &self.points
     }
 
+    pub fn cfg(&self) -> &ControlFlowGraph {
+        &self.cfg
+    }
+
+    /// Compatibility view over the canonical control-flow edge table.
     pub fn control_edges(&self) -> &[ControlEdge] {
-        &self.control_edges
+        self.cfg.edges()
+    }
+
+    pub fn control_edge(&self, id: ControlEdgeId) -> Option<&ControlEdge> {
+        self.cfg.edge(id)
+    }
+
+    pub fn successor_edges(
+        &self,
+        point: ProgramPointId,
+    ) -> impl ExactSizeIterator<Item = (ControlEdgeId, &ControlEdge)> + '_ {
+        self.cfg.successor_edges(point)
+    }
+
+    pub fn predecessor_edges(
+        &self,
+        point: ProgramPointId,
+    ) -> impl ExactSizeIterator<Item = (ControlEdgeId, &ControlEdge)> + '_ {
+        self.cfg.predecessor_edges(point)
     }
 
     pub const fn entry_point(&self) -> ProgramPointId {
@@ -1237,12 +1643,12 @@ impl SemanticArtifact {
         for parts in procedure_parts {
             let boundaries = find_boundaries(&parts)?;
             procedures_by_locator.insert(parts.locator.clone(), parts.id);
-            procedures.push(ProcedureSemantics::from_parts(
+            procedures.push(ProcedureSemantics::try_from_parts(
                 parts,
                 boundaries.entry,
                 boundaries.normal_exit,
                 boundaries.exceptional_exit,
-            ));
+            )?);
         }
 
         let artifact = Self {
@@ -1343,6 +1749,11 @@ impl ProcedureHandle {
         Some(self.scoped(id))
     }
 
+    pub fn control_edge_handle(&self, id: ControlEdgeId) -> Option<ControlEdgeHandle> {
+        self.semantics().control_edge(id)?;
+        Some(self.scoped(id))
+    }
+
     pub fn call_site_handle(&self, id: CallSiteId) -> Option<CallSiteHandle> {
         self.semantics().call_site(id)?;
         Some(self.scoped(id))
@@ -1419,6 +1830,7 @@ impl<I: Copy> ProcedureLocalHandle<I> {
 
 pub type BlockHandle = ProcedureLocalHandle<BlockId>;
 pub type ProgramPointHandle = ProcedureLocalHandle<ProgramPointId>;
+pub type ControlEdgeHandle = ProcedureLocalHandle<ControlEdgeId>;
 pub type ValueHandle = ProcedureLocalHandle<ValueId>;
 pub type AllocationHandle = ProcedureLocalHandle<AllocationId>;
 pub type CallSiteHandle = ProcedureLocalHandle<CallSiteId>;
@@ -1437,23 +1849,39 @@ struct Boundaries {
 
 #[derive(Default)]
 struct ControlEdgeIndex {
-    exact: HashSet<(ProgramPointId, ProgramPointId, ControlEdgeKind)>,
+    exact: HashSet<(
+        ProgramPointId,
+        ProgramPointId,
+        ControlEdgeKind,
+        SourceMappingId,
+        EvidenceId,
+    )>,
+    topology: HashSet<(ProgramPointId, ProgramPointId, ControlEdgeKind)>,
     outgoing_by_kind: HashMap<(ProgramPointId, ControlEdgeKind), usize>,
     outgoing_total: HashMap<ProgramPointId, usize>,
 }
 
 impl ControlEdgeIndex {
-    fn insert(
-        &mut self,
-        source: ProgramPointId,
-        target: ProgramPointId,
-        kind: ControlEdgeKind,
-    ) -> bool {
-        if !self.exact.insert((source, target, kind)) {
+    fn insert(&mut self, edge: &ControlEdge) -> bool {
+        if !self.exact.insert((
+            edge.source_point,
+            edge.target_point,
+            edge.kind,
+            edge.source,
+            edge.evidence,
+        )) {
             return false;
         }
-        *self.outgoing_by_kind.entry((source, kind)).or_default() += 1;
-        *self.outgoing_total.entry(source).or_default() += 1;
+        let topology_inserted =
+            self.topology
+                .insert((edge.source_point, edge.target_point, edge.kind));
+        if topology_inserted {
+            *self
+                .outgoing_by_kind
+                .entry((edge.source_point, edge.kind))
+                .or_default() += 1;
+            *self.outgoing_total.entry(edge.source_point).or_default() += 1;
+        }
         true
     }
 
@@ -1463,7 +1891,7 @@ impl ControlEdgeIndex {
         target: ProgramPointId,
         kind: ControlEdgeKind,
     ) -> bool {
-        self.exact.contains(&(source, target, kind))
+        self.topology.contains(&(source, target, kind))
     }
 
     fn outgoing_count(&self, source: ProgramPointId, kind: ControlEdgeKind) -> usize {
@@ -1556,6 +1984,15 @@ fn measure_artifact_work(
         work.control_edges = work
             .control_edges
             .saturating_add(procedure.control_edges.len());
+        // The frozen CFG retains two point-indexed offset arrays plus one
+        // incoming procedure-local edge ID per canonical rich edge.
+        let adjacency_entries = procedure
+            .points
+            .len()
+            .saturating_add(1)
+            .saturating_mul(2)
+            .saturating_add(procedure.control_edges.len());
+        work.nested_entries = work.nested_entries.saturating_add(adjacency_entries);
 
         // The locator is retained once on the procedure and once as the key
         // in the artifact's locator index.
@@ -2897,15 +3334,17 @@ fn validate_control_edges(
                 ),
             ));
         }
-        if !edges.insert(edge.source_point, edge.target_point, edge.kind) {
+        if !edges.insert(edge) {
             return Err(SemanticIrError::procedure(
                 id,
                 SemanticIrErrorKind::DuplicateEdge,
                 format!(
-                    "duplicate {} edge {} -> {}",
+                    "duplicate {} edge {} -> {} with source {} and evidence {}",
                     edge.kind.label(),
                     edge.source_point,
-                    edge.target_point
+                    edge.target_point,
+                    edge.source,
+                    edge.evidence,
                 ),
             ));
         }
@@ -4310,7 +4749,242 @@ mod tests {
             .expect("in-bounds procedure handle");
         assert!(handle.point_handle(ProgramPointId::new(2)).is_some());
         assert!(handle.point_handle(ProgramPointId::new(3)).is_none());
+        assert!(handle.control_edge_handle(ControlEdgeId::new(1)).is_some());
+        assert!(handle.control_edge_handle(ControlEdgeId::new(2)).is_none());
         assert!(handle.value_handle(ValueId::new(0)).is_none());
+    }
+
+    #[test]
+    fn cfg_freeze_assigns_canonical_edge_ids_and_bidirectional_rows() {
+        let key = key();
+        let mut parts = minimal_procedure(&key, ProcedureId::new(0), "main", 1);
+        parts.control_edges.reverse();
+
+        let artifact = SemanticArtifact::try_new(key, capabilities(&[]), vec![parts])
+            .expect("valid edges should freeze into indexed topology");
+        let procedure = &artifact.procedures()[0];
+
+        // Six locator segments, one evidence source, three block members,
+        // eight row offsets, and two incoming edge IDs are retained.
+        assert_eq!(artifact.work().nested_entries, 20);
+        assert_eq!(procedure.control_edges(), procedure.cfg().edges());
+        assert_eq!(procedure.control_edges().len(), 2);
+        assert_eq!(
+            procedure.control_edge(ControlEdgeId::new(0)).unwrap().kind,
+            ControlEdgeKind::Exceptional
+        );
+        assert_eq!(
+            procedure.control_edge(ControlEdgeId::new(1)).unwrap().kind,
+            ControlEdgeKind::Normal
+        );
+        assert!(procedure.control_edge(ControlEdgeId::new(2)).is_none());
+
+        let successors = procedure
+            .successor_edges(ProgramPointId::new(0))
+            .map(|(id, edge)| (id, edge.target_point, edge.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            successors,
+            vec![
+                (
+                    ControlEdgeId::new(0),
+                    ProgramPointId::new(2),
+                    ControlEdgeKind::Exceptional,
+                ),
+                (
+                    ControlEdgeId::new(1),
+                    ProgramPointId::new(1),
+                    ControlEdgeKind::Normal,
+                ),
+            ]
+        );
+        assert_eq!(
+            procedure
+                .predecessor_edges(ProgramPointId::new(1))
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec![ControlEdgeId::new(1)]
+        );
+        assert_eq!(
+            procedure
+                .predecessor_edges(ProgramPointId::new(2))
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec![ControlEdgeId::new(0)]
+        );
+        assert_eq!(procedure.predecessor_edges(ProgramPointId::new(0)).len(), 0);
+        assert_eq!(procedure.successor_edges(ProgramPointId::new(1)).len(), 0);
+
+        let invalid = ProgramPointId::new(u32::MAX);
+        assert!(
+            std::panic::catch_unwind(|| procedure.cfg().successor_edges(invalid).count()).is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| procedure.cfg().predecessor_edges(invalid).count())
+                .is_err()
+        );
+        assert!(std::panic::catch_unwind(|| procedure.successor_edges(invalid).count()).is_err());
+        assert!(std::panic::catch_unwind(|| procedure.predecessor_edges(invalid).count()).is_err());
+    }
+
+    #[test]
+    fn exact_rich_edges_are_rejected_but_distinct_provenance_is_preserved() {
+        let key = key();
+        let mut duplicate = minimal_procedure(&key, ProcedureId::new(0), "duplicate", 1);
+        duplicate
+            .control_edges
+            .push(duplicate.control_edges[0].clone());
+        let error = SemanticArtifact::try_new(key.clone(), capabilities(&[]), vec![duplicate])
+            .expect_err("an exact rich-edge duplicate must fail");
+        assert_eq!(error.kind(), SemanticIrErrorKind::DuplicateEdge);
+
+        let mut parallel = minimal_procedure(&key, ProcedureId::new(0), "parallel", 1);
+        let second_source = SourceMappingId::new(1);
+        let second_evidence = EvidenceId::new(1);
+        parallel.source_mappings.push(SourceMapping {
+            id: second_source,
+            locator: parallel.locator.clone(),
+            kind: SourceMappingKind::Exact,
+        });
+        parallel.evidence_rows.push(Evidence {
+            id: second_evidence,
+            proof: ProofStatus::Proven,
+            completeness: EvidenceCompleteness::Complete,
+            sources: Box::new([second_source]),
+        });
+        let mut second = parallel.control_edges[0].clone();
+        second.source = second_source;
+        second.evidence = second_evidence;
+        parallel.control_edges.push(second);
+
+        let artifact = SemanticArtifact::try_new(key, capabilities(&[]), vec![parallel])
+            .expect("parallel rich edges with distinct provenance are valid");
+        let procedure = &artifact.procedures()[0];
+        let parallel_edges = procedure
+            .predecessor_edges(ProgramPointId::new(1))
+            .map(|(_, edge)| (edge.source, edge.evidence))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parallel_edges,
+            vec![
+                (SourceMappingId::new(0), EvidenceId::new(0)),
+                (second_source, second_evidence),
+            ]
+        );
+    }
+
+    fn raw_cfg_parts() -> (Vec<ControlEdge>, Vec<u32>, Vec<u32>, Vec<ControlEdgeId>) {
+        let source = SourceMappingId::new(0);
+        let evidence = EvidenceId::new(0);
+        (
+            vec![
+                ControlEdge {
+                    source_point: ProgramPointId::new(0),
+                    target_point: ProgramPointId::new(2),
+                    kind: ControlEdgeKind::Exceptional,
+                    source,
+                    evidence,
+                },
+                ControlEdge {
+                    source_point: ProgramPointId::new(0),
+                    target_point: ProgramPointId::new(1),
+                    kind: ControlEdgeKind::Normal,
+                    source,
+                    evidence,
+                },
+            ],
+            vec![0, 2, 2, 2],
+            vec![0, 0, 1, 2],
+            vec![ControlEdgeId::new(1), ControlEdgeId::new(0)],
+        )
+    }
+
+    #[test]
+    fn checked_cfg_parts_reject_corrupt_adjacency() {
+        let procedure = ProcedureId::new(0);
+        let (edges, outgoing, incoming_offsets, incoming_ids) = raw_cfg_parts();
+        ControlFlowGraph::try_from_parts(
+            procedure,
+            3,
+            edges,
+            outgoing,
+            incoming_offsets,
+            incoming_ids,
+        )
+        .expect("valid raw adjacency should pass defensive validation");
+
+        let (edges, _, incoming_offsets, incoming_ids) = raw_cfg_parts();
+        let error = ControlFlowGraph::try_from_parts(
+            procedure,
+            3,
+            edges,
+            vec![0, 1, 2, 2],
+            incoming_offsets,
+            incoming_ids,
+        )
+        .expect_err("an edge in the wrong outgoing row must fail");
+        assert_eq!(error.kind(), SemanticIrErrorKind::ControlFlowContract);
+
+        let (edges, outgoing, incoming_offsets, _) = raw_cfg_parts();
+        let error = ControlFlowGraph::try_from_parts(
+            procedure,
+            3,
+            edges,
+            outgoing,
+            incoming_offsets,
+            vec![ControlEdgeId::new(1), ControlEdgeId::new(9)],
+        )
+        .expect_err("an out-of-range incoming edge id must fail");
+        assert_eq!(error.kind(), SemanticIrErrorKind::ControlFlowContract);
+
+        let (edges, outgoing, incoming_offsets, _) = raw_cfg_parts();
+        let error = ControlFlowGraph::try_from_parts(
+            procedure,
+            3,
+            edges,
+            outgoing,
+            incoming_offsets,
+            vec![ControlEdgeId::new(0), ControlEdgeId::new(1)],
+        )
+        .expect_err("an edge in the wrong incoming row must fail");
+        assert_eq!(error.kind(), SemanticIrErrorKind::ControlFlowContract);
+
+        let (edges, outgoing, incoming_offsets, _) = raw_cfg_parts();
+        let error = ControlFlowGraph::try_from_parts(
+            procedure,
+            3,
+            edges,
+            outgoing,
+            incoming_offsets,
+            vec![ControlEdgeId::new(1), ControlEdgeId::new(1)],
+        )
+        .expect_err("duplicate and missing incoming membership must fail");
+        assert_eq!(error.kind(), SemanticIrErrorKind::ControlFlowContract);
+
+        let source = SourceMappingId::new(0);
+        let evidence = EvidenceId::new(0);
+        let (mut edges, _, _, _) = raw_cfg_parts();
+        edges.push(ControlEdge {
+            source_point: ProgramPointId::new(1),
+            target_point: ProgramPointId::new(2),
+            kind: ControlEdgeKind::Normal,
+            source,
+            evidence,
+        });
+        let error = ControlFlowGraph::try_from_parts(
+            procedure,
+            3,
+            edges,
+            vec![0, 2, 3, 3],
+            vec![0, 0, 1, 3],
+            vec![
+                ControlEdgeId::new(1),
+                ControlEdgeId::new(2),
+                ControlEdgeId::new(0),
+            ],
+        )
+        .expect_err("incoming rows must retain canonical control-edge order");
+        assert_eq!(error.kind(), SemanticIrErrorKind::ControlFlowContract);
     }
 
     #[test]
@@ -5514,6 +6188,36 @@ mod tests {
             .for_each(|edge| edge.target_point = ProgramPointId::new(1));
         SemanticArtifact::try_new(key.clone(), semantic_capabilities.clone(), vec![converged])
             .expect("normal and exceptional call arms may converge on one typed join point");
+
+        let mut parallel_provenance = parts.clone();
+        let second_source = SourceMappingId::new(1);
+        let second_evidence = EvidenceId::new(1);
+        parallel_provenance.source_mappings.push(SourceMapping {
+            id: second_source,
+            locator: parallel_provenance.locator.clone(),
+            kind: SourceMappingKind::Exact,
+        });
+        parallel_provenance.evidence_rows.push(Evidence {
+            id: second_evidence,
+            proof: ProofStatus::Proven,
+            completeness: EvidenceCompleteness::Complete,
+            sources: Box::new([second_source]),
+        });
+        let mut parallel_normal_edge = parallel_provenance
+            .control_edges
+            .iter()
+            .find(|edge| edge.kind == ControlEdgeKind::Normal)
+            .cloned()
+            .expect("fixture has a normal continuation edge");
+        parallel_normal_edge.source = second_source;
+        parallel_normal_edge.evidence = second_evidence;
+        parallel_provenance.control_edges.push(parallel_normal_edge);
+        SemanticArtifact::try_new(
+            key.clone(),
+            semantic_capabilities.clone(),
+            vec![parallel_provenance],
+        )
+        .expect("parallel provenance must not multiply call-continuation topology");
 
         let artifact = SemanticArtifact::try_new(key, semantic_capabilities, vec![parts])
             .expect("matched call continuations are valid");

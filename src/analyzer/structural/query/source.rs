@@ -4,20 +4,21 @@ use super::schema::{
     ALL_PATTERN_FIELDS, ALL_QUERY_FIELDS, ALL_QUERY_STEP_FIELDS, ALL_QUERY_STEP_OPS, ALL_RQL_FORMS,
     ALL_RQL_PROPERTIES, ALL_STRING_PREDICATE_FIELDS, PatternField, QueryField, QueryStepField,
     RqlForm, RqlFormClass, RqlProperty, StringPredicateField, reference_kind_from_label,
-    usage_proof_from_label, usage_surface_from_label,
+    rql_schema_version_registry, usage_proof_from_label, usage_surface_from_label,
 };
-use super::sexp::query_to_json;
-use super::syntax::{Expr, ExprKind, parse_rql};
+use super::sexp::{parse_query_sexp, query_to_json};
 use super::{
     CodeQuery, CodeQueryResultDetail, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES,
     MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_QUERY_BRANCHES,
     MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
-    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, QueryStep, SCHEMA_VERSION,
+    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, QueryStep,
 };
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{
     ALL_KINDS, ALL_ROLES, NormalizedKind, Role, RoleValueShape,
 };
+use crate::schema_version::SchemaVersionRegistry;
+use crate::sexp::{Expr, ExprKind};
 use json_spanned_value::{ErrorExt, spanned};
 use regex::Regex;
 use serde_json::{Map, Value};
@@ -395,24 +396,57 @@ impl Analysis {
     }
 
     fn semantic_error(&mut self, error: super::QueryError, fallback: Range<usize>) {
-        let mut path = error.path.as_str();
-        let range = loop {
+        let range = self.range_for_path(&error.path, fallback);
+        self.error(range, "invalid-query", error.message);
+    }
+
+    fn range_for_path(&self, path: &str, fallback: Range<usize>) -> Range<usize> {
+        let mut path = path;
+        loop {
             if let Some(range) = self.paths.get(path) {
-                break range.clone();
+                return range.clone();
             }
             if let Some(index) = path.rfind(['.', '[']) {
                 path = &path[..index];
             } else {
-                break fallback;
+                return fallback;
             }
-        };
-        self.error(range, "invalid-query", error.message);
+        }
     }
+
+    fn path_for_range(&self, target: &Range<usize>) -> Option<String> {
+        self.paths
+            .iter()
+            .filter(|(_, range)| range.start <= target.start && target.end <= range.end)
+            .min_by(|(left_path, left_range), (right_path, right_range)| {
+                let left_width = left_range.end.saturating_sub(left_range.start);
+                let right_width = right_range.end.saturating_sub(right_range.start);
+                left_width
+                    .cmp(&right_width)
+                    .then_with(|| right_path.len().cmp(&left_path.len()))
+                    .then_with(|| left_path.cmp(right_path))
+            })
+            .map(|(path, _)| path.clone())
+    }
+}
+
+pub(super) fn query_expr_range_for_path(expr: &Expr, path: &str) -> Range<usize> {
+    let mut analysis = Analysis::default();
+    let mut plan_budget = SourcePlanBudget::default();
+    validate_rql_query(expr, "", &mut analysis, 0, &mut plan_budget);
+    analysis.range_for_path(path, expr.range.clone())
+}
+
+pub(super) fn query_expr_path_for_range(expr: &Expr, range: &Range<usize>) -> Option<String> {
+    let mut analysis = Analysis::default();
+    let mut plan_budget = SourcePlanBudget::default();
+    validate_rql_query(expr, "", &mut analysis, 0, &mut plan_budget);
+    analysis.path_for_range(range)
 }
 
 fn analyze_source(source: &str) -> Analysis {
     if is_json_source(source) {
-        analyze_json(source)
+        analyze_json_with_schema_registry(source, rql_schema_version_registry())
     } else {
         analyze_rql(source)
     }
@@ -420,7 +454,7 @@ fn analyze_source(source: &str) -> Analysis {
 
 fn analyze_rql(source: &str) -> Analysis {
     let mut analysis = Analysis::default();
-    let parsed = match parse_rql(source) {
+    let parsed = match parse_query_sexp(source) {
         Ok(parsed) => parsed,
         Err(error) => {
             analysis.error(error.range, "invalid-syntax", error.message);
@@ -432,7 +466,7 @@ fn analyze_rql(source: &str) -> Analysis {
     };
 
     let mut plan_budget = SourcePlanBudget::default();
-    validate_rql_query(&expr, "match", &mut analysis, 0, &mut plan_budget);
+    validate_rql_query(&expr, "", &mut analysis, 0, &mut plan_budget);
     if parsed.incomplete.is_some() || analysis.incomplete {
         analysis.diagnostics.clear();
     } else if analysis.diagnostics.is_empty() {
@@ -442,7 +476,7 @@ fn analyze_rql(source: &str) -> Analysis {
                     analysis.semantic_error(error, expr.range.clone());
                 }
             }
-            Err(message) => analysis.error(expr.range.clone(), "invalid-query", message),
+            Err(error) => analysis.error(error.range, "invalid-query", error.message),
         }
     }
     analysis
@@ -459,6 +493,18 @@ fn list_head(expr: &Expr) -> Option<(&str, Range<usize>, &[Expr])> {
     Some((label, first.range.clone(), &items[1..]))
 }
 
+fn rql_query_child_path(path: &str, field: &str) -> String {
+    if path.is_empty() {
+        field.to_string()
+    } else {
+        format!("{path}.{field}")
+    }
+}
+
+fn rql_query_index_path(path: &str, index: usize) -> String {
+    format!("{path}[{index}]")
+}
+
 fn validate_rql_query(
     expr: &Expr,
     path: &str,
@@ -466,7 +512,9 @@ fn validate_rql_query(
     depth: usize,
     plan_budget: &mut SourcePlanBudget,
 ) {
-    analysis.path(path, expr.range.clone());
+    if !path.is_empty() {
+        analysis.path(path, expr.range.clone());
+    }
     let Some((head, head_range, args)) = list_head(expr) else {
         analysis.error(
             expr.range.clone(),
@@ -485,10 +533,7 @@ fn validate_rql_query(
         }
         analysis.add_help(head_range, form.signature(), form.description());
         validate_wrapper(form, args, path, analysis, depth, plan_budget);
-    } else if path == "match"
-        && NormalizedKind::from_label(head).is_none()
-        && RqlForm::from_label(head).is_none()
-    {
+    } else if NormalizedKind::from_label(head).is_none() && RqlForm::from_label(head).is_none() {
         if !plan_budget.enter(depth, expr.range.clone(), analysis) {
             return;
         }
@@ -505,8 +550,9 @@ fn validate_rql_query(
         if !plan_budget.enter(depth, expr.range.clone(), analysis) {
             return;
         }
-        validate_rql_pattern(expr, path, analysis);
-        if path == "match" && rql_pattern_anchors_root(expr) == Some(false) {
+        let match_path = rql_query_child_path(path, "match");
+        validate_rql_pattern(expr, &match_path, analysis);
+        if rql_pattern_anchors_root(expr) == Some(false) {
             analysis.error(
                 expr.range.clone(),
                 "invalid-query",
@@ -558,8 +604,9 @@ fn validate_wrapper(
                     format!("at most {MAX_WHERE_GLOBS} globs are allowed"),
                 );
             }
+            let where_path = rql_query_child_path(path, "where");
             for (index, arg) in values.iter().enumerate() {
-                let child = format!("where[{index}]");
+                let child = rql_query_index_path(&where_path, index);
                 analysis.path(&child, arg.range.clone());
                 validate_glob(arg, &child, analysis);
             }
@@ -579,8 +626,12 @@ fn validate_wrapper(
                     format!("at most {MAX_LANGUAGE_FILTERS} language filters are allowed"),
                 );
             }
+            let languages_path = rql_query_child_path(path, "languages");
             for (index, arg) in values.iter().enumerate() {
-                analysis.path(format!("languages[{index}]"), arg.range.clone());
+                analysis.path(
+                    rql_query_index_path(&languages_path, index),
+                    arg.range.clone(),
+                );
                 validate_language(arg, analysis);
             }
         }
@@ -605,7 +656,7 @@ fn validate_wrapper(
                 );
             }
             if let Some(value) = args.first() {
-                analysis.path("limit", value.range.clone());
+                analysis.path(rql_query_child_path(path, "limit"), value.range.clone());
             }
         }
         RqlForm::ResultDetail => {
@@ -616,7 +667,10 @@ fn validate_wrapper(
                     "result-detail expects a value and query",
                 );
             } else {
-                analysis.path("result_detail", args[0].range.clone());
+                analysis.path(
+                    rql_query_child_path(path, "result_detail"),
+                    args[0].range.clone(),
+                );
                 validate_result_detail(&args[0], analysis);
             }
         }
@@ -633,7 +687,8 @@ fn validate_wrapper(
                 } else {
                     "not_inside"
                 };
-                validate_rql_pattern(&args[0], field, analysis);
+                let field_path = rql_query_child_path(path, field);
+                validate_rql_pattern(&args[0], &field_path, analysis);
             }
         }
         RqlForm::Union | RqlForm::Intersect | RqlForm::Except => {
@@ -650,10 +705,11 @@ fn validate_wrapper(
                     format!("at most {MAX_QUERY_BRANCHES} branches are allowed"),
                 );
             }
+            let operation_path = rql_query_child_path(path, form.label());
             for (index, branch) in args.iter().enumerate() {
                 validate_rql_query(
                     branch,
-                    &format!("{}[{index}]", form.label()),
+                    &rql_query_index_path(&operation_path, index),
                     analysis,
                     depth + 1,
                     plan_budget,
@@ -1647,12 +1703,15 @@ fn validate_result_detail(value: &Expr, analysis: &mut Analysis) {
     }
 }
 
-fn analyze_json(source: &str) -> Analysis {
+fn analyze_json_with_schema_registry(
+    source: &str,
+    schema_versions: &SchemaVersionRegistry,
+) -> Analysis {
     let mut analysis = Analysis::default();
     let parsed: spanned::Value = match json_spanned_value::from_str(source) {
         Ok(value) => value,
         Err(error) if error.classify() == serde_json::error::Category::Eof => {
-            return analyze_incomplete_json(source);
+            return analyze_incomplete_json(source, schema_versions);
         }
         Err(error) => {
             let offset = error.offset_within(source).unwrap_or(source.len());
@@ -1665,16 +1724,24 @@ fn analyze_json(source: &str) -> Analysis {
         }
     };
     let mut plan_budget = SourcePlanBudget::default();
-    validate_json_query(&parsed, "", &mut analysis, 0, &mut plan_budget);
+    validate_json_query(
+        &parsed,
+        "",
+        &mut analysis,
+        0,
+        &mut plan_budget,
+        schema_versions,
+    );
     if analysis.diagnostics.is_empty()
-        && let Err(error) = CodeQuery::from_json(&spanned_to_json(&parsed))
+        && let Err(error) =
+            CodeQuery::from_json_with_schema_registry(&spanned_to_json(&parsed), schema_versions)
     {
         analysis.semantic_error(error, parsed.range());
     }
     analysis
 }
 
-fn analyze_incomplete_json(source: &str) -> Analysis {
+fn analyze_incomplete_json(source: &str, schema_versions: &SchemaVersionRegistry) -> Analysis {
     if source.len() > MAX_JSON_COMPLETION_SOURCE_BYTES {
         return Analysis::default();
     }
@@ -1698,7 +1765,14 @@ fn analyze_incomplete_json(source: &str) -> Analysis {
                 };
                 let mut analysis = Analysis::default();
                 let mut plan_budget = SourcePlanBudget::default();
-                validate_json_query(&parsed, "", &mut analysis, 0, &mut plan_budget);
+                validate_json_query(
+                    &parsed,
+                    "",
+                    &mut analysis,
+                    0,
+                    &mut plan_budget,
+                    schema_versions,
+                );
                 analysis.diagnostics.clear();
                 analysis.help.retain(|item| item.range.end <= source.len());
                 analysis.paths.retain(|_, range| range.end <= source.len());
@@ -1716,6 +1790,7 @@ fn validate_json_query(
     analysis: &mut Analysis,
     depth: usize,
     plan_budget: &mut SourcePlanBudget,
+    schema_versions: &SchemaVersionRegistry,
 ) {
     analysis.path(path, value.range());
     if !plan_budget.enter(depth, value.range(), analysis) {
@@ -1799,6 +1874,7 @@ fn validate_json_query(
                         analysis,
                         depth + 1,
                         plan_budget,
+                        schema_versions,
                     );
                 }
             }
@@ -1828,11 +1904,27 @@ fn validate_json_query(
             }
             QueryField::ResultDetail => validate_json_result_detail(child, analysis),
             QueryField::SchemaVersion => {
-                if child.as_number().and_then(serde_json::Number::as_u64) != Some(SCHEMA_VERSION) {
+                let Some(version) = child.as_number().and_then(serde_json::Number::as_u64) else {
                     analysis.error(
                         child.range(),
                         "wrong-value-shape",
-                        format!("expected schema version {SCHEMA_VERSION}"),
+                        "expected an unsigned integer schema version",
+                    );
+                    continue;
+                };
+                let Ok(version) = u32::try_from(version) else {
+                    analysis.error(
+                        child.range(),
+                        "wrong-value-shape",
+                        "schema version must fit in an unsigned 32-bit integer",
+                    );
+                    continue;
+                };
+                if let Err(error) = schema_versions.resolve(Some(version)) {
+                    analysis.error(
+                        child.range(),
+                        "unsupported-schema-version",
+                        error.to_string(),
                     );
                 }
             }
@@ -2921,6 +3013,34 @@ mod tests {
         let diagnostic = validate_query_source(source).pop().expect("diagnostic");
         assert_eq!(diagnostic.code, "invalid-json");
         assert_eq!(&source[diagnostic.range], "]");
+    }
+
+    #[test]
+    fn json_schema_validation_uses_the_compatibility_registry() {
+        use crate::schema_version::{SchemaVersionDescriptor, SchemaVersionRegistry};
+
+        let registry = SchemaVersionRegistry::new(&[
+            SchemaVersionDescriptor::new(2, None, true),
+            SchemaVersionDescriptor::new(3, Some(2), true),
+        ])
+        .unwrap();
+        for source in [
+            r#"{"schema_version":2,"match":{"kind":"call"}}"#,
+            r#"{"match":{"kind":"call"}}"#,
+        ] {
+            let analysis = analyze_json_with_schema_registry(source, &registry);
+            assert!(
+                analysis.diagnostics.is_empty(),
+                "{:?}",
+                analysis.diagnostics
+            );
+        }
+
+        let source = r#"{"schema_version":1,"match":{"kind":"call"}}"#;
+        let analysis = analyze_json_with_schema_registry(source, &registry);
+        assert_eq!(analysis.diagnostics.len(), 1);
+        assert_eq!(analysis.diagnostics[0].code, "unsupported-schema-version");
+        assert_eq!(&source[analysis.diagnostics[0].range.clone()], "1");
     }
 
     #[test]

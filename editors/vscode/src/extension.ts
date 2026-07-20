@@ -45,15 +45,13 @@ import type { RuneIrRange, RuneIrResponse } from "./rune_ir";
 import { RUNE_IR_LANGUAGE_ID, RUNE_IR_SOURCE_LANGUAGE_IDS, showRuneIr } from "./rune_ir";
 import type { WireDiagnostic, WireHover } from "./rql_validation";
 import {
-  RQL_QUERY_HOVER_METHOD,
   RqlValidationController,
-  VALIDATE_RQL_QUERY_METHOD,
   handleRqlServerClosed,
-  queryHoverParams,
-  validationDocument
+  hoverRequest,
+  rqlFileDocumentSelectors,
+  validationDocument,
+  validationRequest
 } from "./rql_validation";
-import { RQL_LANGUAGE_ID } from "./rql_query";
-
 let client: LanguageClient | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
 let outputChannel: vscode.OutputChannel | undefined;
@@ -127,30 +125,31 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.onDidCloseTextDocument((document) => {
       rqlValidation?.close(document.uri.toString());
     }),
-    vscode.languages.registerHoverProvider(
-      { scheme: "file", language: RQL_LANGUAGE_ID },
-      {
-        provideHover: async (document, position, token) => {
-          const currentClient = client;
-          if (currentClient?.state !== State.Running) {
-            return undefined;
-          }
-          try {
-            const hover = await currentClient.sendRequest<WireHover | null>(
-              RQL_QUERY_HOVER_METHOD,
-              queryHoverParams(document.getText(), {
-                line: position.line,
-                character: position.character
-              }),
-              token
-            );
-            return hover ? vscodeHover(hover) : undefined;
-          } catch {
-            return undefined;
-          }
+    vscode.languages.registerHoverProvider(rqlFileDocumentSelectors(), {
+      provideHover: async (document, position, token) => {
+        const currentClient = client;
+        if (currentClient?.state !== State.Running) {
+          return undefined;
+        }
+        const request = hoverRequest(document.languageId, document.getText(), {
+          line: position.line,
+          character: position.character
+        });
+        if (!request) {
+          return undefined;
+        }
+        try {
+          const hover = await currentClient.sendRequest<WireHover | null>(
+            request.method,
+            request.params,
+            token
+          );
+          return hover ? vscodeHover(hover) : undefined;
+        } catch {
+          return undefined;
         }
       }
-    )
+    })
   );
 
   void startClient(context);
@@ -350,7 +349,7 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
   const clientOptions: LanguageClientOptions = {
     documentSelector: [
       ...RUNE_IR_SOURCE_LANGUAGE_IDS.map((language) => ({ scheme: "file", language })),
-      { scheme: "file", language: RQL_LANGUAGE_ID },
+      ...rqlFileDocumentSelectors(),
       { scheme: "file", language: RUNE_IR_LANGUAGE_ID }
     ],
     outputChannel,
@@ -496,14 +495,18 @@ async function stopClient(options: { updateUi?: boolean } = {}): Promise<void> {
 
 function createRqlValidationController(): RqlValidationController<vscode.CancellationToken> {
   return new RqlValidationController<vscode.CancellationToken>({
-    validate: async (query, token) => {
+    validate: async (document, token) => {
       const currentClient = client;
       if (currentClient?.state !== State.Running) {
         throw new Error("Bifrost is not running");
       }
+      const request = validationRequest(document);
+      if (!request) {
+        throw new Error(`Unsupported RQL source language: ${document.languageId}`);
+      }
       return currentClient.sendRequest<{ diagnostics: WireDiagnostic[] }>(
-        VALIDATE_RQL_QUERY_METHOD,
-        { query },
+        request.method,
+        request.params,
         token
       );
     },
@@ -517,7 +520,7 @@ function createRqlValidationController(): RqlValidationController<vscode.Cancell
       const current = vscode.workspace.textDocuments.find(
         (document) => document.uri.toString() === expected.uri
       );
-      return current?.languageId === RQL_LANGUAGE_ID && current.version === expected.version;
+      return current?.languageId === expected.languageId && current.version === expected.version;
     },
     createCancellationSource: () => new vscode.CancellationTokenSource(),
     setTimer: (callback, delayMs) => setTimeout(callback, delayMs),

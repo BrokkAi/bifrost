@@ -47,6 +47,8 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser, Tree};
 
+mod semantic;
+
 #[derive(Debug, Clone, Default)]
 pub struct JavascriptAdapter;
 

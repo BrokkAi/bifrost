@@ -1,12 +1,20 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  RQL_POLICY_HOVER_METHOD,
+  RQL_POLICY_LANGUAGE_ID,
   RQL_QUERY_HOVER_METHOD,
+  RQL_SOURCE_LANGUAGE_IDS,
   RQL_VALIDATION_DELAY_MS,
   RqlValidationController,
+  VALIDATE_RQL_POLICY_METHOD,
   VALIDATE_RQL_QUERY_METHOD,
   handleRqlServerClosed,
+  hoverRequest,
+  policyHoverParams,
   queryHoverParams,
+  rqlFileDocumentSelectors,
+  validationRequest,
   type CancellationSource,
   type RqlValidationDocument,
   type WireDiagnostic
@@ -53,7 +61,7 @@ function diagnostic(message: string): WireDiagnostic {
 function harness() {
   const timers: TestTimer[] = [];
   const requests: Array<{
-    query: string;
+    document: RqlValidationDocument;
     token: object;
     pending: Deferred<{ diagnostics: WireDiagnostic[] }>;
   }> = [];
@@ -62,16 +70,16 @@ function harness() {
   const documents = new Map<string, RqlValidationDocument>();
   const cancellations: TestCancellationSource[] = [];
   const controller = new RqlValidationController<object>({
-    validate: (query, token) => {
+    validate: (document, token) => {
       const pending = deferred<{ diagnostics: WireDiagnostic[] }>();
-      requests.push({ query, token, pending });
+      requests.push({ document, token, pending });
       return pending.promise;
     },
     publish: (uri, diagnostics) => published.push([uri, diagnostics]),
     clear: (uri) => cleared.push(uri),
     isCurrent: (document) => {
       const current = documents.get(document.uri);
-      return current?.languageId === RQL_LANGUAGE_ID && current.version === document.version;
+      return current?.languageId === document.languageId && current.version === document.version;
     },
     createCancellationSource: () => {
       const source: TestCancellationSource = {
@@ -125,26 +133,70 @@ function harness() {
 void test("exports the server method contracts and 300ms debounce", () => {
   assert.equal(VALIDATE_RQL_QUERY_METHOD, "bifrost/validateQuery");
   assert.equal(RQL_QUERY_HOVER_METHOD, "bifrost/queryHover");
+  assert.equal(VALIDATE_RQL_POLICY_METHOD, "bifrost/validatePolicy");
+  assert.equal(RQL_POLICY_HOVER_METHOD, "bifrost/policyHover");
+  assert.deepEqual(RQL_SOURCE_LANGUAGE_IDS, [RQL_LANGUAGE_ID, RQL_POLICY_LANGUAGE_ID]);
+  assert.deepEqual(rqlFileDocumentSelectors(), [
+    { scheme: "file", language: RQL_LANGUAGE_ID },
+    { scheme: "file", language: RQL_POLICY_LANGUAGE_ID }
+  ]);
   assert.equal(RQL_VALIDATION_DELAY_MS, 300);
 });
 
-void test("wires unsaved query text and position into hover params", () => {
+void test("wires unsaved query and policy source into their exact server contracts", () => {
   assert.deepEqual(queryHoverParams("(call)", { line: 2, character: 4 }), {
     query: "(call)",
     position: { line: 2, character: 4 }
   });
+  assert.deepEqual(hoverRequest(RQL_LANGUAGE_ID, "(call)", { line: 2, character: 4 }), {
+    method: RQL_QUERY_HOVER_METHOD,
+    params: { query: "(call)", position: { line: 2, character: 4 } }
+  });
+  assert.deepEqual(policyHoverParams("(policy)", { line: 3, character: 2 }), {
+    source: "(policy)",
+    position: { line: 3, character: 2 }
+  });
+  assert.deepEqual(hoverRequest(RQL_POLICY_LANGUAGE_ID, "(policy)", { line: 3, character: 2 }), {
+    method: RQL_POLICY_HOVER_METHOD,
+    params: { source: "(policy)", position: { line: 3, character: 2 } }
+  });
+  assert.deepEqual(
+    validationRequest({
+      uri: "file:///query.rql",
+      version: 6,
+      languageId: RQL_LANGUAGE_ID,
+      text: "(call)"
+    }),
+    {
+      method: VALIDATE_RQL_QUERY_METHOD,
+      params: { query: "(call)" }
+    }
+  );
+  assert.deepEqual(
+    validationRequest({
+      uri: "file:///policy.rqlp",
+      version: 7,
+      languageId: RQL_POLICY_LANGUAGE_ID,
+      text: "(policy)"
+    }),
+    {
+      method: VALIDATE_RQL_POLICY_METHOD,
+      params: { source: "(policy)" }
+    }
+  );
 });
 
-void test("debounces edits and cancels an in-flight request", async () => {
+void test("debounces policy edits and cancels an in-flight validation request", async () => {
   const h = harness();
-  h.schedule(1, "(call)");
+  h.schedule(1, "(policy)", RQL_POLICY_LANGUAGE_ID, "file:///policy.rqlp");
   assert.equal(h.timers[0].delayMs, 300);
-  h.schedule(2, "(class)");
+  h.schedule(2, "(policy :id)", RQL_POLICY_LANGUAGE_ID, "file:///policy.rqlp");
   assert.equal(h.timers[0].cleared, true);
 
   h.fire(1);
-  assert.equal(h.requests[0].query, "(class)");
-  h.schedule(3, "(function)");
+  assert.equal(h.requests[0].document.text, "(policy :id)");
+  assert.equal(h.requests[0].document.languageId, RQL_POLICY_LANGUAGE_ID);
+  h.schedule(3, '(policy :id "demo")', RQL_POLICY_LANGUAGE_ID, "file:///policy.rqlp");
   assert.equal(h.cancellations[0].cancelled, true);
   h.requests[0].pending.resolve({ diagnostics: [diagnostic("stale")] });
   await Promise.resolve();

@@ -9,7 +9,8 @@ use crate::analyzer::bounded_output::{BalancedWriter, TruncationStyle, quoted};
 
 use super::capabilities::{CapabilitySupport, SemanticCapabilities};
 use super::ids::{
-    DeclarationSegmentKind, ProcedureId, SemanticArtifactKey, SemanticLocator, SourceRevision,
+    ControlEdgeId, DeclarationSegmentKind, ProcedureId, SemanticArtifactKey, SemanticLocator,
+    SourceRevision,
 };
 use super::ir::{
     AllocationKind, AllocationSite, BasicBlock, CallableTarget, CallableTargetResolution,
@@ -17,6 +18,10 @@ use super::ir::{
     EvidenceCompleteness, MemoryLocation, MemoryLocationKind, ProcedureSemantics, ProgramPoint,
     ProofStatus, SemanticArtifact, SemanticCallSite, SemanticEffect, SemanticEvent, SemanticGap,
     SemanticGapSubject, SemanticValue, SemanticValueKind, SourceMapping,
+};
+use super::{
+    DispatchBoundaryKind, IcfgBoundary, IcfgBoundaryKind, IcfgEdge, IcfgLimitKind, IcfgNodeKey,
+    IcfgSnapshot,
 };
 
 const TRUNCATION_RESERVE: usize = 160;
@@ -53,6 +58,31 @@ pub struct RenderedSemanticIr {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IcfgRenderLimits {
+    pub max_nodes: usize,
+    pub max_edges: usize,
+    pub max_boundaries: usize,
+    pub max_output_bytes: usize,
+}
+
+impl Default for IcfgRenderLimits {
+    fn default() -> Self {
+        Self {
+            max_nodes: 50_000,
+            max_edges: 200_000,
+            max_boundaries: 50_000,
+            max_output_bytes: 512 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedIcfgSnapshot {
+    pub icfg: String,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticRenderError {
     InvalidLimits,
@@ -77,6 +107,67 @@ impl fmt::Display for SemanticRenderError {
 }
 
 impl std::error::Error for SemanticRenderError {}
+
+/// Render one already-bounded ICFG slice without resolving or materializing
+/// additional procedures. Node references are source-backed and never expose
+/// snapshot-local dense IDs as an assertion contract.
+pub fn render_icfg_snapshot(
+    snapshot: &IcfgSnapshot,
+    limits: IcfgRenderLimits,
+) -> Result<RenderedIcfgSnapshot, SemanticRenderError> {
+    if limits.max_nodes == 0
+        || limits.max_edges == 0
+        || limits.max_boundaries == 0
+        || limits.max_output_bytes < MIN_OUTPUT_BYTES
+    {
+        return Err(SemanticRenderError::InvalidLimits);
+    }
+    let mut writer = BalancedWriter::new(
+        limits.max_output_bytes,
+        TRUNCATION_RESERVE,
+        TruncationStyle::ReasonAttribute,
+    );
+    if writer.open(0, "(icfg-snapshot") && writer.open(1, "(nodes") {
+        for node in snapshot.nodes().iter().take(limits.max_nodes) {
+            if !writer.line_with(2, |output| write_icfg_node(output, node)) {
+                break;
+            }
+        }
+        if snapshot.node_count() > limits.max_nodes {
+            writer.truncate("ICFG node render limit reached");
+        }
+        if !writer.is_truncated() {
+            writer.close(1);
+            writer.open(1, "(edges");
+            for edge in snapshot.edges().iter().take(limits.max_edges) {
+                if !writer.line_with(2, |output| write_icfg_edge(output, snapshot, edge)) {
+                    break;
+                }
+            }
+            if snapshot.edge_count() > limits.max_edges {
+                writer.truncate("ICFG edge render limit reached");
+            }
+        }
+        if !writer.is_truncated() {
+            writer.close(1);
+            writer.open(1, "(boundaries");
+            for boundary in snapshot.boundaries().iter().take(limits.max_boundaries) {
+                if !writer.line_with(2, |output| write_icfg_boundary(output, snapshot, boundary)) {
+                    break;
+                }
+            }
+            if snapshot.boundaries().len() > limits.max_boundaries {
+                writer.truncate("ICFG boundary render limit reached");
+            }
+        }
+    }
+    if !writer.is_truncated() {
+        writer.close(1);
+        writer.close(0);
+    }
+    let (icfg, truncated) = writer.finish();
+    Ok(RenderedIcfgSnapshot { icfg, truncated })
+}
 
 impl SemanticIrLimits {
     fn validate(self) -> Result<Self, SemanticRenderError> {
@@ -222,7 +313,7 @@ fn render_procedure(state: &mut RenderState, procedure: &ProcedureSemantics) -> 
     if !state.writer.open_with(2, |writer| {
         write!(
             writer,
-            "(procedure :id {} :kind {} :parent {} :source {} :evidence {} :entry {} :normal-exit {} :exceptional-exit {} :async {} :generator {} :static {} :synthetic {}",
+            "(procedure :id {} :kind {} :parent {} :source {} :evidence {} :entry {} :normal-exit {} :exceptional-exit {} :async {} :generator {} :static {} :synthetic {} :invocation {}",
             procedure.id(),
             quoted(procedure.kind().label()),
             optional_id(procedure.lexical_parent()),
@@ -235,6 +326,7 @@ fn render_procedure(state: &mut RenderState, procedure: &ProcedureSemantics) -> 
             properties.is_generator,
             properties.is_static,
             properties.is_synthetic,
+            quoted(properties.invocation.label()),
         )
     }) {
         return false;
@@ -373,7 +465,7 @@ fn render_points(state: &mut RenderState, procedure: &ProcedureSemantics) -> boo
         return false;
     }
     for point in procedure.points() {
-        if !render_point(state, point) {
+        if !render_point(state, procedure, point) {
             return false;
         }
     }
@@ -384,8 +476,10 @@ fn render_control_edges(state: &mut RenderState, procedure: &ProcedureSemantics)
     if !state.writer.open(3, "(control-edges") {
         return false;
     }
-    for edge in procedure.control_edges() {
-        if !state.row_with(4, |writer| write_control_edge(writer, edge)) {
+    for (index, edge) in procedure.cfg().edges().iter().enumerate() {
+        let edge_id = ControlEdgeId::try_from_index(index)
+            .expect("validated semantic control-edge count must fit in a u32");
+        if !state.row_with(4, |writer| write_control_edge(writer, edge_id, edge)) {
             return false;
         }
     }
@@ -661,12 +755,30 @@ fn write_block(writer: &mut dyn fmt::Write, block: &BasicBlock) -> fmt::Result {
     )
 }
 
-fn render_point(state: &mut RenderState, point: &ProgramPoint) -> bool {
+fn render_point(
+    state: &mut RenderState,
+    procedure: &ProcedureSemantics,
+    point: &ProgramPoint,
+) -> bool {
     if !state.open_row_with(4, |writer| {
         write!(
             writer,
             "(program-point :id {} :block {} :source {} :evidence {}",
             point.id, point.block, point.source, point.evidence
+        )?;
+        writer.write_str(" :predecessor-edges ")?;
+        write_id_list(
+            writer,
+            procedure
+                .predecessor_edges(point.id)
+                .map(|(edge_id, _)| edge_id),
+        )?;
+        writer.write_str(" :successor-edges ")?;
+        write_id_list(
+            writer,
+            procedure
+                .successor_edges(point.id)
+                .map(|(edge_id, _)| edge_id),
         )
     }) {
         return false;
@@ -820,16 +932,195 @@ fn write_target_resolution(
     writer.write_char(')')
 }
 
-fn write_control_edge(writer: &mut dyn fmt::Write, edge: &ControlEdge) -> fmt::Result {
+fn write_control_edge(
+    writer: &mut dyn fmt::Write,
+    edge_id: ControlEdgeId,
+    edge: &ControlEdge,
+) -> fmt::Result {
     write!(
         writer,
-        "(control-edge :source-point {} :target-point {} :kind {} :source {} :evidence {})",
+        "(control-edge :id {} :source-point {} :target-point {} :kind {} :source {} :evidence {})",
+        edge_id,
         edge.source_point,
         edge.target_point,
         quoted(edge.kind.label()),
         edge.source,
         edge.evidence,
     )
+}
+
+fn write_icfg_node(writer: &mut dyn fmt::Write, node: &IcfgNodeKey) -> fmt::Result {
+    writer.write_str("(icfg-node :point ")?;
+    write_icfg_point_ref(writer, node.point())?;
+    writer.write_str(" :context (")?;
+    for call in node.call_context() {
+        writer.write_str("(call ")?;
+        let semantic_call = call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .expect("published ICFG call context retains a valid call handle");
+        let mapping = call
+            .procedure()
+            .semantics()
+            .source_mapping(semantic_call.source)
+            .expect("published semantic call retains a valid source mapping");
+        write_locator(writer, &mapping.locator)?;
+        writer.write_char(')')?;
+    }
+    writer.write_str("))")
+}
+
+fn write_icfg_point_ref(
+    writer: &mut dyn fmt::Write,
+    point: &super::ProgramPointHandle,
+) -> fmt::Result {
+    let procedure = point.procedure().semantics();
+    let semantic_point = procedure
+        .point(point.id())
+        .expect("published ICFG node retains a valid point handle");
+    let mapping = procedure
+        .source_mapping(semantic_point.source)
+        .expect("published semantic point retains a valid source mapping");
+    writer.write_str("(point :procedure (locator ")?;
+    write_locator(writer, procedure.locator())?;
+    writer.write_str(") :source (locator ")?;
+    write_locator(writer, &mapping.locator)?;
+    writer.write_str(") :effects (")?;
+    for event in semantic_point.events.iter() {
+        write!(writer, "{} ", quoted(event.effect.label()))?;
+    }
+    writer.write_str("))")
+}
+
+fn write_icfg_edge(
+    writer: &mut dyn fmt::Write,
+    snapshot: &IcfgSnapshot,
+    edge: &IcfgEdge,
+) -> fmt::Result {
+    write!(
+        writer,
+        "(icfg-edge :kind {} :source ",
+        quoted(edge.kind.label())
+    )?;
+    write_icfg_node(
+        writer,
+        snapshot
+            .node(edge.source)
+            .expect("published ICFG edge source exists"),
+    )?;
+    writer.write_str(" :target ")?;
+    write_icfg_node(
+        writer,
+        snapshot
+            .node(edge.target)
+            .expect("published ICFG edge target exists"),
+    )?;
+    write!(
+        writer,
+        " :proof {} :completeness {}",
+        quoted(edge.proof.label()),
+        quoted(edge.completeness.label())
+    )?;
+    if let Some(origin) = &edge.origin {
+        writer.write_str(" :origin ")?;
+        let semantic_call = origin
+            .procedure()
+            .semantics()
+            .call_site(origin.id())
+            .expect("published ICFG edge origin exists");
+        let mapping = origin
+            .procedure()
+            .semantics()
+            .source_mapping(semantic_call.source)
+            .expect("published ICFG edge origin has a source mapping");
+        writer.write_str("(call ")?;
+        write_locator(writer, &mapping.locator)?;
+        writer.write_char(')')?;
+    }
+    writer.write_char(')')
+}
+
+fn write_icfg_boundary(
+    writer: &mut dyn fmt::Write,
+    snapshot: &IcfgSnapshot,
+    boundary: &IcfgBoundary,
+) -> fmt::Result {
+    writer.write_str("(icfg-boundary :at ")?;
+    write_icfg_node(
+        writer,
+        snapshot
+            .node(boundary.at)
+            .expect("published ICFG boundary node exists"),
+    )?;
+    writer.write_str(" :kind ")?;
+    match &boundary.kind {
+        IcfgBoundaryKind::Dispatch(dispatch) => {
+            write!(writer, "{}", quoted(dispatch_boundary_label(dispatch)))?
+        }
+        IcfgBoundaryKind::Limit(limit) => write!(
+            writer,
+            "{}",
+            quoted(match limit {
+                IcfgLimitKind::CallDepth => "call_depth_limit",
+                IcfgLimitKind::Nodes => "node_limit",
+                IcfgLimitKind::Edges => "edge_limit",
+            })
+        )?,
+        IcfgBoundaryKind::Continuation { kind, state } => write!(
+            writer,
+            "{} :continuation-state {}",
+            quoted(match kind {
+                super::CallContinuationKind::Normal => "normal_continuation",
+                super::CallContinuationKind::Exceptional => "exceptional_continuation",
+            }),
+            quoted(state.label())
+        )?,
+    }
+    if let IcfgBoundaryKind::Dispatch(
+        DispatchBoundaryKind::External(Some(locator))
+        | DispatchBoundaryKind::Unmaterialized(locator)
+        | DispatchBoundaryKind::Deferred {
+            target: locator, ..
+        },
+    ) = &boundary.kind
+    {
+        writer.write_str(" :target (locator ")?;
+        write_locator(writer, locator)?;
+        writer.write_char(')')?;
+    }
+    if let Some(origin) = &boundary.origin {
+        writer.write_str(" :origin ")?;
+        let semantic_call = origin
+            .procedure()
+            .semantics()
+            .call_site(origin.id())
+            .expect("published ICFG boundary origin exists");
+        let mapping = origin
+            .procedure()
+            .semantics()
+            .source_mapping(semantic_call.source)
+            .expect("published ICFG boundary origin has a source mapping");
+        writer.write_str("(call ")?;
+        write_locator(writer, &mapping.locator)?;
+        writer.write_char(')')?;
+    }
+    writer.write_char(')')
+}
+
+fn dispatch_boundary_label(boundary: &DispatchBoundaryKind) -> &'static str {
+    match boundary {
+        DispatchBoundaryKind::External(_) => "external",
+        DispatchBoundaryKind::Unmaterialized(_) => "unmaterialized",
+        DispatchBoundaryKind::Deferred { kind, .. } => match kind {
+            super::DeferredInvocationKind::Async => "deferred_async",
+            super::DeferredInvocationKind::Generator => "deferred_generator",
+            super::DeferredInvocationKind::AsyncGenerator => "deferred_async_generator",
+            super::DeferredInvocationKind::LanguageDefined => "deferred_language_defined",
+        },
+        DispatchBoundaryKind::Unresolved => "unresolved",
+        DispatchBoundaryKind::Truncated => "truncated",
+    }
 }
 
 fn write_locator(writer: &mut dyn fmt::Write, locator: &SemanticLocator) -> fmt::Result {
@@ -1166,6 +1457,98 @@ mod tests {
     }
 
     #[test]
+    fn control_edge_ids_and_point_adjacency_are_rendered_deterministically() {
+        let artifact = fixture_artifact(1);
+        let procedure = &artifact.procedures()[0];
+        let first = render_semantic_ir(
+            &artifact,
+            SemanticIrSelection::Artifact,
+            SemanticIrLimits::default(),
+        )
+        .unwrap();
+        let second = render_semantic_ir(
+            &artifact,
+            SemanticIrSelection::Artifact,
+            SemanticIrLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+        assert!(!first.truncated);
+        assert_eq!(
+            first.semantic_ir.matches("(control-edge :id ").count(),
+            procedure.cfg().edges().len()
+        );
+        assert!(first.semantic_ir.contains(
+            "(control-edge :id 0 :source-point 0 :target-point 2 :kind \"exceptional\" :source 0 :evidence 0)"
+        ));
+        assert!(first.semantic_ir.contains(
+            "(program-point :id 0 :block 0 :source 0 :evidence 0 :predecessor-edges () :successor-edges (0 1)"
+        ));
+
+        for point in procedure.points() {
+            let mut predecessors = String::new();
+            write_id_list(
+                &mut predecessors,
+                procedure
+                    .predecessor_edges(point.id)
+                    .map(|(edge_id, _)| edge_id),
+            )
+            .unwrap();
+            let mut successors = String::new();
+            write_id_list(
+                &mut successors,
+                procedure
+                    .successor_edges(point.id)
+                    .map(|(edge_id, _)| edge_id),
+            )
+            .unwrap();
+            let expected = format!(
+                "(program-point :id {} :block {} :source {} :evidence {} :predecessor-edges {} :successor-edges {}",
+                point.id, point.block, point.source, point.evidence, predecessors, successors,
+            );
+            assert!(first.semantic_ir.contains(&expected), "{expected:?}");
+        }
+
+        for (index, edge) in procedure.cfg().edges().iter().enumerate() {
+            let edge_id = ControlEdgeId::try_from_index(index).unwrap();
+            let mut expected = String::new();
+            write_control_edge(&mut expected, edge_id, edge).unwrap();
+            assert!(first.semantic_ir.contains(&expected), "{expected:?}");
+        }
+        assert_balanced(&first.semantic_ir);
+    }
+
+    #[test]
+    fn high_degree_adjacency_rows_truncate_transactionally_and_stay_balanced() {
+        const DEGREE: usize = 4_096;
+        let artifact = fixture_high_degree_artifact(DEGREE);
+        let procedure = &artifact.procedures()[0];
+        assert!(procedure.successor_edges(ProgramPointId::new(0)).len() > DEGREE);
+        assert!(procedure.predecessor_edges(ProgramPointId::new(1)).len() > DEGREE);
+
+        for point_id in [ProgramPointId::new(0), ProgramPointId::new(1)] {
+            let limits = SemanticIrLimits {
+                max_output_bytes: 512,
+                ..SemanticIrLimits::default()
+            };
+            let mut state = RenderState::new(limits);
+            assert!(state.writer.open(0, "(semantic-ir"));
+            assert!(state.writer.open(1, "(program-points"));
+            let point = procedure.point(point_id).unwrap();
+
+            assert!(!render_point(&mut state, procedure, point));
+            let (output, truncated) = state.writer.finish();
+
+            assert!(truncated);
+            assert!(output.contains("output byte limit reached"), "{output:?}");
+            assert!(!output.contains(&format!("(program-point :id {point_id} ")));
+            assert!(output.len() <= limits.max_output_bytes);
+            assert_balanced(&output);
+        }
+    }
+
+    #[test]
     fn selected_procedure_keeps_artifact_scope_and_lexical_parent() {
         let artifact = fixture_artifact(3);
         let rendered = render_semantic_ir(
@@ -1421,6 +1804,55 @@ mod tests {
             .map(|index| fixture_procedure(&key, index))
             .collect();
         SemanticArtifact::try_new(key, capabilities, procedures).unwrap()
+    }
+
+    fn fixture_high_degree_artifact(degree: usize) -> SemanticArtifact {
+        let key = fixture_key();
+        let source = SourceMappingId::new(0);
+        let evidence = EvidenceId::new(0);
+        let mut procedure = fixture_procedure(&key, 0);
+        for _ in 0..degree {
+            let point_id = ProgramPointId::try_from_index(procedure.points.len()).unwrap();
+            procedure.points.push(ProgramPoint {
+                id: point_id,
+                block: BlockId::new(0),
+                events: Vec::new().into_boxed_slice(),
+                source,
+                evidence,
+            });
+            procedure.control_edges.push(ControlEdge {
+                source_point: ProgramPointId::new(0),
+                target_point: point_id,
+                kind: ControlEdgeKind::SwitchCase,
+                source,
+                evidence,
+            });
+            procedure.control_edges.push(ControlEdge {
+                source_point: point_id,
+                target_point: ProgramPointId::new(1),
+                kind: ControlEdgeKind::Normal,
+                source,
+                evidence,
+            });
+        }
+        procedure.blocks[0].points = procedure
+            .points
+            .iter()
+            .map(|point| point.id)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        let capabilities = SemanticCapabilities::builder()
+            .complete(SemanticCapability::Procedures)
+            .complete(SemanticCapability::EntryBoundary)
+            .complete(SemanticCapability::NormalExitBoundary)
+            .complete(SemanticCapability::ExceptionalExitBoundary)
+            .complete(SemanticCapability::BasicBlocks)
+            .complete(SemanticCapability::ProgramPoints)
+            .complete(SemanticCapability::NormalControlFlow)
+            .complete(SemanticCapability::ExceptionalControlFlow)
+            .build();
+        SemanticArtifact::try_new(key, capabilities, vec![procedure]).unwrap()
     }
 
     fn fixture_feature_artifact() -> SemanticArtifact {

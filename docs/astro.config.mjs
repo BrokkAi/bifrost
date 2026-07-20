@@ -24,7 +24,7 @@ export default defineConfig({
   },
   integrations: [
     starlight({
-      title: 'Bifrost Docs',
+      title: 'Bifrost Documentation',
       description: 'Documentation for Brokk Bifrost, the analyzer behind Brokk code intelligence.',
       head: [
         { tag: 'meta', attrs: { property: 'og:image', content: socialCardUrl } },
@@ -35,7 +35,8 @@ export default defineConfig({
           tag: 'meta',
           attrs: {
             property: 'og:image:alt',
-            content: 'Bifrost static analysis for agents, editors, and large repositories.',
+            content:
+              'Bifrost code intelligence for AI, with structural queries and multi-language analysis designed for repository-scale use.',
           },
         },
         { tag: 'meta', attrs: { name: 'twitter:image', content: socialCardUrl } },
@@ -43,11 +44,16 @@ export default defineConfig({
           tag: 'meta',
           attrs: {
             name: 'twitter:image:alt',
-            content: 'Bifrost static analysis for agents, editors, and large repositories.',
+            content:
+              'Bifrost code intelligence for AI, with structural queries and multi-language analysis designed for repository-scale use.',
           },
         },
       ],
       customCss: ['./src/styles/brokk.css'],
+      components: {
+        Header: './src/components/BifrostHeader.astro',
+        Hero: './src/components/BifrostHero.astro',
+      },
       favicon: '/favicon.png',
       editLink: {
         baseUrl: 'https://github.com/BrokkAi/bifrost/edit/master/docs/',
@@ -102,6 +108,7 @@ export default defineConfig({
           items: [
             { label: 'Overview', slug: 'code-querying' },
             { label: 'Build a Rule', slug: 'build-static-analysis-rule' },
+            { label: 'Static-Analysis Policies', slug: 'static-analysis-policies' },
             { label: 'Agent Result Safety', slug: 'agent-result-safety' },
             { label: 'Semantic Search', slug: 'semantic-search' },
             { label: 'JSON CodeQuery', slug: 'code-query-json' },

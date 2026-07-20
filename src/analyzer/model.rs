@@ -243,6 +243,14 @@ impl ParameterMetadata {
     }
 }
 
+/// Linkage carried by callable declaration metadata when the language makes
+/// cross-file symbol identity explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) enum CallableLinkage {
+    External,
+    Internal,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SignatureMetadata {
     label: String,
@@ -257,6 +265,8 @@ pub struct SignatureMetadata {
     type_parameters: Vec<String>,
     #[serde(default)]
     bare_return_type_parameter: Option<String>,
+    #[serde(default)]
+    callable_linkage: Option<CallableLinkage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -319,6 +329,7 @@ impl SignatureMetadata {
             callable_arity: None,
             type_parameters: Vec::new(),
             bare_return_type_parameter: None,
+            callable_linkage: None,
         }
     }
 
@@ -358,6 +369,7 @@ impl SignatureMetadata {
             callable_arity: None,
             type_parameters: Vec::new(),
             bare_return_type_parameter: None,
+            callable_linkage: None,
         }
     }
 
@@ -395,6 +407,11 @@ impl SignatureMetadata {
         self
     }
 
+    pub(crate) fn with_callable_linkage(mut self, linkage: CallableLinkage) -> Self {
+        self.callable_linkage = Some(linkage);
+        self
+    }
+
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -421,6 +438,10 @@ impl SignatureMetadata {
 
     pub fn bare_return_type_parameter(&self) -> Option<&str> {
         self.bare_return_type_parameter.as_deref()
+    }
+
+    pub(crate) fn callable_linkage(&self) -> Option<CallableLinkage> {
+        self.callable_linkage
     }
 }
 

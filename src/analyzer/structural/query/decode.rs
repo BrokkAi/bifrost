@@ -5,28 +5,34 @@ use super::ir::{
     MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
     MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
     MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError, QueryStep,
-    ReceiverTraversalFilter, ReferenceTraversalFilter, SCHEMA_VERSION, SetOperator,
-    StringPredicate,
+    ReceiverTraversalFilter, ReferenceTraversalFilter, SetOperator, StringPredicate,
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, PatternField, QueryField, QueryStepField, StringPredicateField,
-    reference_kind_from_label, usage_proof_from_label, usage_surface_from_label,
+    reference_kind_from_label, rql_schema_version_registry, usage_proof_from_label,
+    usage_surface_from_label,
 };
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{ALL_KINDS, NormalizedKind, Role};
+use crate::schema_version::SchemaVersionRegistry;
 use regex::Regex;
 use serde_json::{Map, Value};
 use std::num::NonZeroUsize;
 
 impl CodeQuery {
     pub fn from_json(value: &Value) -> Result<Self, QueryError> {
+        Self::from_json_with_schema_registry(value, rql_schema_version_registry())
+    }
+
+    pub(super) fn from_json_with_schema_registry(
+        value: &Value,
+        schema_versions: &SchemaVersionRegistry,
+    ) -> Result<Self, QueryError> {
         let object = as_object(value, "")?;
         let mut budget = QueryBudget::default();
         let fields = collect_query_fields(object, "")?;
-        let schema_version = match fields.schema_version {
-            None => SCHEMA_VERSION,
-            Some(value) => decode_schema_version(value, "schema_version")?,
-        };
+        let schema_version =
+            decode_schema_version(fields.schema_version, "schema_version", schema_versions)?;
 
         let limit = match fields.limit {
             None => DEFAULT_LIMIT,
@@ -371,17 +377,28 @@ fn decode_limit(value: &Value, path: &str) -> Result<usize, QueryError> {
     Ok(limit as usize)
 }
 
-fn decode_schema_version(value: &Value, path: &str) -> Result<u64, QueryError> {
-    let version = value.as_u64().ok_or_else(|| {
-        QueryError::new(path, format!("expected schema version {SCHEMA_VERSION}"))
-    })?;
-    if version != SCHEMA_VERSION {
-        return Err(QueryError::new(
-            path,
-            format!("unsupported schema version {version}; expected {SCHEMA_VERSION}"),
-        ));
-    }
-    Ok(version)
+fn decode_schema_version(
+    value: Option<&Value>,
+    path: &str,
+    schema_versions: &SchemaVersionRegistry,
+) -> Result<u64, QueryError> {
+    let authored_version = value
+        .map(|value| {
+            let version = value.as_u64().ok_or_else(|| {
+                QueryError::new(path, "expected an unsigned integer schema version")
+            })?;
+            u32::try_from(version).map_err(|_| {
+                QueryError::new(
+                    path,
+                    "schema version must fit in an unsigned 32-bit integer",
+                )
+            })
+        })
+        .transpose()?;
+    schema_versions
+        .resolve(authored_version)
+        .map(|resolution| u64::from(resolution.version))
+        .map_err(|error| QueryError::new(path, error.to_string()))
 }
 
 fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError> {

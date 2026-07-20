@@ -348,6 +348,54 @@ fn parses_and_rejects_schema_version() {
 }
 
 #[test]
+fn compatible_schema_successor_changes_only_the_emitted_version() {
+    use crate::schema_version::{SchemaVersionDescriptor, SchemaVersionRegistry};
+
+    let registry = SchemaVersionRegistry::new(&[
+        SchemaVersionDescriptor::new(2, None, true),
+        SchemaVersionDescriptor::new(3, Some(2), true),
+    ])
+    .unwrap();
+    let source = json!({ "match": { "kind": "call" } });
+    let inferred = CodeQuery::from_json_with_schema_registry(&source, &registry).unwrap();
+    let explicit = CodeQuery::from_json_with_schema_registry(
+        &json!({ "schema_version": 2, "match": { "kind": "call" } }),
+        &registry,
+    )
+    .unwrap();
+
+    assert_eq!(inferred.schema_version, 3);
+    assert_eq!(explicit.schema_version, 2);
+    let mut inferred_json = inferred.to_canonical_json();
+    let mut explicit_json = explicit.to_canonical_json();
+    inferred_json
+        .as_object_mut()
+        .unwrap()
+        .remove("schema_version");
+    explicit_json
+        .as_object_mut()
+        .unwrap()
+        .remove("schema_version");
+    assert_eq!(inferred_json, explicit_json);
+}
+
+#[test]
+fn canonical_query_plan_projection_excludes_execution_controls() {
+    let query = parse_ok(json!({
+        "schema_version": 2,
+        "match": { "kind": "call" },
+        "limit": 7,
+        "result_detail": "full"
+    }));
+    let projected = query.to_canonical_query_plan_json();
+
+    assert_eq!(projected["schema_version"], 2);
+    assert!(projected.get("match").is_some());
+    assert!(projected.get("limit").is_none());
+    assert!(projected.get("result_detail").is_none());
+}
+
+#[test]
 fn parses_and_validates_typed_steps() {
     let query = parse_ok(json!({
         "match": { "kind": "call" },

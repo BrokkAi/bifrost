@@ -4,6 +4,7 @@ mod declarations;
 mod hierarchy;
 mod imports;
 mod mixins;
+mod semantic;
 pub(crate) mod structural;
 mod tests;
 

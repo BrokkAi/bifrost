@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title description">
   <title id="title">Bifrost social card</title>
-  <desc id="description">Bifrost static analysis for agents, editors, and large repositories, illustrated with the symbol graph from the documentation home page.</desc>
+  <desc id="description">Bifrost code intelligence for AI, with structural queries and multi-language analysis designed for repository-scale use, illustrated with the symbol graph from the documentation home page.</desc>
   <defs>
     <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#181614"/>
@@ -32,14 +32,13 @@
     <text x="58" y="27" fill="#f4f1ec" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="27" font-weight="700" letter-spacing="5">BIFROST</text>
   </g>
 
-  <g transform="translate(70 208)">
-    <text fill="#f4f1ec" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif" font-size="64" font-weight="720" letter-spacing="-2">
-      <tspan x="0" y="0">Static analysis</tspan>
-      <tspan x="0" y="76">built for code</tspan>
-      <tspan x="0" y="152">intelligence.</tspan>
+  <g transform="translate(70 218)">
+    <text fill="#f4f1ec" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif" font-size="72" font-weight="720" letter-spacing="-2">
+      <tspan x="0" y="0">Code intelligence</tspan>
+      <tspan x="0" y="86">for AI.</tspan>
     </text>
-    <text x="2" y="224" fill="#aaa39b" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif" font-size="27">
-      <tspan x="2">Agents · Editors · Large repositories</tspan>
+    <text x="2" y="204" fill="#aaa39b" font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif" font-size="22">
+      <tspan x="2">Structural queries · Multi-language analysis · Repository-scale</tspan>
     </text>
   </g>
 

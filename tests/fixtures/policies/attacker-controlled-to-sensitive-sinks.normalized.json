@@ -1,0 +1,108 @@
+{
+  "analysis": {
+    "external_models": {
+      "entries": [],
+      "include_matches": [],
+      "include_sets": []
+    },
+    "finding_combinations": [
+      {
+        "add_classifications": [],
+        "id": "user-input-to-pii",
+        "message": "User-controlled I/O can reach sensitive user PII",
+        "sink": {
+          "predicate": {
+            "categories": [
+              "data.pii",
+              "data.sensitive"
+            ],
+            "type": "all"
+          },
+          "type": "categories"
+        },
+        "source": {
+          "predicate": {
+            "categories": [
+              "input.user-controlled"
+            ],
+            "type": "all"
+          },
+          "type": "categories"
+        },
+        "supersedes": []
+      }
+    ],
+    "mode": "may",
+    "sanitizers": {
+      "entries": [],
+      "include_matches": [],
+      "include_sets": []
+    },
+    "sinks": {
+      "entries": [],
+      "include_matches": [
+        {
+          "reference": {
+            "categories": {
+              "categories": [
+                "data.pii",
+                "data.sensitive"
+              ],
+              "type": "any"
+            },
+            "path": "tests/fixtures/policies/endpoints",
+            "scope": "recursive"
+          },
+          "type": "directory"
+        }
+      ],
+      "include_sets": []
+    },
+    "sources": {
+      "entries": [],
+      "include_matches": [
+        {
+          "reference": {
+            "categories": {
+              "categories": [
+                "input.user-controlled"
+              ],
+              "type": "all"
+            },
+            "path": "tests/fixtures/policies/endpoints",
+            "scope": "recursive"
+          },
+          "type": "directory"
+        }
+      ],
+      "include_sets": []
+    },
+    "transforms": {
+      "entries": [],
+      "include_matches": [],
+      "include_sets": []
+    },
+    "type": "taint"
+  },
+  "id": "bifrost.security.attacker-controlled-to-sensitive-sinks",
+  "message": {
+    "relation": "can_reach",
+    "type": "generated"
+  },
+  "name": "Attacker-controlled data reaches a sensitive sink",
+  "report": {
+    "origins_per_finding": 8,
+    "witness": {
+      "max_bytes": 16384,
+      "max_steps": 64
+    },
+    "witnesses_per_finding": 8
+  },
+  "schema_version": 1,
+  "severity": {
+    "level": "warning",
+    "type": "fixed"
+  },
+  "tags": [],
+  "type": "policy"
+}

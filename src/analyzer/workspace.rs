@@ -293,6 +293,50 @@ impl WorkspaceAnalyzer {
         }
     }
 
+    /// Select the execution-semantics provider for the requested file without
+    /// widening the monolithic [`IAnalyzer`] surface.
+    pub fn program_semantics_provider_for_file(
+        &self,
+        file: &crate::analyzer::ProjectFile,
+    ) -> Option<&dyn crate::analyzer::semantic::ProgramSemanticsProvider> {
+        match self {
+            Self::Empty(_) => None,
+            Self::Single(delegate) => {
+                let language = crate::analyzer::common::language_for_file(file);
+                (delegate.language() == language).then(|| delegate.program_semantics_provider())
+            }
+            Self::Multi(analyzer) => analyzer.program_semantics_provider_for_file(file),
+        }
+    }
+
+    /// File-aware semantic materialization routed through the concrete
+    /// language analyzer. Unknown extensions remain explicitly unsupported.
+    pub fn materialize_program_semantics(
+        &self,
+        file: &crate::analyzer::ProjectFile,
+        request: &mut crate::analyzer::semantic::SemanticRequest<'_>,
+    ) -> Result<
+        crate::analyzer::semantic::SemanticOutcome<
+            Arc<crate::analyzer::semantic::SemanticArtifact>,
+        >,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        let Some(provider) = self.program_semantics_provider_for_file(file) else {
+            return Ok(crate::analyzer::semantic::SemanticOutcome::Unsupported {
+                capability: crate::analyzer::semantic::SemanticCapability::Procedures,
+                partial: None,
+                work: crate::analyzer::semantic::SemanticWork::default(),
+            });
+        };
+        provider.materialize(file, request)
+    }
+
+    /// Bind the demand-materialized ICFG facade to this exact analyzer
+    /// generation without widening the language analyzers or `IAnalyzer`.
+    pub fn icfg_provider(&self) -> crate::analyzer::semantic::WorkspaceIcfgProvider<'_> {
+        crate::analyzer::semantic::WorkspaceIcfgProvider::new(self)
+    }
+
     /// Starts a request-scoped query cache across the active language analyzers.
     pub(crate) fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.analyzer().begin_query(context);

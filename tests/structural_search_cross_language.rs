@@ -3,7 +3,9 @@
 
 mod common;
 
-use brokk_bifrost::analyzer::structural::{CodeQuery, CodeQueryResult, execute};
+use brokk_bifrost::analyzer::structural::{
+    CodeQuery, CodeQueryDiagnosticCode, CodeQueryResult, execute,
+};
 use brokk_bifrost::{AnalyzerConfig, Language, WorkspaceAnalyzer};
 use common::InlineTestProject;
 use serde_json::json;
@@ -497,7 +499,9 @@ func (s Service) Run(code string) {
         unsupported
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.language == "go" && diagnostic.message.contains("kwargs")),
+            .any(|diagnostic| diagnostic.language == "go"
+                && diagnostic.code == CodeQueryDiagnosticCode::UnsupportedStructuralFeature
+                && diagnostic.message.contains("kwargs")),
         "expected go kwargs diagnostic: {:?}",
         unsupported.diagnostics
     );
@@ -742,6 +746,7 @@ std::string audit(const std::string& code) {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.language == "cpp"
+                && diagnostic.code == CodeQueryDiagnosticCode::UnsupportedStructuralFeature
                 && diagnostic.message.contains("kwargs")),
         "expected cpp kwargs diagnostic: {:?}",
         unsupported.diagnostics
@@ -1097,9 +1102,12 @@ fn parse<T>(value: &str) -> String {
         }),
     );
     assert!(
-        unsupported.diagnostics.iter().any(
-            |diagnostic| diagnostic.language == "rust" && diagnostic.message.contains("kwargs")
-        ),
+        unsupported
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.language == "rust"
+                && diagnostic.code == CodeQueryDiagnosticCode::UnsupportedStructuralFeature
+                && diagnostic.message.contains("kwargs")),
         "expected rust kwargs diagnostic: {:?}",
         unsupported.diagnostics
     );
@@ -2765,6 +2773,7 @@ end
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.language == "ruby"
+                && diagnostic.code == CodeQueryDiagnosticCode::UnsupportedStructuralFeature
                 && diagnostic.message.contains("decorators")),
         "expected ruby decorator diagnostic: {:?}",
         unsupported_decorator.diagnostics
@@ -3230,9 +3239,12 @@ fn unsupported_role_queries_report_capability_diagnostics() {
     }));
 
     assert!(
-        output.diagnostics.iter().any(
-            |diagnostic| diagnostic.language == "java" && diagnostic.message.contains("kwargs")
-        ),
+        output
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.language == "java"
+                && diagnostic.code == CodeQueryDiagnosticCode::UnsupportedStructuralFeature
+                && diagnostic.message.contains("kwargs")),
         "expected java kwargs diagnostic: {:?}",
         output.diagnostics
     );
@@ -3241,6 +3253,7 @@ fn unsupported_role_queries_report_capability_diagnostics() {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.language == "javascript"
+                && diagnostic.code == CodeQueryDiagnosticCode::UnsupportedStructuralFeature
                 && diagnostic.message.contains("kwargs")),
         "expected javascript kwargs diagnostic: {:?}",
         output.diagnostics
@@ -3250,6 +3263,7 @@ fn unsupported_role_queries_report_capability_diagnostics() {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.language == "typescript"
+                && diagnostic.code == CodeQueryDiagnosticCode::UnsupportedStructuralFeature
                 && diagnostic.message.contains("kwargs")),
         "expected typescript kwargs diagnostic: {:?}",
         output.diagnostics

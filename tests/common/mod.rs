@@ -1,6 +1,7 @@
 mod inline_project;
 pub mod lsp_click;
 pub mod lsp_client;
+pub mod semantic_graph;
 pub mod usage_graph;
 
 use brokk_bifrost::{

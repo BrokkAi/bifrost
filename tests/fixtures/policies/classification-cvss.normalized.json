@@ -1,0 +1,91 @@
+{
+  "analysis": {
+    "selector": {
+      "query": {
+        "languages": [
+          "python"
+        ],
+        "match": {
+          "callee": {
+            "name": "network_input"
+          },
+          "kind": "call"
+        },
+        "schema_version": 2
+      },
+      "schema_version": 2,
+      "type": "inline"
+    },
+    "type": "match"
+  },
+  "classification": {
+    "cvss": {
+      "emit": "when_base_complete",
+      "metric_rules": [
+        {
+          "assumptions": [
+            "The operation is remotely reachable"
+          ],
+          "basis": "policy_assertion",
+          "evidence_refs": [
+            {
+              "type": "policy_self"
+            }
+          ],
+          "metric": "AV",
+          "rationale": "Input reaches the vulnerable system over the network",
+          "scope": {
+            "system": "vulnerable_system",
+            "type": "system"
+          },
+          "value": "N",
+          "when": {
+            "analysis_type": "match",
+            "type": "analysis_type"
+          }
+        }
+      ],
+      "version": "4.0"
+    },
+    "fallback": {
+      "identifier": "NETWORK-INPUT",
+      "taxonomy": "Bifrost"
+    },
+    "refinements": [
+      {
+        "add": [
+          {
+            "identifier": "CWE-20",
+            "name": "Improper Input Validation",
+            "taxonomy": "CWE"
+          }
+        ],
+        "when": {
+          "analysis_type": "match",
+          "type": "analysis_type"
+        }
+      }
+    ]
+  },
+  "id": "bifrost.security.network-input",
+  "message": {
+    "text": "Network input reaches a sensitive operation",
+    "type": "static"
+  },
+  "name": "Network input",
+  "report": {
+    "origins_per_finding": 8,
+    "witness": {
+      "max_bytes": 16384,
+      "max_steps": 64
+    },
+    "witnesses_per_finding": 8
+  },
+  "schema_version": 1,
+  "severity": {
+    "type": "cvss",
+    "when_unscored": "unrated"
+  },
+  "tags": [],
+  "type": "policy"
+}

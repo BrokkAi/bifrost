@@ -1,11 +1,17 @@
 ---
 title: Build a Static-Analysis Rule
-description: Take a query from RQL exploration to a tested CLI, MCP, Python, or Rust integration.
+description: Take a query from RQL exploration to a native RQLP policy or tested CLI, MCP, Python, or Rust integration.
 ---
 
-A Bifrost rule is a versioned `CodeQuery` plus code that interprets every returned result and its completeness metadata. This guide builds a small “direct calls to Python `eval`” rule, then shows the production concerns that remain the same for richer reference, call, hierarchy, and import pipelines.
+A Bifrost rule begins as a versioned `CodeQuery`. It can remain an application-owned query integration, or it can become a native `.rqlp` policy with stable rule identity, severity, completeness, and human/JSON/SARIF reporting. This guide builds a small “direct calls to Python `eval`” query, then shows both production paths.
 
-This example is a structural policy: it finds parsed call expressions whose callee is named `eval`. It does not prove runtime dispatch, taint, reachability, or data flow. Choose a graph step and proof filter when declaration identity matters, and choose another analysis engine when the policy requires an unsupported guarantee.
+> **Warning — only code matching is implemented:** Bifrost currently executes
+> only `.rqlp` policies whose analysis has `:type match`. Taint-analysis and
+> typestate-analysis policy syntax is available for authoring and validation,
+> but those analyzers are not implemented yet. Running either type reports
+> `unsupported` and exits with status 2.
+
+This example becomes a structural policy: it finds parsed call expressions whose callee is named `eval`. It does not prove runtime dispatch, taint, reachability, or data flow. Choose a graph step and proof filter when declaration identity matters, and choose another analysis engine when the policy requires an unsupported guarantee.
 
 ## 1. Explore In RQL
 
@@ -47,7 +53,39 @@ Run `:json` in the RQL prompt. Save the resulting canonical model under the anal
 
 RQL and JSON are peer frontends to the same query model. Pinning `schema_version` makes an incompatible future engine reject the rule instead of quietly interpreting a changed shape. Keep language and path scope in the saved query so every execution surface analyzes the same policy.
 
-## 3. Execute Through One Supported Surface
+## 3. Promote A Diagnostic To RQLP
+
+When the query represents a durable diagnostic, wrap the native RQL selector in
+one policy document instead of writing a reporting adapter:
+
+```lisp
+(policy
+  :schema-version 1
+  :id "example.security.no-direct-eval"
+  :name "No direct dynamic evaluation"
+  :message "Dynamic evaluation is forbidden"
+  :severity warning
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql :schema-version 2
+          (language python
+            (call :callee (name "eval"))))))
+```
+
+Save it as one `.rqlp` file and run it with `bifrost --policy-file`. The policy
+owns finding identity and presentation while the nested RQL remains the same
+typed selector explored above. See [Static-Analysis
+Policies](/static-analysis-policies/) for endpoint libraries, taint and
+typestate syntax, schema inference, composition, report parity, and the current
+execution boundary.
+
+If an application needs the raw query result or custom domain logic rather than
+a Bifrost policy report, keep the checked-in CodeQuery and use one of the
+integration surfaces below.
+
+## 4. Execute A CodeQuery Through One Supported Surface
 
 Use one integration as the production owner of the rule. The other forms are useful for local debugging and parity checks.
 
@@ -109,7 +147,7 @@ fn run_rule(root: PathBuf) -> Result<CodeQueryResult, String> {
 
 `query_code_result` returns the Rust `CodeQueryResult` directly. Constructing `SearchToolsService` owns workspace indexing and file watching for a long-lived integration. Use `new_without_semantic_index` when this rule does not need the optional embedding service.
 
-## 4. Consume Every Result Variant
+## 5. Consume Every Result Variant
 
 Dispatch on `result_type` in JSON, the corresponding Python dataclass, or `CodeQueryResultValue` in Rust. Do not assume a pipeline will always end in a structural match: changing or appending a typed step changes the terminal value.
 
@@ -127,7 +165,7 @@ In Python, the seven classes are `CodeQueryMatch`, `CodeQueryDeclaration`, `Code
 
 Request `result_detail: "full"` when a report needs stable IDs, byte/line/column ranges, capture ranges, or decorator ranges. Compact mode is designed for agent context, not durable finding identity.
 
-## 5. Gate On Safety Metadata
+## 6. Gate On Safety Metadata
 
 Before a rule passes, fails, or claims completeness:
 
@@ -140,7 +178,7 @@ Before a rule passes, fails, or claims completeness:
 
 Use [Agent Result Safety](/agent-result-safety/) for the exact claim vocabulary and zero-result rules.
 
-## 6. Add Fixture Regression Tests
+## 7. Add Fixture Regression Tests
 
 Keep the smallest source project that demonstrates a true positive, a nearby false positive, and any important language diagnostic. Assert the canonical query, complete tagged result, proof fields, and `truncated: false`; do not assert only a match count.
 
@@ -152,19 +190,19 @@ For Bifrost's own documentation, the executable marker harness in `tests/code_qu
 - Dynamic candidates test their `proven` or `unproven` contract explicitly.
 - A negative fixture is structurally similar enough to catch an over-broad rule.
 
-## 7. Integrate With CI And Reports
+## 8. Integrate With CI And Reports
 
 Run the saved query against the exact revision being reviewed. Record the Bifrost version or commit, `schema_version`, query file hash or revision, workspace root, source revision, and whether the run was cold or warm when timing matters.
 
-For a CI gate, fail closed on execution errors, diagnostics that affect the intended scope, or truncation. Then apply the rule's policy to the typed findings. For a report, map each finding from its result variant rather than guessing a location: structural matches use `node_range` in full mode, declarations use their declaration range, reference/call/expression sites carry explicit ranges, and receiver analyses cite the analyzed input range while retaining the enclosing outcome around their candidates.
+For a raw CodeQuery CI gate, fail closed on execution errors, diagnostics that affect the intended scope, or truncation. Then apply the application's rule to the typed results. For a custom report, map each result from its tagged variant rather than guessing a location: structural matches use `node_range` in full mode, declarations use their declaration range, reference/call/expression sites carry explicit ranges, and receiver analyses cite the analyzed input range while retaining the enclosing outcome around their candidates.
 
-Bifrost does not currently emit a universal policy-report format from `query_code`. If the consumer needs SARIF or another interchange format, write a small adapter that preserves `result_type`, path/range, proof, diagnostics, and reproducibility metadata. Do not flatten importer files into symbol usages or structural matches into resolved declarations during conversion.
+For a native `.rqlp` policy, use `--format human|json|sarif` instead. All three renderers consume the same canonical policy report and preserve the same finding IDs, policy/semantic hashes, locations, completion, classifications, evidence, and CVSS variants. Status 2 takes precedence whenever loading, validation, evaluation, or report completeness is unreliable; an empty incomplete report is never a passing zero-result.
 
 ## Production Checklist
 
-- The saved canonical JSON pins `schema_version` and contains all scope.
+- The saved query JSON pins `schema_version` and contains all query scope, or the `.rqlp` policy records whether independently resolved policy and nested RQL versions were explicit or compatible inferences.
 - The integration handles all seven terminal result variants and every receiver-analysis outcome.
 - Errors, diagnostics, result truncation, proof tiers, and provenance truncation have explicit policy.
 - Fixture tests cover a true positive, a convincing negative, and relevant diagnostics.
 - CI records the engine, query, workspace, and source revisions.
-- Reports cite exact returned locations and do not claim unsupported control or data flow.
+- Reports cite exact returned locations and do not claim unsupported control or data flow; endpoint matches and source/sink co-presence are not reachability.

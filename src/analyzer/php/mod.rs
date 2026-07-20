@@ -4,6 +4,7 @@ mod clones;
 mod composer;
 mod declarations;
 mod diagnostics;
+mod semantic;
 pub(crate) mod structural;
 mod tests;
 

@@ -5,6 +5,8 @@ use crate::analyzer::usages::cpp_call_match::{
     cpp_type_text_pointer_depth, normalize_cpp_type_name,
 };
 
+pub(crate) const CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC: &str = "unproven_cpp_link_unit";
+
 pub(super) fn resolve_cpp(
     analyzer: &dyn IAnalyzer,
     context: &mut DefinitionBatchContext<'_>,
@@ -197,15 +199,30 @@ struct CppLookupCtx<'a, 'tree> {
 fn cpp_reference_node(node: Node<'_>) -> Option<CppReferenceNode<'_>> {
     let mut current = node;
     while let Some(parent) = current.parent() {
-        if parent.kind() == "qualified_identifier"
+        if parent.kind() == "ERROR"
+            && parent.parent().is_some_and(|call| {
+                call.kind() == "call_expression"
+                    && cpp_explicit_operator_name(call) == Some(current)
+            })
+        {
+            current = parent.parent()?;
+            continue;
+        }
+        if current.kind() != "template_type"
+            && matches!(
+                parent.kind(),
+                "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+            )
             && qualified_access_focus(current, parent, &["scope"], &["name"])
                 == Some(QualifiedAccessFocus::Member)
         {
             current = parent;
             continue;
         }
-        if parent.kind() == "template_function"
-            && parent.child_by_field_name("name") == Some(current)
+        if matches!(
+            parent.kind(),
+            "dependent_name" | "template_function" | "template_method" | "template_type"
+        ) && parent.child_by_field_name("name") == Some(current)
         {
             current = parent;
             continue;
@@ -249,7 +266,12 @@ fn cpp_reference_node(node: Node<'_>) -> Option<CppReferenceNode<'_>> {
         | "qualified_identifier"
         | "template_type"
         | "scoped_type_identifier" => Some(CppReferenceNode::Type(current)),
-        "identifier" | "field_identifier" => Some(CppReferenceNode::Identifier(current)),
+        "identifier"
+        | "field_identifier"
+        | "operator_name"
+        | "operator_cast"
+        | "destructor_name"
+        | "literal_operator_name" => Some(CppReferenceNode::Identifier(current)),
         _ => None,
     }
 }
@@ -427,7 +449,7 @@ fn resolve_cpp_type_without_focused_qualifier(
         && visibility.external_type_candidate_visible_at(file, &owner, node.start_byte())
     {
         let candidates =
-            cpp_direct_member_candidates(support, &[owner], cpp_node_text(name, source));
+            cpp_direct_member_candidates(analyzer, support, &[owner], cpp_node_text(name, source));
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
         }
@@ -544,10 +566,7 @@ fn cpp_focused_type_qualifier(node: Node<'_>, source: &str) -> Option<CppFocused
         current = parent.parent();
     };
 
-    let focused = cpp_node_text(node, source).trim();
-    if focused.is_empty() {
-        return None;
-    }
+    let focused = cpp_qualifier_scope_component(node, source)?;
     let mut scopes = Vec::new();
     let mut nested_access = access;
     let mut globally_qualified = false;
@@ -779,6 +798,29 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
         .visibility
         .call_arity_evidence(ctx.file, call, ctx.source)
         .exact();
+    if let Some(operator) = cpp_explicit_operator_name(call) {
+        let member = cpp_node_text(operator, ctx.source);
+        let owners = cpp_receiver_type_units(ctx, function, false);
+        let candidates = cpp_member_candidates_lazy(ctx, owners, member, call_arity, || {
+            cpp_call_argument_types(
+                ctx.analyzer,
+                ctx.support,
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+                ctx.root,
+                call,
+            )
+        });
+        return if candidates.is_empty() {
+            no_definition(
+                "unsupported_cpp_receiver",
+                format!("receiver for C++ operator `{member}` is not resolved"),
+            )
+        } else {
+            cpp_callable_candidates_outcome(candidates)
+        };
+    }
     match function.kind() {
         "field_expression" => {
             let call_arg_types = cpp_call_argument_types(
@@ -833,7 +875,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                     ctx.visibility,
                     ctx.file,
                 );
-                return candidates_outcome(candidates);
+                return cpp_callable_candidates_outcome(candidates);
             }
             let constructor = resolve_cpp_constructor(ctx, call);
             if constructor.status != DefinitionLookupStatus::NoDefinition {
@@ -862,7 +904,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                             )
                         });
                     if !candidates.is_empty() {
-                        return candidates_outcome(candidates);
+                        return cpp_callable_candidates_outcome(candidates);
                     }
                 }
             }
@@ -876,7 +918,15 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 format!("`{text}` did not resolve to an indexed C++ callable"),
             )
         }
-        "identifier" | "template_function" => {
+        "identifier"
+        | "field_identifier"
+        | "dependent_name"
+        | "template_function"
+        | "template_method"
+        | "operator_name"
+        | "operator_cast"
+        | "destructor_name"
+        | "literal_operator_name" => {
             let Some(name_node) = cpp_callable_name_node(function) else {
                 return no_definition("no_function_name", "C++ call name is blank");
             };
@@ -921,7 +971,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                             "the argument count for C++ call `{name}` is unknown after macro expansion"
                         ));
                     }
-                    return candidates_outcome(member_candidates);
+                    return cpp_callable_candidates_outcome(member_candidates);
                 }
             }
             let imports = cpp_initialized_effective_using_imports(
@@ -960,7 +1010,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                         ctx.visibility,
                         ctx.file,
                     );
-                    return candidates_outcome(candidates);
+                    return cpp_callable_candidates_outcome(candidates);
                 }
                 CppBareCallTargetResolution::UnprovenFreeFunctions(units) => {
                     if units.len() < 2 {
@@ -1004,7 +1054,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                                 },
                             ));
                         if !constructors.is_empty() {
-                            return candidates_outcome(constructors);
+                            return cpp_callable_candidates_outcome(constructors);
                         }
                     }
                     return candidates_outcome(owners);
@@ -1054,6 +1104,10 @@ fn cpp_bare_free_function_definition_candidates(
                         ctx.support,
                         candidate,
                         CppTargetKind::FreeFunction,
+                    ) && cpp_callable_definitions_share_identity_evidence(
+                        ctx.analyzer,
+                        &unit,
+                        candidate,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -1066,11 +1120,66 @@ fn cpp_bare_free_function_definition_candidates(
         .collect()
 }
 
+fn cpp_explicit_operator_name(call: Node<'_>) -> Option<Node<'_>> {
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let arguments = call.child_by_field_name("arguments");
+    let mut cursor = call.walk();
+    let errors = call
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "ERROR" && Some(*child) != arguments);
+    for error in errors {
+        let mut stack = vec![error];
+        while let Some(node) = stack.pop() {
+            if matches!(
+                node.kind(),
+                "operator_name" | "operator_cast" | "literal_operator_name"
+            ) {
+                return Some(node);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+    }
+    None
+}
+
 fn cpp_callable_name_node(node: Node<'_>) -> Option<Node<'_>> {
-    if node.kind() == "template_function" {
-        node.child_by_field_name("name")
-    } else {
-        Some(node)
+    let mut current = node;
+    loop {
+        current = match current.kind() {
+            "identifier"
+            | "field_identifier"
+            | "type_identifier"
+            | "namespace_identifier"
+            | "operator_name"
+            | "operator_cast"
+            | "destructor_name"
+            | "literal_operator_name"
+            | "primitive_type" => return Some(current),
+            "dependent_name" | "template_function" | "template_method" | "template_type" => {
+                current.child_by_field_name("name")?
+            }
+            "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier" => {
+                let mut cursor = current.walk();
+                current
+                    .children_by_field_name("name", &mut cursor)
+                    .filter(|child| child.is_named())
+                    .last()?
+            }
+            "field_expression" => current.child_by_field_name("field")?,
+            "parenthesized_expression" => {
+                let mut cursor = current.walk();
+                let mut children = current.named_children(&mut cursor);
+                let child = children.next()?;
+                if children.next().is_some() {
+                    return None;
+                }
+                child
+            }
+            _ => return None,
+        };
     }
 }
 
@@ -1191,7 +1300,11 @@ fn cpp_prefer_declaration_candidates(candidates: Vec<CodeUnit>) -> Vec<CodeUnit>
 }
 
 fn cpp_source_is_header(unit: &CodeUnit) -> bool {
-    let path = rel_path_string(unit.source()).to_ascii_lowercase();
+    cpp_source_path_is_header(unit.source())
+}
+
+fn cpp_source_path_is_header(source: &ProjectFile) -> bool {
+    let path = rel_path_string(source).to_ascii_lowercase();
     matches!(path.rsplit('.').next(), Some("h" | "hh" | "hpp" | "hxx"))
 }
 
@@ -1203,6 +1316,15 @@ fn resolve_cpp_field(
 ) -> DefinitionLookupOutcome {
     let Some(name_node) = field.child_by_field_name("field") else {
         return no_definition("no_member_name", "C++ field expression has no member name");
+    };
+    let Some(name_node) = cpp_callable_name_node(name_node) else {
+        return no_definition(
+            "unsupported_cpp_reference_shape",
+            format!(
+                "C++ `{}` member names are not resolved by get_definition yet",
+                name_node.kind()
+            ),
+        );
     };
     let member = cpp_node_text(name_node, ctx.source);
     let Some(receiver) = field
@@ -1228,7 +1350,11 @@ fn resolve_cpp_field(
             format!("receiver for C++ member `{member}` is not resolved"),
         )
     } else {
-        candidates_outcome(candidates)
+        if arity.is_some() {
+            cpp_callable_candidates_outcome(candidates)
+        } else {
+            candidates_outcome(candidates)
+        }
     }
 }
 
@@ -1272,7 +1398,7 @@ fn cpp_visible_name_candidates(
         support
             .fqn_candidates(fqns)
             .into_iter()
-            .filter(|unit| visibility.is_visible(file, unit))
+            .filter(|unit| visibility.is_physically_visible(file, unit))
             .filter(|unit| {
                 let cpp_name = cpp_name_for(unit);
                 cpp_name == normalized
@@ -1295,7 +1421,10 @@ fn cpp_visible_name_candidates(
     candidates = candidates
         .into_iter()
         .flat_map(|unit| {
-            let indexed = support.fqn(&unit.fq_name());
+            let mut indexed = support.fqn(&unit.fq_name());
+            indexed.retain(|candidate| {
+                cpp_callable_definitions_share_identity_evidence(analyzer, &unit, candidate)
+            });
             if indexed.is_empty() {
                 vec![unit]
             } else {
@@ -1306,6 +1435,94 @@ fn cpp_visible_name_candidates(
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
+}
+
+fn cpp_callable_definitions_share_identity_evidence(
+    analyzer: &dyn IAnalyzer,
+    visible: &CodeUnit,
+    candidate: &CodeUnit,
+) -> bool {
+    visible.source() == candidate.source()
+        || (matches!(
+            cpp_indexed_callable_linkage(analyzer, visible),
+            Some(crate::analyzer::CallableLinkage::External)
+        ) && matches!(
+            cpp_indexed_callable_linkage(analyzer, candidate),
+            Some(crate::analyzer::CallableLinkage::External)
+        ) && cpp_header_body_files_are_related(analyzer, visible.source(), candidate.source()))
+}
+
+/// The include graph can relate one declaration header to one implementation
+/// file, but it cannot prove that every external definition with the same FQN
+/// belongs to the same binary. Keep only a direct header/body include edge;
+/// broader workspace-global linkage is deliberately rejected.
+fn cpp_header_body_files_are_related(
+    analyzer: &dyn IAnalyzer,
+    left: &ProjectFile,
+    right: &ProjectFile,
+) -> bool {
+    let (header, implementation) = if cpp_source_path_is_header(left) {
+        (left, right)
+    } else if cpp_source_path_is_header(right) {
+        (right, left)
+    } else {
+        return false;
+    };
+    if cpp_source_path_is_header(implementation) {
+        return false;
+    }
+    let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) else {
+        return false;
+    };
+    let include_targets = cpp.include_target_index();
+    analyzer
+        .import_statements(implementation)
+        .into_iter()
+        .flat_map(|import| cpp_include_paths(std::slice::from_ref(&import)))
+        .any(|include| {
+            let targets =
+                resolve_include_targets_with_index(implementation, &include, include_targets);
+            targets.len() == 1 && targets.first() == Some(header)
+        })
+}
+
+/// Cross-file C/C++ callable bodies selected from include evidence are useful
+/// targets, but their link-unit identity remains unproven without build graph
+/// metadata. Preserve the candidates while making that uncertainty explicit.
+fn cpp_callable_candidates_outcome(candidates: Vec<CodeUnit>) -> DefinitionLookupOutcome {
+    let mut callable_sources = HashSet::default();
+    for candidate in &candidates {
+        if candidate.is_callable() {
+            callable_sources.insert(candidate.source().clone());
+        }
+    }
+    let link_unit_unproven = callable_sources.len() > 1;
+    let mut outcome = candidates_outcome(candidates);
+    if link_unit_unproven {
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            kind: CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC.to_string(),
+            message: "the include graph relates this C/C++ declaration and body, but no build graph proves one link unit"
+                .to_string(),
+        });
+    }
+    outcome
+}
+
+pub(crate) fn cpp_indexed_callable_linkage(
+    analyzer: &dyn IAnalyzer,
+    callable: &CodeUnit,
+) -> Option<crate::analyzer::CallableLinkage> {
+    let mut external = false;
+    for metadata in analyzer.signature_metadata(callable) {
+        match metadata.callable_linkage() {
+            Some(crate::analyzer::CallableLinkage::Internal) => {
+                return Some(crate::analyzer::CallableLinkage::Internal);
+            }
+            Some(crate::analyzer::CallableLinkage::External) => external = true,
+            None => {}
+        }
+    }
+    external.then_some(crate::analyzer::CallableLinkage::External)
 }
 
 fn cpp_unit_matches_kind(
@@ -1392,7 +1609,7 @@ fn cpp_member_candidates(
     arity: Option<usize>,
     arg_types: Option<&[Option<CppType>]>,
 ) -> Vec<CodeUnit> {
-    let mut candidates = cpp_direct_member_candidates(ctx.support, &owners, member);
+    let mut candidates = cpp_direct_member_candidates(ctx.analyzer, ctx.support, &owners, member);
     if candidates.is_empty() {
         let mut seen = HashSet::default();
         candidates = cpp_inherited_member_candidates(ctx, &owners, member, &mut seen);
@@ -1420,7 +1637,7 @@ fn cpp_member_candidates_lazy<F>(
 where
     F: FnOnce() -> Option<Vec<Option<CppType>>>,
 {
-    let mut candidates = cpp_direct_member_candidates(ctx.support, &owners, member);
+    let mut candidates = cpp_direct_member_candidates(ctx.analyzer, ctx.support, &owners, member);
     if candidates.is_empty() {
         let mut seen = HashSet::default();
         candidates = cpp_inherited_member_candidates(ctx, &owners, member, &mut seen);
@@ -1439,13 +1656,29 @@ where
 }
 
 fn cpp_direct_member_candidates(
+    analyzer: &dyn IAnalyzer,
     support: &dyn BoundedDefinitionLookup,
     owners: &[CodeUnit],
     member: &str,
 ) -> Vec<CodeUnit> {
     let mut candidates = Vec::new();
     for owner in owners {
-        candidates.extend(support.fqn(&format!("{}.{}", owner.fq_name(), member)));
+        candidates.extend(
+            support
+                .fqn(&format!("{}.{}", owner.fq_name(), member))
+                .into_iter()
+                .filter(|candidate| {
+                    candidate.source() == owner.source()
+                        || (matches!(
+                            cpp_indexed_callable_linkage(analyzer, candidate),
+                            Some(crate::analyzer::CallableLinkage::External)
+                        ) && cpp_header_body_files_are_related(
+                            analyzer,
+                            owner.source(),
+                            candidate.source(),
+                        ))
+                }),
+        );
     }
     sort_units(&mut candidates);
     candidates.dedup();
@@ -1469,7 +1702,7 @@ fn cpp_inherited_member_candidates(
     if bases.is_empty() {
         return Vec::new();
     }
-    let direct = cpp_direct_member_candidates(ctx.support, &bases, member);
+    let direct = cpp_direct_member_candidates(ctx.analyzer, ctx.support, &bases, member);
     if !direct.is_empty() {
         return direct;
     }
@@ -3141,29 +3374,40 @@ fn cpp_call_return_type(
     let candidates = match function.kind() {
         "qualified_identifier" => {
             let scope = function.child_by_field_name("scope")?;
-            let name = function.child_by_field_name("name")?;
+            let name = function
+                .child_by_field_name("name")
+                .and_then(cpp_callable_name_node)?;
             let owner = visibility.resolve_type(file, cpp_node_text(scope, source))?;
             cpp_filter_candidates_by_arity(
-                cpp_direct_member_candidates(support, &[owner], cpp_node_text(name, source)),
+                cpp_direct_member_candidates(
+                    analyzer,
+                    support,
+                    &[owner],
+                    cpp_node_text(name, source),
+                ),
                 Some(arity),
             )
         }
-        "identifier" => cpp_filter_candidates_by_arity(
-            cpp_visible_name_candidates(
-                analyzer,
-                visibility,
-                file,
-                support,
-                cpp_node_text(function, source),
-                Some(CppTargetKind::FreeFunction),
-                None,
-            ),
-            Some(arity),
-        ),
+        "identifier" | "dependent_name" | "template_function" | "template_method" => {
+            let name = cpp_callable_name_node(function)?;
+            cpp_filter_candidates_by_arity(
+                cpp_visible_name_candidates(
+                    analyzer,
+                    visibility,
+                    file,
+                    support,
+                    cpp_node_text(name, source),
+                    Some(CppTargetKind::FreeFunction),
+                    None,
+                ),
+                Some(arity),
+            )
+        }
         "field_expression" => {
             let root = root?;
             let member = function
                 .child_by_field_name("field")
+                .and_then(cpp_callable_name_node)
                 .map(|field| cpp_node_text(field, source))?;
             let receiver = function
                 .child_by_field_name("argument")

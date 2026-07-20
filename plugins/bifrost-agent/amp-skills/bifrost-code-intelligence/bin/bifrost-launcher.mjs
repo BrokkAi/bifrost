@@ -14,7 +14,12 @@ const OWNER = "BrokkAi";
 const REPO = "bifrost";
 const BINARY_NAME = "bifrost";
 const DEFAULT_TOOLSET = "symbol|extended";
-const DOWNLOAD_TIMEOUT_MS = 60_000;
+export const DOWNLOAD_TIMEOUT_MS = 60_000;
+export const EXTRACTION_TIMEOUT_MS = 60_000;
+export const VERSION_PROBE_TIMEOUT_MS = 10_000;
+export const STARTUP_MARGIN_MS = 30_000;
+export const MINIMUM_MCP_STARTUP_TIMEOUT_MS =
+  DOWNLOAD_TIMEOUT_MS + EXTRACTION_TIMEOUT_MS + VERSION_PROBE_TIMEOUT_MS + STARTUP_MARGIN_MS;
 export const SUPPORTED_TARGETS = [
   "aarch64-pc-windows-msvc",
   "aarch64-unknown-linux-gnu",
@@ -39,7 +44,25 @@ export class LauncherError extends Error {
 }
 
 export function parseLauncherArgs(args) {
+  const command = args[0];
+  if (command === "doctor" || command === "prepare") {
+    let json = false;
+    for (const arg of args.slice(1)) {
+      if (arg === "--json") {
+        json = true;
+        continue;
+      }
+      throw new LauncherError(
+        "invalid_arguments",
+        `${command} accepts only --json and cannot be combined with MCP server arguments.`
+      );
+    }
+    return { command, json };
+  }
+
   const parsed = {
+    command: "serve",
+    json: false,
     root: null,
     toolset: DEFAULT_TOOLSET,
     passThrough: []
@@ -206,63 +229,227 @@ export function managedBinaryPath(cacheRoot, version, platform = process.platfor
 }
 
 export async function resolveBifrostBinary(options = {}) {
+  const assessment = await assessBifrostCandidates(options);
+  return resolveAssessedBinary(assessment, options);
+}
+
+async function resolveAssessedBinary(assessment, options) {
+  if (assessment.status === "ready") {
+    return { path: assessment.binaryPath, source: assessment.source };
+  }
+  if (assessment.status === "error" || assessment.source === "explicit" || !assessment.autoInstall) {
+    throw assessment.error ?? new LauncherError("binary_not_found", assessment.message);
+  }
+
+  options.onInstallStart?.({
+    version: assessment.requiredVersion,
+    cachePath: assessment.cachePath
+  });
+  const installed = await installManagedBinary({
+    ...options,
+    metadata: assessment.metadata,
+    cacheRoot: assessment.cacheRoot,
+    platform: assessment.platform,
+    arch: assessment.arch,
+    fsImpl: assessment.fsImpl
+  });
+  options.onInstallComplete?.({
+    version: assessment.requiredVersion,
+    cachePath: installed
+  });
+  return { path: installed, source: "installed" };
+}
+
+export async function inspectBifrostInstallation(options = {}) {
+  const env = options.env ?? process.env;
+  const autoInstall = env.BIFROST_LAUNCHER_AUTO_INSTALL !== "0";
+  try {
+    return launcherStatus(await assessBifrostCandidates(options));
+  } catch (error) {
+    return launcherStatus({
+      status: launcherStatusForError(error),
+      requiredVersion: null,
+      source: null,
+      binaryPath: null,
+      cachePath: null,
+      autoInstall,
+      message: formatCause(error)
+    });
+  }
+}
+
+export async function prepareBifrostInstallation(options = {}) {
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  const arch = options.arch ?? process.arch;
+  const autoInstall = env.BIFROST_LAUNCHER_AUTO_INSTALL !== "0";
+  let assessment = null;
+
+  try {
+    assessment = await assessBifrostCandidates(options);
+    const binary = await resolveAssessedBinary(assessment, options);
+    return launcherStatus({
+      status: "ready",
+      requiredVersion: assessment.requiredVersion,
+      source: binary.source,
+      binaryPath: binary.path,
+      cachePath: assessment.cachePath,
+      autoInstall,
+      message: `Bifrost ${assessment.requiredVersion} is ready.`
+    });
+  } catch (error) {
+    const requiredVersion = assessment?.requiredVersion ?? options.metadata?.binaryVersion ?? null;
+    const cachePath = assessment?.cachePath ?? (requiredVersion
+      ? managedBinaryPath(options.cacheRoot ?? cacheRootFor(env, platform), requiredVersion, platform, arch)
+      : null);
+    return launcherStatus({
+      status: launcherStatusForError(error),
+      requiredVersion,
+      source: assessment?.source ?? null,
+      binaryPath: assessment?.binaryPath ?? null,
+      cachePath,
+      autoInstall,
+      message: `${formatCause(error)} ${formatRecoveryMessage(requiredVersion, cachePath)}`
+    });
+  }
+}
+
+async function assessBifrostCandidates(options = {}) {
   const env = options.env ?? process.env;
   const platform = options.platform ?? process.platform;
   const arch = options.arch ?? process.arch;
   const fsImpl = options.fsImpl ?? fs;
   const metadata = options.metadata ?? await readReleaseMetadata(options.metadataPath ?? metadataPath, fsImpl);
-
-  if (env.BIFROST_BINARY_PATH?.trim()) {
-    const explicit = path.resolve(env.BIFROST_BINARY_PATH.trim());
-    await validateExecutable(explicit, fsImpl, platform, "BIFROST_BINARY_PATH");
-    await validateVersion(explicit, metadata.binaryVersion, options);
-    return { path: explicit, source: "explicit" };
-  }
-
   releaseTargetFor(platform, arch);
   const cacheRoot = options.cacheRoot ?? cacheRootFor(env, platform);
-  const managed = managedBinaryPath(cacheRoot, metadata.binaryVersion, platform, arch);
-  let incompatibleBinaryError = null;
-  if (await isExecutable(managed, fsImpl, platform)) {
-    try {
-      await validateVersion(managed, metadata.binaryVersion, options);
-      return { path: managed, source: "managed" };
-    } catch (error) {
-      incompatibleBinaryError = error;
-    }
-  }
-
-  if (allowsPathLookup(env)) {
-    const pathBinary = await findOnPath("bifrost", env.PATH ?? "", env.PATHEXT, process.cwd(), fsImpl, platform);
-    if (pathBinary) {
-      try {
-        await validateVersion(pathBinary, metadata.binaryVersion, options);
-        return { path: pathBinary, source: "path" };
-      } catch (error) {
-        incompatibleBinaryError = error;
-      }
-    }
-  }
-
-  if (env.BIFROST_LAUNCHER_AUTO_INSTALL === "0") {
-    if (incompatibleBinaryError instanceof LauncherError) {
-      throw incompatibleBinaryError;
-    }
-    throw new LauncherError(
-      "binary_not_found",
-      `No compatible Bifrost ${metadata.binaryVersion} binary was found. Set BIFROST_BINARY_PATH, set BIFROST_LAUNCHER_ALLOW_PATH=1 to use PATH, or allow the launcher to install the pinned release.`
-    );
-  }
-
-  const installed = await installManagedBinary({
-    ...options,
+  const cachePath = managedBinaryPath(cacheRoot, metadata.binaryVersion, platform, arch);
+  const context = {
+    requiredVersion: metadata.binaryVersion,
+    cachePath,
+    autoInstall: env.BIFROST_LAUNCHER_AUTO_INSTALL !== "0",
     metadata,
     cacheRoot,
     platform,
     arch,
     fsImpl
-  });
-  return { path: installed, source: "installed" };
+  };
+
+  try {
+    if (env.BIFROST_BINARY_PATH?.trim()) {
+      const explicit = path.resolve(env.BIFROST_BINARY_PATH.trim());
+      return inspectCandidate("explicit", explicit, context, options);
+    }
+
+    let fallback = null;
+    if (await pathExists(cachePath, fsImpl)) {
+      const managed = await inspectCandidate("managed", cachePath, context, options);
+      if (managed.status === "ready") {
+        return managed;
+      }
+      fallback = managed;
+    }
+
+    if (allowsPathLookup(env)) {
+      const pathBinary = await findOnPath(
+        "bifrost",
+        env.PATH ?? "",
+        env.PATHEXT,
+        options.cwd ?? process.cwd(),
+        fsImpl,
+        platform
+      );
+      if (pathBinary) {
+        const pathResult = await inspectCandidate("path", pathBinary, context, options);
+        if (pathResult.status === "ready") {
+          return pathResult;
+        }
+        fallback = pathResult;
+      }
+    }
+
+    return fallback ?? {
+      ...context,
+      status: "missing",
+      source: null,
+      binaryPath: null,
+      error: new LauncherError(
+        "binary_not_found",
+        `No compatible Bifrost ${context.requiredVersion} binary was found. Set BIFROST_BINARY_PATH, set BIFROST_LAUNCHER_ALLOW_PATH=1 to use PATH, or allow the launcher to install the pinned release.`
+      ),
+      message: `No compatible Bifrost ${context.requiredVersion} binary is available.`
+    };
+  } catch (error) {
+    return {
+      ...context,
+      status: "error",
+      source: null,
+      binaryPath: null,
+      error: error instanceof LauncherError
+        ? error
+        : new LauncherError("candidate_inspection_failed", formatCause(error), error),
+      message: formatCause(error)
+    };
+  }
+}
+
+async function inspectCandidate(source, binaryPath, context, options) {
+  try {
+    await validateExecutable(binaryPath, context.fsImpl, context.platform, `${source} Bifrost binary`);
+    await validateVersion(binaryPath, context.requiredVersion, options);
+    return {
+      ...context,
+      status: "ready",
+      source,
+      binaryPath,
+      error: null,
+      message: `Bifrost ${context.requiredVersion} is ready from ${source}.`
+    };
+  } catch (error) {
+    return {
+      ...context,
+      status: launcherStatusForError(error),
+      source,
+      binaryPath,
+      error,
+      message: formatCause(error)
+    };
+  }
+}
+
+function launcherStatus(status) {
+  return {
+    status: status.status,
+    requiredVersion: status.requiredVersion,
+    source: status.source,
+    binaryPath: status.binaryPath,
+    cachePath: status.cachePath,
+    autoInstall: status.autoInstall,
+    message: status.message
+  };
+}
+
+function launcherStatusForError(error) {
+  if (error instanceof LauncherError) {
+    if (error.code === "version_mismatch") {
+      return "incompatible";
+    }
+    if (error.code === "binary_not_found") {
+      return "missing";
+    }
+  }
+  return "error";
+}
+
+async function pathExists(candidate, fsImpl) {
+  try {
+    await fsImpl.stat(candidate);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+      return false;
+    }
+    throw error;
+  }
 }
 
 export async function installManagedBinary(options) {
@@ -352,10 +539,10 @@ async function extractArchive(archivePath, destination, platform) {
         "Expand-Archive -LiteralPath $args[0] -DestinationPath $args[1] -Force",
         archivePath,
         destination
-      ], { windowsHide: true, timeout: 60_000 });
+      ], { windowsHide: true, timeout: EXTRACTION_TIMEOUT_MS });
       return;
     }
-    await execFileAsync("tar", ["-xzf", archivePath, "-C", destination], { timeout: 60_000 });
+    await execFileAsync("tar", ["-xzf", archivePath, "-C", destination], { timeout: EXTRACTION_TIMEOUT_MS });
   } catch (error) {
     throw new LauncherError("extract_failed", `Failed to extract Bifrost release archive: ${formatCause(error)}`, error);
   }
@@ -386,7 +573,7 @@ export async function probeBifrostVersion(binaryPath, options = {}) {
   const execFileImpl = options.execFileImpl ?? execFileAsync;
   try {
     const { stdout, stderr } = await execFileImpl(binaryPath, ["--version"], {
-      timeout: 10_000,
+      timeout: VERSION_PROBE_TIMEOUT_MS,
       windowsHide: true
     });
     const rawOutput = `${stdout ?? ""}${stderr ?? ""}`.trim();
@@ -469,16 +656,15 @@ function commandNamesForPathLookup(command, pathExt, platform) {
 }
 
 async function downloadBytes(url, fetchImpl, timeoutMs) {
-  const response = await fetchWithTimeout(url, fetchImpl, timeoutMs);
-  return Buffer.from(await response.arrayBuffer());
+  const bytes = await fetchWithTimeout(url, fetchImpl, timeoutMs, (response) => response.arrayBuffer());
+  return Buffer.from(bytes);
 }
 
 async function downloadText(url, fetchImpl, timeoutMs) {
-  const response = await fetchWithTimeout(url, fetchImpl, timeoutMs);
-  return response.text();
+  return fetchWithTimeout(url, fetchImpl, timeoutMs, (response) => response.text());
 }
 
-async function fetchWithTimeout(url, fetchImpl, timeoutMs) {
+async function fetchWithTimeout(url, fetchImpl, timeoutMs, readBody) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -486,7 +672,7 @@ async function fetchWithTimeout(url, fetchImpl, timeoutMs) {
     if (!response.ok) {
       throw new LauncherError("download_failed", `Failed to download ${url}: HTTP ${response.status}.`);
     }
-    return response;
+    return await readBody(response);
   } catch (error) {
     if (error instanceof LauncherError) {
       throw error;
@@ -565,6 +751,34 @@ export function spawnBifrost(binaryPath, args, options = {}) {
   return child;
 }
 
+export function formatLauncherStatus(status) {
+  const details = [
+    `status=${status.status}`,
+    `required=${status.requiredVersion ?? "unknown"}`,
+    `source=${status.source ?? "none"}`,
+    `binary=${status.binaryPath ?? "none"}`,
+    `cache=${status.cachePath ?? "unknown"}`,
+    `auto-install=${status.autoInstall ? "enabled" : "disabled"}`
+  ];
+  return `${details.join(" ")}\n${status.message}`;
+}
+
+function installProgressHandlers() {
+  return {
+    onInstallStart: ({ version, cachePath }) => {
+      console.error(`Bifrost launcher: preparing pinned Bifrost ${version} at ${cachePath}.`);
+    },
+    onInstallComplete: ({ version, cachePath }) => {
+      console.error(`Bifrost launcher: prepared Bifrost ${version} at ${cachePath}.`);
+    }
+  };
+}
+
+function formatRecoveryMessage(requiredVersion, cachePath) {
+  return `Expected ${requiredVersion ?? "unknown"}; cache ${cachePath ?? "unknown"}. ` +
+    "Run this launcher with doctor, then prepare, and start a fresh host task.";
+}
+
 function formatCause(error) {
   if (error instanceof Error) {
     return error.message;
@@ -575,12 +789,20 @@ function formatCause(error) {
 async function main() {
   try {
     const parsed = parseLauncherArgs(process.argv.slice(2));
+    if (parsed.command === "doctor" || parsed.command === "prepare") {
+      const status = parsed.command === "doctor"
+        ? await inspectBifrostInstallation()
+        : await prepareBifrostInstallation(installProgressHandlers());
+      console.log(parsed.json ? JSON.stringify(status) : formatLauncherStatus(status));
+      process.exitCode = status.status === "ready" ? 0 : 1;
+      return;
+    }
     const root = await resolveWorkspaceRoot({
       env: process.env,
       argvRoot: parsed.root,
       cwd: process.cwd()
     });
-    const binary = await resolveBifrostBinary();
+    const binary = await resolveBifrostBinary(installProgressHandlers());
     const args = buildBifrostArgs(root, parsed.toolset, parsed.passThrough);
     spawnBifrost(binary.path, args, {
       cwd: root,
@@ -592,8 +814,29 @@ async function main() {
     } else {
       console.error(`Bifrost launcher error: ${formatCause(error)}`);
     }
+    if (isBinaryRecoveryError(error)) {
+      const metadata = await readReleaseMetadata().catch(() => null);
+      const requiredVersion = metadata?.binaryVersion ?? "unknown";
+      const cachePath = metadata
+        ? managedBinaryPath(cacheRootFor(process.env), metadata.binaryVersion)
+        : "unknown";
+      console.error(`Bifrost launcher recovery: ${formatRecoveryMessage(requiredVersion, cachePath)}`);
+    }
     process.exit(1);
   }
+}
+
+function isBinaryRecoveryError(error) {
+  return error instanceof LauncherError && [
+    "binary_not_found",
+    "candidate_inspection_failed",
+    "checksum_mismatch",
+    "download_failed",
+    "extract_failed",
+    "failed_launch",
+    "install_failed",
+    "version_mismatch"
+  ].includes(error.code);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === thisFile) {

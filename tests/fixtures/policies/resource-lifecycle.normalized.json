@@ -1,0 +1,124 @@
+{
+  "analysis": {
+    "automaton": {
+      "accepting_states": [
+        "closed"
+      ],
+      "error_states": [
+        "violated"
+      ],
+      "events": [
+        {
+          "id": "close",
+          "supersedes": [],
+          "trigger": {
+            "phase": "after_normal_return",
+            "role": "sink",
+            "set": {
+              "reference": {
+                "categories": {
+                  "categories": [
+                    "resource.close"
+                  ],
+                  "type": "all"
+                },
+                "path": "tests/fixtures/policies/endpoints",
+                "scope": "recursive"
+              },
+              "type": "directory"
+            },
+            "type": "match_endpoints"
+          }
+        }
+      ],
+      "initial": "open",
+      "states": [
+        "closed",
+        "open",
+        "violated"
+      ],
+      "terminal_expectations": [
+        {
+          "expected_states": [
+            "closed"
+          ],
+          "id": "exceptional-exit-closed",
+          "supersedes": [],
+          "trigger": {
+            "event": {
+              "scope": "analysis_root",
+              "type": "exceptional_procedure_exit"
+            },
+            "type": "semantic_event"
+          }
+        },
+        {
+          "expected_states": [
+            "closed"
+          ],
+          "id": "normal-exit-closed",
+          "supersedes": [],
+          "trigger": {
+            "event": {
+              "scope": "analysis_root",
+              "type": "normal_procedure_exit"
+            },
+            "type": "semantic_event"
+          }
+        }
+      ],
+      "transitions": [
+        {
+          "from": "open",
+          "on": "close",
+          "to": "closed"
+        }
+      ]
+    },
+    "mode": "may",
+    "subjects": {
+      "entries": [],
+      "include_matches": [
+        {
+          "reference": {
+            "categories": {
+              "categories": [
+                "resource.acquire"
+              ],
+              "type": "all"
+            },
+            "path": "tests/fixtures/policies/endpoints",
+            "scope": "recursive"
+          },
+          "type": "directory"
+        }
+      ]
+    },
+    "type": "typestate",
+    "uncertainty": {
+      "escape": "inconclusive",
+      "unknown_call": "inconclusive"
+    }
+  },
+  "id": "bifrost.correctness.resource-lifecycle",
+  "message": {
+    "text": "Resource can leave its analysis root without being closed",
+    "type": "static"
+  },
+  "name": "Resource lifecycle",
+  "report": {
+    "origins_per_finding": 8,
+    "witness": {
+      "max_bytes": 16384,
+      "max_steps": 64
+    },
+    "witnesses_per_finding": 8
+  },
+  "schema_version": 1,
+  "severity": {
+    "level": "error",
+    "type": "fixed"
+  },
+  "tags": [],
+  "type": "policy"
+}

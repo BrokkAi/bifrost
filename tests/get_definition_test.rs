@@ -1399,6 +1399,89 @@ pub fn format_value() {}
 }
 
 #[test]
+fn rust_imported_turbofish_function_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+mod util;
+use crate::util::leaf;
+
+pub fn run() {
+    leaf::<u8>();
+}
+"#,
+        )
+        .file("util.rs", "pub fn leaf<T>() {}\n")
+        .build();
+
+    let line = "    leaf::<u8>();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":6,"column":{}}}]}}"#,
+            column_of(line, "leaf")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["reference"]["target"], "leaf", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "leaf", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "util.rs", "{value}");
+}
+
+#[test]
+fn rust_generic_method_call_prefers_method_over_same_named_field() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+mod model;
+use crate::model::Worker;
+
+pub fn run(worker: Worker) {
+    worker.make::<u8>();
+}
+"#,
+        )
+        .file(
+            "model.rs",
+            r#"
+pub struct Worker {
+    pub make: usize,
+}
+
+impl Worker {
+    pub fn make<T>(&self) {}
+}
+"#,
+        )
+        .build();
+
+    let line = "    worker.make::<u8>();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":6,"column":{}}}]}}"#,
+            column_of(line, "make")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["reference"]["target"], "worker.make", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().expect("definitions").len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["fqn"], "Worker.make", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "model.rs", "{value}");
+    assert_eq!(result["definitions"][0]["kind"], "function", "{value}");
+}
+
+#[test]
 fn rust_definition_lookup_ignores_other_language_normalized_fqn_collisions() {
     let rust_source = "pub struct Widget;\n\nimpl Widget {\n    pub fn build() -> Self {\n        Self\n    }\n}\n";
     let project = InlineTestProject::new()
@@ -11508,6 +11591,131 @@ fn php_typed_receiver_method_resolves_to_definition() {
 }
 
 #[test]
+fn php_typed_nullsafe_receiver_method_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Service.php",
+            "<?php\nnamespace App;\nclass Service {\n    public function run(): void {}\n}\n",
+        )
+        .file(
+            "src/Controller.php",
+            "<?php\nnamespace App;\nclass Controller {\n    public function handle(Service $service): void {\n        $service?->run();\n    }\n}\n",
+        )
+        .build();
+
+    let line = "        $service?->run();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Controller.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "run")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "App.Service.run",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "src/Service.php",
+        "{value}"
+    );
+}
+
+#[test]
+fn php_nullsafe_property_access_and_chained_call_resolve_to_definitions() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Service.php",
+            "<?php\nnamespace App;\nclass Service {\n    public function run(): void {}\n}\n",
+        )
+        .file(
+            "src/Holder.php",
+            "<?php\nnamespace App;\nclass Holder {\n    public Service $service;\n}\n",
+        )
+        .file(
+            "src/Controller.php",
+            "<?php\nnamespace App;\nclass Controller {\n    public function handle(Holder $holder): void {\n        $holder?->service?->run();\n    }\n}\n",
+        )
+        .build();
+
+    let line = "        $holder?->service?->run();";
+    let property_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Controller.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "service")
+        ),
+    );
+    let property_result = &property_value["results"][0];
+    assert_eq!(property_result["status"], "resolved", "{property_value}");
+    assert_eq!(
+        property_result["definitions"][0]["fqn"], "App.Holder.service",
+        "{property_value}"
+    );
+    assert_eq!(
+        property_result["definitions"][0]["path"], "src/Holder.php",
+        "{property_value}"
+    );
+
+    let method_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Controller.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "run")
+        ),
+    );
+    let method_result = &method_value["results"][0];
+    assert_eq!(method_result["status"], "resolved", "{method_value}");
+    assert_eq!(
+        method_result["definitions"][0]["fqn"], "App.Service.run",
+        "{method_value}"
+    );
+    assert_eq!(
+        method_result["definitions"][0]["path"], "src/Service.php",
+        "{method_value}"
+    );
+}
+
+#[test]
+fn php_nullsafe_method_return_chain_resolves_to_definitions() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Service.php",
+            "<?php\nnamespace App;\nclass Service {\n    public function run(): void {}\n}\n",
+        )
+        .file(
+            "src/Holder.php",
+            "<?php\nnamespace App;\nclass Holder {\n    public function service(): ?Service { return new Service(); }\n}\n",
+        )
+        .file(
+            "src/Controller.php",
+            "<?php\nnamespace App;\nclass Controller {\n    public function handle(Holder $holder): void {\n        $holder?->service()?->run();\n    }\n}\n",
+        )
+        .build();
+
+    let line = "        $holder?->service()?->run();";
+    for (name, expected_fqn, expected_path) in [
+        ("service", "App.Holder.service", "src/Holder.php"),
+        ("run", "App.Service.run", "src/Service.php"),
+    ] {
+        let value = lookup(
+            project.root(),
+            &format!(
+                r#"{{"references":[{{"path":"src/Controller.php","line":5,"column":{}}}]}}"#,
+                column_of(line, name)
+            ),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected_fqn, "{value}");
+        assert_eq!(result["definitions"][0]["path"], expected_path, "{value}");
+    }
+}
+
+#[test]
 fn php_trait_method_resolves_through_using_class() {
     let project = InlineTestProject::with_language(Language::Php)
         .file(
@@ -11800,6 +12008,29 @@ fn php_parent_constructor_resolves_to_nearest_inherited_definition() {
         result["definitions"][0]["fqn"], "App.GrandBase.__construct",
         "{value}"
     );
+}
+
+#[test]
+fn php_late_static_constructor_resolves_to_enclosing_class() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Base.php",
+            "<?php\nnamespace App;\nclass Base {\n    public function __construct() {}\n    public static function create(): Base { return new static(); }\n}\n",
+        )
+        .build();
+
+    let line = "    public static function create(): Base { return new static(); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Base.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "static();")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "App.Base", "{value}");
 }
 
 #[test]
@@ -15301,6 +15532,52 @@ fn cpp_template_type_qualifier_focus_uses_structured_type_names() {
 }
 
 #[test]
+fn cpp_scoped_template_alias_reference_preserves_specialization_arguments() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "choice.h",
+            r#"namespace persist {
+struct Special {};
+struct Shared {};
+template <typename T, typename Tag> class choice {};
+template <typename T> class choice<T, Shared> {};
+template <> class choice<Special, Shared> {};
+template <typename T> using selected = choice<T, Shared>;
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            "#include \"choice.h\"\nusing persist::Special;\npersist::selected<Special> value;\n",
+        )
+        .build();
+    let line = "persist::selected<Special> value;";
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [{
+                "path": "consumer.cc",
+                "line": 3,
+                "column": column_of(line, "selected")
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "the explicit specialization must outrank the partial specialization: {value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["fqn"], "persist.choice<Special, Shared>",
+        "{value}"
+    );
+}
+
+#[test]
 fn cpp_constructor_call_resolves_to_header_constructor_declaration() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -16307,6 +16584,80 @@ fn cpp_relative_namespace_call_resolves_to_definition() {
         result["definitions"][0]["fqn"], "ns::detail.helper",
         "{value}"
     );
+}
+
+#[test]
+fn cpp_flattened_macro_namespace_forward_declaration_activates_qualified_definition() {
+    let base_header = r#"
+#define FMT_API
+FMT_API void vformat_to(int& out, int format, int args, int locale = {});
+}  // namespace detail, flattened after an earlier macro-shaped parse error
+void run() {
+    int out = 0;
+    detail::vformat_to(out, 0, 0, 0);
+}
+#include "format-inl.h"
+"#;
+    let format_inline = r#"
+#define FMT_FUNC
+namespace detail {
+FMT_FUNC void vformat_to(int& out, int format, int args, int locale) {}
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("base.h", base_header)
+        .file("format-inl.h", format_inline)
+        .build();
+
+    let line = "    detail::vformat_to(out, 0, 0, 0);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"base.h","line":7,"column":{}}}]}}"#,
+            column_of(line, "vformat_to")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "detail.vformat_to",
+        "{value}"
+    );
+    assert!(
+        result["definitions"]
+            .as_array()
+            .is_some_and(|definitions| definitions
+                .iter()
+                .any(|definition| definition["path"] == "format-inl.h")),
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_global_macro_forward_declaration_does_not_activate_later_namespace_definition() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            r#"
+#define API
+API void helper(int value);
+void run() { detail::helper(1); }
+namespace detail { void helper(int value) {} }
+"#,
+        )
+        .build();
+
+    let line = "void run() { detail::helper(1); }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":4,"column":{}}}]}}"#,
+            column_of(line, "helper")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
 }
 
 #[test]
@@ -18200,6 +18551,361 @@ fn scala_postfix_operator_method_resolves_to_definition() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "app.Box.!", "{value}");
+}
+
+#[test]
+fn scala_generic_and_curried_member_calls_resolve_to_definitions() {
+    let source = r#"
+package app
+
+class Service {
+  def generic[A](value: Int): Int = value
+  def curried(value: Int)(label: String): Int = value
+}
+
+object Controller {
+  def run(service: Service): Int =
+    service.generic[String](1) + service.curried(2)("two")
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Calls.scala", source)
+        .build();
+
+    for (needle, expected) in [
+        ("generic[String]", "app.Service.generic"),
+        ("curried(2)", "app.Service.curried"),
+    ] {
+        let start = source.find(needle).expect("Scala call");
+        let value = lookup(
+            project.root(),
+            &location_reference("app/Calls.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn scala_unapplied_generic_function_resolves_to_definition() {
+    let source = r#"
+package app
+
+object GenericRefs {
+  def generic[A](value: A): A = value
+  val reference = generic[Int]
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/GenericRefs.scala", source)
+        .build();
+    let start = source.rfind("generic[Int]").expect("generic reference");
+    let value = lookup(
+        project.root(),
+        &location_reference("app/GenericRefs.scala", source, start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.GenericRefs$.generic",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_wrapped_type_references_resolve_structured_targets() {
+    let source = r#"
+package app
+
+class Target
+class Parent(value: Int)
+class Child extends Parent(1)
+class Outer { class Inner }
+class Uses {
+  val annotated: Target @unchecked = ???
+  val projected: Outer#Inner = ???
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/WrappedTypes.scala", source)
+        .build();
+
+    for (start, expected) in [
+        (
+            source.find("Target @unchecked").expect("annotated type"),
+            "app.Target",
+        ),
+        (
+            source.find("Parent(1)").expect("applied constructor type"),
+            "app.Parent",
+        ),
+        (
+            source.find("Outer#Inner").expect("projected type") + "Outer#".len(),
+            "app.Outer.Inner",
+        ),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference("app/WrappedTypes.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn scala_trailing_block_argument_forms_have_one_top_level_argument() {
+    let source = r#"
+package app
+
+class Service {
+  def braced(value: => Int): Int = value
+  def partial(value: PartialFunction[Int, Int]): Int = 1
+  def colon(value: => Int): Int = value
+  def first(): Int = 1
+  def second(): Int = 2
+
+  def run(): Int = {
+    val a = braced { first(); second() }
+    val b = partial { case 0 => 0; case other => other }
+    val c = colon:
+      first()
+      second()
+    a + b + c
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/BlockArguments.scala", source)
+        .build();
+
+    for (needle, expected) in [
+        ("braced {", "app.Service.braced"),
+        ("partial {", "app.Service.partial"),
+        ("colon:", "app.Service.colon"),
+    ] {
+        let start = source.rfind(needle).expect("block argument call");
+        let value = lookup(
+            project.root(),
+            &location_reference("app/BlockArguments.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn scala_direct_application_chain_rejects_more_lists_than_the_declaration() {
+    let source = r#"
+package app
+
+class Service {
+  def single(value: Int): Int = value
+}
+
+object Controller {
+  def run(service: Service): Int = service.single(1)("extra")
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Calls.scala", source)
+        .build();
+    let start = source.find("single(1)").expect("Scala call");
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Calls.scala", source, start),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn scala_generic_and_curried_new_calls_resolve_to_primary_constructors() {
+    let source = r#"
+package app
+
+class Box[A](value: Int)
+class Curried(value: Int)(label: String)
+
+object Controller {
+  val box = new Box[String](1)
+  val curried = new Curried(2)("two")
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Constructors.scala", source)
+        .build();
+
+    for (needle, expected) in [
+        ("Box[String]", "app.Box.Box"),
+        ("Curried(2)", "app.Curried.Curried"),
+    ] {
+        let start = source.find(needle).expect("Scala constructor");
+        let value = lookup(
+            project.root(),
+            &location_reference("app/Constructors.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn scala_constructor_application_chain_rejects_extra_argument_lists() {
+    let source = r#"
+package app
+
+class Single(value: Int)
+
+object Controller {
+  val invalid = new Single(1)("extra")
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/InvalidConstructor.scala", source)
+        .build();
+    let start = source.find("Single(1)").expect("Scala constructor call");
+    let value = lookup(
+        project.root(),
+        &location_reference("app/InvalidConstructor.scala", source, start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "scala_constructor_arity_mismatch",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_parameterless_primary_and_secondary_constructors_share_valid_shapes() {
+    let source = r#"
+package app
+
+class Multi {
+  def this(value: Int) = this()
+}
+
+object Controller {
+  val zero = new Multi
+  val one = new Multi(1)
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/ConstructorAlternatives.scala", source)
+        .build();
+
+    for needle in ["new Multi\n", "new Multi(1)"] {
+        let start = source.find(needle).expect("constructor call") + "new ".len();
+        let value = lookup(
+            project.root(),
+            &location_reference("app/ConstructorAlternatives.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], "app.Multi.Multi",
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn scala_infix_dispatch_uses_left_receiver_for_ordinary_operators() {
+    let source = r#"
+package app
+
+class Right
+class Left {
+  def combine(right: Right): Int = 1
+}
+
+object Controller {
+  def run(left: Left, right: Right): Int = left combine right
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Infix.scala", source)
+        .build();
+    let start = source.rfind("combine").expect("infix call");
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Infix.scala", source, start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Left.combine",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_colon_infix_dispatch_uses_the_right_receiver() {
+    let source = r#"
+package app
+
+class Head {
+  def ::(tail: Tail): Int = 1
+}
+class Tail {
+  def ::(head: Head): Int = 2
+}
+
+object Controller {
+  def run(head: Head, tail: Tail): Int = head :: tail
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Colon.scala", source)
+        .build();
+    let start = source.rfind("::").expect("right-associative infix call");
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Colon.scala", source, start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Tail.::", "{value}");
+}
+
+#[test]
+fn scala_compound_infix_dispatch_fails_closed_without_precedence_reconstruction() {
+    let source = r#"
+package app
+
+class A { def +(right: B): A = this }
+class B { def *(right: C): B = this }
+class C
+
+object Controller {
+  def run(a: A, b: B, c: C) = a + b * c
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Compound.scala", source)
+        .build();
+    let start = source.rfind('*').expect("compound infix call");
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Compound.scala", source, start),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert!(
+        value["results"][0]["diagnostics"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("precedence-aware receiver reconstruction")),
+        "{value}"
+    );
 }
 
 #[test]

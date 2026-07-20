@@ -6,6 +6,7 @@ mod dependency_discovery;
 pub mod external;
 mod hierarchy;
 mod imports;
+mod semantic;
 pub(crate) mod structural;
 mod tests;
 
