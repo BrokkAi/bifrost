@@ -1714,22 +1714,6 @@ pub(super) fn usage_class_field_receiver_type(
     }
 }
 
-pub(super) fn expression_resolves_to_type(
-    expression: Node<'_>,
-    owner: &CodeUnit,
-    csharp: &CSharpAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    bindings: &LocalInferenceEngine<String>,
-) -> SymbolResolution<String> {
-    match expression_type_fq_name(expression, csharp, file, source, bindings) {
-        Some(fq_name) if fq_name == owner.fq_name() => {
-            SymbolResolution::Precise(std::iter::once(fq_name).collect())
-        }
-        _ => SymbolResolution::Unknown,
-    }
-}
-
 /// Whether an unqualified `member_name` is bound by a local (parameter or local
 /// variable) of the same name in scope — in which case it is provably *not* the
 /// field, so the occurrence should be skipped rather than treated as an ambiguous
