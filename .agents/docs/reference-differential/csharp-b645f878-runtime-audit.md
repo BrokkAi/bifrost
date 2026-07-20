@@ -17,7 +17,19 @@ Both artifacts report clean Bifrost and repository trees, completed records, the
 
 This document preserves the `b645f878` baseline diagnosis below. At clean fixing head `204061c6`, issues #945, #231, #737, #423, #726, and #946 are exact-proved and closed. The three rows originally assigned to #946 became exact consistent hits after the #423/#726 visibility-tier repair, so the baseline overload-return hypothesis was not their production root cause and no type-shape metadata refactor was made.
 
-#701 is the sole known open C# issue from this audit. Its 24 runtime rows are the alias RHS, nested/static owner, and structured type-role families. Current exact profiling separates two defects: missing structured AST roots for aliases, intermediate type receivers, and patterns; and an arity-unsafe normalized inverse fallback that combines nongeneric `ICollection` with `ICollection<T>` in already-recognized ordinary parameter and explicit-interface roles. Runtime exact artifacts are `csharp-runtime-{alias-rhs,nested-qualifier,pattern-type,interface-parameter}-fadbaa91.jsonl`; Mono recurrences are `csharp-mono-{alias-rhs,is-type,explicit-interface}-fadbaa91.jsonl`, all under `/mnt/optane/tmp/reference-differential/` and all clean one-site missing records with zero file errors.
+#701 was the sole remaining C# issue from this audit and is now closed. Its 24 runtime rows reduce to missing structured AST roots for aliases, intermediate type receivers, and patterns; an arity-unsafe normalized inverse fallback; relative dotted-name visibility; and the distinct tree-sitter `is_expression.right` type role. Commits `e1a55cb3`, `379f0819`, and `530fb3d1` fix those layers with shared structured roots, arity-preserving lookup, namespace-tier resolution, and exact field-role recognition. The original `fadbaa91` artifacts remain diagnostic missing records.
+
+Final release-binary proof uses clean Bifrost head `530fb3d1411ccb9dca9e6e6b4b73ddfaf325df6b` and runner SHA-256 `1a3fa81fdaf482891e38acf42e654f4cf32da989149389f67e5d174f28b1a707`. Each record samples the requested site exactly, resolves one forward target, queries it inversely, classifies the site consistent, and reports zero missing, unproven, or file-error rows:
+
+- Runtime alias RHS: `csharp-701-runtime-alias-530fb3d1.jsonl`, SHA-256 `c244ec4cdabbfdfdaa2aee4ce0261cd794f997dda63950d9e661733238684b3e`.
+- Runtime ordinary interface parameter: `csharp-701-runtime-icollection-530fb3d1.jsonl`, SHA-256 `1f0881df327603cb027c69b1d08c42db3d06c65993aec559296a3ff760449914`.
+- Runtime relative nested owner: `csharp-701-runtime-nested-530fb3d1.jsonl`, SHA-256 `2821abdaf3339e2edef0f9585d2b034a55b973bd7622f21a668e7366d2f55d20`.
+- Runtime simple type test: `csharp-701-runtime-pattern-530fb3d1.jsonl`, SHA-256 `1545267cae8cb5e3c9af860f5fc59fa784ef6bc81473e2c6c9dec2b953d5406e`.
+- Mono alias RHS: `csharp-701-mono-alias-530fb3d1.jsonl`, SHA-256 `dea4950ebb99dc291aebbe0280e5a6e0ceeadd50fb0aaa142a52aa1ae6cadcfc`.
+- Mono explicit interface: `csharp-701-mono-explicit-interface-530fb3d1.jsonl`, SHA-256 `3db776df14a3eeb1e48e584df316b4211195fd942ec6aa25e240a1f35b4669aa`.
+- Mono simple `is` type: `csharp-701-mono-is-type-530fb3d1.jsonl`, SHA-256 `da0fc7bd6c86cfb79e45d872c431da0d8f5c3ed2eafb54086c7d7988aea6369d`.
+
+All raw artifacts are under `/mnt/optane/tmp/reference-differential/`. The runtime pattern artifact contains two independently clean identical records because a session presumed interrupted continued outside the sandbox process namespace while its replacement ran. The append-only artifact is preserved as produced; both records pin runtime `a0311b3485a8df84608d9aab82aa98e097c21948` and satisfy the same acceptance checks.
 
 ## Exhaustive disposition
 
