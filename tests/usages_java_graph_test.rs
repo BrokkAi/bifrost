@@ -2825,13 +2825,25 @@ public class ParserException {
 
 #[test]
 fn java_graph_strategy_keeps_nested_constructor_usage_narrow() {
-    let (_project, analyzer) = java_analyzer_with_files(&[
+    let service_test_source = r#"
+package com.example;
+
+public class ServiceTest {
+    public void runsService() {
+        Service.Repository repository = new Service.Repository();
+        Service service = new Service(repository);
+        String prefix = Service.DEFAULT_PREFIX;
+    }
+}
+"#;
+    let (project, analyzer) = java_analyzer_with_files(&[
         (
             "com/example/Service.java",
             r#"
 package com.example;
 
 public class Service {
+    public static final String DEFAULT_PREFIX = "service";
     public Service(Repository repository) {}
 
     public static class Repository {
@@ -2840,24 +2852,67 @@ public class Service {
 }
 "#,
         ),
-        (
-            "com/example/ServiceTest.java",
-            r#"
-package com.example;
-
-public class ServiceTest {
-    public void runsService() {
-        Service.Repository repository = new Service.Repository();
-        Service service = new Service(repository);
-    }
-}
-"#,
-        ),
+        ("com/example/ServiceTest.java", service_test_source),
     ]);
 
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let service_test_file = project.file("com/example/ServiceTest.java");
+    let service_type = definition(&analyzer, "com.example.Service");
+    let repository_type = definition(&analyzer, "com.example.Service.Repository");
     let service_constructor = definition(&analyzer, "com.example.Service.Service");
     let repository_constructor = definition(&analyzer, "com.example.Service.Repository.Repository");
+
+    let outer_qualifier_line = line_of(service_test_source, "Service.Repository repository");
+    let service_type_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&service_type),
+        &candidates,
+        1000,
+    ));
+    let service_qualifier_hits: Vec<_> = service_type_hits
+        .iter()
+        .filter(|hit| hit.file == service_test_file && hit.line == outer_qualifier_line)
+        .collect();
+    assert_eq!(
+        2,
+        service_qualifier_hits.len(),
+        "both outer Service qualifiers should be distinct usages: {service_type_hits:#?}"
+    );
+    for hit in service_qualifier_hits {
+        assert_eq!(
+            "Service",
+            &service_test_source[hit.start_offset..hit.end_offset],
+            "outer qualifier hit must retain its exact token range"
+        );
+    }
+    assert_hit_contains(
+        &service_type_hits,
+        "Service service = new Service(repository)",
+    );
+    assert_hit_contains(&service_type_hits, "Service.DEFAULT_PREFIX");
+
+    let repository_type_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&repository_type),
+        &candidates,
+        1000,
+    ));
+    let repository_qualifier_hits: Vec<_> = repository_type_hits
+        .iter()
+        .filter(|hit| hit.file == service_test_file && hit.line == outer_qualifier_line)
+        .collect();
+    assert_eq!(
+        2,
+        repository_qualifier_hits.len(),
+        "nested type should retain only its Repository leaf tokens: {repository_type_hits:#?}"
+    );
+    for hit in repository_qualifier_hits {
+        assert_eq!(
+            "Repository",
+            &service_test_source[hit.start_offset..hit.end_offset],
+            "nested type hit must retain its exact leaf range"
+        );
+    }
 
     let service_hits: Vec<_> = JavaUsageGraphStrategy::new()
         .find_usages(
@@ -2895,6 +2950,230 @@ public class ServiceTest {
         "repository constructor should be found"
     );
     assert_hit_line(&repository_hits, 6);
+}
+
+#[test]
+fn java_graph_strategy_resolves_each_scoped_type_segment_by_identity() {
+    let consumer_source = r#"
+package consumer;
+
+import app.Service;
+import java.util.List;
+
+public class Consumer {
+    Service.Repository imported;
+    app.Service.Repository qualified;
+    List<Service.Repository> generic;
+    Service.Missing.Repository malformed;
+    other.Service.Repository unrelated;
+}
+"#;
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "app/Service.java",
+            r#"
+package app;
+
+public class Service {
+    public static class Repository {}
+}
+"#,
+        ),
+        (
+            "other/Service.java",
+            r#"
+package other;
+
+public class Service {
+    public static class Repository {}
+}
+"#,
+        ),
+        ("consumer/Consumer.java", consumer_source),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let service = definition(&analyzer, "app.Service");
+    let repository = definition(&analyzer, "app.Service.Repository");
+    let service_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&service),
+        &candidates,
+        1000,
+    ));
+
+    for marker in [
+        "Service.Repository imported",
+        "app.Service.Repository qualified",
+        "List<Service.Repository> generic",
+    ] {
+        let line = line_of(consumer_source, marker);
+        let line_hits: Vec<_> = service_hits.iter().filter(|hit| hit.line == line).collect();
+        assert_eq!(
+            1,
+            line_hits.len(),
+            "expected one app.Service qualifier hit for {marker:?}: {service_hits:#?}"
+        );
+        assert_eq!(
+            "Service",
+            &consumer_source[line_hits[0].start_offset..line_hits[0].end_offset],
+            "outer type hit must retain its exact token range"
+        );
+    }
+    assert_no_hit_line(
+        &service_hits,
+        line_of(consumer_source, "other.Service.Repository unrelated"),
+    );
+
+    let repository_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&repository),
+        &candidates,
+        1000,
+    ));
+    for marker in [
+        "Service.Repository imported",
+        "app.Service.Repository qualified",
+        "List<Service.Repository> generic",
+    ] {
+        let line = line_of(consumer_source, marker);
+        let line_hits: Vec<_> = repository_hits
+            .iter()
+            .filter(|hit| hit.line == line)
+            .collect();
+        assert_eq!(
+            1,
+            line_hits.len(),
+            "expected one app.Service.Repository leaf hit for {marker:?}: {repository_hits:#?}"
+        );
+        assert_eq!(
+            "Repository",
+            &consumer_source[line_hits[0].start_offset..line_hits[0].end_offset],
+            "nested type hit must retain its exact token range"
+        );
+    }
+    assert_no_hit_line(
+        &repository_hits,
+        line_of(consumer_source, "other.Service.Repository unrelated"),
+    );
+    assert_no_hit_line(
+        &repository_hits,
+        line_of(consumer_source, "Service.Missing.Repository malformed"),
+    );
+}
+
+#[test]
+fn java_usage_graph_persists_outer_and_nested_scoped_type_edges() {
+    let (project, _analyzer) = java_analyzer_with_files(&[
+        (
+            "app/Service.java",
+            r#"
+package app;
+
+public class Service {
+    public static class Repository {}
+}
+"#,
+        ),
+        (
+            "consumer/Consumer.java",
+            r#"
+package consumer;
+
+import app.Service;
+
+public class Consumer {
+    void use() {
+        Service.Repository repository = new Service.Repository();
+    }
+}
+"#,
+        ),
+        (
+            "local/Outer.java",
+            r#"
+package local;
+
+public class Outer {
+    static class Service {
+        static class Repository {}
+    }
+
+    void use() {
+        Service.Repository repository = new Service.Repository();
+    }
+}
+"#,
+        ),
+        (
+            "app/Marker.java",
+            r#"
+package app;
+
+public class Marker {
+    public @interface Nested {}
+}
+"#,
+        ),
+        (
+            "consumer/Annotated.java",
+            r#"
+package consumer;
+
+import app.Marker;
+
+@Marker.Nested
+public class Annotated {}
+"#,
+        ),
+    ]);
+
+    let graph = call_search_tool_json(project.root(), "usage_graph", "{}");
+    let has_edge = |to: &str| {
+        graph["edges"].as_array().is_some_and(|edges| {
+            edges
+                .iter()
+                .any(|edge| edge["from"] == "consumer.Consumer.use" && edge["to"] == to)
+        })
+    };
+    assert!(
+        has_edge("app.Service"),
+        "persisted graph should retain the outer Service reference: {graph}"
+    );
+    assert!(
+        has_edge("app.Service.Repository"),
+        "persisted graph should retain the nested Repository reference: {graph}"
+    );
+    let has_local_edge = |to: &str| {
+        graph["edges"].as_array().is_some_and(|edges| {
+            edges
+                .iter()
+                .any(|edge| edge["from"] == "local.Outer.use" && edge["to"] == to)
+        })
+    };
+    assert!(
+        has_local_edge("local.Outer.Service"),
+        "persisted graph should retain the lexically resolved outer Service reference: {graph}"
+    );
+    assert!(
+        has_local_edge("local.Outer.Service.Repository"),
+        "persisted graph should retain the lexically resolved nested Repository reference: {graph}"
+    );
+    let has_annotation_edge = |to: &str| {
+        graph["edges"].as_array().is_some_and(|edges| {
+            edges
+                .iter()
+                .any(|edge| edge["from"] == "consumer.Annotated" && edge["to"] == to)
+        })
+    };
+    assert!(
+        has_annotation_edge("app.Marker"),
+        "persisted graph should retain the outer annotation type reference: {graph}"
+    );
+    assert!(
+        has_annotation_edge("app.Marker.Nested"),
+        "persisted graph should retain the nested annotation type reference: {graph}"
+    );
 }
 
 #[test]

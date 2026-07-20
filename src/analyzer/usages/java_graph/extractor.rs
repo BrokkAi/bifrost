@@ -5,8 +5,9 @@ use crate::analyzer::usages::java_graph::hits;
 use crate::analyzer::usages::java_graph::resolver::{
     TargetKind, TargetSpec, argument_list_arity, bare_field_context_matches_target,
     bare_method_context_matches_target, has_proven_static_import, infer_type_from_value,
-    is_declaration_name, is_ignored_type_context, java_method_signatures_match, node_text,
-    receiver_matches_target, resolve_type_from_node, same_owner_context, seed_class_binding,
+    is_declaration_name, is_ignored_type_context, java_method_signatures_match,
+    nested_type_for_owner, node_text, receiver_matches_target, resolve_non_nested_type_from_node,
+    resolve_type_from_node, resolve_type_segments, same_owner_context, seed_class_binding,
 };
 use crate::analyzer::usages::java_graph::return_type::{FileReturnCache, MethodReturnCache};
 use crate::analyzer::usages::local_inference::{
@@ -280,30 +281,29 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(type_node) = type_reference_node(node) else {
         return;
     };
-    if type_node
-        .parent()
-        .is_some_and(|parent| parent.kind() == "scoped_type_identifier")
-    {
+    // A scoped parent records each of its semantic type segments with exact
+    // token ranges, so visiting a child separately would only duplicate it.
+    if type_node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "scoped_type_identifier" | "scoped_identifier"
+        )
+    }) {
         return;
     }
     if is_ignored_type_context(type_node) {
         return;
     }
-    if !type_terminal_name_matches(type_node, ctx) {
-        return;
+    for (resolved, segment) in resolve_type_segments(
+        type_node,
+        ctx.source,
+        |candidate| resolve_non_nested_type_from_node(candidate, ctx),
+        |owner, name| nested_type_for_owner(owner, name, ctx),
+    ) {
+        if resolved.fq_name() == ctx.spec.owner.fq_name() {
+            hits::push_hit(segment, ctx);
+        }
     }
-    let Some(resolved) = resolve_type_from_node(type_node, ctx) else {
-        return;
-    };
-    if resolved.fq_name() != ctx.spec.owner.fq_name() {
-        return;
-    }
-    let hit_node = if matches!(node.kind(), "annotation" | "marker_annotation") {
-        expression_name_node(type_node).unwrap_or(type_node)
-    } else {
-        type_node
-    };
-    hits::push_hit(hit_node, ctx);
 }
 
 fn maybe_record_static_qualifier_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {

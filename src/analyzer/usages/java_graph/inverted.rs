@@ -18,11 +18,13 @@
 //! a wrong edge. Method-invocation receivers are typed from the callee's declared
 //! return type, matching the same inference used when seeding locals.
 
-use super::resolver::{is_ignored_type_context, node_text};
+use super::resolver::{
+    is_ignored_type_context, node_text, resolve_nested_type_for_owner, resolve_type_segments,
+};
 use super::return_type::{
-    FileReturnCache, JavaReturnTypeContext, METHOD_RECEIVER_CHAIN_LIMIT,
-    METHOD_RECEIVER_CHAIN_LIMIT_NAME, MethodReturnCache, java_type_name_from_node,
-    merge_receiver_type_outcomes, method_return_type_for_owner_fqn,
+    FileReturnCache, JavaReturnTypeContext, LexicalTypeResolution, METHOD_RECEIVER_CHAIN_LIMIT,
+    METHOD_RECEIVER_CHAIN_LIMIT_NAME, MethodReturnCache, java_lexical_type_from_node,
+    java_type_name_from_node, merge_receiver_type_outcomes, method_return_type_for_owner_fqn,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
@@ -33,7 +35,7 @@ use crate::analyzer::usages::inverted_edges::{
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
-use crate::analyzer::{IAnalyzer, JavaAnalyzer, ProjectFile};
+use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::sync::Mutex;
 use tree_sitter::Node;
@@ -69,6 +71,7 @@ where
             |parsed, collector| {
                 let mut ctx = JavaScan {
                     java,
+                    analyzer,
                     file,
                     source: parsed.source.as_str(),
                     root: parsed.tree.root_node(),
@@ -86,6 +89,7 @@ where
 
 struct JavaScan<'a, 'b> {
     java: &'a JavaAnalyzer,
+    analyzer: &'a dyn IAnalyzer,
     file: &'a ProjectFile,
     source: &'a str,
     root: Node<'a>,
@@ -98,10 +102,21 @@ struct JavaScan<'a, 'b> {
 impl JavaScan<'_, '_> {
     /// Resolve the nominal identity carried by a structured type node to its fqn.
     fn resolve_type_fqn(&self, node: Node<'_>) -> Option<String> {
+        self.resolve_type(node).map(|unit| unit.fq_name())
+    }
+
+    fn resolve_type(&self, node: Node<'_>) -> Option<CodeUnit> {
+        match java_lexical_type_from_node(self.java, self.analyzer, self.file, self.source, node) {
+            LexicalTypeResolution::Resolved(unit) => return Some(unit),
+            LexicalTypeResolution::Blocked => return None,
+            LexicalTypeResolution::NotFound => {}
+        }
         let type_name = java_type_name_from_node(node, self.source)?;
-        self.java
-            .resolve_usage_type_name(self.file, &type_name)
-            .map(|unit| unit.fq_name())
+        self.java.resolve_usage_type_name(self.file, &type_name)
+    }
+
+    fn resolve_nested_type(&self, owner: &CodeUnit, name: &str) -> Option<CodeUnit> {
+        resolve_nested_type_for_owner(self.analyzer, owner, name)
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
@@ -196,17 +211,25 @@ fn record_reference(
 ) {
     match node.kind() {
         // `new Foo()` and generics resolve via the type_identifier children, so
-        // only the leaf type nodes are handled here (avoids double counting).
-        "type_identifier" | "scoped_type_identifier" => {
-            if node
-                .parent()
-                .is_some_and(|parent| parent.kind() == "scoped_type_identifier")
-                || is_ignored_type_context(node)
+        // a scoped parent handles all of its semantic type segments (avoids
+        // double counting while retaining outer-owner references).
+        "type_identifier" | "scoped_identifier" | "scoped_type_identifier" => {
+            if node.parent().is_some_and(|parent| {
+                matches!(
+                    parent.kind(),
+                    "scoped_type_identifier" | "scoped_identifier"
+                )
+            }) || is_ignored_type_context(node)
             {
                 return;
             }
-            if let Some(fqn) = ctx.resolve_type_fqn(node) {
-                ctx.record(fqn, node);
+            for (resolved, segment) in resolve_type_segments(
+                node,
+                ctx.source,
+                |candidate| ctx.resolve_type(candidate),
+                |owner, name| ctx.resolve_nested_type(owner, name),
+            ) {
+                ctx.record(resolved.fq_name(), segment);
             }
         }
         "method_invocation" => {

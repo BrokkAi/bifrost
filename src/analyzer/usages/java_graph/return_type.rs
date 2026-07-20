@@ -250,7 +250,7 @@ fn java_type_name_components(type_node: Node<'_>, source: &str) -> Option<Vec<St
     (!components.is_empty()).then_some(components)
 }
 
-fn is_java_nominal_type_node(kind: &str) -> bool {
+pub(super) fn is_java_nominal_type_node(kind: &str) -> bool {
     matches!(
         kind,
         "identifier"
