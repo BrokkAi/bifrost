@@ -420,7 +420,7 @@ fn run_inner(
         return Err("--repl cannot be combined with --mcp or --lsp".to_string());
     }
 
-    if !root_explicit {
+    if !root_explicit && mcp_mode.is_none() {
         eprintln!(
             "bifrost: no --root supplied, using current directory: {}",
             escape_terminal_text(root.to_string_lossy().as_ref())
@@ -436,9 +436,22 @@ fn run_inner(
     }
 
     let mode = mcp_mode.as_deref().unwrap_or("searchtools");
-    let git_repo = brokk_bifrost::mcp_registry::workspace_is_git(&root);
+    // The no-argument compatibility mode still analyzes cwd. An explicit MCP
+    // launch without a root starts unbound so package-local command cwd never
+    // becomes analyzer scope.
+    let initial_root = if root_explicit || mcp_mode.is_none() {
+        Some(root)
+    } else {
+        None
+    };
+    // A rootless MCP server does not know whether the client-selected root will
+    // be a Git repository yet. Advertise the potential NLP surface up front;
+    // runtime availability is checked after roots negotiation.
+    let git_repo = initial_root
+        .as_deref()
+        .is_none_or(brokk_bifrost::mcp_registry::workspace_is_git);
     let spec = resolve_server_spec_for_render_options(mode, render_options, git_repo)?;
-    run_stdio_server(root, render_options, &spec).map(|()| CliRunResult::Complete)
+    run_stdio_server(initial_root, render_options, &spec).map(|()| CliRunResult::Complete)
 }
 
 fn parse_policy_format(value: &str) -> Result<PolicyOutputFormat, String> {

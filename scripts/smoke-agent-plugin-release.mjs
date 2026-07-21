@@ -5,6 +5,7 @@ import { spawn, execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -26,8 +27,8 @@ const launcherEnv = {
 };
 
 await prepare(launcher, pluginDir, launcherEnv);
-await assertMcpTools(launcher, workspace, launcherEnv);
-console.log("Packaged agent plugin prepared and advertised search_symbols over MCP.");
+await assertMcpWorkspaceBinding(launcher, pluginDir, workspace, launcherEnv);
+console.log("Packaged agent plugin prepared, accepted the client workspace root, and searched it over MCP.");
 
 function parseArgs(args) {
   const options = {};
@@ -90,9 +91,9 @@ async function prepare(launcherPath, cwd, env) {
   assert.match(status.binaryPath ?? "", /bifrost(?:\.exe)?$/);
 }
 
-async function assertMcpTools(launcherPath, cwd, env) {
-  const child = spawn(process.execPath, [launcherPath, "--root", cwd, "--mcp", "symbol|extended"], {
-    cwd,
+async function assertMcpWorkspaceBinding(launcherPath, pluginCwd, workspaceRoot, env) {
+  const child = spawn(process.execPath, [launcherPath, "--mcp", "symbol|extended"], {
+    cwd: pluginCwd,
     env,
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -109,12 +110,21 @@ async function assertMcpTools(launcherPath, cwd, env) {
       method: "initialize",
       params: {
         protocolVersion: "2025-11-25",
-        capabilities: {},
+        capabilities: { roots: { listChanged: true } },
         clientInfo: { name: "bifrost-release-smoke", version: "1" },
       },
     });
     assert.ok(initialize.result, "MCP initialize did not return a result");
+    const rootsRequestPromise = waitForMethod(child, reader, "roots/list");
     writeMessage(child, { jsonrpc: "2.0", method: "notifications/initialized" });
+    const rootsRequest = await rootsRequestPromise;
+    writeMessage(child, {
+      jsonrpc: "2.0",
+      id: rootsRequest.id,
+      result: {
+        roots: [{ uri: pathToFileURL(workspaceRoot).href, name: "release-smoke-workspace" }],
+      },
+    });
     const toolList = await roundTrip(child, reader, {
       jsonrpc: "2.0",
       id: 2,
@@ -123,6 +133,22 @@ async function assertMcpTools(launcherPath, cwd, env) {
     const tools = toolList.result?.tools;
     assert.ok(Array.isArray(tools), "MCP tools/list did not return a tools array");
     assert.ok(tools.some((tool) => tool.name === "search_symbols"), "MCP tools/list did not advertise search_symbols");
+    const search = await roundTrip(child, reader, {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: {
+        name: "search_symbols",
+        arguments: { patterns: ["SearchToolsService"] },
+      },
+    });
+    assert.equal(search.result?.isError, false, `MCP search_symbols returned an error: ${JSON.stringify(search)}`);
+    assert.match(JSON.stringify(search.result), /SearchToolsService/);
+    await assert.rejects(
+      fs.access(path.join(pluginCwd, ".brokk", "bifrost_cache.db")),
+      { code: "ENOENT" },
+      "Packaged MCP launch wrote analyzer storage under the plugin directory"
+    );
   } finally {
     reader.close();
     await stop(child);
@@ -131,6 +157,41 @@ async function assertMcpTools(launcherPath, cwd, env) {
   if (child.exitCode && child.exitCode !== 0) {
     throw new Error(`Packaged MCP launcher exited with ${child.exitCode}: ${stderr.join("")}`);
   }
+}
+
+function waitForMethod(child, reader, method) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timed out waiting for MCP server request ${method}`));
+    }, 90_000);
+    const onLine = (line) => {
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch (error) {
+        cleanup();
+        reject(new Error(`MCP emitted non-JSON stdout: ${error.message}`));
+        return;
+      }
+      if (message.method !== method) {
+        return;
+      }
+      cleanup();
+      resolve(message);
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    const cleanup = () => {
+      clearTimeout(timeout);
+      reader.off("line", onLine);
+      child.off("error", onError);
+    };
+    reader.on("line", onLine);
+    child.on("error", onError);
+  });
 }
 
 function waitForSpawn(child) {

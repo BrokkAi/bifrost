@@ -106,9 +106,22 @@ export function looksUnexpandedHostPlaceholder(value) {
   return /\$\{[^}]+}|\{\{[^}]+}}|%[A-Za-z_][A-Za-z0-9_]*%/.test(value);
 }
 
-export async function resolveWorkspaceRoot({ env = process.env, argvRoot = null, cwd = process.cwd(), fsImpl = fs } = {}) {
-  const raw = firstUsableRootCandidate(env.BIFROST_WORKSPACE_ROOT, argvRoot, cwd);
+export async function resolveWorkspaceRoot({
+  env = process.env,
+  argvRoot = null,
+  cwd = process.cwd(),
+  allowCwdFallback = true,
+  fsImpl = fs
+} = {}) {
+  const raw = firstUsableRootCandidate(
+    env.BIFROST_WORKSPACE_ROOT,
+    argvRoot,
+    allowCwdFallback ? cwd : null
+  );
   if (!raw) {
+    if (!allowCwdFallback) {
+      return null;
+    }
     throw new LauncherError(
       "missing_workspace_root",
       "Bifrost workspace root is missing. Set BIFROST_WORKSPACE_ROOT or start the host from a workspace directory."
@@ -728,7 +741,8 @@ function archiveRootName(archiveName) {
 }
 
 export function buildBifrostArgs(root, toolset, passThrough = []) {
-  return ["--root", root, "--mcp", toolset || DEFAULT_TOOLSET, ...passThrough];
+  const rootArgs = root ? ["--root", root] : [];
+  return [...rootArgs, "--mcp", toolset || DEFAULT_TOOLSET, ...passThrough];
 }
 
 export function spawnBifrost(binaryPath, args, options = {}) {
@@ -800,12 +814,13 @@ async function main() {
     const root = await resolveWorkspaceRoot({
       env: process.env,
       argvRoot: parsed.root,
-      cwd: process.cwd()
+      cwd: process.cwd(),
+      allowCwdFallback: false
     });
     const binary = await resolveBifrostBinary(installProgressHandlers());
     const args = buildBifrostArgs(root, parsed.toolset, parsed.passThrough);
     spawnBifrost(binary.path, args, {
-      cwd: root,
+      cwd: root ?? process.cwd(),
       env: process.env
     });
   } catch (error) {

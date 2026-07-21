@@ -143,7 +143,7 @@ fn production_watcher_starter() -> WatcherStarter {
 }
 
 pub struct SearchToolsService {
-    root: RwLock<PathBuf>,
+    root: RwLock<Option<PathBuf>>,
     session: RwLock<Option<WorkspaceSession>>,
     /// When constructed via `new_deferred`, the initial workspace build (file
     /// discovery + parse) runs on a background thread and lands here.
@@ -316,8 +316,9 @@ fn semantic_indexing_enabled() -> bool {
 fn maybe_start_semantic(
     enabled: bool,
     snapshot: &Arc<WorkspaceAnalyzer>,
+    cache_db_path: Option<&Path>,
 ) -> Option<Arc<SemanticIndexer>> {
-    maybe_start_semantic_checked(enabled, snapshot, semantic_accelerator_ready)
+    maybe_start_semantic_checked(enabled, snapshot, cache_db_path, semantic_accelerator_ready)
 }
 
 /// Ok when the voyage-4-nano embedder can run: a CUDA/Metal accelerator is
@@ -340,6 +341,7 @@ fn semantic_accelerator_ready() -> Result<(), String> {
 fn maybe_start_semantic_checked(
     enabled: bool,
     snapshot: &Arc<WorkspaceAnalyzer>,
+    cache_db_path: Option<&Path>,
     accelerator_ready: impl FnOnce() -> Result<(), String>,
 ) -> Option<Arc<SemanticIndexer>> {
     if !enabled {
@@ -354,7 +356,10 @@ fn maybe_start_semantic_checked(
         eprintln!("bifrost semantic index disabled: semantic search requires a git repository");
         return None;
     }
-    Some(SemanticIndexer::start(root, snapshot.clone()))
+    Some(match cache_db_path {
+        Some(db_path) => SemanticIndexer::start_at(root, snapshot.clone(), db_path.to_path_buf()),
+        None => SemanticIndexer::start(root, snapshot.clone()),
+    })
 }
 
 impl SearchToolsService {
@@ -401,9 +406,10 @@ impl SearchToolsService {
             UpdateStrategy::Manual,
             false,
             &watcher_starter,
+            None,
         )?;
         Ok(Self {
-            root: RwLock::new(root),
+            root: RwLock::new(Some(root)),
             session: RwLock::new(Some(session)),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
@@ -833,11 +839,8 @@ impl SearchToolsService {
         SearchToolsServiceError::invalid_params(message)
     }
 
-    pub fn active_workspace_root(&self) -> PathBuf {
-        self.root
-            .read()
-            .map(|root| root.clone())
-            .unwrap_or_default()
+    pub fn active_workspace_root(&self) -> Option<PathBuf> {
+        self.root.read().map(|root| root.clone()).unwrap_or(None)
     }
 
     // Note: `--root` and `new_for_python` take the path as-given (canonicalized
@@ -875,9 +878,10 @@ impl SearchToolsService {
             update_strategy,
             semantic_indexing,
             &watcher_starter,
+            None,
         )?;
         Ok(Self {
-            root: RwLock::new(root),
+            root: RwLock::new(Some(root)),
             session: RwLock::new(Some(session)),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
@@ -914,9 +918,10 @@ impl SearchToolsService {
             update_strategy,
             semantic_indexing,
             &watcher_starter,
+            None,
         )?;
         Ok(Self {
-            root: RwLock::new(root),
+            root: RwLock::new(Some(root)),
             session: RwLock::new(Some(session)),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
@@ -955,7 +960,7 @@ impl SearchToolsService {
             ));
         }
         Ok(Self {
-            root: RwLock::new(canonical),
+            root: RwLock::new(Some(canonical)),
             session: RwLock::new(None),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
@@ -982,6 +987,106 @@ impl SearchToolsService {
     /// client's startup timeout.
     pub fn new_deferred(root: PathBuf) -> Result<Self, String> {
         Self::new_deferred_with_watcher_starter(root, production_watcher_starter())
+    }
+
+    /// Construct an MCP service that has not yet been bound to a client-approved
+    /// workspace root. Analyzer-backed tools return an actionable error until a
+    /// later protocol roots negotiation installs a workspace.
+    pub fn new_unbound() -> Self {
+        Self {
+            root: RwLock::new(None),
+            session: RwLock::new(None),
+            pending_build: Mutex::new(None),
+            build_error: Mutex::new(None),
+            update_strategy: UpdateStrategy::WatchFiles,
+            semantic_indexing: semantic_indexing_enabled(),
+            watcher_starter: production_watcher_starter(),
+        }
+    }
+
+    /// Bind a rootless MCP service to an exact filesystem root approved by the
+    /// client's roots capability. Unlike the user-facing activation tool, this
+    /// deliberately does not promote a nested directory to an enclosing Git
+    /// repository: the client's declared boundary is authoritative.
+    pub fn bind_client_workspace(&self, root: PathBuf) -> Result<PathBuf, SearchToolsServiceError> {
+        let canonical = root.canonicalize().map_err(|err| {
+            SearchToolsServiceError::invalid_params(format!(
+                "Failed to resolve client workspace root {}: {err}",
+                root.display()
+            ))
+        })?;
+        if !canonical.is_dir() {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "Client workspace root is not a directory: {}",
+                canonical.display()
+            )));
+        }
+
+        if self.active_workspace_root().as_ref() == Some(&canonical) {
+            return Ok(canonical);
+        }
+
+        let cache_db_path = client_cache_db_path(&canonical);
+        let (project, workspace) = build_persisted_workspace_at(canonical.clone(), &cache_db_path)
+            .map_err(|err| {
+                SearchToolsServiceError::internal(format!(
+                    "Failed to bind client workspace {}: {err}",
+                    canonical.display()
+                ))
+            })?;
+        let new_session = assemble_session(
+            project,
+            workspace,
+            self.update_strategy,
+            self.semantic_indexing,
+            &self.watcher_starter,
+            Some(&cache_db_path),
+        )
+        .map_err(|err| {
+            SearchToolsServiceError::internal(format!(
+                "Failed to bind client workspace {}: {err}",
+                canonical.display()
+            ))
+        })?;
+
+        let mut session = self
+            .session
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?;
+        let mut active_root = self
+            .root
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?;
+        let old_session = session.replace(new_session);
+        *active_root = Some(canonical.clone());
+        drop(active_root);
+        drop(session);
+        if let Some(old_session) = old_session {
+            old_session.close_semantic();
+        }
+        Ok(canonical)
+    }
+
+    /// Remove a workspace previously supplied through MCP roots. This is used
+    /// when the client explicitly returns an empty or unusable replacement
+    /// root list, so revoked scope never remains queryable.
+    pub fn unbind_client_workspace(&self) -> Result<(), SearchToolsServiceError> {
+        let mut session = self
+            .session
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?;
+        let mut active_root = self
+            .root
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?;
+        let old_session = session.take();
+        *active_root = None;
+        drop(active_root);
+        drop(session);
+        if let Some(old_session) = old_session {
+            old_session.close_semantic();
+        }
+        Ok(())
     }
 
     fn new_deferred_with_watcher_starter(
@@ -1020,12 +1125,13 @@ impl SearchToolsService {
                         update_strategy,
                         semantic_indexing,
                         &watcher_starter,
+                        None,
                     )
                 }
             })
             .map_err(|err| format!("Failed to spawn index build thread: {err}"))?;
         Ok(Self {
-            root: RwLock::new(canonical),
+            root: RwLock::new(Some(canonical)),
             session: RwLock::new(None),
             pending_build: Mutex::new(Some(handle)),
             build_error: Mutex::new(None),
@@ -1078,16 +1184,17 @@ impl SearchToolsService {
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
             .is_none()
         {
-            let built =
-                build_persisted_workspace(self.service_root()?).and_then(|(project, workspace)| {
-                    assemble_session(
-                        project,
-                        workspace,
-                        self.update_strategy,
-                        self.semantic_indexing,
-                        &self.watcher_starter,
-                    )
-                });
+            let root = self.service_root()?;
+            let built = build_persisted_workspace(root).and_then(|(project, workspace)| {
+                assemble_session(
+                    project,
+                    workspace,
+                    self.update_strategy,
+                    self.semantic_indexing,
+                    &self.watcher_starter,
+                    None,
+                )
+            });
             let session = match built {
                 Ok(session) => session,
                 Err(err) => {
@@ -1244,6 +1351,7 @@ impl SearchToolsService {
             self.update_strategy,
             semantic_indexing,
             &self.watcher_starter,
+            None,
         )
         .map_err(|err| {
             SearchToolsServiceError::internal(format!(
@@ -1256,7 +1364,7 @@ impl SearchToolsService {
             .write()
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?;
         let old_session = std::mem::replace(session, new_session);
-        *root = resolved.clone();
+        *root = Some(resolved.clone());
         drop(guard);
         drop(root);
         old_session.close_semantic();
@@ -1656,8 +1764,9 @@ impl SearchToolsService {
     fn service_root(&self) -> Result<PathBuf, SearchToolsServiceError> {
         self.root
             .read()
-            .map(|root| root.clone())
-            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
+            .clone()
+            .ok_or_else(Self::unbound_error)
     }
 
     fn normalize_arguments_for_current_workspace(
@@ -1686,6 +1795,12 @@ impl SearchToolsService {
 
     fn closed_error() -> SearchToolsServiceError {
         SearchToolsServiceError::internal("SearchToolsService is closed")
+    }
+
+    fn unbound_error() -> SearchToolsServiceError {
+        SearchToolsServiceError::internal(
+            "Bifrost is not bound to a workspace. The MCP client must provide an approved filesystem root via roots/list, or configure Bifrost with --root or BIFROST_WORKSPACE_ROOT.",
+        )
     }
 }
 
@@ -1732,6 +1847,25 @@ fn build_persisted_workspace(
     Ok((project, workspace))
 }
 
+fn client_cache_db_path(root: &Path) -> PathBuf {
+    root.join(crate::gitblob::CACHE_DIR_NAME)
+        .join(crate::cache_db::CACHE_DB_FILE_NAME)
+}
+
+fn build_persisted_workspace_at(
+    root: PathBuf,
+    db_path: &Path,
+) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
+    let project = build_project(root)?;
+    let workspace = WorkspaceAnalyzer::build_persisted_at(
+        Arc::clone(&project),
+        AnalyzerConfig::default(),
+        db_path,
+    )
+    .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
+    Ok((project, workspace))
+}
+
 fn build_transient_workspace(
     root: PathBuf,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
@@ -1750,6 +1884,7 @@ fn assemble_session(
     update_strategy: UpdateStrategy,
     semantic_indexing: bool,
     watcher_starter: &WatcherStarter,
+    cache_db_path: Option<&Path>,
 ) -> Result<WorkspaceSession, String> {
     let document_root = Arc::new(
         WorkspaceRoot::open(project.root())
@@ -1758,9 +1893,9 @@ fn assemble_session(
     let watcher = start_session_watcher(Arc::clone(&project), update_strategy, watcher_starter)?;
     let snapshot = Arc::new(workspace);
     #[cfg(feature = "nlp")]
-    let semantic = maybe_start_semantic(semantic_indexing, &snapshot);
+    let semantic = maybe_start_semantic(semantic_indexing, &snapshot, cache_db_path);
     #[cfg(not(feature = "nlp"))]
-    let _ = semantic_indexing;
+    let _ = (semantic_indexing, cache_db_path);
     Ok(WorkspaceSession {
         snapshot,
         document_root,
@@ -2020,7 +2155,7 @@ mod watcher_startup_tests {
             )
             .unwrap_err();
         assert_watcher_error(&error);
-        assert_eq!(service.active_workspace_root(), old_root);
+        assert_eq!(service.active_workspace_root(), Some(old_root.clone()));
 
         let active = service
             .call_tool_value("get_active_workspace", json!({}))
@@ -2243,7 +2378,7 @@ public partial class MudDialogContainer
     fn watching_service_without_watcher(root: PathBuf) -> SearchToolsService {
         let (project, workspace) = build_transient_workspace(root).unwrap();
         SearchToolsService {
-            root: RwLock::new(project.root().to_path_buf()),
+            root: RwLock::new(Some(project.root().to_path_buf())),
             session: RwLock::new(Some(WorkspaceSession {
                 snapshot: Arc::new(workspace),
                 document_root: Arc::new(WorkspaceRoot::open(project.root()).unwrap()),
@@ -2450,6 +2585,63 @@ public partial class MudDialogContainer
     }
 }
 
+#[cfg(test)]
+mod client_roots_tests {
+    use super::*;
+    use git2::{IndexAddOption, Repository, Signature};
+
+    fn commit_all(repo: &Repository) {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let signature = Signature::now("Bifrost Test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .unwrap();
+    }
+
+    #[test]
+    fn client_root_cache_stays_inside_linked_worktree_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary_root = temp.path().join("primary");
+        std::fs::create_dir(&primary_root).unwrap();
+        let repo = Repository::init(&primary_root).unwrap();
+        std::fs::write(primary_root.join("Primary.java"), "class Primary {}\n").unwrap();
+        commit_all(&repo);
+
+        let linked_root = temp.path().join("linked");
+        let worktree = repo.worktree("linked", &linked_root, None).unwrap();
+        let linked_repo = Repository::open_from_worktree(&worktree).unwrap();
+        assert!(linked_repo.is_worktree());
+
+        let service = SearchToolsService {
+            root: RwLock::new(None),
+            session: RwLock::new(None),
+            pending_build: Mutex::new(None),
+            build_error: Mutex::new(None),
+            update_strategy: UpdateStrategy::Manual,
+            semantic_indexing: false,
+            watcher_starter: production_watcher_starter(),
+        };
+        let canonical_linked = linked_root.canonicalize().unwrap();
+        service
+            .bind_client_workspace(canonical_linked.clone())
+            .unwrap();
+
+        assert!(client_cache_db_path(&canonical_linked).exists());
+        assert!(
+            !primary_root
+                .join(crate::gitblob::CACHE_DIR_NAME)
+                .join(crate::cache_db::CACHE_DB_FILE_NAME)
+                .exists(),
+            "client-root binding must not collapse cache writes to the primary checkout"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "nlp"))]
 mod tests {
     use super::*;
@@ -2475,7 +2667,7 @@ mod tests {
             },
         );
         let service = SearchToolsService {
-            root: RwLock::new(dir.path().to_path_buf()),
+            root: RwLock::new(Some(dir.path().to_path_buf())),
             session: RwLock::new(Some(WorkspaceSession {
                 snapshot,
                 document_root: Arc::new(WorkspaceRoot::open(dir.path()).unwrap()),
@@ -2509,7 +2701,7 @@ mod tests {
         let snapshot = Arc::new(workspace);
 
         // No CUDA/Metal and no --force-semantic-cpu: the indexer must not start.
-        let semantic = maybe_start_semantic_checked(true, &snapshot, || {
+        let semantic = maybe_start_semantic_checked(true, &snapshot, None, || {
             Err("no CUDA or Metal accelerator detected".to_string())
         });
 

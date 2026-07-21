@@ -11,19 +11,19 @@ Bifrost analyzes source on the machine where its process runs. That local execut
 | --- | --- | --- |
 | Bifrost analyzer, CLI, and LSP | Files under the configured workspace root plus local Git metadata needed for indexing | Structured results to stdout, stdio MCP, LSP, or the embedding caller; persistent cache data under `.brokk/`. |
 | Agent MCP host | Bifrost tool schemas and returned results, which may include source excerpts | May include those results in model requests, logs, transcripts, or host caches according to host configuration. |
-| Agent-plugin launcher | Pinned release metadata, environment overrides, and workspace root | May download a checksum-verified Bifrost release from GitHub into a user cache. |
+| Agent-plugin launcher | Pinned release metadata and explicit environment or argument overrides | May download a checksum-verified Bifrost release from GitHub into a user cache. |
 | Optional semantic search | Workspace code chunks and a local embedding model | Downloads model files from Hugging Face on first use unless `BIFROST_EMBED_MODEL_DIR` points to local files; inference runs in a local Python sidecar and derived index data is cached. |
 | Skills and agent instructions | Instruction text | No repository analysis and no tools by themselves. The agent host decides how instruction text is used. |
 
 ## Workspace Scope
 
-The process root is explicit through `--root` or host configuration. The packaged launcher resolves it from `BIFROST_WORKSPACE_ROOT`, then a host-provided `--root`/`--workspace-root`, then the session working directory. Confirm the effective root before trusting a query or exposing a repository to an agent session.
+The process root is explicit through `--root`, a packaged-launcher `BIFROST_WORKSPACE_ROOT` override, or the MCP client's standard roots response. Without an explicit override, the packaged launcher starts Bifrost unbound and the server accepts the first usable local filesystem root returned by the client. It does not infer analyzer scope from the launcher working directory, because plugin hosts may use the installed package directory there. A client without roots support leaves the server unbound. Confirm the effective root before trusting a query or exposing a repository to an agent session.
 
 Workspace-relative query files cannot escape the configured root. Results can still contain source excerpts from indexed files inside that root. Path filters narrow an individual request; they are not an access-control boundary for the already configured process.
 
 ## Persistent Repository Cache
 
-Analyzer facts and optional semantic-index data use `.brokk/bifrost_cache.db` at the primary Git repository root. Linked worktrees share that content-addressed database. Set `BIFROST_CACHE_DIR` to use an explicit cache directory for the process, for example when running isolated workers. The cache is local persistent data derived from workspace source and Git objects; protect and retain it according to the same sensitivity policy as the repository.
+For an explicit `--root` process, analyzer facts and optional semantic-index data use `.brokk/bifrost_cache.db` at the primary Git repository root, so linked worktrees share that content-addressed database. Set `BIFROST_CACHE_DIR` to use an explicit cache directory for such a process, for example when running isolated workers. A rootless MCP process bound through client roots instead keeps its database under the exact approved root, including when that root is a linked worktree; it never broadens cache writes to the primary checkout. The cache is local persistent data derived from workspace source and Git objects; protect and retain it according to the same sensitivity policy as the repository.
 
 Removing the database while Bifrost is stopped forces later work to rebuild it. A running process may also hold in-memory source and analysis state. If a test requires a clean cache, stop Bifrost first and record that removal in the evaluation method.
 

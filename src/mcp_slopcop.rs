@@ -24,7 +24,7 @@ pub fn run_slopcop_stdio_server(
     render_options: McpRenderOptions,
 ) -> Result<(), String> {
     let spec = crate::mcp_registry::resolve_server_spec("slopcop")?;
-    run_stdio_server(root, render_options, &spec)
+    run_stdio_server(Some(root), render_options, &spec)
 }
 
 pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {

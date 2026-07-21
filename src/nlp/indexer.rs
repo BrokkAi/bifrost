@@ -115,13 +115,42 @@ pub struct SemanticIndexStatus {
 
 impl SemanticIndexer {
     pub fn start(workspace_root: PathBuf, snapshot: Arc<WorkspaceAnalyzer>) -> Arc<Self> {
-        Self::start_with_provider(workspace_root, snapshot, DefaultEngineProvider)
+        let db_path = semantic_db_path(&workspace_root);
+        Self::start_with_provider_and_db_path(
+            workspace_root,
+            snapshot,
+            DefaultEngineProvider,
+            db_path,
+        )
+    }
+
+    pub(crate) fn start_at(
+        workspace_root: PathBuf,
+        snapshot: Arc<WorkspaceAnalyzer>,
+        db_path: PathBuf,
+    ) -> Arc<Self> {
+        Self::start_with_provider_and_db_path(
+            workspace_root,
+            snapshot,
+            DefaultEngineProvider,
+            db_path,
+        )
     }
 
     pub fn start_with_provider(
         workspace_root: PathBuf,
         snapshot: Arc<WorkspaceAnalyzer>,
         provider: impl EngineProvider,
+    ) -> Arc<Self> {
+        let db_path = semantic_db_path(&workspace_root);
+        Self::start_with_provider_and_db_path(workspace_root, snapshot, provider, db_path)
+    }
+
+    fn start_with_provider_and_db_path(
+        workspace_root: PathBuf,
+        snapshot: Arc<WorkspaceAnalyzer>,
+        provider: impl EngineProvider,
+        db_path: PathBuf,
     ) -> Arc<Self> {
         let shared = Arc::new(Shared {
             phase: Mutex::new(Phase::Starting),
@@ -143,7 +172,14 @@ impl SemanticIndexer {
             .spawn(move || {
                 let panic_shared = worker_shared.clone();
                 let result = catch_unwind(AssertUnwindSafe(move || {
-                    worker_loop(worker_shared, worker_active, workspace_root, provider, rx);
+                    worker_loop(
+                        worker_shared,
+                        worker_active,
+                        workspace_root,
+                        db_path,
+                        provider,
+                        rx,
+                    );
                 }));
                 if let Err(payload) = result {
                     fail_indexer(
@@ -363,6 +399,7 @@ fn worker_loop(
     shared: Arc<Shared>,
     active: Arc<RwLock<Option<ActiveIndex>>>,
     workspace_root: PathBuf,
+    db_path: PathBuf,
     provider: impl EngineProvider,
     rx: Receiver<IndexerMsg>,
 ) {
@@ -376,7 +413,7 @@ fn worker_loop(
             "semantic search requires a git repository".to_string(),
         );
     };
-    let store = match SemanticStore::open(&semantic_db_path(&workspace_root)) {
+    let store = match SemanticStore::open(&db_path) {
         Ok(store) => Arc::new(store),
         Err(err) => return fail(&shared, format!("index open failed: {err}")),
     };
