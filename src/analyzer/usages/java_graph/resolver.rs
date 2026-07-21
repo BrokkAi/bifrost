@@ -281,14 +281,15 @@ pub(super) fn receiver_matches_target(
                 match_result
             }
         }
-        "this" => (owner_matches_target_context(receiver, ctx)
-            || anonymous_creation_context_matches_target(receiver, ctx))
-        .then_some(ReceiverTargetMatch::Matched)
-        .unwrap_or(ReceiverTargetMatch::Unresolved),
-        "super" => (owner_matches_target_context(receiver, ctx)
-            || anonymous_creation_context_matches_target(receiver, ctx))
-        .then_some(ReceiverTargetMatch::Matched)
-        .unwrap_or(ReceiverTargetMatch::Unresolved),
+        "this" | "super" => {
+            if owner_matches_target_context(receiver, ctx)
+                || anonymous_creation_context_matches_target(receiver, ctx)
+            {
+                ReceiverTargetMatch::Matched
+            } else {
+                ReceiverTargetMatch::Unresolved
+            }
+        }
         _ => ReceiverTargetMatch::Unresolved,
     }
 }
@@ -356,9 +357,7 @@ fn method_invocation_anonymous_return_match(
     node: Node<'_>,
     ctx: &ScanCtx<'_>,
 ) -> Option<ReceiverTargetMatch> {
-    let Some(name_node) = node.child_by_field_name("name") else {
-        return None;
-    };
+    let name_node = node.child_by_field_name("name")?;
     let name = node_text(name_node, ctx.source);
     if name.is_empty() {
         return None;
@@ -367,9 +366,7 @@ fn method_invocation_anonymous_return_match(
         Some(object) => receiver_type_from_node_at_depth(object, ctx, 1),
         None => enclosing_owner(node, ctx),
     };
-    let Some(owner) = owner else {
-        return None;
-    };
+    let owner = owner?;
     let arity = argument_list_arity(node);
     if let Some(outcome) =
         method_anonymous_return_type_for_owner_fqn(&owner.fq_name(), name, arity, ctx)

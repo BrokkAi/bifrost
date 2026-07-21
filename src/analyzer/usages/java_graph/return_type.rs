@@ -541,9 +541,11 @@ fn method_declaration_anonymous_return_type(
             }
         }
     }
-    (!return_types.is_empty())
-        .then_some(ReceiverAnalysisOutcome::Precise(return_types))
-        .unwrap_or(ReceiverAnalysisOutcome::Unknown)
+    if return_types.is_empty() {
+        ReceiverAnalysisOutcome::Unknown
+    } else {
+        ReceiverAnalysisOutcome::Precise(return_types)
+    }
 }
 
 fn has_anonymous_class_body(node: Node<'_>) -> bool {

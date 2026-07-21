@@ -1,4 +1,4 @@
-use super::extractor::{ScanState, scan_file};
+use super::extractor::{ReturnTypeCaches, ScanState, scan_file};
 use super::inverted;
 use super::jvm_scala::scan_scala_files_for_java_type;
 use super::resolver::TargetSpec;
@@ -67,6 +67,11 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
         let method_anonymous_return_cache: MethodAnonymousReturnCache =
             Mutex::new(HashMap::default());
         let file_return_cache: FileReturnCache = Mutex::new(HashMap::default());
+        let return_caches = ReturnTypeCaches {
+            method_return: &method_return_cache,
+            method_anonymous_return: &method_anonymous_return_cache,
+            file_return: &file_return_cache,
+        };
         let mut state = ScanState {
             max_usages,
             hits: &mut hits,
@@ -81,9 +86,7 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
                 analyzer,
                 &file,
                 &spec,
-                &method_return_cache,
-                &method_anonymous_return_cache,
-                &file_return_cache,
+                &return_caches,
                 &mut state,
             );
             if *state.limit_exceeded {

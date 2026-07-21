@@ -37,6 +37,12 @@ pub(super) struct ScanState<'a> {
     pub(super) limit_exceeded: &'a mut bool,
 }
 
+pub(super) struct ReturnTypeCaches<'a> {
+    pub(super) method_return: &'a MethodReturnCache,
+    pub(super) method_anonymous_return: &'a MethodAnonymousReturnCache,
+    pub(super) file_return: &'a FileReturnCache,
+}
+
 pub(super) struct ScanCtx<'a> {
     pub(super) java: &'a JavaAnalyzer,
     pub(super) analyzer: &'a dyn IAnalyzer,
@@ -66,9 +72,7 @@ pub(super) fn scan_file(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     spec: &TargetSpec,
-    method_return_cache: &MethodReturnCache,
-    method_anonymous_return_cache: &MethodAnonymousReturnCache,
-    file_return_cache: &FileReturnCache,
+    return_caches: &ReturnTypeCaches<'_>,
     state: &mut ScanState<'_>,
 ) {
     if *state.limit_exceeded {
@@ -110,9 +114,9 @@ pub(super) fn scan_file(
         limit_exceeded: state.limit_exceeded,
         class_ranges: ClassRangeIndex::build(analyzer, file),
         method_call_return_cache: RefCell::new(HashMap::default()),
-        method_return_cache,
-        method_anonymous_return_cache,
-        file_return_cache,
+        method_return_cache: return_caches.method_return,
+        method_anonymous_return_cache: return_caches.method_anonymous_return,
+        file_return_cache: return_caches.file_return,
         enclosing_cache: HashMap::default(),
         class_scope_depths: Vec::new(),
     };
@@ -584,10 +588,10 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
     let receiver_match = if let Some(object) = node.child_by_field_name("object") {
         receiver_matches_target(object, ctx)
+    } else if bare_method_context_matches_target(node, ctx) || has_proven_static_import(ctx) {
+        ReceiverTargetMatch::Matched
     } else {
-        (bare_method_context_matches_target(node, ctx) || has_proven_static_import(ctx))
-            .then_some(ReceiverTargetMatch::Matched)
-            .unwrap_or(ReceiverTargetMatch::Unresolved)
+        ReceiverTargetMatch::Unresolved
     };
     match receiver_match {
         ReceiverTargetMatch::Matched => hits::push_hit(name_node, ctx),
@@ -859,9 +863,11 @@ fn maybe_record_lombok_accessor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bo
         .child_by_field_name("object")
         .map(|object| receiver_matches_target(object, ctx))
         .unwrap_or_else(|| {
-            bare_field_context_matches_target(node, ctx)
-                .then_some(ReceiverTargetMatch::Matched)
-                .unwrap_or(ReceiverTargetMatch::Unresolved)
+            if bare_field_context_matches_target(node, ctx) {
+                ReceiverTargetMatch::Matched
+            } else {
+                ReceiverTargetMatch::Unresolved
+            }
         });
     match receiver_match {
         ReceiverTargetMatch::Matched => hits::push_hit(member, ctx),
