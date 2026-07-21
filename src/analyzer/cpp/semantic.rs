@@ -85,67 +85,16 @@ impl ProgramSemanticsLowerer for CppSemanticLowerer {
                 }
             };
 
-        let mut procedures = Vec::with_capacity(specs.len());
-        let mut observed = enumeration_work;
-        for spec in &specs {
-            if cancellation.is_cancelled() {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: None,
-                    work: observed,
-                });
-            }
-            let mut staged_budget = budget.clone();
-            if let Err(exceeded) = staged_budget.charge(observed) {
-                return Ok(SemanticOutcome::ExceededBudget {
-                    partial: None,
-                    exceeded,
-                    work: observed,
-                });
-            }
-            match lower_procedure(prepared, spec, &staged_budget, cancellation) {
-                Ok((parts, work)) => {
-                    let candidate = sum_work(observed, work);
-                    if let Err(exceeded) = budget.check(candidate) {
-                        return Ok(SemanticOutcome::ExceededBudget {
-                            partial: None,
-                            exceeded,
-                            work: candidate,
-                        });
-                    }
-                    observed = candidate;
-                    procedures.push(parts);
-                }
-                Err(CppLoweringError::Cancelled(work)) => {
-                    return Ok(SemanticOutcome::Cancelled {
-                        partial: None,
-                        work: sum_work(observed, *work),
-                    });
-                }
-                Err(CppLoweringError::Budget(exceeded, work)) => {
-                    let work = sum_work(observed, *work);
-                    let exceeded = budget.check(work).err().unwrap_or(exceeded);
-                    return Ok(SemanticOutcome::ExceededBudget {
-                        partial: None,
-                        exceeded,
-                        work,
-                    });
-                }
-                Err(CppLoweringError::Invalid(detail)) => {
-                    return Err(SemanticProviderError::internal(detail));
-                }
-            }
-        }
-
-        Ok(SemanticOutcome::Complete {
-            value: procedures,
-            work: observed,
-        })
+        lower_procedure_batch(
+            &specs,
+            enumeration_work,
+            budget,
+            cancellation,
+            |spec, staged_budget, cancellation| {
+                lower_procedure(prepared, spec, staged_budget, cancellation)
+            },
+        )
     }
-}
-
-fn sum_work(left: SemanticWork, right: SemanticWork) -> SemanticWork {
-    left.checked_add(right)
-        .unwrap_or_else(|| SemanticWork::uniform(usize::MAX))
 }
 
 fn cpp_capabilities() -> SemanticCapabilities {
@@ -302,7 +251,7 @@ fn enumerate_procedures<'tree>(
     while let Some(frame) = stack.pop() {
         if cancellation.is_cancelled() {
             return Ok(ProcedureEnumeration::Cancelled {
-                work: sum_work(preflight, traversal_work),
+                work: sum_lowering_work(preflight, traversal_work),
             });
         }
 
@@ -310,14 +259,14 @@ fn enumerate_procedures<'tree>(
         // entry per pending node. Bound that work even in files that contain no
         // callable declarations, instead of charging only when a procedure is
         // eventually discovered.
-        let traversal = sum_work(
+        let traversal = sum_lowering_work(
             traversal_work,
             SemanticWork {
                 nested_entries: 1,
                 ..SemanticWork::default()
             },
         );
-        let traversal_candidate = sum_work(preflight, traversal);
+        let traversal_candidate = sum_lowering_work(preflight, traversal);
         if let Err(exceeded) = budget.check(traversal_candidate) {
             return Ok(ProcedureEnumeration::ExceededBudget {
                 exceeded,
@@ -377,7 +326,7 @@ fn enumerate_procedures<'tree>(
                 frame.node,
                 is_c_source,
                 budget,
-                sum_work(preflight, traversal_work),
+                sum_lowering_work(preflight, traversal_work),
                 cancellation,
             ) {
                 Ok(scan) => scan,
@@ -391,7 +340,7 @@ fn enumerate_procedures<'tree>(
                     return Ok(ProcedureEnumeration::Cancelled { work: *work });
                 }
             };
-            traversal_work = sum_work(traversal_work, scan.work);
+            traversal_work = sum_lowering_work(traversal_work, scan.work);
             properties.is_async = scan.is_async;
             properties.is_generator = scan.is_generator;
             properties.invocation = if scan.is_async || scan.is_generator {
@@ -437,8 +386,8 @@ fn enumerate_procedures<'tree>(
                 SemanticRole::Procedure,
                 anchor,
             );
-            let candidate = sum_work(preflight, procedure_identity_preflight(&locator));
-            let total_candidate = sum_work(traversal_work, candidate);
+            let candidate = sum_lowering_work(preflight, procedure_identity_preflight(&locator));
+            let total_candidate = sum_lowering_work(traversal_work, candidate);
             if let Err(exceeded) = budget.check(total_candidate) {
                 return Ok(ProcedureEnumeration::ExceededBudget {
                     exceeded,
@@ -488,7 +437,7 @@ fn enumerate_procedures<'tree>(
 
     Ok(ProcedureEnumeration::Complete {
         specs,
-        work: sum_work(preflight, traversal_work),
+        work: sum_lowering_work(preflight, traversal_work),
     })
 }
 
@@ -508,17 +457,17 @@ fn callable_preflight(
     while let Some(node) = stack.pop() {
         if cancellation.is_cancelled() {
             return Err(CallablePreflightStop::Cancelled {
-                work: Box::new(sum_work(observed, result.work)),
+                work: Box::new(sum_lowering_work(observed, result.work)),
             });
         }
-        let candidate = sum_work(
+        let candidate = sum_lowering_work(
             result.work,
             SemanticWork {
                 nested_entries: 1,
                 ..SemanticWork::default()
             },
         );
-        let total = sum_work(observed, candidate);
+        let total = sum_lowering_work(observed, candidate);
         if let Err(exceeded) = budget.check(total) {
             return Err(CallablePreflightStop::ExceededBudget {
                 exceeded,
@@ -918,18 +867,7 @@ fn nonempty_node_text<'source>(source: &'source str, node: Node<'_>) -> Option<&
     node_text(source, node).filter(|text| !text.is_empty())
 }
 
-#[derive(Debug)]
-enum CppLoweringError {
-    Cancelled(Box<SemanticWork>),
-    Budget(SemanticBudgetExceeded, Box<SemanticWork>),
-    Invalid(String),
-}
-
-impl From<SemanticBudgetExceeded> for CppLoweringError {
-    fn from(error: SemanticBudgetExceeded) -> Self {
-        Self::Budget(error, Box::default())
-    }
-}
+type CppLoweringError = ProcedureLoweringError;
 
 #[derive(Debug, Clone, Copy)]
 struct EdgeTarget {
@@ -969,12 +907,6 @@ enum Work<'tree> {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PointMetadata {
-    source: SourceMappingId,
-    evidence: EvidenceId,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct GapFact {
     point: ProgramPointId,
@@ -984,14 +916,7 @@ struct GapFact {
 
 struct LoweringContext<'tree, 'targets> {
     source: &'tree str,
-    locator: SemanticLocator,
-    point_metadata: Vec<PointMetadata>,
-    next_source: usize,
-    next_evidence: usize,
-    next_value: usize,
-    next_call_site: usize,
-    next_gap: usize,
-    source_occurrences: HashMap<(usize, usize), u32>,
+    session: ProcedureLoweringSession<'targets>,
     labels: HashMap<Box<str>, ProgramPointId>,
     switch_case_entries: HashMap<usize, ProgramPointId>,
     published_gaps: HashSet<GapFact>,
@@ -1000,7 +925,6 @@ struct LoweringContext<'tree, 'targets> {
     has_implicit_object_context: bool,
     raii_possible: bool,
     vla_possible: bool,
-    cancellation: &'targets CancellationToken,
 }
 
 fn lower_procedure<'tree>(
@@ -1009,85 +933,34 @@ fn lower_procedure<'tree>(
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), CppLoweringError> {
-    let base_source = SourceMappingId::new(0);
-    let base_evidence = EvidenceId::new(0);
     let mut parts = ProcedureSemanticsParts::new(
         spec.id,
         spec.locator.clone(),
         spec.kind,
-        base_source,
-        base_evidence,
+        SourceMappingId::new(0),
+        EvidenceId::new(0),
     );
     parts.lexical_parent = spec.lexical_parent;
     parts.properties = spec.properties;
-    parts.source_mappings.push(SourceMapping {
-        id: base_source,
-        locator: spec.locator.clone(),
-        kind: SourceMappingKind::Exact,
-    });
-    parts.evidence_rows.push(Evidence {
-        id: base_evidence,
-        proof: ProofStatus::Proven,
-        completeness: EvidenceCompleteness::Complete,
-        sources: Box::new([base_source]),
-    });
-
-    let mut builder = ProcedureCfgBuilder::new(parts, budget)?;
-    let entry = builder.add_point(
-        vec![SemanticEvent::new(
-            SemanticEffect::Entry,
-            base_source,
-            base_evidence,
-        )],
-        base_source,
-        base_evidence,
-    )?;
-    let normal_exit = builder.add_point(
-        vec![SemanticEvent::new(
-            SemanticEffect::NormalExit,
-            base_source,
-            base_evidence,
-        )],
-        base_source,
-        base_evidence,
-    )?;
-    let exceptional_exit = builder.add_point(
-        vec![SemanticEvent::new(
-            SemanticEffect::ExceptionalExit,
-            base_source,
-            base_evidence,
-        )],
-        base_source,
-        base_evidence,
-    )?;
-    let noexcept_termination = if spec.noexcept == NoexceptSpecification::Unconditional {
-        Some(builder.add_point(Vec::new(), base_source, base_evidence)?)
-    } else {
-        None
-    };
-    let function_scope = builder.push_scope(
-        None,
-        ScopeBinding::Function {
-            return_target: normal_exit,
-            throw_target: noexcept_termination.unwrap_or(exceptional_exit),
+    let (
+        ProcedureLoweringStart {
+            mut builder,
+            session,
+            entry,
+            normal_exit,
+            exceptional_exit,
+            function_scope,
         },
-    );
+        noexcept_termination,
+    ) = ProcedureLoweringSession::start_with_function_throw_boundary(
+        parts,
+        budget,
+        cancellation,
+        spec.noexcept == NoexceptSpecification::Unconditional,
+    )?;
     let mut context = LoweringContext {
         source: prepared.source(),
-        locator: spec.locator.clone(),
-        point_metadata: vec![
-            PointMetadata {
-                source: base_source,
-                evidence: base_evidence,
-            };
-            3 + usize::from(noexcept_termination.is_some())
-        ],
-        next_source: 1,
-        next_evidence: 1,
-        next_value: 0,
-        next_call_site: 0,
-        next_gap: 0,
-        source_occurrences: HashMap::default(),
+        session,
         labels: HashMap::default(),
         switch_case_entries: HashMap::default(),
         published_gaps: HashSet::default(),
@@ -1100,7 +973,6 @@ fn lower_procedure<'tree>(
         has_implicit_object_context: spec.has_implicit_object_context,
         raii_possible: spec.has_raii_boundaries,
         vla_possible: spec.has_vla_boundaries,
-        cancellation,
     };
 
     context.register_labels(&mut builder, spec.body)?;
@@ -1377,7 +1249,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         work: Work<'tree>,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CppLoweringError> {
-        if self.cancellation.is_cancelled() {
+        if self.session.cancellation().is_cancelled() {
             return Err(CppLoweringError::Cancelled(Box::default()));
         }
         match work {
@@ -3185,46 +3057,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
         )?;
 
-        let call_site = CallSiteId::new(
-            u32::try_from(self.next_call_site)
-                .map_err(|_| CppLoweringError::Invalid("too many C/C++ call sites".into()))?,
-        );
         let arguments = call_arguments(node);
         let argument_values = arguments
             .iter()
             .map(|_| self.value(builder, invoke, SemanticValueKind::Temporary))
             .collect::<Result<Vec<_>, _>>()?;
-        builder.add_call_site(SemanticCallSite {
-            id: call_site,
-            point: invoke,
-            callee,
-            receiver,
-            arguments: argument_values.into_iter().map(Into::into).collect(),
-            result: Some(result),
-            thrown: Some(thrown),
-            declared_targets: resolution.clone(),
-            target_evidence: metadata.evidence,
-            normal_continuation: ControlContinuation::Target(normal),
-            exceptional_continuation: ControlContinuation::Target(exceptional),
-            source: metadata.source,
-            evidence: metadata.evidence,
-        })?;
-        self.next_call_site += 1;
-        self.append_effect(builder, invoke, SemanticEffect::Invoke { call_site })?;
-        self.append_effect(
+        let call_site = self.session.add_call_site(
             builder,
-            normal,
-            SemanticEffect::CallContinuation {
-                call_site,
-                kind: CallContinuationKind::Normal,
-            },
-        )?;
-        self.append_effect(
-            builder,
-            exceptional,
-            SemanticEffect::CallContinuation {
-                call_site,
-                kind: CallContinuationKind::Exceptional,
+            CallSiteScaffold {
+                point: invoke,
+                callee,
+                receiver,
+                arguments: argument_values.into_iter().map(Into::into).collect(),
+                result: Some(result),
+                thrown: Some(thrown),
+                declared_targets: resolution.clone(),
+                normal_continuation: normal,
+                exceptional_continuation: exceptional,
             },
         )?;
         self.edge(builder, invoke, EdgeTarget::normal(normal))?;
@@ -3423,7 +3272,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), CppLoweringError> {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
-            if self.cancellation.is_cancelled() {
+            if self.session.cancellation().is_cancelled() {
                 return Err(CppLoweringError::Cancelled(Box::new(
                     builder.prospective_work(),
                 )));
@@ -3472,7 +3321,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     fn is_c_source(&self) -> bool {
-        self.locator
+        self.session
+            .locator()
             .path()
             .as_path()
             .extension()
@@ -3940,18 +3790,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         effects: Vec<SemanticEffect>,
     ) -> Result<ProgramPointId, CppLoweringError> {
         let metadata = self.mapping(builder, node)?;
-        let events = effects
-            .into_iter()
-            .map(|effect| SemanticEvent::new(effect, metadata.source, metadata.evidence))
-            .collect();
-        let point = builder.add_point(events, metadata.source, metadata.evidence)?;
-        if point.index() != self.point_metadata.len() {
-            return Err(CppLoweringError::Invalid(
-                "C/C++ program-point allocation is not dense".into(),
-            ));
-        }
-        self.point_metadata.push(metadata);
-        Ok(point)
+        self.session.add_point(builder, metadata, effects)
     }
 
     fn mapping(
@@ -3960,53 +3799,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         node: Node<'tree>,
     ) -> Result<PointMetadata, CppLoweringError> {
         let range = node.byte_range();
-        let occurrence = self
-            .source_occurrences
-            .entry((range.start, range.end))
-            .or_default();
-        let anchor = source_anchor(node, *occurrence).map_err(CppLoweringError::Invalid)?;
-        *occurrence += 1;
-        let source = SourceMappingId::new(
-            u32::try_from(self.next_source)
-                .map_err(|_| CppLoweringError::Invalid("too many source mappings".into()))?,
-        );
-        let evidence = EvidenceId::new(
-            u32::try_from(self.next_evidence)
-                .map_err(|_| CppLoweringError::Invalid("too many evidence rows".into()))?,
-        );
-        let locator = SemanticLocator::new(
-            self.locator.mount(),
-            self.locator.path().clone(),
-            self.locator.language(),
-            self.locator.declaration().clone(),
-            SemanticRole::ProgramPoint,
-            anchor,
-        );
-        builder.add_source_mapping(SourceMapping {
-            id: source,
-            locator,
-            kind: SourceMappingKind::Exact,
-        })?;
-        builder.add_evidence(Evidence {
-            id: evidence,
-            proof: ProofStatus::Proven,
-            completeness: EvidenceCompleteness::Complete,
-            sources: Box::new([source]),
-        })?;
-        self.next_source += 1;
-        self.next_evidence += 1;
-        Ok(PointMetadata { source, evidence })
+        let occurrence = self.session.next_source_occurrence(range.start, range.end);
+        let anchor = source_anchor(node, occurrence).map_err(CppLoweringError::Invalid)?;
+        self.session
+            .add_mapping(builder, anchor, SourceMappingKind::Exact)
     }
 
     fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, CppLoweringError> {
-        self.point_metadata
-            .get(point.index())
-            .copied()
-            .ok_or_else(|| {
-                CppLoweringError::Invalid(format!(
-                    "missing metadata for C/C++ program point {point}"
-                ))
-            })
+        self.session.metadata(point)
     }
 
     fn value(
@@ -4015,19 +3815,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         kind: SemanticValueKind,
     ) -> Result<ValueId, CppLoweringError> {
-        let metadata = self.metadata(point)?;
-        let id = ValueId::new(
-            u32::try_from(self.next_value)
-                .map_err(|_| CppLoweringError::Invalid("too many semantic values".into()))?,
-        );
-        builder.add_value(SemanticValue {
-            id,
-            kind,
-            source: metadata.source,
-            evidence: metadata.evidence,
-        })?;
-        self.next_value += 1;
-        Ok(id)
+        self.session.add_value(builder, point, kind)
     }
 
     fn append_effect(
@@ -4036,12 +3824,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         effect: SemanticEffect,
     ) -> Result<(), CppLoweringError> {
-        let metadata = self.metadata(point)?;
-        builder.append_event(
-            point,
-            SemanticEvent::new(effect, metadata.source, metadata.evidence),
-        )?;
-        Ok(())
+        self.session.append_effect(builder, point, effect)
     }
 
     fn add_gap(
@@ -4082,25 +3865,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }) {
             return Ok(());
         }
-        let metadata = self.metadata(point)?;
-        let id = SemanticGapId::new(
-            u32::try_from(self.next_gap)
-                .map_err(|_| CppLoweringError::Invalid("too many semantic gaps".into()))?,
-        );
-        builder.add_gap(SemanticGap {
-            id,
-            point,
-            subject,
-            capability,
-            impacts,
-            kind,
-            budget: None,
-            detail: detail.into(),
-            source: metadata.source,
-            evidence: metadata.evidence,
-        })?;
-        self.next_gap += 1;
-        self.append_effect(builder, point, SemanticEffect::Gap { gap: id })
+        self.session
+            .add_gap_with_impacts(builder, point, subject, capability, impacts, kind, detail)?;
+        Ok(())
     }
 
     fn edge(
@@ -4109,15 +3876,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         source_point: ProgramPointId,
         target: EdgeTarget,
     ) -> Result<(), CppLoweringError> {
-        let metadata = self.metadata(source_point)?;
-        builder.add_edge(ControlEdge {
-            source_point,
-            target_point: target.point,
-            kind: target.kind,
-            source: metadata.source,
-            evidence: metadata.evidence,
-        })?;
-        Ok(())
+        self.session
+            .add_edge(builder, source_point, target.point, target.kind)
     }
 }
 
