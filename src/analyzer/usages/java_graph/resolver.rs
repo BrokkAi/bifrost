@@ -3,8 +3,9 @@ use crate::analyzer::usages::java_graph::extractor::ScanCtx;
 use crate::analyzer::usages::java_graph::hits::enclosing_context;
 use crate::analyzer::usages::java_graph::return_type::{
     FileReturnCache, JavaReturnTypeContext, LexicalTypeResolution, METHOD_RECEIVER_CHAIN_LIMIT,
-    MethodReturnCache, is_java_nominal_type_node, java_lexical_type_from_node,
-    java_type_name_from_node, method_return_type_for_owner_fqns,
+    MethodAnonymousReturnCache, MethodReturnCache, is_java_nominal_type_node,
+    java_lexical_type_from_node, java_type_name_from_node, merge_receiver_type_outcomes,
+    method_anonymous_return_type_for_owner_fqn, method_return_type_for_owner_fqns,
 };
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
@@ -29,6 +30,13 @@ pub(super) struct TargetSpec {
     pub(super) declaration_owner_fq_names: HashSet<String>,
     pub(super) member_name: String,
     pub(super) callable_arities: Option<HashSet<CallableArity>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReceiverTargetMatch {
+    Matched,
+    Incompatible,
+    Unresolved,
 }
 
 impl TargetSpec {
@@ -232,55 +240,169 @@ impl JavaReturnTypeContext for ScanCtx<'_> {
         self.method_return_cache
     }
 
+    fn method_anonymous_return_cache(&self) -> &MethodAnonymousReturnCache {
+        self.method_anonymous_return_cache
+    }
+
     fn file_return_cache(&self) -> &FileReturnCache {
         self.file_return_cache
     }
 }
 
-pub(super) fn receiver_matches_target(receiver: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
+pub(super) fn receiver_matches_target(
+    receiver: Node<'_>,
+    ctx: &mut ScanCtx<'_>,
+) -> ReceiverTargetMatch {
     match receiver.kind() {
         "identifier" => {
             let name = node_text(receiver, ctx.source);
-            ctx.bindings
-                .resolve_symbol(name)
-                .as_precise()
-                .is_some_and(|targets| {
-                    targets
-                        .iter()
-                        .any(|target| ctx.spec.receiver_owner_fq_names.contains(target))
-                })
+            match ctx.bindings.resolve_symbol(name).as_precise() {
+                Some(targets) => receiver_fq_names_match_target(targets.iter(), ctx),
+                None => ReceiverTargetMatch::Unresolved,
+            }
         }
         "type_identifier" | "scoped_type_identifier" | "generic_type" => {
-            resolve_type_from_node(receiver, ctx).is_some_and(|resolved| {
-                ctx.spec
-                    .receiver_owner_fq_names
-                    .contains(&resolved.fq_name())
-            })
+            resolve_type_from_node(receiver, ctx)
+                .map(|resolved| receiver_type_matches_target(&resolved, ctx))
+                .unwrap_or(ReceiverTargetMatch::Unresolved)
         }
         "object_creation_expression" => receiver
             .child_by_field_name("type")
             .and_then(|type_node| resolve_type_from_node(type_node, ctx))
-            .is_some_and(|resolved| {
-                ctx.spec
-                    .receiver_owner_fq_names
-                    .contains(&resolved.fq_name())
-            }),
+            .map(|resolved| receiver_type_matches_target(&resolved, ctx))
+            .unwrap_or(ReceiverTargetMatch::Unresolved),
         "method_invocation" => {
-            method_invocation_return_type(receiver, ctx).is_some_and(|resolved| {
+            let match_result = method_invocation_return_type(receiver, ctx)
+                .map(|resolved| receiver_type_matches_target(&resolved, ctx))
+                .unwrap_or(ReceiverTargetMatch::Unresolved);
+            if match_result == ReceiverTargetMatch::Unresolved {
+                method_invocation_anonymous_return_match(receiver, ctx).unwrap_or(match_result)
+            } else {
+                match_result
+            }
+        }
+        "this" | "super" => {
+            if owner_matches_target_context(receiver, ctx)
+                || anonymous_creation_context_matches_target(receiver, ctx)
+            {
+                ReceiverTargetMatch::Matched
+            } else {
+                ReceiverTargetMatch::Unresolved
+            }
+        }
+        _ => ReceiverTargetMatch::Unresolved,
+    }
+}
+
+fn receiver_fq_names_match_target<'a>(
+    fq_names: impl Iterator<Item = &'a String>,
+    ctx: &ScanCtx<'_>,
+) -> ReceiverTargetMatch {
+    let outcomes: Vec<_> = fq_names
+        .filter_map(|fq_name| class_definition(ctx, fq_name))
+        .map(|resolved| receiver_type_matches_target(&resolved, ctx))
+        .collect();
+    if outcomes.contains(&ReceiverTargetMatch::Matched) {
+        ReceiverTargetMatch::Matched
+    } else if outcomes
+        .iter()
+        .all(|outcome| *outcome == ReceiverTargetMatch::Incompatible)
+        && !outcomes.is_empty()
+    {
+        ReceiverTargetMatch::Incompatible
+    } else {
+        ReceiverTargetMatch::Unresolved
+    }
+}
+
+fn receiver_type_matches_target(
+    receiver_type: &CodeUnit,
+    ctx: &ScanCtx<'_>,
+) -> ReceiverTargetMatch {
+    if ctx
+        .spec
+        .receiver_owner_fq_names
+        .contains(&receiver_type.fq_name())
+    {
+        return ReceiverTargetMatch::Matched;
+    }
+
+    let Some(provider) = ctx.analyzer.type_hierarchy_provider() else {
+        return ReceiverTargetMatch::Unresolved;
+    };
+    if ctx.spec.kind == TargetKind::Method
+        && provider
+            .get_ancestors(receiver_type)
+            .iter()
+            .any(|ancestor| {
                 ctx.spec
                     .receiver_owner_fq_names
-                    .contains(&resolved.fq_name())
+                    .contains(&ancestor.fq_name())
             })
-        }
-        "this" => {
-            owner_matches_target_context(receiver, ctx)
-                || anonymous_creation_context_matches_target(receiver, ctx)
-        }
-        "super" => {
-            owner_matches_target_context(receiver, ctx)
-                || anonymous_creation_context_matches_target(receiver, ctx)
-        }
-        _ => false,
+    {
+        return ReceiverTargetMatch::Matched;
+    }
+    if provider
+        .get_ancestors(&ctx.spec.owner)
+        .into_iter()
+        .any(|ancestor| ancestor == *receiver_type)
+    {
+        ReceiverTargetMatch::Unresolved
+    } else {
+        ReceiverTargetMatch::Incompatible
+    }
+}
+
+fn method_invocation_anonymous_return_match(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> Option<ReceiverTargetMatch> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = node_text(name_node, ctx.source);
+    if name.is_empty() {
+        return None;
+    }
+    let owner = match node.child_by_field_name("object") {
+        Some(object) => receiver_type_from_node_at_depth(object, ctx, 1),
+        None => enclosing_owner(node, ctx),
+    };
+    let owner = owner?;
+    let arity = argument_list_arity(node);
+    if let Some(outcome) =
+        method_anonymous_return_type_for_owner_fqn(&owner.fq_name(), name, arity, ctx)
+    {
+        return anonymous_return_types_match_target(outcome, ctx);
+    }
+    let provider = ctx.analyzer.type_hierarchy_provider()?;
+    let outcomes = provider
+        .get_ancestors(&owner)
+        .into_iter()
+        .filter_map(|ancestor| {
+            method_anonymous_return_type_for_owner_fqn(&ancestor.fq_name(), name, arity, ctx)
+        })
+        .collect::<Vec<_>>();
+    (!outcomes.is_empty())
+        .then(|| anonymous_return_types_match_target(merge_receiver_type_outcomes(outcomes), ctx))?
+}
+
+fn anonymous_return_types_match_target(
+    outcome: ReceiverAnalysisOutcome<String>,
+    ctx: &ScanCtx<'_>,
+) -> Option<ReceiverTargetMatch> {
+    let targets = outcome.into_precise()?;
+    let outcomes = targets
+        .iter()
+        .filter_map(|fq_name| class_definition(ctx, fq_name))
+        .map(|receiver_type| receiver_type_matches_target(&receiver_type, ctx))
+        .collect::<Vec<_>>();
+    if outcomes.contains(&ReceiverTargetMatch::Matched) {
+        Some(ReceiverTargetMatch::Matched)
+    } else if outcomes.len() == targets.len() && !outcomes.is_empty() {
+        // An inline anonymous object cannot be an unknown concrete subtype of
+        // its declared nominal type: it is exactly the class being created.
+        Some(ReceiverTargetMatch::Incompatible)
+    } else {
+        None
     }
 }
 

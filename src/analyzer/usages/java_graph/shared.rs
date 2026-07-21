@@ -1,8 +1,8 @@
-use super::extractor::{ScanState, scan_file};
+use super::extractor::{ReturnTypeCaches, ScanState, scan_file};
 use super::inverted;
 use super::jvm_scala::scan_scala_files_for_java_type;
 use super::resolver::TargetSpec;
-use super::return_type::{FileReturnCache, MethodReturnCache};
+use super::return_type::{FileReturnCache, MethodAnonymousReturnCache, MethodReturnCache};
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
@@ -64,7 +64,14 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
         let mut raw_match_count = 0usize;
         let mut limit_exceeded = false;
         let method_return_cache: MethodReturnCache = Mutex::new(HashMap::default());
+        let method_anonymous_return_cache: MethodAnonymousReturnCache =
+            Mutex::new(HashMap::default());
         let file_return_cache: FileReturnCache = Mutex::new(HashMap::default());
+        let return_caches = ReturnTypeCaches {
+            method_return: &method_return_cache,
+            method_anonymous_return: &method_anonymous_return_cache,
+            file_return: &file_return_cache,
+        };
         let mut state = ScanState {
             max_usages,
             hits: &mut hits,
@@ -79,8 +86,7 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
                 analyzer,
                 &file,
                 &spec,
-                &method_return_cache,
-                &file_return_cache,
+                &return_caches,
                 &mut state,
             );
             if *state.limit_exceeded {

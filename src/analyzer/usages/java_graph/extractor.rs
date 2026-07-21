@@ -4,15 +4,17 @@ use crate::analyzer::usages::get_definition::java_lombok_generated_accessor_fiel
 use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::java_graph::hits;
 use crate::analyzer::usages::java_graph::resolver::{
-    TargetKind, TargetSpec, argument_list_arity, bare_field_context_matches_target,
-    bare_method_context_matches_target, constructor_method_reference_receiver,
-    has_proven_static_import, infer_type_from_value, is_declaration_name, is_ignored_type_context,
-    java_method_signatures_match, nested_type_for_owner, node_text, receiver_matches_target,
-    resolve_field_access_type, resolve_field_access_type_segments,
-    resolve_non_nested_type_from_node, resolve_type_from_node, resolve_type_segments,
-    same_owner_context, seed_class_binding,
+    ReceiverTargetMatch, TargetKind, TargetSpec, argument_list_arity,
+    bare_field_context_matches_target, bare_method_context_matches_target,
+    constructor_method_reference_receiver, has_proven_static_import, infer_type_from_value,
+    is_declaration_name, is_ignored_type_context, java_method_signatures_match,
+    nested_type_for_owner, node_text, receiver_matches_target, resolve_field_access_type,
+    resolve_field_access_type_segments, resolve_non_nested_type_from_node, resolve_type_from_node,
+    resolve_type_segments, same_owner_context, seed_class_binding,
 };
-use crate::analyzer::usages::java_graph::return_type::{FileReturnCache, MethodReturnCache};
+use crate::analyzer::usages::java_graph::return_type::{
+    FileReturnCache, MethodAnonymousReturnCache, MethodReturnCache,
+};
 use crate::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
@@ -35,6 +37,12 @@ pub(super) struct ScanState<'a> {
     pub(super) limit_exceeded: &'a mut bool,
 }
 
+pub(super) struct ReturnTypeCaches<'a> {
+    pub(super) method_return: &'a MethodReturnCache,
+    pub(super) method_anonymous_return: &'a MethodAnonymousReturnCache,
+    pub(super) file_return: &'a FileReturnCache,
+}
+
 pub(super) struct ScanCtx<'a> {
     pub(super) java: &'a JavaAnalyzer,
     pub(super) analyzer: &'a dyn IAnalyzer,
@@ -53,6 +61,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) method_call_return_cache:
         RefCell<HashMap<MethodCallReturnCacheKey, ReceiverAnalysisOutcome<String>>>,
     pub(super) method_return_cache: &'a MethodReturnCache,
+    pub(super) method_anonymous_return_cache: &'a MethodAnonymousReturnCache,
     pub(super) file_return_cache: &'a FileReturnCache,
     pub(super) enclosing_cache: HashMap<(usize, usize), hits::EnclosingContext>,
     class_scope_depths: Vec<usize>,
@@ -63,8 +72,7 @@ pub(super) fn scan_file(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     spec: &TargetSpec,
-    method_return_cache: &MethodReturnCache,
-    file_return_cache: &FileReturnCache,
+    return_caches: &ReturnTypeCaches<'_>,
     state: &mut ScanState<'_>,
 ) {
     if *state.limit_exceeded {
@@ -106,8 +114,9 @@ pub(super) fn scan_file(
         limit_exceeded: state.limit_exceeded,
         class_ranges: ClassRangeIndex::build(analyzer, file),
         method_call_return_cache: RefCell::new(HashMap::default()),
-        method_return_cache,
-        file_return_cache,
+        method_return_cache: return_caches.method_return,
+        method_anonymous_return_cache: return_caches.method_anonymous_return,
+        file_return_cache: return_caches.file_return,
         enclosing_cache: HashMap::default(),
         class_scope_depths: Vec::new(),
     };
@@ -577,16 +586,17 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
 
-    let receiver_matches = if let Some(object) = node.child_by_field_name("object") {
+    let receiver_match = if let Some(object) = node.child_by_field_name("object") {
         receiver_matches_target(object, ctx)
+    } else if bare_method_context_matches_target(node, ctx) || has_proven_static_import(ctx) {
+        ReceiverTargetMatch::Matched
     } else {
-        bare_method_context_matches_target(node, ctx) || has_proven_static_import(ctx)
+        ReceiverTargetMatch::Unresolved
     };
-
-    if receiver_matches {
-        hits::push_hit(name_node, ctx);
-    } else {
-        hits::push_unproven_hit(name_node, ctx);
+    match receiver_match {
+        ReceiverTargetMatch::Matched => hits::push_hit(name_node, ctx),
+        ReceiverTargetMatch::Unresolved => hits::push_unproven_hit(name_node, ctx),
+        ReceiverTargetMatch::Incompatible => {}
     }
 }
 
@@ -767,10 +777,11 @@ fn maybe_record_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             return;
         }
         if let Some(object) = node.child_by_field_name("object") {
-            if receiver_matches_target(object, ctx) {
-                hits::push_hit(field_node, ctx);
-            } else {
-                hits::push_unproven_hit(field_node, ctx);
+            match receiver_matches_target(object, ctx) {
+                ReceiverTargetMatch::Matched => hits::push_hit(field_node, ctx),
+                ReceiverTargetMatch::Unresolved | ReceiverTargetMatch::Incompatible => {
+                    hits::push_unproven_hit(field_node, ctx)
+                }
             }
         }
         return;
@@ -848,14 +859,21 @@ fn maybe_record_lombok_accessor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bo
         return true;
     }
 
-    let receiver_matches = node
+    let receiver_match = node
         .child_by_field_name("object")
         .map(|object| receiver_matches_target(object, ctx))
-        .unwrap_or_else(|| bare_field_context_matches_target(node, ctx));
-    if receiver_matches {
-        hits::push_hit(member, ctx);
-    } else {
-        hits::push_unproven_hit(member, ctx);
+        .unwrap_or_else(|| {
+            if bare_field_context_matches_target(node, ctx) {
+                ReceiverTargetMatch::Matched
+            } else {
+                ReceiverTargetMatch::Unresolved
+            }
+        });
+    match receiver_match {
+        ReceiverTargetMatch::Matched => hits::push_hit(member, ctx),
+        ReceiverTargetMatch::Unresolved | ReceiverTargetMatch::Incompatible => {
+            hits::push_unproven_hit(member, ctx)
+        }
     }
     true
 }

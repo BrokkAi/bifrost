@@ -24,8 +24,9 @@ use super::resolver::{
 };
 use super::return_type::{
     FileReturnCache, JavaReturnTypeContext, LexicalTypeResolution, METHOD_RECEIVER_CHAIN_LIMIT,
-    METHOD_RECEIVER_CHAIN_LIMIT_NAME, MethodReturnCache, java_lexical_type_from_node,
-    java_type_name_from_node, merge_receiver_type_outcomes, method_return_type_for_owner_fqn,
+    METHOD_RECEIVER_CHAIN_LIMIT_NAME, MethodAnonymousReturnCache, MethodReturnCache,
+    java_lexical_type_from_node, java_type_name_from_node, merge_receiver_type_outcomes,
+    method_return_type_for_owner_fqn,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
@@ -55,6 +56,7 @@ where
 {
     let language = tree_sitter_java::LANGUAGE.into();
     let return_type_cache: MethodReturnCache = Mutex::new(HashMap::default());
+    let anonymous_return_cache: MethodAnonymousReturnCache = Mutex::new(HashMap::default());
     let file_return_cache: FileReturnCache = Mutex::new(HashMap::default());
     build_edge_output(files, keep_file, |file| {
         let state = file_states.get(file);
@@ -78,6 +80,7 @@ where
                     root: parsed.tree.root_node(),
                     class_ranges,
                     return_type_cache: &return_type_cache,
+                    anonymous_return_cache: &anonymous_return_cache,
                     file_return_cache: &file_return_cache,
                     collector,
                 };
@@ -96,6 +99,7 @@ struct JavaScan<'a, 'b> {
     root: Node<'a>,
     class_ranges: ClassRangeIndex,
     return_type_cache: &'a MethodReturnCache,
+    anonymous_return_cache: &'a MethodAnonymousReturnCache,
     file_return_cache: &'a FileReturnCache,
     collector: &'a mut EdgeCollector<'b>,
 }
@@ -169,6 +173,10 @@ impl JavaReturnTypeContext for JavaScan<'_, '_> {
 
     fn method_return_cache(&self) -> &MethodReturnCache {
         self.return_type_cache
+    }
+
+    fn method_anonymous_return_cache(&self) -> &MethodAnonymousReturnCache {
+        self.anonymous_return_cache
     }
 
     fn file_return_cache(&self) -> &FileReturnCache {
