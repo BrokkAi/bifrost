@@ -291,14 +291,30 @@ impl RustPhysicalOwnerIndex {
             let declared = identity
                 .module
                 .with_suffix(std::slice::from_ref(&identity.name));
-            edges.entry(identity.file.clone()).or_default().extend(
-                module_files
-                    .files_for_module(&declared)
-                    .into_iter()
-                    .filter(|file| {
-                        file != &identity.file && physical_roots.get(file) == Some(&declared)
-                    }),
-            );
+            let mut children: Vec<_> = module_files
+                .files_for_module(&declared)
+                .into_iter()
+                .filter(|file| {
+                    file != &identity.file && physical_roots.get(file) == Some(&declared)
+                })
+                .collect();
+            if let Some(physical_root) = physical_roots.get(&identity.file)
+                && let Some(relative_segments) = declared
+                    .components
+                    .strip_prefix(physical_root.components.as_slice())
+            {
+                children.extend(
+                    rust_module_files_from_segments(&identity.file, relative_segments)
+                        .into_iter()
+                        .filter(|file| file != &identity.file && physical_roots.contains_key(file)),
+                );
+            }
+            children.sort();
+            children.dedup();
+            edges
+                .entry(identity.file.clone())
+                .or_default()
+                .extend(children);
         }
 
         let mut index = Self::default();
