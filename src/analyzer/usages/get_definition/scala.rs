@@ -17,12 +17,13 @@ use crate::analyzer::usages::scala_graph::namespace::{
 };
 use crate::analyzer::usages::scala_graph::syntax::{
     ScalaCallArgumentListKind, ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableRole,
-    ScalaCallableSiteRole, ScalaParameterListKind, ScalaParameterTypeIdentity,
-    ScalaQualifiedStableTypeRole, applied_expression_for_reference, call_arities_for_reference,
-    call_site_shape_for_reference, is_extractor_reference, is_infix_type_operator_reference,
-    is_scala_case_pattern_binder, is_scala_named_argument_assignment,
-    qualified_stable_type_reference, scala_callable_alternative_is_candidate,
-    scala_callable_alternative_matches, scala_pattern_binder_names,
+    ScalaCallableSiteRole, ScalaCallableSourceAlternative, ScalaFunctionParameterShape,
+    ScalaParameterListKind, ScalaParameterTypeIdentity, ScalaQualifiedStableTypeRole,
+    applied_expression_for_reference, call_arities_for_reference, call_site_shape_for_reference,
+    is_extractor_reference, is_infix_type_operator_reference, is_scala_case_pattern_binder,
+    is_scala_named_argument_assignment, qualified_stable_type_reference,
+    scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
+    scala_pattern_binder_names, scala_source_facts,
 };
 use crate::analyzer::usages::scala_graph::{
     method_signature_arity, resolved_extension_receiver_type,
@@ -34,6 +35,14 @@ use std::collections::VecDeque;
 struct ForwardScalaExtensionMethod {
     fqn: String,
     receiver_type: Option<String>,
+}
+
+#[derive(Clone)]
+struct ForwardScalaCallableAlternative {
+    role: ScalaCallableRole,
+    shape: Vec<ScalaCallableParameterList>,
+    parameter_types: Vec<Vec<Option<ScalaParameterTypeIdentity>>>,
+    parameter_function_shapes: Vec<Vec<Option<ScalaFunctionParameterShape>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -2424,17 +2433,31 @@ fn scala_forward_method_value_arity(
     methods.sort();
     methods.dedup();
     let mut resolved = None;
+    let actual = ScalaCallSiteShape::ordinary(&call_arities);
     for method in methods {
-        let arity = ctx
-            .scala
-            .project_types()
-            .callable_parameter_function_arity(
-                ctx.scala,
-                &method,
-                &call_arities,
-                parameter_list,
-                parameter_index,
-            )?;
+        let alternatives = scala_forward_callable_alternatives(ctx.scala, ctx.support, &method);
+        let mut method_arity = None;
+        for alternative in alternatives.iter().filter(|alternative| {
+            scala_callable_alternative_matches(
+                alternative.role,
+                &alternative.shape,
+                Some(&actual),
+                ScalaCallableSiteRole::Ordinary,
+                true,
+            )
+        }) {
+            let arity = alternative
+                .parameter_function_shapes
+                .get(parameter_list)
+                .and_then(|parameters| parameters.get(parameter_index))
+                .and_then(Option::as_ref)
+                .map(|shape| shape.arity)?;
+            if method_arity.is_some_and(|resolved| resolved != arity) {
+                return None;
+            }
+            method_arity = Some(arity);
+        }
+        let arity = method_arity?;
         if resolved.is_some_and(|resolved| resolved != arity) {
             return None;
         }
@@ -3052,13 +3075,30 @@ fn resolve_scala_constructor(
         }
         ScalaPhysicalCallableCandidates::NoCandidates => {}
     }
-    if ctx.scala.project_types().constructor_target_matches(
-        ctx.scala,
-        &exact_owner,
-        call_shape.as_ref(),
-        ScalaCallableSiteRole::ExplicitConstruction,
-    ) && !constructor_units.iter().any(CodeUnit::is_synthetic)
-    {
+    let owner_alternatives =
+        scala_forward_callable_alternatives(ctx.scala, ctx.support, &exact_owner);
+    let owner_matches = if owner_alternatives.is_empty() {
+        scala_callable_alternative_matches(
+            ScalaCallableRole::PrimaryConstructor,
+            &[ScalaCallableParameterList::explicit(
+                crate::analyzer::CallableArity::exact(0),
+            )],
+            call_shape.as_ref(),
+            ScalaCallableSiteRole::ExplicitConstruction,
+            false,
+        )
+    } else {
+        owner_alternatives.iter().any(|alternative| {
+            scala_callable_alternative_matches(
+                alternative.role,
+                &alternative.shape,
+                call_shape.as_ref(),
+                ScalaCallableSiteRole::ExplicitConstruction,
+                false,
+            )
+        })
+    };
+    if owner_matches && !constructor_units.iter().any(CodeUnit::is_synthetic) {
         return candidates_outcome(vec![exact_owner]);
     }
     if !constructor_units.is_empty()
@@ -3611,11 +3651,7 @@ fn scala_exact_owner_typed_overload_resolution(
                 Some(call_shape),
                 ScalaCallableSiteRole::Ordinary,
             ));
-            match ctx
-                .scala
-                .project_types()
-                .exact_direct_ancestor_resolution(ctx.scala, &current)
-            {
+            match scala_forward_direct_ancestor_resolution(ctx.scala, ctx.support, &current) {
                 ScalaDirectAncestorResolution::Resolved(ancestors) => next.extend(ancestors),
                 ScalaDirectAncestorResolution::Ambiguous => {
                     return ScalaTypedOverloadResolution::Ambiguous;
@@ -3717,10 +3753,7 @@ fn scala_callable_matches_constructed_arguments(
     call_shape: &ScalaCallSiteShape,
     arguments: &[CodeUnit],
 ) -> ScalaTypedCandidateMatch {
-    let alternatives = ctx
-        .scala
-        .project_types()
-        .callable_alternatives_for(ctx.scala, candidate);
+    let alternatives = scala_forward_callable_alternatives(ctx.scala, ctx.support, candidate);
     if alternatives.is_empty() {
         return ScalaTypedCandidateMatch::Unknown;
     }
@@ -3798,11 +3831,7 @@ fn scala_exact_subtype_relation(
         if current == *expected {
             return ScalaTypedCandidateMatch::Match;
         }
-        match ctx
-            .scala
-            .project_types()
-            .exact_direct_ancestor_resolution(ctx.scala, &current)
-        {
+        match scala_forward_direct_ancestor_resolution(ctx.scala, ctx.support, &current) {
             ScalaDirectAncestorResolution::Resolved(ancestors) => stack.extend(ancestors),
             ScalaDirectAncestorResolution::Ambiguous => {
                 return ScalaTypedCandidateMatch::Unknown;
@@ -3823,11 +3852,7 @@ fn scala_exact_owner_member_candidate_units(
         return ScalaExactMemberResolution::Found(direct);
     }
 
-    let mut level = match ctx
-        .scala
-        .project_types()
-        .exact_direct_ancestor_resolution(ctx.scala, owner)
-    {
+    let mut level = match scala_forward_direct_ancestor_resolution(ctx.scala, ctx.support, owner) {
         ScalaDirectAncestorResolution::Resolved(ancestors) => ancestors,
         ScalaDirectAncestorResolution::Ambiguous => {
             return ScalaExactMemberResolution::Ambiguous;
@@ -3845,11 +3870,7 @@ fn scala_exact_owner_member_candidate_units(
             matches.extend(scala_direct_member_candidate_units_for_owner(
                 ctx, &ancestor, member,
             ));
-            match ctx
-                .scala
-                .project_types()
-                .exact_direct_ancestor_resolution(ctx.scala, &ancestor)
-            {
+            match scala_forward_direct_ancestor_resolution(ctx.scala, ctx.support, &ancestor) {
                 ScalaDirectAncestorResolution::Resolved(ancestors) => next.extend(ancestors),
                 ScalaDirectAncestorResolution::Ambiguous => next_is_ambiguous = true,
             }
@@ -3942,6 +3963,107 @@ fn scala_applicable_callable_candidate_units(
     )
 }
 
+fn scala_forward_callable_type_identity(
+    resolver: &ScalaNameResolver<'_>,
+    path: &[String],
+) -> Option<ScalaParameterTypeIdentity> {
+    match resolver.resolve_owner_segments(path, ScalaOwnerKind::Class) {
+        ScalaNameResolution::Resolved(owner) => {
+            Some(ScalaParameterTypeIdentity::Declaration(owner._declaration))
+        }
+        ScalaNameResolution::Unresolved => {
+            let [simple] = path else {
+                return None;
+            };
+            scala_builtin_type_name(simple).map(ScalaParameterTypeIdentity::Builtin)
+        }
+        ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous => None,
+    }
+}
+
+/// Decode only the declaration source and exact ranges needed by this forward
+/// request.  The inverse `ScalaProjectTypes` projection intentionally remains
+/// a whole-workspace facility and must not be constructed from this path.
+fn scala_forward_callable_alternatives(
+    scala: &ScalaAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    target: &CodeUnit,
+) -> Vec<ForwardScalaCallableAlternative> {
+    let resolver = scala_name_resolver_for_unit(scala, support, target);
+    scala_forward_callable_source_alternatives(scala, target)
+        .iter()
+        .map(|facts| ForwardScalaCallableAlternative {
+            role: facts.role,
+            shape: facts.shape.clone(),
+            parameter_types: facts
+                .parameter_type_paths
+                .iter()
+                .map(|parameters| {
+                    parameters
+                        .iter()
+                        .map(|path| {
+                            path.as_deref().and_then(|path| {
+                                scala_forward_callable_type_identity(&resolver, path)
+                            })
+                        })
+                        .collect()
+                })
+                .collect(),
+            parameter_function_shapes: facts
+                .parameter_function_arities
+                .iter()
+                .zip(&facts.parameter_function_type_paths)
+                .map(|(arities, parameter_paths)| {
+                    arities
+                        .iter()
+                        .zip(parameter_paths)
+                        .map(|(arity, paths)| {
+                            let arity = (*arity)?;
+                            let parameter_types = paths.as_ref().and_then(|paths| {
+                                paths
+                                    .iter()
+                                    .map(|path| {
+                                        path.as_deref().and_then(|path| {
+                                            scala_forward_callable_type_identity(&resolver, path)
+                                        })
+                                    })
+                                    .collect::<Option<Vec<_>>>()
+                            });
+                            Some(ScalaFunctionParameterShape {
+                                arity,
+                                parameter_types,
+                                parameter_types_authoritative: true,
+                            })
+                        })
+                        .collect()
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn scala_forward_callable_source_alternatives(
+    scala: &ScalaAnalyzer,
+    target: &CodeUnit,
+) -> Vec<ScalaCallableSourceAlternative> {
+    let Some(source) = scala.indexed_source(target.source()) else {
+        return Vec::new();
+    };
+    let Some(source_facts) = scala_source_facts(&source) else {
+        return Vec::new();
+    };
+    scala
+        .ranges(target)
+        .into_iter()
+        .filter_map(|range| {
+            source_facts
+                .callable_alternatives_by_range
+                .get(&(range.start_byte, range.end_byte))
+                .cloned()
+        })
+        .collect()
+}
+
 fn scala_filter_callable_units(
     scala: &ScalaAnalyzer,
     candidates: Vec<CodeUnit>,
@@ -3952,7 +4074,7 @@ fn scala_filter_callable_units(
         .iter()
         .filter(|unit| unit.is_function())
         .map(|unit| {
-            let alternatives = scala.project_types().callable_alternatives_for(scala, unit);
+            let alternatives = scala_forward_callable_source_alternatives(scala, unit);
             if let Some(call_shape) = call_shape {
                 if !alternatives.is_empty() {
                     return alternatives
@@ -4026,7 +4148,7 @@ fn scala_member_unit_applies(
     if !unit.is_function() {
         return false;
     }
-    let alternatives = scala.project_types().callable_alternatives_for(scala, unit);
+    let alternatives = scala_forward_callable_source_alternatives(scala, unit);
     if !alternatives.is_empty() {
         return alternatives.iter().any(|alternative| {
             scala_callable_alternative_matches(
@@ -4076,7 +4198,7 @@ fn scala_constructor_only_callable(scala: &ScalaAnalyzer, unit: &CodeUnit) -> bo
     if !unit.is_function() {
         return false;
     }
-    let alternatives = scala.project_types().callable_alternatives_for(scala, unit);
+    let alternatives = scala_forward_callable_source_alternatives(scala, unit);
     if alternatives.is_empty() {
         return matches!(
             scala_fallback_callable_role(scala, unit),
@@ -4120,7 +4242,7 @@ fn scala_unit_has_callable_role(
     unit: &CodeUnit,
     role: ScalaCallableRole,
 ) -> bool {
-    let alternatives = scala.project_types().callable_alternatives_for(scala, unit);
+    let alternatives = scala_forward_callable_source_alternatives(scala, unit);
     if alternatives.is_empty() {
         scala_fallback_callable_role(scala, unit) == role
     } else {
@@ -4297,30 +4419,81 @@ fn scala_ancestor_owners(
     let mut discovered = HashSet::from_iter([owner.fq_name()]);
     let mut ancestors = Vec::new();
     while let Some((current, depth)) = queue.pop_front() {
-        let Some(facts) = scala.forward_owner_facts(&current) else {
-            continue;
+        let ScalaDirectAncestorResolution::Resolved(direct) =
+            scala_forward_direct_ancestor_resolution(scala, support, &current)
+        else {
+            break;
         };
-        let resolver = scala_name_resolver_for_unit(scala, support, &current);
-        for lookup_path in facts.supertype_lookup_paths {
-            let ScalaNameResolution::Resolved(identity) =
-                resolver.resolve_lookup_path(&lookup_path, ScalaOwnerKind::Class)
-            else {
-                continue;
-            };
-            for ancestor in support
-                .fqn(&identity.fqn)
-                .into_iter()
-                .filter(|unit| unit.is_class() && unit.fq_name() == identity.fqn)
-            {
-                if discovered.insert(ancestor.fq_name()) {
-                    let ancestor_depth = depth + 1;
-                    ancestors.push((ancestor.clone(), ancestor_depth));
-                    queue.push_back((ancestor, ancestor_depth));
-                }
+        for ancestor in direct {
+            if discovered.insert(ancestor.fq_name()) {
+                let ancestor_depth = depth + 1;
+                ancestors.push((ancestor.clone(), ancestor_depth));
+                queue.push_back((ancestor, ancestor_depth));
             }
         }
     }
     ancestors
+}
+
+fn scala_forward_direct_ancestor_resolution(
+    scala: &ScalaAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    owner: &CodeUnit,
+) -> ScalaDirectAncestorResolution {
+    let Some(facts) = scala.forward_owner_facts(owner) else {
+        return ScalaDirectAncestorResolution::Resolved(Vec::new());
+    };
+    let resolver = scala_name_resolver_for_unit(scala, support, owner);
+    let mut ancestors = Vec::new();
+    for path in facts.supertype_lookup_paths {
+        let identity = match resolver
+            .resolve_explicit_owner_segments(path.segments(), ScalaOwnerKind::Class)
+        {
+            ScalaNameResolution::Resolved(identity) => identity,
+            ScalaNameResolution::Ambiguous => return ScalaDirectAncestorResolution::Ambiguous,
+            ScalaNameResolution::MissingExplicitImport => continue,
+            ScalaNameResolution::Unresolved => {
+                match resolver.resolve_lookup_path(&path, ScalaOwnerKind::Class) {
+                    ScalaNameResolution::Resolved(identity) => identity,
+                    ScalaNameResolution::Ambiguous
+                        if !resolver.visible_imports().any(|import| import.is_wildcard) =>
+                    {
+                        let mut same_source = scala_nested_type_candidates(
+                            owner.package_name().to_string(),
+                            path.segments(),
+                            false,
+                        )
+                        .into_iter()
+                        .flat_map(|fqn| support.fqn(&fqn))
+                        .filter(|unit| {
+                            unit.is_class()
+                                && unit.source() == owner.source()
+                                && !unit.short_name().ends_with('$')
+                        })
+                        .collect::<Vec<_>>();
+                        sort_units(&mut same_source);
+                        same_source.dedup();
+                        let [ancestor] = same_source.as_slice() else {
+                            return ScalaDirectAncestorResolution::Ambiguous;
+                        };
+                        ancestors.push(ancestor.clone());
+                        continue;
+                    }
+                    ScalaNameResolution::Ambiguous => {
+                        return ScalaDirectAncestorResolution::Ambiguous;
+                    }
+                    ScalaNameResolution::MissingExplicitImport => continue,
+                    ScalaNameResolution::Unresolved => {
+                        return ScalaDirectAncestorResolution::Ambiguous;
+                    }
+                }
+            }
+        };
+        ancestors.push(identity._declaration);
+    }
+    sort_units(&mut ancestors);
+    ancestors.dedup();
+    ScalaDirectAncestorResolution::Resolved(ancestors)
 }
 
 fn scala_direct_member_candidate_units(
@@ -5040,11 +5213,7 @@ fn scala_exact_lexical_type_namespace(
                 })
                 .collect()
         },
-        |owner| {
-            ctx.scala
-                .project_types()
-                .exact_direct_ancestor_resolution(ctx.scala, owner)
-        },
+        |owner| scala_forward_direct_ancestor_resolution(ctx.scala, ctx.support, owner),
     )
 }
 
@@ -5058,11 +5227,7 @@ fn scala_exact_owner_namespace_children(
         return ScalaExactMemberResolution::Found(direct);
     }
 
-    let mut level = match ctx
-        .scala
-        .project_types()
-        .exact_direct_ancestor_resolution(ctx.scala, owner)
-    {
+    let mut level = match scala_forward_direct_ancestor_resolution(ctx.scala, ctx.support, owner) {
         ScalaDirectAncestorResolution::Resolved(ancestors) => ancestors,
         ScalaDirectAncestorResolution::Ambiguous => {
             return ScalaExactMemberResolution::Ambiguous;
@@ -5079,11 +5244,7 @@ fn scala_exact_owner_namespace_children(
             matches.extend(scala_exact_direct_namespace_children(
                 ctx, &ancestor, name, None,
             ));
-            match ctx
-                .scala
-                .project_types()
-                .exact_direct_ancestor_resolution(ctx.scala, &ancestor)
-            {
+            match scala_forward_direct_ancestor_resolution(ctx.scala, ctx.support, &ancestor) {
                 ScalaDirectAncestorResolution::Resolved(ancestors) => next.extend(ancestors),
                 ScalaDirectAncestorResolution::Ambiguous => {
                     return ScalaExactMemberResolution::Ambiguous;

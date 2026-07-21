@@ -1643,24 +1643,6 @@ impl ProjectTypes {
             || member.is_class() && self.type_is_stable_owner(scala, member)
     }
 
-    pub(crate) fn callable_parameter_function_arity(
-        &self,
-        scala: &ScalaAnalyzer,
-        method: &CodeUnit,
-        call_arities: &[usize],
-        parameter_list: usize,
-        parameter_index: usize,
-    ) -> Option<usize> {
-        self.callable_parameter_function_shape(
-            scala,
-            method,
-            call_arities,
-            parameter_list,
-            parameter_index,
-        )
-        .map(|shape| shape.arity)
-    }
-
     pub(crate) fn callable_parameter_function_shape(
         &self,
         scala: &ScalaAnalyzer,
