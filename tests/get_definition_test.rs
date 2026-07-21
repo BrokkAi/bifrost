@@ -11198,6 +11198,166 @@ public class ImportedFields {
 }
 
 #[test]
+fn java_enclosing_end_field_ignores_locals_from_earlier_sibling_methods() {
+    let source = r#"
+package com.alibaba.fastjson2;
+
+import static com.alibaba.fastjson2.JSONReaderUTF8.*;
+
+final class JSONReaderJSONB {
+    final int end = 10;
+
+    int earlierSibling() {
+        int end = 1;
+        return end; // same-method-local
+    }
+
+    int parameterShadow(int end) {
+        return end; // same-method-parameter
+    }
+
+    int blockShadow() {
+        {
+            int end = 2;
+            return end; // active-block-local
+        }
+    }
+
+    int afterBlock() {
+        {
+            int end = 3;
+        }
+        return end; // field-after-block
+    }
+
+    int targetWitness() {
+        return end; // field-after-sibling-local
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "com/alibaba/fastjson2/JSONReaderUTF8.java",
+            r#"
+package com.alibaba.fastjson2;
+
+public class JSONReaderUTF8 {
+    public static int end;
+}
+"#,
+        )
+        .file("com/alibaba/fastjson2/JSONReaderJSONB.java", source)
+        .build();
+
+    for marker in [
+        "end; // field-after-sibling-local",
+        "end; // field-after-block",
+    ] {
+        let start = source.find(marker).expect("enclosing end witness");
+        let value = lookup(
+            project.root(),
+            &location_reference("com/alibaba/fastjson2/JSONReaderJSONB.java", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{marker}: {value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], "com.alibaba.fastjson2.JSONReaderJSONB.end",
+            "{marker}: {value}"
+        );
+    }
+
+    for marker in ["end; // same-method-local", "end; // active-block-local"] {
+        let start = source.find(marker).expect("lexical shadow witness");
+        let value = lookup(
+            project.root(),
+            &location_reference("com/alibaba/fastjson2/JSONReaderJSONB.java", source, start),
+        );
+        assert_eq!(
+            value["results"][0]["status"], "no_definition",
+            "the active lexical binding must shadow both fields: {marker}: {value}"
+        );
+    }
+
+    let parameter = source
+        .find("end; // same-method-parameter")
+        .expect("parameter shadow witness");
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "com/alibaba/fastjson2/JSONReaderJSONB.java",
+            source,
+            parameter,
+        ),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["kind"], "parameter",
+        "the parameter must shadow both enclosing and imported fields: {value}"
+    );
+}
+
+#[test]
+fn java_enclosing_instance_type_field_ignores_constructor_and_sibling_parameters() {
+    let source = r#"
+package com.alibaba.fastjson2.reader;
+
+import static com.alibaba.fastjson2.reader.ObjectReaderImplMap.*;
+
+public class ObjectReaderImplMapMultiValueType {
+    final Class instanceType;
+
+    public ObjectReaderImplMapMultiValueType(Class mapType) {
+        Class instanceType = mapType;
+        this.instanceType = instanceType;
+    }
+
+    int earlierSibling(Class instanceType) {
+        return instanceType.hashCode();
+    }
+
+    Class createInstance() {
+        return instanceType; // retained-instanceType-witness
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "com/alibaba/fastjson2/reader/ObjectReaderImplMap.java",
+            r#"
+package com.alibaba.fastjson2.reader;
+
+public class ObjectReaderImplMap {
+    public Class instanceType;
+}
+"#,
+        )
+        .file(
+            "com/alibaba/fastjson2/reader/ObjectReaderImplMapMultiValueType.java",
+            source,
+        )
+        .build();
+
+    let start = source
+        .find("instanceType; // retained-instanceType-witness")
+        .expect("retained instanceType witness");
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "com/alibaba/fastjson2/reader/ObjectReaderImplMapMultiValueType.java",
+            source,
+            start,
+        ),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"],
+        "com.alibaba.fastjson2.reader.ObjectReaderImplMapMultiValueType.instanceType",
+        "{value}"
+    );
+}
+
+#[test]
 fn java_typed_receiver_method_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

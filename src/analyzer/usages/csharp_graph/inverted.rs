@@ -22,8 +22,8 @@ use super::extractor::{
     member_access_receiver,
 };
 use super::resolver::{
-    UnqualifiedMethodGroupResolution, applicable_member_candidates_for_owner, argument_count,
-    class_unit_for_fq_name, extension_visibility_site_key, first_type_child,
+    UnqualifiedMethodGroupResolution, argument_count, class_unit_for_fq_name,
+    extension_visibility_site_key, first_type_child, invocation_member_candidates_for_owner,
     is_member_variable_declaration, is_type_reference_node, nearest_member_candidates_for_owner,
     node_text, object_initializer_for_label, object_initializer_owner_type_node,
     reference_type_text, resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner,
@@ -157,7 +157,7 @@ impl CsScan<'_, '_> {
                             )
                         },
                         |arity| {
-                            applicable_member_candidates_for_owner(
+                            invocation_member_candidates_for_owner(
                                 self.analyzer,
                                 self.csharp,
                                 &owner,

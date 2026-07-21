@@ -8,8 +8,9 @@ use crate::analyzer::usages::java_graph::resolver::{
     bare_method_context_matches_target, constructor_method_reference_receiver,
     has_proven_static_import, infer_type_from_value, is_declaration_name, is_ignored_type_context,
     java_method_signatures_match, nested_type_for_owner, node_text, receiver_matches_target,
-    resolve_field_access_type, resolve_non_nested_type_from_node, resolve_type_from_node,
-    resolve_type_segments, same_owner_context, seed_class_binding,
+    resolve_field_access_type, resolve_field_access_type_segments,
+    resolve_non_nested_type_from_node, resolve_type_from_node, resolve_type_segments,
+    same_owner_context, seed_class_binding,
 };
 use crate::analyzer::usages::java_graph::return_type::{FileReturnCache, MethodReturnCache};
 use crate::analyzer::usages::local_inference::{
@@ -319,12 +320,14 @@ fn maybe_record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if let Some(receiver) = constructor_method_reference_receiver(node) {
-        if resolve_type_from_node(receiver, ctx)
-            .is_some_and(|owner| owner.fq_name() == ctx.spec.owner.fq_name())
-        {
-            hits::push_hit(receiver, ctx);
+    if node.kind() == "method_reference" {
+        if let Some(receiver) = node.named_child(0) {
+            record_selector_type_segments(receiver, ctx);
         }
+        return;
+    }
+    if node.kind() == "field_access" {
+        record_selector_type_segments(node, ctx);
         return;
     }
     if maybe_record_static_qualifier_type_hit(node, ctx) {
@@ -355,6 +358,49 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         if resolved.fq_name() == ctx.spec.owner.fq_name() {
             hits::push_hit(segment, ctx);
         }
+    }
+}
+
+fn record_selector_type_segments(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let segments = match node.kind() {
+        "field_access" => resolve_field_access_type_segments(
+            node,
+            ctx.source,
+            |base| Ok(resolve_selector_root_type(base, ctx)),
+            |qualified| ctx.java.resolve_usage_type_name(ctx.file, qualified),
+            |owner, name| nested_type_for_owner(owner, name, ctx),
+        ),
+        "identifier"
+        | "type_identifier"
+        | "scoped_identifier"
+        | "scoped_type_identifier"
+        | "generic_type" => resolve_type_segments(
+            node,
+            ctx.source,
+            |candidate| resolve_selector_root_type(candidate, ctx),
+            |owner, name| nested_type_for_owner(owner, name, ctx),
+        ),
+        _ => Vec::new(),
+    };
+    for (resolved, segment) in segments {
+        if resolved.fq_name() == ctx.spec.owner.fq_name() {
+            hits::push_hit(segment, ctx);
+        }
+    }
+}
+
+fn resolve_selector_root_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
+    let name = node_text(node, ctx.source);
+    let direct = || {
+        ctx.java
+            .resolve_usage_type_name(ctx.file, name)
+            .or_else(|| resolve_non_nested_type_from_node(node, ctx))
+    };
+    match ctx.bindings.resolve_symbol(name) {
+        SymbolResolution::Precise(_) => direct(),
+        SymbolResolution::Ambiguous => None,
+        SymbolResolution::Unknown if ctx.bindings.is_shadowed(name) => None,
+        SymbolResolution::Unknown => direct(),
     }
 }
 

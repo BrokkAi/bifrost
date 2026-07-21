@@ -603,50 +603,99 @@ where
 pub(super) fn resolve_field_access_type<ResolveBase, ResolveQualified, ResolveNested>(
     node: Node<'_>,
     source: &str,
-    mut resolve_base: ResolveBase,
-    mut resolve_qualified: ResolveQualified,
-    mut resolve_nested: ResolveNested,
+    resolve_base: ResolveBase,
+    resolve_qualified: ResolveQualified,
+    resolve_nested: ResolveNested,
 ) -> Option<CodeUnit>
 where
     ResolveBase: FnMut(Node<'_>) -> Result<Option<CodeUnit>, ()>,
     ResolveQualified: FnMut(&str) -> Option<CodeUnit>,
     ResolveNested: FnMut(&CodeUnit, &str) -> Option<CodeUnit>,
 {
+    let terminal = node.child_by_field_name("field")?;
+    resolve_field_access_type_segments(
+        node,
+        source,
+        resolve_base,
+        resolve_qualified,
+        resolve_nested,
+    )
+    .into_iter()
+    .last()
+    .filter(|(_, segment)| segment.id() == terminal.id())
+    .map(|(resolved, _)| resolved)
+}
+
+/// Resolve every declaration-backed type prefix in an expression-shaped Java
+/// selector. Unlike [`resolve_field_access_type`], this intentionally retains
+/// a proven intermediate type when a later component is an ordinary field or
+/// method member. The exact identifier node paired with each type lets callers
+/// report `Feature` in `JSONWriter.Feature.FieldBased` without misclassifying
+/// `FieldBased` itself as a type.
+pub(super) fn resolve_field_access_type_segments<
+    'tree,
+    ResolveBase,
+    ResolveQualified,
+    ResolveNested,
+>(
+    node: Node<'tree>,
+    source: &str,
+    mut resolve_base: ResolveBase,
+    mut resolve_qualified: ResolveQualified,
+    mut resolve_nested: ResolveNested,
+) -> Vec<(CodeUnit, Node<'tree>)>
+where
+    ResolveBase: FnMut(Node<'tree>) -> Result<Option<CodeUnit>, ()>,
+    ResolveQualified: FnMut(&str) -> Option<CodeUnit>,
+    ResolveNested: FnMut(&CodeUnit, &str) -> Option<CodeUnit>,
+{
     if node.kind() != "field_access" {
-        return None;
+        return Vec::new();
     }
 
     let mut components = Vec::new();
     let mut current = node;
     while current.kind() == "field_access" {
-        let field = current.child_by_field_name("field")?;
+        let Some(field) = current.child_by_field_name("field") else {
+            return Vec::new();
+        };
         if field.kind() != "identifier" {
-            return None;
+            return Vec::new();
         }
         components.push(field);
-        current = current.child_by_field_name("object")?;
+        let Some(object) = current.child_by_field_name("object") else {
+            return Vec::new();
+        };
+        current = object;
     }
     if !matches!(current.kind(), "identifier" | "type_identifier") {
-        return None;
+        return Vec::new();
     }
     components.push(current);
     components.reverse();
 
     let mut qualified = node_text(components[0], source).to_string();
     if qualified.is_empty() {
-        return None;
+        return Vec::new();
     }
-    let mut owner = resolve_base(components[0]).ok()?;
+    let Ok(mut owner) = resolve_base(components[0]) else {
+        return Vec::new();
+    };
+    let mut segments = Vec::new();
     let mut consumed = 1;
+    if let Some(resolved) = owner.as_ref() {
+        segments.push((resolved.clone(), components[0]));
+    }
     if owner.is_none() {
         for (index, component) in components[1..].iter().enumerate() {
             let name = node_text(*component, source);
             if name.is_empty() {
-                return None;
+                return Vec::new();
             }
             qualified.push('.');
             qualified.push_str(name);
             if let Some(resolved) = resolve_qualified(&qualified) {
+                segments.push((resolved.clone(), *component));
                 owner = Some(resolved);
                 consumed = index + 2;
                 break;
@@ -654,15 +703,21 @@ where
         }
     }
 
-    let mut owner = owner?;
+    let Some(mut owner) = owner else {
+        return Vec::new();
+    };
     for component in &components[consumed..] {
         let name = node_text(*component, source);
         if name.is_empty() {
-            return None;
+            return Vec::new();
         }
-        owner = resolve_nested(&owner, name)?;
+        let Some(nested) = resolve_nested(&owner, name) else {
+            break;
+        };
+        owner = nested;
+        segments.push((owner.clone(), *component));
     }
-    Some(owner)
+    segments
 }
 
 fn nominal_type_child(node: Node<'_>) -> Option<Node<'_>> {

@@ -1965,7 +1965,7 @@ impl VisibilityIndex {
                                 && declaration_guards.is_subset(&reference_guards)
                                 && self.preprocessor_guards_stable_between(
                                     file,
-                                    0,
+                                    declaration_byte,
                                     reference.start_byte(),
                                     &declaration_guards,
                                 );

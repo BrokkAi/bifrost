@@ -36,6 +36,9 @@ The observable result is ten accepted repository records selected by exact desce
 - [x] (2026-07-20 21:12Z) Reconciled all 135 exact C++ rows: 78 are product discrepancies (ESPHome 15, libcbor 3, qpid-proton 60) and 57 are non-product or soundly inconclusive (ESPHome 2, Circl 4, qpid-proton 51). Reused assigned issue #940, created #1000 through #1005, and verified every worked issue is open and assigned only to `jbellis` before implementation.
 - [x] (2026-07-21 05:35Z) Integrated the structured fixes for #940 and #1000 through #1005, root-reviewed the combined resolver/declaration/hierarchy behavior, and exact-proved all 78 product witnesses on the working release runner; the final nine previously unresolved coordinates now classify as five `consistent`, two correct import-boundary `inconclusive`, one exact two-definition `editor_only`, and one `consistent` constructor call.
 - [x] (2026-07-21 06:05Z) Passed formatting, `git diff --check`, 43 C++ analyzer tests, 76 C++ definition tests, 141 C++ graph tests, 16 C++ hierarchy tests, isolated all-target/all-feature Clippy, and the complete serialized `cargo test --features nlp,python` suite. The full suite passed after independently confirming that an `EPERM` under the filesystem sandbox and one parallel SQLite lock were environmental concurrency artifacts.
+- [x] (2026-07-21 06:20Z) Published the six-family C++ fix stack in clean master head `d4a02d76`, rebuilt its release runner, and completed five fresh task-selected records. All 78 adjudicated product witnesses cleared; 51 raw residual rows remained for exact review.
+- [x] (2026-07-21 06:35Z) Exact-reran all 51 clean-head residuals. The sampled ESPHome return-type coordinate exposed a seventh legitimate family: public inverse lookup omitted all seven guarded `LwIPSocketImpl` self-type references after an earlier include defined the shared guard. Created #1010 and verified it is open and assigned only to `jbellis` before implementation.
+- [x] (2026-07-21 06:45Z) Delegated and root-reviewed #1010's structured same-file guard-stability fix. Its InlineTestProject reduction proves targeted and public inverse parity for seven self-type roles and retains a post-declaration `#undef` negative; 142 C++ graph tests, formatting, diff checks, isolated all-target/all-feature Clippy, and the complete serialized feature-enabled suite all pass.
 - [ ] Complete the five-repository C++ baseline, integrity-check every record, exhaustively disposition every raw missing row, and give the user the requested C++-language summary.
 - [ ] File/assign, implement, review, test, publish, and exact-prove every legitimate C++ root cause not owned by somebody else; rebuild and rerun the complete C++ set after any fix.
 - [ ] Publish compact manifests and summaries, comment on and close every assigned issue proven fixed, run the final local gates, and verify the clean local head, `origin/master`, and remote master agree.
@@ -90,6 +93,12 @@ The observable result is ten accepted repository records selected by exact desce
 - Observation: The full feature-enabled suite has two host-sensitive tests that require their intended execution environment.
   Evidence: a sandboxed run passed 1,464 library tests but three stderr-pipe cases received `EPERM`; those five focused tests passed outside the sandbox. A parallel unsandboxed run passed 1,466 library tests but one fresh-cache migration stress case encountered a transient SQLite lock; it passed focused and the complete unsandboxed serialized suite then exited zero.
 
+- Observation: A clean complete-language rerun can expose a legitimate family absent from the discovery sample even after every earlier product row clears.
+  Evidence: the `d4a02d76` ESPHome record sampled one `LwIPSocketImpl` return type that had not appeared in the 135-row baseline. Public `scan_usages_by_reference` returned zero header hits, while forward lookup resolved seven adjacent self-type tokens exactly. Same-file conditional visibility was checking macro stability from byte zero, so `defines.h` defining `USE_SOCKET_IMPL_LWIP_SOCKETS` before both the class and its references incorrectly invalidated the later references.
+
+- Observation: Same-file guard stability is a declaration-to-reference property, not a file-prefix property.
+  Evidence: starting the mutation interval at the class declaration recovers all seven ESPHome self-type roles. A behavior control with `#undef` after the declaration remains excluded, so the narrower interval ignores only setup that precedes both facts and continues to fail closed on mutations that can change their relationship.
+
 ## Decision Log
 
 - Decision: Interpret “tasks” as fully filtered primary SFT tasks and use `tasks.SFT_PREDICATES`.
@@ -138,6 +147,10 @@ The observable result is ten accepted repository records selected by exact desce
 
 - Decision: Publish the six C++ issue families as one reviewed checkpoint before the final corpus rerun.
   Rationale: the production witnesses overlap in owner recovery, declaration identity, hierarchy, and forward/inverse candidate selection. Landing the coherent stack once avoids accepting evidence from intermediate resolver combinations, while each issue retains focused reductions and exact coordinates for closure proof.
+  Date/Author: 2026-07-21 / Codex
+
+- Decision: Treat the new ESPHome guarded self-type residual as issue #1010 and rerun the entire five-repository C++ set again after publishing it.
+  Rationale: the public symbols API omits seven semantically valid forward references, so this is a product defect rather than a sampler artifact. Acceptance requires a fresh one-head corpus after every fix even though the prior full rerun already cleared all 78 baseline product witnesses.
   Date/Author: 2026-07-21 / Codex
 
 ## Outcomes & Retrospective

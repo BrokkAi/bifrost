@@ -1026,7 +1026,7 @@ fn resolve_in_enclosing_type_scopes(
         let mut candidates = parts
             .into_iter()
             .flat_map(|part| csharp.direct_children(&part))
-            .filter(|child| child.is_class() && csharp_source_identifier(child) == name)
+            .filter(|child| child.is_class() && child.identifier() == name)
             .collect::<Vec<_>>();
         if !candidates.is_empty() {
             csharp.sort_dedup_type_candidates(&mut candidates);
@@ -1866,6 +1866,37 @@ pub(super) fn applicable_member_candidates_for_owner(
         Some(call_arity),
         true,
     )
+}
+
+/// Resolve the callable selected by invocation syntax. The invocation may call
+/// either a method or the delegate value read from a field/property, so only
+/// method candidates are constrained by the outer argument list.
+pub(super) fn invocation_member_candidates_for_owner(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    owner: &CodeUnit,
+    name: &str,
+    explicit_generic_arity: Option<usize>,
+    call_arity: usize,
+) -> Vec<CodeUnit> {
+    let mut candidates = applicable_member_candidates_for_owner(
+        analyzer,
+        csharp,
+        owner,
+        name,
+        explicit_generic_arity,
+        call_arity,
+    );
+    if explicit_generic_arity.is_none() {
+        candidates.extend(
+            nearest_member_candidates_for_owner(analyzer, csharp, owner, name, None)
+                .into_iter()
+                .filter(|candidate| !candidate.is_function()),
+        );
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 fn nearest_member_candidates_for_owner_inner(

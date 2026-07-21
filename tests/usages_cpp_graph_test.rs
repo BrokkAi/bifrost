@@ -8405,6 +8405,94 @@ void consume(const ns::Owner* value);
 }
 
 #[test]
+fn authoritative_cpp_same_guard_self_types_ignore_prior_macro_setup() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "features.h",
+            r#"#pragma once
+#define FEATURE
+"#,
+        )
+        .file(
+            "owner.h",
+            r#"#pragma once
+#include "features.h"
+namespace lib { template <typename T> class Ptr {}; }
+#ifdef FEATURE
+namespace ns {
+class Owner {
+public:
+    Owner(const Owner&) = delete;
+    ~Owner();
+    Owner& operator=(const Owner&) = delete;
+    lib::Ptr<Owner> first() { return make<Owner>(); }
+    lib::Ptr<Owner> second() { return make<Owner>(); }
+};
+}
+#endif
+#undef FEATURE
+#ifdef FEATURE
+namespace ns { Owner excluded; }
+#endif
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "ns.Owner" && !unit.is_synthetic()
+    });
+    let owner = project.file("owner.h");
+    let source = owner.read_to_string().expect("owner header");
+    let line_token_ranges = |line: &str| {
+        let line_start = source
+            .find(line)
+            .unwrap_or_else(|| panic!("missing fixture line {line}"));
+        line.match_indices("Owner")
+            .map(|(start, token)| (line_start + start, line_start + start + token.len()))
+            .collect::<Vec<_>>()
+    };
+    let copy = line_token_ranges("    Owner(const Owner&) = delete;");
+    let assignment = line_token_ranges("    Owner& operator=(const Owner&) = delete;");
+    let first = line_token_ranges("    lib::Ptr<Owner> first() { return make<Owner>(); }");
+    let second = line_token_ranges("    lib::Ptr<Owner> second() { return make<Owner>(); }");
+    let expected = BTreeSet::from([
+        copy[1],
+        assignment[0],
+        assignment[1],
+        first[0],
+        first[1],
+        second[0],
+        second[1],
+    ]);
+
+    let targeted = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &owner);
+    let public = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&target))
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == owner)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        (&targeted, &public),
+        (&expected, &expected),
+        "an include that defines the shared guard before the declaration must not hide the seven structured self-type references"
+    );
+
+    let mut controls = BTreeSet::new();
+    controls.extend(line_token_ranges("class Owner {"));
+    controls.insert(copy[0]);
+    controls.extend(line_token_ranges("    ~Owner();"));
+    controls.extend(line_token_ranges("namespace ns { Owner excluded; }"));
+    assert!(
+        controls
+            .iter()
+            .all(|control| !targeted.contains(control) && !public.contains(control)),
+        "class, constructor, and destructor declaration names must stay excluded, and a post-declaration undef must invalidate the later guarded reference: targeted={targeted:#?}, public={public:#?}"
+    );
+}
+
+#[test]
 fn authoritative_cpp_class_usage_keeps_consumer_qualified_parameter_type() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
         (
