@@ -1,6 +1,6 @@
 {
   "name": "@brokk/bifrost-agent",
-  "version": "0.8.6",
+  "version": "0.8.7",
   "description": "Bifrost code intelligence tools and skills for Pi",
   "keywords": [
     "pi-package",

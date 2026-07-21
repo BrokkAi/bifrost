@@ -750,7 +750,8 @@ export async function resolveBifrostLaunch(options = {}) {
   const root = await resolveWorkspaceRoot({
     env: {},
     argvRoot: options.root,
-    cwd: options.root
+    cwd: options.root,
+    allowCwdFallback: false
   });
   const binary = await resolveBifrostBinary({ ...options, env });
   return {
