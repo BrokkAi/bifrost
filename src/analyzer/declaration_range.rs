@@ -1,13 +1,15 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tree_sitter::{Node, Tree};
 
 use crate::analyzer::common::{language_for_file, source_identifier_for_target};
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
+use crate::text_utils::compute_line_starts;
 
 pub(crate) struct DeclarationNameRangeContext {
     content: Arc<String>,
+    line_starts: OnceLock<Vec<usize>>,
     tree: Option<Tree>,
 }
 
@@ -16,11 +18,20 @@ impl DeclarationNameRangeContext {
         let language = language_for_file(file);
         let content = Arc::new(content);
         let tree = parse_tree_for_language(file, language, content.as_str());
-        Self { content, tree }
+        Self {
+            content,
+            line_starts: OnceLock::new(),
+            tree,
+        }
     }
 
     pub(crate) fn content(&self) -> &str {
         &self.content
+    }
+
+    pub(crate) fn line_starts(&self) -> &[usize] {
+        self.line_starts
+            .get_or_init(|| compute_line_starts(&self.content))
     }
 
     pub(crate) fn shared_content(&self) -> Arc<String> {

@@ -443,7 +443,9 @@ type DefinitionCandidateKey = (
     Option<String>,
     String,
     usize,
+    Option<usize>,
     usize,
+    Option<usize>,
     String,
     Option<String>,
     String,
@@ -457,7 +459,11 @@ pub struct DefinitionCandidate {
     pub fqn: Option<String>,
     pub path: String,
     pub start_line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_column: Option<usize>,
     pub end_line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_column: Option<usize>,
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
@@ -940,6 +946,12 @@ pub struct UsageFileGroup {
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageLocation {
     pub line: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_column: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line_range: Option<String>,
     pub enclosing: String,
@@ -1494,8 +1506,15 @@ pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> 
         .collect();
     let outcomes = crate::analyzer::usages::get_type::resolve_type_batch(analyzer, requests);
 
+    let mut render_cache = DefinitionCandidateRenderCache::default();
     for ((index, query, request), outcome) in pending.into_iter().zip(outcomes) {
-        results[index] = Some(render_type_lookup(analyzer, query, &request.file, outcome));
+        results[index] = Some(render_type_lookup(
+            analyzer,
+            query,
+            &request.file,
+            outcome,
+            &mut render_cache,
+        ));
     }
 
     GetTypeResult {
@@ -1973,7 +1992,9 @@ fn definition_candidate_key(candidate: &DefinitionCandidate) -> DefinitionCandid
         candidate.fqn.clone(),
         candidate.path.clone(),
         candidate.start_line,
+        candidate.start_column,
         candidate.end_line,
+        candidate.end_column,
         candidate.kind.clone(),
         candidate.signature.clone(),
         candidate.language.clone(),
@@ -2059,6 +2080,7 @@ fn lexical_definition_candidate(
     definition: &LexicalDefinition,
 ) -> Option<DefinitionCandidate> {
     let source = analyzer.project().read_source(file).ok()?;
+    let line_starts = compute_line_starts(&source);
     let signature = source
         .get(definition.declaration_range.start_byte..definition.declaration_range.end_byte)?
         .trim()
@@ -2068,7 +2090,23 @@ fn lexical_definition_candidate(
         fqn: None,
         path: rel_path_string(file),
         start_line: definition.name_range.start_line,
+        start_column: Some(
+            crate::text_utils::line_column_for_offset(
+                &source,
+                &line_starts,
+                definition.name_range.start_byte,
+            )
+            .1,
+        ),
         end_line: definition.name_range.end_line,
+        end_column: Some(
+            crate::text_utils::line_column_for_offset(
+                &source,
+                &line_starts,
+                definition.name_range.end_byte,
+            )
+            .1,
+        ),
         kind: declaration_kind_name(definition.kind).to_string(),
         signature: (!signature.is_empty()).then_some(signature),
         language: language_name(language_for_file(file)),
@@ -2094,7 +2132,32 @@ struct DefinitionCandidateRenderCache {
 }
 
 impl DefinitionCandidateRenderCache {
-    fn display_range(&mut self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<Range> {
+    fn exact_display_range(
+        context: &DeclarationNameRangeContext,
+        mut name_range: Range,
+    ) -> (Range, (usize, usize)) {
+        let start_column = crate::text_utils::line_column_for_offset(
+            context.content(),
+            context.line_starts(),
+            name_range.start_byte,
+        )
+        .1;
+        let end_column = crate::text_utils::line_column_for_offset(
+            context.content(),
+            context.line_starts(),
+            name_range.end_byte,
+        )
+        .1;
+        name_range.start_line += 1;
+        name_range.end_line += 1;
+        (name_range, (start_column, end_column))
+    }
+
+    fn display_range(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+    ) -> Option<(Range, Option<(usize, usize)>)> {
         let context = self
             .contexts
             .entry(unit.source().clone())
@@ -2102,14 +2165,18 @@ impl DefinitionCandidateRenderCache {
         let name_range = context
             .as_ref()
             .and_then(|context| context.name_range(analyzer, unit));
-        display_range_with_declaration_name(analyzer, unit, name_range)
+        if let (Some(context), Some(name_range)) = (context.as_ref(), name_range) {
+            let (name_range, columns) = Self::exact_display_range(context, name_range);
+            return Some((name_range, Some(columns)));
+        }
+        Some((primary_range(analyzer, unit)?, None))
     }
 
     fn navigation_display_range(
         &mut self,
         analyzer: &dyn IAnalyzer,
         target: &crate::analyzer::usages::get_definition::NavigationTarget,
-    ) -> Option<Range> {
+    ) -> Option<(Range, Option<(usize, usize)>)> {
         let Some(declaration_range) = target.declaration_range else {
             return self.display_range(analyzer, &target.code_unit);
         };
@@ -2117,14 +2184,14 @@ impl DefinitionCandidateRenderCache {
             .contexts
             .entry(target.code_unit.source().clone())
             .or_insert_with(|| load_declaration_name_context(analyzer, target.code_unit.source()));
-        if let Some(mut name_range) = context.as_ref().and_then(|context| {
+        let name_range = context.as_ref().and_then(|context| {
             context.name_range_for_declaration(&target.code_unit, declaration_range)
-        }) {
-            name_range.start_line += 1;
-            name_range.end_line += 1;
-            return Some(name_range);
+        });
+        if let (Some(context), Some(name_range)) = (context.as_ref(), name_range) {
+            let (name_range, columns) = Self::exact_display_range(context, name_range);
+            return Some((name_range, Some(columns)));
         }
-        Some(declaration_range)
+        Some((declaration_range, None))
     }
 }
 
@@ -2133,6 +2200,7 @@ fn render_type_lookup(
     query: TypeReferenceQuery,
     file: &ProjectFile,
     outcome: crate::analyzer::usages::get_type::TypeLookupOutcome,
+    render_cache: &mut DefinitionCandidateRenderCache,
 ) -> TypeLookupResult {
     let status = outcome.status.as_str().to_string();
     let mut diagnostics: Vec<DefinitionDiagnostic> = outcome
@@ -2168,7 +2236,7 @@ fn render_type_lookup(
         types: outcome
             .types
             .iter()
-            .map(|item| type_lookup_candidate(analyzer, item))
+            .map(|item| type_lookup_candidate(analyzer, item, render_cache))
             .collect(),
         diagnostics,
     }
@@ -2224,8 +2292,9 @@ fn location_failure_message(
 fn type_lookup_candidate(
     analyzer: &dyn IAnalyzer,
     item: &crate::analyzer::usages::get_type::TypeLookupType,
+    render_cache: &mut DefinitionCandidateRenderCache,
 ) -> TypeLookupCandidate {
-    let definitions = definition_candidates(analyzer, &item.definitions);
+    let definitions = definition_candidates_with_cache(analyzer, &item.definitions, render_cache);
     let primary = definitions.first();
     TypeLookupCandidate {
         fqn: item.fqn.clone(),
@@ -2236,9 +2305,18 @@ fn type_lookup_candidate(
 }
 
 fn definition_candidates(analyzer: &dyn IAnalyzer, units: &[CodeUnit]) -> Vec<DefinitionCandidate> {
+    let mut render_cache = DefinitionCandidateRenderCache::default();
+    definition_candidates_with_cache(analyzer, units, &mut render_cache)
+}
+
+fn definition_candidates_with_cache(
+    analyzer: &dyn IAnalyzer,
+    units: &[CodeUnit],
+    render_cache: &mut DefinitionCandidateRenderCache,
+) -> Vec<DefinitionCandidate> {
     units
         .iter()
-        .filter_map(|unit| definition_candidate(analyzer, unit))
+        .filter_map(|unit| definition_candidate_with_cache(analyzer, unit, render_cache))
         .collect()
 }
 
@@ -2250,25 +2328,41 @@ fn navigation_candidates_with_cache(
     targets
         .iter()
         .filter_map(|target| {
-            let range = render_cache.navigation_display_range(analyzer, target)?;
+            let (range, columns) = render_cache.navigation_display_range(analyzer, target)?;
             Some(definition_candidate_from_range(
                 analyzer,
                 &target.code_unit,
                 range,
+                columns,
             ))
         })
         .collect()
 }
 
 fn definition_candidate(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<DefinitionCandidate> {
-    let range = definition_display_range(analyzer, unit)?;
-    Some(definition_candidate_from_range(analyzer, unit, range))
+    definition_candidate_with_cache(
+        analyzer,
+        unit,
+        &mut DefinitionCandidateRenderCache::default(),
+    )
+}
+
+fn definition_candidate_with_cache(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    render_cache: &mut DefinitionCandidateRenderCache,
+) -> Option<DefinitionCandidate> {
+    let (range, columns) = render_cache.display_range(analyzer, unit)?;
+    Some(definition_candidate_from_range(
+        analyzer, unit, range, columns,
+    ))
 }
 
 fn definition_candidate_from_range(
     analyzer: &dyn IAnalyzer,
     unit: &CodeUnit,
     range: Range,
+    columns: Option<(usize, usize)>,
 ) -> DefinitionCandidate {
     let language = language_for_target(unit);
     let name = if language == Language::CSharp {
@@ -2281,7 +2375,9 @@ fn definition_candidate_from_range(
         fqn: Some(unit.fq_name()),
         path: rel_path_string(unit.source()),
         start_line: range.start_line,
+        start_column: columns.map(|(start, _)| start),
         end_line: range.end_line,
+        end_column: columns.map(|(_, end)| end),
         kind: code_unit_kind_name(unit.kind()).to_string(),
         signature: unit
             .signature()
@@ -2289,17 +2385,6 @@ fn definition_candidate_from_range(
             .or_else(|| analyzer.signatures(unit).first().cloned()),
         language: language_name(language),
     }
-}
-
-fn definition_display_range(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<Range> {
-    let name_range = analyzer
-        .project()
-        .read_source(unit.source())
-        .ok()
-        .and_then(|content| {
-            code_unit_declaration_name_range(analyzer, unit.source(), &content, unit)
-        });
-    display_range_with_declaration_name(analyzer, unit, name_range)
 }
 
 pub fn get_symbol_ancestors(
@@ -5372,6 +5457,11 @@ struct FilteredUsageHits {
 struct UsageHitRow {
     path: String,
     line: usize,
+    column: Option<usize>,
+    end_line: Option<usize>,
+    end_column: Option<usize>,
+    start_offset: usize,
+    end_offset: usize,
     enclosing: String,
     kind: UsageHitKind,
     snippet: String,
@@ -5535,7 +5625,10 @@ fn filter_and_dedupe_hits(
             .extend(external_usage_definition_ranges(analyzer, overload));
     }
 
-    let mut rows: BTreeMap<(String, usize, String, UsageHitKind), UsageHitRow> = BTreeMap::new();
+    let mut rows: BTreeMap<(String, usize, usize, String, UsageHitKind), UsageHitRow> =
+        BTreeMap::new();
+    let mut source_positions: HashMap<ProjectFile, Option<(String, Vec<usize>)>> =
+        HashMap::default();
     let mut definition_sites_excluded = 0usize;
     for hit in hits {
         // Import and self-receiver hits are for editor references, not the
@@ -5554,15 +5647,52 @@ fn filter_and_dedupe_hits(
 
         let path = rel_path_string(&hit.file);
         let enclosing = hit.enclosing.fq_name();
+        let exact_position = source_positions
+            .entry(hit.file.clone())
+            .or_insert_with(|| {
+                analyzer
+                    .project()
+                    .read_source(&hit.file)
+                    .ok()
+                    .map(|source| {
+                        let line_starts = compute_line_starts(&source);
+                        (source, line_starts)
+                    })
+            })
+            .as_ref()
+            .and_then(|(source, line_starts)| {
+                (hit.start_offset <= hit.end_offset
+                    && hit.end_offset <= source.len()
+                    && source.is_char_boundary(hit.start_offset)
+                    && source.is_char_boundary(hit.end_offset))
+                .then(|| {
+                    let start = crate::text_utils::line_column_for_offset(
+                        source,
+                        line_starts,
+                        hit.start_offset,
+                    );
+                    let end = crate::text_utils::line_column_for_offset(
+                        source,
+                        line_starts,
+                        hit.end_offset,
+                    );
+                    (start, end)
+                })
+            });
         let row = UsageHitRow {
             path: path.clone(),
-            line: hit.line,
+            line: exact_position.map_or(hit.line, |(start, _)| start.0),
+            column: exact_position.map(|(start, _)| start.1),
+            end_line: exact_position.map(|(_, end)| end.0),
+            end_column: exact_position.map(|(_, end)| end.1),
+            start_offset: hit.start_offset,
+            end_offset: hit.end_offset,
             enclosing: enclosing.clone(),
             kind: hit.kind,
             snippet: hit.snippet.trim_end().to_string(),
             confidence: hit.confidence,
         };
-        let key = (path, hit.line, enclosing, hit.kind);
+        let key = (path, hit.start_offset, hit.end_offset, enclosing, hit.kind);
         rows.entry(key)
             .and_modify(|existing| {
                 if row.confidence > existing.confidence
@@ -5580,6 +5710,8 @@ fn filter_and_dedupe_hits(
         left.path
             .cmp(&right.path)
             .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.start_offset.cmp(&right.start_offset))
+            .then_with(|| left.end_offset.cmp(&right.end_offset))
             .then_with(|| left.enclosing.cmp(&right.enclosing))
     });
 
@@ -6172,6 +6304,9 @@ fn render_usage_file_groups(hits: &[UsageHitRow], include_snippets: bool) -> Vec
             .or_default()
             .push(UsageLocation {
                 line: hit.line,
+                column: hit.column,
+                end_line: hit.end_line,
+                end_column: hit.end_column,
                 line_range: None,
                 enclosing: hit.enclosing.clone(),
                 kind: hit.kind.external_label().map(str::to_string),
@@ -6236,6 +6371,9 @@ fn render_clustered_usage_file_groups(hits: &[UsageHitRow]) -> Vec<UsageFileGrou
                         .fold(0.0_f64, f64::max);
                     rendered_hits.push(UsageLocation {
                         line: first.line,
+                        column: None,
+                        end_line: None,
+                        end_column: None,
                         line_range: Some(if first.line == last.line {
                             first.line.to_string()
                         } else {
@@ -6253,6 +6391,9 @@ fn render_clustered_usage_file_groups(hits: &[UsageHitRow]) -> Vec<UsageFileGrou
                 } else {
                     rendered_hits.extend(group.into_iter().map(|hit| UsageLocation {
                         line: hit.line,
+                        column: None,
+                        end_line: None,
+                        end_column: None,
                         line_range: None,
                         enclosing: hit.enclosing.clone(),
                         kind: hit.kind.external_label().map(str::to_string),
@@ -6967,20 +7108,6 @@ fn search_symbol_display_range(
         return name_range;
     }
     candidate.primary_range
-}
-
-fn display_range_with_declaration_name(
-    analyzer: &dyn IAnalyzer,
-    code_unit: &CodeUnit,
-    name_range: Option<Range>,
-) -> Option<Range> {
-    let primary = primary_range(analyzer, code_unit)?;
-    if let Some(mut name_range) = name_range {
-        name_range.start_line += 1;
-        name_range.end_line += 1;
-        return Some(name_range);
-    }
-    Some(primary)
 }
 
 pub(crate) fn summary_block_for_code_unit(
@@ -8067,15 +8194,16 @@ fn language_name(language: Language) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainerListingEntry, ScanUsageRequest, ScanUsagesAbsenceCaveat,
-        ScanUsagesCandidateFilesSample, ScanUsagesStatus, ScanUsagesSurface, ScanUsagesWorkEntry,
-        SourceBlock, SummaryElement, SymbolUsageRenderState, UsageFailureInfo, UsageHitKind,
-        UsageHitRow, UsageRendering, classify_scan_usages_entry, list_symbols,
+        ContainerListingEntry, DefinitionCandidateRenderCache, ScanUsageRequest,
+        ScanUsagesAbsenceCaveat, ScanUsagesCandidateFilesSample, ScanUsagesStatus,
+        ScanUsagesSurface, ScanUsagesWorkEntry, SourceBlock, SummaryElement,
+        SymbolUsageRenderState, UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering,
+        classify_scan_usages_entry, definition_candidate_from_range, list_symbols,
         resolve_file_patterns, trim_summary_signature,
     };
     use super::{function_like_macro_query, route_summary_targets, usage_failure_hint};
     use crate::analyzer::{
-        CodeUnit, DeclarationInfo, IAnalyzer, Language, Project, ProjectFile, Range,
+        CodeUnit, CodeUnitType, DeclarationInfo, IAnalyzer, Language, Project, ProjectFile, Range,
     };
     use std::collections::BTreeSet;
     use std::io;
@@ -8266,6 +8394,38 @@ mod tests {
     fn trims_synthetic_summary_lines() {
         assert_eq!(trim_summary_signature("class A {\n}\n"), "class A");
         assert_eq!(trim_summary_signature("[...]\n"), "");
+    }
+
+    #[test]
+    fn broad_navigation_fallback_omits_unproven_columns() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = ProjectFile::new(root.clone(), "Broken.java");
+        file.write("???\n").unwrap();
+        let analyzer = CountingAnalyzer::new(root, &["Broken.java"]);
+        let code_unit = CodeUnit::new(file, CodeUnitType::Function, "", "missing");
+        let declaration_range = Range {
+            start_byte: 0,
+            end_byte: 3,
+            start_line: 1,
+            end_line: 1,
+        };
+        let target = crate::analyzer::usages::get_definition::NavigationTarget {
+            code_unit,
+            declaration_range: Some(declaration_range),
+        };
+
+        let (range, columns) = DefinitionCandidateRenderCache::default()
+            .navigation_display_range(&analyzer, &target)
+            .expect("broad fallback range");
+        assert_eq!(range, declaration_range);
+        assert_eq!(columns, None);
+
+        let candidate =
+            definition_candidate_from_range(&analyzer, &target.code_unit, range, columns);
+        let value = serde_json::to_value(candidate).unwrap();
+        assert!(value.get("start_column").is_none(), "{value}");
+        assert!(value.get("end_column").is_none(), "{value}");
     }
 
     #[test]
@@ -8518,6 +8678,11 @@ def gamma():
         UsageHitRow {
             path: path.to_string(),
             line,
+            column: Some(1),
+            end_line: Some(line),
+            end_column: Some(2),
+            start_offset: line.saturating_sub(1),
+            end_offset: line,
             enclosing: "Caller.run".to_string(),
             kind: UsageHitKind::Reference,
             snippet: "target();".to_string(),

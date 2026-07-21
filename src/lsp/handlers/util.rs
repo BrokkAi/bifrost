@@ -117,16 +117,18 @@ pub(super) fn navigation_target_location(
         cached.context.name_range(analyzer, &target.code_unit)
     };
     let lsp_range = exact_name_range
-        .map(|range| byte_range_to_lsp_range(body, &cached.line_starts, &range))
+        .map(|range| byte_range_to_lsp_range(body, cached.context.line_starts(), &range))
         .or_else(|| {
             identifier_selection_range(
                 &target.code_unit,
                 body,
-                &cached.line_starts,
+                cached.context.line_starts(),
                 &declaration_range,
             )
         })
-        .unwrap_or_else(|| byte_range_to_lsp_range(body, &cached.line_starts, &declaration_range));
+        .unwrap_or_else(|| {
+            byte_range_to_lsp_range(body, cached.context.line_starts(), &declaration_range)
+        });
     let uri: Uri = path_to_uri_string(&file.abs_path()).parse().ok()?;
     Some(Location {
         uri,
@@ -141,7 +143,6 @@ pub(super) struct NavigationLocationCache {
 
 struct NavigationLocationFile {
     context: DeclarationNameRangeContext,
-    line_starts: Vec<usize>,
 }
 
 impl NavigationLocationCache {
@@ -153,12 +154,10 @@ impl NavigationLocationCache {
         let key = file.abs_path();
         if !self.files.contains_key(&key) {
             let body = project.read_source(file).ok()?;
-            let line_starts = compute_line_starts(&body);
             self.files.insert(
                 key.clone(),
                 NavigationLocationFile {
                     context: DeclarationNameRangeContext::new(file, body),
-                    line_starts,
                 },
             );
         }

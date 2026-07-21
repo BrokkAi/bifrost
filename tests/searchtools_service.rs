@@ -2582,6 +2582,67 @@ fn scan_usages_returns_call_sites_grouped_by_file() {
 }
 
 #[test]
+fn scan_usages_full_rows_preserve_distinct_same_line_unicode_ranges() {
+    let source = "export function target() {}\nexport function caller() { const café = 1; target(); target(); }\n";
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", source)
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_payload_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["app.js#target"],"include_tests":true}"#,
+            RenderOptions::default(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value["structured"]);
+
+    assert_eq!("full", usage["rendering"], "payload: {value}");
+    assert_eq!(2, usage["total_hits"], "payload: {value}");
+    let hits = usage["files"][0]["hits"].as_array().unwrap();
+    assert_eq!(2, hits.len(), "payload: {value}");
+
+    let call_line = source.lines().nth(1).unwrap();
+    let expected_columns = call_line
+        .match_indices("target")
+        .map(|(byte, token)| {
+            let start = call_line[..byte].chars().count() + 1;
+            (start, start + token.chars().count())
+        })
+        .collect::<Vec<_>>();
+    let actual_ranges = hits
+        .iter()
+        .map(|hit| {
+            (
+                hit["line"].as_u64().unwrap() as usize,
+                hit["column"].as_u64().unwrap() as usize,
+                hit["end_line"].as_u64().unwrap() as usize,
+                hit["end_column"].as_u64().unwrap() as usize,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        expected_columns
+            .into_iter()
+            .map(|(start, end)| (2, start, 2, end))
+            .collect::<Vec<_>>(),
+        actual_ranges,
+        "payload: {value}"
+    );
+
+    let rendered = value["rendered_text"].as_str().unwrap();
+    for (_, start, _, end) in actual_ranges {
+        assert!(
+            rendered.contains(&format!("line 2:{start}-2:{end}")),
+            "rendered: {rendered}"
+        );
+    }
+}
+
+#[test]
 fn scan_usages_by_reference_includes_all_scala_overloads() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
@@ -3658,6 +3719,9 @@ fn scan_usages_lines_mode_clusters_repeated_enclosing_hits_and_preserves_sparse_
     assert_eq!(101, bulk_hits[0]["hit_count"], "payload: {value}");
     assert_eq!("3-103", bulk_hits[0]["line_range"], "payload: {value}");
     assert!(bulk_hits[0]["snippet"].is_null(), "payload: {value}");
+    for field in ["column", "end_line", "end_column"] {
+        assert!(bulk_hits[0][field].is_null(), "payload: {value}");
+    }
 
     for path in ["SingleA.java", "SingleB.java"] {
         let file = usage["files"]
@@ -3673,6 +3737,9 @@ fn scan_usages_lines_mode_clusters_repeated_enclosing_hits_and_preserves_sparse_
                 .is_some_and(|snippet| snippet.contains("Service.target()")),
             "payload: {value}"
         );
+        for field in ["column", "end_line", "end_column"] {
+            assert!(hit[field].is_null(), "payload: {value}");
+        }
     }
 }
 
@@ -5777,6 +5844,14 @@ namespace Domain {
     assert!(
         usage["status"] == "unverified_absent",
         "unproven evidence must block the verified-absent claim: {value}"
+    );
+    let hit = &usage["unproven_files"][0]["hits"][0];
+    assert_eq!(5, hit["line"], "payload: {value}");
+    assert!(hit["column"].as_u64().is_some(), "payload: {value}");
+    assert_eq!(hit["line"], hit["end_line"], "payload: {value}");
+    assert!(
+        hit["end_column"].as_u64().unwrap() > hit["column"].as_u64().unwrap(),
+        "payload: {value}"
     );
 }
 
