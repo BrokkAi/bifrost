@@ -8,6 +8,7 @@ use super::super::query::{
     CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed, QueryError, QueryStep,
     QueryValueKind, SetOperator,
 };
+use super::derived::DerivedLayerRequest;
 
 /// A dense, plan-local identifier for one logical operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -290,6 +291,7 @@ pub(crate) struct PhysicalQueryNode {
     logical_node: LogicalQueryNodeId,
     operator: PhysicalQueryOperator,
     dependencies: Box<[PhysicalQueryNodeId]>,
+    derived_layer_request: Option<DerivedLayerRequest>,
 }
 
 impl PhysicalQueryNode {
@@ -303,6 +305,10 @@ impl PhysicalQueryNode {
 
     pub(crate) fn dependencies(&self) -> &[PhysicalQueryNodeId] {
         &self.dependencies
+    }
+
+    pub(crate) const fn derived_layer_request(&self) -> Option<DerivedLayerRequest> {
+        self.derived_layer_request
     }
 }
 
@@ -343,10 +349,18 @@ impl PhysicalQueryPlan {
                     .copied()
                     .map(PhysicalQueryNodeId::from_logical)
                     .collect();
+                let derived_layer_request = match node.operator() {
+                    LogicalQueryOperator::Step {
+                        step: QueryStep::ImportersOf,
+                        ..
+                    } => Some(DerivedLayerRequest::complete_direct_import_topology()),
+                    _ => None,
+                };
                 PhysicalQueryNode {
                     logical_node,
                     operator,
                     dependencies,
+                    derived_layer_request,
                 }
             })
             .collect();
@@ -389,6 +403,7 @@ impl PhysicalQueryPlan {
                     ),
                     output_kind: self.logical.node(node.logical_node()).output_kind().label(),
                     dependencies: node.dependencies().to_vec(),
+                    derived_layer_request: node.derived_layer_request(),
                 })
                 .collect(),
         }
@@ -411,6 +426,8 @@ pub(crate) struct PhysicalQueryNodeExplain {
     logical_operator: LogicalQueryOperatorExplain,
     output_kind: &'static str,
     dependencies: Vec<PhysicalQueryNodeId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    derived_layer_request: Option<DerivedLayerRequest>,
 }
 
 /// The complete semantic payload of one logical operator in an explain node.
@@ -649,6 +666,88 @@ mod tests {
                     }
                 ]
             })
+        );
+    }
+
+    #[test]
+    fn only_complete_reverse_import_traversal_requests_a_derived_layer() {
+        let logical = LogicalQueryPlan::lower(&query(branch(
+            seed("AnyDeclaration"),
+            vec![
+                QueryStep::FileOf,
+                QueryStep::ImportersOf,
+                QueryStep::ImportsOf,
+            ],
+        )))
+        .expect("query should lower");
+        let physical = PhysicalQueryPlan::select(logical);
+
+        let importer_node = physical
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(
+                    physical.logical.node(node.logical_node()).operator(),
+                    LogicalQueryOperator::Step {
+                        step: QueryStep::ImportersOf,
+                        ..
+                    }
+                )
+            })
+            .expect("physical plan should contain importers_of");
+        let request = importer_node
+            .derived_layer_request()
+            .expect("reverse imports require the complete direct import topology");
+        assert_eq!(
+            request,
+            DerivedLayerRequest::complete_direct_import_topology()
+        );
+
+        let imports_node = physical
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(
+                    physical.logical.node(node.logical_node()).operator(),
+                    LogicalQueryOperator::Step {
+                        step: QueryStep::ImportsOf,
+                        ..
+                    }
+                )
+            })
+            .expect("physical plan should contain imports_of");
+        assert_eq!(imports_node.derived_layer_request(), None);
+    }
+
+    #[test]
+    fn derived_layer_request_is_visible_in_physical_explain() {
+        let physical = PhysicalQueryPlan::select(
+            LogicalQueryPlan::lower(&query(branch(
+                seed("AnyDeclaration"),
+                vec![QueryStep::FileOf, QueryStep::ImportersOf],
+            )))
+            .expect("query should lower"),
+        );
+        let explained = serde_json::to_value(physical.explain()).expect("explain should serialize");
+        let importer_node = explained["nodes"]
+            .as_array()
+            .expect("explain nodes should be an array")
+            .iter()
+            .find(|node| node["logical_operator"]["step"]["op"] == "importers_of")
+            .expect("explain should contain importers_of");
+        assert_eq!(
+            importer_node["derived_layer_request"],
+            serde_json::to_value(DerivedLayerRequest::complete_direct_import_topology())
+                .expect("request should serialize")
+        );
+        assert!(
+            explained["nodes"]
+                .as_array()
+                .expect("explain nodes should be an array")
+                .iter()
+                .filter(|node| node["logical_operator"]["step"]["op"] != "importers_of")
+                .all(|node| node.get("derived_layer_request").is_none()),
+            "unannotated operators should not gain a null derived-layer field"
         );
     }
 

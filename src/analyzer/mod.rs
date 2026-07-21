@@ -5,6 +5,7 @@ pub mod cognitive_complexity;
 #[cfg(test)]
 mod cognitive_complexity_tests;
 pub(crate) mod common;
+mod complete_value_cache;
 mod config;
 mod cpp;
 mod csharp;

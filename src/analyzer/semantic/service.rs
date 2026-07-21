@@ -1,14 +1,13 @@
 //! Shared snapshot, publication, and complete-cache mechanics for language lowerers.
 
 use std::mem::size_of;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
 
-use moka::sync::Cache;
-
+use crate::analyzer::complete_value_cache::{
+    CompleteValueAcquisition, CompleteValueCache, CompleteValueWait,
+};
 use crate::analyzer::tree_sitter_analyzer::{PreparedSourceOrigin, PreparedSyntaxTree};
 use crate::analyzer::{LanguageAdapter, ProjectFile, TreeSitterAnalyzer};
-use crate::hash::HashMap;
 
 use super::{
     AdapterSemanticsVersion, AllocationSite, BasicBlock, CaptureBinding, ConfigurationFingerprint,
@@ -21,7 +20,6 @@ use super::{
 };
 
 const DEFAULT_COMPLETE_CACHE_BYTES: u64 = 256 * 1024 * 1024 / 8;
-const SINGLE_FLIGHT_CANCELLATION_POLL: Duration = Duration::from_millis(10);
 
 /// Immutable complete-artifact cache shared by one concrete analyzer adapter.
 ///
@@ -31,8 +29,7 @@ const SINGLE_FLIGHT_CANCELLATION_POLL: Duration = Duration::from_millis(10);
 /// one exact artifact key without retaining completed work.
 #[derive(Clone)]
 pub(crate) struct CompleteSemanticArtifactCache {
-    entries: Cache<SemanticArtifactKey, Arc<SemanticArtifact>>,
-    in_flight: Arc<Mutex<HashMap<SemanticArtifactKey, Arc<InFlightMaterialization>>>>,
+    inner: CompleteValueCache<SemanticArtifactKey, SemanticArtifact>,
 }
 
 impl Default for CompleteSemanticArtifactCache {
@@ -44,189 +41,34 @@ impl Default for CompleteSemanticArtifactCache {
 impl CompleteSemanticArtifactCache {
     pub(crate) fn new(max_retained_bytes: u64) -> Self {
         Self {
-            entries: Cache::builder()
-                .max_capacity(max_retained_bytes.max(1))
-                .weigher(weigh_complete_artifact)
-                .build(),
-            in_flight: Arc::new(Mutex::new(HashMap::default())),
+            inner: CompleteValueCache::new(max_retained_bytes, weigh_complete_artifact),
         }
     }
 
-    fn get(&self, key: &SemanticArtifactKey) -> Option<Arc<SemanticArtifact>> {
-        self.entries.get(key)
-    }
-
+    #[cfg(test)]
     fn insert(&self, key: SemanticArtifactKey, artifact: Arc<SemanticArtifact>) {
-        self.entries.insert(key, artifact);
+        self.inner.insert_complete_for_test(key, artifact);
     }
 
     fn acquire(
         &self,
         key: &SemanticArtifactKey,
         cancellation: &super::CancellationToken,
-    ) -> CacheAcquisition {
-        loop {
-            if cancellation.is_cancelled() {
-                return CacheAcquisition::Cancelled;
-            }
-            if let Some(artifact) = self.get(key) {
-                return CacheAcquisition::Cached(artifact);
-            }
-
-            let (flight, is_leader) = {
-                let mut in_flight = self
-                    .in_flight
-                    .lock()
-                    .expect("semantic single-flight map mutex poisoned");
-                match in_flight.get(key) {
-                    Some(flight) => (Arc::clone(flight), false),
-                    None => {
-                        let flight = Arc::new(InFlightMaterialization::new());
-                        in_flight.insert(key.clone(), Arc::clone(&flight));
-                        (flight, true)
-                    }
-                }
-            };
-
-            if is_leader {
-                return CacheAcquisition::Leader(Box::new(MaterializationPermit {
-                    key: key.clone(),
-                    flight,
-                    in_flight: Arc::clone(&self.in_flight),
-                }));
-            }
-            match flight.wait(cancellation) {
-                FlightWait::Completed(artifact) => {
-                    return CacheAcquisition::Cached(artifact);
-                }
-                FlightWait::Retry => {}
-                FlightWait::Cancelled => return CacheAcquisition::Cancelled,
-            }
-        }
+    ) -> (
+        CompleteValueAcquisition<SemanticArtifactKey, SemanticArtifact>,
+        CompleteValueWait,
+    ) {
+        self.inner.acquire(key, cancellation)
     }
 
     #[cfg(test)]
     fn len(&self) -> u64 {
-        self.entries.run_pending_tasks();
-        self.entries.entry_count()
+        self.inner.len_for_test()
     }
 
     #[cfg(test)]
     fn waiting_count(&self) -> usize {
-        self.in_flight
-            .lock()
-            .expect("semantic single-flight map mutex poisoned")
-            .values()
-            .map(|flight| {
-                flight
-                    .state
-                    .lock()
-                    .expect("semantic single-flight state mutex poisoned")
-                    .waiters
-            })
-            .sum()
-    }
-}
-
-struct InFlightMaterialization {
-    state: Mutex<InFlightState>,
-    wake: Condvar,
-}
-
-struct InFlightState {
-    running: bool,
-    waiters: usize,
-    completed: Option<Arc<SemanticArtifact>>,
-}
-
-impl InFlightMaterialization {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(InFlightState {
-                running: true,
-                waiters: 0,
-                completed: None,
-            }),
-            wake: Condvar::new(),
-        }
-    }
-
-    /// Wait for the current builder, polling cooperative cancellation because
-    /// `std::sync::Condvar` cannot be interrupted directly.
-    fn wait(&self, cancellation: &super::CancellationToken) -> FlightWait {
-        let mut state = self
-            .state
-            .lock()
-            .expect("semantic single-flight state mutex poisoned");
-        state.waiters = state.waiters.saturating_add(1);
-        while state.running && !cancellation.is_cancelled() {
-            let (next, _) = self
-                .wake
-                .wait_timeout(state, SINGLE_FLIGHT_CANCELLATION_POLL)
-                .expect("semantic single-flight state mutex poisoned while waiting");
-            state = next;
-        }
-        state.waiters = state.waiters.saturating_sub(1);
-        if cancellation.is_cancelled() {
-            FlightWait::Cancelled
-        } else if let Some(artifact) = &state.completed {
-            FlightWait::Completed(Arc::clone(artifact))
-        } else {
-            FlightWait::Retry
-        }
-    }
-}
-
-enum FlightWait {
-    Completed(Arc<SemanticArtifact>),
-    Retry,
-    Cancelled,
-}
-
-enum CacheAcquisition {
-    Cached(Arc<SemanticArtifact>),
-    Leader(Box<MaterializationPermit>),
-    Cancelled,
-}
-
-struct MaterializationPermit {
-    key: SemanticArtifactKey,
-    flight: Arc<InFlightMaterialization>,
-    in_flight: Arc<Mutex<HashMap<SemanticArtifactKey, Arc<InFlightMaterialization>>>>,
-}
-
-impl MaterializationPermit {
-    fn complete(&self, artifact: Arc<SemanticArtifact>) {
-        self.flight
-            .state
-            .lock()
-            .expect("semantic single-flight state mutex poisoned")
-            .completed = Some(artifact);
-    }
-}
-
-impl Drop for MaterializationPermit {
-    fn drop(&mut self) {
-        {
-            let mut in_flight = self
-                .in_flight
-                .lock()
-                .expect("semantic single-flight map mutex poisoned");
-            if in_flight
-                .get(&self.key)
-                .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight))
-            {
-                in_flight.remove(&self.key);
-            }
-        }
-        let mut state = self
-            .flight
-            .state
-            .lock()
-            .expect("semantic single-flight state mutex poisoned");
-        state.running = false;
-        drop(state);
-        self.flight.wake.notify_all();
+        self.inner.waiting_count_for_test()
     }
 }
 
@@ -391,12 +233,13 @@ pub(crate) fn materialize_with_lowerer<A: LanguageAdapter>(
 
     let identity = lowerer.identity();
     let key = semantic_artifact_key(file, &prepared, identity)?;
-    let permit = match cache.acquire(&key, request.cancellation) {
-        CacheAcquisition::Cached(artifact) => {
+    let (acquisition, _cache_wait) = cache.acquire(&key, request.cancellation);
+    let permit = match acquisition {
+        CompleteValueAcquisition::Cached { value: artifact } => {
             return publish_cached(artifact, source_work, staged_budget, request);
         }
-        CacheAcquisition::Leader(permit) => permit,
-        CacheAcquisition::Cancelled => {
+        CompleteValueAcquisition::Leader { permit } => permit,
+        CompleteValueAcquisition::Cancelled => {
             return Ok(SemanticOutcome::Cancelled {
                 partial: None,
                 work: source_work,
@@ -404,13 +247,6 @@ pub(crate) fn materialize_with_lowerer<A: LanguageAdapter>(
         }
     };
 
-    // A previous builder can publish and release its permit between our last
-    // cache check and reservation of a new flight. Avoid rebuilding that
-    // already-complete artifact.
-    if let Some(artifact) = cache.get(&key) {
-        permit.complete(Arc::clone(&artifact));
-        return publish_cached(artifact, source_work, staged_budget, request);
-    }
     if request.cancellation.is_cancelled() {
         return Ok(SemanticOutcome::Cancelled {
             partial: None,
@@ -439,12 +275,11 @@ pub(crate) fn materialize_with_lowerer<A: LanguageAdapter>(
         lowerer.capabilities(),
         lowered,
         source_work,
-        cache,
         staged_budget,
         request,
     );
     if let Ok(SemanticOutcome::Complete { value, .. }) = &outcome {
-        permit.complete(Arc::clone(value));
+        permit.publish_complete(Arc::clone(value));
     }
     outcome
 }
@@ -515,7 +350,6 @@ fn publish_lowered(
     capabilities: SemanticCapabilities,
     lowered: SemanticOutcome<Vec<ProcedureSemanticsParts>>,
     source_work: SemanticWork,
-    cache: &CompleteSemanticArtifactCache,
     mut staged_budget: super::SemanticBudget,
     request: &mut SemanticRequest<'_>,
 ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
@@ -565,7 +399,6 @@ fn publish_lowered(
                 });
             }
             *request.budget = staged_budget;
-            cache.insert(key, Arc::clone(&artifact));
             Ok(SemanticOutcome::Complete {
                 work: total_work,
                 value: artifact,
@@ -741,6 +574,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
+    use std::sync::{Condvar, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 

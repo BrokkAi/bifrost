@@ -1214,7 +1214,7 @@ fn code_query_execution_profile_measurement() {
     let limits = CodeQueryExecutionLimits::default();
 
     let result = BenchmarkResult {
-        format: "bifrost_code_query_execution_benchmark/v1",
+        format: "bifrost_code_query_execution_benchmark/v2",
         kind: "sample",
         round,
         provenance,

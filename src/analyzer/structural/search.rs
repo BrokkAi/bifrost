@@ -7258,7 +7258,7 @@ mod tests {
     }
 
     fn assert_serial_profile_reconciles(profile: &QueryExecutionProfile) {
-        assert_eq!(profile.format, "bifrost_code_query_execution_profile/v1");
+        assert_eq!(profile.format, "bifrost_code_query_execution_profile/v2");
         assert_eq!(profile.peak_concurrency, 1);
         assert!(
             profile

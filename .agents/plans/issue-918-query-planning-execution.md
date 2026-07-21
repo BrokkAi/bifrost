@@ -18,20 +18,21 @@ The first independently verifiable milestone is deliberately sequential. Existin
 - [x] (2026-07-20 14:28Z) Chose the storage-neutral sequential plan spine and the measured later graph-materialization boundary described below.
 - [x] (2026-07-20 15:09Z) Milestone 1: lowered authored queries into a logical DAG, selected and executed an explicit sequential physical plan without public semantic change, added opt-in structured explain/profile observations, completed adversarial review, and passed the focused tests plus strict all-target/all-feature Clippy.
 - [x] (2026-07-20 20:38Z) Milestone 2: completed opt-in operator, work, cache, termination, and request-phase instrumentation; added a versioned ignored benchmark; ran optimized reversed-order measurements plus an M1 ordinary-path differential; and deliberately deferred scheduler thresholds and storage selection.
-- [ ] Milestone 3: introduce exact derived-layer dependency keys and cancellation-aware complete-value single-flight, then run a promote-or-discard SQL-to-memory graph materialization experiment.
+- [x] (2026-07-21 08:06Z) Fetched `origin/master` and cleanly rebased the M1/M2 checkpoints onto `a84d6df4`; the rebased M2 checkpoint is `063b8ad9`.
+- [x] (2026-07-21 09:01Z) Milestone 3: extracted a generic complete-value single-flight, proved exact layer-owned key requirements and generation cutover with a fake composite key, annotated reverse-import physical plan nodes with request metadata, measured and discarded the non-equivalent `unit_children` SQL negative control, removed the prototype, completed adversarial review, and passed focused regressions plus strict Clippy.
 - [ ] Milestone 4: add a bounded scheduler plus sequential and parallel union implementations, select between them with benchmark-derived policy, and preserve deterministic semantics and budgets.
 - [ ] Milestone 5: expose explain/profile through the supported query surfaces, document measured thresholds and rejected alternatives, and complete adversarial review and repository validation.
 
 ## Surprises & Discoveries
 
-- Observation: `CodeQueryPlan` is already a semantic recursive tree, but it is also the execution strategy.
-  Evidence: `src/analyzer/structural/search.rs::execute_plan` directly pattern-matches `CodeQueryPlanSource`, recursively executes branches in authored order, assigns fair budgets from cumulative mutable state, and immediately combines rows.
+- Initial observation before M1: `CodeQueryPlan` was both the semantic recursive tree and the execution strategy.
+  Evidence: at plan start, `src/analyzer/structural/search.rs::execute_plan` directly pattern-matched `CodeQueryPlanSource`. M1 replaced that coupling with explicit logical lowering and physical selection while preserving recursive authored-order execution semantics.
 
 - Observation: the current request state already shares completed structural seeds and several semantic caches, so the new plan boundary must preserve those reuse and charging semantics before adding concurrency.
   Evidence: `QueryExecutionState` owns `seed_cache`, `indexed_declarations`, `reference_cache`, `call_cache`, and the lazy `DirectImportGraph`; focused tests prove complete and truncated seed reuse, roll-forward budgets, branch provenance, and root-only limits.
 
-- Observation: Bifrost already contains a cancellation-aware same-key single-flight implementation that publishes complete values only.
-  Evidence: `CompleteSemanticArtifactCache` in `src/analyzer/semantic/service.rs` uses a retained-value cache, an in-flight leader/follower map, cancellation-polled waiters, retry after an incomplete leader, and tests proving one lowerer call for concurrent requests. Later query graph caching should generalize or reuse this lifecycle instead of cloning it.
+- Initial observation before M3: Bifrost already contained a cancellation-aware same-key single-flight implementation that published complete values only.
+  Evidence: `CompleteSemanticArtifactCache` in `src/analyzer/semantic/service.rs` originally owned retained values and its leader/follower map. M3 extracted that lifecycle into `src/analyzer/complete_value_cache.rs`; the semantic cache now delegates to it, and later layer owners must reuse the generic lifecycle instead of cloning it.
 
 - Observation: `PoolSafeMemo` deliberately permits duplicate builds in some Rayon contexts.
   Evidence: blocking a worker on work queued to the same saturated pool previously deadlocked. A query scheduler must model dependency waiting or use a build executor that cannot starve, rather than placing a naive condition variable around arbitrary Rayon work.
@@ -74,6 +75,15 @@ The first independently verifiable milestone is deliberately sequential. Existin
 
 - Observation: opt-in profile collection is cheap on these fixtures, but the ordinary M2 code path is not literally byte-for-byte cost-free versus M1.
   Evidence: paired M2 profiled/unprofiled deltas ranged from -0.77 to +1.91 percent across two optimized rounds. A separate four-round public-API comparison against the exact M1 checkpoint preserved all result digests and produced combined ordinary-path medians from -0.32 to +1.82 percent, with one non-reproduced broad-query timing outlier.
+
+- Observation: M2 identified resolver-heavy reference and import traversals, but neither relation currently has stable resolved topology columns in the store.
+  Evidence: the store persists parsed reference/import inputs and packed structural facts, while language-specific resolution still depends on live analyzer state. Structural facts are already a versioned dense arena with CSR role rows, so another SQL graph would duplicate its warm representation.
+
+- Observation: physical planning can identify a derived relation's semantic shape but cannot capture its runtime resolver identity.
+  Evidence: reverse-import planning knows it needs the complete direct-import topology, while JS/TS aliases depend on effective `tsconfig.json` or `jsconfig.json` state available only from the analyzer. The request fingerprint and runtime configuration fingerprint must therefore remain separate key dimensions.
+
+- Observation: `unit_children` is normalized SQL topology, but the first experiment was not an end-to-end equivalent candidate for the current `Members` consumer.
+  Evidence: the prototype could bulk-remap and freeze adjacency, but its lookup returned edge IDs instead of rich `CodeUnit` values, did not bind exact generation/completeness through publication, and used a global hash remap despite dense per-blob unit keys. It was retained only long enough to capture a negative-control measurement, then removed.
 
 ## Decision Log
 
@@ -141,6 +151,26 @@ The first independently verifiable milestone is deliberately sequential. Existin
   Rationale: the benchmark omits real scheduler contention, per-request CPU time, RSS/retained bytes, persisted reopen, asymmetric branches, and real-repository fanout. It validates instrumentation and nominates later experiments; it cannot promote or discard a production representation.
   Date/Author: 2026-07-20 / Codex
 
+- Decision: extract `CompleteValueCache<K, V>` from the semantic artifact cache and keep ready-value retention and same-key flights in one shared lifecycle.
+  Rationale: derived values and semantic artifacts need identical leader, waiter, cancellation, retry, oversize handoff, and complete-only publication semantics. One implementation also closes the ready-publication/flight-reservation race consistently.
+  Date/Author: 2026-07-21 / Codex
+
+- Decision: make exact key construction the responsibility of each concrete derived-layer owner, and do not retain an unbound production runtime key after discarding the only M3 candidate.
+  Rationale: workspace mount, canonical store generations, content/overlay state, layer kind, projection/filter, representation version, and resolver configuration can each independently change validity. The generic cache documents that contract and a fake composite key proves every dimension plus generation cutover. No current layer can honestly construct the whole identity, so a speculative shared key type would only pretend exactness.
+  Date/Author: 2026-07-21 / Codex
+
+- Decision: annotate only `ImportersOf` with the complete direct-import-topology request in M3.
+  Rationale: reverse traversal requires a complete project-local relation, whereas `ImportsOf` materializes only its dynamic input frontier. The annotation exposes the future scheduler dependency without changing the serial executor or claiming that a production layer exists.
+  Date/Author: 2026-07-21 / Codex
+
+- Decision: discard the `unit_children` SQL graph prototype and retain only its evidence.
+  Rationale: it was not nominated by M2, did not compare equivalent consumer outputs, and lacked exact publication validity. Keeping experiment-only code would add normal test compilation and schema maintenance without supporting a production path; the result does not justify the broader claim that SQL-backed graphs are slow.
+  Date/Author: 2026-07-21 / Codex
+
+- Decision: bump the internal execution profile and enclosing benchmark formats to version 2.
+  Rationale: physical explain nodes now optionally serialize derived-layer request metadata. A version bump prevents consumers from assuming the v1 explain shape.
+  Date/Author: 2026-07-21 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 is complete. Parsed JSON and RQL now converge on a dense dependency-first logical DAG with exact shared seed nodes, then select a one-to-one physical plan with explicit seed, step, sequential set, and root-limit operators. The existing query path executes through that plan while preserving authored branch order, fair budget roll-forward, cache replay and charging, provenance, diagnostics, cancellation checkpoints, intermediate-step exhaustion, and the global `limit + 1` probe.
@@ -159,13 +189,21 @@ The profile also uncovered and fixed partial reference-cache replay that allowed
 
 Final validation passed with 5 execution-plan tests plus the ignored benchmark registration, 85 structural query tests, all 40 structural search tests including 11 focused profile cases, the exact structural-facts outcome test, all 73 `code_query_pipelines` tests, both optimized benchmark rounds, `cargo fmt --all`, `git diff --check`, and pinned-toolchain `cargo-clippy --all-targets --all-features -- -D warnings`.
 
-No threshold was selected. The reported headroom is an idealized wall-time projection with zero scheduler cost, not measured parallel execution or CPU-capacity evidence. The fixtures do not measure RSS, retained bytes, persisted reopen, asymmetric branches, high-fanout real repositories, or real scheduler contention, so they neither promote nor discard a SQL-backed graph layer. Milestone 3 remains responsible for exact dependency keys and cancellation-aware complete-value single-flight; Milestone 4 remains responsible for actual bounded sequential/parallel A/B measurements and policy selection.
+No threshold was selected. The reported headroom is an idealized wall-time projection with zero scheduler cost, not measured parallel execution or CPU-capacity evidence. The fixtures do not measure RSS, retained bytes, persisted reopen, asymmetric branches, high-fanout real repositories, or real scheduler contention, so they neither promote nor discard a SQL-backed graph layer. At the M2 checkpoint, Milestone 3 remained responsible for exact dependency keys and cancellation-aware complete-value single-flight; Milestone 4 remains responsible for actual bounded sequential/parallel A/B measurements and policy selection.
+
+Milestone 3 is complete. `CompleteSemanticArtifactCache` now delegates ready-value retention and same-key flight coordination to one generic `CompleteValueCache<K, V>`. Leaders build outside locks and publish only complete immutable `Arc` values; dropped error, cancellation, and incomplete paths remove the exact flight and wake a retry; cancelled followers leave leaders alone; and oversize values reach current followers without bypassing the bounded ready cache. Review also caught and fixed a zero-weight hole in the generalized Moka weigher.
+
+The cache contract requires each concrete derived-layer owner to bind workspace identity, canonical storage generations, content/overlay state, layer kind, exact projection/filter shape, resolver configuration, and representation version. A fake composite key proves every dimension and generation invalidation. Because no M3 graph candidate could construct that full identity, no speculative production runtime-key type remains. Physical `ImportersOf` nodes instead carry an explicit complete direct-import-topology request recipe; frontier-scoped `ImportsOf` nodes do not. The internal profile and enclosing benchmark formats are version 2 for the added physical-explain metadata.
+
+The only normalized SQL topology, `unit_children`, was measured as a deliberately small negative control and then removed. The release run reported a 1.252 ms SQL scan, 0.034 ms remap/freeze, and 1.370 ms invalidation rebuild for 140 vertices and 120 edges, but the nearest current traversal returned only 100 rich results. The mismatch was one file-scope-to-top-level-class edge per synthetic file, and the prototype also lacked exact generation/integrity publication. These timings therefore do not promote the candidate and do not support a general rejection of SQL-to-CSR techniques.
+
+Final validation passed 7 generic lifecycle/key tests, all 15 semantic-service tests, 7 execution-plan tests with the ignored benchmark registered, all 40 structural-search tests, all 73 `code_query_pipelines` tests, the ignored optimized negative-control run, `cargo fmt --all`, `git diff --check`, and pinned-toolchain `cargo-clippy --all-targets --all-features -- -D warnings`. No SQL migration, production graph cache, scheduler, parallel operator, scheduling threshold, or public profile surface was added. Milestone 4 remains responsible for bounded scheduling and real sequential-versus-parallel A/B policy.
 
 ## Context and Orientation
 
 The public query frontend lives under `src/analyzer/structural/query/`. `ir.rs` defines `CodeQuery`, the recursively authored `CodeQueryPlan`, `CodeQuerySeed`, typed `QueryStep` values, and set operators. `decode.rs` validates canonical JSON, `sexp.rs` lowers RQL, and `json.rs` produces canonical structured forms. A `CodeQueryPlan` node currently contains either a seed or a set composition followed by zero or more typed steps. `CodeQuery` owns the result limit and rendering detail.
 
-The current executor is `src/analyzer/structural/search.rs`. `execute_internal` validates the authored plan, constructs a mutable `QueryExecutionState`, and calls recursive `execute_plan`. `execute_seed` scans deterministic candidate files and materializes structural rows. `apply_plan_steps` runs semantic traversals. `fair_branch_limits` reserves part of the remaining request budget for each authored branch. `combine_set_rows` implements exact typed union, intersection, and subtraction while preserving deterministic order and bounded provenance. Rendering happens only after internal execution and must remain outside the physical operators.
+The current executor is `src/analyzer/structural/search.rs`. `execute_internal` lowers the authored query with `LogicalQueryPlan::lower`, selects a `PhysicalQueryPlan`, constructs `QueryExecutionState`, and recursively executes physical node IDs through `execute_plan`. `execute_seed` scans deterministic candidate files and materializes structural rows. `apply_plan_steps` runs semantic traversals. `fair_branch_limits` reserves part of the remaining request budget for each authored branch. `combine_set_rows` implements exact typed union, intersection, and subtraction while preserving deterministic order and bounded provenance. Rendering happens only after internal execution and remains outside the physical operators.
 
 The name `QueryPlan` in `src/analyzer/structural/planner.rs` refers only to seed-scan anchor pruning. It is not a whole-query logical or physical plan. New types therefore use the explicit names `LogicalQueryPlan` and `PhysicalQueryPlan` to avoid confusing the two responsibilities.
 
@@ -175,7 +213,7 @@ A physical operator is the implementation chosen for one logical operation. For 
 
 A derived layer is an expensive reusable analysis value such as a complete import topology, hierarchy relation, call relation, or another resolver intermediate. Single-flight means that concurrent requests for one exact key elect one builder while other consumers wait or yield; all consumers receive the same complete immutable value. Failed, partial, stale, or cancelled construction is not published.
 
-The reusable storage primitives live in `src/compact_graph.rs`. The persisted analyzer store is in `src/analyzer/store/mod.rs`, its schema migrations are under `migrations/cache/`, and structural snapshot hydration is split across `src/analyzer/structural/provider.rs`, `facts.rs`, and `tree_sitter_analyzer.rs`. The semantic artifact lifecycle worth reusing is in `src/analyzer/semantic/service.rs`. The canonical shared-payload bidirectional graph construction pattern is `ControlFlowGraph` in `src/analyzer/semantic/ir.rs`.
+The reusable storage primitives live in `src/compact_graph.rs`. The persisted analyzer store is in `src/analyzer/store/mod.rs`, its schema migrations are under `migrations/cache/`, and structural snapshot hydration is split across `src/analyzer/structural/provider.rs`, `facts.rs`, and `tree_sitter_analyzer.rs`. The reusable complete-value lifecycle is in `src/analyzer/complete_value_cache.rs`; `src/analyzer/semantic/service.rs` is its first production client. The canonical shared-payload bidirectional graph construction pattern is `ControlFlowGraph` in `src/analyzer/semantic/ir.rs`.
 
 The most important behavioral regression suite is `tests/code_query_pipelines.rs`. Existing tests cover exact endpoint identity, branch order, nested composition, common suffix steps, identical complete and truncated seed reuse, fair budgets, rejected-work charging, resumable import graph work, cancellation, and applying the global result limit only after composition.
 
@@ -189,9 +227,9 @@ Refactor `search.rs::execute_internal` into the explicit stages `validate and lo
 
 Milestone 2 turns the profile skeleton into decision-grade measurement. Add cache hit, miss, and wait counts; dependency execution and wait time; rows or edges visited; merge time; scheduling overhead; temporary allocation estimates where practical; and cancellation/early-termination markers. Extend the benchmark harness with representative composed queries and versioned machine-readable results. Cover fresh-analyzer and same-analyzer-later cache states, distinct and identical branches, small and large outputs, shared graph prerequisites, multiple synthetic workspace sizes, and TypeScript and Java. Keep physical execution sequential and calculate an explicitly idealized perfect-overlap lower bound only for complete distinct branches without shared derived dependencies. Do not introduce experimental parallel execution or publish a threshold here; repeated optimized sequential-versus-parallel A/B runs belong to Milestone 4 after Milestone 3 establishes complete-value single-flight.
 
-Milestone 3 creates explicit shared dependency keys and a promote-or-discard graph materialization experiment. Generalize the complete-value single-flight lifecycle from `CompleteSemanticArtifactCache` instead of duplicating leader, waiter, cancellation, retry, and publication logic. The key includes workspace or store generation, derived-layer kind, projection/filter/configuration identity, and representation version. First prove with an in-memory fake layer that concurrent consumers cause one build, cancelled waiters do not cancel the leader, a failed leader wakes a retry, and incomplete results are never cached.
+Milestone 3 creates an exact shared-dependency contract and a promote-or-discard graph materialization experiment. Generalize the complete-value single-flight lifecycle from `CompleteSemanticArtifactCache` instead of duplicating leader, waiter, cancellation, retry, and publication logic. Each promoted layer-owned key must include workspace or store generation, derived-layer kind, projection/filter/configuration identity, and representation version. First prove with an in-memory fake layer that concurrent consumers cause one build, cancelled waiters do not cancel the leader, a failed leader wakes a retry, and incomplete results are never cached. Physical planning records only a plan-known request recipe; binding a runtime key remains the responsibility of an actual layer owner.
 
-Only then select one stable expensive layer from profile evidence. Its SQL reader must select only identity and topology columns, order rows so grouping is linear, and avoid reconstructing rich `FileState` values. Build a domain-owned node arena and typed dense IDs. If persistent IDs are dense enough, an indexed vector remap is allowed; otherwise use a pre-sized hash remap. Build adjacency with degree counts, prefix sums, and scatter. Store rich edge payload once and use edge IDs for the reverse orientation. Validate all endpoints and boundaries before publishing `Arc<Snapshot>`, then drop temporary remap, degree, and dedup structures. Benchmark SQL scan, decode/remap, freeze, vertices, edges, retained bytes, cold/warm reuse, sibling contention, and invalidation separately. Discard the implementation if end-to-end profile data does not justify it.
+The production graph gate stopped at candidate eligibility: M2 identified no expensive resolved relation with stable persisted topology, and packed structural facts already had a dense warm representation. `unit_children` was measured only as a negative control. Its prototype exercised minimal SQL projection, dense remapping, count/prefix/scatter adjacency, and invalidation rebuild timing, but returned non-equivalent results and lacked exact publication validity, so it was deleted. The reported warm number is direct lookup reuse, not `CompleteValueCache` reuse or sibling contention. Cold/warm cache reuse and contention gates were intentionally not run because no valid layer survived to acquire a runtime key. Any future candidate must first be nominated by end-to-end profile evidence, then meet the original equivalent-result, exact-key, complete-publication, cold/warm, contention, retained-memory, and invalidation gates.
 
 Milestone 4 adds the bounded scheduler and real physical alternatives. The scheduler owns a fixed parallelism budget and dispatches only ready DAG nodes. It must not recursively spawn arbitrary tasks from operators. Implement sequential and parallel union as separate physical operators over the same exact typed rows. Keep branch occurrence as edge metadata so shared node materialization can be reused while branch provenance is attached deterministically. Preserve the existing global budgets and reserve work for every branch; synchronize counter admission before committing scans or graph expansion. Propagate cancellation to queued and running work and ensure dependency waits cannot starve the executor. Use measured cost/cardinality/cache state to select parallel union, with sequential as the conservative fallback. Add bitmap-backed set operations only for a domain with proven stable dense identities; do not coerce heterogeneous query domains into one global integer namespace.
 
@@ -199,7 +237,7 @@ Milestone 5 exposes and documents the result. Add supported `explain` and `profi
 
 ## Concrete Steps
 
-Work from `/Users/dave/.codex/worktrees/740b/bifrost` on the existing branch `918-modularise-query-planning-and-execution-for-measurable-parallel-scheduling`. Do not create or switch branches. At the start of this plan the branch and its upstream both equal `ce79d33b`.
+Work from `/Users/dave/.codex/worktrees/740b/bifrost` on the existing branch `918-modularise-query-planning-and-execution-for-measurable-parallel-scheduling`. Do not create or switch branches. The plan originally started at `ce79d33b`; before M3, the M1/M2 checkpoints were cleanly rebased onto `origin/master` at `a84d6df4`, producing rebased M2 checkpoint `063b8ad9`.
 
 For Milestone 1, run:
 
@@ -235,6 +273,26 @@ After the milestone implementation, update this plan's progress, discoveries, de
 
 For later benchmark work, use ignored configurable tests with versioned JSON result lines and repeat optimized candidate/baseline runs in alternating order. Record absolute times as well as percentages. Cold runs must start without a ready derived layer; warm runs must prove the exact generation-matched layer was reused; contention runs must prove sibling branches requested the same key.
 
+For Milestone 3, run the focused lifecycle, key, explain, profile, and query regression gates:
+
+    cargo fmt --all
+    cargo test --lib complete_value_cache
+    cargo test --lib analyzer::semantic::service::tests
+    cargo test --lib analyzer::structural::execution
+    cargo test --lib analyzer::structural::search::tests
+    cargo test --test code_query_pipelines
+    rustup run 1.96.0 cargo-clippy --all-targets --all-features -- -D warnings
+    git diff --check
+
+The discarded `unit_children` negative control was measured in an ignored optimized test before its experiment-only module was deleted:
+
+    BIFROST_UNIT_CHILDREN_GRAPH_FILES=20 \
+    BIFROST_UNIT_CHILDREN_GRAPH_MEMBERS=4 \
+    BIFROST_UNIT_CHILDREN_GRAPH_ITERATIONS=3 \
+    cargo test --release --lib \
+      analyzer::store::graph_experiment::unit_children_graph_negative_control_benchmark \
+      --no-default-features -- --ignored --exact --nocapture
+
 ## Validation and Acceptance
 
 Milestone 1 is accepted when equivalent JSON and RQL queries lower to identical logical explain structures; exact repeated seeds produce one seed node referenced by multiple branch edges; all dependency IDs precede their consumers; a union selects `SequentialUnion`; the root limit is explicit; and the structured execution profile reports deterministic operator identities and `peak_concurrency = 1`. The existing query pipeline suite must remain green, with no public result, ordering, provenance, diagnostic, truncation, cancellation, or budget change.
@@ -259,6 +317,11 @@ Milestone 2 benchmark configuration, optimized medians, cache/work contracts,
 ordinary-path M1 comparison, limitations, and the decision to defer threshold
 selection are recorded in
 `.agents/docs/issue-918-code-query-execution-benchmark-2026-07-20.md`.
+
+Milestone 3 candidate selection, exact lifecycle/key contracts, raw optimized
+negative-control evidence, experiment limitations, and the discard decision
+are recorded in
+`.agents/docs/issue-918-derived-layer-graph-experiment-2026-07-21.md`.
 
 The intended first-milestone plan shape for two identical union branches is:
 
@@ -291,6 +354,8 @@ Revision note (2026-07-20, Milestone 1): Recorded the completed sequential plan 
 
 Revision note (2026-07-20, Milestone 2): Recorded the completed profile schema and cache lifecycle attribution, the partial-reference replay correctness repair, the versioned ignored benchmark, optimized reversed-order evidence, explicit idealized-headroom limits, ordinary-path M1 comparison, and the decision to leave single-flight, SQL promotion, real parallel execution, and policy selection to later milestones.
 
+Revision note (2026-07-21, Milestone 3): Recorded the clean rebase onto current `origin/master`, generic complete-value lifecycle, exact layer-owned key contract and fake-key proof, reverse-import request annotation, versioned execution-profile/benchmark schemas for the added explain metadata, and the measured decision to delete rather than promote the non-equivalent `unit_children` SQL graph prototype. Milestone 4 remains the first scheduler and real sequential-versus-parallel A/B milestone.
+
 ## Interfaces and Dependencies
 
 In `src/analyzer/structural/execution/plan.rs`, Milestone 1 should provide types equivalent to:
@@ -315,8 +380,8 @@ In `src/analyzer/structural/execution/plan.rs`, Milestone 1 should provide types
         Limit,
     }
 
-The exact field visibility may remain private behind accessors. Each logical node carries its terminal `QueryValueKind`; each physical node points back to one logical node and retains ordered physical dependencies. `LogicalQueryPlan::lower(&CodeQuery)` validates and lowers the authored query. `PhysicalQueryPlan::select(LogicalQueryPlan)` chooses the sequential implementation. `PhysicalQueryPlan::explain()` returns a deterministic serializable structure without borrowing internal arenas.
+The exact field visibility may remain private behind accessors. Each logical node carries its terminal `QueryValueKind`; each physical node points back to one logical node, retains ordered physical dependencies, and may carry a plan-known `DerivedLayerRequest`. `LogicalQueryPlan::lower(&CodeQuery)` validates and lowers the authored query. `PhysicalQueryPlan::select(LogicalQueryPlan)` chooses the sequential implementation. `PhysicalQueryPlan::explain()` returns a deterministic serializable structure without borrowing internal arenas.
 
 The internal profile types belong beside execution, not in MCP result models. Milestone 1 needs a request profile and per-operator observation sufficient to prove plan identity, elapsed wall time, cardinality, truncation, cancellation, and sequential peak concurrency. Later milestones extend this same model rather than adding a second profiler.
 
-Do not add a new dependency for Milestone 1. Use the repository hash-map alias, `std::time::Instant`, existing cancellation and budget types, and current typed row/set helpers. Later scheduling should prefer existing runtime facilities only after their worker-blocking behavior has been proven safe. Later derived-layer caching should extract a generic complete-value lifecycle from the semantic cache or reuse it directly; it must not maintain two subtly different single-flight implementations.
+Do not add a new dependency for Milestone 1. Use the repository hash-map alias, `std::time::Instant`, existing cancellation and budget types, and current typed row/set helpers. Later scheduling should prefer existing runtime facilities only after their worker-blocking behavior has been proven safe. M3 extracted `CompleteValueCache<K, V>` from the semantic cache; future derived-layer owners must define their exact typed key next to the materializer and reuse this lifecycle rather than maintaining a second single-flight implementation.

@@ -28,7 +28,7 @@ pub(crate) struct QueryExecutionProfile {
 impl QueryExecutionProfile {
     pub(crate) fn sequential(plan: &PhysicalQueryPlan, planning_ns: u64) -> Self {
         Self {
-            format: "bifrost_code_query_execution_profile/v1",
+            format: "bifrost_code_query_execution_profile/v2",
             plan: plan.explain(),
             operators: Vec::new(),
             peak_concurrency: 1,
@@ -315,8 +315,9 @@ pub(crate) struct QueryOperatorProfile {
     pub(crate) total_elapsed_ns: u64,
     /// Wall time spent synchronously executing dependency subtrees.
     pub(crate) dependency_execution_ns: u64,
-    /// Idle time waiting for an already-running dependency. The serial M2
-    /// executor has no such lifecycle, so this remains zero until M3/M4.
+    /// Idle time waiting for an already-running scheduled dependency. The
+    /// serial executor has no such lifecycle, so this remains zero until M4;
+    /// M3 same-key materialization waits belong to the cache `wait_ns` fields.
     pub(crate) dependency_wait_ns: u64,
     /// Time spent attaching branch provenance/diagnostics and combining sets.
     pub(crate) merge_ns: u64,
