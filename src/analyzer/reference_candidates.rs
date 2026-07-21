@@ -120,12 +120,19 @@ fn is_excluded_reference_candidate(
     node: Node<'_>,
     frontier: CandidateFrontier,
 ) -> bool {
-    if !matches!(frontier, CandidateFrontier::References)
-        || !matches!(language, Language::JavaScript | Language::TypeScript)
-    {
+    if !matches!(frontier, CandidateFrontier::References) {
         return false;
     }
 
+    match language {
+        Language::Go => is_go_field_or_type_declaration_name(node),
+        Language::CSharp => is_csharp_tuple_element_name(node),
+        Language::JavaScript | Language::TypeScript => is_js_ts_export_alias(node),
+        _ => false,
+    }
+}
+
+fn is_js_ts_export_alias(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
@@ -133,6 +140,28 @@ fn is_excluded_reference_candidate(
         && parent
             .child_by_field_name("alias")
             .is_some_and(|alias| alias == node)
+}
+
+fn is_go_field_or_type_declaration_name(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "field_declaration" | "type_alias" | "type_spec"
+        ) && node_is_field(parent, node, "name")
+    })
+}
+
+fn is_csharp_tuple_element_name(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "tuple_element" && node_is_field(parent, node, "name")
+    })
+}
+
+fn node_is_field(parent: Node<'_>, node: Node<'_>, field: &str) -> bool {
+    (0..parent.child_count()).any(|index| {
+        parent.child(index).is_some_and(|child| child == node)
+            && parent.field_name_for_child(index as u32) == Some(field)
+    })
 }
 
 fn is_semantic_token_identifier_node(language: Language, kind: &str) -> bool {
@@ -176,6 +205,20 @@ mod tests {
     use super::*;
     use crate::analyzer::ProjectFile;
     use crate::analyzer::usages::get_definition::parse_tree_for_language;
+
+    fn reference_candidate_offsets(language: Language, path: &str, source: &str) -> Vec<usize> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(&root, path);
+        let tree = parse_tree_for_language(&file, language, source)
+            .unwrap_or_else(|| panic!("failed to parse {language:?}"));
+        let ReferenceCandidateRanges::Complete(ranges) =
+            reference_candidate_ranges(tree.root_node(), language, 100)
+        else {
+            panic!("reference candidate budget exceeded for {language:?}");
+        };
+        ranges.into_iter().map(|range| range.start_byte).collect()
+    }
 
     #[test]
     fn js_ts_reference_frontier_excludes_export_alias_but_semantic_frontier_keeps_it() {
@@ -232,6 +275,80 @@ mod tests {
                     .iter()
                     .any(|range| range.start_byte == alias_start),
                 "semantic tokens must retain the export alias for {language:?}: {semantic_ranges:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_reference_frontier_excludes_field_and_type_names_but_keeps_type_and_member_uses() {
+        let source = r#"package sample
+
+type Repository struct {
+    Query Query
+}
+type Query struct{}
+type Alias = Query
+
+func use(repository Repository) Alias {
+    return repository.Query
+}
+"#;
+        let offsets = reference_candidate_offsets(Language::Go, "sample.go", source);
+        let field_declaration = source.find("Query Query").expect("field declaration");
+        let declarations = [
+            source.find("Repository struct").expect("repository type"),
+            field_declaration,
+            source.find("Query struct").expect("query type"),
+            source.find("Alias =").expect("type alias"),
+        ];
+        for declaration in declarations {
+            assert!(
+                !offsets.contains(&declaration),
+                "Go declaration name at byte {declaration} must not enter the reference frontier: {offsets:?}"
+            );
+        }
+
+        let references = [
+            field_declaration + "Query ".len(),
+            source.find("= Query").expect("alias target") + "= ".len(),
+            source
+                .find("repository Repository")
+                .expect("parameter type")
+                + "repository ".len(),
+            source.rfind("Query").expect("member reference"),
+        ];
+        for reference in references {
+            assert!(
+                offsets.contains(&reference),
+                "neighboring Go type/reference at byte {reference} must remain in the frontier: {offsets:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn csharp_reference_frontier_excludes_tuple_name_but_keeps_type_and_member_uses() {
+        let source = r#"class StylesWriter {
+    TableRegion? Read((TableRegion? TableRegion, int Count) value) {
+        return value.TableRegion;
+    }
+}
+"#;
+        let offsets = reference_candidate_offsets(Language::CSharp, "StylesWriter.cs", source);
+        let tuple = source
+            .find("(TableRegion? TableRegion, int Count)")
+            .expect("tuple declaration");
+        let tuple_type = tuple + 1;
+        let tuple_name = tuple_type + "TableRegion? ".len();
+        let member_reference = source.rfind("TableRegion").expect("member reference");
+
+        assert!(
+            !offsets.contains(&tuple_name),
+            "C# tuple element name must not enter the reference frontier: {offsets:?}"
+        );
+        for reference in [tuple_type, member_reference] {
+            assert!(
+                offsets.contains(&reference),
+                "neighboring C# type/reference at byte {reference} must remain in the frontier: {offsets:?}"
             );
         }
     }

@@ -181,7 +181,7 @@ fn resolve_token_path_segment_fqn(
 fn rust_token_path_segment(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
-        "identifier" | "type_identifier" | "crate" | "self" | "super"
+        "identifier" | "type_identifier" | "crate" | "self" | "super" | "default"
     )
 }
 
@@ -209,23 +209,18 @@ fn rust_token_call_arguments(node: &Node<'_>) -> bool {
     node.kind() == "token_tree" && node.child(0).is_some_and(|open| open.kind() == "(")
 }
 
-pub(super) fn supports_same_file_local_scan(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
-    target.is_function()
-        && analyzer
-            .parent_of(target)
-            .is_none_or(|parent| parent.is_module())
-        && (!is_public_like_declaration(analyzer, target)
-            || analyzer.is_rust_cfg_test_declaration(target))
-}
-
 pub(super) fn is_member_target(analyzer: &RustAnalyzer, target: &CodeUnit) -> bool {
     // A member is referenced through a value of its owning type (`receiver.member`).
-    // A function or field whose parent is a module is a free item referenced by name,
-    // so it belongs on the top-level scan path, not the member-receiver path.
+    // Free items belong on the top-level scan path even if a same-FQN module/macro
+    // collision gives one a non-module hierarchy parent.
     (target.is_function() || target.is_field())
-        && analyzer
-            .parent_of(target)
-            .is_some_and(|parent| !parent.is_module())
+        && analyzer.parent_of(target).is_some_and(|parent| {
+            // Rust members are owned by structs, enums, traits, or impl target
+            // types. A same-FQN module/macro collision can otherwise attach a
+            // free item to a macro CodeUnit and incorrectly route it through
+            // receiver-based member scanning.
+            parent.is_class()
+        })
 }
 
 pub(super) fn is_trait_owner(rust: &RustAnalyzer, owner: &CodeUnit) -> bool {
@@ -525,6 +520,17 @@ fn infer_export_graph_seeds(
     target: &CodeUnit,
 ) -> BTreeSet<(ProjectFile, String)> {
     let mut seeds = BTreeSet::new();
+    // A module-scope constant is represented as a parentless field. Its own
+    // declaration remains a valid import origin even when a public-like
+    // visibility produces additional export seeds through the crate graph.
+    // Retain that structured origin so `use crate::module::CONST` bindings are
+    // matched without treating the constant as a type member.
+    if target.is_field()
+        && analyzer.parent_of(target).is_none()
+        && is_local_declaration(analyzer, target)
+    {
+        seeds.insert((target.source().clone(), target.identifier().to_string()));
+    }
     let nested_module_target = analyzer
         .parent_of(target)
         .is_some_and(|parent| parent.is_module());
@@ -573,7 +579,8 @@ fn local_declaration_graph_seeds(
     analyzer: &RustAnalyzer,
     target: &CodeUnit,
 ) -> BTreeSet<(ProjectFile, String)> {
-    let seed_target = if is_member_target(analyzer, target) {
+    let member_target = is_member_target(analyzer, target);
+    let seed_target = if member_target {
         analyzer.parent_of(target)
     } else {
         Some(target.clone())
@@ -581,7 +588,13 @@ fn local_declaration_graph_seeds(
     let Some(seed_target) = seed_target else {
         return BTreeSet::new();
     };
-    if !is_local_declaration(analyzer, &seed_target) {
+    // Macro-generated and imported impl target types may not have their own
+    // declaration in this file. Their impl members do, and the parser retains
+    // the exact structural owner for those members. Seed that owner identity so
+    // associated references inside the impl remain graph-addressable.
+    if !(is_local_declaration(analyzer, &seed_target)
+        || member_target && is_local_declaration(analyzer, target))
+    {
         return BTreeSet::new();
     }
     [(

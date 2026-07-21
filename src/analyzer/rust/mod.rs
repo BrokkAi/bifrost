@@ -40,6 +40,7 @@ use tests::detect_rust_test_assertion_smells;
 
 pub use graph_support::RustReferenceContext;
 use hierarchy::RustHierarchyIndex;
+pub(crate) use usage_index::RustBindingSeeds;
 use usage_index::RustUsageIndex;
 
 #[derive(Clone)]
@@ -284,6 +285,11 @@ impl IAnalyzer for RustAnalyzer {
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.direct_children(code_unit)
+    }
+
+    fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        IAnalyzer::parent_of(&self.inner, code_unit)
+            .or_else(|| self.inner.structural_parent_of(code_unit))
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {

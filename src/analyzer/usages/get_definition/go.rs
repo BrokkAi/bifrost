@@ -80,6 +80,7 @@ pub(super) fn parse_go_tree(source: &str) -> Option<Tree> {
     parser.parse(source, None)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_go(
     analyzer: &dyn IAnalyzer,
     support: &dyn GoDefinitionProvider,
@@ -87,16 +88,43 @@ pub(super) fn resolve_go(
     source: &str,
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
+    selector: Option<&GoSelectorDescriptor<'_>>,
     resolution: Option<GoReferenceResolution>,
 ) -> DefinitionLookupOutcome {
     let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
         return no_definition("go_analyzer_unavailable", "Go analyzer is unavailable");
     };
-    let reference = site.text.as_str();
+    let reference = selector
+        .map(GoSelectorDescriptor::focused_node)
+        .map(|node| go_node_text(node, source))
+        .unwrap_or(site.text.as_str());
     if let Some(outcome) = tree.and_then(|tree| {
         go_keyed_composite_label_outcome(analyzer, support, file, source, tree.root_node(), site)
     }) {
         return outcome;
+    }
+    if let Some(selector) = selector
+        && selector.focus_segment > 0
+        && selector.base_identifier(source).is_none()
+    {
+        return tree
+            .and_then(|tree| {
+                resolve_go_local_selector_chain(
+                    analyzer,
+                    support,
+                    file,
+                    source,
+                    tree.root_node(),
+                    site,
+                    selector,
+                )
+            })
+            .unwrap_or_else(|| {
+                no_definition(
+                    "no_indexed_definition",
+                    format!("`{reference}` did not resolve to an indexed Go definition"),
+                )
+            });
     }
     if let Some(resolution) = resolution {
         let candidates = go_fqn_candidates(support, resolution.fqn_candidates);
@@ -104,9 +132,19 @@ pub(super) fn resolve_go(
             return candidates_outcome(candidates);
         }
         if resolution.shadowed {
-            if let Some(outcome) =
-                resolve_go_local_selector_chain(analyzer, support, file, source, site, reference)
-            {
+            if let Some(outcome) = tree.and_then(|tree| {
+                selector.and_then(|selector| {
+                    resolve_go_local_selector_chain(
+                        analyzer,
+                        support,
+                        file,
+                        source,
+                        tree.root_node(),
+                        site,
+                        selector,
+                    )
+                })
+            }) {
                 return outcome;
             }
             return no_definition(
@@ -114,14 +152,17 @@ pub(super) fn resolve_go(
                 format!("`{reference}` is shadowed by a local Go binding"),
             );
         }
-        if let Some((_, name)) = reference.split_once('.')
-            && let Some(package) = resolution.resolved_import_packages.first()
+        if let Some(package) = resolution.resolved_import_packages.first()
+            && let Some(selector) = selector
         {
-            let candidates = go_package_member_candidates(support, package, name);
-            if !candidates.is_empty() {
-                return candidates_outcome(candidates);
+            if selector.focus_segment == 0 {
+                return boundary(format!(
+                    "`{reference}` is a Go import namespace rather than an indexed declaration"
+                ));
             }
-            if let Some(outcome) = go_package_selector_chain_outcome(support, package, site) {
+            if let Some(outcome) =
+                go_package_selector_chain_outcome(support, package, source, selector)
+            {
                 return outcome;
             }
             if !go_import_path_is_workspace(support, package) {
@@ -131,7 +172,7 @@ pub(super) fn resolve_go(
             }
             return no_definition(
                 "no_indexed_definition",
-                format!("`{name}` is not indexed in Go package `{package}`"),
+                format!("`{reference}` is not indexed in Go package `{package}`"),
             );
         }
         if let Some(package) = resolution
@@ -146,14 +187,16 @@ pub(super) fn resolve_go(
     }
 
     let package = go_package_name(file, source);
-    if let Some((qualifier, name)) = reference.split_once('.') {
+    if let Some(selector) = selector
+        && selector.focus_segment > 0
+        && let Some(qualifier) = selector.base_identifier(source)
+    {
+        let name = go_node_text(selector.focused_node(), source);
         let imports = go_import_paths(go, file);
         if let Some(import_path) = imports.get(qualifier) {
-            let candidates = go_package_member_candidates(support, import_path, name);
-            if !candidates.is_empty() {
-                return candidates_outcome(candidates);
-            }
-            if let Some(outcome) = go_package_selector_chain_outcome(support, import_path, site) {
+            if let Some(outcome) =
+                go_package_selector_chain_outcome(support, import_path, source, selector)
+            {
                 return outcome;
             }
             if !go_import_path_is_workspace(support, import_path) {
@@ -166,12 +209,24 @@ pub(super) fn resolve_go(
                 format!("`{name}` is not indexed in Go package `{import_path}`"),
             );
         }
-        if let Some(outcome) =
-            resolve_go_local_selector_chain(analyzer, support, file, source, site, reference)
-        {
+        if let Some(outcome) = tree.and_then(|tree| {
+            resolve_go_local_selector_chain(
+                analyzer,
+                support,
+                file,
+                source,
+                tree.root_node(),
+                site,
+                selector,
+            )
+        }) {
             return outcome;
         }
-        let candidates = go_fqn_candidates(support, [format!("{package}.{qualifier}.{name}")]);
+        let candidates = if selector.focus_segment == 1 {
+            go_fqn_candidates(support, [format!("{package}.{qualifier}.{name}")])
+        } else {
+            Vec::new()
+        };
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
         }
@@ -430,14 +485,13 @@ fn go_package_member_candidates(
 fn go_package_selector_chain_outcome(
     support: &dyn GoDefinitionProvider,
     package: &str,
-    site: &ResolvedReferenceSite,
+    source: &str,
+    selector: &GoSelectorDescriptor<'_>,
 ) -> Option<DefinitionLookupOutcome> {
-    let segments = dotted_reference_segments(site)?;
-    let focus_index = dotted_focus_segment_index(site, &segments)?;
-    if focus_index != 1 {
+    if selector.focus_segment != 1 {
         return None;
     }
-    let member = &segments.get(1)?.0;
+    let member = selector.member_name(source, 0)?;
     let candidates = go_package_member_candidates(support, package, member);
     (!candidates.is_empty()).then(|| candidates_outcome(candidates))
 }
@@ -455,63 +509,66 @@ fn go_external_dot_import_path(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_go_local_selector_chain(
     analyzer: &dyn IAnalyzer,
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     site: &ResolvedReferenceSite,
-    reference: &str,
+    selector: &GoSelectorDescriptor<'_>,
 ) -> Option<DefinitionLookupOutcome> {
-    let segments: Vec<_> = reference.split('.').collect();
-    if segments.len() < 2 {
+    if selector.focus_segment == 0 {
         return None;
     }
 
-    let tree = parse_go_tree(source)?;
-    let root = tree.root_node();
-    // Type the chain's base from its AST node, not the reference text. The text
-    // reference expander drops non-identifier receivers (a `T{}` composite literal,
-    // an `f()` call), yielding a base like `` in `.Name`, so `segments[0]` can't be
-    // typed. `go_expression_type_fqn` types identifiers, composite literals, and
-    // calls uniformly from the AST; fall back to the name lookup for a plain-ident
-    // base the expander captured.
-    let mut owner_fqn =
-        go_selector_chain_base_node(root, site.focus_start_byte, site.focus_end_byte)
-            .and_then(|base| {
-                go_expression_type_fqn(
-                    analyzer,
-                    support,
-                    file,
-                    source,
-                    root,
-                    base,
-                    site.focus_start_byte,
-                )
-            })
-            .or_else(|| {
-                go_binding_type_fqn(
-                    analyzer,
-                    support,
-                    file,
-                    source,
-                    root,
-                    segments[0],
-                    site.focus_start_byte,
-                )
-            })?;
+    // Type the chain's structured base node directly. This supports both plain
+    // identifiers and expression receivers such as `T{}` or `f()` without
+    // reconstructing selector syntax from expanded source text.
+    let mut owner_fqn = go_expression_type_fqn(
+        analyzer,
+        support,
+        file,
+        source,
+        root,
+        selector.base,
+        site.focus_start_byte,
+    )
+    .or_else(|| {
+        selector.base_identifier(source).and_then(|base| {
+            go_binding_type_fqn(
+                analyzer,
+                support,
+                file,
+                source,
+                root,
+                base,
+                site.focus_start_byte,
+            )
+        })
+    })?;
     let mut deepest_workspace_field = None;
-    for (index, member) in segments[1..].iter().enumerate() {
+    for (index, member) in selector
+        .members
+        .iter()
+        .take(selector.focus_segment)
+        .enumerate()
+    {
+        let member = go_node_text(*member, source);
         let lookup = go_indexed_field_lookup(analyzer, support, &owner_fqn, member);
+        if matches!(lookup, GoIndexedMemberLookup::Ambiguous) {
+            return Some(go_ambiguous_selector_outcome(member));
+        }
         if let GoIndexedMemberLookup::Unique(candidate) = &lookup {
             deepest_workspace_field = Some(vec![candidate.clone()]);
         }
-        if index == segments.len() - 2 {
+        if index + 1 == selector.focus_segment {
             return match lookup {
                 GoIndexedMemberLookup::Unique(candidate) => {
                     Some(candidates_outcome(vec![candidate]))
                 }
-                GoIndexedMemberLookup::Ambiguous => Some(go_ambiguous_selector_outcome(member)),
+                GoIndexedMemberLookup::Ambiguous => unreachable!("handled above"),
                 GoIndexedMemberLookup::Missing => deepest_workspace_field
                     .map(|candidates| go_partial_selector_chain_outcome(candidates, member)),
             };
@@ -530,30 +587,6 @@ fn go_ambiguous_selector_outcome(member: &str) -> DefinitionLookupOutcome {
     ambiguous_definition(format!(
         "`{member}` resolves to multiple Go embedded members at the nearest promotion depth"
     ))
-}
-
-/// The base (leftmost operand) node of the selector chain covering the cursor —
-/// e.g. `e{}` in `e{}.a.b`. Returns `None` when the cursor is not inside a
-/// selector chain.
-fn go_selector_chain_base_node(root: Node<'_>, start: usize, end: usize) -> Option<Node<'_>> {
-    let mut top = smallest_named_node_covering(root, start, end)?;
-    while let Some(parent) = top.parent() {
-        if parent.kind() == "selector_expression" {
-            top = parent;
-        } else {
-            break;
-        }
-    }
-    if top.kind() != "selector_expression" {
-        return None;
-    }
-    let mut base = top;
-    while base.kind() == "selector_expression" {
-        base = base
-            .child_by_field_name("operand")
-            .or_else(|| go_first_named_child(base))?;
-    }
-    Some(base)
 }
 
 fn go_partial_selector_chain_outcome(

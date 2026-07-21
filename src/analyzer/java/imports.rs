@@ -256,19 +256,17 @@ impl JavaAnalyzer {
             let Some(imported_name) = import.identifier.as_deref() else {
                 continue;
             };
-            if normalized == imported_name
-                && let Some(unit) = source_type_by_fqn(import_path)
-            {
-                return Some(unit);
+            // A matching single-type import constrains this name even when its
+            // declaration is outside the indexed workspace.
+            if normalized == imported_name {
+                return source_type_by_fqn(import_path);
             }
             if let Some(rest) = normalized
                 .strip_prefix(imported_name)
                 .and_then(|rest| rest.strip_prefix('.'))
             {
                 let nested_fqn = format!("{import_path}.{rest}");
-                if let Some(unit) = source_type_by_fqn(&nested_fqn) {
-                    return Some(unit);
-                }
+                return source_type_by_fqn(&nested_fqn);
             }
         }
 

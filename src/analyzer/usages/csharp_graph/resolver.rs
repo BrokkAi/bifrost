@@ -2,6 +2,7 @@ pub(in crate::analyzer::usages) use crate::analyzer::usages::common::node_text;
 pub(super) use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
+use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
 use crate::analyzer::{
     CSharpAnalyzer, CSharpMemberName, CallableArity, CodeUnit, IAnalyzer, ProjectFile,
     csharp_callable_arity, csharp_conditional_member_access, csharp_member_name,
@@ -520,6 +521,36 @@ pub(super) fn class_unit_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Opti
     (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
+pub(in crate::analyzer::usages) fn usage_direct_base(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    owner: &CodeUnit,
+) -> Option<CodeUnit> {
+    let mut candidates = csharp
+        .usage_direct_ancestors(owner)
+        .into_iter()
+        .filter(|candidate| csharp_is_class_base_declaration(analyzer, candidate))
+        .collect::<Vec<_>>();
+    csharp.sort_dedup_type_candidates(&mut candidates);
+    (csharp.logical_type_count(&candidates) == 1)
+        .then(|| candidates.into_iter().next())
+        .flatten()
+}
+
+fn csharp_is_class_base_declaration(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+    let language = tree_sitter_c_sharp::LANGUAGE.into();
+    let Some(parsed) = parse_tree_sitter_file(candidate.source(), &language) else {
+        return false;
+    };
+    analyzer.ranges(candidate).into_iter().any(|range| {
+        parsed
+            .tree
+            .root_node()
+            .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+            .is_some_and(|node| matches!(node.kind(), "class_declaration" | "record_declaration"))
+    })
+}
+
 fn forward_class_unit_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Option<CodeUnit> {
     let mut candidates = forward_type_declarations_for_fq_name(csharp, fqn);
     csharp.sort_dedup_type_candidates(&mut candidates);
@@ -668,6 +699,7 @@ fn method_return_type_fq_name_for_arity_inner(
         owner,
         method_name,
         explicit_generic_arity,
+        arity,
         usage,
     )
     .into_iter()
@@ -804,10 +836,21 @@ fn seed_symbol_for_type(
     bindings: &mut LocalInferenceEngine<String>,
     usage: bool,
 ) {
-    if let Some(target) =
-        resolve_type_fq_name_for_scope(csharp, file, &reference_type_text(type_node, source), usage)
-    {
+    let reference = reference_type_text(type_node, source);
+    if let Some(target) = resolve_type_fq_name_for_scope(csharp, file, &reference, usage) {
         bindings.seed_symbol(node_text(name_node, source), target);
+    } else if !usage {
+        let normalized = normalize_type_text(&reference);
+        let raw_type = csharp
+            .using_aliases_of(file)
+            .get(&normalized)
+            .cloned()
+            .unwrap_or(normalized);
+        if raw_type.is_empty() || raw_type == "var" {
+            bindings.declare_shadow(node_text(name_node, source));
+        } else {
+            bindings.seed_symbol(node_text(name_node, source), raw_type);
+        }
     } else {
         bindings.declare_shadow(node_text(name_node, source));
     }
@@ -869,7 +912,7 @@ pub(super) fn resolve_type_fq_name_at(
     if let Some(canonical) = canonical_builtin_type_identity(&normalized) {
         return Some(canonical.to_string());
     }
-    resolve_in_enclosing_class_ranges(csharp, class_ranges, &normalized, node.start_byte())
+    resolve_in_enclosing_type_scopes(csharp, class_ranges, &normalized, node.start_byte())
         .map(|unit| unit.fq_name())
         .or_else(|| resolve_usage_visible_type_fq_name(csharp, file, &normalized))
         .or_else(|| class_unit_for_fq_name(csharp, &normalized).map(|unit| unit.fq_name()))
@@ -964,7 +1007,7 @@ fn resolve_usage_visible_type_fq_name(
         .flatten()
 }
 
-fn resolve_in_enclosing_class_ranges(
+fn resolve_in_enclosing_type_scopes(
     csharp: &CSharpAnalyzer,
     class_ranges: &ClassRangeIndex,
     name: &str,
@@ -973,19 +1016,49 @@ fn resolve_in_enclosing_class_ranges(
     if name.is_empty() || name.contains('.') {
         return None;
     }
-    let mut scope = class_ranges.enclosing(byte)?.to_string();
+
+    let mut scope = class_ranges.enclosing_unit(byte)?.clone();
     loop {
-        if scope.is_empty() {
-            return None;
+        let mut parts = csharp.usage_partial_type_parts(&scope);
+        if parts.is_empty() {
+            parts.push(scope.clone());
         }
-        let child_fqn = format!("{scope}.{name}");
-        if let Some(child) = class_unit_for_fq_name(csharp, &child_fqn) {
-            return Some(child);
+        let mut candidates = parts
+            .into_iter()
+            .flat_map(|part| csharp.direct_children(&part))
+            .filter(|child| child.is_class() && csharp_source_identifier(child) == name)
+            .collect::<Vec<_>>();
+        if !candidates.is_empty() {
+            csharp.sort_dedup_type_candidates(&mut candidates);
+            return (csharp.logical_type_count(&candidates) == 1)
+                .then(|| candidates.into_iter().next())
+                .flatten();
         }
-        match scope.rfind('.') {
-            Some(idx) => scope.truncate(idx),
-            None => return None,
+
+        let Some(parent) = csharp.parent_of(&scope) else {
+            return resolve_in_enclosing_namespace(csharp, scope.package_name(), name);
+        };
+        scope = parent;
+    }
+}
+
+fn resolve_in_enclosing_namespace(
+    csharp: &CSharpAnalyzer,
+    namespace: &str,
+    name: &str,
+) -> Option<CodeUnit> {
+    let mut namespace = namespace.to_string();
+    loop {
+        let candidate_fqn = if namespace.is_empty() {
+            name.to_string()
+        } else {
+            format!("{namespace}.{name}")
+        };
+        if let Some(candidate) = class_unit_for_fq_name(csharp, &candidate_fqn) {
+            return Some(candidate);
         }
+        let separator = namespace.rfind('.')?;
+        namespace.truncate(separator);
     }
 }
 
@@ -1109,13 +1182,17 @@ fn extension_method_receiver_type_inner(
     }
     let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer)?;
     let owner = analyzer.parent_of(unit)?;
-    analyzer
+    let receiver_type = analyzer
         .signatures(unit)
         .iter()
-        .find_map(|signature| extension_receiver_type_from_signature(signature))
-        .and_then(|type_text| {
-            resolve_member_type_fq_name(csharp, unit.source(), &owner, &type_text, usage)
-        })
+        .find_map(|signature| extension_receiver_type_from_signature(signature))?;
+    let resolved =
+        resolve_member_type_fq_name(csharp, unit.source(), &owner, &receiver_type, usage);
+    if usage {
+        resolved
+    } else {
+        resolved.or_else(|| Some(normalize_type_text(&receiver_type)))
+    }
 }
 
 #[derive(Default)]
@@ -1208,6 +1285,9 @@ fn visible_extension_method_candidates_inner(
 ) -> Vec<CodeUnit> {
     let compatible_receiver_types =
         compatible_receiver_type_names(csharp, analyzer, receiver_type_names, usage);
+    if !usage && compatible_receiver_types.is_empty() {
+        return Vec::new();
+    }
     let scopes = extension_visibility_scopes(csharp, source, site, usage);
     let named_candidates = if usage {
         csharp
@@ -1254,18 +1334,22 @@ fn visible_extension_method_candidates_inner(
             })
             .filter(|unit| is_extension_method(analyzer, unit))
             .filter(|unit| {
-                compatible_receiver_types.is_empty()
-                    || (if usage {
-                        usage_extension_method_receiver_type(analyzer, unit)
-                    } else {
-                        extension_method_receiver_type(analyzer, unit)
-                    })
-                    .is_none_or(|receiver| {
-                        let receiver = csharp_normalize_full_name(&receiver);
-                        compatible_receiver_types
-                            .iter()
-                            .any(|candidate| type_identity_matches(candidate, &receiver))
-                    })
+                let receiver = if usage {
+                    usage_extension_method_receiver_type(analyzer, unit)
+                } else {
+                    extension_method_receiver_type(analyzer, unit)
+                };
+                let matches_receiver = |receiver: String| {
+                    let receiver = csharp_normalize_full_name(&receiver);
+                    compatible_receiver_types
+                        .iter()
+                        .any(|candidate| type_identity_matches(candidate, &receiver))
+                };
+                if usage {
+                    compatible_receiver_types.is_empty() || receiver.is_none_or(matches_receiver)
+                } else {
+                    receiver.is_some_and(matches_receiver)
+                }
             })
             .collect::<Vec<_>>();
         let Some(call_arity) = call_arity else {
@@ -1679,6 +1763,10 @@ fn receiver_type_fq_names(
         "this" => enclosing_declared_type(receiver_node, csharp, file, source)
             .map(|owner| SymbolResolution::Precise(std::iter::once(owner.fq_name()).collect()))
             .unwrap_or(SymbolResolution::Unknown),
+        "base" => enclosing_declared_type(receiver_node, csharp, file, source)
+            .and_then(|owner| usage_direct_base(analyzer, csharp, &owner))
+            .map(|owner| SymbolResolution::Precise(std::iter::once(owner.fq_name()).collect()))
+            .unwrap_or(SymbolResolution::Unknown),
         _ => SymbolResolution::Unknown,
     }
 }
@@ -1695,7 +1783,15 @@ pub(super) fn usage_class_field_receiver_type(
         return SymbolResolution::Unknown;
     };
     let candidates =
-        nearest_member_candidates_for_owner(analyzer, csharp, &enclosing, receiver, None);
+        nearest_member_candidates_for_owner(analyzer, csharp, &enclosing, receiver, None)
+            .into_iter()
+            .filter(|candidate| {
+                !(candidate.is_function()
+                    && analyzer.parent_of(candidate).is_some_and(|owner| {
+                        candidate.identifier() == csharp_source_identifier(&owner)
+                    }))
+            })
+            .collect::<Vec<_>>();
     if candidates.is_empty() {
         return SymbolResolution::Unknown;
     }
@@ -1748,6 +1844,26 @@ pub(super) fn nearest_member_candidates_for_owner(
         owner,
         name,
         explicit_generic_arity,
+        None,
+        true,
+    )
+}
+
+pub(super) fn applicable_member_candidates_for_owner(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    owner: &CodeUnit,
+    name: &str,
+    explicit_generic_arity: Option<usize>,
+    call_arity: usize,
+) -> Vec<CodeUnit> {
+    nearest_member_candidates_for_owner_inner(
+        analyzer,
+        csharp,
+        owner,
+        name,
+        explicit_generic_arity,
+        Some(call_arity),
         true,
     )
 }
@@ -1758,6 +1874,7 @@ fn nearest_member_candidates_for_owner_inner(
     owner: &CodeUnit,
     name: &str,
     explicit_generic_arity: Option<usize>,
+    call_arity: Option<usize>,
     usage: bool,
 ) -> Vec<CodeUnit> {
     let mut hierarchy = None;
@@ -1790,9 +1907,20 @@ fn nearest_member_candidates_for_owner_inner(
                     .into_iter()
                     .filter(|candidate: &CodeUnit| candidate.identifier() == name)
                     .filter(|candidate| {
+                        analyzer
+                            .parent_of(candidate)
+                            .is_some_and(|parent| parent.fq_name() == current.fq_name())
+                    })
+                    .filter(|candidate| {
                         explicit_generic_arity.is_none_or(|arity| {
                             candidate.is_function()
                                 && csharp_method_generic_arity(candidate.signature()) == arity
+                        })
+                    })
+                    .filter(|candidate| {
+                        call_arity.is_none_or(|arity| {
+                            candidate.is_function()
+                                && csharp_callable_arity(analyzer, candidate).accepts(arity)
                         })
                     }),
             );
@@ -2071,6 +2199,72 @@ pub(in crate::analyzer::usages) fn object_initializer_for_label(
     .then_some(initializer)
 }
 
+pub(in crate::analyzer::usages) fn object_initializer_owner_type_node(
+    initializer: Node<'_>,
+) -> Option<Node<'_>> {
+    let object_creation = initializer.parent()?;
+    match object_creation.kind() {
+        "object_creation_expression" => object_creation
+            .child_by_field_name("type")
+            .or_else(|| first_type_child(object_creation))
+            .or_else(|| implicit_object_creation_declarator_type(object_creation)),
+        "implicit_object_creation_expression" => {
+            implicit_object_creation_declarator_type(object_creation)
+        }
+        _ => None,
+    }
+}
+
+fn implicit_object_creation_declarator_type(object_creation: Node<'_>) -> Option<Node<'_>> {
+    let mut current = object_creation;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "equals_value_clause" | "parenthesized_expression" | "checked_expression" => {
+                current = parent;
+            }
+            "ERROR" => {
+                if let Some(type_node) = error_recovered_implicit_declarator_type(parent, current) {
+                    return Some(type_node);
+                }
+                current = parent;
+            }
+            "variable_declarator" => {
+                let initializer = variable_declarator_initializer(parent)?;
+                if initializer.start_byte() > object_creation.start_byte()
+                    || object_creation.end_byte() > initializer.end_byte()
+                {
+                    return None;
+                }
+                let declaration = parent.parent()?;
+                return declaration
+                    .child_by_field_name("type")
+                    .or_else(|| first_type_child(declaration));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn error_recovered_implicit_declarator_type<'tree>(
+    error: Node<'tree>,
+    value: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let mut cursor = error.walk();
+    let children = error.named_children(&mut cursor).collect::<Vec<_>>();
+    let value_index = children.iter().position(|child| same_node(*child, value))?;
+    let name = value_index
+        .checked_sub(1)
+        .and_then(|index| children.get(index))?;
+    if !matches!(name.kind(), "identifier" | "implicit_parameter") {
+        return None;
+    }
+    let type_node = value_index
+        .checked_sub(2)
+        .and_then(|index| children.get(index))?;
+    is_type_syntax_kind(type_node.kind()).then_some(*type_node)
+}
+
 fn count_named_children_of_kind(node: Node<'_>, kind: &str) -> usize {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
@@ -2080,17 +2274,15 @@ fn count_named_children_of_kind(node: Node<'_>, kind: &str) -> usize {
 
 pub(in crate::analyzer::usages) fn first_type_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
-    node.named_children(&mut cursor).find(|child| {
-        matches!(
-            child.kind(),
-            "identifier"
-                | "qualified_name"
-                | "generic_name"
-                | "nullable_type"
-                | "array_type"
-                | "type"
-        )
-    })
+    node.named_children(&mut cursor)
+        .find(|child| is_type_syntax_kind(child.kind()))
+}
+
+fn is_type_syntax_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier" | "qualified_name" | "generic_name" | "nullable_type" | "array_type" | "type"
+    )
 }
 
 fn first_named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {

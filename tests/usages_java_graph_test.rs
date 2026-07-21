@@ -2527,6 +2527,56 @@ public class Consumer {
 }
 
 #[test]
+fn java_graph_strategy_resolves_nested_type_method_reference_receivers() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "app/Settings.java",
+            r#"
+package app;
+
+public class Settings {
+    public static class Basic {
+        public boolean enabled() { return true; }
+    }
+
+    public static class OtherBasic {
+        public boolean enabled() { return false; }
+    }
+}
+"#,
+        ),
+        (
+            "app/Consumer.java",
+            r#"
+package app;
+
+public class Consumer {
+    java.util.function.Function<Settings.Basic, Boolean> reference() {
+        return Settings.Basic::enabled; // positive-nested-reference
+    }
+
+    java.util.function.Function<Settings.OtherBasic, Boolean> wrongOwner() {
+        return Settings.OtherBasic::enabled; // negative-wrong-nested-owner
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "app.Settings.Basic.enabled");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let nested_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    ));
+
+    assert_hit_contains(&nested_hits, "positive-nested-reference");
+    assert_no_hit_contains(&nested_hits, "negative-wrong-nested-owner");
+}
+
+#[test]
 fn java_graph_strategy_matches_this_and_super_method_references_selector_accurately() {
     let (_project, analyzer) = java_analyzer_with_files(&[
         (
@@ -2685,6 +2735,64 @@ public class Consumer {
         "zero-arg constructor should stay narrow"
     );
     assert_eq!(1, one_hits.len(), "one-arg constructor should stay narrow");
+}
+
+#[test]
+fn java_graph_strategy_finds_constructor_method_references() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "app/Request.java",
+            "package app; public class Request { public Request(String value) {} }\n",
+        ),
+        (
+            "app/Other.java",
+            "package app; public class Other { public Other(String value) {} }\n",
+        ),
+        (
+            "app/Consumer.java",
+            r#"
+package app;
+
+public class Consumer {
+    Request direct(String value) {
+        return new Request(value); // positive-object-creation
+    }
+
+    java.util.function.Function<String, Request> factory() {
+        return Request::new; // positive-constructor-reference
+    }
+
+    java.util.function.Function<String, Other> otherFactory() {
+        return Other::new; // negative-wrong-owner
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "app.Request.Request");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let constructor_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    ));
+
+    assert_eq!(2, constructor_hits.len(), "{constructor_hits:#?}");
+    assert_hit_contains(&constructor_hits, "positive-object-creation");
+    assert_hit_contains(&constructor_hits, "positive-constructor-reference");
+    assert_no_hit_contains(&constructor_hits, "negative-wrong-owner");
+
+    let request_type = definition(&analyzer, "app.Request");
+    let type_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&request_type),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&type_hits, "positive-constructor-reference");
+    assert_no_hit_contains(&type_hits, "negative-wrong-owner");
 }
 
 #[test]
@@ -3997,4 +4105,165 @@ public class JavaConsumer {
     ));
 
     assert_no_hit_contains(&hits, "new ScalaTarget()");
+}
+
+#[test]
+fn java_graph_strategy_types_try_resource_receivers_without_leaking_the_binding() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "other/Indexer.java",
+            "package other; public class Indexer { public void run() {} }\n",
+        ),
+        (
+            "app/SentenceSourceIndexer.java",
+            r#"
+package app;
+
+import other.Indexer;
+
+public class SentenceSourceIndexer implements AutoCloseable {
+    private Indexer indexer;
+
+    public void execute() throws Exception {
+        try (SentenceSourceIndexer indexer = new SentenceSourceIndexer()) {
+            indexer.run(); // resource-receiver
+        }
+        indexer.run(); // field-receiver-after-try
+    }
+
+    public void run() {}
+    public void close() {}
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let local_run = definition(&analyzer, "app.SentenceSourceIndexer.run");
+    let local_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&local_run),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&local_hits, "resource-receiver");
+    assert_no_hit_contains(&local_hits, "field-receiver-after-try");
+
+    let imported_run = definition(&analyzer, "other.Indexer.run");
+    let imported_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&imported_run),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&imported_hits, "field-receiver-after-try");
+    assert_no_hit_contains(&imported_hits, "resource-receiver");
+}
+
+#[test]
+fn java_graph_strategy_maps_lombok_accessor_usages_back_to_fields() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "app/Accessors.java",
+            r#"
+package app;
+
+import lombok.Getter;
+import lombok.Setter;
+
+@Getter
+@Setter
+public class Accessors {
+    String name;
+    boolean ready;
+}
+"#,
+        ),
+        (
+            "app/Shadowed.java",
+            r#"
+package app;
+
+import lombok.Getter;
+
+@Getter
+public class Shadowed {
+    String name;
+
+    public String getName() {
+        return name;
+    }
+}
+"#,
+        ),
+        (
+            "app/Plain.java",
+            r#"
+package app;
+
+public class Plain {
+    String name;
+}
+"#,
+        ),
+        (
+            "app/Consumer.java",
+            r#"
+package app;
+
+public class Consumer {
+    void call(Accessors accessors, Shadowed shadowed, Plain plain) {
+        accessors.getName(); // generated-getter-call
+        accessors.setName("value"); // generated-setter-call
+        accessors.isReady(); // generated-boolean-getter-call
+        java.util.function.Function<Accessors, String> getter = Accessors::getName; // generated-getter-reference
+        java.util.function.BiConsumer<Accessors, String> setter = Accessors::setName; // generated-setter-reference
+        java.util.function.Predicate<Accessors> ready = Accessors::isReady; // generated-boolean-getter-reference
+
+        accessors.isName(); // rejected-non-boolean-is-getter
+        accessors.getName("unexpected"); // rejected-getter-arity
+        accessors.setName(); // rejected-setter-arity
+        shadowed.getName(); // rejected-declared-method-shadow
+        java.util.function.Function<Shadowed, String> shadowedRef = Shadowed::getName; // rejected-declared-method-reference
+        plain.getName(); // rejected-without-lombok
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = JavaUsageGraphStrategy::new();
+
+    let name = definition(&analyzer, "app.Accessors.name");
+    let name_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&name), &candidates, 1000));
+    assert_hit_contains(&name_hits, "generated-getter-call");
+    assert_hit_contains(&name_hits, "generated-setter-call");
+    assert_hit_contains(&name_hits, "generated-getter-reference");
+    assert_hit_contains(&name_hits, "generated-setter-reference");
+    assert_no_hit_contains(&name_hits, "rejected-non-boolean-is-getter");
+    assert_no_hit_contains(&name_hits, "rejected-getter-arity");
+    assert_no_hit_contains(&name_hits, "rejected-setter-arity");
+
+    let ready = definition(&analyzer, "app.Accessors.ready");
+    let ready_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&ready), &candidates, 1000));
+    assert_hit_contains(&ready_hits, "generated-boolean-getter-call");
+    assert_hit_contains(&ready_hits, "generated-boolean-getter-reference");
+
+    let shadowed = definition(&analyzer, "app.Shadowed.name");
+    let shadowed_hits = hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&shadowed),
+        &candidates,
+        1000,
+    ));
+    assert_no_hit_contains(&shadowed_hits, "rejected-declared-method-shadow");
+    assert_no_hit_contains(&shadowed_hits, "rejected-declared-method-reference");
+
+    let plain = definition(&analyzer, "app.Plain.name");
+    let plain_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&plain), &candidates, 1000));
+    assert_no_hit_contains(&plain_hits, "rejected-without-lombok");
 }

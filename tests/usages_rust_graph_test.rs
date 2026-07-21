@@ -4287,6 +4287,185 @@ fn run() {
 }
 
 #[test]
+fn authoritative_rust_usage_resolves_private_root_function_and_nested_module_constant() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            "mod blocking;\nmod consumer;\nfn is_unpin<T>() {}\n",
+        ),
+        ("src/blocking.rs", "pub(crate) const LIMIT: usize = 8;\n"),
+        (
+            "src/consumer.rs",
+            r#"
+#[cfg(test)]
+mod tests {
+    use crate::blocking::LIMIT;
+
+    fn first() { let _ = LIMIT; }
+    fn second() {
+        let n = 1;
+        let _ = LIMIT - n;
+        crate::is_unpin::<()>();
+    }
+}
+"#,
+        ),
+    ]);
+    let candidates: HashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+
+    let limit = definition(&analyzer, "blocking._module_.LIMIT");
+    let limit_hits = authoritative_hits(&analyzer, &limit, candidates.clone());
+    let references: Vec<_> = limit_hits
+        .iter()
+        .filter(|hit| hit.kind == UsageHitKind::Reference)
+        .collect();
+    assert_eq!(2, references.len(), "nested constant hits: {limit_hits:#?}");
+    assert!(
+        references
+            .iter()
+            .all(|hit| hit.file == project.file("src/consumer.rs"))
+    );
+
+    let is_unpin = definition(&analyzer, "is_unpin");
+    let function_hits = authoritative_hits(&analyzer, &is_unpin, candidates);
+    assert_eq!(
+        1,
+        function_hits.len(),
+        "private turbofish hits: {function_hits:#?}"
+    );
+    assert!(
+        function_hits
+            .iter()
+            .all(|hit| hit.snippet.contains("crate::is_unpin::<()>"))
+    );
+}
+
+#[test]
+fn authoritative_rust_usage_keeps_impl_self_associated_type_identity() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+pub trait Future { type Output; }
+pub struct Flush;
+impl Future for Flush {
+    type Output = ();
+    fn poll() -> Self::Output { () }
+}
+
+pub struct Decoy;
+impl Future for Decoy {
+    type Output = ();
+    fn poll() -> Self::Output { () }
+}
+"#,
+    )]);
+    let candidates: HashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+
+    let output = definition(&analyzer, "Flush.Output");
+    let hits = authoritative_hits(&analyzer, &output, candidates);
+    assert_eq!(1, hits.len(), "impl Self::Output hits: {hits:#?}");
+    assert!(hits.iter().all(|hit| hit.snippet.contains("Self::Output")));
+}
+
+#[test]
+fn authoritative_rust_usage_resolves_glob_imported_paths_in_nested_macro_tokens() {
+    let lib_source = r#"
+pub mod task;
+pub mod other_task;
+mod runtime;
+pub struct EventInfo;
+impl EventInfo { pub fn default() -> Self { Self } }
+pub struct OtherInfo;
+impl OtherInfo { pub fn default() -> Self { Self } }
+
+mod tests {
+    use super::*;
+    macro_rules! consume { ($($tokens:tt)*) => {}; }
+
+    fn run() {
+        consume!([EventInfo::default(), EventInfo::default()]);
+        consume!([OtherInfo::default()]);
+    }
+}
+"#;
+    let coop_source = r#"
+use super::*;
+macro_rules! consume { ($($tokens:tt)*) => {}; }
+fn run() {
+    consume!({ task::spawn(); });
+    consume!({ other_task::spawn(); });
+}
+"#;
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", lib_source),
+        ("src/task.rs", "pub fn spawn() {}\n"),
+        ("src/other_task.rs", "pub fn spawn() {}\n"),
+        (
+            "src/runtime/mod.rs",
+            "use crate::{other_task, task};\nmod coop;\n",
+        ),
+        ("src/runtime/coop.rs", coop_source),
+    ]);
+    let candidates: HashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+
+    let event_ranges: Vec<_> = lib_source
+        .match_indices("EventInfo::default")
+        .map(|(start, _)| (start, start + "EventInfo".len()))
+        .collect();
+    let default_ranges: Vec<_> = event_ranges
+        .iter()
+        .map(|(start, _)| {
+            let start = start + "EventInfo::".len();
+            (start, start + "default".len())
+        })
+        .collect();
+    let task_start = coop_source.find("task::spawn").expect("task macro path");
+    let other_event_start = lib_source
+        .find("OtherInfo::default()")
+        .expect("decoy event macro path");
+    let other_default_start = other_event_start + "OtherInfo::".len();
+    let other_task_start = coop_source
+        .find("other_task::spawn")
+        .expect("decoy task macro path");
+    for (target_fqn, file, expected, forbidden) in [
+        (
+            "EventInfo",
+            "src/lib.rs",
+            event_ranges,
+            vec![(other_event_start, other_event_start + "OtherInfo".len())],
+        ),
+        (
+            "EventInfo.default",
+            "src/lib.rs",
+            default_ranges,
+            vec![(other_default_start, other_default_start + "default".len())],
+        ),
+        (
+            "task",
+            "src/runtime/coop.rs",
+            vec![(task_start, task_start + "task".len())],
+            vec![(other_task_start, other_task_start + "other_task".len())],
+        ),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let hits = authoritative_hits(&analyzer, &target, candidates.clone());
+        let actual: Vec<_> = hits
+            .iter()
+            .filter(|hit| hit.file.rel_path().to_string_lossy() == file)
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect();
+        assert!(
+            expected.iter().all(|range| actual.contains(range)),
+            "{target_fqn} expected macro ranges {expected:?}: {hits:#?}"
+        );
+        assert!(
+            forbidden.iter().all(|range| !actual.contains(range)),
+            "{target_fqn} crossed into decoy macro ranges {forbidden:?}: {hits:#?}"
+        );
+    }
+}
+
+#[test]
 fn rust_graph_strategy_counts_associated_functions_used_as_values() {
     let (_project, analyzer) = rust_analyzer_with_files(&[(
         "src/lib.rs",

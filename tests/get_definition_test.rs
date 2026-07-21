@@ -4695,6 +4695,192 @@ where
 }
 
 #[test]
+fn rust_explicit_type_import_beats_same_named_enclosing_type() {
+    let source = r#"
+mod tracing_core {
+    pub trait Subscriber {}
+}
+
+pub struct Subscriber;
+
+pub fn use_local(_: Subscriber) {}
+
+mod format {
+    use crate::tracing_core::Subscriber;
+
+    pub trait FormatEvent<S>
+    where
+        S: Subscriber,
+    {}
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    let imported = source.rfind("S: Subscriber").expect("imported type use") + "S: ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, imported),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "tracing_core.Subscriber",
+        "{value}"
+    );
+
+    let enclosing = source.find("_: Subscriber").unwrap() + "_: ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, enclosing),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "Subscriber",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_self_in_impl_of_scoped_type_alias_resolves_physical_owner() {
+    let main = r#"
+use comrak::options;
+
+enum ListStyle {
+    Plus,
+}
+
+impl From<ListStyle> for options::ListStyleType {
+    fn from(style: ListStyle) -> Self {
+        match style {
+            ListStyle::Plus => Self::Plus,
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"comrak\"\nversion = \"0.1.0\"\n",
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+pub mod parser;
+pub use parser::options;
+
+#[deprecated]
+pub type ListStyleType = parser::options::ListStyleType;
+"#,
+        )
+        .file("src/parser/mod.rs", "pub mod options;\n")
+        .file(
+            "src/parser/options.rs",
+            r#"
+pub enum ListStyleType {
+    Dash,
+    Plus,
+    Star,
+}
+"#,
+        )
+        .file("src/main.rs", main)
+        .build();
+
+    for (start, expected_fqn, expected_kind) in [
+        (
+            main.find("-> Self").expect("bare Self return type") + "-> ".len(),
+            "parser.options.ListStyleType",
+            "class",
+        ),
+        (
+            main.find("Self::Plus").expect("associated owner"),
+            "parser.options.ListStyleType",
+            "class",
+        ),
+        (
+            main.find("Self::Plus").expect("associated item") + "Self::".len(),
+            "parser.options.ListStyleType.Plus",
+            "field",
+        ),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference("src/main.rs", main, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"].as_array().expect("definitions").len(),
+            1,
+            "{value}"
+        );
+        assert_eq!(result["definitions"][0]["fqn"], expected_fqn, "{value}");
+        assert_eq!(
+            result["definitions"][0]["path"], "src/parser/options.rs",
+            "{value}"
+        );
+        assert_eq!(result["definitions"][0]["kind"], expected_kind, "{value}");
+    }
+}
+
+#[test]
+fn rust_scoped_factory_call_preserves_owner_during_receiver_inference() {
+    let source = r#"
+struct AContext {
+    span: usize,
+}
+
+impl AContext {
+    fn parse() -> Result<Self, ()> { todo!() }
+
+    fn exercise() -> Result<(), ()> {
+        let root = ZFactory::parse()?;
+        root.span();
+        Ok(())
+    }
+
+    fn unresolved() -> Result<(), ()> {
+        let root = MissingFactory::parse()?;
+        root.span();
+        Ok(())
+    }
+}
+
+struct Wrapped;
+impl Wrapped {
+    fn span(&self) {}
+}
+
+struct ZFactory;
+impl ZFactory {
+    fn parse() -> Result<Wrapped, ()> { todo!() }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", source)
+        .build();
+
+    let proven = source.find("root.span();").expect("proven method") + "root.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("lib.rs", source, proven),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Wrapped.span", "{value}");
+    assert_eq!(result["definitions"][0]["kind"], "function", "{value}");
+
+    let unresolved = source.rfind("root.span();").expect("unresolved method") + "root.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("lib.rs", source, unresolved),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn rust_scoped_owner_resolution_preserves_namespace_and_canonical_identity() {
     let source = r#"
 mod format {
@@ -5351,6 +5537,38 @@ fn fit_to_json(fit: &ModelFit) {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "ModelFit.model", "{value}");
+}
+
+#[test]
+fn rust_qualified_macro_path_focus_resolves_each_exact_segment() {
+    let source = r#"
+pub struct EventInfo;
+impl EventInfo { pub fn default() -> Self { Self } }
+
+fn run() {
+    let _ = vec![EventInfo::default(), EventInfo::default()];
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", source)
+        .build();
+    let expression = "EventInfo::default()";
+    let first = source.find(expression).expect("first macro path");
+
+    for (offset, expected) in [
+        (first, "EventInfo"),
+        (first + "EventInfo::".len(), "EventInfo.default"),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference("lib.rs", source, offset),
+        );
+        assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+        assert_eq!(
+            value["results"][0]["definitions"][0]["fqn"], expected,
+            "{value}"
+        );
+    }
 }
 
 #[test]
@@ -10241,6 +10459,157 @@ func (br *Buf) Lock() {
 }
 
 #[test]
+fn go_selector_focus_resolves_only_the_structured_prefix() {
+    let source = r#"
+package main
+
+import cfg "example.com/app/config"
+
+type Command struct {
+    Options cfg.Options
+}
+
+func (c *Command) run() {
+    _ = c.Options.KeepUserTurns
+}
+
+func shadow() {
+    cfg := Command{}
+    _ = cfg.Options.KeepUserTurns
+}
+
+var _ cfg.Options
+"#;
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "config/config.go",
+            r#"
+package config
+
+type Options struct {
+    KeepUserTurns bool
+}
+"#,
+        )
+        .file("main.go", source)
+        .build();
+
+    let chain = source
+        .find("c.Options.KeepUserTurns")
+        .expect("receiver chain");
+    let receiver = lookup(
+        project.root(),
+        &location_reference("main.go", source, chain),
+    );
+    let result = &receiver["results"][0];
+    assert_eq!(result["status"], "resolved", "{receiver}");
+    assert_eq!(result["definitions"][0]["name"], "c", "{receiver}");
+    assert_eq!(
+        result["definitions"][0]["kind"], "receiver_parameter",
+        "{receiver}"
+    );
+
+    for (offset, expected) in [
+        ("c.".len(), "example.com/app.Command.Options"),
+        (
+            "c.Options.".len(),
+            "example.com/app/config.Options.KeepUserTurns",
+        ),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference("main.go", source, chain + offset),
+        );
+        assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+        assert_eq!(
+            value["results"][0]["definitions"][0]["fqn"], expected,
+            "{value}"
+        );
+    }
+
+    let shadowed = source
+        .find("cfg.Options.KeepUserTurns")
+        .expect("shadowed local chain");
+    for (offset, expected) in [
+        ("cfg.".len(), "example.com/app.Command.Options"),
+        (
+            "cfg.Options.".len(),
+            "example.com/app/config.Options.KeepUserTurns",
+        ),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference("main.go", source, shadowed + offset),
+        );
+        assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+        assert_eq!(
+            value["results"][0]["definitions"][0]["fqn"], expected,
+            "{value}"
+        );
+    }
+
+    let alias_start = source.rfind("cfg.Options").expect("package alias chain");
+    let alias = lookup(
+        project.root(),
+        &location_reference("main.go", source, alias_start),
+    );
+    assert_eq!(
+        alias["results"][0]["status"], "unresolvable_import_boundary",
+        "{alias}"
+    );
+
+    let package_type = lookup(
+        project.root(),
+        &location_reference("main.go", source, alias_start + "cfg.".len()),
+    );
+    assert_eq!(
+        package_type["results"][0]["status"], "resolved",
+        "{package_type}"
+    );
+    assert_eq!(
+        package_type["results"][0]["definitions"][0]["fqn"], "example.com/app/config.Options",
+        "{package_type}"
+    );
+}
+
+#[test]
+fn go_selector_focus_preserves_ambiguous_intermediate_members() {
+    let source = r#"
+package main
+
+type Leaf struct { ID string }
+type Left struct { Leaf }
+type Right struct { Leaf }
+type Model struct {
+    Left
+    Right
+}
+
+func inspect(model Model) {
+    _ = model.Leaf.ID
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("main.go", source)
+        .build();
+    let chain = source.find("model.Leaf.ID").expect("ambiguous chain");
+
+    for offset in ["model.".len(), "model.Leaf.".len()] {
+        let value = lookup(
+            project.root(),
+            &location_reference("main.go", source, chain + offset),
+        );
+        assert_eq!(value["results"][0]["status"], "ambiguous", "{value}");
+        assert_eq!(
+            value["results"][0]["diagnostics"][0]["kind"], "ambiguous_definition",
+            "{value}"
+        );
+    }
+}
+
+#[test]
 fn go_receiver_chain_with_missing_terminal_still_honors_receiver_focus() {
     let project = InlineTestProject::with_language(Language::Go)
         .file(
@@ -10625,6 +10994,58 @@ public class UseTarget {
 }
 
 #[test]
+fn java_enclosing_fields_shadow_static_wildcard_imports() {
+    let source = r#"
+package app;
+
+import static pkg.ImportedFields.*;
+
+public class Consumer extends pkg.Base {
+    int collision;
+
+    int read() {
+        return collision + inheritedCollision + importedOnly;
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "pkg/ImportedFields.java",
+            r#"
+package pkg;
+
+public class ImportedFields {
+    public static int collision;
+    public static int inheritedCollision;
+    public static int importedOnly;
+}
+"#,
+        )
+        .file(
+            "pkg/Base.java",
+            "package pkg; public class Base { protected int inheritedCollision; }\n",
+        )
+        .file("app/Consumer.java", source)
+        .build();
+
+    for (name, expected) in [
+        ("collision", "app.Consumer.collision"),
+        ("inheritedCollision", "pkg.Base.inheritedCollision"),
+        ("importedOnly", "pkg.ImportedFields.importedOnly"),
+    ] {
+        let start = source.rfind(name).expect("bare field reference");
+        let value = lookup(
+            project.root(),
+            &location_reference("app/Consumer.java", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{name}: {value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{name}: {value}");
+        assert_eq!(result["definitions"][0]["kind"], "field", "{name}: {value}");
+    }
+}
+
+#[test]
 fn java_typed_receiver_method_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
@@ -10663,6 +11084,61 @@ public class UseTarget {
         result["definitions"][0]["path"], "pkg/Target.java",
         "{value}"
     );
+}
+
+#[test]
+fn java_try_resource_receiver_shadows_same_named_imported_type() {
+    let source = r#"
+package app;
+
+import other.Indexer;
+
+public class SentenceSourceIndexer implements AutoCloseable {
+    private Indexer indexer;
+
+    public void execute() throws Exception {
+        try (SentenceSourceIndexer indexer = new SentenceSourceIndexer()) {
+            indexer.run(); // resource-receiver
+        }
+        indexer.run(); // field-receiver-after-try
+    }
+
+    public void run() {}
+    public void close() {}
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "other/Indexer.java",
+            "package other; public class Indexer { public void run() {} }\n",
+        )
+        .file("app/SentenceSourceIndexer.java", source)
+        .build();
+
+    for (marker, expected) in [
+        (
+            "indexer.run(); // resource-receiver",
+            "app.SentenceSourceIndexer.run",
+        ),
+        (
+            "indexer.run(); // field-receiver-after-try",
+            "other.Indexer.run",
+        ),
+    ] {
+        let start = source.find(marker).expect("receiver marker") + marker.find("run").unwrap();
+        let value = lookup(
+            project.root(),
+            &location_reference("app/SentenceSourceIndexer.java", source, start),
+        );
+        assert_eq!(
+            value["results"][0]["status"], "resolved",
+            "{marker}: {value}"
+        );
+        assert_eq!(
+            value["results"][0]["definitions"][0]["fqn"], expected,
+            "{marker}: {value}"
+        );
+    }
 }
 
 #[test]
@@ -11691,6 +12167,104 @@ public class UseMap {
         .as_str()
         .expect("diagnostic message");
     assert!(message.contains("outside the indexed workspace"), "{value}");
+}
+
+#[test]
+fn java_explicit_import_beats_same_named_same_package_type() {
+    let imported_source = r#"
+package app;
+
+import target.Channel;
+
+public interface ImportedHandler {
+    void connected(Channel channel);
+}
+"#;
+    let same_package_source = r#"
+package app;
+
+public interface LocalHandler {
+    void connected(Channel channel);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "target/Channel.java",
+            "package target; public interface Channel {}\n",
+        )
+        .file(
+            "app/Channel.java",
+            "package app; public interface Channel {}\n",
+        )
+        .file("app/ImportedHandler.java", imported_source)
+        .file("app/LocalHandler.java", same_package_source)
+        .build();
+
+    let imported = lookup(
+        project.root(),
+        &location_reference(
+            "app/ImportedHandler.java",
+            imported_source,
+            imported_source
+                .find("Channel channel")
+                .expect("imported type"),
+        ),
+    );
+    assert_eq!(imported["results"][0]["status"], "resolved", "{imported}");
+    assert_eq!(
+        imported["results"][0]["definitions"][0]["fqn"], "target.Channel",
+        "an explicit single-type import must constrain the simple name before same-package lookup: {imported}"
+    );
+
+    let local = lookup(
+        project.root(),
+        &location_reference(
+            "app/LocalHandler.java",
+            same_package_source,
+            same_package_source
+                .find("Channel channel")
+                .expect("same-package type"),
+        ),
+    );
+    assert_eq!(local["results"][0]["status"], "resolved", "{local}");
+    assert_eq!(
+        local["results"][0]["definitions"][0]["fqn"], "app.Channel",
+        "without an explicit import the same-package type must remain visible: {local}"
+    );
+}
+
+#[test]
+fn java_missing_explicit_import_does_not_fall_back_to_same_package_type() {
+    let source = r#"
+package app;
+
+import missing.Channel;
+
+public interface Handler {
+    void connected(Channel channel);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "app/Channel.java",
+            "package app; public interface Channel {}\n",
+        )
+        .file("app/Handler.java", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/Handler.java",
+            source,
+            source.find("Channel channel").expect("imported type"),
+        ),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "a matched explicit import must block same-package fallback even when its target is outside the workspace: {value}"
+    );
 }
 
 #[test]
@@ -14247,6 +14821,85 @@ fn csharp_extension_method_resolves_from_visible_namespace() {
 }
 
 #[test]
+fn csharp_extension_candidates_require_structured_external_receiver_evidence() {
+    let source = r#"using System;
+namespace ClosedXML.Excel;
+
+internal static class TypeExtensions {
+    public static string Describe(this Type type) => "type";
+    public static Type GetUnderlyingType(this Type type) => type;
+
+    public static bool IsNullable(Type type) =>
+        Nullable.GetUnderlyingType(type) != null;
+
+    public static string DescribeLocal(Type type) {
+        Type local = type;
+        return local.Describe();
+    }
+}
+
+internal static class UriExtensions {
+    public static string Describe(this Uri uri) => "uri";
+}
+
+internal static class Consumer {
+    public static string DescribeType(Type type) => type.Describe();
+    public static string DescribeUri(Uri uri) => uri.Describe();
+    public static string Unknown() => mystery.Describe();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("ClosedXML/Extensions/TypeExtensions.cs", source)
+        .build();
+
+    let sites = [
+        ("Nullable.GetUnderlyingType", "Nullable."),
+        ("local.Describe()", "local."),
+        ("type.Describe()", "type."),
+        ("uri.Describe()", "uri."),
+        ("mystery.Describe()", "mystery."),
+    ];
+    let references = sites
+        .into_iter()
+        .map(|(needle, receiver)| {
+            let offset = source.find(needle).expect("reference site") + receiver.len();
+            location_query("ClosedXML/Extensions/TypeExtensions.cs", source, offset)
+        })
+        .collect::<Vec<_>>();
+    let value = lookup(
+        project.root(),
+        &json!({ "references": references }).to_string(),
+    );
+
+    for index in [0, 4] {
+        assert_ne!(
+            value["results"][index]["status"], "resolved",
+            "an untyped receiver must not borrow a visible extension owner: {value}"
+        );
+        assert!(
+            value["results"][index]["definitions"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "an untyped receiver must not produce a local definition: {value}"
+        );
+    }
+
+    for index in [1, 2] {
+        assert_eq!(value["results"][index]["status"], "resolved", "{value}");
+        assert_eq!(
+            value["results"][index]["definitions"][0]["fqn"],
+            "ClosedXML.Excel.TypeExtensions.Describe",
+            "declared Type evidence must select only the Type extension: {value}"
+        );
+    }
+    assert_eq!(value["results"][3]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][3]["definitions"][0]["fqn"], "ClosedXML.Excel.UriExtensions.Describe",
+        "declared Uri evidence must select only the Uri extension: {value}"
+    );
+}
+
+#[test]
 fn csharp_inapplicable_direct_member_yields_to_matching_extension() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
@@ -14933,6 +15586,52 @@ public class Runner {
         value["results"][0]["definitions"][0]["fqn"], "Lib.RestException`1.Body",
         "{value}"
     );
+}
+
+#[test]
+fn csharp_nongeneric_static_receiver_beats_same_named_generic_type() {
+    let source = r#"namespace Demo;
+
+[System.Runtime.CompilerServices.CollectionBuilder(
+    typeof(ImmutableEquatableArray),
+    nameof(ImmutableEquatableArray.Create))]
+public sealed class ImmutableEquatableArray<T>
+{
+    public ImmutableEquatableArray(T value) {}
+}
+
+public static class ImmutableEquatableArray
+{
+    public static ImmutableEquatableArray<T> Create<T>(T value) => new(value);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("ImmutableEquatableArray.cs", source)
+        .build();
+    let receiver = source
+        .find("ImmutableEquatableArray.Create")
+        .expect("nameof receiver");
+    for (start, expected_fqn) in [
+        (receiver, "Demo.ImmutableEquatableArray"),
+        (
+            receiver + "ImmutableEquatableArray.".len(),
+            "Demo.ImmutableEquatableArray.Create",
+        ),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference("ImmutableEquatableArray.cs", source, start),
+        );
+
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"].as_array().unwrap().len(),
+            1,
+            "{value}"
+        );
+        assert_eq!(result["definitions"][0]["fqn"], expected_fqn, "{value}");
+    }
 }
 
 #[test]
@@ -20543,6 +21242,106 @@ fn java_reference_context_resolves_field_access_member_to_field() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "app.Types.JSON", "{value}");
+}
+
+#[test]
+fn java_definition_lookup_honors_each_focused_selector_segment() {
+    let source = r#"
+package app;
+
+public class Consumer {
+    Types value;
+
+    void run() {
+        Types.get();
+        java.util.function.Supplier<Types> reference = Types::get;
+        java.util.function.Function<Argument, Types> generic = Types::<Argument>create;
+        java.util.function.Supplier<Types> constructor = Types::new;
+        Types.Nested.create();
+        value.nested.create();
+        new Types.Nested();
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "app/Types.java",
+            r#"
+package app;
+
+public class Types {
+    public Types() {}
+    public static Types get() { return new Types(); }
+    public static <T> Types create(T value) { return new Types(); }
+    public Nested nested = new Nested();
+
+    public static class Nested {
+        public Nested() {}
+        public static void create() {}
+    }
+}
+"#,
+        )
+        .file(
+            "app/Argument.java",
+            "package app; public class Argument {}\n",
+        )
+        .file("app/Consumer.java", source)
+        .build();
+
+    let cases = [
+        ("Types.get();", "Types", "app.Types"),
+        ("Types.get();", "get", "app.Types.get"),
+        ("Types::get", "Types", "app.Types"),
+        ("Types::get", "get", "app.Types.get"),
+        ("Types::<Argument>create", "Types", "app.Types"),
+        ("Types::<Argument>create", "Argument", "app.Argument"),
+        ("Types::<Argument>create", "create", "app.Types.create"),
+        ("Types::new", "Types", "app.Types"),
+        ("Types::new", "new", "app.Types.Types"),
+        ("Types.Nested.create();", "Types", "app.Types"),
+        ("Types.Nested.create();", "Nested", "app.Types.Nested"),
+        (
+            "Types.Nested.create();",
+            "create",
+            "app.Types.Nested.create",
+        ),
+        ("value.nested.create();", "value", "app.Consumer.value"),
+        ("value.nested.create();", "nested", "app.Types.nested"),
+        (
+            "value.nested.create();",
+            "create",
+            "app.Types.Nested.create",
+        ),
+        ("new Types.Nested();", "Types", "app.Types"),
+        ("new Types.Nested();", "Nested", "app.Types.Nested.Nested"),
+    ];
+    let references = cases
+        .iter()
+        .map(|(marker, focus, _)| {
+            let marker_start = source.find(marker).expect("case marker");
+            let start = marker_start + marker.find(focus).expect("focus in marker");
+            serde_json::from_str::<Value>(&location_reference("app/Consumer.java", source, start))
+                .expect("location reference JSON")["references"][0]
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    let value = lookup(
+        project.root(),
+        &json!({ "references": references }).to_string(),
+    );
+
+    for (index, (marker, focus, expected)) in cases.iter().enumerate() {
+        let result = &value["results"][index];
+        assert_eq!(
+            result["status"], "resolved",
+            "{marker} focus {focus}: {value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["fqn"], *expected,
+            "{marker} focus {focus}: {value}"
+        );
+    }
 }
 
 #[test]

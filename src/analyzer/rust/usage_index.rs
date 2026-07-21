@@ -41,6 +41,17 @@ pub(super) struct RustImportEdge {
     pub(super) kind: RustImportEdgeKind,
 }
 
+pub(crate) struct RustBindingSeeds {
+    identities: BTreeSet<(ProjectFile, String)>,
+    edges_by_importer: HashMap<ProjectFile, Vec<RustImportEdge>>,
+}
+
+impl RustBindingSeeds {
+    pub(crate) fn identities(&self) -> &BTreeSet<(ProjectFile, String)> {
+        &self.identities
+    }
+}
+
 /// Re-export and reverse-import indices over the Rust workspace.
 #[derive(Debug, Default)]
 pub(super) struct RustUsageIndex {
@@ -96,6 +107,17 @@ impl RustModuleFiles {
     }
 
     fn resolve(&self, importing_file: &ProjectFile, module_specifier: &str) -> Vec<ProjectFile> {
+        if let Some(root_file) = self
+            .cargo_routes
+            .resolve_crate_root_file(importing_file, module_specifier)
+        {
+            return self
+                .files
+                .iter()
+                .filter(|file| *file == &root_file)
+                .cloned()
+                .collect();
+        }
         let package = rust_package_name(importing_file);
         let crate_package = rust_crate_root_package(importing_file);
         let Some(resolved_module) = self
@@ -278,42 +300,89 @@ impl RustUsageIndex {
     }
 
     /// Files that import one of the `seeds` (plus the seed files themselves) —
-    /// the candidate set the forward scan narrows to.
-    pub(super) fn importers_of_seeds(
-        &self,
-        seeds: &BTreeSet<(ProjectFile, String)>,
-    ) -> HashSet<ProjectFile> {
-        let mut out: HashSet<ProjectFile> = HashSet::default();
-        for (target_file, _) in seeds {
-            if let Some(edges) = self.importer_reverse.get(target_file) {
-                for edge in edges {
-                    out.insert(edge.importer.clone());
-                }
-            }
-            out.insert(target_file.clone());
-        }
+    /// the candidate set the forward scan narrows to. Named imports are followed
+    /// transitively because a private parent-module import can itself be imported
+    /// by a child module without becoming a public re-export.
+    pub(super) fn importers_of_seeds(&self, seeds: &RustBindingSeeds) -> HashSet<ProjectFile> {
+        let mut out: HashSet<ProjectFile> = seeds.edges_by_importer.keys().cloned().collect();
+        out.extend(seeds.identities.iter().map(|(file, _)| file.clone()));
         out
     }
 
-    /// The import edges in `importer` that bind one of the `seeds`.
-    pub(super) fn matching_edges_for_importer(
+    fn matching_edges_for_importer<'a>(
         &self,
         importer: &ProjectFile,
-        seeds: &BTreeSet<(ProjectFile, String)>,
-    ) -> Vec<RustImportEdge> {
-        let mut matches = Vec::new();
-        for (target_file, _) in seeds {
-            let Some(edges) = self.importer_reverse.get(target_file) else {
+        seeds: &'a RustBindingSeeds,
+    ) -> impl Iterator<Item = &'a RustImportEdge> {
+        seeds.edges_by_importer.get(importer).into_iter().flatten()
+    }
+
+    fn binding_seeds(&self, seeds: &BTreeSet<(ProjectFile, String)>) -> RustBindingSeeds {
+        let mut identities = seeds.clone();
+        let mut edges_by_importer: HashMap<ProjectFile, Vec<RustImportEdge>> = HashMap::default();
+        let mut pending: VecDeque<_> = seeds.iter().cloned().collect();
+        while let Some((target_file, target_name)) = pending.pop_front() {
+            let Some(edges) = self.importer_reverse.get(&target_file) else {
                 continue;
             };
-            matches.extend(
-                edges
-                    .iter()
-                    .filter(|edge| &edge.importer == importer && edge_matches_seed(edge, seeds))
-                    .cloned(),
-            );
+            let forward_exported = self.seed_is_forward_exported(&target_file, &target_name);
+            for edge in edges {
+                if !edge_matches_single_seed(edge, &target_file, &target_name) {
+                    continue;
+                }
+                if matches!(edge.kind, RustImportEdgeKind::Named(_))
+                    && !forward_exported
+                    && !rust_module_is_descendant(&target_file, &edge.importer)
+                {
+                    continue;
+                }
+                edges_by_importer
+                    .entry(edge.importer.clone())
+                    .or_default()
+                    .push(edge.clone());
+                if matches!(edge.kind, RustImportEdgeKind::Named(_)) {
+                    let alias = (edge.importer.clone(), edge.local_name.clone());
+                    if identities.insert(alias.clone()) {
+                        pending.push_back(alias);
+                    }
+                }
+            }
         }
-        matches
+        RustBindingSeeds {
+            identities,
+            edges_by_importer,
+        }
+    }
+
+    fn seed_is_forward_exported(&self, file: &ProjectFile, name: &str) -> bool {
+        let mut pending = vec![(file.clone(), name.to_string())];
+        let mut visited = HashSet::default();
+        while let Some((file, name)) = pending.pop() {
+            if !visited.insert((file.clone(), name.clone())) {
+                continue;
+            }
+            let Some(index) = self.exports_by_file.get(&file) else {
+                continue;
+            };
+            for star in &index.reexport_stars {
+                pending.extend(
+                    self.module_files
+                        .resolve(&file, &star.module_specifier)
+                        .into_iter()
+                        .map(|target| (target, name.clone())),
+                );
+            }
+            match index.exports_by_name.get(&name) {
+                Some(ExportEntry::Local { .. }) => return true,
+                Some(ExportEntry::ReexportedNamed { .. }) => return true,
+                Some(ExportEntry::Default {
+                    local_name: Some(_),
+                }) => return true,
+                Some(ExportEntry::Default { local_name: None }) => {}
+                None => {}
+            }
+        }
+        false
     }
 
     pub(super) fn export_targets_from_files(
@@ -421,6 +490,20 @@ fn rust_declaration_targets_in_files(
     targets
 }
 
+fn rust_module_is_descendant(module_file: &ProjectFile, candidate: &ProjectFile) -> bool {
+    if module_file == candidate {
+        return true;
+    }
+    let module = rust_package_name(module_file);
+    let candidate = rust_package_name(candidate);
+    if module.is_empty() {
+        return !candidate.is_empty();
+    }
+    candidate
+        .strip_prefix(&module)
+        .is_some_and(|suffix| suffix.starts_with('.'))
+}
+
 impl RustAnalyzer {
     /// The cached re-export/importer index, built once per analyzer generation.
     fn usage_index(&self) -> &RustUsageIndex {
@@ -438,33 +521,47 @@ impl RustAnalyzer {
     }
 
     /// Candidate files: those importing a seed, plus the seed files themselves.
-    pub(crate) fn usage_importers(
-        &self,
-        seeds: &BTreeSet<(ProjectFile, String)>,
-    ) -> HashSet<ProjectFile> {
+    pub(crate) fn usage_importers(&self, seeds: &RustBindingSeeds) -> HashSet<ProjectFile> {
         self.usage_index().importers_of_seeds(seeds)
     }
 
-    /// `(direct_names, namespace_names)` — the local names in `file` that bind a
-    /// seed directly (`use path::Item;`) vs. as a namespace (`use crate::module;`).
+    /// Canonical local binding identities for a target, including named private
+    /// imports that can be imported again by descendant modules.
+    pub(crate) fn usage_binding_seeds(
+        &self,
+        seeds: &BTreeSet<(ProjectFile, String)>,
+    ) -> RustBindingSeeds {
+        self.usage_index().binding_seeds(seeds)
+    }
+
+    /// `(direct_names, qualified_names)` — local names that bind a seed directly
+    /// (`use path::Item;`) and exact paths that reach a seed through a namespace
+    /// binding (`use crate_name;` followed by `crate_name::Item`).
     pub(crate) fn usage_binding_names(
         &self,
         file: &ProjectFile,
-        seeds: &BTreeSet<(ProjectFile, String)>,
+        seeds: &RustBindingSeeds,
     ) -> (HashSet<String>, HashSet<String>) {
         let mut direct = HashSet::default();
-        let mut namespace = HashSet::default();
-        for edge in self.usage_index().matching_edges_for_importer(file, seeds) {
-            match edge.kind {
+        let mut qualified = HashSet::default();
+        let index = self.usage_index();
+        for edge in index.matching_edges_for_importer(file, seeds) {
+            match &edge.kind {
                 RustImportEdgeKind::Namespace => {
-                    namespace.insert(edge.local_name);
+                    qualified.extend(
+                        seeds
+                            .identities
+                            .iter()
+                            .filter(|(target_file, _)| target_file == &edge.target_file)
+                            .map(|(_, target_name)| format!("{}::{target_name}", edge.local_name)),
+                    );
                 }
                 RustImportEdgeKind::Named(_) => {
-                    direct.insert(edge.local_name);
+                    direct.insert(edge.local_name.clone());
                 }
             }
         }
-        (direct, namespace)
+        (direct, qualified)
     }
 
     /// All local names in `file` binding a seed (direct or namespace) — the
@@ -472,12 +569,11 @@ impl RustAnalyzer {
     pub(crate) fn usage_binding_local_names(
         &self,
         file: &ProjectFile,
-        seeds: &BTreeSet<(ProjectFile, String)>,
+        seeds: &RustBindingSeeds,
     ) -> HashSet<String> {
         self.usage_index()
             .matching_edges_for_importer(file, seeds)
-            .into_iter()
-            .map(|edge| edge.local_name)
+            .map(|edge| edge.local_name.clone())
             .collect()
     }
 
@@ -491,12 +587,17 @@ impl RustAnalyzer {
     }
 }
 
-fn edge_matches_seed(edge: &RustImportEdge, seeds: &BTreeSet<(ProjectFile, String)>) -> bool {
+fn edge_matches_single_seed(
+    edge: &RustImportEdge,
+    target_file: &ProjectFile,
+    target_name: &str,
+) -> bool {
+    if &edge.target_file != target_file {
+        return false;
+    }
     match &edge.kind {
-        RustImportEdgeKind::Named(name) => {
-            seeds.contains(&(edge.target_file.clone(), name.clone()))
-        }
-        RustImportEdgeKind::Namespace => seeds.iter().any(|(file, _)| file == &edge.target_file),
+        RustImportEdgeKind::Named(name) => name == target_name,
+        RustImportEdgeKind::Namespace => true,
     }
 }
 

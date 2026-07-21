@@ -825,15 +825,7 @@ pub(crate) fn csharp_type_reference_root(mut node: Node<'_>) -> Option<Node<'_>>
             node = parent;
             continue;
         }
-        if parent
-            .child_by_field_name("type")
-            .is_some_and(|type_node| same_csharp_node(type_node, node))
-            || parent
-                .child_by_field_name("return_type")
-                .is_some_and(|type_node| same_csharp_node(type_node, node))
-            || parent
-                .child_by_field_name("returns")
-                .is_some_and(|type_node| same_csharp_node(type_node, node))
+        if csharp_is_structured_type_role(parent, node)
             || csharp_as_expression_type_operand(parent, node)
             || csharp_is_expression_type_operand(parent, node)
         {
@@ -870,6 +862,83 @@ pub(crate) fn csharp_type_reference_root(mut node: Node<'_>) -> Option<Node<'_>>
         }
         return None;
     }
+}
+
+fn csharp_is_structured_type_role(parent: Node<'_>, node: Node<'_>) -> bool {
+    // A tuple element exposes both `type` and `name` identifier children. Keep
+    // that distinction declaration-driven: only the grammar's `type` field is
+    // a reference, even when the element name has identical text.
+    let fields: &[&str] = if parent.kind() == "tuple_element" {
+        &["type"]
+    } else {
+        &["type", "return_type", "returns"]
+    };
+    fields.iter().any(|field| {
+        parent
+            .child_by_field_name(field)
+            .is_some_and(|candidate| same_csharp_node(candidate, node))
+    })
+}
+
+/// Return the expression that can denote a type in a `nameof(...)` operand.
+///
+/// C# parses `nameof(Type)` in expression position, so the identifier does not
+/// carry one of the ordinary syntax-tree type roles handled by
+/// [`csharp_type_reference_root`]. A qualified operand may itself be a type
+/// (`nameof(Namespace.Type)`); otherwise its receiver may be the type owner
+/// (`nameof(Type.Member)`). Resolution remains responsible for choosing the
+/// first valid interpretation and rejecting locals, fields, and other value
+/// expressions with the same shape.
+pub(crate) fn csharp_nameof_type_candidates<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, Option<Node<'tree>>)> {
+    if node.kind() != "invocation_expression" {
+        return None;
+    }
+    let function = node
+        .child_by_field_name("function")
+        .or_else(|| node.named_child(0))?;
+    if function.kind() != "identifier"
+        || source.get(function.start_byte()..function.end_byte())? != "nameof"
+    {
+        return None;
+    }
+    let arguments = node.child_by_field_name("arguments").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| child.kind() == "argument_list")
+    })?;
+    if arguments.named_child_count() != 1 {
+        return None;
+    }
+    let argument = arguments.named_child(0)?;
+    let operand = if argument.kind() == "argument" {
+        argument
+            .child_by_field_name("value")
+            .or_else(|| argument.child_by_field_name("expression"))
+            .or_else(|| argument.named_child(0))?
+    } else {
+        argument
+    };
+    let qualified_owner = if operand.kind() == "member_access_expression" {
+        Some(
+            operand
+                .child_by_field_name("expression")
+                .or_else(|| operand.named_child(0))?,
+        )
+    } else {
+        None
+    };
+    matches!(
+        operand.kind(),
+        "identifier"
+            | "qualified_name"
+            | "alias_qualified_name"
+            | "generic_name"
+            | "member_access_expression"
+    )
+    .then_some((operand, qualified_owner))
 }
 
 pub(crate) fn csharp_constant_pattern_type_candidate(node: Node<'_>) -> Option<Node<'_>> {

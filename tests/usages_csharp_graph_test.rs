@@ -380,6 +380,85 @@ fn csharp_graph_resolves_nested_partial_type_references_in_sibling_file() {
 }
 
 #[test]
+fn usage_finder_csharp_resolves_sibling_nested_constructor_in_enclosing_type() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "Demo/Nested.cs",
+        r#"namespace Demo;
+
+public class Outer {
+    public class Consumer {
+        public object Build() => new Target(42);
+    }
+
+    public class Target(int value) {}
+}
+
+public class OtherOuter {
+    public class Target(int value) {}
+    public object Build() => new Target(7);
+}
+"#,
+    )]);
+
+    let consumer = project.file("Demo/Nested.cs");
+    let source = consumer.read_to_string().expect("nested source");
+    let outer_call = source
+        .find("Target(42)")
+        .expect("outer target construction");
+    let other_call = source.find("Target(7)").expect("other target construction");
+    let outer_target = type_definition(&analyzer, "Demo.Outer$Target");
+    let other_target = type_definition(&analyzer, "Demo.OtherOuter$Target");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    let forward = definition_lookup(
+        project.root(),
+        "Demo/Nested.cs",
+        outer_call,
+        outer_call + "Target".len(),
+    );
+    assert_eq!(forward["results"][0]["status"], "resolved", "{forward}");
+    assert_eq!(
+        forward["results"][0]["definitions"][0]["fqn"], "Demo.Outer$Target",
+        "{forward}"
+    );
+
+    let targeted = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&outer_target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result
+        .into_either()
+        .expect("targeted sibling-nested query should resolve");
+    let whole_workspace = UsageFinder::new()
+        .query(&analyzer, std::slice::from_ref(&outer_target), 1000, 1000)
+        .result
+        .into_either()
+        .expect("whole-workspace sibling-nested query should resolve");
+    for hits in [&targeted, &whole_workspace] {
+        assert_eq!(hits.len(), 1, "{hits:#?}");
+        assert!(hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= outer_call
+                && outer_call + "Target".len() <= hit.end_offset
+        }));
+    }
+
+    let unrelated_hits = graph_hits(&analyzer, &other_target);
+    assert_eq!(unrelated_hits.len(), 1, "{unrelated_hits:#?}");
+    assert!(unrelated_hits.iter().any(|hit| {
+        hit.file == consumer
+            && hit.start_offset <= other_call
+            && other_call + "Target".len() <= hit.end_offset
+    }));
+}
+
+#[test]
 fn csharp_graph_nested_type_reference_respects_type_parameter_shadow() {
     let (project, analyzer) = csharp_analyzer_with_files(&[
         (
@@ -3539,6 +3618,60 @@ namespace System.Reflection.Emit {
 }
 
 #[test]
+fn csharp_tuple_element_type_is_a_usage_but_its_declaration_name_is_not() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Configuration/MapperConfiguration.cs",
+            "namespace Configuration { public class MapperConfiguration { } }\n",
+        ),
+        (
+            "MapperGenerator.cs",
+            r#"
+using Configuration;
+
+namespace Generators;
+
+public class MapperGenerator {
+    private static (MapperConfiguration MapperConfiguration, int Diagnostics) BuildDefaults() {
+        return default;
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = type_definition(&analyzer, "Configuration.MapperConfiguration");
+    let hits = graph_hits(&analyzer, &target);
+    let consumer = project.file("MapperGenerator.cs");
+    let source = consumer.read_to_string().expect("tuple consumer source");
+    let type_start = source
+        .find("(MapperConfiguration")
+        .expect("tuple element type")
+        + 1;
+    let name_start = source
+        .find("MapperConfiguration,")
+        .expect("tuple element declaration name");
+
+    assert_eq!(
+        1,
+        hits.len(),
+        "only the tuple element type should count: {hits:#?}"
+    );
+    let hit = hits.iter().next().expect("tuple type hit");
+    assert_eq!(consumer, hit.file);
+    assert!(
+        hit.start_offset <= type_start
+            && type_start + "MapperConfiguration".len() <= hit.end_offset,
+        "tuple type token should be returned: {hit:#?}"
+    );
+    assert!(
+        !(hit.start_offset <= name_start
+            && name_start + "MapperConfiguration".len() <= hit.end_offset),
+        "tuple element declaration name must stay excluded: {hit:#?}"
+    );
+}
+
+#[test]
 fn csharp_graph_distinguishes_generic_and_nongeneric_constructor_owners() {
     let (_project, analyzer) = csharp_analyzer_with_files(&[
         (
@@ -5312,6 +5445,146 @@ namespace Demo {
 }
 
 #[test]
+fn usage_finder_csharp_resolves_base_receiver_to_logical_direct_class_base() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Demo/Hierarchy.cs",
+            r#"namespace Demo;
+
+public interface AFirstContract {}
+
+public class RootMapping {
+    protected virtual void BuildBody(int value) {}
+    protected virtual void BuildBody(int value, int other) {}
+}
+
+public partial class BaseMapping : RootMapping {
+    protected override void BuildBody(int value) {}
+}
+"#,
+        ),
+        (
+            "Demo/BaseMapping.Part.cs",
+            r#"namespace Demo;
+
+public partial class BaseMapping {}
+"#,
+        ),
+        (
+            "Demo/DerivedMapping.Base.cs",
+            r#"namespace Demo;
+
+public sealed partial class DerivedMapping : BaseMapping {}
+"#,
+        ),
+        (
+            "Demo/DerivedMapping.Calls.cs",
+            r#"namespace Demo;
+
+public sealed partial class DerivedMapping : AFirstContract {
+    protected override void BuildBody(int value, int other) {}
+
+    public void Run() {
+        base.BuildBody(1, 2);
+        this.BuildBody(3, 4);
+        BuildBody(5, 6);
+    }
+}
+
+public sealed class UnrelatedMapping {
+    private void BuildBody(int value, int other) {}
+    public void Run() => this.BuildBody(7, 8);
+}
+"#,
+        ),
+    ]);
+
+    let consumer = project.file("Demo/DerivedMapping.Calls.cs");
+    let source = consumer.read_to_string().expect("consumer source");
+    let base_call = source.find("base.BuildBody").expect("base call") + "base.".len();
+    let this_call = source.find("this.BuildBody").expect("this call") + "this.".len();
+    let unqualified_call = source.find("BuildBody(5, 6)").expect("unqualified call");
+    let unrelated_call =
+        source.find("this.BuildBody(7, 8)").expect("unrelated call") + "this.".len();
+
+    let base_target = member_function_with_arity(&analyzer, "Demo.RootMapping", "BuildBody", 2);
+    let derived_target =
+        member_function_with_arity(&analyzer, "Demo.DerivedMapping", "BuildBody", 2);
+    let unrelated_target =
+        member_function_with_arity(&analyzer, "Demo.UnrelatedMapping", "BuildBody", 2);
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    let forward = definition_lookup(
+        project.root(),
+        "Demo/DerivedMapping.Calls.cs",
+        base_call,
+        base_call + "BuildBody".len(),
+    );
+    assert_eq!(forward["results"][0]["status"], "resolved", "{forward}");
+    assert_eq!(
+        forward["results"][0]["definitions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "{forward}"
+    );
+    assert_eq!(
+        forward["results"][0]["definitions"][0]["fqn"], "Demo.RootMapping.BuildBody",
+        "{forward}"
+    );
+    assert_eq!(
+        forward["results"][0]["definitions"][0]["signature"], "(int, int)",
+        "{forward}"
+    );
+
+    let targeted = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&base_target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result
+        .into_either()
+        .expect("targeted base-qualified query should resolve");
+    let whole_workspace = UsageFinder::new()
+        .query(&analyzer, std::slice::from_ref(&base_target), 1000, 1000)
+        .result
+        .into_either()
+        .expect("whole-workspace base-qualified query should resolve");
+    for hits in [&targeted, &whole_workspace] {
+        assert_eq!(hits.len(), 1, "{hits:#?}");
+        assert!(hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= base_call
+                && base_call + "BuildBody".len() <= hit.end_offset
+        }));
+    }
+
+    let derived_hits = graph_hits(&analyzer, &derived_target);
+    assert_eq!(derived_hits.len(), 2, "{derived_hits:#?}");
+    for expected in [this_call, unqualified_call] {
+        assert!(derived_hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= expected
+                && expected + "BuildBody".len() <= hit.end_offset
+        }));
+    }
+
+    let unrelated_hits = graph_hits(&analyzer, &unrelated_target);
+    assert_eq!(unrelated_hits.len(), 1, "{unrelated_hits:#?}");
+    assert!(unrelated_hits.iter().any(|hit| {
+        hit.file == consumer
+            && hit.start_offset <= unrelated_call
+            && unrelated_call + "BuildBody".len() <= hit.end_offset
+    }));
+}
+
+#[test]
 fn csharp_graph_finds_unqualified_same_class_async_member_calls_with_arguments() {
     let (project, analyzer) = csharp_analyzer_with_files(&[(
         "MudTabs.cs",
@@ -5737,6 +6010,184 @@ namespace App {
 }
 
 #[test]
+fn usage_finder_csharp_finds_nameof_type_roles_with_persisted_parity() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "src/NameofTypes.cs",
+            r#"namespace Example;
+
+public sealed class Target {
+    public const string Value = "";
+}
+
+public sealed class Other {
+    public const string Value = "";
+}
+
+public sealed class Consumer {
+    public enum Nested { Value }
+
+    public string Direct() => nameof(Target);
+    public string FullyQualified() => nameof(Example.Target);
+    public string GlobalQualified() => nameof(global::Example.Target);
+    public string QualifiedOwner() => nameof(Target.Value);
+    public string NestedType() => nameof(Nested);
+    public string QualifiedNestedType() => nameof(Consumer.Nested);
+    public string FullyQualifiedNestedType() => nameof(global::Example.Consumer.Nested);
+    public string NestedOwner() => nameof(Nested.Value);
+    public string OtherType() => nameof(Other);
+
+    public string ShadowedDirect() {
+        object Target = new();
+        return nameof(Target);
+    }
+
+    public string ShadowedQualified() {
+        object Target = new();
+        return nameof(Target.ToString);
+    }
+}
+"#,
+        )
+        .build();
+    let consumer = project.file("src/NameofTypes.cs");
+    let source = consumer.read_to_string().expect("nameof type source");
+    let direct = source.find("nameof(Target);").expect("direct nameof type") + "nameof(".len();
+    let qualified = source
+        .find("nameof(Target.Value)")
+        .expect("qualified nameof owner")
+        + "nameof(".len();
+    let fully_qualified = source
+        .find("nameof(Example.Target)")
+        .expect("fully-qualified nameof type")
+        + "nameof(Example.".len();
+    let global_qualified = source
+        .find("nameof(global::Example.Target)")
+        .expect("global-qualified nameof type")
+        + "nameof(global::Example.".len();
+    let nested = source.find("nameof(Nested)").expect("nested nameof type") + "nameof(".len();
+    let qualified_nested = source
+        .find("nameof(Consumer.Nested)")
+        .expect("qualified nested nameof type")
+        + "nameof(Consumer.".len();
+    let fully_qualified_nested = source
+        .find("nameof(global::Example.Consumer.Nested)")
+        .expect("fully-qualified nested nameof type")
+        + "nameof(global::Example.Consumer.".len();
+    let nested_owner = source
+        .find("nameof(Nested.Value)")
+        .expect("nested nameof owner")
+        + "nameof(".len();
+    let other = source.find("nameof(Other)").expect("other nameof type") + "nameof(".len();
+    let shadowed_direct = source
+        .rfind("nameof(Target);")
+        .expect("shadowed direct nameof value")
+        + "nameof(".len();
+    let shadowed_qualified = source
+        .find("nameof(Target.ToString)")
+        .expect("shadowed qualified nameof value")
+        + "nameof(".len();
+
+    let assert_queries = |analyzer: &dyn IAnalyzer| {
+        let type_target = |fq_name: &str| {
+            analyzer
+                .get_all_declarations()
+                .iter()
+                .find(|unit| unit.kind() == CodeUnitType::Class && unit.fq_name() == fq_name)
+                .cloned()
+                .unwrap_or_else(|| panic!("missing C# type {fq_name}"))
+        };
+        let provider =
+            ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+        let query = |target: &CodeUnit| {
+            let targeted = UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    analyzer,
+                    std::slice::from_ref(target),
+                    Some(&provider),
+                    1,
+                    1000,
+                )
+                .result
+                .into_either()
+                .expect("targeted nameof type query should resolve");
+            let whole_workspace = UsageFinder::new()
+                .query(analyzer, std::slice::from_ref(target), 1000, 1000)
+                .result
+                .into_either()
+                .expect("whole-workspace nameof type query should resolve");
+            (targeted, whole_workspace)
+        };
+
+        let target = type_target("Example.Target");
+        let (targeted, whole_workspace) = query(&target);
+        for hits in [&targeted, &whole_workspace] {
+            assert_eq!(hits.len(), 4, "{hits:#?}");
+            for expected in [direct, qualified, fully_qualified, global_qualified] {
+                assert!(
+                    hits.iter().any(|hit| {
+                        hit.start_offset <= expected && expected + "Target".len() <= hit.end_offset
+                    }),
+                    "missing Target at {expected}: {hits:#?}"
+                );
+            }
+            for shadowed in [shadowed_direct, shadowed_qualified] {
+                assert!(
+                    hits.iter().all(|hit| {
+                        !(hit.start_offset <= shadowed
+                            && shadowed + "Target".len() <= hit.end_offset)
+                    }),
+                    "a local value named Target must not become a type usage: {hits:#?}"
+                );
+            }
+        }
+
+        let nested_target = type_target("Example.Consumer$Nested");
+        let (targeted, whole_workspace) = query(&nested_target);
+        for hits in [&targeted, &whole_workspace] {
+            assert_eq!(hits.len(), 4, "{hits:#?}");
+            for expected in [
+                nested,
+                qualified_nested,
+                fully_qualified_nested,
+                nested_owner,
+            ] {
+                assert!(
+                    hits.iter().any(|hit| {
+                        hit.start_offset <= expected && expected + "Nested".len() <= hit.end_offset
+                    }),
+                    "missing nested type at {expected}: {hits:#?}"
+                );
+            }
+        }
+
+        let other_target = type_target("Example.Other");
+        let (targeted, whole_workspace) = query(&other_target);
+        for hits in [&targeted, &whole_workspace] {
+            assert_eq!(hits.len(), 1, "{hits:#?}");
+            assert!(
+                hits.iter().any(|hit| {
+                    hit.start_offset <= other && other + "Other".len() <= hit.end_offset
+                }),
+                "missing Other nameof type: {hits:#?}"
+            );
+        }
+    };
+
+    {
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+                .expect("persisted nameof project should build");
+        assert_queries(workspace.analyzer());
+    }
+    let reopened =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("persisted nameof project should reopen");
+    assert_queries(reopened.analyzer());
+}
+
+#[test]
 fn usage_finder_csharp_candidate_routing_covers_using_and_same_namespace() {
     let (project, analyzer) = csharp_analyzer_with_files(&[
         (
@@ -6153,6 +6604,49 @@ public sealed class Service {
     );
 }
 
+#[test]
+fn csharp_graph_attributes_nameof_receiver_to_nongeneric_owner_with_matching_member() {
+    let source = r#"namespace Demo;
+
+[System.Runtime.CompilerServices.CollectionBuilder(
+    typeof(ImmutableEquatableArray),
+    nameof(ImmutableEquatableArray.Create))]
+public sealed class ImmutableEquatableArray<T>
+{
+    public ImmutableEquatableArray(T value) {}
+}
+
+public static class ImmutableEquatableArray
+{
+    public static ImmutableEquatableArray<T> Create<T>(T value) => new(value);
+}
+"#;
+    let (_project, analyzer) =
+        csharp_analyzer_with_files(&[("ImmutableEquatableArray.cs", source)]);
+    let nongeneric = type_definition(&analyzer, "Demo.ImmutableEquatableArray");
+    let generic = type_definition(&analyzer, "Demo.ImmutableEquatableArray`1");
+    let receiver = source
+        .find("ImmutableEquatableArray.Create")
+        .expect("nameof receiver");
+    let receiver_end = receiver + "ImmutableEquatableArray".len();
+
+    let nongeneric_hits = graph_hits(&analyzer, &nongeneric);
+    assert!(
+        nongeneric_hits
+            .iter()
+            .any(|hit| hit.start_offset == receiver && hit.end_offset == receiver_end),
+        "nameof receiver should resolve to the non-generic owner: {nongeneric_hits:#?}"
+    );
+
+    let generic_hits = graph_hits(&analyzer, &generic);
+    assert!(
+        generic_hits
+            .iter()
+            .all(|hit| hit.start_offset != receiver || hit.end_offset != receiver_end),
+        "nameof receiver must not resolve to the same-named generic owner: {generic_hits:#?}"
+    );
+}
+
 // A local of the same name in an unrelated method is provably not the field, so it
 // must be skipped silently rather than poisoning the file's other proven hits.
 #[test]
@@ -6257,6 +6751,105 @@ public sealed class Dto {
             .iter()
             .all(|hit| hit.file == project.file("src/Service.cs")),
         "{dto_hits:#?}"
+    );
+}
+
+#[test]
+fn usage_finder_csharp_resolves_implicit_new_initializer_owner_from_declarator() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "src/ImplicitNew.cs",
+        r#"namespace Example;
+
+public sealed class Key {}
+
+public class BaseShortcut {
+    public string Key { get; set; } = "";
+}
+
+public sealed class Shortcut : BaseShortcut {
+    public string Title { get; set; } = "";
+}
+
+public sealed class OtherShortcut {
+    public string Key { get; set; } = "";
+}
+
+public static class Consumer {
+    // Keep the newer field-backed-property syntax: tree-sitter recovers the
+    // following implicit-new declaration inside an ERROR node, as in Terminal.Gui.
+    public static bool Toggle { get => field; set => field = value; }
+
+    public static void Build() {
+        Shortcut shortcut = new () { Key = "target", Title = "show" };
+        OtherShortcut other = new () { Key = "other" };
+    }
+}
+"#,
+    )]);
+
+    let consumer = project.file("src/ImplicitNew.cs");
+    let source = consumer.read_to_string().expect("implicit-new source");
+    let target_label = source.find("Key = \"target\"").expect("target label");
+    let other_label = source.find("Key = \"other\"").expect("other label");
+    let target = member_field(&analyzer, "Example.BaseShortcut", "Key");
+    let other = member_field(&analyzer, "Example.OtherShortcut", "Key");
+    let same_named_type = type_definition(&analyzer, "Example.Key");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    for (offset, expected_fqn) in [
+        (target_label, "Example.BaseShortcut.Key"),
+        (other_label, "Example.OtherShortcut.Key"),
+    ] {
+        let forward = definition_lookup(
+            project.root(),
+            "src/ImplicitNew.cs",
+            offset,
+            offset + "Key".len(),
+        );
+        assert_eq!(forward["results"][0]["status"], "resolved", "{forward}");
+        assert_eq!(
+            forward["results"][0]["definitions"][0]["fqn"], expected_fqn,
+            "{forward}"
+        );
+    }
+
+    let targeted = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result
+        .into_either()
+        .expect("targeted implicit-new initializer query should resolve");
+    let whole_workspace = UsageFinder::new()
+        .query(&analyzer, std::slice::from_ref(&target), 1000, 1000)
+        .result
+        .into_either()
+        .expect("whole-workspace implicit-new initializer query should resolve");
+    for hits in [&targeted, &whole_workspace] {
+        assert_eq!(hits.len(), 1, "{hits:#?}");
+        assert!(hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= target_label
+                && target_label + "Key".len() <= hit.end_offset
+        }));
+    }
+
+    let other_hits = graph_hits(&analyzer, &other);
+    assert_eq!(other_hits.len(), 1, "{other_hits:#?}");
+    assert!(other_hits.iter().any(|hit| {
+        hit.file == consumer
+            && hit.start_offset <= other_label
+            && other_label + "Key".len() <= hit.end_offset
+    }));
+    assert!(
+        graph_hits(&analyzer, &same_named_type).is_empty(),
+        "initializer labels must not resolve as same-named types"
     );
 }
 

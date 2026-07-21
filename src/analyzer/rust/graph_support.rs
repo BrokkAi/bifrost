@@ -623,10 +623,10 @@ impl RustAnalyzer {
         let mut pending: Vec<_> = module_files
             .iter()
             .cloned()
-            .map(|file| (file, export_name.to_string()))
+            .map(|file| (file, export_name.to_string(), false))
             .collect();
-        while let Some((file, name)) = pending.pop() {
-            if !visited.insert((file.clone(), name.clone())) {
+        while let Some((file, name, reached_through_reexport)) = pending.pop() {
+            if !visited.insert((file.clone(), name.clone(), reached_through_reexport)) {
                 continue;
             }
             let index = self.export_index_of(&file);
@@ -641,7 +641,7 @@ impl RustAnalyzer {
                     pending.extend(
                         self.resolve_module_files(&file, module_specifier)
                             .into_iter()
-                            .map(|target_file| (target_file, imported_name.clone())),
+                            .map(|target_file| (target_file, imported_name.clone(), true)),
                     );
                 }
                 Some(ExportEntry::Default {
@@ -650,13 +650,22 @@ impl RustAnalyzer {
                     targets.insert((file.clone(), local_name.clone()));
                 }
                 Some(ExportEntry::Default { local_name: None }) => {}
+                None if reached_through_reexport => {
+                    targets.extend(
+                        self.declarations(&file)
+                            .into_iter()
+                            .filter(|unit| unit.identifier() == name)
+                            .filter(|unit| self.is_rust_export_visible_declaration(unit))
+                            .map(|unit| (file.clone(), unit.identifier().to_string())),
+                    );
+                }
                 None => {}
             }
             for star in index.reexport_stars {
                 pending.extend(
                     self.resolve_module_files(&file, &star.module_specifier)
                         .into_iter()
-                        .map(|target_file| (target_file, name.clone())),
+                        .map(|target_file| (target_file, name.clone(), true)),
                 );
             }
         }
@@ -668,6 +677,16 @@ impl RustAnalyzer {
         importing_file: &ProjectFile,
         module_specifier: &str,
     ) -> Vec<ProjectFile> {
+        let analyzed_files = self.get_analyzed_files();
+        if let Some(root_file) = self
+            .cargo_routes()
+            .resolve_crate_root_file(importing_file, module_specifier)
+        {
+            return analyzed_files
+                .into_iter()
+                .filter(|file| file == &root_file)
+                .collect();
+        }
         let package = rust_package_name(importing_file);
         let crate_package = rust_crate_root_package(importing_file);
         let Some(resolved_module) = self
@@ -679,8 +698,7 @@ impl RustAnalyzer {
             return rust_module_files_from_path(importing_file, module_specifier);
         };
 
-        let mut files: Vec<_> = self
-            .get_analyzed_files()
+        let mut files: Vec<_> = analyzed_files
             .into_iter()
             .filter(|file| rust_package_name(file) == resolved_module)
             .collect();
@@ -844,12 +862,6 @@ impl RustAnalyzer {
         self.rust_declaration_node_is(code_unit, |node, source| {
             rust_visibility_text(node, source)
                 .is_some_and(|visibility| visibility.starts_with("pub"))
-        })
-    }
-
-    pub(crate) fn is_rust_cfg_test_declaration(&self, code_unit: &CodeUnit) -> bool {
-        self.rust_declaration_node_is(code_unit, |node, source| {
-            rust_declaration_has_cfg_test_attribute(node, source)
         })
     }
 
@@ -1119,66 +1131,6 @@ fn is_export_visibility(visibility: &str) -> bool {
         .filter(|ch| !ch.is_whitespace())
         .collect();
     compact == "pub" || compact == "pub(crate)" || compact.starts_with("pub(incrate")
-}
-
-fn rust_declaration_has_cfg_test_attribute(node: Node<'_>, source: &str) -> bool {
-    node.named_children(&mut node.walk())
-        .any(|child| child.kind() == "attribute_item" && rust_attribute_is_cfg_test(child, source))
-        || contiguous_outer_attributes(node)
-            .into_iter()
-            .any(|attribute| rust_attribute_is_cfg_test(attribute, source))
-}
-
-fn contiguous_outer_attributes(node: Node<'_>) -> Vec<Node<'_>> {
-    let mut attributes = Vec::new();
-    let mut previous = node.prev_named_sibling();
-    while let Some(sibling) = previous {
-        if sibling.kind() != "attribute_item" {
-            break;
-        }
-        attributes.push(sibling);
-        previous = sibling.prev_named_sibling();
-    }
-    attributes
-}
-
-fn rust_attribute_is_cfg_test(attribute: Node<'_>, source: &str) -> bool {
-    let mut stack = vec![attribute];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "attribute"
-            && node
-                .child_by_field_name("path")
-                .is_some_and(|path| node_text(path, source) == "cfg")
-            && node
-                .child_by_field_name("arguments")
-                .is_some_and(|arguments| rust_cfg_arguments_are_exact_test(arguments, source))
-        {
-            return true;
-        }
-
-        if node.kind() == "attribute_item"
-            && node
-                .child_by_field_name("name")
-                .is_some_and(|name| node_text(name, source) == "cfg")
-            && node
-                .child_by_field_name("arguments")
-                .is_some_and(|arguments| rust_cfg_arguments_are_exact_test(arguments, source))
-        {
-            return true;
-        }
-
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
-    }
-    false
-}
-
-fn rust_cfg_arguments_are_exact_test(arguments: Node<'_>, source: &str) -> bool {
-    let identifiers = named_descendants_of_kind(arguments, "identifier")
-        .into_iter()
-        .map(|identifier| node_text(identifier, source))
-        .collect::<Vec<_>>();
-    identifiers == ["test"]
 }
 
 fn named_descendants_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {

@@ -19,7 +19,8 @@
 //! return type, matching the same inference used when seeding locals.
 
 use super::resolver::{
-    is_ignored_type_context, node_text, resolve_nested_type_for_owner, resolve_type_segments,
+    constructor_method_reference_receiver, is_ignored_type_context, node_text,
+    resolve_field_access_type, resolve_nested_type_for_owner, resolve_type_segments,
 };
 use super::return_type::{
     FileReturnCache, JavaReturnTypeContext, LexicalTypeResolution, METHOD_RECEIVER_CHAIN_LIMIT,
@@ -106,6 +107,21 @@ impl JavaScan<'_, '_> {
     }
 
     fn resolve_type(&self, node: Node<'_>) -> Option<CodeUnit> {
+        if matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier") {
+            return resolve_type_segments(
+                node,
+                self.source,
+                |candidate| self.resolve_non_nested_type(candidate),
+                |owner, name| self.resolve_nested_type(owner, name),
+            )
+            .into_iter()
+            .last()
+            .map(|(resolved, _)| resolved);
+        }
+        self.resolve_non_nested_type(node)
+    }
+
+    fn resolve_non_nested_type(&self, node: Node<'_>) -> Option<CodeUnit> {
         match java_lexical_type_from_node(self.java, self.analyzer, self.file, self.source, node) {
             LexicalTypeResolution::Resolved(unit) => return Some(unit),
             LexicalTypeResolution::Blocked => return None,
@@ -210,6 +226,7 @@ fn record_reference(
     bindings: &LocalInferenceEngine<String>,
 ) {
     match node.kind() {
+        "object_creation_expression" => record_constructor_reference(node, ctx),
         // `new Foo()` and generics resolve via the type_identifier children, so
         // a scoped parent handles all of its semantic type segments (avoids
         // double counting while retaining outer-owner references).
@@ -247,6 +264,10 @@ fn record_reference(
             }
         }
         "method_reference" => {
+            if let Some(receiver) = constructor_method_reference_receiver(node) {
+                record_constructor_reference_for_type(receiver, node, ctx);
+                return;
+            }
             let Some((receiver, member_node)) = method_reference_parts(node) else {
                 return;
             };
@@ -279,6 +300,34 @@ fn record_reference(
             }
         }
         _ => {}
+    }
+}
+
+fn record_constructor_reference(node: Node<'_>, ctx: &mut JavaScan<'_, '_>) {
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return;
+    };
+    record_constructor_reference_for_type(type_node, node, ctx);
+}
+
+fn record_constructor_reference_for_type(
+    type_node: Node<'_>,
+    reference_node: Node<'_>,
+    ctx: &mut JavaScan<'_, '_>,
+) {
+    let Some(owner) = ctx.resolve_type(type_node) else {
+        return;
+    };
+    ctx.record(owner.fq_name().to_string(), type_node);
+    let constructor_fqn = format!("{}.{}", owner.fq_name(), owner.identifier());
+    let declared = ctx
+        .java
+        .global_usage_definition_index()
+        .by_fqn(&constructor_fqn)
+        .iter()
+        .any(|candidate| candidate.is_function() && !candidate.is_synthetic());
+    if declared {
+        ctx.record(constructor_fqn, reference_node);
     }
 }
 
@@ -376,9 +425,24 @@ fn receiver_type_fqn_at_depth(
             .class_ranges
             .enclosing(object.start_byte())
             .map(str::to_string),
-        "type_identifier" | "scoped_type_identifier" | "generic_type" => {
+        "type_identifier" | "scoped_identifier" | "scoped_type_identifier" | "generic_type" => {
             ctx.resolve_type_fqn(object)
         }
+        "field_access" => resolve_field_access_type(
+            object,
+            ctx.source,
+            |base| {
+                let name = node_text(base, ctx.source);
+                if bindings.is_shadowed(name) {
+                    Err(())
+                } else {
+                    Ok(ctx.resolve_type(base))
+                }
+            },
+            |qualified| ctx.java.resolve_usage_type_name(ctx.file, qualified),
+            |owner, name| ctx.resolve_nested_type(owner, name),
+        )
+        .map(|owner| owner.fq_name()),
         "object_creation_expression" => object
             .child_by_field_name("type")
             .and_then(|type_node| ctx.resolve_type_fqn(type_node)),
