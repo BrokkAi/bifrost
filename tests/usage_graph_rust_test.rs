@@ -79,6 +79,55 @@ fn resolves_namespace_qualified_and_associated_calls() {
 }
 
 #[test]
+fn macro_associated_calls_respect_function_local_imports() {
+    let value = inline_usage_graph(&[
+        (
+            "src/a.rs",
+            "pub struct Thing; impl Thing { pub fn build() -> Self { Self } }\n",
+        ),
+        (
+            "src/b.rs",
+            "pub struct Thing; impl Thing { pub fn build() -> Self { Self } }\n",
+        ),
+        (
+            "src/lib.rs",
+            r#"
+mod a;
+mod b;
+macro_rules! consume { ($value:expr) => {}; }
+
+fn first() {
+    use crate::a::Thing;
+    consume!(Thing::build());
+}
+
+fn second() {
+    use crate::b::Thing;
+    consume!(Thing::build());
+}
+"#,
+        ),
+    ]);
+
+    assert!(
+        find_edge(&value, "first", "a.Thing.build").is_some(),
+        "first must resolve through its lexical import: {}",
+        value["edges"]
+    );
+    assert!(
+        find_edge(&value, "second", "b.Thing.build").is_some(),
+        "second must resolve through its lexical import: {}",
+        value["edges"]
+    );
+    assert!(
+        find_edge(&value, "first", "b.Thing.build").is_none()
+            && find_edge(&value, "second", "a.Thing.build").is_none(),
+        "function-local imports must not cross-resolve macro paths: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn resolves_unique_trait_associated_function_candidate() {
     let value = inline_usage_graph(&[(
         "src/lib.rs",

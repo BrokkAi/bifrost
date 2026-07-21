@@ -374,15 +374,13 @@ impl RustUsageIndex {
             }
             match index.exports_by_name.get(&name) {
                 Some(ExportEntry::Local { .. }) => return true,
-                Some(ExportEntry::ReexportedNamed {
-                    module_specifier,
-                    imported_name,
-                }) => pending.extend(
-                    self.module_files
-                        .resolve(&file, module_specifier)
-                        .into_iter()
-                        .map(|target| (target, imported_name.clone())),
-                ),
+                Some(ExportEntry::ReexportedNamed { .. }) => {
+                    // The named `pub use` is itself the export boundary. Its
+                    // target may live in a private module and therefore have no
+                    // independent `Local` export entry; requiring that terminal
+                    // entry would discard legal consumers of this public name.
+                    return true;
+                }
                 Some(ExportEntry::Default {
                     local_name: Some(_),
                 }) => return true,

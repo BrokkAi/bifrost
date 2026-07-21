@@ -4695,6 +4695,115 @@ where
 }
 
 #[test]
+fn rust_member_calls_do_not_fall_back_to_same_named_fields() {
+    let source = r#"
+struct Builder {
+    enable_io: bool,
+}
+
+impl Builder {
+    fn configure(&mut self) {
+        self.enable_io();
+        let _enabled = self.enable_io;
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    let call = source.find("self.enable_io();").expect("field-shaped call") + "self.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, call),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+
+    let access = source.rfind("self.enable_io;").expect("field access") + "self.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, access),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "Builder.enable_io",
+        "{value}"
+    );
+    assert_eq!(
+        value["results"][0]["definitions"][0]["kind"], "field",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_shorthand_pattern_binding_does_not_fall_back_to_same_named_callable() {
+    let source = r#"
+enum Inner {
+    Alternative { is_shutdown: bool },
+}
+
+impl Inner {
+    fn is_shutdown(&self) -> bool { true }
+}
+
+fn inspect(inner: Inner) {
+    match inner {
+        Inner::Alternative { is_shutdown, .. } => {
+            let _value = is_shutdown;
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    for marker in ["{ is_shutdown, ..", "= is_shutdown;"] {
+        let start = source.find(marker).expect("pattern binding marker")
+            + marker.find("is_shutdown").expect("binding name in marker");
+        let value = lookup(
+            project.root(),
+            &location_reference("src/lib.rs", source, start),
+        );
+        assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+        assert_eq!(
+            value["results"][0]["diagnostics"][0]["kind"], "local_binding",
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn rust_impl_type_owner_prefers_the_local_struct_over_same_named_module_alias() {
+    let buffer = r#"
+pub struct Table;
+pub trait Display {}
+impl Display for Table {}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", "pub mod table; pub mod document;\n")
+        .file("src/table.rs", "pub type Table = ();\n")
+        .file("src/document.rs", "pub mod buffer;\n")
+        .file("src/document/buffer.rs", buffer)
+        .build();
+
+    let owner = buffer.rfind("Table").expect("impl type owner");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/document/buffer.rs", buffer, owner),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "document.buffer.Table",
+        "a local type declaration must beat an unrelated same-named module alias: {value}"
+    );
+    assert_eq!(
+        value["results"][0]["definitions"][0]["kind"], "class",
+        "{value}"
+    );
+}
+
+#[test]
 fn rust_explicit_type_import_beats_same_named_enclosing_type() {
     let source = r#"
 mod tracing_core {
