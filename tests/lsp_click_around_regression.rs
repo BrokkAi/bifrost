@@ -2154,7 +2154,7 @@ end
 }
 
 #[test]
-#[ignore = "stress"]
+#[ignore = "stress: generated 24-layer Go embedding navigation; run explicitly with cargo test --test lsp_click_around_regression -- --ignored"]
 fn stress_milestone_12_go_embedded_promotion_click_around() {
     let mut service = String::from(
         r#"package service
@@ -2224,7 +2224,7 @@ func use() {
 }
 
 #[test]
-#[ignore = "stress"]
+#[ignore = "stress: generated 16-type Rust trait-implementation navigation; run explicitly with cargo test --test lsp_click_around_regression -- --ignored"]
 fn stress_milestone_12_rust_trait_impl_click_around() {
     let mut service = String::from("use crate::contracts::Worker;\n\n");
     let mut client_imports = Vec::new();

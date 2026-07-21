@@ -7182,7 +7182,7 @@ fn service_initializes_generated_large_workspace_with_deep_java_shape() {
 }
 
 #[test]
-#[ignore = "expensive 10k-file smoke test for issue #175"]
+#[ignore = "expensive 10k-file stack-safety smoke; run explicitly with cargo test --test searchtools_service -- --ignored"]
 fn service_initializes_ten_thousand_tracked_java_files_without_stack_overflow() {
     let temp = generated_java_workspace(10_000, 512, true);
     let service =

@@ -43,6 +43,8 @@ Bifrost needs tests that catch realistic failures in the analyzer, its persisten
   Evidence: `tests/bifrost_lsp_server.rs` covers malformed diagnostics around lines 7156-7520, formatting cancellation around 8941-9030, CRLF/Unicode edits around 9400-9475, stale changes around 9579-9627, and unknown requests at 7662; `src/lsp/handlers/formatting.rs` retains one explicit opt-in integration test.
 - Observation: six ignored parity markers do not exercise code: three Python markers and one Git-hotspot marker panic unconditionally, while two JS/TS markers have empty bodies. They add no executable contract and turn `--ignored` into a knowingly failing/non-informative mode.
   Evidence: `tests/usages_python_graph_test.rs`, `tests/usages_js_ts_graph_test.rs`, and `src/code_quality/git_hotspots.rs` each contained the named ignored marker functions.
+- Observation: three retained stress tests do exercise real behavior but two had only the uninformative reason `stress`, and the 10k-file smoke reason omitted its execution command.
+  Evidence: `tests/lsp_click_around_regression.rs` generates the Go embedding and Rust trait-implementation fixtures; `tests/searchtools_service.rs` generates 10,000 tracked Java files.
 
 ## Decision Log
 
@@ -63,6 +65,9 @@ Bifrost needs tests that catch realistic failures in the analyzer, its persisten
   Date/Author: 2026-07-21 / Codex.
 - Decision: remove ignored parity-marker non-tests rather than converting them into comments or retaining their test names.
   Rationale: the markers contain neither a fixture nor a behavioral assertion, so they are not regressions and cannot become useful by being run. The relevant supported behavior remains covered by nearby real tests; future parity work needs an issue or an executable contract, not a placeholder test.
+  Date/Author: 2026-07-21 / Codex.
+- Decision: retain the three stress tests, but make their ignore messages describe the generated workload and exact opt-in command.
+  Rationale: each test has a distinct behavior assertion and deliberately large fixture. Explicit messages make the skip auditable without running a host-costly workload in ordinary CI.
   Date/Author: 2026-07-21 / Codex.
 
 ## Context and Orientation
