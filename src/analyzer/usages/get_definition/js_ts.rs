@@ -1025,9 +1025,7 @@ fn jsts_scope_contains_binding_before(
             return true;
         }
         if matches!(node.kind(), "identifier" | "type_identifier")
-            && node
-                .parent()
-                .is_some_and(|parent| matches!(parent.kind(), "formal_parameters" | "parameters"))
+            && jsts_identifier_is_parameter(node)
             && source
                 .get(node.start_byte()..node.end_byte())
                 .is_some_and(|text| text.trim() == name)
@@ -1043,6 +1041,17 @@ fn jsts_scope_contains_binding_before(
         stack.extend(children.into_iter().rev());
     }
     false
+}
+
+fn jsts_identifier_is_parameter(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    matches!(parent.kind(), "formal_parameters" | "parameters")
+        || (parent.kind() == "arrow_function"
+            && parent
+                .child_by_field_name("parameter")
+                .is_some_and(|parameter| parameter.id() == node.id()))
 }
 
 fn jsts_binding_scope_for_declaration(

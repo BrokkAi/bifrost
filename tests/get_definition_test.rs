@@ -9136,6 +9136,55 @@ function render(query) {
 }
 
 #[test]
+fn javascript_unparenthesized_arrow_parameter_blocks_project_wide_member_fallback() {
+    let consumer = r#"
+const inspect = data => data.originalPlacement;
+const inspectParenthesized = (data) => data.originalPlacement;
+
+const inspectLocal = data => {
+  data.localPlacement = data.placement;
+  return data.localPlacement;
+};
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "generated.js",
+            r#"
+function update(data) {
+  data.originalPlacement = data.placement;
+}
+"#,
+        )
+        .file("consumer.js", consumer)
+        .build();
+
+    let unrelated_reads: Vec<_> = consumer
+        .match_indices("data.originalPlacement")
+        .map(|(start, _)| start)
+        .collect();
+    assert_eq!(unrelated_reads.len(), 2);
+    for unrelated_read in unrelated_reads {
+        let value = lookup(
+            project.root(),
+            &location_reference("consumer.js", consumer, unrelated_read + "data.".len()),
+        );
+        assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    }
+
+    let local_read = consumer
+        .rfind("data.localPlacement")
+        .expect("same-arrow local property read");
+    let value = lookup(
+        project.root(),
+        &location_reference("consumer.js", consumer, local_read + "data.".len()),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "consumer.js", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 6, "{value}");
+}
+
+#[test]
 fn javascript_block_shadowed_member_assignment_does_not_resolve_outer_receiver() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
