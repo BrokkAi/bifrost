@@ -149,6 +149,50 @@ pub(crate) trait ProgramSemanticsLowerer: Send + Sync {
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError>;
 }
 
+fn validate_semantic_file<A: LanguageAdapter>(
+    analyzer: &TreeSitterAnalyzer<A>,
+    file: &ProjectFile,
+) -> Result<(), SemanticProviderError> {
+    if file.root() != analyzer.project().root() {
+        return Err(SemanticProviderError::invalid_identity(format!(
+            "semantic file root `{}` does not match analyzer root `{}`",
+            file.root().display(),
+            analyzer.project().root().display()
+        )));
+    }
+    let file_language = crate::analyzer::common::language_for_file(file);
+    if file_language != analyzer.adapter().language() {
+        return Err(SemanticProviderError::invalid_identity(format!(
+            "semantic file language {} does not match {} adapter",
+            file_language.config_label(),
+            analyzer.adapter().language().config_label()
+        )));
+    }
+    Ok(())
+}
+
+/// Derive the current complete artifact identity from one atomic prepared
+/// syntax snapshot. This deliberately does not consult the artifact cache,
+/// lower procedures, or mutate a semantic budget.
+pub(crate) fn current_artifact_key_with_lowerer<A: LanguageAdapter>(
+    analyzer: &TreeSitterAnalyzer<A>,
+    lowerer: &dyn ProgramSemanticsLowerer,
+    file: &ProjectFile,
+    max_source_bytes: usize,
+) -> Result<Option<SemanticArtifactKey>, SemanticProviderError> {
+    validate_semantic_file(analyzer, file)?;
+    let prepared = match analyzer.prepared_syntax_limited(file, max_source_bytes) {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => {
+            return Err(SemanticProviderError::source_access(format!(
+                "could not prepare the current source snapshot for `{file}`"
+            )));
+        }
+        Err(_) => return Ok(None),
+    };
+    semantic_artifact_key(file, &prepared, lowerer.identity()).map(Some)
+}
+
 /// Materialize against exactly one prepared syntax snapshot.
 ///
 /// The content digest, source origin, dialect, tree, and source mappings all
@@ -167,21 +211,7 @@ pub(crate) fn materialize_with_lowerer<A: LanguageAdapter>(
         });
     }
 
-    if file.root() != analyzer.project().root() {
-        return Err(SemanticProviderError::invalid_identity(format!(
-            "semantic file root `{}` does not match analyzer root `{}`",
-            file.root().display(),
-            analyzer.project().root().display()
-        )));
-    }
-    let file_language = crate::analyzer::common::language_for_file(file);
-    if file_language != analyzer.adapter().language() {
-        return Err(SemanticProviderError::invalid_identity(format!(
-            "semantic file language {} does not match {} adapter",
-            file_language.config_label(),
-            analyzer.adapter().language().config_label()
-        )));
-    }
+    validate_semantic_file(analyzer, file)?;
 
     let max_source_bytes = request.budget.remaining().source_bytes;
     let prepared = match analyzer.prepared_syntax_limited(file, max_source_bytes) {
@@ -667,6 +697,28 @@ mod tests {
         }
     }
 
+    struct IdentityOnlyLowerer(SemanticAdapterIdentity);
+
+    impl ProgramSemanticsLowerer for IdentityOnlyLowerer {
+        fn identity(&self) -> SemanticAdapterIdentity {
+            self.0.clone()
+        }
+
+        fn capabilities(&self) -> SemanticCapabilities {
+            SemanticCapabilities::default()
+        }
+
+        fn lower(
+            &self,
+            _file: &ProjectFile,
+            _prepared: &PreparedSyntaxTree,
+            _budget: &SemanticBudget,
+            _cancellation: &super::super::CancellationToken,
+        ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
+            panic!("artifact-key lookup must not invoke semantic lowering")
+        }
+    }
+
     struct BlockingLowerer {
         calls: AtomicUsize,
         entered: mpsc::Sender<()>,
@@ -793,6 +845,105 @@ mod tests {
         );
         retained.source_bytes = 0;
         assert_eq!(retained, artifact.work());
+    }
+
+    #[test]
+    fn current_artifact_key_tracks_source_adapter_and_configuration_without_lowering() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("root");
+        let file = write_file(&root, "src/main.ts", "export const value = 1;\n");
+        let analyzer = analyzer(&root);
+        let identity = |adapter: &[u8], configuration: &[u8], dependencies: &[u8]| {
+            IdentityOnlyLowerer(SemanticAdapterIdentity {
+                adapter: AdapterSemanticsVersion::hash_bytes("identity-only", adapter)
+                    .expect("adapter name"),
+                configuration: ConfigurationFingerprint::hash_bytes(configuration),
+                dependencies: DependencyFingerprint::hash_bytes(dependencies),
+            })
+        };
+
+        let baseline_lowerer = identity(b"adapter-v1", b"config-v1", b"dependencies-v1");
+        assert_eq!(
+            current_artifact_key_with_lowerer(
+                &analyzer,
+                &baseline_lowerer,
+                &file,
+                "export const value = 1;\n".len() - 1,
+            )
+            .expect("bounded key lookup"),
+            None
+        );
+        assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 0);
+
+        let baseline =
+            current_artifact_key_with_lowerer(&analyzer, &baseline_lowerer, &file, usize::MAX)
+                .expect("baseline key lookup")
+                .expect("baseline key");
+        let adapter_changed = current_artifact_key_with_lowerer(
+            &analyzer,
+            &identity(b"adapter-v2", b"config-v1", b"dependencies-v1"),
+            &file,
+            usize::MAX,
+        )
+        .expect("adapter key lookup")
+        .expect("adapter key");
+        let configuration_changed = current_artifact_key_with_lowerer(
+            &analyzer,
+            &identity(b"adapter-v1", b"config-v2", b"dependencies-v1"),
+            &file,
+            usize::MAX,
+        )
+        .expect("configuration key lookup")
+        .expect("configuration key");
+        let dependencies_changed = current_artifact_key_with_lowerer(
+            &analyzer,
+            &identity(b"adapter-v1", b"config-v1", b"dependencies-v2"),
+            &file,
+            usize::MAX,
+        )
+        .expect("dependency key lookup")
+        .expect("dependency key");
+
+        assert_ne!(baseline, adapter_changed);
+        assert_ne!(baseline, configuration_changed);
+        assert_ne!(baseline, dependencies_changed);
+
+        file.write("export const value = 2;\n")
+            .expect("rewrite fixture");
+        let source_changed =
+            current_artifact_key_with_lowerer(&analyzer, &baseline_lowerer, &file, usize::MAX)
+                .expect("updated source key lookup")
+                .expect("updated source key");
+        assert_ne!(baseline, source_changed);
+    }
+
+    #[test]
+    fn current_artifact_key_matches_materialization_without_running_the_lowerer() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("root");
+        let file = write_file(&root, "src/main.ts", "export const value = 1;\n");
+        let analyzer = analyzer(&root);
+        let cache = CompleteSemanticArtifactCache::default();
+        let lowerer = FakeLowerer::new(FakeMode::Complete);
+
+        let current = current_artifact_key_with_lowerer(&analyzer, &lowerer, &file, usize::MAX)
+            .expect("current artifact key lookup")
+            .expect("current artifact key");
+        assert_eq!(lowerer.calls(), 0);
+
+        let mut budget = SemanticBudget::default();
+        let SemanticOutcome::Complete { value, .. } = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &file,
+            &mut budget,
+            &super::super::CancellationToken::default(),
+        ) else {
+            panic!("complete artifact")
+        };
+        assert_eq!(value.key(), &current);
+        assert_eq!(lowerer.calls(), 1);
     }
 
     #[test]

@@ -7,6 +7,7 @@ use crate::analyzer::ProjectFile;
 use crate::cancellation::CancellationToken;
 
 use super::capabilities::SemanticCapability;
+use super::ids::SemanticArtifactKey;
 use super::ir::{SemanticArtifact, SemanticIrError};
 
 /// Declare every independently bounded semantic-materialization dimension once.
@@ -428,6 +429,20 @@ impl std::error::Error for SemanticProviderError {
 
 /// A standalone per-language adapter boundary for immutable semantic artifacts.
 pub trait ProgramSemanticsProvider: Send + Sync {
+    /// Derive the complete identity of the file's current atomic source
+    /// snapshot without lowering procedures or charging semantic work.
+    ///
+    /// This is the generation check for handles that cross provider calls. It
+    /// uses the same adapter, IR, configuration, and dependency identity as
+    /// [`Self::materialize`].
+    /// `None` means the current snapshot exceeds `max_source_bytes`; source
+    /// access and identity failures remain operational errors.
+    fn current_artifact_key(
+        &self,
+        file: &ProjectFile,
+        max_source_bytes: usize,
+    ) -> Result<Option<SemanticArtifactKey>, SemanticProviderError>;
+
     /// Prepare one exact file snapshot, derive its identity, and lower it as
     /// one linearized operation. Implementations cache only complete artifacts.
     fn materialize(
@@ -444,6 +459,14 @@ mod tests {
     struct FailingProgramSemanticsProvider(SemanticProviderError);
 
     impl ProgramSemanticsProvider for FailingProgramSemanticsProvider {
+        fn current_artifact_key(
+            &self,
+            _file: &ProjectFile,
+            _max_source_bytes: usize,
+        ) -> Result<Option<SemanticArtifactKey>, SemanticProviderError> {
+            Err(self.0.clone())
+        }
+
         fn materialize(
             &self,
             _file: &ProjectFile,

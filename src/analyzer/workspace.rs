@@ -320,6 +320,26 @@ impl WorkspaceAnalyzer {
         }
     }
 
+    /// Check a retained semantic handle against the complete identity of the
+    /// file's current analyzer generation without rematerializing its IR.
+    pub(crate) fn semantic_artifact_key_is_current(
+        &self,
+        key: &crate::analyzer::semantic::SemanticArtifactKey,
+        max_source_bytes: usize,
+    ) -> Result<Option<bool>, crate::analyzer::semantic::SemanticProviderError> {
+        let root = self.analyzer().project().root();
+        if key.mount() != crate::analyzer::semantic::WorkspaceMountId::from_root(root) {
+            return Ok(Some(false));
+        }
+        let file = crate::analyzer::ProjectFile::new(root.to_path_buf(), key.path().as_path());
+        let Some(provider) = self.program_semantics_provider_for_file(&file) else {
+            return Ok(Some(false));
+        };
+        Ok(provider
+            .current_artifact_key(&file, max_source_bytes)?
+            .map(|current| current == *key))
+    }
+
     /// File-aware semantic materialization routed through the concrete
     /// language analyzer. Unknown extensions remain explicitly unsupported.
     pub fn materialize_program_semantics(
@@ -346,6 +366,14 @@ impl WorkspaceAnalyzer {
     /// generation without widening the language analyzers or `IAnalyzer`.
     pub fn icfg_provider(&self) -> crate::analyzer::semantic::WorkspaceIcfgProvider<'_> {
         crate::analyzer::semantic::WorkspaceIcfgProvider::new(self)
+    }
+
+    /// Bind the language-neutral semantic-oracle facade to this exact analyzer
+    /// generation without widening the language analyzers or `IAnalyzer`.
+    pub fn semantic_oracle_provider(
+        &self,
+    ) -> crate::analyzer::semantic::WorkspaceSemanticOracle<'_> {
+        crate::analyzer::semantic::WorkspaceSemanticOracle::new(self)
     }
 
     /// Starts a request-scoped query cache across the active language analyzers.
@@ -385,6 +413,51 @@ mod tests {
     use crate::analyzer::{OverlayProject, ProjectFile, TestProject};
     use crate::gitblob::tests::{commit_all, init_repo};
     use rusqlite::Connection;
+
+    #[test]
+    fn semantic_generation_check_rejects_a_stale_configuration_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = ProjectFile::new(root.clone(), "src/generation.ts");
+        file.write("export const generation = 1;\n").unwrap();
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::TypeScript));
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let cancellation = crate::analyzer::semantic::CancellationToken::default();
+        let mut budget = crate::analyzer::semantic::SemanticBudget::default();
+        let artifact = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut crate::analyzer::semantic::SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .unwrap()
+            .available_value()
+            .cloned()
+            .expect("semantic artifact");
+        assert!(
+            workspace
+                .semantic_artifact_key_is_current(artifact.key(), usize::MAX)
+                .unwrap()
+                .expect("source within limit")
+        );
+
+        let current = artifact.key();
+        let stale = crate::analyzer::semantic::SemanticArtifactKey::new(
+            current.mount(),
+            current.path().clone(),
+            current.language(),
+            current.revision(),
+            current.adapter().clone(),
+            current.ir_version(),
+            crate::analyzer::semantic::ConfigurationFingerprint::hash_bytes(b"stale-configuration"),
+            current.dependencies(),
+        );
+        assert_eq!(
+            workspace
+                .semantic_artifact_key_is_current(&stale, usize::MAX)
+                .unwrap(),
+            Some(false)
+        );
+    }
 
     #[test]
     fn unsupported_analyzer_query_remains_a_healthy_empty_result() {

@@ -368,9 +368,11 @@ fn assert_direct_call_project_conformance(
     let return_edge = icfg_edge("icfg_normal_continuation", IcfgEdgeKind::NormalReturn)
         .originating_call("direct_call");
     icfg.assert_successors("callee_normal_exit", &[return_edge]);
-    if has_dynamic_dispatch_gap || expect_unproven_link_unit || expect_unproven_return {
+    if expect_unproven_link_unit || expect_unproven_return {
         icfg.assert_edge_unproven_partial("callee_normal_exit", return_edge);
     } else {
+        // An open target set weakens the operation and adds an unresolved arm,
+        // but it does not invalidate proof for a retained exact candidate.
         icfg.assert_edge_proven_complete("callee_normal_exit", return_edge);
     }
     icfg.assert_predecessors(
@@ -744,7 +746,7 @@ fn rust_turbofish_direct_call_uses_the_shared_dispatch_oracle() {
 
 #[test]
 fn rust_generic_method_call_uses_the_shared_dispatch_oracle() {
-    assert_direct_call_conformance(DirectCallFixture {
+    assert_return_partial_direct_call_conformance(DirectCallFixture {
         language: Language::Rust,
         dialect: SemanticLanguage::Standard(Language::Rust),
         callee_path: "worker.rs",
@@ -14542,7 +14544,7 @@ fn scala_generic_method_direct_call_conformance() {
           def root(worker: GenericWorker): Int = worker.identity[Int](7)
         }
     "#;
-    assert_direct_call_conformance(DirectCallFixture {
+    assert_return_partial_direct_call_conformance(DirectCallFixture {
         language: Language::Scala,
         dialect: SemanticLanguage::Standard(Language::Scala),
         callee_path: "scala/GenericWorker.scala",
@@ -15222,7 +15224,7 @@ fn scala_curried_call_is_one_dispatch_matched_invoke() {
     "#;
     const CALL: &str = "worker.combine(7)(\"seven\")";
 
-    assert_direct_call_conformance(DirectCallFixture {
+    assert_return_partial_direct_call_conformance(DirectCallFixture {
         language: Language::Scala,
         dialect: SemanticLanguage::Standard(Language::Scala),
         callee_path: "scala/CurriedWorker.scala",

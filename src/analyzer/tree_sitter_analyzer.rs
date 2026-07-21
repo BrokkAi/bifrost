@@ -1481,6 +1481,23 @@ where
         )
     }
 
+    pub(crate) fn current_semantic_artifact_key_with_lowerer(
+        &self,
+        lowerer: &dyn crate::analyzer::semantic::service::ProgramSemanticsLowerer,
+        file: &ProjectFile,
+        max_source_bytes: usize,
+    ) -> Result<
+        Option<crate::analyzer::semantic::SemanticArtifactKey>,
+        crate::analyzer::semantic::SemanticProviderError,
+    > {
+        crate::analyzer::semantic::service::current_artifact_key_with_lowerer(
+            self,
+            lowerer,
+            file,
+            max_source_bytes,
+        )
+    }
+
     /// Resolve a persistence identity for the exact source string being
     /// normalized. Hashing the supplied bytes prevents a concurrent file or
     /// overlay change from associating facts with a different live OID.

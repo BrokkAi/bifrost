@@ -12,14 +12,18 @@ pub(crate) mod cfg;
 pub mod icfg;
 pub mod ids;
 pub mod ir;
+pub mod oracle;
 pub mod provider;
 pub mod render;
 pub(crate) mod service;
+pub(crate) mod workspace_oracle;
 
 pub use crate::cancellation::CancellationToken;
 pub use capabilities::*;
 pub use icfg::*;
 pub use ids::*;
 pub use ir::*;
+pub use oracle::*;
 pub use provider::*;
 pub use render::*;
+pub use workspace_oracle::*;

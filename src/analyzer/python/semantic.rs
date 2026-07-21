@@ -21,6 +21,18 @@ use crate::hash::HashMap;
 const ADAPTER_VERSION: &[u8] = b"python-cfg-v1";
 
 impl ProgramSemanticsProvider for PythonAnalyzer {
+    fn current_artifact_key(
+        &self,
+        file: &ProjectFile,
+        max_source_bytes: usize,
+    ) -> Result<Option<SemanticArtifactKey>, SemanticProviderError> {
+        self.inner.current_semantic_artifact_key_with_lowerer(
+            &PythonSemanticLowerer,
+            file,
+            max_source_bytes,
+        )
+    }
+
     fn materialize(
         &self,
         file: &ProjectFile,
@@ -2920,6 +2932,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             point,
             subject,
             capability,
+            impacts: SemanticGapImpacts::for_gap(capability, subject),
             kind,
             budget: None,
             detail: detail.into(),

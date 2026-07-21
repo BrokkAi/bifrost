@@ -3287,6 +3287,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             point,
             subject,
             capability,
+            impacts: SemanticGapImpacts::for_gap(capability, subject),
             kind,
             budget: None,
             detail: detail.into(),

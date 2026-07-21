@@ -20,6 +20,18 @@ use crate::hash::{HashMap, HashSet};
 const ADAPTER_VERSION: &[u8] = b"cpp-cfg-v1";
 
 impl ProgramSemanticsProvider for CppAnalyzer {
+    fn current_artifact_key(
+        &self,
+        file: &ProjectFile,
+        max_source_bytes: usize,
+    ) -> Result<Option<SemanticArtifactKey>, SemanticProviderError> {
+        self.inner.current_semantic_artifact_key_with_lowerer(
+            &CppSemanticLowerer,
+            file,
+            max_source_bytes,
+        )
+    }
+
     fn materialize(
         &self,
         file: &ProjectFile,
@@ -1118,11 +1130,21 @@ fn lower_procedure<'tree>(
                 "macro-expanded callable references are not fabricated from source text",
             ),
         ] {
-            context.add_gap(
+            let impacts = SemanticGapImpacts::for_gap(capability, SemanticGapSubject::Procedure);
+            let impacts = if matches!(
+                capability,
+                SemanticCapability::Calls | SemanticCapability::CallableReferences
+            ) {
+                impacts.with(SemanticGapImpact::DispatchCoverage)
+            } else {
+                impacts
+            };
+            context.add_gap_with_impacts(
                 &mut builder,
                 entry,
                 SemanticGapSubject::Procedure,
                 capability,
+                impacts,
                 SemanticGapKind::Unsupported,
                 detail,
             )?;
@@ -1143,11 +1165,18 @@ fn lower_procedure<'tree>(
                 "object and VLA lifetimes across parser-error regions cannot be delimited exactly",
             ),
         ] {
-            context.add_gap(
+            let impacts = SemanticGapImpacts::for_gap(capability, SemanticGapSubject::Procedure);
+            let impacts = if capability == SemanticCapability::Calls {
+                impacts.with(SemanticGapImpact::DispatchCoverage)
+            } else {
+                impacts
+            };
+            context.add_gap_with_impacts(
                 &mut builder,
                 entry,
                 SemanticGapSubject::Procedure,
                 capability,
+                impacts,
                 SemanticGapKind::Unsupported,
                 detail,
             )?;
@@ -3225,11 +3254,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "temporaries created by default arguments and implicit conversions may require cleanup before or after the represented call",
             ),
         ] {
-            self.add_gap(
+            let subject = SemanticGapSubject::CallSite(call_site);
+            self.add_gap_with_impacts(
                 builder,
                 invoke,
-                SemanticGapSubject::CallSite(call_site),
+                subject,
                 capability,
+                SemanticGapImpacts::for_gap(capability, subject)
+                    .with(SemanticGapImpact::CallEvaluation),
                 SemanticGapKind::Unknown,
                 detail,
             )?;
@@ -4026,6 +4058,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         kind: SemanticGapKind,
         detail: &str,
     ) -> Result<(), CppLoweringError> {
+        self.add_gap_with_impacts(
+            builder,
+            point,
+            subject,
+            capability,
+            SemanticGapImpacts::for_gap(capability, subject),
+            kind,
+            detail,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_gap_with_impacts(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        subject: SemanticGapSubject,
+        capability: SemanticCapability,
+        impacts: SemanticGapImpacts,
+        kind: SemanticGapKind,
+        detail: &str,
+    ) -> Result<(), CppLoweringError> {
         if !self.published_gaps.insert(GapFact {
             point,
             subject,
@@ -4043,6 +4097,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             point,
             subject,
             capability,
+            impacts,
             kind,
             budget: None,
             detail: detail.into(),
