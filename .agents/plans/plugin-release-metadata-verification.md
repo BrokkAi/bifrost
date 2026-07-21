@@ -13,7 +13,7 @@ Codex, Claude Code, Cursor, and Amp install Bifrost through a launcher that down
 - [x] (2026-07-21 12:07Z) Ran manifest and launcher tests, then prepared v0.8.6 successfully in the normal host environment.
 - [x] (2026-07-21 12:09Z) Initialized the corrected MCP server and confirmed it advertises the `symbol|extended` toolset; `get_summaries` returned the `SearchToolsService` outline from this checkout.
 - [x] (2026-07-21 12:12Z) Found that a clean Codex reinstall retained `./bin/bifrost-launcher.mjs` but launched it from the workspace, producing `No such file or directory` before MCP initialization.
-- [ ] Add the plugin-package working directory, reinstall again, and confirm a fresh Codex task injects the advertised Bifrost tools.
+- [x] (2026-07-21 12:17Z) Reinstalled from the local checkout after clearing the stale MCP entry. `codex mcp get bifrost` resolved `cwd` to the cached plugin package and a fresh read-only Codex session invoked `mcp__bifrost__search_symbols`.
 
 ## Surprises & Discoveries
 
@@ -28,7 +28,7 @@ Codex, Claude Code, Cursor, and Amp install Bifrost through a launcher that down
 
 ## Outcomes & Retrospective
 
-The v0.8.6 macOS archive can now be downloaded, checksum-verified, and launched. A clean Codex reinstall additionally revealed that the shared MCP config needs to declare the plugin package as its working directory; otherwise Codex resolves the relative launcher command from the workspace.
+The v0.8.6 macOS archive now downloads, verifies, and launches. The plugin also declares its package directory as the MCP working directory, so a clean Codex reinstall resolves `./bin/bifrost-launcher.mjs` from the cached package rather than the workspace. A fresh Codex session exposed and invoked `mcp__bifrost__search_symbols`; its no-result response is analyzer search behavior, not an MCP startup failure.
 
 ## Context and Orientation
 
@@ -68,4 +68,4 @@ The failing sidecar comparison was:
 
 The launcher already verifies the committed hash against both the published sidecar and the downloaded archive. The host `prepare` smoke is the end-to-end proof of this contract for the release being repaired.
 
-Revision note (2026-07-21): Updated after the first clean reinstall showed that Codex launched the relative command from the workspace. The plan now records the package working-directory requirement and repeats the fresh-session validation.
+Revision note (2026-07-21): Completed after the final clean reinstall and fresh Codex session successfully exposed and called `mcp__bifrost__search_symbols`.
