@@ -641,8 +641,21 @@ mod tests {
         let note = "note: policy test.render inferred policy schema 1 and RQL schema 2\n";
         assert!(output.starts_with(note));
         assert_eq!(output.matches(note).count(), 1);
-        assert!(output.contains("policy rule: test.render (Render)\n"));
+        assert!(!output.contains("policy rule: test.render (Render)\n"));
         assert!(output.ends_with("summary: 0 findings; 1 complete policy run; clean\n"));
+
+        let mut verbose = Vec::new();
+        write_policy_human(
+            &report,
+            &HumanRenderOptions::new(HumanRenderDetail::Verbose, HumanRenderColor::Plain),
+            &mut verbose,
+            usize::MAX,
+        )
+        .unwrap();
+        let verbose = String::from_utf8(verbose).unwrap();
+        assert!(verbose.starts_with(note));
+        assert_eq!(verbose.matches(note).count(), 1);
+        assert!(verbose.contains("policy rule: test.render (Render)\n"));
     }
 
     #[test]
