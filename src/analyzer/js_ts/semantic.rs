@@ -14,7 +14,7 @@ use crate::analyzer::{Language, ProjectFile, Range};
 use crate::hash::HashMap;
 
 const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v2";
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v2";
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v3";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {

@@ -2,9 +2,13 @@ mod common;
 
 use brokk_bifrost::AnalyzerConfig;
 use brokk_bifrost::analyzer::semantic::{
-    AllocationKind, ArgumentDomain, CallArgumentExpansion, CaptureMode, CaptureSource,
-    MemoryAccessKind, MemoryLocationKind, ProcedureKind, ProcedureSemantics, SemanticEffect,
-    SemanticValueKind, ValueFlowKind,
+    AllocationKind, ArgumentDomain, CallArgumentExpansion, CallBinding, CallBindings,
+    CancellationToken, CandidateCoverage, CaptureMode, CaptureSource, DispatchCandidate,
+    DispatchOracle, FormalMultiplicity, MemoryAccessKind, MemoryLocationKind, OracleCallContext,
+    OracleContractError, OracleLimits, ProcedureHandle, ProcedureKind, ProcedurePortHandle,
+    ProcedurePortKind, ProcedureSemantics, SemanticBudget, SemanticEffect, SemanticOutcome,
+    SemanticRequest, SemanticValueKind, ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle,
+    ValueFlowRelationKind, ValueFlowSnapshot, WorkspaceSemanticOracle,
 };
 
 use common::{InlineTestProject, semantic_graph::SemanticGraph};
@@ -29,6 +33,24 @@ fn procedure_named<'artifact>(
                     == Some(name)
         })
         .unwrap_or_else(|| panic!("missing {kind:?} procedure {name}"))
+}
+
+fn procedure_handle_named(
+    graph: &SemanticGraph,
+    name: &str,
+    kind: ProcedureKind,
+) -> ProcedureHandle {
+    let procedure = procedure_named(graph, name, kind);
+    graph
+        .artifact()
+        .procedure_handle(procedure.id())
+        .expect("selected procedure must have a scoped handle")
+}
+
+fn available<T>(outcome: &SemanticOutcome<T>) -> &T {
+    outcome
+        .available_value()
+        .expect("source-backed oracle outcome must retain its partial value")
 }
 
 fn mapped_source<'source>(
@@ -493,6 +515,447 @@ fn assert_java_sibling_scopes(graph: &SemanticGraph, source: &str) {
     );
 }
 
+fn assert_value_flow_oracle(analyzer: &brokk_bifrost::WorkspaceAnalyzer, graph: &SemanticGraph) {
+    let oracle = analyzer.semantic_oracle_provider();
+    let instance = procedure_handle_named(graph, "instance", ProcedureKind::Method);
+    let mut budget = SemanticBudget::default();
+    let cancellation = CancellationToken::default();
+    let outcome = oracle
+        .procedure_relations(
+            &instance,
+            &OracleCallContext::empty(),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("value-flow snapshot should materialize");
+    let snapshot = available(&outcome);
+    assert_ne!(
+        snapshot.coverage(),
+        CandidateCoverage::Truncated,
+        "adapter gaps may keep the whole-procedure relation set open, but the bounded query must retain every published row"
+    );
+    for expected in [
+        ValueFlowRelationKind::Assignment,
+        ValueFlowRelationKind::Parameter,
+        ValueFlowRelationKind::Receiver,
+        ValueFlowRelationKind::NormalReturn,
+        ValueFlowRelationKind::Allocation,
+    ] {
+        assert!(
+            snapshot
+                .relations()
+                .iter()
+                .any(|relation| relation.kind == expected),
+            "instance snapshot must publish {expected:?}"
+        );
+    }
+    assert!(snapshot.relations().iter().any(|relation| matches!(
+        (&relation.kind, &relation.source),
+        (
+            ValueFlowRelationKind::Parameter,
+            ValueFlowEndpoint::Port(port)
+        ) if port.kind() == ProcedurePortKind::Parameter { ordinal: 0 }
+    )));
+    assert!(snapshot.relations().iter().any(|relation| matches!(
+        (&relation.kind, &relation.source),
+        (
+            ValueFlowRelationKind::Receiver,
+            ValueFlowEndpoint::Port(port)
+        ) if port.kind() == ProcedurePortKind::Receiver
+    )));
+    assert_eq!(
+        budget.used(),
+        outcome.work(),
+        "complete oracle work must be committed exactly once"
+    );
+
+    let first = procedure_handle_named(graph, "first", ProcedureKind::Method);
+    let mut budget = SemanticBudget::default();
+    let first_outcome = oracle
+        .procedure_relations(
+            &first,
+            &OracleCallContext::empty(),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("indexed-load snapshot should materialize");
+    assert!(
+        available(&first_outcome)
+            .relations()
+            .iter()
+            .any(|relation| {
+                matches!(
+                    (&relation.kind, &relation.source),
+                    (
+                        ValueFlowRelationKind::MemoryLoad,
+                        ValueFlowEndpoint::Location(location)
+                    ) if location.path().is_exact()
+                )
+            })
+    );
+
+    let capture = procedure_handle_named(graph, "capture", ProcedureKind::Method);
+    let mut budget = SemanticBudget::default();
+    let capture_outcome = oracle
+        .procedure_relations(
+            &capture,
+            &OracleCallContext::empty(),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("capture snapshot should materialize");
+    let capture_relation = available(&capture_outcome)
+        .relations()
+        .iter()
+        .find(|relation| {
+            matches!(
+                (&relation.kind, &relation.target),
+                (
+                    ValueFlowRelationKind::Capture,
+                    ValueFlowEndpoint::Port(port)
+                ) if matches!(port.kind(), ProcedurePortKind::Capture { .. })
+                    && port.procedure().semantics().lexical_parent() == Some(capture.id())
+            )
+        })
+        .expect("capture source must bind the exact child-procedure capture port")
+        .clone();
+    let ValueFlowEndpoint::Port(child_capture) = &capture_relation.target else {
+        unreachable!("capture relation target was selected above")
+    };
+    let mut invalid_cross_procedure = capture_relation.clone();
+    invalid_cross_procedure.target = ValueFlowEndpoint::Port(ProcedurePortHandle::normal_return(
+        child_capture.procedure().clone(),
+    ));
+    assert_eq!(
+        ValueFlowSnapshot::new(
+            capture.clone(),
+            OracleCallContext::empty(),
+            vec![invalid_cross_procedure],
+            CandidateCoverage::Open,
+            OracleLimits::default(),
+        ),
+        Err(OracleContractError::CrossProcedure),
+        "only an exact parent capture row may cross into its lexical child"
+    );
+
+    let cancelled = CancellationToken::default();
+    cancelled.cancel();
+    let mut budget = SemanticBudget::default();
+    assert!(matches!(
+        oracle
+            .procedure_relations(
+                &instance,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut budget, &cancelled),
+            )
+            .unwrap(),
+        SemanticOutcome::Cancelled {
+            partial: None,
+            work
+        } if work == Default::default()
+    ));
+
+    let bounded = WorkspaceSemanticOracle::with_limits(analyzer, OracleLimits::uniform(1).unwrap());
+    let mut budget = SemanticBudget::default();
+    let bounded_outcome = bounded
+        .procedure_relations(
+            &instance,
+            &OracleCallContext::empty(),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("bounded snapshot should retain a prefix");
+    assert!(matches!(bounded_outcome, SemanticOutcome::Unproven { .. }));
+    assert_eq!(
+        available(&bounded_outcome).coverage(),
+        CandidateCoverage::Truncated
+    );
+    assert_eq!(available(&bounded_outcome).relations().len(), 1);
+}
+
+fn call_named(
+    graph: &SemanticGraph,
+    source: &str,
+    procedure_name: &str,
+    call_source: &str,
+) -> brokk_bifrost::analyzer::semantic::CallSiteHandle {
+    let procedure = procedure_handle_named(graph, procedure_name, ProcedureKind::Method);
+    let call = procedure
+        .semantics()
+        .call_sites()
+        .iter()
+        .find(|call| mapped_source(procedure.semantics(), source, call.source) == call_source)
+        .unwrap_or_else(|| panic!("missing call {call_source:?} in {procedure_name}"));
+    procedure
+        .call_site_handle(call.id)
+        .expect("selected call must have a scoped handle")
+}
+
+fn dispatch_candidate_named(
+    oracle: &WorkspaceSemanticOracle<'_>,
+    call: &brokk_bifrost::analyzer::semantic::CallSiteHandle,
+    name: &str,
+    budget: &mut SemanticBudget,
+    cancellation: &CancellationToken,
+) -> DispatchCandidate {
+    let dispatch = oracle
+        .resolve_call(call, &mut SemanticRequest::new(budget, cancellation))
+        .expect("fixture dispatch should run");
+    available(&dispatch)
+        .candidates()
+        .iter()
+        .find(|candidate| {
+            candidate
+                .target()
+                .semantics()
+                .locator()
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some(name)
+        })
+        .unwrap_or_else(|| panic!("fixture call must retain the local {name} candidate"))
+        .clone()
+}
+
+fn bindings_for_call(
+    analyzer: &brokk_bifrost::WorkspaceAnalyzer,
+    graph: &SemanticGraph,
+    source: &str,
+    procedure_name: &str,
+    call_source: &str,
+    target_name: &str,
+) -> CallBindings {
+    let oracle = analyzer.semantic_oracle_provider();
+    let call = call_named(graph, source, procedure_name, call_source);
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let candidate =
+        dispatch_candidate_named(&oracle, &call, target_name, &mut budget, &cancellation);
+    let outcome = oracle
+        .call_bindings(
+            &call,
+            &candidate,
+            &OracleCallContext::empty(),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("candidate-specific bindings should materialize");
+    available(&outcome).clone()
+}
+
+fn assert_call_bindings(
+    analyzer: &brokk_bifrost::WorkspaceAnalyzer,
+    graph: &SemanticGraph,
+    source: &str,
+) {
+    let oracle = analyzer.semantic_oracle_provider();
+    let call = call_named(graph, source, "instance", "this.sink(input, made)");
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let candidate = dispatch_candidate_named(&oracle, &call, "sink", &mut budget, &cancellation);
+
+    let cancelled = CancellationToken::default();
+    cancelled.cancel();
+    let mut cancelled_budget = SemanticBudget::default();
+    assert!(matches!(
+        oracle
+            .call_bindings(
+                &call,
+                &candidate,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut cancelled_budget, &cancelled),
+            )
+            .unwrap(),
+        SemanticOutcome::Cancelled {
+            partial: None,
+            work
+        } if work == Default::default()
+    ));
+
+    let mut bounded_budget = SemanticBudget::uniform(1).unwrap();
+    let bounded = oracle
+        .call_bindings(
+            &call,
+            &candidate,
+            &OracleCallContext::empty(),
+            &mut SemanticRequest::new(&mut bounded_budget, &cancellation),
+        )
+        .expect("bounded call binding should retain an explicit partial");
+    assert!(matches!(
+        bounded,
+        SemanticOutcome::ExceededBudget {
+            partial: Some(_),
+            ..
+        }
+    ));
+
+    let bindings = oracle
+        .call_bindings(
+            &call,
+            &candidate,
+            &OracleCallContext::empty(),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("candidate-specific bindings should materialize");
+    let bindings = available(&bindings);
+    assert_eq!(
+        bindings.coverage(),
+        CandidateCoverage::Exhaustive,
+        "caller gaps: {:?}; callee gaps: {:?}",
+        call.procedure().semantics().gaps(),
+        candidate.target().semantics().gaps()
+    );
+    assert!(
+        bindings
+            .bindings()
+            .iter()
+            .any(|binding| matches!(binding, CallBinding::Receiver { .. }))
+    );
+    let groups = bindings
+        .bindings()
+        .iter()
+        .filter_map(|binding| match binding {
+            CallBinding::ArgumentGroup(group) => Some(group),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(groups.len(), 2);
+    assert!(groups.iter().all(|group| {
+        group.coverage() == CandidateCoverage::Exhaustive && group.mappings().len() == 1
+    }));
+    assert!(
+        bindings
+            .bindings()
+            .iter()
+            .any(|binding| matches!(binding, CallBinding::NormalReturn { .. }))
+    );
+    assert!(
+        bindings
+            .bindings()
+            .iter()
+            .any(|binding| matches!(binding, CallBinding::ExceptionalReturn { .. }))
+    );
+}
+
+fn assert_variadic_and_static_receiver_bindings(
+    analyzer: &brokk_bifrost::WorkspaceAnalyzer,
+    graph: &SemanticGraph,
+    source: &str,
+) {
+    let variadic = bindings_for_call(
+        analyzer,
+        graph,
+        source,
+        "variadic",
+        "this.collect(input, input)",
+        "collect",
+    );
+    assert_ne!(variadic.coverage(), CandidateCoverage::Truncated);
+    let groups = variadic
+        .bindings()
+        .iter()
+        .filter_map(|binding| match binding {
+            CallBinding::ArgumentGroup(group) => Some(group),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(groups.len(), 2);
+    let observed_formals = groups
+        .iter()
+        .map(|group| {
+            group.mappings().first().map(|mapping| {
+                let formal = mapping.value().formal();
+                (formal.kind(), formal.formal_multiplicity().cloned())
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        observed_formals.iter().all(|formal| {
+            matches!(
+                formal,
+                Some((
+                    ProcedurePortKind::Parameter { ordinal: 0 },
+                    Some(FormalMultiplicity::Rest(
+                        ArgumentDomain::Positional | ArgumentDomain::PositionalOrKeyword
+                    )),
+                ))
+            )
+        }),
+        "variadic bindings mapped to {observed_formals:?}"
+    );
+
+    let static_call = bindings_for_call(
+        analyzer,
+        graph,
+        source,
+        "staticCall",
+        "consume(input)",
+        "consume",
+    );
+    assert_ne!(static_call.coverage(), CandidateCoverage::Truncated);
+    assert!(
+        static_call
+            .bindings()
+            .iter()
+            .all(|binding| !matches!(binding, CallBinding::Receiver { .. })),
+        "a call to a receiverless target must not manufacture a callee receiver binding"
+    );
+}
+
+fn assert_open_spread_bindings(
+    analyzer: &brokk_bifrost::WorkspaceAnalyzer,
+    graph: &SemanticGraph,
+    source: &str,
+) {
+    let oracle = analyzer.semantic_oracle_provider();
+    let call = call_named(graph, source, "spread", "this.sink(...values)");
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let candidate = dispatch_candidate_named(&oracle, &call, "sink", &mut budget, &cancellation);
+    let outcome = oracle
+        .call_bindings(
+            &call,
+            &candidate,
+            &OracleCallContext::empty(),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .unwrap();
+    assert!(matches!(outcome, SemanticOutcome::Unknown { .. }));
+    let bindings = available(&outcome);
+    assert_eq!(bindings.coverage(), CandidateCoverage::Open);
+    let group = bindings
+        .bindings()
+        .iter()
+        .find_map(|binding| match binding {
+            CallBinding::ArgumentGroup(group) => Some(group),
+            _ => None,
+        })
+        .expect("spread source must remain visible as an argument group");
+    assert_eq!(group.sources(), [0]);
+    assert!(group.mappings().is_empty());
+    assert_eq!(group.coverage(), CandidateCoverage::Open);
+}
+
+fn assert_open_default_bindings(
+    analyzer: &brokk_bifrost::WorkspaceAnalyzer,
+    graph: &SemanticGraph,
+    source: &str,
+) {
+    let bindings = bindings_for_call(
+        analyzer,
+        graph,
+        source,
+        "defaultCall",
+        "this.defaults()",
+        "defaults",
+    );
+    assert_eq!(bindings.coverage(), CandidateCoverage::Open);
+    assert!(
+        bindings
+            .bindings()
+            .iter()
+            .all(|binding| !matches!(binding, CallBinding::ArgumentGroup(_))),
+        "an omitted default must remain an unbound formal until its callee-side value is modeled"
+    );
+}
+
 #[test]
 fn typescript_and_java_publish_expression_backed_call_and_return_facts() {
     const TYPESCRIPT: &str = r#"class Box {}
@@ -521,7 +984,14 @@ class Sample {
         { const input = new Box(); this.sink(1, input); }
         return input;
     }
+    spread(values: Box[]) { this.sink(...values); }
+    collect(...values: Box[]) {}
+    variadic(input: Box) { this.collect(input, input); }
+    defaults(input: Box = new Box()) {}
+    defaultCall() { this.defaults(); }
+    static staticCall(input: Box) { consume(input); return input; }
 }
+function consume(input: Box) {}
 "#;
     const JAVA: &str = r#"class Box {}
 class Sample {
@@ -549,6 +1019,10 @@ class Sample {
         { Object value = new Box(input); this.sink(input, value); }
         { Object value = new Box(input); this.sink(input, value); }
     }
+    void collect(Object... values) {}
+    void variadic(Object input) { this.collect(input, input); }
+    static void consume(Object input) {}
+    static Object staticCall(Object input) { consume(input); return input; }
 }
 "#;
 
@@ -577,6 +1051,14 @@ class Sample {
     assert_branch_ambiguous_local(&java, JAVA);
     assert_typescript_shadowing(&typescript, TYPESCRIPT);
     assert_java_sibling_scopes(&java, JAVA);
+    assert_value_flow_oracle(&analyzer, &typescript);
+    assert_value_flow_oracle(&analyzer, &java);
+    assert_call_bindings(&analyzer, &typescript, TYPESCRIPT);
+    assert_call_bindings(&analyzer, &java, JAVA);
+    assert_variadic_and_static_receiver_bindings(&analyzer, &typescript, TYPESCRIPT);
+    assert_variadic_and_static_receiver_bindings(&analyzer, &java, JAVA);
+    assert_open_spread_bindings(&analyzer, &typescript, TYPESCRIPT);
+    assert_open_default_bindings(&analyzer, &typescript, TYPESCRIPT);
 
     for graph in [&typescript, &java] {
         let factory = procedure_named(graph, "factory", ProcedureKind::Method);

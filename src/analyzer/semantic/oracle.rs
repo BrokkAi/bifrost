@@ -1535,6 +1535,49 @@ impl ValueFlowEndpoint {
     }
 }
 
+fn validate_capture_flow(
+    procedure: &ProcedureHandle,
+    source: &ValueFlowEndpoint,
+    target: &ValueFlowEndpoint,
+) -> Result<(), OracleContractError> {
+    source.validate_at(procedure)?;
+    let ValueFlowEndpoint::Port(target) = target else {
+        return Err(OracleContractError::CrossProcedure);
+    };
+    let ProcedurePortKind::Capture { slot } = target.kind() else {
+        return Err(OracleContractError::CrossProcedure);
+    };
+    let child = target.procedure();
+    if !Arc::ptr_eq(procedure.artifact(), child.artifact())
+        || child.semantics().lexical_parent() != Some(procedure.id())
+    {
+        return Err(OracleContractError::CrossProcedure);
+    }
+
+    let matches_source = |captured: super::ir::CaptureSource| match (captured, source) {
+        (super::ir::CaptureSource::Value(expected), ValueFlowEndpoint::Value(actual)) => {
+            actual.id() == expected
+        }
+        (super::ir::CaptureSource::Location(expected), ValueFlowEndpoint::Location(actual)) => {
+            matches!(
+                actual.object().identity(),
+                AbstractObjectIdentity::LexicalCell(location) if location.id() == expected
+            )
+        }
+        (super::ir::CaptureSource::Value(_), _) | (super::ir::CaptureSource::Location(_), _) => {
+            false
+        }
+    };
+    if !procedure.semantics().captures().iter().any(|capture| {
+        capture.target == child.id()
+            && capture.destination == slot
+            && matches_source(capture.captured)
+    }) {
+        return Err(OracleContractError::InvalidRelationIdentity);
+    }
+    Ok(())
+}
+
 /// One materialized value-flow relation.  Relation IDs provide stable identity
 /// inside this oracle materialization without imposing any weight algebra.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1592,8 +1635,12 @@ impl ValueFlowSnapshot {
             {
                 return Err(OracleContractError::InvalidRelationQuality);
             }
-            relation.source.validate_at(&procedure)?;
-            relation.target.validate_at(&procedure)?;
+            if relation.kind == ValueFlowRelationKind::Capture {
+                validate_capture_flow(&procedure, &relation.source, &relation.target)?;
+            } else {
+                relation.source.validate_at(&procedure)?;
+                relation.target.validate_at(&procedure)?;
+            }
         }
         validate_retained_relation_arenas(relations.iter().map(|relation| &relation.id), limits)?;
         Ok(Self {
