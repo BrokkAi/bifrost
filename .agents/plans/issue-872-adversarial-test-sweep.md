@@ -13,9 +13,9 @@ Bifrost needs tests that catch realistic failures in the analyzer, its persisten
 - [ ] Establish a completed, reproducible focused baseline for the concurrency/cache milestone. Two isolated-Cargo attempts began cold dependency builds but the execution host ended each 30-second capture before Cargo returned a result; do not treat either as a pass or failure. Re-run in a session that can retain the command to completion before editing the test fixture.
 - [ ] Audit and, only with equivalent behavioral evidence, reduce the JS/TS lazy-index deadlock regression's generated fixture cost. The test now asserts its triggering imported-call contract rather than only a broad node count; fixture reduction still requires a completed baseline and pre-fix reproduction.
 - [ ] Audit persistence, reconciliation, and interrupted-state transitions with deterministic low-budget corruption and cancellation probes. Added the first recovery probe: a single corrupted cached Python blob must reparse while its clean peer hydrates, then hydrate normally after repair.
-- [ ] Audit protocol, parser, and boundary inputs: JSON, RQL, Rune, LSP, MCP, CLI, source text, Unicode, CRLF, and paths. The first LSP/MCP review found existing behavior-focused coverage for malformed language input, CRLF/Unicode incremental edits, stale document versions, cancellation, and unknown requests; continue with RQL/Rune/CLI before declaring this milestone complete.
-- [ ] Audit watcher lifecycle, incremental invalidation, cancellation, and stale generations using barriers/channels instead of elapsed-time races.
-- [ ] Audit analyzer ambiguity and structural-query behavior across import, receiver, ordering, and platform boundaries; use `InlineTestProject` for small projects.
+- [x] (2026-07-21 14:20Z) Audited protocol, parser, and boundary inputs: JSON, RQL, Rune, LSP, MCP, CLI, source text, Unicode, CRLF, and paths. Existing query-file service tests already cover malformed RQL/JSON, invalid query shapes, missing/oversized/directory files, traversal, symlink escape, Unicode paths, and portable Windows prefixes. Existing LSP tests cover malformed language input, CRLF/Unicode incremental edits, stale document versions, cancellation, and unknown requests. Added the missing direct Rune handler contracts for backwards selections and empty documents.
+- [ ] Audit watcher lifecycle, incremental invalidation, cancellation, and stale generations using barriers/channels instead of elapsed-time races. Fixed and covered the coalesced source-plus-Git event case: any refresh-fallback path must force a full refresh even when the same event has an incremental source path.
+- [ ] Audit analyzer ambiguity and structural-query behavior across import, receiver, ordering, and platform boundaries; use `InlineTestProject` for small projects. Deferred from the active sweep at user direction.
 - [ ] Review ignored, flaky, duplicate, and implementation-mirroring tests; removed six ignored parity-marker non-tests with empty or unconditional-panic bodies. Continue reviewing the remaining ignored tests, retaining only documented opt-in benchmarks/external-model tests or explicitly justified deferred contracts.
 - [ ] Run the full acceptance matrix and publish the final report in this plan.
 
@@ -41,6 +41,12 @@ Bifrost needs tests that catch realistic failures in the analyzer, its persisten
   Evidence: `src/analyzer/store/mod.rs` has `metadata_unit_count_mismatch_is_treated_as_incomplete`; `tests/analyzer_persistence.rs` had warm and dirty-file reconciliation coverage but no externally corrupted-cache repair scenario.
 - Observation: the initial LSP/MCP boundary audit found mature, behavior-focused coverage for malformed language input, cancellation, CRLF and Unicode incremental edits, stale `didChange` versions, and unknown requests. Adding another test in those shapes would duplicate existing contracts.
   Evidence: `tests/bifrost_lsp_server.rs` covers malformed diagnostics around lines 7156-7520, formatting cancellation around 8941-9030, CRLF/Unicode edits around 9400-9475, stale changes around 9579-9627, and unknown requests at 7662; `src/lsp/handlers/formatting.rs` retains one explicit opt-in integration test.
+- Observation: `ProjectChangeWatcher` only requested a full refresh for fallback paths when no source path appeared in the same event. Filesystem backends may coalesce a `.git/HEAD` change with a source edit, and a ref change invalidates workspace state beyond that source file.
+  Evidence: `src/project_watcher.rs::handle_event` previously gated `mark_full_refresh` on `!saw_relevant_path`; the new unit regression supplies both paths in one `notify::Event`.
+- Observation: the RQL/CLI boundary behavior is already concentrated in behavior-focused tests rather than only parser units; adding another malformed-file test at the CLI shim would duplicate the service contract.
+  Evidence: `tests/searchtools_service.rs::query_code_file_input_reports_validation_and_workspace_errors` covers malformed, invalid, oversized, non-regular, traversal, symlink, and mixed-input failures; `tests/policy_loading_workspace.rs` covers normalized, Unicode, and Windows-like paths; `tests/bifrost_tool_cli.rs` exercises both RQL and JSON one-shot success paths and incompatible modes.
+- Observation: focused test execution again began a clean isolated Cargo build but the host terminated the captured command before Cargo completed.
+  Evidence: `scripts/with-isolated-cargo-target.sh cargo test --features nlp project_watcher::tests --lib` reached dependency compilation only; no test result was emitted.
 - Observation: six ignored parity markers do not exercise code: three Python markers and one Git-hotspot marker panic unconditionally, while two JS/TS markers have empty bodies. They add no executable contract and turn `--ignored` into a knowingly failing/non-informative mode.
   Evidence: `tests/usages_python_graph_test.rs`, `tests/usages_js_ts_graph_test.rs`, and `src/code_quality/git_hotspots.rs` each contained the named ignored marker functions.
 - Observation: three retained stress tests do exercise real behavior but two had only the uninformative reason `stress`, and the 10k-file smoke reason omitted its execution command.
@@ -68,6 +74,12 @@ Bifrost needs tests that catch realistic failures in the analyzer, its persisten
   Date/Author: 2026-07-21 / Codex.
 - Decision: retain the three stress tests, but make their ignore messages describe the generated workload and exact opt-in command.
   Rationale: each test has a distinct behavior assertion and deliberately large fixture. Explicit messages make the skip auditable without running a host-costly workload in ordinary CI.
+  Date/Author: 2026-07-21 / Codex.
+- Decision: treat any coalesced watcher event containing a refresh-fallback path as a full refresh.
+  Rationale: incremental file updates are still collected for diagnostics, but a Git or out-of-project path means the watcher cannot soundly claim the event is limited to those files.
+  Date/Author: 2026-07-21 / Codex.
+- Decision: focus the remaining active sweep on protocol/input boundaries and watcher lifecycle/incremental behavior; defer analyzer ambiguity work.
+  Rationale: this is the requested scope split, keeping the next changes independently reviewable.
   Date/Author: 2026-07-21 / Codex.
 
 ## Context and Orientation

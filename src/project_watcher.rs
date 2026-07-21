@@ -100,7 +100,6 @@ fn handle_event(project: &Arc<dyn Project>, pending: &Arc<Mutex<PendingChanges>>
         return;
     }
 
-    let mut saw_relevant_path = false;
     let mut saw_refresh_fallback_path = false;
     for path in &event.paths {
         match classify_project_path(project.as_ref(), path) {
@@ -109,15 +108,13 @@ fn handle_event(project: &Arc<dyn Project>, pending: &Arc<Mutex<PendingChanges>>
                     .lock()
                     .expect("project watcher pending state poisoned");
                 state.files.insert(project_file);
-                saw_relevant_path = true;
             }
             PathDisposition::IgnoredInternal => {}
             PathDisposition::RefreshFallback => saw_refresh_fallback_path = true,
         }
     }
 
-    if !saw_relevant_path
-        && saw_refresh_fallback_path
+    if saw_refresh_fallback_path
         && matches!(
             event.kind,
             EventKind::Any | EventKind::Other | EventKind::Modify(_) | EventKind::Remove(_)
@@ -318,5 +315,30 @@ mod tests {
         let git_state = git_pending.lock().unwrap();
         assert!(git_state.files.is_empty());
         assert!(git_state.requires_full_refresh);
+    }
+
+    #[test]
+    fn mixed_source_and_git_events_trigger_full_refresh() {
+        let (_temp, project) = project_with_files(&["src/main.rs"]);
+        let source = ProjectFile::new(project.root().to_path_buf(), "src/main.rs");
+        let git_head = project.root().join(".git/HEAD");
+        fs::create_dir_all(git_head.parent().unwrap()).unwrap();
+        fs::write(&git_head, "ref: refs/heads/main\n").unwrap();
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+
+        handle_event(
+            &project,
+            &pending,
+            Event::new(EventKind::Modify(ModifyKind::Any))
+                .add_path(source.abs_path())
+                .add_path(git_head),
+        );
+
+        let state = pending.lock().unwrap();
+        assert!(state.files.contains(&source));
+        assert!(
+            state.requires_full_refresh,
+            "a coalesced Git event can invalidate files beyond the incremental source path"
+        );
     }
 }

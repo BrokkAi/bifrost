@@ -190,4 +190,30 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn requested_range_rejects_backwards_ranges_and_empty_documents() {
+        let source = "fn demo() {}";
+        let starts = compute_line_starts(source);
+        let backwards = requested_byte_range(
+            source,
+            &starts,
+            None,
+            Some(LspRange::new(Position::new(0, 5), Position::new(0, 2))),
+        )
+        .unwrap_err();
+        assert!(
+            backwards.contains("start must not be after its end"),
+            "{backwards}"
+        );
+
+        let empty = requested_byte_range(
+            "",
+            &compute_line_starts(""),
+            Some(Position::new(0, 0)),
+            None,
+        )
+        .unwrap_err();
+        assert!(empty.contains("empty document"), "{empty}");
+    }
 }
