@@ -1084,7 +1084,7 @@ void run(parity::Sink& sink) {
     assert!(
         hits.iter()
             .any(|hit| hit.file == project.file("src/main.cpp")
-                && main_source[hit.start_offset..hit.end_offset] == *"parity::HandlerAlias"),
+                && main_source[hit.start_offset..hit.end_offset] == *"HandlerAlias"),
         "alias-typed declaration site should resolve through the alias: {selected_texts:?}"
     );
 
@@ -6819,6 +6819,8 @@ fn cpp_free_function_usage_ranges_select_only_terminal_identifiers() {
 namespace outer::inner {
 void run();
 template <typename T> T choose(T value);
+struct Handler { explicit Handler(int value); };
+using HandlerAlias = Handler;
 }
 "#,
         )
@@ -6831,6 +6833,7 @@ void consume() {
     ::outer::inner::run();
     auto first = choose<int>(1);
     auto cafe = "é"; auto second = ::outer::inner::choose<int>(2);
+    outer::inner::HandlerAlias handler(1);
 }
 }
 "#,
@@ -6841,6 +6844,7 @@ void consume() {
     let source = consumer.read_to_string().expect("consumer source");
     let run = function_definition(&analyzer, "run");
     let choose = function_definition(&analyzer, "choose");
+    let handler = class_definition(&analyzer, "Handler");
 
     let expected = |lines: &[(&str, &str)]| {
         lines
@@ -6856,6 +6860,8 @@ void consume() {
             "choose",
         ),
     ]);
+    let handler_ranges =
+        expected(&[("    outer::inner::HandlerAlias handler(1);", "HandlerAlias")]);
 
     let ranges = |target: &CodeUnit| {
         let targeted =
@@ -6879,6 +6885,7 @@ void consume() {
         assert_eq!(&source[start..end], "choose");
         assert_eq!(end, start + "choose".len());
     }
+    assert_eq!(ranges(&handler), (handler_ranges.clone(), handler_ranges));
 }
 
 #[test]

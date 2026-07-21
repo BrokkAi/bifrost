@@ -32,13 +32,13 @@ use super::extractor::{
 use super::resolver::{
     DesignatedInitializerOwner, EnclosingMemberOwnerResolution, LexicalCallableValueResolution,
     LexicalTypeResolution, OrdinaryTypeImportCell, TargetKind, VisibilityIndex,
-    VisibleMemberResolution, call_callee_reference_node, constructor_style_local_declaration,
-    cpp_callable_arity, declarator_name_node, designated_initializer_owner, extract_variable_name,
-    first_type_child, function_terminal_node, infer_cpp_initializer_binding,
-    infer_cpp_initializer_type, is_declaration_name, is_declarator_node, is_nested_type_node,
-    normalize_type_text, out_of_line_destructor_type_reference,
-    out_of_line_member_definition_owner, recovered_macro_decorated_declarator_type,
-    resolve_declaring_member_owner, same_visible_symbol,
+    VisibleMemberResolution, constructor_style_local_declaration, cpp_callable_arity,
+    declarator_name_node, designated_initializer_owner, extract_variable_name, first_type_child,
+    function_terminal_node, infer_cpp_initializer_binding, infer_cpp_initializer_type,
+    is_declaration_name, is_declarator_node, is_nested_type_node, normalize_type_text,
+    out_of_line_destructor_type_reference, out_of_line_member_definition_owner,
+    recovered_macro_decorated_declarator_type, resolve_declaring_member_owner, same_visible_symbol,
+    type_reference_hit_node,
 };
 use super::syntax::explicit_qualified_callable_value;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
@@ -247,7 +247,7 @@ fn record_reference(
     }
     match node.kind() {
         "namespace_identifier" if recovered_macro_decorated_declarator_type(node).is_some() => {
-            record_type_reference(node, ctx);
+            record_type_reference(node, ctx, bindings);
         }
         // A type reference (`Foo x`, base class, `new Foo()`'s type child) resolves
         // to the class. `new Foo()` reaches its type via this case (its type child
@@ -320,15 +320,18 @@ fn record_reference(
                     return;
                 }
             }
-            record_type_reference(node, ctx);
+            record_type_reference(node, ctx, bindings);
         }
         "call_expression" => record_call(node, ctx, bindings),
         _ => {}
     }
 }
 
-fn record_type_reference(node: Node<'_>, ctx: &mut CppScan<'_, '_>) {
-    let reference_node = call_callee_reference_node(node);
+fn record_type_reference(
+    node: Node<'_>,
+    ctx: &mut CppScan<'_, '_>,
+    bindings: &LocalInferenceEngine<CodeUnit>,
+) {
     match resolve_type_node_lexically(
         node,
         ctx.analyzer,
@@ -337,9 +340,10 @@ fn record_type_reference(node: Node<'_>, ctx: &mut CppScan<'_, '_>) {
         ctx.file,
         ctx.source,
     ) {
-        LexicalTypeResolution::Resolved { unit, .. } => {
-            ctx.record(unit.fq_name(), reference_node);
-        }
+        LexicalTypeResolution::Resolved { unit, .. } => ctx.record(
+            unit.fq_name(),
+            type_reference_hit_node(node, ctx.file, ctx.source, bindings),
+        ),
         LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => {}
     }
 }

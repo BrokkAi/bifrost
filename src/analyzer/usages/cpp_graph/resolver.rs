@@ -6261,8 +6261,65 @@ pub(super) fn is_call_callee_node(mut node: Node<'_>) -> bool {
     false
 }
 
-pub(super) fn call_callee_reference_node(node: Node<'_>) -> Node<'_> {
+pub(super) fn type_reference_hit_node<'tree, T: Clone + Eq + Hash>(
+    node: Node<'tree>,
+    file: &ProjectFile,
+    source: &str,
+    bindings: &LocalInferenceEngine<T>,
+) -> Node<'tree> {
     if is_call_callee_node(node) {
+        return function_terminal_node(node);
+    }
+    if file.rel_path().extension().is_some_and(|ext| ext == "c") {
+        return node;
+    }
+    let mut current = node;
+    let declaration = loop {
+        let Some(parent) = current.parent() else {
+            return node;
+        };
+        if parent.kind() == "declaration" {
+            break parent;
+        }
+        if matches!(
+            parent.kind(),
+            "compound_statement" | "function_definition" | "lambda_expression"
+        ) {
+            return node;
+        }
+        current = parent;
+    };
+    let Some(_type_node) = declaration.child_by_field_name("type").filter(|type_node| {
+        type_node.start_byte() <= node.start_byte() && node.end_byte() <= type_node.end_byte()
+    }) else {
+        return node;
+    };
+    let mut cursor = declaration.walk();
+    let constructs_object = declaration.named_children(&mut cursor).any(|child| {
+        if child.kind() == "init_declarator" {
+            return child.child_by_field_name("value").is_some()
+                || first_named_child_of_kind(child, "initializer_list").is_some()
+                || first_named_child_of_kind(child, "compound_literal_expression").is_some();
+        }
+        let declarator = if is_declarator_node(child) {
+            Some(child)
+        } else {
+            None
+        };
+        declarator.is_some_and(|declarator| {
+            declarator.kind() == "function_declarator"
+                && has_ancestor_kind(declarator, "compound_statement")
+                && declarator
+                    .child_by_field_name("declarator")
+                    .is_some_and(|name| name.kind() == "identifier")
+                && declarator
+                    .child_by_field_name("parameters")
+                    .is_some_and(|parameters| {
+                        constructor_parameters_look_like_expressions(parameters, source, bindings)
+                    })
+        })
+    });
+    if constructs_object {
         function_terminal_node(node)
     } else {
         node

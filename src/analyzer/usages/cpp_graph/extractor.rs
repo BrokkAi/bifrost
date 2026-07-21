@@ -577,7 +577,10 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         if !direct_temporary_resolves_to_explicit_constructor(call, &unit, ctx) {
             *ctx.raw_match_count += 1;
-            push_type_hit(function_terminal_node(node), ctx);
+            push_type_hit(
+                type_reference_hit_node(node, ctx.file, ctx.source, &ctx.bindings),
+                ctx,
+            );
         }
         return;
     }
@@ -618,7 +621,10 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target)) =>
         {
             *ctx.raw_match_count += 1;
-            push_type_hit(call_callee_reference_node(hit_node), ctx);
+            push_type_hit(
+                type_reference_hit_node(hit_node, ctx.file, ctx.source, &ctx.bindings),
+                ctx,
+            );
             return;
         }
         LexicalTypeResolution::Resolved { .. } => {
@@ -662,7 +668,10 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 )
             {
                 *ctx.raw_match_count += 1;
-                push_unproven_hit(call_callee_reference_node(hit_node), ctx);
+                push_unproven_hit(
+                    type_reference_hit_node(hit_node, ctx.file, ctx.source, &ctx.bindings),
+                    ctx,
+                );
                 return;
             }
         }
@@ -672,7 +681,10 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         .parser_alias_resolves_to_type(ctx.analyzer, ctx.file, text, &ctx.spec.target)
     {
         *ctx.raw_match_count += 1;
-        push_type_hit(call_callee_reference_node(hit_node), ctx);
+        push_type_hit(
+            type_reference_hit_node(hit_node, ctx.file, ctx.source, &ctx.bindings),
+            ctx,
+        );
         return;
     }
     if let Some(scopes) = static_qualifier_type_scopes(node, ctx) {
