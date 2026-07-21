@@ -87,7 +87,8 @@ use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 pub(crate) use rust::{
     AnalyzerRustDefinitionProvider, RustTypeLookupCache,
-    rust_expression_type_definition_fqn_cached, rust_is_type_definition,
+    rust_expression_type_definition_candidates_cached, rust_expression_type_definition_fqn_cached,
+    rust_field_definition_type_candidates_cached, rust_is_type_definition,
     rust_resolve_type_node_fqn,
 };
 use std::sync::{Arc, OnceLock};

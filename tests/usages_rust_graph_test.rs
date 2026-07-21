@@ -1144,6 +1144,142 @@ impl Status {
 }
 
 #[test]
+fn authoritative_rust_field_initializers_are_not_routed_to_same_named_trait_methods() {
+    let source = r#"
+pub trait Link {
+    fn pointers(&self) -> usize;
+}
+
+pub struct Waiter {
+    pub pointers: usize,
+}
+
+impl Link for Waiter {
+    fn pointers(&self) -> usize {
+        self.pointers
+    }
+}
+
+impl Waiter {
+    fn from_self(pointers: usize) -> Self {
+        Self { pointers }
+    }
+}
+
+fn from_explicit(pointers: usize) -> Waiter {
+    Waiter { pointers }
+}
+
+fn call_trait_method(waiter: &impl Link) -> usize {
+    waiter.pointers()
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/model.rs", source)]);
+    let file = project.file("src/model.rs");
+    let target = analyzer
+        .get_definitions("model.Waiter.pointers")
+        .into_iter()
+        .find(|candidate| candidate.is_field() && !analyzer.is_type_alias(candidate))
+        .expect("Waiter.pointers field");
+
+    let hits = authoritative_hits(&analyzer, &target, [file].into_iter().collect());
+    let expected: Vec<_> = ["Self { pointers }", "Waiter { pointers }"]
+        .into_iter()
+        .map(|initializer| {
+            source.find(initializer).expect("field initializer")
+                + initializer.find("pointers").expect("initializer field")
+        })
+        .collect();
+    let trait_call = source
+        .find("waiter.pointers()")
+        .expect("same-named trait method call")
+        + "waiter.".len();
+
+    for start in expected {
+        assert!(
+            hits.iter()
+                .any(|hit| (hit.start_offset, hit.end_offset) == (start, start + "pointers".len())),
+            "explicit-owner and Self initializers must resolve to the struct field: {hits:#?}"
+        );
+    }
+    assert!(
+        hits.iter()
+            .all(|hit| (hit.start_offset, hit.end_offset)
+                != (trait_call, trait_call + "pointers".len())),
+        "same-named trait method calls must not resolve to the struct field: {hits:#?}"
+    );
+}
+
+#[test]
+fn authoritative_rust_enum_variants_are_not_routed_to_same_named_trait_methods() {
+    let source = r#"
+#[allow(non_snake_case)]
+pub trait Transition {
+    fn Ready(&self) -> bool;
+}
+
+pub enum Status {
+    Ready,
+}
+
+#[allow(non_snake_case)]
+impl Transition for Status {
+    fn Ready(&self) -> bool {
+        true
+    }
+}
+
+impl Status {
+    fn from_self() -> Self {
+        Self::Ready
+    }
+}
+
+fn from_explicit() -> Status {
+    Status::Ready
+}
+
+fn call_trait_method(status: &impl Transition) -> bool {
+    status.Ready()
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/model.rs", source)]);
+    let file = project.file("src/model.rs");
+    let target = analyzer
+        .get_definitions("model.Status.Ready")
+        .into_iter()
+        .find(|candidate| candidate.is_field())
+        .expect("Status::Ready variant");
+
+    let hits = authoritative_hits(&analyzer, &target, [file].into_iter().collect());
+    let expected: Vec<_> = ["Self::Ready", "Status::Ready"]
+        .into_iter()
+        .map(|expression| {
+            source.find(expression).expect("variant expression")
+                + expression.find("Ready").expect("variant name")
+        })
+        .collect();
+    let trait_call = source
+        .find("status.Ready()")
+        .expect("same-named trait method call")
+        + "status.".len();
+
+    for start in expected {
+        assert!(
+            hits.iter()
+                .any(|hit| (hit.start_offset, hit.end_offset) == (start, start + "Ready".len())),
+            "explicit-owner and Self variant expressions must preserve enum identity: {hits:#?}"
+        );
+    }
+    assert!(
+        hits.iter()
+            .all(|hit| (hit.start_offset, hit.end_offset)
+                != (trait_call, trait_call + "Ready".len())),
+        "same-named trait method calls must not resolve to the enum variant: {hits:#?}"
+    );
+}
+
+#[test]
 fn authoritative_rust_usage_finds_private_self_associated_method() {
     let (project, analyzer) = rust_analyzer_with_files(&[(
         "src/service.rs",
@@ -4466,6 +4602,46 @@ fn run() {
 }
 
 #[test]
+fn authoritative_rust_usage_resolves_crate_module_paths_in_macro_tokens() {
+    let source = r#"
+pub mod task;
+pub mod other_task;
+
+macro_rules! call_task {
+    () => { $crate::task::spawn(); };
+}
+macro_rules! call_other_task {
+    () => { $crate::other_task::spawn(); };
+}
+"#;
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", source),
+        ("src/task.rs", "pub fn spawn() {}\n"),
+        ("src/other_task.rs", "pub fn spawn() {}\n"),
+    ]);
+    let candidates: HashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+    let target = definition(&analyzer, "task");
+    let hits = authoritative_hits(&analyzer, &target, candidates);
+    let expected_start = source.find("$crate::task").expect("crate task path") + "$crate::".len();
+    let forbidden_start =
+        source.find("$crate::other_task").expect("decoy crate path") + "$crate::".len();
+    let actual: Vec<_> = hits
+        .iter()
+        .filter(|hit| hit.file.rel_path().to_string_lossy() == "src/lib.rs")
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect();
+
+    assert!(
+        actual.contains(&(expected_start, expected_start + "task".len())),
+        "crate-qualified macro module segment must be found: {hits:#?}"
+    );
+    assert!(
+        !actual.contains(&(forbidden_start, forbidden_start + "other_task".len())),
+        "crate-qualified macro module segment must preserve identity: {hits:#?}"
+    );
+}
+
+#[test]
 fn rust_graph_strategy_counts_associated_functions_used_as_values() {
     let (_project, analyzer) = rust_analyzer_with_files(&[(
         "src/lib.rs",
@@ -5104,5 +5280,156 @@ pub use service::{Cache, MemoryRepository};
     assert!(
         hits.is_empty(),
         "other::MemoryRepository.last must not be counted as service::MemoryRepository.last: {hits:?}",
+    );
+}
+
+#[test]
+fn rust_graph_resolves_fields_on_explicitly_typed_same_fqn_local_receivers() {
+    let target_source = r#"
+#[derive(FromArgs)]
+#[argh(description = "proxy")]
+pub struct Args {
+    #[argh(option)] log_format: usize,
+    #[argh(option)] server_addr: usize,
+}
+pub struct OtherArgs { log_format: usize, server_addr: usize }
+
+fn make_args() -> Args { todo!() }
+fn make_other() -> OtherArgs { todo!() }
+fn run() {
+    let args: Args = make_args();
+    let other: OtherArgs = make_other();
+    let _ = args.log_format;
+    let _ = args.server_addr;
+    let _ = other.log_format;
+    let _ = other.server_addr;
+}
+"#;
+    let sibling_source = r#"
+#[derive(FromArgs)]
+pub struct Args {
+    #[argh(option)] log_format: usize,
+    #[argh(option)] server_addr: usize,
+}
+
+fn make_args() -> Args { todo!() }
+fn run() {
+    let args: Args = make_args();
+    let _ = args.log_format;
+    let _ = args.server_addr;
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("examples/examples/proxy.rs", target_source),
+        ("examples/examples/toggle.rs", sibling_source),
+    ]);
+    let target_file = project.file("examples/examples/proxy.rs");
+    let target = analyzer
+        .declarations(&target_file)
+        .into_iter()
+        .find(|unit| unit.is_field() && unit.short_name() == "Args.log_format")
+        .expect("proxy Args.log_format field");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let found = authoritative_hits(&analyzer, &target, candidates);
+    let expected = target_source
+        .find("args.log_format")
+        .map(|start| start + "args.".len())
+        .map(|start| (start, start + "log_format".len()))
+        .expect("typed target receiver field");
+
+    assert!(
+        found.iter().any(|hit| {
+            hit.file == target_file && (hit.start_offset, hit.end_offset) == expected
+        }),
+        "the local physical Args declaration must survive a sibling same-FQN Args: {found:#?}"
+    );
+    assert!(
+        found
+            .iter()
+            .all(|hit| hit.file == target_file && !hit.snippet.contains("other.log_format")),
+        "sibling and explicitly unrelated receiver fields must not cross-match: {found:#?}"
+    );
+}
+
+#[test]
+fn rust_graph_proves_field_through_self_field_receiver_chain() {
+    let source = r#"
+pub struct BlockHeader { pub start_index: usize }
+pub struct Block { pub header: BlockHeader }
+pub struct OtherHeader { pub start_index: usize }
+pub struct OtherBlock { pub header: OtherHeader }
+
+impl Block {
+    fn next(&self) -> usize { self.header.start_index.wrapping_add(1) }
+}
+impl OtherBlock {
+    fn next(&self) -> usize { self.header.start_index.wrapping_add(1) }
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("tokio/src/block.rs", source)]);
+    let file = project.file("tokio/src/block.rs");
+    let target = analyzer
+        .declarations(&file)
+        .into_iter()
+        .find(|unit| unit.is_field() && unit.short_name() == "BlockHeader.start_index")
+        .expect("BlockHeader.start_index field");
+    let found = authoritative_hits(&analyzer, &target, [file].into_iter().collect());
+    let expected = source
+        .find("self.header.start_index")
+        .map(|start| start + "self.header.".len())
+        .map(|start| (start, start + "start_index".len()))
+        .expect("self field receiver chain");
+
+    assert_eq!(
+        1,
+        found.len(),
+        "only the BlockHeader field may match: {found:#?}"
+    );
+    let hit = found.iter().next().expect("the BlockHeader field hit");
+    assert_eq!(
+        expected,
+        (hit.start_offset, hit.end_offset),
+        "self.header must prove the terminal field owner"
+    );
+}
+
+#[test]
+fn rust_graph_resolves_dotted_member_chains_inside_macro_token_trees() {
+    let source = r#"
+pub struct AlertType;
+impl AlertType { pub fn default_title(&self) -> &'static str { "Alert" } }
+pub struct OtherAlertType;
+impl OtherAlertType { pub fn default_title(&self) -> &'static str { "Other" } }
+pub struct NodeAlert { pub alert_type: AlertType }
+pub struct OtherAlert { pub alert_type: OtherAlertType }
+
+fn render(output: &mut String, alert: &NodeAlert, other: &OtherAlert) {
+    write!(output, "{}", alert.alert_type.default_title());
+    write!(output, "{}", other.alert_type.default_title());
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let target = definition(&analyzer, "AlertType.default_title");
+    let found = authoritative_hits(
+        &analyzer,
+        &target,
+        [project.file("src/lib.rs")].into_iter().collect(),
+    );
+    let expected = source
+        .find("alert.alert_type.default_title")
+        .map(|start| start + "alert.alert_type.".len())
+        .map(|start| (start, start + "default_title".len()))
+        .expect("macro token-tree member chain");
+
+    assert_eq!(
+        1,
+        found.len(),
+        "the unrelated macro chain must not match: {found:#?}"
+    );
+    let hit = found.iter().next().expect("the AlertType method hit");
+    assert_eq!(
+        expected,
+        (hit.start_offset, hit.end_offset),
+        "the token-tree receiver chain must retain its intermediate field type"
     );
 }

@@ -41,10 +41,6 @@ pub struct RustReferenceContext {
 }
 
 impl RustReferenceContext {
-    pub(crate) fn package_name(&self) -> &str {
-        &self.package
-    }
-
     /// The callee fqn a bare `name` refers to: a named import, a same-file item,
     /// or a free function imported via `use path::func;` (the binder classifies
     /// the latter as a namespace whose resolved value is the function's own fqn).

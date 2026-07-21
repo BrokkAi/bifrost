@@ -63,6 +63,10 @@ pub struct RustAnalyzer {
 crate::analyzer::impl_forward_query_provider!(RustAnalyzer);
 
 impl RustAnalyzer {
+    pub(crate) fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        self.inner.structural_parent_of(code_unit)
+    }
+
     pub(crate) fn prepared_syntax(
         &self,
         file: &ProjectFile,
