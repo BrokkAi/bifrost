@@ -4,27 +4,35 @@ use crate::analyzer::usages::cpp_graph::extractor::{EnclosingContext, ScanCtx};
 use crate::analyzer::usages::cpp_graph::resolver::{
     TargetKind, precise_parent_of, same_logical_symbol, visible_owner_from_member_name,
 };
-use crate::analyzer::usages::model::UsageHitSurface;
+use crate::analyzer::usages::model::{UsageHitKind, UsageHitSurface};
 use crate::text_utils::{find_line_index_for_offset, snippet_around_line};
 use tree_sitter::Node;
 
 pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    push_hit_with_options(node, ctx, false, false, false);
+    push_hit_with_options(node, ctx, false, UsageHitKind::Reference, false);
 }
 
 pub(super) fn push_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    push_hit_with_options(node, ctx, false, false, true);
+    push_hit_with_options(node, ctx, false, UsageHitKind::Reference, true);
 }
 
 pub(super) fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    push_hit_with_options(node, ctx, false, true, false);
+    push_hit_with_options(node, ctx, false, UsageHitKind::SelfReceiver, false);
 }
 
 pub(super) fn push_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    push_hit_with_options(node, ctx, true, false, false);
+    push_hit_with_options(node, ctx, true, UsageHitKind::Definition, false);
 }
 
 pub(super) fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    push_unproven_hit_with_kind(node, ctx, UsageHitKind::Reference);
+}
+
+pub(super) fn push_unproven_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    push_unproven_hit_with_kind(node, ctx, UsageHitKind::Definition);
+}
+
+fn push_unproven_hit_with_kind(node: Node<'_>, ctx: &mut ScanCtx<'_>, kind: UsageHitKind) {
     if is_inside_target_declaration(node, ctx) || is_member_field_own_declarator(node, ctx) {
         return;
     }
@@ -40,24 +48,32 @@ pub(super) fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if enclosing == ctx.spec.target || same_logical_symbol(&enclosing, &ctx.spec.target) {
         return;
     }
-    ctx.unproven_hits.insert(
-        usage_hit(
-            ctx.file,
-            line_idx,
-            start,
-            end,
-            enclosing,
-            snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
-        )
-        .into_unproven(),
+    let hit = usage_hit(
+        ctx.file,
+        line_idx,
+        start,
+        end,
+        enclosing,
+        snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
     );
+    let hit = match kind {
+        UsageHitKind::Reference => hit,
+        UsageHitKind::Definition => hit.into_definition(),
+        UsageHitKind::Import
+        | UsageHitKind::Reexport
+        | UsageHitKind::SelfReceiver
+        | UsageHitKind::OverrideDeclaration => {
+            unreachable!("unsupported unproven C++ hit emission kind: {kind:?}")
+        }
+    };
+    ctx.unproven_hits.insert(hit.into_unproven());
 }
 
 fn push_hit_with_options(
     node: Node<'_>,
     ctx: &mut ScanCtx<'_>,
     allow_logical_target_enclosing: bool,
-    self_receiver: bool,
+    kind: UsageHitKind,
     allow_inside_target_declaration: bool,
 ) {
     if *ctx.limit_exceeded {
@@ -90,12 +106,16 @@ fn push_hit_with_options(
         enclosing,
         snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
     );
-    ctx.hits.insert(if self_receiver {
-        hit.into_self_receiver()
-    } else {
-        hit
-    });
-    if !self_receiver
+    let hit = match kind {
+        UsageHitKind::Reference => hit,
+        UsageHitKind::SelfReceiver => hit.into_self_receiver(),
+        UsageHitKind::Definition => hit.into_definition(),
+        UsageHitKind::Import | UsageHitKind::Reexport | UsageHitKind::OverrideDeclaration => {
+            unreachable!("unsupported C++ hit emission kind: {kind:?}")
+        }
+    };
+    ctx.hits.insert(hit);
+    if kind.included_in(UsageHitSurface::ExternalUsages)
         && ctx
             .hits
             .iter()

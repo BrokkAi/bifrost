@@ -14,7 +14,7 @@ use common::lsp_client::LspServer;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-fn references(files: &[(&str, &str)]) -> Vec<(String, u64)> {
+fn references(files: &[(&str, &str)], include_declaration: bool) -> Vec<(String, u64)> {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
 
@@ -35,7 +35,7 @@ fn references(files: &[(&str, &str)]) -> Vec<(String, u64)> {
     let (caret_file, line, character) = caret.expect("one fixture file must contain <caret>");
 
     let mut server = LspServer::start(&root);
-    let locations = server.references(&caret_file, line, character, false);
+    let locations = server.references(&caret_file, line, character, include_declaration);
     server.shutdown();
 
     let mut out: Vec<(String, u64)> = locations
@@ -51,12 +51,41 @@ fn references(files: &[(&str, &str)]) -> Vec<(String, u64)> {
 }
 
 fn assert_refs(files: &[(&str, &str)], expected: &[(&str, u64)]) {
-    let got = references(files);
+    let got = references(files, false);
     let expected: Vec<(String, u64)> = expected
         .iter()
         .map(|(n, l)| ((*n).to_string(), *l))
         .collect();
     assert_eq!(expected, got, "reference set mismatch");
+}
+
+#[test]
+fn clangd_refs_header_declaration_keeps_definition_editor_only() {
+    let files = [
+        ("api.h", "int foo<caret>(int value);\n"),
+        (
+            "api.cpp",
+            "#include \"api.h\"\nint foo(int value) { return value; }\n",
+        ),
+        (
+            "main.cpp",
+            "#include \"api.h\"\nint main() { return foo(1); }\n",
+        ),
+    ];
+
+    assert_eq!(
+        references(&files, false),
+        vec![("api.cpp".to_string(), 1), ("main.cpp".to_string(), 1)]
+    );
+    assert_eq!(
+        references(&files, true),
+        vec![
+            ("api.cpp".to_string(), 1),
+            ("api.h".to_string(), 0),
+            ("main.cpp".to_string(), 1),
+        ],
+        "includeDeclaration should add the header once without duplicating the body"
+    );
 }
 
 // clangd FindReferences.WithinAST "Field": a field is referenced by a member

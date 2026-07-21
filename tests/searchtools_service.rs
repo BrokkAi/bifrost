@@ -4709,6 +4709,120 @@ void entry(Target target) {
 }
 
 #[test]
+fn scan_usages_cpp_excludes_out_of_line_definitions_from_external_hits() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "include/service.h",
+            r#"#pragma once
+namespace example {
+int compute(int value);
+struct Service {
+    int run(int value);
+};
+}
+"#,
+        )
+        .file(
+            "src/service.cpp",
+            r#"#include "service.h"
+namespace example {
+int compute(int value) { return value + 1; }
+int Service::run(int value) { return compute(value); }
+}
+"#,
+        )
+        .file(
+            "src/main.cpp",
+            r#"#include "service.h"
+int use(example::Service& service) {
+    return service.run(example::compute(1));
+}
+"#,
+        )
+        .file(
+            "src/unresolved.cpp",
+            "int Service::run(int value) { return value; }\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    for (target, expected_total, definition_line, expected_column, token_len) in [
+        (
+            r#"{"path":"include/service.h","line":3,"column":5,"symbol":"example.compute"}"#,
+            2,
+            3,
+            33,
+            7,
+        ),
+        (
+            r#"{"path":"include/service.h","line":5,"column":9,"symbol":"example.Service.run"}"#,
+            1,
+            4,
+            20,
+            3,
+        ),
+    ] {
+        let payload = service
+            .call_tool_json(
+                "scan_usages_by_location",
+                &format!(r#"{{"targets":[{target}],"include_tests":true}}"#),
+            )
+            .expect("C++ location scan succeeds");
+        let value: Value = serde_json::from_str(&payload).expect("valid response");
+        let result = only_result(&value);
+
+        assert_eq!("found", result["status"], "payload: {value}");
+        assert_eq!(expected_total, result["total_hits"], "payload: {value}");
+        assert_eq!(1, result["definition_sites_excluded"], "payload: {value}");
+        assert_eq!("src/main.cpp", result["files"][0]["path"], "{value}");
+        assert_eq!(3, result["files"][0]["hits"][0]["line"], "{value}");
+        assert_eq!(
+            expected_column, result["files"][0]["hits"][0]["column"],
+            "{value}"
+        );
+        assert_eq!(
+            expected_column + token_len,
+            result["files"][0]["hits"][0]["end_column"],
+            "{value}"
+        );
+        assert!(
+            result["files"]
+                .as_array()
+                .expect("files")
+                .iter()
+                .all(|file| file["path"] != "src/service.cpp"
+                    || file["hits"]
+                        .as_array()
+                        .expect("hits")
+                        .iter()
+                        .all(|hit| hit["line"] != definition_line)),
+            "out-of-line definition leaked into external usages: {value}"
+        );
+    }
+
+    let unresolved_payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"include/service.h","line":5,"column":9,"symbol":"example.Service.run"}],"paths":["src/unresolved.cpp"],"include_tests":true}"#,
+        )
+        .expect("path-scoped unresolved definition scan succeeds");
+    let unresolved_value: Value =
+        serde_json::from_str(&unresolved_payload).expect("valid response");
+    let unresolved = only_result(&unresolved_value);
+    assert_eq!(0, unresolved["total_hits"], "{unresolved_value}");
+    assert_eq!(0, unresolved["unproven_hits"], "{unresolved_value}");
+    assert_eq!(
+        1, unresolved["definition_sites_excluded"],
+        "{unresolved_value}"
+    );
+    assert!(
+        unresolved["files"].as_array().is_none_or(Vec::is_empty),
+        "unresolved definition must not render as a usage row: {unresolved_value}"
+    );
+}
+
+#[test]
 fn scan_usages_cpp_macro_failure_is_actionable_and_hides_strategy_details() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file("defs.h", "#define TEST_DECLARE(name) int name\n")
