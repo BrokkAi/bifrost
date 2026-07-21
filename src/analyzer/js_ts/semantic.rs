@@ -11,10 +11,10 @@ use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapte
 use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::{Language, ProjectFile, Range};
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 
-const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v3";
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v4";
+const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v4";
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v5";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {
@@ -118,19 +118,19 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
             }
         };
         for index in 0..specs.len() {
-            let can_capture_receiver = specs[index]
+            let parent = specs[index]
                 .lexical_parent
-                .and_then(|parent| specs.get(parent.index()))
-                .is_some_and(|parent| {
-                    parent.captures_receiver
-                        || (!parent.properties.is_static
-                            && matches!(
-                                parent.kind,
-                                ProcedureKind::Method
-                                    | ProcedureKind::Constructor
-                                    | ProcedureKind::Function
-                            ))
-                });
+                .and_then(|parent| specs.get(parent.index()));
+            let can_capture_receiver = parent.is_some_and(|parent| {
+                parent.captures_receiver
+                    || (!parent.properties.is_static
+                        && matches!(
+                            parent.kind,
+                            ProcedureKind::Method
+                                | ProcedureKind::Constructor
+                                | ProcedureKind::Function
+                        ))
+            });
             specs[index].captures_receiver &= can_capture_receiver;
         }
         if cancellation.is_cancelled() {
@@ -151,19 +151,25 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
                 )
             })
             .collect::<HashMap<_, _>>();
+        let mut bound_capture_targets = HashSet::default();
         lower_procedure_batch(
             &specs,
             SemanticWork::default(),
             budget,
             cancellation,
             |spec, staged_budget, cancellation| {
-                lower_procedure(
+                let capture_binding_expected = bound_capture_targets.contains(&spec.id);
+                let lowered = lower_procedure(
                     prepared,
                     spec,
                     &procedure_targets,
+                    capture_binding_expected,
                     staged_budget,
                     cancellation,
-                )
+                )?;
+                bound_capture_targets
+                    .extend(lowered.0.captures.iter().map(|capture| capture.target));
+                Ok(lowered)
             },
         )
     }
@@ -211,7 +217,6 @@ fn js_ts_capabilities() -> SemanticCapabilities {
     builder.build()
 }
 
-#[derive(Clone)]
 struct ProcedureSpec<'tree> {
     id: ProcedureId,
     body: Node<'tree>,
@@ -718,6 +723,7 @@ fn lower_procedure<'tree, 'targets>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
     procedure_targets: &'targets HashMap<usize, NestedProcedureTarget>,
+    capture_binding_expected: bool,
     budget: &SemanticBudget,
     cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), TsLoweringError> {
@@ -757,7 +763,7 @@ fn lower_procedure<'tree, 'targets>(
         spec.kind,
         spec.properties,
     )?;
-    context.emit_captured_receiver(&mut builder, entry, spec)?;
+    context.emit_captured_receiver(&mut builder, entry, spec, capture_binding_expected)?;
     context.emit_local_bindings(&mut builder, spec.body)?;
     if spec.properties.is_generator {
         context.add_gap(
@@ -881,6 +887,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         entry: ProgramPointId,
         spec: &ProcedureSpec<'tree>,
+        capture_binding_expected: bool,
     ) -> Result<(), TsLoweringError> {
         let Some(lexical_parent) = spec.lexical_parent.filter(|_| spec.captures_receiver) else {
             return Ok(());
@@ -894,6 +901,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             entry,
             MemoryLocationKind::Capture { lexical_parent },
         )?;
+        if !capture_binding_expected {
+            self.add_gap(
+                builder,
+                entry,
+                SemanticGapSubject::MemoryLocation(location),
+                SemanticCapability::Captures,
+                SemanticGapKind::Unsupported,
+                "lexical receiver capture source is not represented by the parent procedure",
+            )?;
+        }
         self.append_effect(
             builder,
             entry,

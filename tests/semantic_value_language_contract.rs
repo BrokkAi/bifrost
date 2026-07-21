@@ -9,10 +9,10 @@ use brokk_bifrost::analyzer::semantic::{
     FormalMultiplicity, HeapOracle, IndexSelector, MemoryAccessKind, MemoryLocationKind,
     MemoryStoreHandle, ObjectCardinality, ObservationPhase, OracleCallContext, OracleContractError,
     OracleLimits, ProcedureHandle, ProcedureKind, ProcedurePortHandle, ProcedurePortKind,
-    ProcedureSemantics, ScopedSemanticLocator, SemanticBudget, SemanticEffect, SemanticOutcome,
-    SemanticRequest, SemanticValueKind, StoreAtPoint, UpdateEligibility, ValueAtPoint,
-    ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle, ValueFlowRelationKind, ValueFlowSnapshot,
-    WeakUpdateReason, WorkspaceSemanticOracle,
+    ProcedureSemantics, ScopedSemanticLocator, SemanticBudget, SemanticCapability, SemanticEffect,
+    SemanticGapSubject, SemanticOutcome, SemanticRequest, SemanticValueKind, StoreAtPoint,
+    UpdateEligibility, ValueAtPoint, ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle,
+    ValueFlowRelationKind, ValueFlowSnapshot, WeakUpdateReason, WorkspaceSemanticOracle,
 };
 
 use common::{InlineTestProject, semantic_graph::SemanticGraph};
@@ -367,6 +367,13 @@ fn assert_receiver_capture(graph: &SemanticGraph) {
         child.memory_location(capture.destination).unwrap().kind,
         MemoryLocationKind::Capture { lexical_parent } if lexical_parent == parent.id()
     ));
+    assert!(
+        !child.gaps().iter().any(|gap| {
+            gap.subject == SemanticGapSubject::MemoryLocation(capture.destination)
+                && gap.capability == SemanticCapability::Captures
+        }),
+        "an emitted parent binding must keep the child capture exact"
+    );
     assert!(
         child
             .points()
@@ -1673,6 +1680,7 @@ class Sample {
     writeField(box: Box, replacement: Box) { box.value = replacement; }
     static staticCall(input: Box) { consume(input); return input; }
 }
+
 function consume(input: Box) {}
 "#;
     const JAVA: &str = r#"class Box {}
@@ -1793,4 +1801,63 @@ class Sample {
             "parameter reads must flow from the formal port"
         );
     }
+}
+
+#[test]
+fn logical_assignment_arrow_without_parent_binding_retains_an_explicit_capture_gap() {
+    let project = InlineTestProject::new()
+        .file(
+            "event.ts",
+            "class Event { private listener?: () => void; get event() { this.listener ??= () => this.fire(); return this.listener; } fire() {} }\n",
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "event.ts");
+    let lambda = graph
+        .artifact()
+        .procedures()
+        .iter()
+        .find(|procedure| procedure.kind() == ProcedureKind::Lambda)
+        .expect("logical-assignment arrow procedure");
+    let capture = lambda
+        .memory_locations()
+        .iter()
+        .find(|location| matches!(location.kind, MemoryLocationKind::Capture { .. }))
+        .expect("lexical receiver capture slot");
+    assert!(lambda.gaps().iter().any(|gap| {
+        gap.subject == SemanticGapSubject::MemoryLocation(capture.id)
+            && gap.capability == SemanticCapability::Captures
+    }));
+}
+
+#[test]
+fn parameter_assignment_projects_the_parameter_port_as_the_flow_target() {
+    let project = InlineTestProject::new()
+        .file(
+            "parameter.ts",
+            "function overwrite(input: number) { input = 1; return input; }\n",
+        )
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+    let graph = SemanticGraph::materialize(&project, &analyzer, "parameter.ts");
+    let procedure = procedure_handle_named(&graph, "overwrite", ProcedureKind::Function);
+    let oracle = analyzer.semantic_oracle_provider();
+    let cancellation = CancellationToken::default();
+    let mut budget = SemanticBudget::default();
+    let outcome = oracle
+        .procedure_relations(
+            &procedure,
+            &OracleCallContext::empty(),
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("parameter assignment value-flow projection");
+    let snapshot = available(&outcome);
+    assert!(snapshot.relations().iter().any(|relation| matches!(
+        (&relation.kind, &relation.source, &relation.target),
+        (
+            ValueFlowRelationKind::Parameter,
+            ValueFlowEndpoint::Value(_),
+            ValueFlowEndpoint::Port(port),
+        ) if port.kind() == ProcedurePortKind::Parameter { ordinal: 0 }
+    )));
 }

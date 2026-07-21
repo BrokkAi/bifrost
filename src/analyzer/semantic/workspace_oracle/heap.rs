@@ -14,9 +14,9 @@ use crate::analyzer::semantic::{
     EvidenceHandle, HeapOracle, LocationResult, ObjectCardinality, ObservationPhase,
     OracleCandidate, OracleContractError, OracleRelationArena, OracleRelationId,
     OracleRelationKind, OracleRelationOwner, OracleRelationRecord, OracleSet, PointsToResult,
-    ProcedureHandle, ProcedurePortHandle, ProofStatus, SemanticEffect, SemanticGapImpact,
-    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind, SemanticWork,
-    StoreAtPoint, StrongUpdateEvidence, UpdateEligibility, ValueAtPoint, ValueHandle,
+    ProcedureHandle, ProcedurePortHandle, ProofStatus, SemanticCapability, SemanticEffect,
+    SemanticGapImpact, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValueKind,
+    SemanticWork, StoreAtPoint, StrongUpdateEvidence, UpdateEligibility, ValueAtPoint, ValueHandle,
     WeakUpdateReason,
 };
 use crate::hash::HashSet;
@@ -295,6 +295,42 @@ fn gap_opens_heap(
     Ok(open)
 }
 
+fn points_to_capabilities_are_open(procedure: &ProcedureHandle) -> bool {
+    let capabilities = procedure.artifact().capabilities();
+    [
+        SemanticCapability::Values,
+        SemanticCapability::Assignments,
+        SemanticCapability::Allocations,
+        SemanticCapability::LocalFlow,
+        SemanticCapability::ParameterFlow,
+        SemanticCapability::ReceiverFlow,
+        SemanticCapability::ReturnFlow,
+        SemanticCapability::Captures,
+    ]
+    .into_iter()
+    .any(|capability| !capabilities.is_available(capability))
+}
+
+fn location_capabilities_are_open(access: &AccessPathAtPoint) -> bool {
+    let procedure = access.point().procedure();
+    let capabilities = procedure.artifact().capabilities();
+    points_to_capabilities_are_open(procedure)
+        || matches!(access.path().root(), AccessPathRoot::Static(_))
+            && !capabilities.is_available(SemanticCapability::StaticMemory)
+        || access
+            .path()
+            .selectors()
+            .iter()
+            .any(|selector| match selector {
+                crate::analyzer::semantic::AccessSelector::Field(_) => {
+                    !capabilities.is_available(SemanticCapability::FieldMemory)
+                }
+                crate::analyzer::semantic::AccessSelector::Index(_) => {
+                    !capabilities.is_available(SemanticCapability::IndexMemory)
+                }
+            })
+}
+
 fn allocation_is_cyclic(
     procedure: &ProcedureHandle,
     point: crate::analyzer::semantic::ProgramPointId,
@@ -444,8 +480,9 @@ fn resolve_objects(
             ..SemanticWork::default()
         })
         .map_err(InterruptionOrProvider::Interruption)?;
-    let mut open = gap_opens_heap(procedure, staged, cancellation)
+    let gaps_open = gap_opens_heap(procedure, staged, cancellation)
         .map_err(InterruptionOrProvider::Interruption)?;
+    let mut open = points_to_capabilities_are_open(procedure) || gaps_open;
     open |= query.context().was_truncated();
     let point_row = procedure
         .semantics()
@@ -827,9 +864,10 @@ fn resolve_locations(
                 ..SemanticWork::default()
             })
             .map_err(InterruptionOrProvider::Interruption)?;
-        let open = gap_opens_heap(procedure, staged, cancellation)
-            .map_err(InterruptionOrProvider::Interruption)?
-            || query.context().was_truncated();
+        let gaps_open = gap_opens_heap(procedure, staged, cancellation)
+            .map_err(InterruptionOrProvider::Interruption)?;
+        let open =
+            location_capabilities_are_open(query) || gaps_open || query.context().was_truncated();
         let evidence = root_evidence(procedure, query.path().root())
             .map_err(InterruptionOrProvider::Provider)?;
         let mut quality = evidence_quality(&evidence);

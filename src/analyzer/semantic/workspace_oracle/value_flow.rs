@@ -92,6 +92,25 @@ struct FlowRelationDraft {
     evidence: Vec<EvidenceHandle>,
 }
 
+fn value_flow_capabilities_are_open(procedure: &ProcedureHandle) -> bool {
+    let capabilities = procedure.artifact().capabilities();
+    [
+        SemanticCapability::Values,
+        SemanticCapability::Assignments,
+        SemanticCapability::Allocations,
+        SemanticCapability::LocalFlow,
+        SemanticCapability::ParameterFlow,
+        SemanticCapability::ReceiverFlow,
+        SemanticCapability::ReturnFlow,
+        SemanticCapability::FieldMemory,
+        SemanticCapability::StaticMemory,
+        SemanticCapability::IndexMemory,
+        SemanticCapability::Captures,
+    ]
+    .into_iter()
+    .any(|capability| !capabilities.is_available(capability))
+}
+
 fn internal_contract(context: &str, error: OracleContractError) -> SemanticProviderError {
     SemanticProviderError::internal(format!("{context}: {error}"))
 }
@@ -642,7 +661,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
         }
         let mut interrupted = None;
 
-        let mut open = false;
+        let mut open = value_flow_capabilities_are_open(procedure);
         let mut gap_quality = None;
         if interrupted.is_none() {
             for gap in procedure.semantics().gaps() {
@@ -821,22 +840,38 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                         let source_row = procedure.semantics().value(*source).ok_or_else(|| {
                             SemanticProviderError::internal("parameter flow has a stale source")
                         })?;
-                        let SemanticValueKind::Parameter { ordinal, .. } = source_row.kind else {
-                            return Err(SemanticProviderError::internal(
-                                "parameter flow source is not a parameter",
-                            ));
-                        };
-                        (
-                            ValueFlowRelationKind::Parameter,
-                            ValueFlowEndpoint::Port(
-                                ProcedurePortHandle::parameter(procedure.clone(), ordinal)
-                                    .map_err(|error| {
-                                        internal_contract("invalid parameter port", error)
-                                    })?,
+                        let target_row = procedure.semantics().value(*target).ok_or_else(|| {
+                            SemanticProviderError::internal("parameter flow has a stale target")
+                        })?;
+                        match (&source_row.kind, &target_row.kind) {
+                            (SemanticValueKind::Parameter { ordinal, .. }, _) => (
+                                ValueFlowRelationKind::Parameter,
+                                ValueFlowEndpoint::Port(
+                                    ProcedurePortHandle::parameter(procedure.clone(), *ordinal)
+                                        .map_err(|error| {
+                                            internal_contract("invalid parameter port", error)
+                                        })?,
+                                ),
+                                ValueFlowEndpoint::Value(value_handle(procedure, *target)?),
+                                false,
                             ),
-                            ValueFlowEndpoint::Value(value_handle(procedure, *target)?),
-                            false,
-                        )
+                            (_, SemanticValueKind::Parameter { ordinal, .. }) => (
+                                ValueFlowRelationKind::Parameter,
+                                ValueFlowEndpoint::Value(value_handle(procedure, *source)?),
+                                ValueFlowEndpoint::Port(
+                                    ProcedurePortHandle::parameter(procedure.clone(), *ordinal)
+                                        .map_err(|error| {
+                                            internal_contract("invalid parameter port", error)
+                                        })?,
+                                ),
+                                false,
+                            ),
+                            _ => {
+                                return Err(SemanticProviderError::internal(
+                                    "parameter flow has no parameter endpoint",
+                                ));
+                            }
+                        }
                     }
                     SemanticEffect::ValueFlow {
                         kind: ValueFlowKind::Receiver,
