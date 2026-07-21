@@ -3908,7 +3908,7 @@ mod tests {
         );
         context.begin();
 
-        let response = finish_cancellable_request::<serde_json::Value>(
+        let response = finish_cancellable_request::<serde_json::Value, CancellableWorkerError>(
             &RequestId::from(9),
             References::METHOD,
             &context,
@@ -3952,7 +3952,7 @@ mod tests {
             &cancellation,
             "query request cancelled by client",
             "Query ready",
-            || Ok(json!({ "results": ["partial"] })),
+            || Ok::<_, CancellableWorkerError>(json!({ "results": ["partial"] })),
         );
 
         assert!(response.result.is_none());

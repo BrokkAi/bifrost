@@ -36,6 +36,9 @@ The behavior is visible by opening a workspace policy, changing it without savin
 - Observation: A detailed generated helmet/document concept lost its silhouette at Explorer sizes.
   Evidence: The simplified SVG keeps the red horned helmet as the dominant shape and the document as a low-detail secondary outline; direct 16- and 24-pixel renders remain recognizable on both theme backgrounds.
 
+- Observation: The shell resolved Homebrew's `clippy-driver` ahead of the repository-pinned rustup toolchain, producing incompatible compiler metadata despite matching version labels.
+  Evidence: Reordering `PATH` to put `/Users/dave/.cargo/bin` first aligned Cargo, rustc, and clippy; the strict all-targets/all-features gate then reached source diagnostics and passed after correcting two test-only generic annotations.
+
 ## Decision Log
 
 - Decision: Reuse the canonical `PolicyReportDocument` wire shape rather than defining a flattened editor-only report.
@@ -143,3 +146,5 @@ Revision note (2026-07-21 18:45Z): Marked Milestone 2 complete after adding the 
 Revision note (2026-07-21 18:57Z): Marked Milestone 3 complete after adding typed canonical report handling, the dedicated policy-results tree, exact finding navigation, stale lifecycle wiring, manifest contributions, and passing the full VS Code test pipeline.
 
 Revision note (2026-07-21 19:00Z): Marked Milestone 4 complete after replacing the generic icon with separate light/dark Brokk-helmet assets and visually inspecting Explorer-size renders.
+
+Revision note (2026-07-21 19:05Z): Recorded the pinned-toolchain clippy invocation and its clean result after fixing generic annotations in the cancellable-worker unit tests.
