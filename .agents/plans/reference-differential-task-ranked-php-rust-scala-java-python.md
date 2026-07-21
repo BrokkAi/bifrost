@@ -26,6 +26,7 @@ The observable result is twenty-five clean completed repository records, five pe
 - [x] (2026-07-21 08:30-05:00) Integrated and independently reviewed the Rust structured-resolution repairs through `13dda48d`, covering re-exported/private associated calls, exact scoped types, module routing, receiver identity, and candidate authority. Follow-up `22c3a6b9` replaced a per-reference workspace declaration scan with an exact hash lookup. The two focused Rust usage suites pass 21 and 157 tests; publication and the authoritative final Rust corpus remain pending.
 - [x] (2026-07-21 10:15-05:00) Merged the detached structured Scala lineage as `5e57b0e2`, applied its preserved exact hierarchy/callable tail as `6c934486`, and committed review corrections in `6ec3736f`. Full definition lookup (566), Scala hierarchy (21), precedence (43), parameterized enum (7), forward usage graph (55), inverse usage graph (139), cache DB (25), and analyzer store (47) selections pass.
 - [x] (2026-07-21 11:02-05:00) Created and assigned #1034 before completing the newly confirmed Scala-to-Java constructor root. Commit `c579f681` now classifies exact Java constructors from one prepared syntax snapshot, preserves class and record constructor shapes, and indexes compact record constructors with canonical signatures and cache invalidation. Repeated independent review found no remaining correctness or performance issue; the expanded public definition regression and the 643-test definition/Java/cache/store selection pass.
+- [x] (2026-07-21 13:40-05:00) Created and assigned #1036 and #1037 before completing the bounded Scala forward-lookup repairs in `45e2dd4f` and `3bfcd3cf`; `5769b716` restored exact scoped Rust enum-constructor definitions, and `2abf0707` restored flat-layout Rust external-module ownership under already-assigned #987. Formatting, focused definition/LSP suites, both Rust usage suites, and isolated all-target/all-feature Clippy pass. The complete feature-enabled gate subsequently exposed two further #987 partial-project usage regressions in the Rust dead-code integration suite, which remain under active repair before publication.
 - [ ] Complete, publish, close owned issues for, and summarize the Rust task-ranked leg.
 - [ ] Complete, publish, close owned issues for, and summarize the Scala task-ranked leg.
 - [ ] Complete, publish, close owned issues for, and summarize the Java task-ranked leg.
@@ -58,6 +59,9 @@ The observable result is twenty-five clean completed repository records, five pe
 - Observation: Scala hierarchy and Java-constructor correctness both depend on parser context surviving persistence and forward-query boundaries.
   Evidence: Scala supertype facts now persist lexical scopes and bump the Scala epoch; Java constructor classification reads declaration ranges, owner children, and syntax from one prepared `FileState`. Compact record constructors required a Java epoch bump because they newly enter the persisted declaration surface.
 
+- Observation: The live Python task ranking changed after the initial campaign selection because the underlying eligible task inventory changed.
+  Evidence: Re-running `task_repos(SFT_PREDICATES, langs=['py'])` on 2026-07-21 selects `pewdiepie-archdaemon__odysseus` (137) and `powsybl__powsybl-core` (97) in place of Glom and Caikit. All five live records are `RepoRef(lang='py')` and pass `not_overlarge`; powsybl-core is a legitimate selector result even though its checkout currently exposes only `docs/conf.py` to the Python analyzer.
+
 ## Decision Log
 
 - Decision: Treat all previous LOC-ranked language records as regression evidence only and rerun all five requested languages.
@@ -88,6 +92,10 @@ The observable result is twenty-five clean completed repository records, five pe
   Rationale: Constructor kind, ordinary default suppression, record canonical shape, varargs, and compact declarations are Java semantics. Reading them from one prepared Java AST snapshot prevents same-FQN methods and stale parent/range facts from producing false definitions.
   Date/Author: 2026-07-21 / Codex
 
+- Decision: Re-evaluate each not-yet-started language through the live `tasks.py` selector immediately before its corpus begins.
+  Rationale: The user's acceptance set is defined by the selector rather than by a frozen hand-copied list, and the Python task inventory changed during this long-running campaign. The live result therefore supersedes the initial Python list while preserving the same stable descending-count rule and `large-repos.csv` filter.
+  Date/Author: 2026-07-21 / Codex
+
 ## Outcomes & Retrospective
 
 PHP is complete. Its task-ranked baseline contained 298 legitimate misses: 96 owner-relative type references, 200 call-return receiver chains, and four nullsafe calls, with two chain/nullsafe overlaps. Structured fixes for #960, #961, and #962 reduced all five final repositories to zero actionable and zero inconclusive rows at pushed head `64de341e`; the three issues are closed. Historical #904/#905 remain integrated regression fixes. The focused PHP suites, formatting, diff hygiene, isolated all-feature Clippy, full feature-enabled Cargo gate, exact witnesses, and production corpus all passed. The final artifact and hashes are recorded in `.agents/docs/reference-differential/php-task-ranked-64de341e-summary.md`.
@@ -108,7 +116,7 @@ The authoritative task-ranked selections are:
 - Rust: `tokio-rs__tokio` (142), `kivikakk__comrak` (59), `ordian__toml_edit` (44), `tokio-rs__tracing` (40), `foobarto__stado` (37).
 - Scala: `scala-steward-org__scala-steward` (147), `zio__zio` (106), `linkerd__linkerd` (72), `scalameta__metals` (71), `typelevel__fs2` (62). `zio__zio-http` also has 62; stable `tasks.py` order selects `typelevel__fs2`.
 - Java: `alibaba__fastjson2` (328), `chinabugotech__hutool` (208), `languagetool-org__languagetool` (192), `halo-dev__halo` (163), `apache__dubbo` (126).
-- Python: `bytedance__deer-flow` (208), `kornia__kornia` (112), `quantumlib__Cirq` (105), `mahmoud__glom` (90), `caikit__caikit` (84).
+- Python (live selector, refreshed 2026-07-21): `bytedance__deer-flow` (208), `pewdiepie-archdaemon__odysseus` (137), `kornia__kornia` (112), `quantumlib__Cirq` (105), `powsybl__powsybl-core` (97). Powsybl-core is retained because `tasks.py` classifies it as `py` and filters it as eligible, despite its checkout currently containing only one Python file.
 
 All twenty-five clone paths exist and their tracked worktrees were clean at selection time. Generated `.brokk/` cache state is operational, not source corpus content; exclude it in each clone's local `.git/info/exclude` if it would otherwise appear as untracked dirtiness.
 
