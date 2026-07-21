@@ -247,7 +247,7 @@ fn dispatch_message(
                 spec,
             ))
         }
-        None => handle_notification(connection, method, params),
+        None => handle_notification(service, connection, method, params),
     }
 }
 
@@ -257,13 +257,18 @@ fn handle_response(
     id: &Value,
     response: &serde_json::Map<String, Value>,
 ) -> Option<Value> {
-    let Some(pending_id) = connection.pending_roots_request.as_deref() else {
-        return None;
-    };
+    let pending_id = connection.pending_roots_request.as_deref()?;
     if id.as_str() != Some(pending_id) {
         return None;
     }
     connection.pending_roots_request = None;
+
+    // A roots change received while this request was in flight makes its
+    // response stale. The notification already revoked the active workspace;
+    // discard the old list and request the current one before binding again.
+    if connection.roots_refresh_requested {
+        return connection.finish_roots_response();
+    }
 
     if let Some(error) = response.get("error") {
         eprintln!("bifrost: MCP roots/list failed: {error}");
@@ -378,6 +383,7 @@ fn write_benchmark_profile_boundary() -> Result<Value, (i64, String)> {
 }
 
 fn handle_notification(
+    service: &SearchToolsService,
     connection: &mut McpConnectionState,
     method: &str,
     _params: Value,
@@ -388,6 +394,9 @@ fn handle_notification(
             connection.roots_request()
         }
         "notifications/roots/list_changed" => {
+            if let Err(error) = service.unbind_client_workspace() {
+                eprintln!("bifrost: failed to revoke changed MCP workspace roots: {error}");
+            }
             if connection.pending_roots_request.is_some() {
                 connection.roots_refresh_requested = true;
                 None
@@ -1350,6 +1359,7 @@ mod uri_tests {
 
     #[test]
     fn roots_changes_during_a_request_are_coalesced() {
+        let service = SearchToolsService::new_unbound();
         let mut connection = McpConnectionState::new(true);
         connection.client_supports_roots = true;
         connection.initialized = true;
@@ -1357,6 +1367,7 @@ mod uri_tests {
 
         assert!(
             handle_notification(
+                &service,
                 &mut connection,
                 "notifications/roots/list_changed",
                 Value::Null,

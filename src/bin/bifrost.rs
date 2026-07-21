@@ -444,9 +444,12 @@ fn run_inner(
     } else {
         None
     };
+    // A rootless MCP server does not know whether the client-selected root will
+    // be a Git repository yet. Advertise the potential NLP surface up front;
+    // runtime availability is checked after roots negotiation.
     let git_repo = initial_root
         .as_deref()
-        .is_some_and(brokk_bifrost::mcp_registry::workspace_is_git);
+        .is_none_or(brokk_bifrost::mcp_registry::workspace_is_git);
     let spec = resolve_server_spec_for_render_options(mode, render_options, git_repo)?;
     run_stdio_server(initial_root, render_options, &spec).map(|()| CliRunResult::Complete)
 }

@@ -6,6 +6,7 @@ use crate::analyzer::{
 };
 use crate::profiling;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -189,6 +190,16 @@ impl WorkspaceAnalyzer {
         config: AnalyzerConfig,
     ) -> Result<Self, StoreError> {
         let store_context = crate::analyzer::persistent_store_context(project.as_ref())?;
+        Self::build_filtered(project, config, None, store_context, None)
+    }
+
+    pub(crate) fn build_persisted_at(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        db_path: &Path,
+    ) -> Result<Self, StoreError> {
+        let store_context =
+            crate::analyzer::persistent_store_context_at(project.as_ref(), db_path)?;
         Self::build_filtered(project, config, None, store_context, None)
     }
 

@@ -133,6 +133,7 @@ pub(crate) use scala::scala_parenthesized_arity;
 pub use source_content::SourceContent;
 pub(crate) use tree_sitter_analyzer::{
     AnalyzerStoreContext, BulkFileStateSource, default_store_context, persistent_store_context,
+    persistent_store_context_at,
 };
 pub use tree_sitter_analyzer::{
     BuildProgress, BuildProgressEvent, BuildProgressPhase, LanguageAdapter, TreeSitterAnalyzer,

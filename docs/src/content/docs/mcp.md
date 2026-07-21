@@ -33,7 +33,7 @@ bifrost --root /path/to/project --mcp "symbol|workspace"
 bifrost --root /path/to/project --mcp "text|extended"
 ```
 
-The no-argument compatibility command, `bifrost`, uses the current working directory and the `searchtools` toolset. An explicit `bifrost --mcp <toolsets>` command without `--root` starts unbound, requests `roots/list` from a roots-capable MCP client after initialization, and selects the first usable local filesystem root in client order. Clients can send `notifications/roots/list_changed` to replace that root transactionally. If the client does not support roots, analyzer calls return an actionable unbound-workspace error instead of analyzing process cwd.
+The no-argument compatibility command, `bifrost`, uses the current working directory and the `searchtools` toolset. An explicit `bifrost --mcp <toolsets>` command without `--root` starts unbound, requests `roots/list` from a roots-capable MCP client after initialization, and selects the first usable local filesystem root in client order. Clients can send `notifications/roots/list_changed` to replace that root; Bifrost revokes the old root immediately and remains unbound until the refreshed list is accepted. If the client does not support roots, analyzer calls return an actionable unbound-workspace error instead of analyzing process cwd.
 
 Explicit `--root` integrations remain authoritative and do not require roots negotiation. The packaged launcher also translates `BIFROST_WORKSPACE_ROOT` into an explicit `--root`. Prefer an explicit root for manual fixed-project configurations. Packaged plugins use roots negotiation so package-local command resolution stays independent from analyzer scope.
 

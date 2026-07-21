@@ -2293,6 +2293,28 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
     );
     let roots_request = read_line(&mut reader, &mut stderr);
     assert_eq!(roots_request["method"], "roots/list", "{roots_request}");
+    // If the client's roots change before it answers, the in-flight result is
+    // stale and must never become analyzer scope, even briefly.
+    write_line(
+        &mut stdin,
+        json!({ "jsonrpc": "2.0", "method": "notifications/roots/list_changed" }),
+    );
+    let plugin_uri = url::Url::from_directory_path(plugin_dir.path())
+        .expect("plugin file URI")
+        .to_string();
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": roots_request["id"],
+            "result": { "roots": [{ "uri": plugin_uri, "name": "stale" }] }
+        }),
+    );
+    let current_roots_request = read_line(&mut reader, &mut stderr);
+    assert_eq!(
+        current_roots_request["method"], "roots/list",
+        "{current_roots_request}"
+    );
     let workspace_uri = url::Url::from_directory_path(workspace.path())
         .expect("workspace file URI")
         .to_string();
@@ -2300,7 +2322,7 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
         &mut stdin,
         json!({
             "jsonrpc": "2.0",
-            "id": roots_request["id"],
+            "id": current_roots_request["id"],
             "result": { "roots": [{ "uri": workspace_uri, "name": "fixture" }] }
         }),
     );
@@ -2331,6 +2353,26 @@ fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
     assert_eq!(
         replacement_request["method"], "roots/list",
         "{replacement_request}"
+    );
+    let unbound_during_refresh = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["ClientWorkspace"] }
+            }
+        }),
+    );
+    assert!(
+        unbound_during_refresh["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not bound to a workspace")),
+        "{unbound_during_refresh}"
     );
     let replacement_uri = url::Url::from_directory_path(replacement.path())
         .expect("replacement file URI")

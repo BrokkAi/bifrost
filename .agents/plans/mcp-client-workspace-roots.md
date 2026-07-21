@@ -17,7 +17,8 @@ This does not require users to install a second MCP server. The agent plugin con
 - [x] (2026-07-21 19:40Z) Implemented MCP `roots/list` request/response handling, root-change notifications, coalesced refreshes, revocation, and standards-aware file-URI parsing.
 - [x] (2026-07-21 19:45Z) Constrained protocol binding to exact client-returned canonical roots and added actionable unbound-state errors; the unrestricted lifecycle tool remains absent from the packaged toolset.
 - [x] (2026-07-21 20:00Z) Updated the packaged launcher, generated skill bundles, release smoke, security-boundary docs, and Codex/Claude/Cursor installation guidance.
-- [ ] Run Rust CI-equivalent checks, the packaged release smoke where practical, a real roots-capable host smoke, and the guided specialist review. Focused MCP, URI, manifest, and launcher tests pass.
+- [x] (2026-07-21 21:00Z) Ran focused MCP, URI, manifest, launcher, linked-worktree cache, and all-feature Clippy checks. The full `nlp,python` suite compiled but was blocked at the macOS PyO3 link step by unresolved Python symbols; the pinned v0.8.7 release cannot run the new roots smoke until a release contains this change.
+- [x] (2026-07-21 21:20Z) Completed architecture and security review, then made roots changes fail closed, discarded stale in-flight root responses, constrained client-bound analyzer and semantic caches to the exact approved root, and kept the potential NLP tool surface visible before a root is known.
 
 ## Surprises & Discoveries
 
@@ -31,7 +32,10 @@ This does not require users to install a second MCP server. The agent plugin con
   Evidence: MCP specification version 2025-11-25, client feature “Roots”. Bifrost's hand-written JSON-RPC loop currently handles only client requests and notifications, so it needs a small bidirectional connection state machine.
 
 - Observation: A root-change notification can race an outstanding roots request, and an empty replacement list revokes the previous workspace rather than meaning “keep using it.”
-  Evidence: the connection state now coalesces an in-flight change into one follow-up request, and the host-equivalent integration test replaces then revokes the selected workspace.
+  Evidence: the connection state immediately unbinds, discards the stale response, and coalesces the change into one follow-up request. The host-equivalent integration test proves tools fail during refresh, then replaces and revokes the selected workspace.
+
+- Observation: the ordinary persistent-cache policy collapses linked worktrees to the primary checkout, which can fall outside a client-approved MCP root.
+  Evidence: the client-roots regression constructs a real linked worktree and proves binding creates the unified analyzer/semantic database only below the linked root, leaving the primary checkout untouched.
 
 ## Decision Log
 
@@ -51,13 +55,17 @@ This does not require users to install a second MCP server. The agent plugin con
   Rationale: existing CLI, Amp, release, and manual MCP configurations already provide a trusted root and must not incur a roots negotiation or behavior change.
   Date/Author: 2026-07-21 / Codex
 
+- Decision: Scope caches created by roots negotiation to the exact approved root instead of applying the ordinary linked-worktree cache-sharing policy.
+  Rationale: the MCP root is an authorization boundary. Sharing a cache through the primary checkout would write outside that boundary and could mix path-index state across independently approved roots.
+  Date/Author: 2026-07-21 / Codex
+
 - Decision: Preserve the historical bare `bifrost` command as `searchtools` on cwd, but make explicit `--mcp <toolsets>` launches rootless when no trusted root is supplied.
   Rationale: packaged and configured MCP clients use the explicit form, while existing shell integrations may rely on the documented no-argument compatibility behavior.
   Date/Author: 2026-07-21 / Codex
 
 ## Outcomes & Retrospective
 
-The Bifrost and packaging halves are implemented. An explicit root remains deterministic; a package-launched server without one stays unbound until a roots-capable client approves a local directory, follows later root changes, and drops access when the list is revoked. The release smoke now exercises this host-equivalent protocol and a real symbol search. Current Codex still needs its host-side roots implementation before the original clean-install acceptance can pass end to end.
+The Bifrost and packaging halves are implemented. An explicit root remains deterministic; a package-launched server without one stays unbound until a roots-capable client approves a local directory, follows later root changes fail-closed, and drops access when the list is revoked. Client-bound analyzer and semantic caches remain inside that exact root, including linked worktrees. The release smoke now exercises this host-equivalent protocol and a real symbol search. Current Codex still needs its host-side roots implementation before the original clean-install acceptance can pass end to end.
 
 ## Context and Orientation
 

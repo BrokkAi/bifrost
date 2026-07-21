@@ -316,8 +316,9 @@ fn semantic_indexing_enabled() -> bool {
 fn maybe_start_semantic(
     enabled: bool,
     snapshot: &Arc<WorkspaceAnalyzer>,
+    cache_db_path: Option<&Path>,
 ) -> Option<Arc<SemanticIndexer>> {
-    maybe_start_semantic_checked(enabled, snapshot, semantic_accelerator_ready)
+    maybe_start_semantic_checked(enabled, snapshot, cache_db_path, semantic_accelerator_ready)
 }
 
 /// Ok when the voyage-4-nano embedder can run: a CUDA/Metal accelerator is
@@ -340,6 +341,7 @@ fn semantic_accelerator_ready() -> Result<(), String> {
 fn maybe_start_semantic_checked(
     enabled: bool,
     snapshot: &Arc<WorkspaceAnalyzer>,
+    cache_db_path: Option<&Path>,
     accelerator_ready: impl FnOnce() -> Result<(), String>,
 ) -> Option<Arc<SemanticIndexer>> {
     if !enabled {
@@ -354,7 +356,10 @@ fn maybe_start_semantic_checked(
         eprintln!("bifrost semantic index disabled: semantic search requires a git repository");
         return None;
     }
-    Some(SemanticIndexer::start(root, snapshot.clone()))
+    Some(match cache_db_path {
+        Some(db_path) => SemanticIndexer::start_at(root, snapshot.clone(), db_path.to_path_buf()),
+        None => SemanticIndexer::start(root, snapshot.clone()),
+    })
 }
 
 impl SearchToolsService {
@@ -401,6 +406,7 @@ impl SearchToolsService {
             UpdateStrategy::Manual,
             false,
             &watcher_starter,
+            None,
         )?;
         Ok(Self {
             root: RwLock::new(Some(root)),
@@ -872,6 +878,7 @@ impl SearchToolsService {
             update_strategy,
             semantic_indexing,
             &watcher_starter,
+            None,
         )?;
         Ok(Self {
             root: RwLock::new(Some(root)),
@@ -911,6 +918,7 @@ impl SearchToolsService {
             update_strategy,
             semantic_indexing,
             &watcher_starter,
+            None,
         )?;
         Ok(Self {
             root: RwLock::new(Some(root)),
@@ -1018,18 +1026,21 @@ impl SearchToolsService {
             return Ok(canonical);
         }
 
-        let (project, workspace) = build_persisted_workspace(canonical.clone()).map_err(|err| {
-            SearchToolsServiceError::internal(format!(
-                "Failed to bind client workspace {}: {err}",
-                canonical.display()
-            ))
-        })?;
+        let cache_db_path = client_cache_db_path(&canonical);
+        let (project, workspace) = build_persisted_workspace_at(canonical.clone(), &cache_db_path)
+            .map_err(|err| {
+                SearchToolsServiceError::internal(format!(
+                    "Failed to bind client workspace {}: {err}",
+                    canonical.display()
+                ))
+            })?;
         let new_session = assemble_session(
             project,
             workspace,
             self.update_strategy,
             self.semantic_indexing,
             &self.watcher_starter,
+            Some(&cache_db_path),
         )
         .map_err(|err| {
             SearchToolsServiceError::internal(format!(
@@ -1114,6 +1125,7 @@ impl SearchToolsService {
                         update_strategy,
                         semantic_indexing,
                         &watcher_starter,
+                        None,
                     )
                 }
             })
@@ -1180,6 +1192,7 @@ impl SearchToolsService {
                     self.update_strategy,
                     self.semantic_indexing,
                     &self.watcher_starter,
+                    None,
                 )
             });
             let session = match built {
@@ -1338,6 +1351,7 @@ impl SearchToolsService {
             self.update_strategy,
             semantic_indexing,
             &self.watcher_starter,
+            None,
         )
         .map_err(|err| {
             SearchToolsServiceError::internal(format!(
@@ -1833,6 +1847,25 @@ fn build_persisted_workspace(
     Ok((project, workspace))
 }
 
+fn client_cache_db_path(root: &Path) -> PathBuf {
+    root.join(crate::gitblob::CACHE_DIR_NAME)
+        .join(crate::cache_db::CACHE_DB_FILE_NAME)
+}
+
+fn build_persisted_workspace_at(
+    root: PathBuf,
+    db_path: &Path,
+) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
+    let project = build_project(root)?;
+    let workspace = WorkspaceAnalyzer::build_persisted_at(
+        Arc::clone(&project),
+        AnalyzerConfig::default(),
+        db_path,
+    )
+    .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
+    Ok((project, workspace))
+}
+
 fn build_transient_workspace(
     root: PathBuf,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
@@ -1851,6 +1884,7 @@ fn assemble_session(
     update_strategy: UpdateStrategy,
     semantic_indexing: bool,
     watcher_starter: &WatcherStarter,
+    cache_db_path: Option<&Path>,
 ) -> Result<WorkspaceSession, String> {
     let document_root = Arc::new(
         WorkspaceRoot::open(project.root())
@@ -1859,9 +1893,9 @@ fn assemble_session(
     let watcher = start_session_watcher(Arc::clone(&project), update_strategy, watcher_starter)?;
     let snapshot = Arc::new(workspace);
     #[cfg(feature = "nlp")]
-    let semantic = maybe_start_semantic(semantic_indexing, &snapshot);
+    let semantic = maybe_start_semantic(semantic_indexing, &snapshot, cache_db_path);
     #[cfg(not(feature = "nlp"))]
-    let _ = semantic_indexing;
+    let _ = (semantic_indexing, cache_db_path);
     Ok(WorkspaceSession {
         snapshot,
         document_root,
@@ -2551,6 +2585,63 @@ public partial class MudDialogContainer
     }
 }
 
+#[cfg(test)]
+mod client_roots_tests {
+    use super::*;
+    use git2::{IndexAddOption, Repository, Signature};
+
+    fn commit_all(repo: &Repository) {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let signature = Signature::now("Bifrost Test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .unwrap();
+    }
+
+    #[test]
+    fn client_root_cache_stays_inside_linked_worktree_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary_root = temp.path().join("primary");
+        std::fs::create_dir(&primary_root).unwrap();
+        let repo = Repository::init(&primary_root).unwrap();
+        std::fs::write(primary_root.join("Primary.java"), "class Primary {}\n").unwrap();
+        commit_all(&repo);
+
+        let linked_root = temp.path().join("linked");
+        let worktree = repo.worktree("linked", &linked_root, None).unwrap();
+        let linked_repo = Repository::open_from_worktree(&worktree).unwrap();
+        assert!(linked_repo.is_worktree());
+
+        let service = SearchToolsService {
+            root: RwLock::new(None),
+            session: RwLock::new(None),
+            pending_build: Mutex::new(None),
+            build_error: Mutex::new(None),
+            update_strategy: UpdateStrategy::Manual,
+            semantic_indexing: false,
+            watcher_starter: production_watcher_starter(),
+        };
+        let canonical_linked = linked_root.canonicalize().unwrap();
+        service
+            .bind_client_workspace(canonical_linked.clone())
+            .unwrap();
+
+        assert!(client_cache_db_path(&canonical_linked).exists());
+        assert!(
+            !primary_root
+                .join(crate::gitblob::CACHE_DIR_NAME)
+                .join(crate::cache_db::CACHE_DB_FILE_NAME)
+                .exists(),
+            "client-root binding must not collapse cache writes to the primary checkout"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "nlp"))]
 mod tests {
     use super::*;
@@ -2576,7 +2667,7 @@ mod tests {
             },
         );
         let service = SearchToolsService {
-            root: RwLock::new(dir.path().to_path_buf()),
+            root: RwLock::new(Some(dir.path().to_path_buf())),
             session: RwLock::new(Some(WorkspaceSession {
                 snapshot,
                 document_root: Arc::new(WorkspaceRoot::open(dir.path()).unwrap()),
@@ -2610,7 +2701,7 @@ mod tests {
         let snapshot = Arc::new(workspace);
 
         // No CUDA/Metal and no --force-semantic-cpu: the indexer must not start.
-        let semantic = maybe_start_semantic_checked(true, &snapshot, || {
+        let semantic = maybe_start_semantic_checked(true, &snapshot, None, || {
             Err("no CUDA or Metal accelerator detected".to_string())
         });
 

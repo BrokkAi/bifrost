@@ -102,7 +102,9 @@ bifrost --mcp "symbol|extended"
 Codex must advertise the active task directory through MCP roots for that
 rootless process to bind. A Codex build without roots support leaves Bifrost
 safely unbound instead of indexing the plugin cache. `BIFROST_WORKSPACE_ROOT`
-remains an explicit compatibility override for such hosts.
+remains an explicit compatibility override for such hosts. Client-root sessions
+also keep analyzer and semantic cache writes under the exact approved root,
+including for linked worktrees.
 
 The plugin gives Bifrost up to 180 seconds to download, verify, extract, and
 start a missing pinned release, and up to 300 seconds for individual analyzer
