@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use tree_sitter::Node;
 
+use crate::analyzer::lexical_definitions::{FormalVariadicKind, formal_parameter_slots};
 use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, DriveError,
     ProcedureCfgBuilder, ScopeBinding, ScopeFrameId,
@@ -15,10 +16,10 @@ use crate::analyzer::semantic::cfg::{
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
-use crate::analyzer::{JavaAnalyzer, ProjectFile};
+use crate::analyzer::{JavaAnalyzer, Language, ProjectFile, Range};
 use crate::hash::HashMap;
 
-const ADAPTER_VERSION: &[u8] = b"java-cfg-v1";
+const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v2";
 
 impl ProgramSemanticsProvider for JavaAnalyzer {
     fn current_artifact_key(
@@ -68,7 +69,7 @@ impl ProgramSemanticsLowerer for JavaSemanticLowerer {
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
-        let specs = match enumerate_procedures(file, prepared, budget, cancellation)? {
+        let mut specs = match enumerate_procedures(file, prepared, budget, cancellation)? {
             ProcedureEnumeration::Complete(specs) => specs,
             ProcedureEnumeration::ExceededBudget { exceeded, work } => {
                 return Ok(SemanticOutcome::ExceededBudget {
@@ -84,6 +85,34 @@ impl ProgramSemanticsLowerer for JavaSemanticLowerer {
                 });
             }
         };
+        for index in 0..specs.len() {
+            let can_capture_receiver = specs[index]
+                .lexical_parent
+                .and_then(|parent| specs.get(parent.index()))
+                .is_some_and(|parent| {
+                    parent.captures_receiver
+                        || (!parent.properties.is_static
+                            && matches!(
+                                parent.kind,
+                                ProcedureKind::Method
+                                    | ProcedureKind::Constructor
+                                    | ProcedureKind::Initializer
+                            ))
+                });
+            specs[index].captures_receiver &= can_capture_receiver;
+        }
+        let procedure_targets = specs
+            .iter()
+            .map(|spec| {
+                (
+                    spec.callable.id(),
+                    NestedProcedureTarget {
+                        id: spec.id,
+                        captures_receiver: spec.captures_receiver,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
 
         lower_procedure_batch(
             &specs,
@@ -91,7 +120,13 @@ impl ProgramSemanticsLowerer for JavaSemanticLowerer {
             budget,
             cancellation,
             |spec, staged_budget, cancellation| {
-                lower_procedure(prepared, spec, staged_budget, cancellation)
+                lower_procedure(
+                    prepared,
+                    spec,
+                    &procedure_targets,
+                    staged_budget,
+                    cancellation,
+                )
             },
         )
     }
@@ -120,6 +155,13 @@ fn java_capabilities() -> SemanticCapabilities {
         SemanticCapability::DynamicDispatch,
         SemanticCapability::CallableReferences,
         SemanticCapability::Values,
+        SemanticCapability::Assignments,
+        SemanticCapability::Allocations,
+        SemanticCapability::IndexMemory,
+        SemanticCapability::LocalFlow,
+        SemanticCapability::ParameterFlow,
+        SemanticCapability::ReceiverFlow,
+        SemanticCapability::Captures,
         SemanticCapability::NonLocalControl,
         SemanticCapability::ResourceManagement,
         SemanticCapability::DeferredExecution,
@@ -132,11 +174,19 @@ fn java_capabilities() -> SemanticCapabilities {
 #[derive(Clone)]
 struct ProcedureSpec<'tree> {
     id: ProcedureId,
+    callable: Node<'tree>,
     body: Node<'tree>,
     locator: SemanticLocator,
     lexical_parent: Option<ProcedureId>,
     kind: ProcedureKind,
     properties: ProcedureProperties,
+    captures_receiver: bool,
+}
+
+#[derive(Clone, Copy)]
+struct NestedProcedureTarget {
+    id: ProcedureId,
+    captures_receiver: bool,
 }
 
 enum ProcedureEnumeration<'tree> {
@@ -248,11 +298,13 @@ fn enumerate_procedures<'tree>(
             preflight = candidate;
             specs.push(ProcedureSpec {
                 id,
+                callable: frame.node,
                 body,
                 locator,
                 lexical_parent: frame.lexical_parent,
                 kind,
                 properties,
+                captures_receiver: kind == ProcedureKind::Lambda && body_contains_free_this(body),
             });
             child_parent = Some(id);
             child_path = push_declaration_path(&mut declaration_paths, child_path, segment);
@@ -583,14 +635,29 @@ struct JavaSwitchArm<'tree> {
 struct LoweringContext<'tree, 'targets> {
     prepared: &'tree PreparedSyntaxTree,
     session: ProcedureLoweringSession<'targets>,
+    expression_values: HashMap<usize, ValueId>,
+    parameters: HashMap<Box<str>, ValueId>,
+    locals: HashMap<Box<str>, Vec<LocalBinding>>,
+    receiver: Option<ValueId>,
+    captured_receiver: Option<ValueId>,
+    procedure_targets: &'targets HashMap<usize, NestedProcedureTarget>,
     cleanups: Vec<CleanupRegion<'tree>>,
 }
 
-fn lower_procedure<'tree>(
+struct LocalBinding {
+    declaration_start: usize,
+    visible_from: usize,
+    scope_start: usize,
+    scope_end: usize,
+    value: ValueId,
+}
+
+fn lower_procedure<'tree, 'targets>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
+    procedure_targets: &'targets HashMap<usize, NestedProcedureTarget>,
     budget: &SemanticBudget,
-    cancellation: &CancellationToken,
+    cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), JavaLoweringError> {
     let mut parts = ProcedureSemanticsParts::new(
         spec.id,
@@ -612,8 +679,23 @@ fn lower_procedure<'tree>(
     let mut context = LoweringContext {
         prepared,
         session,
+        expression_values: HashMap::default(),
+        parameters: HashMap::default(),
+        locals: HashMap::default(),
+        receiver: None,
+        captured_receiver: None,
+        procedure_targets,
         cleanups: Vec::new(),
     };
+    context.emit_procedure_inputs(
+        &mut builder,
+        spec.callable,
+        entry,
+        spec.kind,
+        spec.properties,
+    )?;
+    context.emit_captured_receiver(&mut builder, entry, spec)?;
+    context.emit_local_bindings(&mut builder, spec.body)?;
 
     if spec.kind == ProcedureKind::Initializer {
         context.add_gap(
@@ -665,7 +747,22 @@ fn lower_procedure<'tree>(
         }
     } else {
         let implicit_return = context.point(&mut builder, spec.body, Vec::new())?;
+        let source = context.expression_value(
+            &mut builder,
+            spec.body,
+            body_entry,
+            SemanticValueKind::Temporary,
+        )?;
         let value = context.value(&mut builder, implicit_return, SemanticValueKind::Return)?;
+        context.append_effect(
+            &mut builder,
+            implicit_return,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Return,
+                source,
+                target: value,
+            },
+        )?;
         context.append_effect(
             &mut builder,
             implicit_return,
@@ -720,6 +817,395 @@ fn lower_procedure<'tree>(
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
+    fn emit_captured_receiver(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
+        spec: &ProcedureSpec<'tree>,
+    ) -> Result<(), JavaLoweringError> {
+        let Some(lexical_parent) = spec.lexical_parent.filter(|_| spec.captures_receiver) else {
+            return Ok(());
+        };
+        let metadata = self.value_mapping(builder, spec.callable)?;
+        let value =
+            self.session
+                .add_value_with_metadata(builder, metadata, SemanticValueKind::Local)?;
+        let location = self.session.add_memory_location(
+            builder,
+            entry,
+            MemoryLocationKind::Capture { lexical_parent },
+        )?;
+        self.append_effect(
+            builder,
+            entry,
+            SemanticEffect::MemoryLoad {
+                kind: MemoryAccessKind::Capture,
+                location,
+                result: value,
+            },
+        )?;
+        self.captured_receiver = Some(value);
+        Ok(())
+    }
+
+    fn emit_local_bindings(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        body: Node<'tree>,
+    ) -> Result<(), JavaLoweringError> {
+        let mut stack = vec![body];
+        while let Some(node) = stack.pop() {
+            if node.id() != body.id() && is_java_nested_declaration(node.kind()) {
+                continue;
+            }
+            if node.kind() == "variable_declarator"
+                && let Some(name) = node.child_by_field_name("name")
+                && name.kind() == "identifier"
+                && let Some(text) = node_text(self.prepared.source(), name)
+                && let Some((scope_start, scope_end)) = java_local_scope(node)
+            {
+                let metadata = self.value_mapping(builder, name)?;
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Local,
+                )?;
+                self.locals
+                    .entry(text.into())
+                    .or_default()
+                    .push(LocalBinding {
+                        declaration_start: name.start_byte(),
+                        visible_from: node.end_byte(),
+                        scope_start,
+                        scope_end,
+                        value,
+                    });
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        Ok(())
+    }
+
+    fn local_at(&self, name: &str, byte: usize) -> Option<ValueId> {
+        self.locals
+            .get(name)?
+            .iter()
+            .filter(|binding| {
+                binding.visible_from <= byte
+                    && binding.scope_start <= byte
+                    && byte < binding.scope_end
+            })
+            .min_by_key(|binding| binding.scope_end - binding.scope_start)
+            .map(|binding| binding.value)
+    }
+
+    fn local_declaration_value(&self, name: &str, declaration_start: usize) -> Option<ValueId> {
+        self.locals
+            .get(name)?
+            .iter()
+            .find(|binding| binding.declaration_start == declaration_start)
+            .map(|binding| binding.value)
+    }
+
+    fn local_declaration(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), JavaLoweringError> {
+        let initializers = children_by_field_name(node, "declarator")
+            .into_iter()
+            .filter_map(|declarator| {
+                let name = declarator.child_by_field_name("name")?;
+                let initializer = declarator.child_by_field_name("value")?;
+                (name.kind() == "identifier").then_some((declarator, name, initializer))
+            })
+            .collect::<Vec<_>>();
+        if initializers.is_empty() {
+            return self.edge(builder, entry, next);
+        }
+
+        let expression_entries = initializers
+            .iter()
+            .map(|(_, _, initializer)| self.point(builder, *initializer, Vec::new()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let terminals = initializers
+            .iter()
+            .map(|(declarator, _, _)| self.point(builder, *declarator, Vec::new()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.edge(builder, entry, EdgeTarget::normal(expression_entries[0]))?;
+        for (index, (_, name, initializer)) in initializers.iter().enumerate().rev() {
+            let target_name = node_text(self.prepared.source(), *name).ok_or_else(|| {
+                JavaLoweringError::Invalid("local declaration has invalid name range".into())
+            })?;
+            let target = self
+                .local_declaration_value(target_name, name.start_byte())
+                .ok_or_else(|| {
+                    JavaLoweringError::Invalid("local declaration was not preindexed".into())
+                })?;
+            let value = self.expression_value(
+                builder,
+                *initializer,
+                terminals[index],
+                expression_value_kind(*initializer),
+            )?;
+            self.append_effect(
+                builder,
+                terminals[index],
+                SemanticEffect::Assignment { target, value },
+            )?;
+            self.append_effect(
+                builder,
+                terminals[index],
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local,
+                    source: value,
+                    target,
+                },
+            )?;
+            let following = expression_entries
+                .get(index + 1)
+                .copied()
+                .map(EdgeTarget::normal)
+                .unwrap_or(next);
+            self.edge(builder, terminals[index], following)?;
+            stack.push(Work::Expression {
+                node: *initializer,
+                entry: expression_entries[index],
+                next: EdgeTarget::normal(terminals[index]),
+                scope,
+            });
+        }
+        Ok(())
+    }
+
+    fn assignment_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), JavaLoweringError> {
+        let left = required_field(node, "left")?;
+        let right = required_field(node, "right")?;
+        let terminal = self.point(builder, node, Vec::new())?;
+        let value =
+            self.expression_value(builder, right, terminal, expression_value_kind(right))?;
+        let result = self.expression_value(builder, node, terminal, expression_value_kind(node))?;
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::Assignment {
+                target: result,
+                value,
+            },
+        )?;
+
+        let evaluations = if left.kind() == "identifier" {
+            let name = node_text(self.prepared.source(), left).ok_or_else(|| {
+                JavaLoweringError::Invalid("assignment has invalid target range".into())
+            })?;
+            let local = self.local_at(name, left.start_byte());
+            let target = local.or_else(|| self.parameters.get(name).copied());
+            if let Some(target) = target {
+                let kind = if local.is_some() {
+                    ValueFlowKind::Local
+                } else {
+                    ValueFlowKind::Parameter
+                };
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::Assignment { target, value },
+                )?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind,
+                        source: value,
+                        target,
+                    },
+                )?;
+            }
+            vec![right]
+        } else if left.kind() == "array_access" {
+            let array = required_field(left, "array")?;
+            let index = required_field(left, "index")?;
+            let base =
+                self.expression_value(builder, array, terminal, expression_value_kind(array))?;
+            let index_value =
+                self.expression_value(builder, index, terminal, expression_value_kind(index))?;
+            let location = self.session.add_memory_location(
+                builder,
+                terminal,
+                MemoryLocationKind::Index {
+                    base,
+                    index: Some(index_value),
+                },
+            )?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::MemoryStore {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    value,
+                },
+            )?;
+            vec![array, index, right]
+        } else {
+            runtime_expression_children(node)
+        };
+        self.edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &evaluations,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    fn emit_procedure_inputs(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        callable: Node<'tree>,
+        _entry: ProgramPointId,
+        procedure_kind: ProcedureKind,
+        properties: ProcedureProperties,
+    ) -> Result<(), JavaLoweringError> {
+        let declaration_range = node_range(callable);
+        let layout = formal_parameter_slots(
+            Language::Java,
+            self.prepared.tree().root_node(),
+            self.prepared.source(),
+            &declaration_range,
+        )
+        .unwrap_or_default();
+        let mut ordinal = 0_u32;
+        for slot in layout.slots {
+            let node = callable
+                .named_descendant_for_byte_range(
+                    slot.declaration_range.start_byte,
+                    slot.declaration_range.end_byte,
+                )
+                .unwrap_or(callable);
+            let metadata = self.value_mapping(builder, node)?;
+            let value = if slot.receiver {
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Receiver,
+                )?;
+                self.receiver = Some(value);
+                value
+            } else {
+                let multiplicity = formal_multiplicity(slot.variadic);
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Parameter {
+                        ordinal,
+                        multiplicity,
+                    },
+                )?;
+                ordinal = ordinal.checked_add(1).ok_or_else(|| {
+                    JavaLoweringError::Invalid("too many formal parameters".into())
+                })?;
+                value
+            };
+            for name in slot.names {
+                self.parameters.insert(name.into_boxed_str(), value);
+            }
+        }
+
+        if self.receiver.is_none()
+            && !properties.is_static
+            && matches!(
+                procedure_kind,
+                ProcedureKind::Method | ProcedureKind::Constructor | ProcedureKind::Initializer
+            )
+        {
+            let metadata = self.value_mapping(builder, callable)?;
+            self.receiver = Some(self.session.add_value_with_metadata(
+                builder,
+                metadata,
+                SemanticValueKind::Receiver,
+            )?);
+        }
+        if let Some(receiver) = self.receiver {
+            self.parameters.insert("this".into(), receiver);
+        }
+        Ok(())
+    }
+
+    fn expression_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        _point: ProgramPointId,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, JavaLoweringError> {
+        if let Some(value) = self.expression_values.get(&node.id()) {
+            return Ok(*value);
+        }
+        let metadata = self.value_mapping(builder, node)?;
+        let value = self
+            .session
+            .add_value_with_metadata(builder, metadata, kind)?;
+        self.expression_values.insert(node.id(), value);
+        Ok(value)
+    }
+
+    fn emit_lexical_input_flow(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        point: ProgramPointId,
+        target: ValueId,
+    ) -> Result<(), JavaLoweringError> {
+        let Some(name) = node_text(self.prepared.source(), node) else {
+            return Ok(());
+        };
+        let (source, kind) = if node.kind() == "this" {
+            if let Some(captured) = self.captured_receiver {
+                (Some(captured), ValueFlowKind::Local)
+            } else {
+                (self.receiver, ValueFlowKind::Receiver)
+            }
+        } else if node.kind() == "identifier" {
+            if let Some(local) = self.local_at(name, node.start_byte()) {
+                (Some(local), ValueFlowKind::Local)
+            } else {
+                (self.parameters.get(name).copied(), ValueFlowKind::Parameter)
+            }
+        } else {
+            (None, ValueFlowKind::Local)
+        };
+        if let Some(source) = source
+            && source != target
+        {
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::ValueFlow {
+                    kind,
+                    source,
+                    target,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     fn step(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -935,7 +1421,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "return_statement" => {
                 let terminal = if let Some(value_node) = first_named_child(node) {
                     let point = self.point(builder, node, Vec::new())?;
+                    let source = self.expression_value(
+                        builder,
+                        value_node,
+                        entry,
+                        expression_value_kind(value_node),
+                    )?;
                     let value = self.value(builder, point, SemanticValueKind::Return)?;
+                    self.append_effect(
+                        builder,
+                        point,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Return,
+                            source,
+                            target: value,
+                        },
+                    )?;
                     self.append_effect(
                         builder,
                         point,
@@ -1171,11 +1672,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 Ok(())
             }
             "local_variable_declaration" => {
-                let initializers = children_by_field_name(node, "declarator")
-                    .into_iter()
-                    .filter_map(|declarator| declarator.child_by_field_name("value"))
-                    .collect::<Vec<_>>();
-                self.schedule_expressions(builder, entry, &initializers, next, scope, stack)
+                self.local_declaration(builder, node, entry, next, scope, stack)
             }
             "explicit_constructor_invocation" => {
                 self.call_expression(builder, node, entry, next, scope, stack)
@@ -1224,6 +1721,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), JavaLoweringError> {
+        let result = self.expression_value(builder, node, entry, expression_value_kind(node))?;
+        if matches!(node.kind(), "identifier" | "this") {
+            self.emit_lexical_input_flow(builder, node, entry, result)?;
+        }
         match node.kind() {
             "method_invocation" | "object_creation_expression" | "enum_constant" => {
                 self.call_expression(builder, node, entry, next, scope, stack)
@@ -1321,10 +1822,46 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     self.edge(builder, entry, next)
                 }
             }
-            "field_access" | "array_access" => {
+            "field_access" => {
                 self.implicit_exception_gap(builder, entry, node)?;
                 let children = runtime_expression_children(node);
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
+            }
+            "array_access" => {
+                self.implicit_exception_gap(builder, entry, node)?;
+                let array = required_field(node, "array")?;
+                let index = required_field(node, "index")?;
+                let access = self.point(builder, node, Vec::new())?;
+                let base =
+                    self.expression_value(builder, array, access, expression_value_kind(array))?;
+                let index_value =
+                    self.expression_value(builder, index, access, expression_value_kind(index))?;
+                let location = self.session.add_memory_location(
+                    builder,
+                    access,
+                    MemoryLocationKind::Index {
+                        base,
+                        index: Some(index_value),
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    access,
+                    SemanticEffect::MemoryLoad {
+                        kind: MemoryAccessKind::Index,
+                        location,
+                        result,
+                    },
+                )?;
+                self.edge(builder, access, next)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &[array, index],
+                    EdgeTarget::normal(access),
+                    scope,
+                    stack,
+                )
             }
             "string_literal" => {
                 let interpolations = named_children(node)
@@ -1337,8 +1874,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let values = named_children(node);
                 self.schedule_expressions(builder, entry, &values, next, scope, stack)
             }
-            "assignment_expression"
-            | "binary_expression"
+            "assignment_expression" => {
+                self.assignment_expression(builder, node, entry, next, scope, stack)
+            }
+            "binary_expression"
             | "unary_expression"
             | "update_expression"
             | "cast_expression"
@@ -2103,7 +2642,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let normal = self.point(builder, node, Vec::new())?;
         let exceptional = self.point(builder, node, Vec::new())?;
         let callee = self.value(builder, invoke, SemanticValueKind::Callable)?;
-        let result = self.value(builder, invoke, SemanticValueKind::Temporary)?;
+        let result = self.expression_value(builder, node, normal, SemanticValueKind::Temporary)?;
         let thrown = self.value(builder, invoke, SemanticValueKind::Exception)?;
         let receiver_node = match node.kind() {
             "method_invocation" | "explicit_constructor_invocation" => {
@@ -2113,7 +2652,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             _ => None,
         };
         let receiver = receiver_node
-            .map(|_| self.value(builder, invoke, SemanticValueKind::Receiver))
+            .map(|receiver_node| {
+                self.expression_value(
+                    builder,
+                    receiver_node,
+                    invoke,
+                    expression_value_kind(receiver_node),
+                )
+            })
             .transpose()?;
         let callable_kind = match node.kind() {
             "object_creation_expression" | "explicit_constructor_invocation" | "enum_constant" => {
@@ -2146,7 +2692,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .unwrap_or_default();
         let argument_values = arguments
             .iter()
-            .map(|_| self.value(builder, invoke, SemanticValueKind::Temporary))
+            .map(|argument| {
+                self.expression_value(builder, *argument, invoke, expression_value_kind(*argument))
+                    .map(SemanticCallArgument::direct)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let call_site = self.session.add_call_site(
             builder,
@@ -2154,7 +2703,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point: invoke,
                 callee,
                 receiver,
-                arguments: argument_values.into_iter().map(Into::into).collect(),
+                arguments: argument_values.into_boxed_slice(),
                 result: Some(result),
                 thrown: Some(thrown),
                 declared_targets: resolution.clone(),
@@ -2162,6 +2711,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 exceptional_continuation: exceptional,
             },
         )?;
+        if node.kind() == "object_creation_expression" {
+            self.session
+                .add_allocation(builder, normal, result, AllocationKind::Object)?;
+        }
         self.edge(builder, invoke, EdgeTarget::normal(normal))?;
         self.edge(
             builder,
@@ -2216,20 +2769,33 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         entry: ProgramPointId,
         next: EdgeTarget,
     ) -> Result<(), JavaLoweringError> {
-        let result = self.value(builder, entry, SemanticValueKind::Callable)?;
-        let resolution = CallableTargetResolution::Unknown;
+        let result = self.expression_value(builder, node, entry, SemanticValueKind::Callable)?;
+        let target = self.procedure_targets.get(&node.id()).copied();
+        let resolution = target
+            .map(|target| CallableTargetResolution::Proven(CallableTarget::Local(target.id)))
+            .unwrap_or(CallableTargetResolution::Unknown);
         let metadata = self.metadata(entry)?;
         let kind = if node.kind() == "lambda_expression" {
             CallableReferenceKind::Lambda
         } else {
             CallableReferenceKind::UnboundMethod
         };
+        let environment = if target.is_some_and(|target| target.captures_receiver) {
+            Some(self.session.add_allocation(
+                builder,
+                entry,
+                result,
+                AllocationKind::ClosureEnvironment,
+            )?)
+        } else {
+            None
+        };
         let callable = CallableValue {
             kind,
-            targets: resolution,
+            targets: resolution.clone(),
             target_evidence: metadata.evidence,
             bound_receiver: None,
-            environment: None,
+            environment,
         };
         let effect = if node.kind() == "lambda_expression" {
             SemanticEffect::CallableCreation { result, callable }
@@ -2237,14 +2803,32 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticEffect::CallableReference { result, callable }
         };
         self.append_effect(builder, entry, effect)?;
-        self.add_gap(
-            builder,
-            entry,
-            SemanticGapSubject::Value(result),
-            SemanticCapability::CallableReferences,
-            SemanticGapKind::Unknown,
-            "nested callable target mapping is not yet published",
-        )?;
+        if let (Some(target), Some(environment), Some(captured)) = (
+            target,
+            environment,
+            self.receiver.or(self.captured_receiver),
+        ) {
+            self.session.add_capture(
+                builder,
+                entry,
+                result,
+                target.id,
+                environment,
+                CaptureSource::Value(captured),
+                MemoryLocationId::new(0),
+                CaptureMode::Value,
+            )?;
+        }
+        if resolution == CallableTargetResolution::Unknown {
+            self.add_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Value(result),
+                SemanticCapability::CallableReferences,
+                SemanticGapKind::Unknown,
+                "nested callable target mapping is not yet published",
+            )?;
+        }
         self.edge(builder, entry, next)
     }
 
@@ -2262,9 +2846,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let qualifier = (!constructor_reference)
             .then(|| method_reference_qualifier(node))
             .flatten();
-        let result = self.value(builder, reference, SemanticValueKind::Callable)?;
+        let result =
+            self.expression_value(builder, node, reference, SemanticValueKind::Callable)?;
         let receiver = qualifier
-            .map(|_| self.value(builder, reference, SemanticValueKind::Receiver))
+            .map(|qualifier| {
+                self.expression_value(
+                    builder,
+                    qualifier,
+                    reference,
+                    expression_value_kind(qualifier),
+                )
+            })
             .transpose()?;
         let metadata = self.metadata(reference)?;
         self.append_effect(
@@ -2632,6 +3224,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .add_mapping(builder, anchor, SourceMappingKind::Exact)
     }
 
+    fn value_mapping(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<PointMetadata, JavaLoweringError> {
+        let anchor = source_anchor(node, 0).map_err(JavaLoweringError::Invalid)?;
+        self.session
+            .add_mapping(builder, anchor, SourceMappingKind::Exact)
+    }
+
     fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, JavaLoweringError> {
         self.session.metadata(point)
     }
@@ -2867,6 +3469,99 @@ fn missing_field(node: Node<'_>, field: &str) -> JavaLoweringError {
 
 fn node_text<'source>(source: &'source str, node: Node<'_>) -> Option<&'source str> {
     source.get(node.byte_range())
+}
+
+fn node_range(node: Node<'_>) -> Range {
+    Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+    }
+}
+
+fn is_java_nested_declaration(kind: &str) -> bool {
+    matches!(
+        kind,
+        "lambda_expression"
+            | "method_declaration"
+            | "constructor_declaration"
+            | "compact_constructor_declaration"
+            | "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration"
+    )
+}
+
+fn body_contains_free_this(body: Node<'_>) -> bool {
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "this" {
+            return true;
+        }
+        if node.id() != body.id() && is_java_nested_declaration(node.kind()) {
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
+fn java_local_scope(node: Node<'_>) -> Option<(usize, usize)> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "block"
+                | "constructor_body"
+                | "for_statement"
+                | "enhanced_for_statement"
+                | "switch_block_statement_group"
+                | "switch_rule"
+                | "catch_clause"
+        ) {
+            return Some((parent.start_byte(), parent.end_byte()));
+        }
+        if is_java_nested_declaration(parent.kind()) {
+            return Some((parent.start_byte(), parent.end_byte()));
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn formal_multiplicity(variadic: Option<FormalVariadicKind>) -> FormalMultiplicity {
+    match variadic {
+        None => FormalMultiplicity::One,
+        Some(FormalVariadicKind::Positional) => {
+            FormalMultiplicity::Rest(ArgumentDomain::Positional)
+        }
+        Some(FormalVariadicKind::Keyword) => FormalMultiplicity::Rest(ArgumentDomain::Keyword),
+        Some(FormalVariadicKind::Both) => {
+            FormalMultiplicity::Rest(ArgumentDomain::PositionalOrKeyword)
+        }
+    }
+}
+
+fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
+    match node.kind() {
+        "lambda_expression" | "method_reference" => SemanticValueKind::Callable,
+        "decimal_integer_literal"
+        | "hex_integer_literal"
+        | "octal_integer_literal"
+        | "binary_integer_literal"
+        | "decimal_floating_point_literal"
+        | "hex_floating_point_literal"
+        | "true"
+        | "false"
+        | "character_literal"
+        | "string_literal"
+        | "null_literal" => SemanticValueKind::Constant,
+        _ => SemanticValueKind::Temporary,
+    }
 }
 
 fn source_anchor(node: Node<'_>, occurrence: u32) -> Result<SourceAnchor, String> {

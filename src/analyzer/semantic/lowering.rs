@@ -9,13 +9,15 @@ use crate::hash::HashMap;
 
 use super::cfg::{ProcedureCfgBuilder, ScopeBinding, ScopeFrameId};
 use super::{
-    CallContinuationKind, CallSiteId, CallableTargetResolution, CancellationToken,
-    ControlContinuation, ControlEdge, ControlEdgeKind, Evidence, EvidenceCompleteness, EvidenceId,
-    ProcedureSemanticsParts, ProgramPointId, ProofStatus, SemanticBudget, SemanticBudgetExceeded,
-    SemanticCallArgument, SemanticCallSite, SemanticCapability, SemanticEffect, SemanticEvent,
-    SemanticGap, SemanticGapId, SemanticGapImpacts, SemanticGapKind, SemanticGapSubject,
-    SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRole, SemanticValue,
-    SemanticValueKind, SemanticWork, SourceAnchor, SourceMapping, SourceMappingId,
+    AllocationId, AllocationKind, AllocationSite, CallContinuationKind, CallSiteId,
+    CallableTargetResolution, CancellationToken, CaptureBinding, CaptureId, CaptureMode,
+    CaptureSource, ControlContinuation, ControlEdge, ControlEdgeKind, Evidence,
+    EvidenceCompleteness, EvidenceId, MemoryLocation, MemoryLocationId, MemoryLocationKind,
+    ProcedureId, ProcedureSemanticsParts, ProgramPointId, ProofStatus, SemanticBudget,
+    SemanticBudgetExceeded, SemanticCallArgument, SemanticCallSite, SemanticCapability,
+    SemanticEffect, SemanticEvent, SemanticGap, SemanticGapId, SemanticGapImpacts, SemanticGapKind,
+    SemanticGapSubject, SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRole,
+    SemanticValue, SemanticValueKind, SemanticWork, SourceAnchor, SourceMapping, SourceMappingId,
     SourceMappingKind, ValueId,
 };
 
@@ -151,6 +153,9 @@ pub(crate) struct ProcedureLoweringSession<'a> {
     next_source: usize,
     next_evidence: usize,
     next_value: usize,
+    next_allocation: usize,
+    next_memory_location: usize,
+    next_capture: usize,
     next_call_site: usize,
     next_gap: usize,
     source_occurrences: HashMap<(usize, usize), u32>,
@@ -249,6 +254,9 @@ impl<'a> ProcedureLoweringSession<'a> {
             next_source: 1,
             next_evidence: 1,
             next_value: 0,
+            next_allocation: 0,
+            next_memory_location: 0,
+            next_capture: 0,
             next_call_site: 0,
             next_gap: 0,
             source_occurrences: HashMap::default(),
@@ -369,6 +377,15 @@ impl<'a> ProcedureLoweringSession<'a> {
         kind: SemanticValueKind,
     ) -> Result<ValueId, ProcedureLoweringError> {
         let metadata = self.metadata(point)?;
+        self.add_value_with_metadata(builder, metadata, kind)
+    }
+
+    pub(crate) fn add_value_with_metadata(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        metadata: PointMetadata,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, ProcedureLoweringError> {
         let id = ValueId::try_from_index(self.next_value)
             .map_err(|_| ProcedureLoweringError::Invalid("too many semantic values".into()))?;
         builder.add_value(SemanticValue {
@@ -378,6 +395,84 @@ impl<'a> ProcedureLoweringSession<'a> {
             evidence: metadata.evidence,
         })?;
         self.next_value += 1;
+        Ok(id)
+    }
+
+    pub(crate) fn add_allocation(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        result: ValueId,
+        kind: AllocationKind,
+    ) -> Result<AllocationId, ProcedureLoweringError> {
+        let metadata = self.metadata(point)?;
+        let id = AllocationId::try_from_index(self.next_allocation)
+            .map_err(|_| ProcedureLoweringError::Invalid("too many allocations".into()))?;
+        builder.add_allocation(AllocationSite {
+            id,
+            point,
+            result,
+            kind,
+            source: metadata.source,
+            evidence: metadata.evidence,
+        })?;
+        self.next_allocation += 1;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::Allocation { allocation: id },
+        )?;
+        Ok(id)
+    }
+
+    pub(crate) fn add_memory_location(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        kind: MemoryLocationKind,
+    ) -> Result<MemoryLocationId, ProcedureLoweringError> {
+        let metadata = self.metadata(point)?;
+        let id = MemoryLocationId::try_from_index(self.next_memory_location)
+            .map_err(|_| ProcedureLoweringError::Invalid("too many memory locations".into()))?;
+        builder.add_memory_location(MemoryLocation {
+            id,
+            kind,
+            source: metadata.source,
+            evidence: metadata.evidence,
+        })?;
+        self.next_memory_location += 1;
+        Ok(id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn add_capture(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        callable: ValueId,
+        target: ProcedureId,
+        environment: AllocationId,
+        captured: CaptureSource,
+        destination: MemoryLocationId,
+        mode: CaptureMode,
+    ) -> Result<CaptureId, ProcedureLoweringError> {
+        let metadata = self.metadata(point)?;
+        let id = CaptureId::try_from_index(self.next_capture)
+            .map_err(|_| ProcedureLoweringError::Invalid("too many captures".into()))?;
+        builder.add_capture(CaptureBinding {
+            id,
+            point,
+            callable,
+            target,
+            environment,
+            captured,
+            destination,
+            mode,
+            source: metadata.source,
+            evidence: metadata.evidence,
+        })?;
+        self.next_capture += 1;
+        self.append_effect(builder, point, SemanticEffect::CaptureBind { capture: id })?;
         Ok(id)
     }
 

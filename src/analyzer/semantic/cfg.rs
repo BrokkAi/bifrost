@@ -3,10 +3,11 @@
 use crate::hash::{HashMap, HashSet};
 
 use super::{
-    BasicBlock, BlockId, ControlEdge, ControlEdgeKind, Evidence, EvidenceId,
-    ProcedureSemanticsParts, ProgramPoint, ProgramPointId, SemanticBudget, SemanticBudgetExceeded,
-    SemanticCallSite, SemanticEvent, SemanticGap, SemanticLocator, SemanticValue, SemanticWork,
-    SourceMapping, SourceMappingId,
+    AllocationId, AllocationKind, AllocationSite, BasicBlock, BlockId, CaptureBinding, CaptureId,
+    CaptureMode, ControlEdge, ControlEdgeKind, Evidence, EvidenceId, MemoryLocation,
+    MemoryLocationId, MemoryLocationKind, ProcedureSemanticsParts, ProgramPoint, ProgramPointId,
+    SemanticBudget, SemanticBudgetExceeded, SemanticCallSite, SemanticEvent, SemanticGap,
+    SemanticLocator, SemanticValue, SemanticWork, SourceMapping, SourceMappingId,
 };
 
 #[derive(Debug, Clone)]
@@ -155,6 +156,84 @@ impl ProcedureCfgBuilder {
             ..SemanticWork::default()
         })?;
         self.parts.values.push(value);
+        Ok(id)
+    }
+
+    pub(crate) fn add_allocation(
+        &mut self,
+        allocation: AllocationSite,
+    ) -> Result<AllocationId, SemanticBudgetExceeded> {
+        let id = AllocationId::try_from_index(self.parts.allocations.len())
+            .expect("allocation count is bounded by the u32 semantic budget");
+        assert_eq!(allocation.id, id, "allocations must use dense builder IDs");
+        let owned_text_bytes = match &allocation.kind {
+            AllocationKind::LanguageDefined(name) => name.len(),
+            AllocationKind::Object
+            | AllocationKind::Array
+            | AllocationKind::Callable
+            | AllocationKind::ClosureEnvironment
+            | AllocationKind::SharedCell => 0,
+        };
+        self.reserve(SemanticWork {
+            allocations: 1,
+            owned_text_bytes,
+            ..SemanticWork::default()
+        })?;
+        self.parts.allocations.push(allocation);
+        Ok(id)
+    }
+
+    pub(crate) fn add_memory_location(
+        &mut self,
+        location: MemoryLocation,
+    ) -> Result<MemoryLocationId, SemanticBudgetExceeded> {
+        let id = MemoryLocationId::try_from_index(self.parts.memory_locations.len())
+            .expect("memory-location count is bounded by the u32 semantic budget");
+        assert_eq!(
+            location.id, id,
+            "memory locations must use dense builder IDs"
+        );
+        let work = match &location.kind {
+            MemoryLocationKind::Field { member, .. } | MemoryLocationKind::Static { member } => {
+                locator_work(member, 1)
+            }
+            MemoryLocationKind::Index { .. }
+            | MemoryLocationKind::LexicalCell { .. }
+            | MemoryLocationKind::Capture { .. } => SemanticWork::default(),
+        };
+        self.reserve(combine_work(
+            SemanticWork {
+                memory_locations: 1,
+                ..SemanticWork::default()
+            },
+            work,
+        ))?;
+        self.parts.memory_locations.push(location);
+        Ok(id)
+    }
+
+    pub(crate) fn add_capture(
+        &mut self,
+        capture: CaptureBinding,
+    ) -> Result<CaptureId, SemanticBudgetExceeded> {
+        let id = CaptureId::try_from_index(self.parts.captures.len())
+            .expect("capture count is bounded by the u32 semantic budget");
+        assert_eq!(capture.id, id, "captures must use dense builder IDs");
+        let owned_text_bytes = match &capture.mode {
+            CaptureMode::LanguageDefined(name) => name.len(),
+            CaptureMode::Value
+            | CaptureMode::Move
+            | CaptureMode::SharedCell
+            | CaptureMode::MutableCell
+            | CaptureMode::Receiver
+            | CaptureMode::Unknown => 0,
+        };
+        self.reserve(SemanticWork {
+            captures: 1,
+            owned_text_bytes,
+            ..SemanticWork::default()
+        })?;
+        self.parts.captures.push(capture);
         Ok(id)
     }
 
