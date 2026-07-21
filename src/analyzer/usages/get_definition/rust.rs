@@ -1450,6 +1450,11 @@ fn resolve_rust_field(
     site: &ResolvedReferenceSite,
     cache: &mut RustTypeLookupCache,
 ) -> Option<DefinitionLookupOutcome> {
+    if let Some(outcome) =
+        rust_token_tree_dotted_member_outcome(analyzer, support, file, source, tree, site, cache)
+    {
+        return Some(outcome);
+    }
     if let Some(node) =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)
         && let Some(field_expression) = rust_enclosing_field_expression(node)
@@ -1522,10 +1527,11 @@ fn resolve_rust_field(
             Some(candidates_outcome(candidates))
         };
     }
-    rust_resolve_dotted_reference_text(analyzer, support, file, source, tree, site, cache)
+    None
 }
 
-fn rust_resolve_dotted_reference_text(
+#[allow(clippy::too_many_arguments)]
+fn rust_token_tree_dotted_member_outcome(
     analyzer: &dyn IAnalyzer,
     support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
@@ -1534,65 +1540,101 @@ fn rust_resolve_dotted_reference_text(
     site: &ResolvedReferenceSite,
     cache: &mut RustTypeLookupCache,
 ) -> Option<DefinitionLookupOutcome> {
-    let segments = reference_segments(site, ".", 1)?;
-    if segments.len() < 2 {
+    let focused =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
+    if focused.parent()?.kind() != "token_tree" || focused.prev_sibling()?.kind() != "." {
         return None;
     }
-    let focus_index = focus_segment_index(site, &segments)?;
-    if focus_index == 0 {
+
+    let mut chain = vec![focused];
+    let mut current = focused;
+    loop {
+        let Some(separator) = current.prev_sibling() else {
+            break;
+        };
+        if separator.kind() != "." {
+            break;
+        }
+        let Some(receiver) = separator.prev_sibling() else {
+            break;
+        };
+        if !matches!(receiver.kind(), "identifier" | "self") {
+            break;
+        }
+        chain.push(receiver);
+        current = receiver;
+    }
+    if chain.len() < 2 {
         return None;
     }
-    let base = &segments[0].0;
-    let mut owner = if base == "self" {
-        let node = smallest_named_node_covering(
-            tree.root_node(),
-            site.focus_start_byte,
-            site.focus_end_byte,
-        )?;
-        rust_enclosing_impl_type_fqn(analyzer, support, file, source, node)?
-    } else {
-        rust_binding_type_fqn(
-            analyzer,
-            support,
-            file,
-            source,
-            tree.root_node(),
-            base,
-            site.range.start_byte,
-            RustTypeMode::Direct,
-            cache,
-        )?
-    };
-    for (index, (member, _, _)) in segments.iter().enumerate().skip(1) {
-        let candidates = rust_member_candidates(
-            support.fqn(&format!("{owner}.{member}")),
-            RustMemberKind::Field,
-        );
-        if index == focus_index {
-            return if candidates.is_empty() {
-                Some(no_definition(
-                    "no_indexed_definition",
-                    format!("`{owner}.{member}` is not indexed as a Rust definition"),
-                ))
-            } else {
-                Some(candidates_outcome(candidates))
-            };
-        }
-        if candidates.is_empty() {
-            return None;
-        }
+    chain.reverse();
+
+    let root = chain[0];
+    let mut owner = rust_expression_type_fqn(
+        analyzer,
+        support,
+        file,
+        source,
+        tree.root_node(),
+        root,
+        focused.start_byte(),
+        cache,
+    )?;
+    for field in &chain[1..chain.len() - 1] {
+        let field_name = rust_node_text(*field, source).trim();
         owner = rust_field_type_fqn(
             analyzer,
             support,
             file,
             source,
             &owner,
-            member,
+            field_name,
             RustTypeMode::Direct,
             cache,
         )?;
     }
-    None
+
+    let member = rust_node_text(focused, source).trim();
+    let member_kind = if focused.next_sibling().is_some_and(|arguments| {
+        arguments.kind() == "token_tree"
+            && arguments.child(0).is_some_and(|open| open.kind() == "(")
+    }) {
+        RustMemberKind::Function
+    } else {
+        RustMemberKind::Field
+    };
+    let mut candidates =
+        rust_member_candidates(support.fqn(&format!("{owner}.{member}")), member_kind);
+    if candidates.is_empty() && member_kind == RustMemberKind::Function {
+        let rust = resolve_analyzer::<RustAnalyzer>(analyzer)?;
+        let refs = rust.forward_reference_context_of(file);
+        candidates =
+            match crate::analyzer::usages::rust_graph::resolve_trait_associated_item_matching(
+                rust,
+                support,
+                &refs,
+                file,
+                &owner,
+                member,
+                CodeUnit::is_function,
+            ) {
+                ReceiverAnalysisOutcome::Precise(resolved) => {
+                    rust_member_candidates(resolved, RustMemberKind::Function)
+                }
+                ReceiverAnalysisOutcome::Ambiguous(_)
+                | ReceiverAnalysisOutcome::Unknown
+                | ReceiverAnalysisOutcome::Unsupported { .. }
+                | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
+            };
+    }
+    if candidates.is_empty() {
+        Some(no_definition(
+            "no_indexed_definition",
+            format!("`{owner}.{member}` is not indexed as a Rust definition"),
+        ))
+    } else {
+        Some(candidates_outcome(candidates))
+    }
 }
 
 fn reference_segments(

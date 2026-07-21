@@ -5649,6 +5649,49 @@ fn fit_to_json(fit: &ModelFit) {
 }
 
 #[test]
+fn rust_dotted_method_chain_resolves_inside_macro_token_trees() {
+    let source = r#"
+macro_rules! render { ($($tt:tt)*) => {}; }
+
+pub struct AlertType;
+impl AlertType { pub fn default_title(&self) -> &'static str { "Alert" } }
+pub struct OtherAlertType;
+impl OtherAlertType { pub fn default_title(&self) -> &'static str { "Other" } }
+pub struct NodeAlert { pub alert_type: AlertType }
+pub struct OtherAlert { pub alert_type: OtherAlertType }
+
+fn format(alert: &NodeAlert, other: &OtherAlert) {
+    render!(alert.alert_type.default_title());
+    render!(other.alert_type.default_title());
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    for (expression, expected) in [
+        ("alert.alert_type.default_title", "AlertType.default_title"),
+        (
+            "other.alert_type.default_title",
+            "OtherAlertType.default_title",
+        ),
+    ] {
+        let start = source.find(expression).expect("macro member chain")
+            + expression.rfind('.').expect("terminal member")
+            + 1;
+        let value = lookup(
+            project.root(),
+            &location_reference("src/lib.rs", source, start),
+        );
+        assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+        assert_eq!(
+            value["results"][0]["definitions"][0]["fqn"], expected,
+            "{value}"
+        );
+    }
+}
+
+#[test]
 fn rust_qualified_macro_path_focus_resolves_each_exact_segment() {
     let source = r#"
 pub struct EventInfo;
