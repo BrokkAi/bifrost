@@ -34,10 +34,11 @@ use super::resolver::{
     LexicalTypeResolution, OrdinaryTypeImportCell, TargetKind, VisibilityIndex,
     VisibleMemberResolution, constructor_style_local_declaration, cpp_callable_arity,
     declarator_name_node, designated_initializer_owner, extract_variable_name, first_type_child,
-    infer_cpp_initializer_binding, infer_cpp_initializer_type, is_declaration_name,
-    is_declarator_node, is_nested_type_node, normalize_type_text,
+    function_terminal_node, infer_cpp_initializer_binding, infer_cpp_initializer_type,
+    is_declaration_name, is_declarator_node, is_nested_type_node, normalize_type_text,
     out_of_line_destructor_type_reference, out_of_line_member_definition_owner,
     recovered_macro_decorated_declarator_type, resolve_declaring_member_owner, same_visible_symbol,
+    type_reference_hit_node,
 };
 use super::syntax::explicit_qualified_callable_value;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
@@ -246,7 +247,7 @@ fn record_reference(
     }
     match node.kind() {
         "namespace_identifier" if recovered_macro_decorated_declarator_type(node).is_some() => {
-            record_type_reference(node, ctx);
+            record_type_reference(node, ctx, bindings);
         }
         // A type reference (`Foo x`, base class, `new Foo()`'s type child) resolves
         // to the class. `new Foo()` reaches its type via this case (its type child
@@ -277,7 +278,7 @@ fn record_reference(
             // A `X::m(..)` static/scoped call appears as a `qualified_identifier`
             // function: resolve the `X` qualifier as a type and emit `Owner.m`.
             if let Some(function) = scoped_free_function(node, ctx) {
-                ctx.record(function.fq_name(), node);
+                ctx.record(function.fq_name(), function_terminal_node(node));
                 return;
             }
             if let Some(call) = node.parent().filter(|parent| {
@@ -296,7 +297,7 @@ fn record_reference(
                     .call_arity_evidence(ctx.file, call, ctx.source)
                     .exact()
                 else {
-                    ctx.record_unproven(node_text(node, ctx.source), node);
+                    ctx.record_unproven(node_text(node, ctx.source), function_terminal_node(node));
                     return;
                 };
                 if let VisibleMemberResolution::Callable(constructors) = ctx
@@ -306,27 +307,31 @@ fn record_reference(
                         cpp_callable_arity(ctx.analyzer, constructor).accepts(call_arity)
                     })
                 {
-                    ctx.record(constructor.fq_name(), node);
+                    ctx.record(constructor.fq_name(), function_terminal_node(node));
                 } else {
-                    ctx.record(unit.fq_name(), node);
+                    ctx.record(unit.fq_name(), function_terminal_node(node));
                 }
                 return;
             }
             if let Some(owner) = scoped_call_owner(node, ctx) {
                 let member = scoped_call_member(node, ctx.source);
                 if !member.is_empty() {
-                    ctx.record(format!("{owner}.{member}"), node);
+                    ctx.record(format!("{owner}.{member}"), function_terminal_node(node));
                     return;
                 }
             }
-            record_type_reference(node, ctx);
+            record_type_reference(node, ctx, bindings);
         }
         "call_expression" => record_call(node, ctx, bindings),
         _ => {}
     }
 }
 
-fn record_type_reference(node: Node<'_>, ctx: &mut CppScan<'_, '_>) {
+fn record_type_reference(
+    node: Node<'_>,
+    ctx: &mut CppScan<'_, '_>,
+    bindings: &LocalInferenceEngine<CodeUnit>,
+) {
     match resolve_type_node_lexically(
         node,
         ctx.analyzer,
@@ -335,7 +340,10 @@ fn record_type_reference(node: Node<'_>, ctx: &mut CppScan<'_, '_>) {
         ctx.file,
         ctx.source,
     ) {
-        LexicalTypeResolution::Resolved { unit, .. } => ctx.record(unit.fq_name(), node),
+        LexicalTypeResolution::Resolved { unit, .. } => ctx.record(
+            unit.fq_name(),
+            type_reference_hit_node(node, ctx.file, ctx.source, bindings),
+        ),
         LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => {}
     }
 }

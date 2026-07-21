@@ -6217,12 +6217,18 @@ pub(super) fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
     false
 }
 
+/// Return the terminal identifier represented by a callable or type callee.
+///
+/// Qualified, scoped, template, and field wrappers are traversed through their
+/// grammar fields so both function calls and type constructions emit the token
+/// that names the referenced declaration.
 pub(super) fn function_terminal_node(mut node: Node<'_>) -> Node<'_> {
     loop {
         let next = match node.kind() {
-            "qualified_identifier" | "scoped_identifier" | "template_function" => {
-                node.child_by_field_name("name")
-            }
+            "qualified_identifier"
+            | "scoped_identifier"
+            | "template_function"
+            | "template_type" => node.child_by_field_name("name"),
             "field_expression" => node.child_by_field_name("field"),
             _ => None,
         };
@@ -6230,6 +6236,93 @@ pub(super) fn function_terminal_node(mut node: Node<'_>) -> Node<'_> {
             return node;
         };
         node = next;
+    }
+}
+
+/// Whether `node` is part of a call's callee expression, walking only through
+/// the grammar wrappers that can structurally contain that callee.
+pub(super) fn is_call_callee_node(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "call_expression" => {
+                return parent
+                    .child_by_field_name("function")
+                    .or_else(|| parent.named_child(0))
+                    == Some(node);
+            }
+            "qualified_identifier"
+            | "scoped_identifier"
+            | "template_function"
+            | "template_type"
+            | "field_expression" => node = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+pub(super) fn type_reference_hit_node<'tree, T: Clone + Eq + Hash>(
+    node: Node<'tree>,
+    file: &ProjectFile,
+    source: &str,
+    bindings: &LocalInferenceEngine<T>,
+) -> Node<'tree> {
+    if is_call_callee_node(node) {
+        return function_terminal_node(node);
+    }
+    if file.rel_path().extension().is_some_and(|ext| ext == "c") {
+        return node;
+    }
+    let mut current = node;
+    let declaration = loop {
+        let Some(parent) = current.parent() else {
+            return node;
+        };
+        if parent.kind() == "declaration" {
+            break parent;
+        }
+        if matches!(
+            parent.kind(),
+            "compound_statement" | "function_definition" | "lambda_expression"
+        ) {
+            return node;
+        }
+        current = parent;
+    };
+    let Some(_type_node) = declaration.child_by_field_name("type").filter(|type_node| {
+        type_node.start_byte() <= node.start_byte() && node.end_byte() <= type_node.end_byte()
+    }) else {
+        return node;
+    };
+    let mut cursor = declaration.walk();
+    let constructs_object = declaration.named_children(&mut cursor).any(|child| {
+        if child.kind() == "init_declarator" {
+            return child.child_by_field_name("value").is_some()
+                || first_named_child_of_kind(child, "initializer_list").is_some()
+                || first_named_child_of_kind(child, "compound_literal_expression").is_some();
+        }
+        let declarator = if is_declarator_node(child) {
+            Some(child)
+        } else {
+            None
+        };
+        declarator.is_some_and(|declarator| {
+            declarator.kind() == "function_declarator"
+                && has_ancestor_kind(declarator, "compound_statement")
+                && declarator
+                    .child_by_field_name("declarator")
+                    .is_some_and(|name| name.kind() == "identifier")
+                && declarator
+                    .child_by_field_name("parameters")
+                    .is_some_and(|parameters| {
+                        constructor_parameters_look_like_expressions(parameters, source, bindings)
+                    })
+        })
+    });
+    if constructs_object {
+        function_terminal_node(node)
+    } else {
+        node
     }
 }
 

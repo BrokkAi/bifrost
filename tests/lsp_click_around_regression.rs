@@ -1441,7 +1441,7 @@ void run() {
                 ClickOperation::References {
                     include_declaration: false,
                 },
-                ClickExpectation::Locations(&["make_derived_qualified_call", "make_derived_def"]),
+                ClickExpectation::Locations(&["make_derived_call", "make_derived_def"]),
             ),
             ClickCase::new(
                 "derived method declaration references out-of-line definition and typed calls",

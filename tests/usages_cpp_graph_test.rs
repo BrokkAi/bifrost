@@ -1084,7 +1084,7 @@ void run(parity::Sink& sink) {
     assert!(
         hits.iter()
             .any(|hit| hit.file == project.file("src/main.cpp")
-                && main_source[hit.start_offset..hit.end_offset] == *"parity::HandlerAlias"),
+                && main_source[hit.start_offset..hit.end_offset] == *"HandlerAlias"),
         "alias-typed declaration site should resolve through the alias: {selected_texts:?}"
     );
 
@@ -6811,6 +6811,84 @@ void consume() {
 }
 
 #[test]
+fn cpp_free_function_usage_ranges_select_only_terminal_identifiers() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "api.h",
+            r#"#pragma once
+namespace outer::inner {
+void run();
+template <typename T> T choose(T value);
+struct Handler { explicit Handler(int value); };
+using HandlerAlias = Handler;
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "api.h"
+namespace outer::inner {
+void consume() {
+    run();
+    ::outer::inner::run();
+    auto first = choose<int>(1);
+    auto cafe = "é"; auto second = ::outer::inner::choose<int>(2);
+    outer::inner::HandlerAlias handler(1);
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let run = function_definition(&analyzer, "run");
+    let choose = function_definition(&analyzer, "choose");
+    let handler = class_definition(&analyzer, "Handler");
+
+    let expected = |lines: &[(&str, &str)]| {
+        lines
+            .iter()
+            .map(|(line, token)| fixture_token_range(&source, line, token))
+            .collect::<BTreeSet<_>>()
+    };
+    let run_ranges = expected(&[("    run();", "run"), ("    ::outer::inner::run();", "run")]);
+    let choose_ranges = expected(&[
+        ("    auto first = choose<int>(1);", "choose"),
+        (
+            "    auto cafe = \"é\"; auto second = ::outer::inner::choose<int>(2);",
+            "choose",
+        ),
+    ]);
+    let handler_ranges =
+        expected(&[("    outer::inner::HandlerAlias handler(1);", "HandlerAlias")]);
+
+    let ranges = |target: &CodeUnit| {
+        let targeted =
+            authoritative_exact_ranges(&analyzer, std::slice::from_ref(target), &consumer);
+        let whole = UsageFinder::new()
+            .find_usages_default(&analyzer, std::slice::from_ref(target))
+            .all_hits_including_imports()
+            .into_iter()
+            .filter(|hit| hit.file == consumer)
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect::<BTreeSet<_>>();
+        (targeted, whole)
+    };
+
+    assert_eq!(ranges(&run), (run_ranges.clone(), run_ranges));
+    assert_eq!(
+        ranges(&choose),
+        (choose_ranges.clone(), choose_ranges.clone())
+    );
+    for (start, end) in choose_ranges {
+        assert_eq!(&source[start..end], "choose");
+        assert_eq!(end, start + "choose".len());
+    }
+    assert_eq!(ranges(&handler), (handler_ranges.clone(), handler_ranges));
+}
+
+#[test]
 fn authoritative_cpp_usage_lets_nearer_lexical_owner_veto_legacy_qualified_matches() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
         (
@@ -7046,8 +7124,8 @@ void consume() {
     let consumer = project.file("app/consumer.cc");
     let source = consumer.read_to_string().expect("consumer source");
     let call = source.find("demo::route(1)").expect("route call");
-    let start = call;
-    let end = start + "demo::route".len();
+    let start = call + "demo::".len();
+    let end = start + "route".len();
     let provider =
         ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
 
@@ -7175,8 +7253,8 @@ void consume(char selected) {
     let consumer = project.file("consumer.cc");
     let source = consumer.read_to_string().expect("consumer source");
     let call = source.find("demo::choose(&selected)").expect("choose call");
-    let start = call;
-    let end = start + "demo::choose".len();
+    let start = call + "demo::".len();
+    let end = start + "choose".len();
     let provider =
         ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
 
@@ -7423,8 +7501,8 @@ void consume() {
     let consumer = project.file("consumer.cc");
     let source = consumer.read_to_string().expect("consumer source");
     let expression = source.find("new views::Widget").expect("new expression");
-    let start = expression + "new ".len();
-    let end = start + "views::Widget".len();
+    let start = expression + "new views::".len();
+    let end = start + "Widget".len();
     let provider =
         ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
     let query = UsageFinder::new()
@@ -14034,10 +14112,7 @@ void wrong_namespace() {
     let widget_ranges = BTreeSet::from([
         range("using WidgetAlias = model::Widget;", "model::Widget"),
         range("    Widget(); // positive-unqualified", "Widget"),
-        range(
-            "    model::Widget(); // positive-qualified",
-            "model::Widget",
-        ),
+        range("    model::Widget(); // positive-qualified", "Widget"),
         range("    WidgetAlias(); // positive-alias", "WidgetAlias"),
         range("    auto heap = new Widget; // positive-new", "Widget"),
         range(
@@ -14052,7 +14127,7 @@ void wrong_namespace() {
         ),
         range(
             "    model::Box<int>(); // positive-qualified-template",
-            "model::Box<int>",
+            "Box",
         ),
         range(
             "    BoxAlias<int>(); // positive-alias-template",
@@ -14269,7 +14344,7 @@ void wrong_namespace() {
     );
     let qualified_constructed_call = range(
         "    model::Constructed(); // positive-qualified-constructor-function-only",
-        "model::Constructed",
+        "Constructed",
     );
     let (constructed_targeted, constructed_whole) = inverse_ranges(&constructed);
     assert!(!constructed_targeted.contains(&constructed_call));
