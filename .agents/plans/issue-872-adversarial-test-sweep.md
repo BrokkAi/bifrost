@@ -83,6 +83,9 @@ Bifrost needs tests that catch realistic failures in the analyzer, its persisten
 - Decision: focus the remaining active sweep on protocol/input boundaries and watcher lifecycle/incremental behavior; defer analyzer ambiguity work.
   Rationale: this is the requested scope split, keeping the next changes independently reviewable.
   Date/Author: 2026-07-21 / Codex.
+- Decision: lower the end-to-end JS/TS deadlock watchdog from 240 seconds to 60 seconds and use the PR's cross-platform CI results as the next measurement point.
+  Rationale: this is a liveness bound, not a performance assertion. The fixed path normally completes in seconds, while 60 seconds remains deliberately generous for constrained runners and reduces hung-job diagnosis by three minutes.
+  Date/Author: 2026-07-21 / Codex.
 
 ## Context and Orientation
 
