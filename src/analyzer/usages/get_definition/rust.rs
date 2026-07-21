@@ -1879,13 +1879,12 @@ fn rust_type_definition_candidates_for_fqn(
             .iter()
             .filter(|unit| unit.source() == file)
             .filter(|unit| {
-                analyzer.ranges(unit).iter().any(|range| {
-                    rust_definition_scope_visible_at(
-                        parsed.tree.root_node(),
-                        range.start_byte,
-                        reference_byte,
-                    )
-                })
+                rust_definition_scope_visible_at(
+                    analyzer,
+                    unit,
+                    parsed.tree.root_node(),
+                    reference_byte,
+                )
             })
             .cloned()
             .collect()
@@ -2551,13 +2550,16 @@ fn rust_local_type_fqn_visible_at(
         .into_iter()
         .filter(|unit| unit.is_class())
         .filter(|unit| {
-            analyzer.ranges(unit).iter().any(|range| {
-                rust_definition_scope_visible_at(tree.root_node(), range.start_byte, reference_byte)
-                    && lexical_scope::enclosing_mod_item_range_at(
-                        tree.root_node(),
-                        range.start_byte,
-                    ) == reference_mod
-            })
+            let Some(declaration) =
+                rust_code_unit_declaration_node(analyzer, unit, tree.root_node())
+            else {
+                return false;
+            };
+            rust_node_scope_visible_at(declaration, reference_byte)
+                && lexical_scope::enclosing_mod_item_range_at(
+                    tree.root_node(),
+                    declaration.start_byte(),
+                ) == reference_mod
         })
         .collect();
     sort_units(&mut candidates);
@@ -2566,15 +2568,18 @@ fn rust_local_type_fqn_visible_at(
 }
 
 fn rust_definition_scope_visible_at(
+    analyzer: &dyn IAnalyzer,
+    definition: &CodeUnit,
     root: Node<'_>,
-    definition_byte: usize,
     reference_byte: usize,
 ) -> bool {
-    let Some(definition_node) =
-        smallest_named_node_covering(root, definition_byte, definition_byte)
-    else {
+    let Some(definition_node) = rust_code_unit_declaration_node(analyzer, definition, root) else {
         return false;
     };
+    rust_node_scope_visible_at(definition_node, reference_byte)
+}
+
+fn rust_node_scope_visible_at(definition_node: Node<'_>, reference_byte: usize) -> bool {
     lexical_scope::enclosing_visibility_scope_range(definition_node)
         .is_none_or(|(start, end)| start <= reference_byte && reference_byte < end)
 }

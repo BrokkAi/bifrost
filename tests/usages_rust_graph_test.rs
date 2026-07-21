@@ -5286,10 +5286,19 @@ pub use service::{Cache, MemoryRepository};
 #[test]
 fn rust_graph_resolves_fields_on_explicitly_typed_same_fqn_local_receivers() {
     let target_source = r#"
-pub struct Args { pub log_format: usize, pub server_addr: usize }
-pub struct OtherArgs { pub log_format: usize, pub server_addr: usize }
+#[derive(FromArgs)]
+#[argh(description = "proxy")]
+pub struct Args {
+    #[argh(option)] log_format: usize,
+    #[argh(option)] server_addr: usize,
+}
+pub struct OtherArgs { log_format: usize, server_addr: usize }
 
-fn run(args: Args, other: OtherArgs) {
+fn make_args() -> Args { todo!() }
+fn make_other() -> OtherArgs { todo!() }
+fn run() {
+    let args: Args = make_args();
+    let other: OtherArgs = make_other();
     let _ = args.log_format;
     let _ = args.server_addr;
     let _ = other.log_format;
@@ -5297,9 +5306,15 @@ fn run(args: Args, other: OtherArgs) {
 }
 "#;
     let sibling_source = r#"
-pub struct Args { pub log_format: usize, pub server_addr: usize }
+#[derive(FromArgs)]
+pub struct Args {
+    #[argh(option)] log_format: usize,
+    #[argh(option)] server_addr: usize,
+}
 
-fn run(args: Args) {
+fn make_args() -> Args { todo!() }
+fn run() {
+    let args: Args = make_args();
     let _ = args.log_format;
     let _ = args.server_addr;
 }

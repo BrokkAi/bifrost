@@ -395,7 +395,10 @@ pub(super) fn scan_files_for_member_target(
     seeds: &RustBindingSeeds,
     cancellation: Option<&CancellationToken>,
 ) -> RustMemberScanResult {
-    let Some(owner) = rust.parent_of(target) else {
+    let Some(owner) = rust
+        .structural_parent_of(target)
+        .or_else(|| rust.parent_of(target))
+    else {
         return RustMemberScanResult::default();
     };
     let member_name = target.identifier().to_string();
@@ -486,7 +489,8 @@ pub(super) fn scan_files_for_member_target(
             target_is_field: requested_target.is_field(),
             target_is_enum_variant: requested_target.is_field()
                 && rust
-                    .parent_of(requested_target)
+                    .structural_parent_of(requested_target)
+                    .or_else(|| rust.parent_of(requested_target))
                     .is_some_and(|owner| rust.is_rust_enum_declaration(&owner)),
             target_owner_is_trait: trait_owner,
             receiver_names: &receiver_names,
