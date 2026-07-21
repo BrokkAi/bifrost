@@ -30,6 +30,7 @@ import {
   releaseAssetFor,
   releaseTargetFor,
   resolveBifrostBinary,
+  resolveBifrostLaunch,
   resolveWorkspaceRoot,
   sha256
 } from "../bin/bifrost-launcher.mjs";
@@ -419,6 +420,38 @@ printf '%s\\n' "$@" > "${recordPath}"
     ["--mcp", "symbol|extended"]
   );
   assert.equal(command.startsWith(repoRoot), true);
+});
+
+test("resolves an explicit reusable launch without allowing env root override", async () => {
+  const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost-launcher-test-"));
+  const workspace = path.join(temp, "workspace");
+  const otherWorkspace = path.join(temp, "other");
+  const binaryPath = path.join(temp, process.platform === "win32" ? "bifrost.exe" : "bifrost");
+  await fsp.mkdir(workspace);
+  await fsp.mkdir(otherWorkspace);
+  await fsp.writeFile(binaryPath, "#!/bin/sh\nexit 0\n");
+  if (process.platform !== "win32") {
+    await fsp.chmod(binaryPath, 0o755);
+  }
+  const env = {
+    BIFROST_BINARY_PATH: binaryPath,
+    BIFROST_WORKSPACE_ROOT: otherWorkspace,
+    BIFROST_LAUNCHER_AUTO_INSTALL: "0"
+  };
+
+  const resolved = await resolveBifrostLaunch({
+    root: workspace,
+    env,
+    toolset: "symbol|extended",
+    metadata: { binaryVersion: "0.8.4", archiveSha256: {} },
+    execFileImpl: async () => ({ stdout: "bifrost 0.8.4\n", stderr: "" })
+  });
+
+  assert.equal(resolved.command, binaryPath);
+  assert.equal(resolved.cwd, path.resolve(workspace));
+  assert.equal(resolved.env, env);
+  assert.equal(resolved.source, "explicit");
+  assert.deepEqual(resolved.args, ["--root", path.resolve(workspace), "--mcp", "symbol|extended"]);
 });
 
 test("builds final Bifrost MCP args with explicit root and toolset", () => {

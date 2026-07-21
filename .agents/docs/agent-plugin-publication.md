@@ -91,6 +91,67 @@ code-intelligence skills aligned with the default Bifrost MCP toolset, and keep
 the workflow skills and agents in the same plugin so `brokk@bifrost` remains a
 single installable bundle for code intelligence plus GitHub/review workflows.
 
+## Pi package
+
+`plugins/bifrost-agent/package.json` also makes the shared directory a Pi
+package named `@brokk/bifrost-agent`. Its `pi` manifest exposes the native
+TypeScript extension under `extensions/` and exactly the three canonical
+generic skills: navigation, code reading, and codebase search. Do not expose
+the generated Codex or Amp skill trees through Pi, and do not copy the
+canonical skills into a Pi-specific directory.
+
+The Pi extension imports the launch-resolution functions from
+`bin/bifrost-launcher.mjs`, then gives the resolved Bifrost binary directly to
+the reviewed, pinned MCP SDK. This keeps binary selection, version checks,
+release checksums, managed cache behavior, and `BIFROST_BINARY_PATH` aligned
+across every host while allowing the SDK to own the child's stdio and shutdown.
+Keep `package.json`, `package-lock.json`, `bifrost-release.json`, and
+`Cargo.toml` version-aligned. Changes to the MCP SDK require a deliberate
+version update and process-boundary test review.
+
+Pi registers every discovered MCP operation as `bifrost_<canonical-name>` and
+forwards the canonical name over MCP. Keep the short `before_agent_start`
+namespace clarification in the extension instead of forking the canonical
+skills. The `/bifrost` SettingsList controls a Pi-local capability model over
+Bifrost's existing server toolsets. Its default is symbols, structural queries,
+and file discovery; quality, Git, text, and transforms are optional. Do not add
+workspace lifecycle tools to this UI. Semantic search is absent because normal
+release binaries do not include the `nlp` feature. Per-workspace
+selections live in independent hashed files under the Pi agent directory at
+`bifrost/workspaces/`, not in the analyzed repository. Separate files prevent
+concurrent Pi sessions for different workspaces from losing each other's
+settings. Malformed settings fail closed: notify and start disabled when Pi supplies a UI
+context, but throw before Bifrost starts in modes without one. Pi's post-filter
+active tool set, not the requested names, determines the Bifrost tool count and whether
+the namespace prompt note appears. Route interactive extension failures through
+the current `ExtensionContext` with `ctx.ui.notify(..., "error")`, and throw
+startup errors through Pi's extension runner in modes without a UI context. Render
+Bifrost results with Pi's compact five-visual-line TUI preview and normal expand
+shortcut, independently cap model-visible text at 2,000 lines or 50 KB, and save
+complete oversized text to a dedicated temporary overflow file. Never use
+`console.log` or `console.error` from the Pi extension because direct terminal
+writes corrupt or displace TUI output.
+
+Release CI publishes the existing GitHub release first, then a dedicated Pi
+job runs `npm ci`, `npm test`, `npm run check`, and the packed-install smoke in
+`plugins/bifrost-agent` before attaching the npm tarball. The Pi job does not
+change the existing VS Code packaging or Marketplace publication sequence.
+Publishing `@brokk/bifrost-agent` to npm remains a separate credentialed action
+until the repository has an approved npm trusted publisher or token. Do not
+document npm installation as available until that publication is configured
+and the matching version exists in the registry.
+Local validation and pre-publication inspection use:
+
+```bash
+cd plugins/bifrost-agent
+npm ci
+npm test
+npm run check
+npm run test:packed
+npm pack --dry-run
+npm publish --dry-run
+```
+
 ## Local testing
 
 Build the local binary:
@@ -201,8 +262,9 @@ claude plugin validate .
 - The macOS release smoke downloads the published agent-plugin archive, starts
   from an empty launcher cache, runs `prepare --json`, and requires the
   packaged MCP server to advertise `search_symbols` through `tools/list`.
-- Confirm the release workflow uploads `bifrost-agent-<tag>.tar.gz` after
-  preparing `plugins/bifrost-agent/bifrost-release.json`.
+- Confirm the release workflow uploads `bifrost-agent-<tag>.tar.gz` after one
+  checksum preparation writes both `editors/vscode/package.json` and
+  `plugins/bifrost-agent/bifrost-release.json` from the same release sidecars.
 - Package the Codex Agent Plugin from `plugins/bifrost-agent` with
   `.codex-plugin/plugin.json`, `.mcp.json`, `bifrost-release.json`, `bin/`,
   `skills/`, `agents/`, and `assets/icon.png`.

@@ -243,6 +243,71 @@ jobs:
         shell: bash
         run: bash scripts/announce-discord-release.sh
 
+  pi-package:
+    name: Pi package
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.tag }}
+        run: scripts/resolve-release-tag.sh
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: plugins/bifrost-agent/package-lock.json
+
+      - name: Install Pi package dependencies
+        run: npm ci
+        working-directory: plugins/bifrost-agent
+
+      - name: Prepare Pi release metadata
+        run: >
+          node scripts/prepare-vscode-extension-manifest.mjs
+          --version "${{ steps.tag.outputs.version }}"
+          --plugin-release plugins/bifrost-agent/bifrost-release.json
+          --dist dist
+
+      - name: Test Pi package
+        run: npm test
+        working-directory: plugins/bifrost-agent
+
+      - name: Check Pi package
+        run: npm run check
+        working-directory: plugins/bifrost-agent
+
+      - name: Test packed Pi package install
+        run: npm run test:packed
+        working-directory: plugins/bifrost-agent
+
+      - name: Package Pi package
+        run: npm pack --pack-destination ../../dist
+        working-directory: plugins/bifrost-agent
+
+      - name: Upload Pi package artifact to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          files: dist/brokk-bifrost-agent-*.tgz
+
   vscode:
     name: vscode extension
     needs: release

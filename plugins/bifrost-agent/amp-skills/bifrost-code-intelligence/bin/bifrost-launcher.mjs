@@ -745,6 +745,24 @@ export function buildBifrostArgs(root, toolset, passThrough = []) {
   return [...rootArgs, "--mcp", toolset || DEFAULT_TOOLSET, ...passThrough];
 }
 
+export async function resolveBifrostLaunch(options = {}) {
+  const env = options.env ?? process.env;
+  const root = await resolveWorkspaceRoot({
+    env: {},
+    argvRoot: options.root,
+    cwd: options.root,
+    allowCwdFallback: false
+  });
+  const binary = await resolveBifrostBinary({ ...options, env });
+  return {
+    command: binary.path,
+    args: buildBifrostArgs(root, options.toolset, options.passThrough),
+    cwd: root,
+    env,
+    source: binary.source
+  };
+}
+
 export function spawnBifrost(binaryPath, args, options = {}) {
   const child = spawn(binaryPath, args, {
     cwd: options.cwd,
@@ -817,11 +835,16 @@ async function main() {
       cwd: process.cwd(),
       allowCwdFallback: false
     });
-    const binary = await resolveBifrostBinary(installProgressHandlers());
-    const args = buildBifrostArgs(root, parsed.toolset, parsed.passThrough);
-    spawnBifrost(binary.path, args, {
-      cwd: root ?? process.cwd(),
-      env: process.env
+    const launch = await resolveBifrostLaunch({
+      ...installProgressHandlers(),
+      root,
+      env: process.env,
+      toolset: parsed.toolset,
+      passThrough: parsed.passThrough
+    });
+    spawnBifrost(launch.command, launch.args, {
+      cwd: launch.cwd,
+      env: launch.env
     });
   } catch (error) {
     if (error instanceof LauncherError) {
