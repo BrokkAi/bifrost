@@ -1,13 +1,15 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tree_sitter::{Node, Tree};
 
 use crate::analyzer::common::{language_for_file, source_identifier_for_target};
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
+use crate::text_utils::compute_line_starts;
 
 pub(crate) struct DeclarationNameRangeContext {
     content: Arc<String>,
+    line_starts: OnceLock<Vec<usize>>,
     tree: Option<Tree>,
 }
 
@@ -16,11 +18,20 @@ impl DeclarationNameRangeContext {
         let language = language_for_file(file);
         let content = Arc::new(content);
         let tree = parse_tree_for_language(file, language, content.as_str());
-        Self { content, tree }
+        Self {
+            content,
+            line_starts: OnceLock::new(),
+            tree,
+        }
     }
 
     pub(crate) fn content(&self) -> &str {
         &self.content
+    }
+
+    pub(crate) fn line_starts(&self) -> &[usize] {
+        self.line_starts
+            .get_or_init(|| compute_line_starts(&self.content))
     }
 
     pub(crate) fn shared_content(&self) -> Arc<String> {
@@ -37,6 +48,20 @@ impl DeclarationNameRangeContext {
         code_unit: &CodeUnit,
     ) -> Option<Range> {
         self.name_ranges(analyzer, code_unit).into_iter().next()
+    }
+
+    pub(crate) fn name_range_for_declaration(
+        &self,
+        code_unit: &CodeUnit,
+        declaration_range: Range,
+    ) -> Option<Range> {
+        let root = self.root_node()?;
+        code_unit_declaration_name_range_for_range(
+            &self.content,
+            root,
+            code_unit,
+            declaration_range,
+        )
     }
 
     pub(crate) fn name_ranges(&self, analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<Range> {
@@ -87,7 +112,7 @@ fn code_unit_declaration_name_ranges_in_tree(
         .collect()
 }
 
-fn code_unit_declaration_name_range_for_range(
+pub(crate) fn code_unit_declaration_name_range_for_range(
     content: &str,
     root: Node<'_>,
     code_unit: &CodeUnit,
@@ -114,7 +139,7 @@ fn declaration_source_identifier(code_unit: &CodeUnit) -> &str {
 /// nodes share that exact span, return the deepest one. The shallow wrapper
 /// often carries no `name` field, so returning it would defeat declaration-name
 /// resolution.
-fn node_for_exact_range<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
+pub(crate) fn node_for_exact_range<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
     let mut best: Option<Node<'tree>> = None;
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {

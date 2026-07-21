@@ -2358,26 +2358,6 @@ class Foo:
         .expect("graph should not overflow on deep attribute expressions");
 }
 
-#[test]
-#[ignore = "Brokk parity marker: cachedDefinitionsByIdentifierFindsBareTopLevelFunction"]
-fn parity_cached_definitions_by_identifier_finds_bare_top_level_function() {
-    // No direct bifrost helper yet; keep as a parity marker until a Rust-side helper
-    // equivalent exists or this assertion is folded into another public-facing surface.
-    panic!("parity marker only");
-}
-
-#[test]
-#[ignore = "Brokk parity marker: cachedDefinitionsByIdentifierFindsMemberIdentifierFallback"]
-fn parity_cached_definitions_by_identifier_finds_member_identifier_fallback() {
-    panic!("parity marker only");
-}
-
-#[test]
-#[ignore = "Brokk parity marker: cachedExactMemberResolvesOnlyWithinSourceFile"]
-fn parity_cached_exact_member_resolves_only_within_source_file() {
-    panic!("parity marker only");
-}
-
 // --- Same-file member-usage regressions (Bug 2a / Bug 2b) ---
 
 /// UsageFinder hit count for `fq` defined and used within a single file `m.py`.

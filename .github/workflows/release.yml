@@ -35,6 +35,9 @@ jobs:
       - name: Install pinned cargo-about
         run: cargo install --locked cargo-about --version 0.9.1 --features cli
 
+      - name: Fetch locked dependencies for offline notice report
+        run: cargo fetch --locked
+
       - name: Generate Rust notice report
         run: scripts/generate-rust-third-party-notices.sh dist/THIRD_PARTY_LICENSES.html
 
@@ -323,3 +326,124 @@ jobs:
         working-directory: editors/vscode
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+  agent-plugin-release-smoke:
+    name: packaged agent plugin smoke
+    needs: vscode
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout release scripts
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.tag }}
+        run: scripts/resolve-release-tag.sh
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Download packaged agent plugin
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_dir="${RUNNER_TEMP}/bifrost-agent-release"
+          mkdir -p "$release_dir"
+          gh release download "${{ steps.tag.outputs.name }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz" \
+            --dir "$release_dir"
+          tar -C "$release_dir" -xzf "$release_dir/bifrost-agent-${{ steps.tag.outputs.name }}.tar.gz"
+
+      - name: Smoke packaged launcher and MCP
+        shell: bash
+        run: >
+          node scripts/smoke-agent-plugin-release.mjs
+          --plugin-dir "${RUNNER_TEMP}/bifrost-agent-release/bifrost-agent"
+          --workspace "$GITHUB_WORKSPACE"
+          --cache-dir "${RUNNER_TEMP}/bifrost-agent-cold-cache"
+
+  sync-agent-plugin-release-metadata:
+    name: sync generated agent plugin metadata
+    needs: [vscode, agent-plugin-release-smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: agent-plugin-release-metadata-master
+      cancel-in-progress: false
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v5
+        with:
+          ref: master
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.tag }}
+        run: scripts/resolve-release-tag.sh
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Confirm master is the released version
+        run: node scripts/check-release-version.mjs "${{ steps.tag.outputs.version }}"
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Prepare generated release metadata
+        run: >
+          node scripts/prepare-vscode-extension-manifest.mjs
+          --version "${{ steps.tag.outputs.version }}"
+          --plugin-release plugins/bifrost-agent/bifrost-release.json
+          --dist dist
+
+      - name: Regenerate Amp skill bundle
+        run: node scripts/generate-amp-skill-bundle.mjs
+
+      - name: Validate agent plugin manifests
+        run: node scripts/check-codex-plugin-manifest.mjs
+
+      - name: Reject non-metadata generated changes
+        shell: bash
+        run: |
+          allowed_canonical="plugins/bifrost-agent/bifrost-release.json"
+          allowed_amp="plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/bifrost-release.json"
+          while IFS= read -r changed_file; do
+            [ -z "$changed_file" ] && continue
+            if [ "$changed_file" != "$allowed_canonical" ] && [ "$changed_file" != "$allowed_amp" ]; then
+              echo "Refusing to commit unexpected generated change: $changed_file" >&2
+              exit 1
+            fi
+          done < <(git diff --name-only)
+
+      - name: Commit generated metadata
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "Generated agent plugin metadata is already current."
+            exit 0
+          fi
+          git add -- plugins/bifrost-agent/bifrost-release.json \
+            plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/bifrost-release.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: sync agent plugin release metadata for ${{ steps.tag.outputs.name }}"
+          git push origin HEAD:master

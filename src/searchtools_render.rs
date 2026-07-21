@@ -652,11 +652,16 @@ fn render_usage_file_groups_text(files: &[UsageFileGroup], indent: bool) -> Vec<
 }
 
 fn render_usage_location_text(hit: &UsageLocation, prefix: &str) -> Vec<String> {
-    let location = hit
-        .line_range
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| hit.line.to_string());
+    let location = match (hit.column, hit.end_line, hit.end_column) {
+        (Some(column), Some(end_line), Some(end_column)) => {
+            format!("{}:{column}-{end_line}:{end_column}", hit.line)
+        }
+        _ => hit
+            .line_range
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| hit.line.to_string()),
+    };
     let mut line = format!("{prefix}  line {location}");
     if !hit.enclosing.is_empty() {
         line.push_str(&format!(" in {}", hit.enclosing));

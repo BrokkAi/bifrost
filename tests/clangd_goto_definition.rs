@@ -168,12 +168,12 @@ fn clangd_def_field() {
     );
 }
 
-// clangd LocateSymbol.All "Method call": `bar.x()` resolves to the method decl.
+// clangd LocateSymbol.All "Method call": `bar.x()` resolves to the method body.
 #[test]
 fn clangd_def_method_call() {
     assert_resolves_to_line(
         "a.cpp",
-        "struct Foo { int x(); };\nint main() {\n    Foo bar;\n    bar.<caret>x();\n}\n",
+        "struct Foo { int x() { return 1; } };\nint main() {\n    Foo bar;\n    bar.<caret>x();\n}\n",
         0,
     );
 }

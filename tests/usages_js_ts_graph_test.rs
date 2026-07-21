@@ -3262,14 +3262,6 @@ fn js_commonjs_module_object_uses_exported_alias_name() {
 // tsconfig/jsconfig `paths` + `baseUrl` alias resolution acceptance tests live in
 // `usages_js_ts_path_alias_test.rs`.
 
-#[test]
-#[ignore = "Brokk parity marker: external frontier reporting needs a richer result model than bifrost v1"]
-fn parity_external_frontier_reporting_is_follow_up_work() {}
-
-#[test]
-#[ignore = "Brokk parity marker: cross-query caches and thread-safety hardening are follow-up work"]
-fn parity_jsts_cache_and_thread_safety_hardening_is_follow_up_work() {}
-
 // --- Phase 5: analyzer-cached JsTsUsageIndex invalidation guards (issue #191) ---
 //
 // The JS/TS resolution maps are now cached on the analyzer and reused across queries, so

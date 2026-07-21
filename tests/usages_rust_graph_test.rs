@@ -4532,7 +4532,7 @@ fn run() {
     consume!({ other_task::spawn(); });
 }
 "#;
-    let (_project, analyzer) = rust_analyzer_with_files(&[
+    let (project, analyzer) = rust_analyzer_with_files(&[
         ("src/lib.rs", lib_source),
         ("src/task.rs", "pub fn spawn() {}\n"),
         ("src/other_task.rs", "pub fn spawn() {}\n"),
@@ -4585,9 +4585,10 @@ fn run() {
     ] {
         let target = definition(&analyzer, target_fqn);
         let hits = authoritative_hits(&analyzer, &target, candidates.clone());
+        let expected_file = project.file(file);
         let actual: Vec<_> = hits
             .iter()
-            .filter(|hit| hit.file.rel_path().to_string_lossy() == file)
+            .filter(|hit| hit.file == expected_file)
             .map(|hit| (hit.start_offset, hit.end_offset))
             .collect();
         assert!(
@@ -4614,7 +4615,7 @@ macro_rules! call_other_task {
     () => { $crate::other_task::spawn(); };
 }
 "#;
-    let (_project, analyzer) = rust_analyzer_with_files(&[
+    let (project, analyzer) = rust_analyzer_with_files(&[
         ("src/lib.rs", source),
         ("src/task.rs", "pub fn spawn() {}\n"),
         ("src/other_task.rs", "pub fn spawn() {}\n"),
@@ -4627,7 +4628,7 @@ macro_rules! call_other_task {
         source.find("$crate::other_task").expect("decoy crate path") + "$crate::".len();
     let actual: Vec<_> = hits
         .iter()
-        .filter(|hit| hit.file.rel_path().to_string_lossy() == "src/lib.rs")
+        .filter(|hit| hit.file == project.file("src/lib.rs"))
         .map(|hit| (hit.start_offset, hit.end_offset))
         .collect();
 

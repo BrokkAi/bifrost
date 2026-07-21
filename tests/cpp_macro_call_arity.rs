@@ -110,30 +110,49 @@ TSNode extract_cpp_only(TSNode node) {
     let line_start = source[..expected.0]
         .rfind('\n')
         .map_or(0, |newline| newline + 1);
-    let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+    let query = brokk_bifrost::searchtools::DefinitionReferenceQuery {
+        path: "extract_channels.c".to_string(),
+        line: Some(line_number),
+        column: Some(source[line_start..expected.0].chars().count() + 1),
+    };
+    let declaration = brokk_bifrost::searchtools::get_declarations_by_location(
         &analyzer,
         brokk_bifrost::searchtools::GetDefinitionParams {
-            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
-                path: "extract_channels.c".to_string(),
-                line: Some(line_number),
-                column: Some(source[line_start..expected.0].chars().count() + 1),
-            }],
+            references: vec![query.clone()],
         },
     )
     .results
     .into_iter()
     .next()
-    .expect("one faithful forward result");
-    assert_eq!(forward.status, "resolved", "{forward:#?}");
+    .expect("one faithful declaration result");
+    assert_eq!(declaration.status, "resolved", "{declaration:#?}");
     assert!(
-        forward.definitions.iter().any(|definition| {
-            definition.path == "tree_sitter/api.h"
-                && definition
+        declaration.declarations.iter().any(|candidate| {
+            candidate.path == "tree_sitter/api.h"
+                && candidate
                     .signature
                     .as_deref()
                     .is_some_and(|signature| signature_arity(signature) == 3)
         }),
-        "forward must retain the included declaration: {forward:#?}"
+        "declaration navigation must retain the included prototype: {declaration:#?}"
+    );
+    let definition = brokk_bifrost::searchtools::get_definitions_by_location(
+        &analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![query],
+        },
+    )
+    .results
+    .into_iter()
+    .next()
+    .expect("one faithful definition result");
+    assert_eq!(definition.status, "resolved", "{definition:#?}");
+    assert!(
+        definition
+            .definitions
+            .iter()
+            .any(|candidate| candidate.path == "node.c"),
+        "definition navigation must select the implementation body: {definition:#?}"
     );
     let cpp_only_line = "    return cpp_only_child_by_field_name(node, TS_FIELD(\"value\"));";
     let cpp_only = token_range(&source, cpp_only_line, "cpp_only_child_by_field_name");
