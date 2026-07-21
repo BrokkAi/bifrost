@@ -30,7 +30,7 @@ pub(in crate::analyzer::usages) use resolver::{
     LexicalTypeResolution as CppLexicalTypeResolution, TargetKind as CppTargetKind,
     VisibilityIndex as CppVisibilityIndex, argument_children as cpp_argument_children,
     constructor_type_node as cpp_constructor_type_node, cpp_function_return_type_text,
-    cpp_name_for, cpp_reference_fqn_candidates,
+    cpp_name_for, cpp_reference_fqn_candidates, cpp_type_name_components,
     designated_initializer_owner as cpp_designated_initializer_owner, extract_variable_name,
     field_declared_type_binding as cpp_field_declared_type_binding,
     first_type_child as cpp_first_type_child, is_declaration_name as cpp_is_declaration_name,

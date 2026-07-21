@@ -5445,6 +5445,146 @@ namespace Demo {
 }
 
 #[test]
+fn usage_finder_csharp_resolves_base_receiver_to_logical_direct_class_base() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Demo/Hierarchy.cs",
+            r#"namespace Demo;
+
+public interface AFirstContract {}
+
+public class RootMapping {
+    protected virtual void BuildBody(int value) {}
+    protected virtual void BuildBody(int value, int other) {}
+}
+
+public partial class BaseMapping : RootMapping {
+    protected override void BuildBody(int value) {}
+}
+"#,
+        ),
+        (
+            "Demo/BaseMapping.Part.cs",
+            r#"namespace Demo;
+
+public partial class BaseMapping {}
+"#,
+        ),
+        (
+            "Demo/DerivedMapping.Base.cs",
+            r#"namespace Demo;
+
+public sealed partial class DerivedMapping : BaseMapping {}
+"#,
+        ),
+        (
+            "Demo/DerivedMapping.Calls.cs",
+            r#"namespace Demo;
+
+public sealed partial class DerivedMapping : AFirstContract {
+    protected override void BuildBody(int value, int other) {}
+
+    public void Run() {
+        base.BuildBody(1, 2);
+        this.BuildBody(3, 4);
+        BuildBody(5, 6);
+    }
+}
+
+public sealed class UnrelatedMapping {
+    private void BuildBody(int value, int other) {}
+    public void Run() => this.BuildBody(7, 8);
+}
+"#,
+        ),
+    ]);
+
+    let consumer = project.file("Demo/DerivedMapping.Calls.cs");
+    let source = consumer.read_to_string().expect("consumer source");
+    let base_call = source.find("base.BuildBody").expect("base call") + "base.".len();
+    let this_call = source.find("this.BuildBody").expect("this call") + "this.".len();
+    let unqualified_call = source.find("BuildBody(5, 6)").expect("unqualified call");
+    let unrelated_call =
+        source.find("this.BuildBody(7, 8)").expect("unrelated call") + "this.".len();
+
+    let base_target = member_function_with_arity(&analyzer, "Demo.RootMapping", "BuildBody", 2);
+    let derived_target =
+        member_function_with_arity(&analyzer, "Demo.DerivedMapping", "BuildBody", 2);
+    let unrelated_target =
+        member_function_with_arity(&analyzer, "Demo.UnrelatedMapping", "BuildBody", 2);
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    let forward = definition_lookup(
+        project.root(),
+        "Demo/DerivedMapping.Calls.cs",
+        base_call,
+        base_call + "BuildBody".len(),
+    );
+    assert_eq!(forward["results"][0]["status"], "resolved", "{forward}");
+    assert_eq!(
+        forward["results"][0]["definitions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "{forward}"
+    );
+    assert_eq!(
+        forward["results"][0]["definitions"][0]["fqn"], "Demo.RootMapping.BuildBody",
+        "{forward}"
+    );
+    assert_eq!(
+        forward["results"][0]["definitions"][0]["signature"], "(int, int)",
+        "{forward}"
+    );
+
+    let targeted = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&base_target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result
+        .into_either()
+        .expect("targeted base-qualified query should resolve");
+    let whole_workspace = UsageFinder::new()
+        .query(&analyzer, std::slice::from_ref(&base_target), 1000, 1000)
+        .result
+        .into_either()
+        .expect("whole-workspace base-qualified query should resolve");
+    for hits in [&targeted, &whole_workspace] {
+        assert_eq!(hits.len(), 1, "{hits:#?}");
+        assert!(hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= base_call
+                && base_call + "BuildBody".len() <= hit.end_offset
+        }));
+    }
+
+    let derived_hits = graph_hits(&analyzer, &derived_target);
+    assert_eq!(derived_hits.len(), 2, "{derived_hits:#?}");
+    for expected in [this_call, unqualified_call] {
+        assert!(derived_hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= expected
+                && expected + "BuildBody".len() <= hit.end_offset
+        }));
+    }
+
+    let unrelated_hits = graph_hits(&analyzer, &unrelated_target);
+    assert_eq!(unrelated_hits.len(), 1, "{unrelated_hits:#?}");
+    assert!(unrelated_hits.iter().any(|hit| {
+        hit.file == consumer
+            && hit.start_offset <= unrelated_call
+            && unrelated_call + "BuildBody".len() <= hit.end_offset
+    }));
+}
+
+#[test]
 fn csharp_graph_finds_unqualified_same_class_async_member_calls_with_arguments() {
     let (project, analyzer) = csharp_analyzer_with_files(&[(
         "MudTabs.cs",

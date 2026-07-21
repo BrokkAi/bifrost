@@ -59,12 +59,15 @@ impl CppAnalyzer {
         visible: &[CodeUnit],
     ) -> Option<CodeUnit> {
         let normalized = normalize_cpp_type_reference(raw)?;
-        let resolved = if normalized.contains("::") {
-            visible
-                .iter()
-                .find(|candidate| cpp_name_for(candidate) == normalized)
+        let resolved = if normalized.name.contains("::") || normalized.global {
+            resolve_qualified_type(
+                code_unit.package_name(),
+                &normalized.name,
+                normalized.global,
+                visible,
+            )
         } else {
-            self.resolve_unqualified_base(code_unit, &normalized, visible)
+            self.resolve_unqualified_base(code_unit, &normalized.name, visible)
         }?;
         self.canonicalize_alias(resolved, visible, &mut HashSet::default())
     }
@@ -101,25 +104,46 @@ impl CppAnalyzer {
             return None;
         }
         let target = alias_target_text(unit)?;
-        let resolved = if target.contains("::") {
-            visible
-                .iter()
-                .find(|candidate| cpp_name_for(candidate) == target)
+        let resolved = if target.name.contains("::") || target.global {
+            resolve_qualified_type(unit.package_name(), &target.name, target.global, visible)
         } else {
             visible
                 .iter()
                 .find(|candidate| {
-                    candidate.identifier() == target
+                    candidate.identifier() == target.name
                         && candidate.package_name() == unit.package_name()
                 })
                 .or_else(|| {
                     visible
                         .iter()
-                        .find(|candidate| candidate.identifier() == target)
+                        .find(|candidate| candidate.identifier() == target.name)
                 })
         }?;
         self.canonicalize_alias(resolved, visible, seen)
     }
+}
+
+fn resolve_qualified_type<'a>(
+    lexical_namespace: &str,
+    name: &str,
+    global: bool,
+    visible: &'a [CodeUnit],
+) -> Option<&'a CodeUnit> {
+    let namespaces = if global {
+        vec![""]
+    } else {
+        namespace_search_order(lexical_namespace)
+    };
+    namespaces.into_iter().find_map(|namespace| {
+        let qualified = if namespace.is_empty() {
+            name.to_string()
+        } else {
+            format!("{namespace}::{name}")
+        };
+        visible
+            .iter()
+            .find(|candidate| cpp_name_for(candidate) == qualified)
+    })
 }
 
 impl TypeHierarchyProvider for CppAnalyzer {
@@ -154,7 +178,7 @@ fn namespace_search_order(package_name: &str) -> Vec<&str> {
     }
 }
 
-fn alias_target_text(alias: &CodeUnit) -> Option<String> {
+fn alias_target_text(alias: &CodeUnit) -> Option<NormalizedCppTypeReference> {
     let signature = alias.signature()?.trim();
     let target = signature
         .strip_prefix("using ")
@@ -169,7 +193,12 @@ fn alias_target_text(alias: &CodeUnit) -> Option<String> {
     normalize_cpp_type_reference(target)
 }
 
-fn normalize_cpp_type_reference(value: &str) -> Option<String> {
+struct NormalizedCppTypeReference {
+    name: String,
+    global: bool,
+}
+
+fn normalize_cpp_type_reference(value: &str) -> Option<NormalizedCppTypeReference> {
     let mut text = normalize_cpp_whitespace(value)
         .trim_start_matches("new ")
         .trim()
@@ -184,15 +213,19 @@ fn normalize_cpp_type_reference(value: &str) -> Option<String> {
         .trim()
         .trim_start_matches("const ")
         .trim_end_matches(|ch: char| ch == '*' || ch == '&' || ch.is_whitespace())
-        .trim_matches(':')
         .trim();
+    let global = normalized.starts_with("::");
+    let normalized = normalized.trim_matches(':').trim();
     let normalized = normalized
         .strip_prefix("struct ")
         .or_else(|| normalized.strip_prefix("class "))
         .or_else(|| normalized.strip_prefix("enum "))
         .unwrap_or(normalized)
         .trim();
-    (!normalized.is_empty()).then(|| normalized.to_string())
+    (!normalized.is_empty()).then(|| NormalizedCppTypeReference {
+        name: normalized.to_string(),
+        global,
+    })
 }
 
 fn cpp_name_for(unit: &CodeUnit) -> String {

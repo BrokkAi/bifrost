@@ -90,6 +90,74 @@ struct Child : api::Base {};
 }
 
 #[test]
+fn cpp_type_hierarchy_resolves_relative_qualified_sibling_bases_and_aliases() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[(
+        "types.cpp",
+        r#"
+namespace rc522 {
+struct Base {};
+using Alias = Base;
+}
+namespace spi {
+template<int Rate> struct Template {};
+}
+
+namespace esphome {
+namespace rc522 {
+struct Base {};
+using Alias = Base;
+}
+namespace spi {
+template<int Rate> struct Template {};
+}
+namespace aliases {
+using RelativeQualified = rc522::Base;
+using GlobalQualified = ::rc522::Base;
+}
+namespace rc522_spi {
+struct Direct : rc522::Base, spi::Template<4> {};
+struct ViaAlias : rc522::Alias {};
+struct ViaRelativeQualifiedAlias : aliases::RelativeQualified {};
+struct GlobalDirect : ::rc522::Base {};
+struct ViaGlobalQualifiedAlias : aliases::GlobalQualified {};
+}
+}
+"#,
+    )]);
+
+    let direct = definition(&analyzer, "esphome::rc522_spi.Direct");
+    let via_alias = definition(&analyzer, "esphome::rc522_spi.ViaAlias");
+    let via_relative_qualified_alias =
+        definition(&analyzer, "esphome::rc522_spi.ViaRelativeQualifiedAlias");
+    let global_direct = definition(&analyzer, "esphome::rc522_spi.GlobalDirect");
+    let via_global_qualified_alias =
+        definition(&analyzer, "esphome::rc522_spi.ViaGlobalQualifiedAlias");
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&direct)),
+        BTreeSet::from([
+            "esphome::rc522.Base".to_string(),
+            "esphome::spi.Template".to_string(),
+        ])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&via_alias)),
+        BTreeSet::from(["esphome::rc522.Base".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&via_relative_qualified_alias)),
+        BTreeSet::from(["esphome::rc522.Base".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&global_direct)),
+        BTreeSet::from(["rc522.Base".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&via_global_qualified_alias)),
+        BTreeSet::from(["rc522.Base".to_string()])
+    );
+}
+
+#[test]
 fn cpp_type_hierarchy_resolves_base_from_included_header() {
     let (_project, analyzer) = cpp_analyzer_with_files(&[
         (

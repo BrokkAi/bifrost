@@ -970,6 +970,7 @@ struct Sink {};
 class ConsoleHandler {
 public:
     explicit ConsoleHandler(Sink& s);
+    ~ConsoleHandler();
     std::string handle(const std::string& value);
     std::string alias_handle(const std::string& value);
 };
@@ -991,6 +992,7 @@ public:
 #include "../include/parity.h"
 namespace parity {
 ConsoleHandler::ConsoleHandler(Sink& s) {}
+ConsoleHandler::~ConsoleHandler() {}
 std::string ConsoleHandler::handle(const std::string& value) { return value; }
 std::string HandlerAlias::alias_handle(const std::string& value) { return value; }
 }
@@ -1023,6 +1025,11 @@ void run(parity::Sink& sink) {
         &summaries,
         "src/parity.cpp",
         "ConsoleHandler::ConsoleHandler",
+    );
+    assert_hit_contains(
+        &summaries,
+        "src/parity.cpp",
+        "ConsoleHandler::~ConsoleHandler",
     );
     assert_hit_contains(&summaries, "src/parity.cpp", "ConsoleHandler::handle");
     assert_hit_contains(&summaries, "src/parity.cpp", "HandlerAlias::alias_handle");
@@ -1057,12 +1064,12 @@ void run(parity::Sink& sink) {
         "class query must select only the class qualifier, not the full member declarator: {selected_texts:?}"
     );
     assert_eq!(
-        2,
+        4,
         selected_texts_by_file
             .iter()
             .filter(|(file, text)| file == "src/parity.cpp" && text == "ConsoleHandler")
             .count(),
-        "constructor and method qualifiers should both select the class token: {selected_texts_by_file:?}"
+        "constructor and method qualifiers plus both destructor type names should select the class token: {selected_texts_by_file:?}"
     );
     assert!(
         selected_texts_by_file
@@ -3789,6 +3796,230 @@ choose(void) { return 0; }
         }),
         "macro-recovered return type should be proven: {hits:#?}"
     );
+}
+
+#[test]
+fn authoritative_cpp_usage_recovers_macro_decorated_api_declaration_types() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.hpp",
+            r#"#pragma once
+typedef unsigned long pn_timestamp_t;
+typedef unsigned long size_t;
+typedef void *(*_cbor_malloc_t)(size_t);
+struct pn_record_t { int value; };
+namespace foreign { struct pn_record_t { int value; }; }
+"#,
+        )
+        .file(
+            "consumer.hpp",
+            r#"#pragma once
+#include "types.hpp"
+#ifdef __cplusplus
+extern "C" {
+#endif
+PN_EXTERN pn_timestamp_t pn_data_get_timestamp(
+    pn_record_t *data); // positive-prototype-parameter
+PN_EXTERN pn_record_t *pn_connection_attachments( // positive-pointer-return
+    pn_record_t *connection); // positive-pointer-parameter
+CBOR_EXPORT extern _cbor_malloc_t _cbor_malloc; // positive-extern-variable
+CBOR_EXPORT pn_record_t *cbor_incref( // positive-libcbor-pointer-return
+    pn_record_t *item); // positive-libcbor-parameter
+#ifdef __cplusplus
+}
+#endif
+
+void consume(
+    pn_record_t value, // positive-ordinary-parameter
+    pn_timestamp_t stamp); // positive-ordinary-alias-parameter
+
+foreign::pn_record_t *foreign_record; // negative-qualified-scope
+PN_EXTERN pn_record_t; // negative-incomplete-declaration
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.hpp");
+    let source = consumer.read_to_string().expect("consumer source");
+
+    let timestamp = class_definition(&analyzer, "pn_timestamp_t");
+    let malloc_type = class_definition(&analyzer, "_cbor_malloc_t");
+    let record = class_definition(&analyzer, "pn_record_t");
+    let timestamp_expected = BTreeSet::from([
+        fixture_token_range(
+            &source,
+            "PN_EXTERN pn_timestamp_t pn_data_get_timestamp(",
+            "pn_timestamp_t",
+        ),
+        fixture_token_range(
+            &source,
+            "    pn_timestamp_t stamp); // positive-ordinary-alias-parameter",
+            "pn_timestamp_t",
+        ),
+    ]);
+    let malloc_expected = BTreeSet::from([fixture_token_range(
+        &source,
+        "CBOR_EXPORT extern _cbor_malloc_t _cbor_malloc; // positive-extern-variable",
+        "_cbor_malloc_t",
+    )]);
+    let record_expected = BTreeSet::from([
+        fixture_token_range(
+            &source,
+            "    pn_record_t *data); // positive-prototype-parameter",
+            "pn_record_t",
+        ),
+        fixture_token_range(
+            &source,
+            "PN_EXTERN pn_record_t *pn_connection_attachments( // positive-pointer-return",
+            "pn_record_t",
+        ),
+        fixture_token_range(
+            &source,
+            "    pn_record_t *connection); // positive-pointer-parameter",
+            "pn_record_t",
+        ),
+        fixture_token_range(
+            &source,
+            "CBOR_EXPORT pn_record_t *cbor_incref( // positive-libcbor-pointer-return",
+            "pn_record_t",
+        ),
+        fixture_token_range(
+            &source,
+            "    pn_record_t *item); // positive-libcbor-parameter",
+            "pn_record_t",
+        ),
+        fixture_token_range(
+            &source,
+            "    pn_record_t value, // positive-ordinary-parameter",
+            "pn_record_t",
+        ),
+    ]);
+
+    let forward_at = |range: (usize, usize), expected_fqn: &str| {
+        let line_start = source[..range.0]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let line = source[..range.0]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let column = source[line_start..range.0].chars().count() + 1;
+        let result = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "consumer.hpp".to_string(),
+                    line: Some(line),
+                    column: Some(column),
+                }],
+            },
+        )
+        .results
+        .into_iter()
+        .next()
+        .expect("one forward definition result");
+        assert_eq!("resolved", result.status, "{result:#?}");
+        assert!(
+            result
+                .definitions
+                .iter()
+                .any(|definition| definition.fqn.as_deref() == Some(expected_fqn)),
+            "forward lookup should resolve {expected_fqn}: {result:#?}"
+        );
+    };
+    for (range, fqn) in [
+        (
+            fixture_token_range(
+                &source,
+                "PN_EXTERN pn_timestamp_t pn_data_get_timestamp(",
+                "pn_timestamp_t",
+            ),
+            "pn_timestamp_t",
+        ),
+        (
+            fixture_token_range(
+                &source,
+                "PN_EXTERN pn_record_t *pn_connection_attachments( // positive-pointer-return",
+                "pn_record_t",
+            ),
+            "pn_record_t",
+        ),
+        (
+            fixture_token_range(
+                &source,
+                "CBOR_EXPORT extern _cbor_malloc_t _cbor_malloc; // positive-extern-variable",
+                "_cbor_malloc_t",
+            ),
+            "_cbor_malloc_t",
+        ),
+        (
+            fixture_token_range(
+                &source,
+                "CBOR_EXPORT pn_record_t *cbor_incref( // positive-libcbor-pointer-return",
+                "pn_record_t",
+            ),
+            "pn_record_t",
+        ),
+        (
+            fixture_token_range(
+                &source,
+                "    pn_record_t value, // positive-ordinary-parameter",
+                "pn_record_t",
+            ),
+            "pn_record_t",
+        ),
+    ] {
+        forward_at(range, fqn);
+    }
+
+    let record_negative = BTreeSet::from([
+        fixture_token_range(
+            &source,
+            "foreign::pn_record_t *foreign_record; // negative-qualified-scope",
+            "pn_record_t",
+        ),
+        fixture_token_range(
+            &source,
+            "PN_EXTERN pn_record_t; // negative-incomplete-declaration",
+            "pn_record_t",
+        ),
+    ]);
+
+    for (target, expected) in [
+        (&timestamp, &timestamp_expected),
+        (&malloc_type, &malloc_expected),
+        (&record, &record_expected),
+    ] {
+        let targeted =
+            authoritative_exact_ranges(&analyzer, std::slice::from_ref(target), &consumer);
+        assert_eq!(
+            &targeted,
+            expected,
+            "targeted inverse lookup must preserve only real references to {}",
+            target.fq_name()
+        );
+        let whole = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(target));
+        let whole_ranges = whole
+            .all_hits_including_imports()
+            .into_iter()
+            .filter(|hit| hit.file == consumer)
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            &whole_ranges,
+            expected,
+            "whole-workspace inverse lookup must preserve only real references to {}",
+            target.fq_name()
+        );
+        if target.fq_name() == "pn_record_t" {
+            assert!(
+                targeted.is_disjoint(&record_negative)
+                    && whole_ranges.is_disjoint(&record_negative),
+                "qualified scopes and incomplete declaration names must stay excluded"
+            );
+        }
+    }
 }
 
 #[test]
@@ -9918,6 +10149,438 @@ void exercise(Base& direct, Derived* pointer, Derived value, Override override_v
             .into_iter()
             .all(|negative| { !targeted.contains(&negative) && !whole_ranges.contains(&negative) }),
         "override, hiding, unrelated, and ambiguous receivers must remain excluded: targeted={targeted:#?}, whole={whole_ranges:#?}"
+    );
+}
+
+#[test]
+fn authoritative_cpp_esphome_inherited_members_through_derived_fields_and_out_of_line_types() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "gpio.h",
+            r#"#pragma once
+namespace esphome {
+class GPIOPin {
+ public:
+    virtual void setup() = 0;
+    virtual void digital_write(bool value) = 0;
+};
+class InternalGPIOPin : public GPIOPin {};
+class OverrideGPIOPin : public GPIOPin {
+ public:
+    void setup() override;
+};
+class OtherPin { public: void setup(); };
+}
+"#,
+        )
+        .file(
+            "hal.h",
+            r#"#pragma once
+#include "gpio.h"
+"#,
+        )
+        .file(
+            "component.h",
+            r#"#pragma once
+namespace esphome {
+class Component {};
+namespace output { class FloatOutput {}; }
+}
+"#,
+        )
+        .file(
+            "ac_dimmer.h",
+            r#"#pragma once
+#include "hal.h"
+#include "component.h"
+namespace esphome::ac_dimmer {
+class AcDimmer final : public output::FloatOutput, public Component {
+ public:
+    void setup();
+ protected:
+    InternalGPIOPin *zero_cross_pin_;
+    GPIOPin *base_pin_;
+    OverrideGPIOPin *overridden_;
+    OtherPin *other_;
+};
+}
+"#,
+        )
+        .file(
+            "rc522.h",
+            r#"#pragma once
+namespace esphome::rc522 {
+class RC522 {
+ protected:
+    enum PcdRegister { COMMAND };
+    virtual void pcd_write_register(PcdRegister reg) = 0;
+};
+}
+"#,
+        )
+        .file(
+            "spi.h",
+            r#"#pragma once
+namespace esphome::spi {
+template<int Order, int Rate> class SPIDevice {};
+}
+"#,
+        )
+        .file(
+            "rc522_spi.h",
+            r#"#pragma once
+#include "rc522.h"
+#include "spi.h"
+namespace esphome::rc522_spi {
+class RC522Spi final : public rc522::RC522, public spi::SPIDevice<1, 4> {
+ protected:
+    void pcd_write_register(PcdRegister reg) override;
+};
+}
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "ac_dimmer.h"
+#include "rc522_spi.h"
+namespace esphome::ac_dimmer {
+void AcDimmer::setup() {
+    this->zero_cross_pin_->setup(); // positive-derived-field-setup
+    this->zero_cross_pin_->digital_write(true); // positive-derived-field-write
+    this->base_pin_->setup(); // positive-base-field-control
+    this->overridden_->setup(); // negative-override
+    this->other_->setup(); // negative-other
+}
+}
+namespace esphome::rc522_spi {
+void RC522Spi::pcd_write_register(PcdRegister reg) { // positive-inherited-nested-type
+    (void) reg;
+}
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let setup = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.fq_name() == "esphome.GPIOPin.setup"
+    });
+    let write = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Function && unit.fq_name() == "esphome.GPIOPin.digital_write"
+    });
+    let register = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "esphome::rc522.RC522$PcdRegister"
+    });
+    let setup_expected = BTreeSet::from([
+        fixture_token_range(
+            &source,
+            "    this->zero_cross_pin_->setup(); // positive-derived-field-setup",
+            "setup",
+        ),
+        fixture_token_range(
+            &source,
+            "    this->base_pin_->setup(); // positive-base-field-control",
+            "setup",
+        ),
+    ]);
+    let write_expected = BTreeSet::from([fixture_token_range(
+        &source,
+        "    this->zero_cross_pin_->digital_write(true); // positive-derived-field-write",
+        "digital_write",
+    )]);
+    let register_expected = BTreeSet::from([fixture_token_range(
+        &source,
+        "void RC522Spi::pcd_write_register(PcdRegister reg) { // positive-inherited-nested-type",
+        "PcdRegister",
+    )]);
+
+    for (target, expected) in [
+        (&setup, &setup_expected),
+        (&write, &write_expected),
+        (&register, &register_expected),
+    ] {
+        let authoritative =
+            authoritative_exact_ranges(&analyzer, std::slice::from_ref(target), &consumer);
+        let public =
+            UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(target));
+        let public_ranges = public
+            .all_hits_including_imports()
+            .into_iter()
+            .filter(|hit| hit.file == consumer)
+            .map(|hit| (hit.start_offset, hit.end_offset))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            (&authoritative, &public_ranges),
+            (expected, expected),
+            "authoritative and public inverse lookup must retain inherited target {}",
+            target.fq_name()
+        );
+    }
+}
+
+#[test]
+fn authoritative_cpp_matching_conditional_type_environments_cover_reference_shapes() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "guarded_types.h",
+            r#"#pragma once
+#ifdef FEATURE
+namespace guarded {
+struct Type {};
+}
+#endif
+"#,
+        )
+        .file(
+            "guarded_alias.h",
+            r#"#pragma once
+#ifdef FEATURE
+#include "guarded_types.h"
+namespace guarded_alias {
+using namespace guarded;
+}
+#endif
+"#,
+        )
+        .file(
+            "consumer.h",
+            r#"#pragma once
+#ifdef FEATURE
+#include "guarded_types.h"
+#include "guarded_alias.h"
+namespace guarded {
+struct Base : Type { // positive-base-clause
+    Type field; // positive-field
+    void method(Type value); // positive-method-parameter
+};
+Type *global; // positive-global
+}
+namespace guarded_alias {
+struct Holder { Type imported; }; // positive-using-namespace-field
+}
+#endif
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "consumer.h"
+#ifdef FEATURE
+namespace guarded {
+Type make(Type parameter) { // positive-return-and-definition-parameter
+    Type local; // positive-local
+    return local;
+}
+void Base::method(Type value) { // positive-out-of-line-parameter
+    (void) value;
+}
+}
+#endif
+"#,
+        )
+        .file(
+            "unknown.cc",
+            r#"#ifdef OTHER_FEATURE
+#include "guarded_types.h"
+#include "guarded_alias.h"
+namespace guarded { Type unknown; } // control-unknown-guard
+namespace guarded_alias { Type unknown_imported; } // control-unknown-using-guard
+#endif
+#ifndef FEATURE
+#include "guarded_types.h"
+#include "guarded_alias.h"
+namespace guarded { Type excluded; } // control-excluded-guard
+namespace guarded_alias { Type excluded_imported; } // control-excluded-using-guard
+#endif
+"#,
+        )
+        .file(
+            "mutated.cc",
+            r#"#undef FEATURE
+#ifdef FEATURE
+#include "guarded_types.h"
+namespace guarded { Type mutated; } // control-guard-mutated-before-include
+#endif
+"#,
+        )
+        .file(
+            "unsupported.cc",
+            r#"#if defined(FEATURE) && defined(OTHER_FEATURE)
+#include "guarded_types.h"
+namespace guarded { Type unsupported; } // control-unsupported-guard
+#endif
+"#,
+        )
+        .file(
+            "same_file.cc",
+            r#"#ifdef FEATURE
+namespace same_file {
+Type before; // control-later-declaration
+struct Type {};
+Type after; // positive-same-file-matching-guard
+}
+#endif
+#ifdef OTHER_FEATURE
+namespace same_file { Type incompatible; } // control-same-file-incompatible-guard
+#endif
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "guarded.Type"
+    });
+    let header = project.file("consumer.h");
+    let implementation = project.file("consumer.cc");
+    let unknown = project.file("unknown.cc");
+    let mutated = project.file("mutated.cc");
+    let unsupported = project.file("unsupported.cc");
+    let same_file = project.file("same_file.cc");
+    let header_source = header.read_to_string().expect("header source");
+    let implementation_source = implementation
+        .read_to_string()
+        .expect("implementation source");
+    let header_expected = BTreeSet::from([
+        fixture_token_range(
+            &header_source,
+            "struct Base : Type { // positive-base-clause",
+            "Type",
+        ),
+        fixture_token_range(&header_source, "    Type field; // positive-field", "Type"),
+        fixture_token_range(
+            &header_source,
+            "    void method(Type value); // positive-method-parameter",
+            "Type",
+        ),
+        fixture_token_range(&header_source, "Type *global; // positive-global", "Type"),
+        fixture_token_range(
+            &header_source,
+            "struct Holder { Type imported; }; // positive-using-namespace-field",
+            "Type",
+        ),
+    ]);
+    let implementation_expected = BTreeSet::from([
+        fixture_token_range(
+            &implementation_source,
+            "Type make(Type parameter) { // positive-return-and-definition-parameter",
+            "Type",
+        ),
+        {
+            let line = "Type make(Type parameter) { // positive-return-and-definition-parameter";
+            let line_start = implementation_source.find(line).expect("make line");
+            let second = line.match_indices("Type").nth(1).expect("second Type").0;
+            (line_start + second, line_start + second + "Type".len())
+        },
+        fixture_token_range(
+            &implementation_source,
+            "    Type local; // positive-local",
+            "Type",
+        ),
+        fixture_token_range(
+            &implementation_source,
+            "void Base::method(Type value) { // positive-out-of-line-parameter",
+            "Type",
+        ),
+    ]);
+
+    for (file, expected) in [
+        (&header, &header_expected),
+        (&implementation, &implementation_expected),
+    ] {
+        let authoritative =
+            authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), file);
+        assert_eq!(
+            &authoritative,
+            expected,
+            "matching conditional environments must retain every structured type role in {}",
+            file.rel_path().display()
+        );
+    }
+    let public = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let public_header = public
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == header)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    let public_implementation = public
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == implementation)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        (&public_header, &public_implementation),
+        (&header_expected, &implementation_expected),
+        "public inverse lookup must share authoritative conditional visibility"
+    );
+
+    let same_file_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "same_file.Type"
+            && unit.source() == &same_file
+    });
+    let same_file_source = same_file.read_to_string().expect("same-file source");
+    let same_file_expected = BTreeSet::from([fixture_token_range(
+        &same_file_source,
+        "Type after; // positive-same-file-matching-guard",
+        "Type",
+    )]);
+    let same_file_authoritative = authoritative_exact_ranges(
+        &analyzer,
+        std::slice::from_ref(&same_file_target),
+        &same_file,
+    );
+    let same_file_public = UsageFinder::new()
+        .find_usages_default(&analyzer, std::slice::from_ref(&same_file_target))
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == same_file)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        (&same_file_authoritative, &same_file_public),
+        (&same_file_expected, &same_file_expected),
+        "same-file proof must require a prior declaration under a compatible guard"
+    );
+
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        [unknown.clone(), mutated.clone(), unsupported.clone()]
+            .into_iter()
+            .collect(),
+    ));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = query.result
+    else {
+        panic!("expected conditional control query success");
+    };
+    assert!(
+        hits_by_overload.get(&target).is_none_or(BTreeSet::is_empty),
+        "unknown and mutually excluded guard contexts must not become proven"
+    );
+    assert!(
+        // Tree-sitter does not always retain a type-reference node beneath an unsupported
+        // preprocessor expression or a branch made unreachable by an explicit macro mutation.
+        // Such recovery-less shapes may be absent, but any structured uncertainty that survives
+        // must remain unproven, and the assertion above ensures none become exact hits.
+        unproven_total_by_overload
+            .get(&target)
+            .copied()
+            .unwrap_or_default()
+            >= 1,
+        "unknown conditional visibility must retain conservative evidence: {unproven_total_by_overload:#?}"
     );
 }
 

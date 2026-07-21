@@ -589,6 +589,13 @@ pub(super) struct OrdinaryTypeImport {
     pub(super) declaration_namespace: Vec<String>,
     pub(super) namespace_scope: Option<Vec<String>>,
     pub(super) resolved_target_components: Option<Vec<String>>,
+    pub(super) required_guards: HashSet<PreprocessorGuard>,
+}
+
+#[derive(Clone)]
+pub(super) struct ConditionalIncludeProjection {
+    pub(super) activation_byte: usize,
+    pub(super) required_guards: HashSet<PreprocessorGuard>,
 }
 
 #[derive(Default)]
@@ -640,6 +647,8 @@ pub(super) enum OrdinaryTypeImportResolution {
 }
 
 type CallableReferenceSpecCell = Arc<OnceLock<Option<TargetSpec>>>;
+type ConditionalIncludeProjectionCache =
+    HashMap<(ProjectFile, ProjectFile), Arc<[ConditionalIncludeProjection]>>;
 
 pub(in crate::analyzer::usages) struct VisibilityIndex {
     cpp: CppAnalyzer,
@@ -652,6 +661,7 @@ pub(in crate::analyzer::usages) struct VisibilityIndex {
     callable_reference_specs:
         Mutex<HashMap<(ProjectFile, LogicalSymbolKey), CallableReferenceSpecCell>>,
     include_activation_cells: Mutex<HashMap<(ProjectFile, ProjectFile), Option<usize>>>,
+    conditional_include_projection_cells: Mutex<ConditionalIncludeProjectionCache>,
     #[cfg(test)]
     include_activation_build_count: AtomicUsize,
     #[cfg(test)]
@@ -687,6 +697,27 @@ pub(in crate::analyzer::usages) struct VisibilityIndex {
     cpp_template_families: HashMap<String, Vec<CodeUnit>>,
     #[cfg(test)]
     qualified_candidate_inspections: AtomicUsize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) enum PreprocessorGuard {
+    Defined(String),
+    Undefined(String),
+}
+
+impl PreprocessorGuard {
+    fn negated(&self) -> Self {
+        match self {
+            Self::Defined(name) => Self::Undefined(name.clone()),
+            Self::Undefined(name) => Self::Defined(name.clone()),
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Defined(name) | Self::Undefined(name) => name,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -882,6 +913,7 @@ impl VisibilityIndex {
             project_using_index: OnceLock::new(),
             callable_reference_specs: Mutex::new(HashMap::default()),
             include_activation_cells: Mutex::new(HashMap::default()),
+            conditional_include_projection_cells: Mutex::new(HashMap::default()),
             #[cfg(test)]
             include_activation_build_count: AtomicUsize::new(0),
             #[cfg(test)]
@@ -1689,6 +1721,32 @@ impl VisibilityIndex {
         *cells.entry(key).or_insert(activation)
     }
 
+    pub(super) fn conditional_include_projections_for_source(
+        &self,
+        file: &ProjectFile,
+        prepared: &PreparedSyntaxTree,
+        donor_source: &ProjectFile,
+    ) -> Arc<[ConditionalIncludeProjection]> {
+        let key = (file.clone(), donor_source.clone());
+        if let Some(cached) = self
+            .conditional_include_projection_cells
+            .lock()
+            .expect("C++ conditional include projection cache poisoned")
+            .get(&key)
+            .cloned()
+        {
+            return cached;
+        }
+        let projections: Arc<[ConditionalIncludeProjection]> =
+            find_conditional_include_projections(&self.cpp, file, prepared, donor_source).into();
+        self.conditional_include_projection_cells
+            .lock()
+            .expect("C++ conditional include projection cache poisoned")
+            .entry(key)
+            .or_insert_with(|| Arc::clone(&projections))
+            .clone()
+    }
+
     #[cfg(test)]
     fn include_activation_build_count_for_test(&self) -> usize {
         self.include_activation_build_count.load(Ordering::Relaxed)
@@ -1865,6 +1923,155 @@ impl VisibilityIndex {
             })
     }
 
+    pub(in crate::analyzer::usages) fn external_type_declaration_visible_at(
+        &self,
+        file: &ProjectFile,
+        candidate: &CodeUnit,
+        reference_byte: usize,
+    ) -> bool {
+        if candidate.source() == file {
+            return true;
+        }
+        let Some(prepared) = self.cpp.prepared_syntax(file) else {
+            return false;
+        };
+        self.include_activation_for_source(&self.cpp, file, prepared.as_ref(), candidate.source())
+            .is_some_and(|activation| activation <= reference_byte)
+    }
+
+    pub(in crate::analyzer::usages) fn external_type_candidate_visible_in_context(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        candidate: &CodeUnit,
+        reference: Node<'_>,
+    ) -> bool {
+        let Some(prepared) = self.cpp.prepared_syntax(file) else {
+            return false;
+        };
+        let Some(reference_guards) = preprocessor_guard_environment(reference, prepared.source())
+        else {
+            return false;
+        };
+
+        self.visible_identifier_candidates(file, candidate.identifier())
+            .filter(|peer| same_logical_symbol(candidate, peer))
+            .any(|peer| {
+                declaration_guard_requirements(analyzer, &self.cpp, peer)
+                    .into_iter()
+                    .any(|(declaration_byte, declaration_guards)| {
+                        if peer.source() == file {
+                            return declaration_byte < reference.start_byte()
+                                && declaration_guards.is_subset(&reference_guards)
+                                && self.preprocessor_guards_stable_between(
+                                    file,
+                                    0,
+                                    reference.start_byte(),
+                                    &declaration_guards,
+                                );
+                        }
+                        if self
+                            .include_activation_for_source(
+                                &self.cpp,
+                                file,
+                                prepared.as_ref(),
+                                peer.source(),
+                            )
+                            .is_some_and(|activation| {
+                                activation <= reference.start_byte()
+                                    && declaration_guards.is_subset(&reference_guards)
+                                    && self.preprocessor_guards_stable_between(
+                                        file,
+                                        0,
+                                        reference.start_byte(),
+                                        &declaration_guards,
+                                    )
+                            })
+                        {
+                            return true;
+                        }
+                        self.conditional_include_projections_for_source(
+                            file,
+                            prepared.as_ref(),
+                            peer.source(),
+                        )
+                        .iter()
+                        .any(|projection| {
+                            let Some(required_guards) = merge_preprocessor_guards(
+                                &projection.required_guards,
+                                &declaration_guards,
+                            ) else {
+                                return false;
+                            };
+                            projection.activation_byte <= reference.start_byte()
+                                && required_guards.is_subset(&reference_guards)
+                                && self.preprocessor_guards_stable_between(
+                                    file,
+                                    0,
+                                    reference.start_byte(),
+                                    &required_guards,
+                                )
+                        })
+                    })
+            })
+    }
+
+    pub(super) fn preprocessor_guards_stable_between(
+        &self,
+        file: &ProjectFile,
+        start_byte: usize,
+        end_byte: usize,
+        guards: &HashSet<PreprocessorGuard>,
+    ) -> bool {
+        if guards.is_empty() || start_byte >= end_byte {
+            return true;
+        }
+        let cell = self.macro_event_cell(file);
+        let events = cell.get_or_init(|| self.collect_macro_events(file).into_boxed_slice());
+        let mut visited = HashSet::from_iter([file.clone()]);
+        !events.iter().any(|event| {
+            event.byte() >= start_byte
+                && event.byte() < end_byte
+                && self.macro_event_may_mutate_guards(event, guards, &mut visited)
+        })
+    }
+
+    fn macro_event_may_mutate_guards(
+        &self,
+        event: &MacroEvent,
+        guards: &HashSet<PreprocessorGuard>,
+        visited: &mut HashSet<ProjectFile>,
+    ) -> bool {
+        match event {
+            MacroEvent::Define { name, .. } | MacroEvent::Undef { name, .. } => {
+                guards.iter().any(|guard| guard.name() == name)
+            }
+            MacroEvent::Include { targets, .. } => {
+                targets.is_empty()
+                    || targets
+                        .iter()
+                        .any(|target| self.source_may_mutate_guards(target, guards, visited))
+            }
+            MacroEvent::Invalidate { .. } => true,
+        }
+    }
+
+    fn source_may_mutate_guards(
+        &self,
+        file: &ProjectFile,
+        guards: &HashSet<PreprocessorGuard>,
+        visited: &mut HashSet<ProjectFile>,
+    ) -> bool {
+        if !visited.insert(file.clone()) {
+            return false;
+        }
+        let cell = self.macro_event_cell(file);
+        let events = cell.get_or_init(|| self.collect_macro_events(file).into_boxed_slice());
+        events
+            .iter()
+            .any(|event| self.macro_event_may_mutate_guards(event, guards, visited))
+    }
+
     pub(in crate::analyzer::usages) fn resolve_type(
         &self,
         file: &ProjectFile,
@@ -1883,11 +2090,7 @@ impl VisibilityIndex {
         node: Node<'_>,
         source: &str,
     ) -> std::result::Result<Option<CodeUnit>, ()> {
-        let mut components = Vec::new();
-        if append_cpp_name_components(node, source, &mut components).is_none() {
-            return Ok(None);
-        }
-        let Some(primary) = self.resolve_type(file, &components.join("::")) else {
+        let Some(primary) = self.resolve_type_node_primary(file, node, source) else {
             return Ok(None);
         };
         let Some(arguments) = cpp_template_reference_arguments(node, source) else {
@@ -1895,6 +2098,16 @@ impl VisibilityIndex {
         };
         self.resolve_template_arguments(file, primary, &arguments)
             .map(Some)
+    }
+
+    pub(in crate::analyzer::usages) fn resolve_type_node_primary(
+        &self,
+        file: &ProjectFile,
+        node: Node<'_>,
+        source: &str,
+    ) -> Option<CodeUnit> {
+        let components = cpp_type_name_components(node, source)?;
+        self.resolve_type(file, &components.join("::"))
     }
 
     pub(super) fn resolve_template_arguments(
@@ -3696,6 +3909,126 @@ fn find_include_activation(
         .map(|(activation, _)| activation)
 }
 
+fn find_conditional_include_projections(
+    cpp: &CppAnalyzer,
+    file: &ProjectFile,
+    prepared: &PreparedSyntaxTree,
+    donor_source: &ProjectFile,
+) -> Vec<ConditionalIncludeProjection> {
+    let include_targets = cpp.include_target_index();
+    let mut projections = Vec::new();
+    let mut nodes = vec![prepared.tree().root_node()];
+    while let Some(node) = nodes.pop() {
+        if node.kind() == "preproc_include" {
+            let Some(required_guards) = preprocessor_guard_environment(node, prepared.source())
+            else {
+                continue;
+            };
+            let raw = normalize_cpp_whitespace(node_text(node, prepared.source()));
+            for include in cpp_include_paths(std::slice::from_ref(&raw)) {
+                let Some(target) = unique_include_target(resolve_include_targets_with_index(
+                    file,
+                    &include,
+                    include_targets,
+                )) else {
+                    continue;
+                };
+                let paths = conditional_include_requirement_paths(
+                    cpp,
+                    &target,
+                    donor_source,
+                    required_guards.clone(),
+                );
+                for required_guards in paths {
+                    if !projections
+                        .iter()
+                        .any(|projection: &ConditionalIncludeProjection| {
+                            projection.activation_byte == node.end_byte()
+                                && projection.required_guards == required_guards
+                        })
+                    {
+                        projections.push(ConditionalIncludeProjection {
+                            activation_byte: node.end_byte(),
+                            required_guards,
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                nodes.push(child);
+            }
+        }
+    }
+    projections.sort_by_key(|projection| projection.activation_byte);
+    projections
+}
+
+fn conditional_include_requirement_paths(
+    cpp: &CppAnalyzer,
+    first: &ProjectFile,
+    donor_source: &ProjectFile,
+    required_guards: HashSet<PreprocessorGuard>,
+) -> Vec<HashSet<PreprocessorGuard>> {
+    let include_targets = cpp.include_target_index();
+    let mut paths = Vec::new();
+    let mut stack = vec![(
+        first.clone(),
+        required_guards,
+        HashSet::from_iter([first.clone()]),
+    )];
+    while let Some((file, required_guards, visited)) = stack.pop() {
+        if file == *donor_source {
+            if !paths.contains(&required_guards) {
+                paths.push(required_guards);
+            }
+            continue;
+        }
+        let Some(prepared) = cpp.prepared_syntax(&file) else {
+            continue;
+        };
+        let mut nodes = vec![prepared.tree().root_node()];
+        while let Some(node) = nodes.pop() {
+            if node.kind() == "preproc_include" {
+                let Some(include_guards) = preprocessor_guard_environment(node, prepared.source())
+                else {
+                    continue;
+                };
+                let Some(path_guards) =
+                    merge_preprocessor_guards(&required_guards, &include_guards)
+                else {
+                    continue;
+                };
+                let raw = normalize_cpp_whitespace(node_text(node, prepared.source()));
+                for include in cpp_include_paths(std::slice::from_ref(&raw)) {
+                    let Some(target) = unique_include_target(resolve_include_targets_with_index(
+                        &file,
+                        &include,
+                        include_targets,
+                    )) else {
+                        continue;
+                    };
+                    if visited.contains(&target) {
+                        continue;
+                    }
+                    let mut next_visited = visited.clone();
+                    next_visited.insert(target.clone());
+                    stack.push((target, path_guards.clone(), next_visited));
+                }
+                continue;
+            }
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    nodes.push(child);
+                }
+            }
+        }
+    }
+    paths
+}
+
 fn unconditional_include_reaches(
     cpp: &CppAnalyzer,
     include_targets: &IncludeTargetIndex,
@@ -3745,6 +4078,122 @@ fn unconditional_include_reaches(
     }
     known_missing.extend(visited);
     false
+}
+
+fn declaration_guard_requirements(
+    analyzer: &dyn IAnalyzer,
+    cpp: &CppAnalyzer,
+    candidate: &CodeUnit,
+) -> Vec<(usize, HashSet<PreprocessorGuard>)> {
+    let Some(prepared) = cpp.prepared_syntax(candidate.source()) else {
+        return Vec::new();
+    };
+    let root = prepared.tree().root_node();
+    analyzer
+        .ranges(candidate)
+        .into_iter()
+        .filter_map(|range| {
+            root.descendant_for_byte_range(range.start_byte, range.end_byte)
+                .and_then(|node| preprocessor_guard_environment(node, prepared.source()))
+                // A class name is injected into its own body at the declaration's
+                // introduction point, not after the complete class range. Using
+                // the start also preserves normal before/after ordering for aliases.
+                .map(|required| (range.start_byte, required))
+        })
+        .collect()
+}
+
+pub(super) fn preprocessor_guard_environment(
+    node: Node<'_>,
+    source: &str,
+) -> Option<HashSet<PreprocessorGuard>> {
+    let mut guards = HashSet::default();
+    let mut ancestor = node.parent();
+    while let Some(conditional) = ancestor {
+        if matches!(conditional.kind(), "preproc_if" | "preproc_ifdef")
+            && !is_file_covering_include_guard(conditional, source)
+        {
+            let mut guard = simple_preprocessor_guard(conditional, source)?;
+            if conditional
+                .child_by_field_name("alternative")
+                .is_some_and(|alternative| {
+                    alternative.start_byte() <= node.start_byte()
+                        && node.end_byte() <= alternative.end_byte()
+                })
+            {
+                let alternative = conditional.child_by_field_name("alternative")?;
+                if alternative.kind() != "preproc_else" {
+                    return None;
+                }
+                guard = guard.negated();
+            }
+            if guards.contains(&guard.negated()) {
+                return None;
+            }
+            guards.insert(guard);
+        }
+        ancestor = conditional.parent();
+    }
+    Some(guards)
+}
+
+pub(super) fn merge_preprocessor_guards(
+    left: &HashSet<PreprocessorGuard>,
+    right: &HashSet<PreprocessorGuard>,
+) -> Option<HashSet<PreprocessorGuard>> {
+    let mut merged = left.clone();
+    for guard in right {
+        if merged.contains(&guard.negated()) {
+            return None;
+        }
+        merged.insert(guard.clone());
+    }
+    Some(merged)
+}
+
+fn simple_preprocessor_guard(conditional: Node<'_>, source: &str) -> Option<PreprocessorGuard> {
+    if conditional.kind() == "preproc_ifdef" {
+        let name = conditional.child_by_field_name("name")?;
+        let name = node_text(name, source).to_string();
+        return match conditional.child(0)?.kind() {
+            "#ifdef" => Some(PreprocessorGuard::Defined(name)),
+            "#ifndef" => Some(PreprocessorGuard::Undefined(name)),
+            _ => None,
+        };
+    }
+    simple_preprocessor_expression_guard(conditional.child_by_field_name("condition")?, source)
+}
+
+fn simple_preprocessor_expression_guard(
+    expression: Node<'_>,
+    source: &str,
+) -> Option<PreprocessorGuard> {
+    match expression.kind() {
+        "preproc_defined" => {
+            let identifier = (0..expression.named_child_count())
+                .filter_map(|index| expression.named_child(index))
+                .find(|child| child.kind() == "identifier")?;
+            Some(PreprocessorGuard::Defined(
+                node_text(identifier, source).to_string(),
+            ))
+        }
+        "unary_expression"
+            if expression
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == "!") =>
+        {
+            simple_preprocessor_expression_guard(
+                expression.child_by_field_name("argument")?,
+                source,
+            )
+            .map(|guard| guard.negated())
+        }
+        "parenthesized_expression" => (0..expression.named_child_count())
+            .filter_map(|index| expression.named_child(index))
+            .next()
+            .and_then(|child| simple_preprocessor_expression_guard(child, source)),
+        _ => None,
+    }
 }
 
 fn unique_include_target(mut targets: Vec<ProjectFile>) -> Option<ProjectFile> {
@@ -4760,63 +5209,115 @@ pub(in crate::analyzer::usages) fn is_declarator_node(node: Node<'_>) -> bool {
     )
 }
 
-pub(super) fn recovered_qualified_declarator_type(node: Node<'_>) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RecoveredDeclaratorTypeContext {
+    Declaration,
+    FunctionDefinition,
+}
+
+/// Recognize a real type displaced into a qualified declarator by a leading
+/// declaration macro.
+///
+/// Tree-sitter parses `API Result *make(Arg);` as if `API` were the declared
+/// type and `Result` were the scope of a qualified declarator with a missing
+/// `::`. The same recovery occurs for macro-prefixed definitions and extern
+/// variables. Keep this intentionally structural: the recovered scope must
+/// have the grammar's missing separator, the qualified node must occupy the
+/// declaration's declarator chain, a separate nonempty type must occupy the
+/// normal type field, and the recovered name must unwrap to a real declarator
+/// name.
+pub(super) fn recovered_macro_decorated_declarator_type(
+    node: Node<'_>,
+) -> Option<RecoveredDeclaratorTypeContext> {
     if node.kind() != "namespace_identifier" || node.is_missing() {
-        return false;
+        return None;
     }
-    let Some(qualified) = node.parent() else {
-        return false;
-    };
+    let qualified = node.parent()?;
     if qualified.kind() != "qualified_identifier"
         || qualified.child_by_field_name("scope") != Some(node)
         || !(0..qualified.child_count())
             .filter_map(|index| qualified.child(index))
             .any(|child| child.kind() == "::" && child.is_missing())
     {
-        return false;
+        return None;
     }
-    let Some(pointer) = qualified.child_by_field_name("name") else {
-        return false;
-    };
-    if pointer.kind() != "pointer_type_declarator" {
-        return false;
-    }
-    let Some(terminal) = pointer.child_by_field_name("declarator") else {
-        return false;
-    };
-    if terminal.is_missing()
-        || terminal.start_byte() == terminal.end_byte()
-        || !matches!(
-            terminal.kind(),
-            "identifier" | "field_identifier" | "type_identifier"
-        )
-    {
-        return false;
+    if !concrete_recovered_declarator_name(qualified.child_by_field_name("name")?) {
+        return None;
     }
 
-    let Some(parent) = qualified.parent() else {
-        return false;
-    };
-    let declaration = if parent.kind() == "init_declarator"
-        && parent.child_by_field_name("declarator") == Some(qualified)
-    {
-        parent
-            .parent()
-            .filter(|declaration| declaration.kind() == "declaration")
-    } else if parent.kind() == "declaration"
-        && parent.child_by_field_name("declarator") == Some(qualified)
-    {
-        Some(parent)
-    } else {
-        None
-    };
+    let (declaration, context) = recovered_declarator_container(qualified)?;
     declaration
-        .and_then(|declaration| declaration.child_by_field_name("type"))
-        .is_some_and(|type_node| {
-            type_node != qualified
+        .child_by_field_name("type")
+        .filter(|type_node| {
+            *type_node != qualified
                 && !type_node.is_missing()
                 && type_node.start_byte() != type_node.end_byte()
         })
+        .map(|_| context)
+}
+
+fn recovered_declarator_container(
+    mut declarator: Node<'_>,
+) -> Option<(Node<'_>, RecoveredDeclaratorTypeContext)> {
+    loop {
+        let parent = declarator.parent()?;
+        if parent.kind() == "init_declarator"
+            && parent.child_by_field_name("declarator") == Some(declarator)
+        {
+            return Some((
+                parent
+                    .parent()
+                    .filter(|declaration| declaration.kind() == "declaration")?,
+                RecoveredDeclaratorTypeContext::Declaration,
+            ));
+        }
+        if parent.kind() == "declaration"
+            && parent.child_by_field_name("declarator") == Some(declarator)
+        {
+            return Some((parent, RecoveredDeclaratorTypeContext::Declaration));
+        }
+        if parent.kind() == "function_definition"
+            && parent.child_by_field_name("declarator") == Some(declarator)
+        {
+            return Some((parent, RecoveredDeclaratorTypeContext::FunctionDefinition));
+        }
+        if !matches!(
+            parent.kind(),
+            "array_declarator"
+                | "function_declarator"
+                | "parenthesized_declarator"
+                | "pointer_declarator"
+                | "pointer_type_declarator"
+                | "reference_declarator"
+        ) || parent.child_by_field_name("declarator") != Some(declarator)
+        {
+            return None;
+        }
+        declarator = parent;
+    }
+}
+
+fn concrete_recovered_declarator_name(mut node: Node<'_>) -> bool {
+    loop {
+        if node.is_missing() || node.start_byte() == node.end_byte() {
+            return false;
+        }
+        match node.kind() {
+            "identifier" | "field_identifier" | "type_identifier" => return true,
+            "array_declarator"
+            | "function_declarator"
+            | "parenthesized_declarator"
+            | "pointer_declarator"
+            | "pointer_type_declarator"
+            | "reference_declarator" => {
+                let Some(declarator) = node.child_by_field_name("declarator") else {
+                    return false;
+                };
+                node = declarator;
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// Aggregate-owner proof for a structurally recognized designated initializer.
@@ -4969,42 +5470,6 @@ fn contains_array_declarator(declarator: Node<'_>) -> bool {
         stack.extend(node.named_children(&mut cursor));
     }
     false
-}
-
-pub(super) fn recovered_macro_function_return_type(node: Node<'_>) -> Option<Node<'_>> {
-    if node.kind() != "namespace_identifier" {
-        return None;
-    }
-    let qualified = node.parent()?;
-    if qualified.kind() != "qualified_identifier"
-        || qualified.child_by_field_name("scope") != Some(node)
-    {
-        return None;
-    }
-    let mut cursor = qualified.walk();
-    if !qualified
-        .children(&mut cursor)
-        .any(|child| child.kind() == "::" && child.is_missing())
-    {
-        return None;
-    }
-    let function = qualified.parent()?;
-    if function.kind() != "function_definition"
-        || function.child_by_field_name("declarator") != Some(qualified)
-    {
-        return None;
-    }
-
-    let mut declarator = qualified.child_by_field_name("name")?;
-    loop {
-        match declarator.kind() {
-            "function_declarator" => return Some(node),
-            "pointer_declarator" | "pointer_type_declarator" | "reference_declarator" => {
-                declarator = declarator.child_by_field_name("declarator")?;
-            }
-            _ => return None,
-        }
-    }
 }
 
 pub(in crate::analyzer::usages) fn first_type_child(node: Node<'_>) -> Option<Node<'_>> {
@@ -5235,6 +5700,22 @@ pub(super) fn qualified_owner_components<'tree>(
     })
 }
 
+/// Return the terminal type-name occurrence in an out-of-line destructor
+/// declarator such as `endpoint::~endpoint`.  Unlike an ordinary terminal
+/// method name, this identifier is a second reference to the owner type.
+pub(super) fn out_of_line_destructor_type_reference(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "qualified_identifier" {
+        return None;
+    }
+    let destructor = node.child_by_field_name("name")?;
+    if destructor.kind() != "destructor_name" {
+        return None;
+    }
+    (0..destructor.named_child_count())
+        .filter_map(|index| destructor.named_child(index))
+        .find(|child| matches!(child.kind(), "identifier" | "type_identifier"))
+}
+
 pub(super) fn out_of_line_member_definition_owner<'tree>(
     analyzer: &dyn IAnalyzer,
     visibility: &VisibilityIndex,
@@ -5304,6 +5785,15 @@ pub(super) fn append_cpp_name_components(
             .map(|component| node_text(component, source).to_string()),
     );
     Some(())
+}
+
+pub(in crate::analyzer::usages) fn cpp_type_name_components(
+    node: Node<'_>,
+    source: &str,
+) -> Option<Vec<String>> {
+    let mut components = Vec::new();
+    append_cpp_name_components(node, source, &mut components)?;
+    Some(components)
 }
 
 pub(super) fn cpp_template_reference_arguments(
@@ -6661,6 +7151,7 @@ mod tests {
             project_using_index: OnceLock::new(),
             callable_reference_specs: Mutex::new(HashMap::default()),
             include_activation_cells: Mutex::new(HashMap::default()),
+            conditional_include_projection_cells: Mutex::new(HashMap::default()),
             include_activation_build_count: AtomicUsize::new(0),
             using_donor_activation_count: AtomicUsize::new(0),
             using_namespace_lookup_count: AtomicUsize::new(0),

@@ -287,6 +287,9 @@ fn recovered_malformed_base_name(node: Node<'_>, source: &str) -> Option<String>
         "type_identifier" | "identifier" | "namespace_identifier" => {
             recovered_base_atom(node, source)
         }
+        "template_type" | "template_function" => node
+            .child_by_field_name("name")
+            .and_then(|name| recovered_malformed_base_name(name, source)),
         "ERROR" => None,
         "qualified_identifier" | "scoped_type_identifier" => {
             let suffix = node

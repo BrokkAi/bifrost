@@ -518,8 +518,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         return;
     }
-    let recovered_type = recovered_macro_function_return_type(node).is_some()
-        || recovered_qualified_declarator_type(node);
+    let recovered_type = recovered_macro_decorated_declarator_type(node).is_some();
     if !recovered_type
         && !matches!(
             node.kind(),
@@ -538,11 +537,20 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             node,
         )
     {
+        let terminal_destructor = out_of_line_destructor_type_reference(node);
+        let innermost = owners.innermost().map(|(_, owner)| owner.clone());
         *ctx.raw_match_count += 1;
         for (owner_node, owner) in owners.owners {
             if same_visible_symbol(&owner, &ctx.spec.target) {
                 push_hit(owner_node, ctx);
             }
+        }
+        if let Some(terminal_destructor) = terminal_destructor
+            && innermost
+                .as_ref()
+                .is_some_and(|owner| same_visible_symbol(owner, &ctx.spec.target))
+        {
+            push_hit(terminal_destructor, ctx);
         }
         return;
     }
@@ -623,7 +631,41 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             return;
         }
         LexicalTypeResolution::Ambiguous => return,
-        LexicalTypeResolution::Missing => {}
+        LexicalTypeResolution::Missing => {
+            let raw_resolution = resolve_type_node_lexically_for_target_without_visibility(
+                hit_node,
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+                &ctx.spec.target,
+            );
+            let raw_matches = matches!(
+                raw_resolution,
+                LexicalTypeResolution::Resolved {
+                    ref unit,
+                    ref candidates,
+                    ..
+                } if same_visible_symbol(unit, &ctx.spec.target)
+                    || candidates
+                        .iter()
+                        .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target))
+            );
+            if raw_matches
+                || type_node_has_exact_target_identity_without_visibility(
+                    hit_node,
+                    ctx.analyzer,
+                    ctx.visibility,
+                    ctx.file,
+                    ctx.source,
+                    &ctx.spec.target,
+                )
+            {
+                *ctx.raw_match_count += 1;
+                push_unproven_hit(hit_node, ctx);
+                return;
+            }
+        }
     }
     if ctx
         .visibility
@@ -644,7 +686,12 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     *ctx.raw_match_count += 1;
-    if !ctx.visibility.is_visible(ctx.file, &ctx.spec.target) {
+    if !ctx.visibility.external_type_candidate_visible_in_context(
+        ctx.analyzer,
+        ctx.file,
+        &ctx.spec.target,
+        hit_node,
+    ) {
         if let Some(scope) = static_qualifier_name_scope(node, ctx) {
             push_unproven_hit(scope, ctx);
         } else {
@@ -930,12 +977,31 @@ pub(in crate::analyzer::usages) fn resolve_bare_call_target(
     );
     let active_bindings = bindings
         .iter()
-        .filter(|binding| effective_using_binding_active(binding, function, &lexical_scope))
+        .filter(|binding| {
+            effective_using_binding_active(
+                binding,
+                function,
+                &lexical_scope,
+                source,
+                visibility,
+                file,
+            )
+        })
         .collect::<Vec<_>>();
+    let function_guards = preprocessor_guard_environment(function, source);
     let transitive_bindings = bindings
         .iter()
         .filter(|binding| {
             binding.declaration_byte <= function.start_byte()
+                && function_guards
+                    .as_ref()
+                    .is_some_and(|active| binding.required_guards.is_subset(active))
+                && visibility.preprocessor_guards_stable_between(
+                    file,
+                    0,
+                    function.start_byte(),
+                    &binding.required_guards,
+                )
                 && (binding.namespace_scope.is_some()
                     || (binding.scope_start <= function.start_byte()
                         && function.end_byte() <= binding.scope_end))
@@ -1711,7 +1777,9 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     match call_function_target_resolution(function, ctx) {
-        MethodReceiverTargetResolution::Target if receiver_is_self_like(function) => {
+        MethodReceiverTargetResolution::Target
+            if call_function_has_direct_self_receiver(function) =>
+        {
             push_self_receiver_hit(function_terminal_node(function), ctx);
         }
         MethodReceiverTargetResolution::Target => {
@@ -2763,36 +2831,23 @@ fn receiver_owner_is_known_non_target(
 }
 
 fn receiver_is_self_like(node: Node<'_>) -> bool {
-    let mut current = node;
-    loop {
-        match current.kind() {
-            "this" => return true,
-            "field_expression" => {
-                let Some(receiver) = current
-                    .child_by_field_name("argument")
-                    .or_else(|| current.child_by_field_name("object"))
-                else {
-                    return false;
-                };
-                current = receiver;
-            }
-            "call_expression" => {
-                let Some(function) = current.child_by_field_name("function") else {
-                    return false;
-                };
-                current = function;
-            }
-            "pointer_expression" | "parenthesized_expression" => {
-                let Some(inner) = current
-                    .child_by_field_name("argument")
-                    .or_else(|| current.named_child(0))
-                else {
-                    return false;
-                };
-                current = inner;
-            }
-            _ => return false,
-        }
+    match node.kind() {
+        "this" => true,
+        "pointer_expression" | "parenthesized_expression" => node
+            .child_by_field_name("argument")
+            .or_else(|| node.named_child(0))
+            .is_some_and(receiver_is_self_like),
+        _ => false,
+    }
+}
+
+fn call_function_has_direct_self_receiver(function: Node<'_>) -> bool {
+    match function.kind() {
+        "field_expression" => function
+            .child_by_field_name("argument")
+            .or_else(|| function.child_by_field_name("object"))
+            .is_some_and(receiver_is_self_like),
+        _ => receiver_is_self_like(function),
     }
 }
 
@@ -3169,6 +3224,71 @@ fn resolve_type_node_lexically_for_target(
     )
 }
 
+fn resolve_type_node_lexically_for_target_without_visibility(
+    node: Node<'_>,
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    target: &CodeUnit,
+) -> LexicalTypeResolution {
+    let Some((components, global)) = type_reference_components(node, source) else {
+        return LexicalTypeResolution::Missing;
+    };
+    let lexical_scope = match enclosing_lexical_scope_components_with_unresolved_owner(
+        node,
+        analyzer,
+        visibility,
+        file,
+        source,
+        true,
+        recovered_macro_decorated_declarator_type(node)
+            == Some(RecoveredDeclaratorTypeContext::FunctionDefinition),
+    ) {
+        LexicalScopeResolution::Resolved(scope) => scope,
+        LexicalScopeResolution::Ambiguous => return LexicalTypeResolution::Ambiguous,
+        LexicalScopeResolution::Missing => return LexicalTypeResolution::Missing,
+    };
+    visibility.resolve_type_components_lexically_for_target(
+        analyzer,
+        file,
+        &components,
+        global,
+        &lexical_scope,
+        target,
+    )
+}
+
+fn type_node_has_exact_target_identity_without_visibility(
+    node: Node<'_>,
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    target: &CodeUnit,
+) -> bool {
+    let Some((components, global)) = type_reference_components(node, source) else {
+        return false;
+    };
+    let LexicalScopeResolution::Resolved(lexical_scope) =
+        enclosing_lexical_scope_components_with_unresolved_owner(
+            node,
+            analyzer,
+            visibility,
+            file,
+            source,
+            true,
+            recovered_macro_decorated_declarator_type(node)
+                == Some(RecoveredDeclaratorTypeContext::FunctionDefinition),
+        )
+    else {
+        return false;
+    };
+    let target_name = cpp_name_for(target);
+    lexical_component_tiers(&components, global, &lexical_scope)
+        .any(|qualified| qualified.join("::") == target_name)
+}
+
 pub(super) fn resolve_using_enum_declaration_owner(
     node: Node<'_>,
     analyzer: &dyn IAnalyzer,
@@ -3314,11 +3434,16 @@ fn collect_source_using_index(
     let mut index = SourceUsingIndex::default();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if !callable_preprocessor_context_is_visible(node, source) {
+        let required_guards = if callable_preprocessor_context_is_visible(node, source) {
+            Some(HashSet::default())
+        } else {
+            preprocessor_guard_environment(node, source)
+        };
+        let Some(required_guards) = required_guards else {
             let mut cursor = node.walk();
             stack.extend(node.children(&mut cursor));
             continue;
-        }
+        };
         let target = if let Some(namespace_node) = using_namespace_directive_name_node(node) {
             let mut namespace_components = Vec::new();
             append_cpp_name_components(namespace_node, source, &mut namespace_components).map(
@@ -3359,6 +3484,7 @@ fn collect_source_using_index(
                 declaration_namespace,
                 namespace_scope,
                 resolved_target_components: None,
+                required_guards,
             };
             match &binding.target {
                 EffectiveUsingTarget::Ordinary { name, .. } => index
@@ -3484,27 +3610,59 @@ fn include_node_for_activation(root: Node<'_>, activation: usize) -> Option<Node
     Some(node)
 }
 
-fn project_using_binding(
-    mut binding: OrdinaryTypeImport,
+fn project_using_bindings(
+    binding: OrdinaryTypeImport,
     visibility: &VisibilityIndex,
     file: &ProjectFile,
     root: Node<'_>,
     source: &str,
-) -> Option<OrdinaryTypeImport> {
+) -> Vec<OrdinaryTypeImport> {
     if binding.source == *file {
-        return Some(binding);
+        return vec![binding];
     }
     if !visibility.source_is_visible(file, &binding.source) || binding.namespace_scope.is_none() {
-        return None;
+        return Vec::new();
     }
     visibility.note_using_donor_activation_for_test();
-    let prepared = visibility.cpp().prepared_syntax(file)?;
-    let activation = visibility.include_activation_for_source(
-        visibility.cpp(),
-        file,
-        prepared.as_ref(),
-        &binding.source,
-    )?;
+    let Some(prepared) = visibility.cpp().prepared_syntax(file) else {
+        return Vec::new();
+    };
+    let projections = visibility
+        .include_activation_for_source(visibility.cpp(), file, prepared.as_ref(), &binding.source)
+        .map_or_else(
+            || {
+                visibility.conditional_include_projections_for_source(
+                    file,
+                    prepared.as_ref(),
+                    &binding.source,
+                )
+            },
+            |activation_byte| {
+                Arc::from([ConditionalIncludeProjection {
+                    activation_byte,
+                    required_guards: HashSet::default(),
+                }])
+            },
+        );
+    projections
+        .iter()
+        .cloned()
+        .filter_map(|projection| {
+            let required_guards =
+                merge_preprocessor_guards(&binding.required_guards, &projection.required_guards)?;
+            let mut projected = binding.clone();
+            projected.required_guards = required_guards;
+            project_using_binding_at_activation(projected, projection.activation_byte, root, source)
+        })
+        .collect()
+}
+
+fn project_using_binding_at_activation(
+    mut binding: OrdinaryTypeImport,
+    activation: usize,
+    root: Node<'_>,
+    source: &str,
+) -> Option<OrdinaryTypeImport> {
     let include = include_node_for_activation(root, activation)?;
     let include_namespace = enclosing_namespace_components(include, source);
     let mut declaration_namespace = include_namespace.clone();
@@ -3562,11 +3720,9 @@ fn effective_using_bindings_for_name(
                 };
                 let mut binding = binding.clone();
                 binding.resolved_target_components = Some(target_components);
-                if let Some(binding) =
-                    project_using_binding(binding, visibility, file, root, source)
-                {
-                    projected.push(binding);
-                }
+                projected.extend(project_using_bindings(
+                    binding, visibility, file, root, source,
+                ));
             }
             Arc::from(projected)
         })
@@ -3596,8 +3752,19 @@ fn effective_using_binding_active(
     binding: &OrdinaryTypeImport,
     node: Node<'_>,
     lexical_scope: &[String],
+    source: &str,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
 ) -> bool {
     binding.declaration_byte <= node.start_byte()
+        && preprocessor_guard_environment(node, source)
+            .is_some_and(|active| binding.required_guards.is_subset(&active))
+        && visibility.preprocessor_guards_stable_between(
+            file,
+            0,
+            node.start_byte(),
+            &binding.required_guards,
+        )
         && binding.namespace_scope.as_ref().map_or_else(
             || binding.scope_start <= node.start_byte() && node.end_byte() <= binding.scope_end,
             |namespace| lexical_scope.starts_with(namespace),
@@ -3699,12 +3866,24 @@ fn ordinary_type_import_resolution(
         effective_using_bindings_for_name(visibility, imports, file, root_node(node), source, name);
     let active = bindings
         .iter()
-        .filter(|binding| effective_using_binding_active(binding, node, lexical_scope))
+        .filter(|binding| {
+            effective_using_binding_active(binding, node, lexical_scope, source, visibility, file)
+        })
         .collect::<Vec<_>>();
+    let reference_guards = preprocessor_guard_environment(node, source);
     let transitive = bindings
         .iter()
         .filter(|binding| {
             binding.declaration_byte <= node.start_byte()
+                && reference_guards
+                    .as_ref()
+                    .is_some_and(|active| binding.required_guards.is_subset(active))
+                && visibility.preprocessor_guards_stable_between(
+                    file,
+                    0,
+                    node.start_byte(),
+                    &binding.required_guards,
+                )
                 && (binding.namespace_scope.is_some()
                     || (binding.scope_start <= node.start_byte()
                         && node.end_byte() <= binding.scope_end))
@@ -3870,7 +4049,8 @@ fn resolve_type_components_lexically_at_inner(
             file,
             source,
             true,
-            recovered_macro_function_return_type(node).is_some(),
+            recovered_macro_decorated_declarator_type(node)
+                == Some(RecoveredDeclaratorTypeContext::FunctionDefinition),
         ) {
             LexicalScopeResolution::Resolved(scope) => scope,
             LexicalScopeResolution::Ambiguous => return LexicalTypeResolution::Ambiguous,
@@ -3910,7 +4090,8 @@ fn resolve_type_components_lexically_at_inner(
     };
     let normal = match normal {
         LexicalTypeResolution::Resolved { ref unit, .. }
-            if !visibility.external_type_candidate_visible_at(file, unit, node.start_byte()) =>
+            if !visibility
+                .external_type_candidate_visible_in_context(analyzer, file, unit, node) =>
         {
             LexicalTypeResolution::Missing
         }

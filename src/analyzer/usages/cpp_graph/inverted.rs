@@ -36,8 +36,8 @@ use super::resolver::{
     declarator_name_node, designated_initializer_owner, extract_variable_name, first_type_child,
     infer_cpp_initializer_binding, infer_cpp_initializer_type, is_declaration_name,
     is_declarator_node, is_nested_type_node, normalize_type_text,
-    out_of_line_member_definition_owner, recovered_macro_function_return_type,
-    recovered_qualified_declarator_type, resolve_declaring_member_owner, same_visible_symbol,
+    out_of_line_destructor_type_reference, out_of_line_member_definition_owner,
+    recovered_macro_decorated_declarator_type, resolve_declaring_member_owner, same_visible_symbol,
 };
 use super::syntax::explicit_qualified_callable_value;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
@@ -245,10 +245,7 @@ fn record_reference(
         return;
     }
     match node.kind() {
-        "namespace_identifier"
-            if recovered_macro_function_return_type(node).is_some()
-                || recovered_qualified_declarator_type(node) =>
-        {
+        "namespace_identifier" if recovered_macro_decorated_declarator_type(node).is_some() => {
             record_type_reference(node, ctx);
         }
         // A type reference (`Foo x`, base class, `new Foo()`'s type child) resolves
@@ -263,8 +260,13 @@ fn record_reference(
                     ctx.source,
                     node,
                 ) {
+                    let terminal_destructor = out_of_line_destructor_type_reference(node);
+                    let innermost = owners.innermost().map(|(_, owner)| owner.clone());
                     for (owner_node, owner) in owners.owners {
                         ctx.record(owner.fq_name(), owner_node);
+                    }
+                    if let (Some(terminal), Some(owner)) = (terminal_destructor, innermost) {
+                        ctx.record(owner.fq_name(), terminal);
                     }
                 }
                 return;

@@ -1,6 +1,8 @@
 use super::*;
 use crate::analyzer::usages::common::same_node;
-use crate::analyzer::usages::csharp_graph::csharp_resolve_type_fq_name;
+use crate::analyzer::usages::csharp_graph::{
+    csharp_resolve_type_fq_name, csharp_usage_direct_base,
+};
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{
     csharp_attribute_name_node, csharp_attribute_type_names, csharp_conditional_member_access,
@@ -149,8 +151,13 @@ pub(super) fn resolve_csharp(
             );
             let mut receiver_type_names = owners.iter().map(CodeUnit::fq_name).collect::<Vec<_>>();
             if receiver_type_names.is_empty() {
-                receiver_type_names =
-                    csharp_explicit_receiver_type_names(csharp, file, source, receiver);
+                receiver_type_names = csharp_structured_receiver_type_names(
+                    csharp,
+                    file,
+                    source,
+                    tree.root_node(),
+                    receiver,
+                );
             }
             let arity = csharp_invocation_arity(name, source);
             let outcome = csharp_member_outcome(
@@ -316,10 +323,11 @@ pub(super) fn resolve_csharp(
     }
 }
 
-fn csharp_explicit_receiver_type_names(
+fn csharp_structured_receiver_type_names(
     csharp: &CSharpAnalyzer,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     mut receiver: Node<'_>,
 ) -> Vec<String> {
     while matches!(
@@ -330,6 +338,16 @@ fn csharp_explicit_receiver_type_names(
             return Vec::new();
         };
         receiver = inner;
+    }
+    if receiver.kind() == "identifier" {
+        let name = csharp_node_text(receiver, source);
+        let bindings =
+            csharp_legacy_bindings_before_scoped(csharp, file, source, root, receiver.start_byte());
+        return bindings
+            .resolve_symbol(name)
+            .as_precise()
+            .map(|types| types.iter().cloned().collect())
+            .unwrap_or_default();
     }
     let type_node = match receiver.kind() {
         "cast_expression" => receiver.child_by_field_name("type"),
@@ -1109,16 +1127,7 @@ fn csharp_member_outcome(
     if !applicable.is_empty() {
         return candidates_outcome(applicable);
     }
-    if !direct_candidates.is_empty() {
-        return if fallback_when_inapplicable {
-            candidates_outcome(direct_candidates)
-        } else {
-            no_definition(
-                "no_applicable_overload",
-                format!("no C# member `{member}` overload accepts this call"),
-            )
-        };
-    }
+    let mut fallback_candidates = direct_candidates;
 
     if let Some(provider) = analyzer.type_hierarchy_provider() {
         let mut seen = HashSet::default();
@@ -1152,18 +1161,21 @@ fn csharp_member_outcome(
             if !applicable.is_empty() {
                 return candidates_outcome(applicable);
             }
-            if !level_candidates.is_empty() {
-                return if fallback_when_inapplicable {
-                    candidates_outcome(level_candidates)
-                } else {
-                    no_definition(
-                        "no_applicable_overload",
-                        format!("no inherited C# member `{member}` overload accepts this call"),
-                    )
-                };
+            if fallback_candidates.is_empty() && !level_candidates.is_empty() {
+                fallback_candidates = level_candidates;
             }
             level = next_level;
         }
+    }
+    if !fallback_candidates.is_empty() {
+        return if fallback_when_inapplicable {
+            candidates_outcome(fallback_candidates)
+        } else {
+            no_definition(
+                "no_applicable_overload",
+                format!("no C# member `{member}` overload accepts this call"),
+            )
+        };
     }
     no_definition(
         "no_indexed_definition",
@@ -1350,11 +1362,7 @@ fn csharp_receiver_type_units(
             .into_iter()
             .collect(),
         "base" => csharp_enclosing_class(analyzer, file, receiver.start_byte())
-            .and_then(|owner| {
-                analyzer
-                    .type_hierarchy_provider()
-                    .and_then(|provider| provider.get_ancestors(&owner).into_iter().next())
-            })
+            .and_then(|owner| csharp_usage_direct_base(analyzer, csharp, &owner))
             .into_iter()
             .collect(),
         "qualified_name" | "generic_name" => csharp_logical_visible_type_candidates(

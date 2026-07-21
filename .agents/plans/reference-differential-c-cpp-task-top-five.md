@@ -30,6 +30,12 @@ The observable result is ten accepted repository records selected by exact desce
 - [x] (2026-07-20 20:15Z) Posted production evidence and closed assigned issues #997, #924, and #928; published the compact C manifest and requested C-language summary.
 - [x] Complete the five-repository C baseline, integrity-check every record, exhaustively disposition every raw missing row, and give the user the requested C-language summary.
 - [x] File/assign, implement, review, test, publish, and exact-prove every legitimate C root cause not owned by somebody else; rebuild and rerun the complete C set after any fix.
+- [x] (2026-07-20 20:35Z) Built and checksummed the clean release runner at published head `e21d1d3e`, verified all five pinned C++ clones are clean, and dry-ran the explicit task-selected set.
+- [x] (2026-07-20 20:45Z) Completed five clean C++ discovery records with one fingerprint, zero file or candidate errors, and 135 raw missing rows; ESPHome's explicit 1,000-target budget left 934 targets and 1,222 sites visibly inconclusive rather than silently omitted.
+- [x] (2026-07-20 21:00Z) Extracted and checksummed all 135 raw C++ rows and exact-reran every coordinate with ephemeral cache; all 135 reproduced without operational failure.
+- [x] (2026-07-20 21:12Z) Reconciled all 135 exact C++ rows: 78 are product discrepancies (ESPHome 15, libcbor 3, qpid-proton 60) and 57 are non-product or soundly inconclusive (ESPHome 2, Circl 4, qpid-proton 51). Reused assigned issue #940, created #1000 through #1005, and verified every worked issue is open and assigned only to `jbellis` before implementation.
+- [x] (2026-07-21 05:35Z) Integrated the structured fixes for #940 and #1000 through #1005, root-reviewed the combined resolver/declaration/hierarchy behavior, and exact-proved all 78 product witnesses on the working release runner; the final nine previously unresolved coordinates now classify as five `consistent`, two correct import-boundary `inconclusive`, one exact two-definition `editor_only`, and one `consistent` constructor call.
+- [x] (2026-07-21 06:05Z) Passed formatting, `git diff --check`, 43 C++ analyzer tests, 76 C++ definition tests, 141 C++ graph tests, 16 C++ hierarchy tests, isolated all-target/all-feature Clippy, and the complete serialized `cargo test --features nlp,python` suite. The full suite passed after independently confirming that an `EPERM` under the filesystem sandbox and one parallel SQLite lock were environmental concurrency artifacts.
 - [ ] Complete the five-repository C++ baseline, integrity-check every record, exhaustively disposition every raw missing row, and give the user the requested C++-language summary.
 - [ ] File/assign, implement, review, test, publish, and exact-prove every legitimate C++ root cause not owned by somebody else; rebuild and rerun the complete C++ set after any fix.
 - [ ] Publish compact manifests and summaries, comment on and close every assigned issue proven fixed, run the final local gates, and verify the clean local head, `origin/master`, and remote master agree.
@@ -68,6 +74,21 @@ The observable result is ten accepted repository records selected by exact desce
 
 - Observation: The accepted C rerun has no residual raw disagreement.
   Evidence: five clean task-selected records at `7c1a16e0` share fingerprint `830e9a0f239fcaa3e8f0a0b9d7831aa8f3ca8917a6b39e24d70e84cb601223d6`; all 40,000 sampled sites partition into 6,215 consistent and 33,785 inconclusive rows with zero missing. The rank-six substantive supplement adds 10,000 sites, 1,698 consistent, two soundly unproven, 8,300 inconclusive, and zero missing.
+
+- Observation: The literal fourth-ranked C++ selection also has no eligible C++ files.
+  Evidence: `ljharb__qs` completed a clean zero-file record. The selector contract is still preserved; unlike C, the other four task-selected C++ repositories all provide substantive analyzer coverage, so no additional replacement policy is needed unless final coverage proves inadequate.
+
+- Observation: The 135 C++ raw rows contain concentrated product families, differential-only rows, and sound uncertainty that require public-path reconciliation.
+  Evidence: 135 clean exact probes reproduced. Qpid-proton and libcbor establish 40 macro-prefixed declaration type omissions and 23 forward lookup errors; ESPHome establishes six inherited-member omissions and nine guarded type omissions. The remaining 57 rows are non-product or soundly inconclusive: 46 differential-batch-only rows retained by the public targeted API, five declaration-sampler leaks in the existing #969 family, four malformed Go/Plan 9 assembly tokens parsed as C++, and two `unproven_cpp_link_unit` cases.
+
+- Observation: ESPHome exceeds the configured inverse-target budget without invalidating the sampled partition.
+  Evidence: 1,934 distinct target groups were discovered, 1,000 were queried, 934 were explicitly skipped, and 1,222 affected sites were marked inconclusive. Every one of ESPHome's 17 raw missing rows belongs to a queried target with a complete inverse result, so the cap does not explain any actionable witness.
+
+- Observation: The C++ product rows were not one fallback-shaped gap; they exposed six interacting structured-resolution boundaries.
+  Evidence: the fixes recover macro-decorated declarator types, model conditional include visibility without evaluating arbitrary source text, preserve qualified/template owners, resolve relative inherited members, distinguish direct `this` from chained member receivers, and keep callable identity ahead of same-named nested types. Exact production probes clear all 78 product witnesses without weakening the 57 deliberately conservative outcomes.
+
+- Observation: The full feature-enabled suite has two host-sensitive tests that require their intended execution environment.
+  Evidence: a sandboxed run passed 1,464 library tests but three stderr-pipe cases received `EPERM`; those five focused tests passed outside the sandbox. A parallel unsandboxed run passed 1,466 library tests but one fresh-cache migration stress case encountered a transient SQLite lock; it passed focused and the complete unsandboxed serialized suite then exited zero.
 
 ## Decision Log
 
@@ -114,6 +135,10 @@ The observable result is ten accepted repository records selected by exact desce
 - Decision: Preserve BitcoinAddressFinder as the literal task-ranked fourth record, and supplement rather than replace it with rank-six `aws__s2n-tls` after #997 is fixed.
   Rationale: Substituting a different repository would violate the user's exact `tasks.py` selector contract, while calling a zero-file record meaningful C coverage would be misleading. The supplement keeps selector provenance intact and produces five substantive C audits; it will be labeled extra rather than silently promoted into the top five.
   Date/Author: 2026-07-20 / Codex
+
+- Decision: Publish the six C++ issue families as one reviewed checkpoint before the final corpus rerun.
+  Rationale: the production witnesses overlap in owner recovery, declaration identity, hierarchy, and forward/inverse candidate selection. Landing the coherent stack once avoids accepting evidence from intermediate resolver combinations, while each issue retains focused reductions and exact coordinates for closure proof.
+  Date/Author: 2026-07-21 / Codex
 
 ## Outcomes & Retrospective
 
@@ -253,3 +278,9 @@ Revision note (2026-07-20 17:18Z): Recorded the clean runner and first C discove
 Revision note (2026-07-20 18:45Z): Recorded #996 publication, gates, production proof, and closure; completed and integrity-checked the literal five-repository C discovery corpus; documented the BitcoinAddressFinder selector mismatch and supplemental real-C policy; and added assigned issue #997 from exhaustive adjudication of all eight declaration-site residuals.
 
 Revision note (2026-07-20 20:17Z): Recorded #997's structured fix, local gates, publication, eight exact proofs, the clean zero-missing five-record C rerun, the matching rank-six substantive supplement, independent acceptance audit, closures for #997/#924/#928, and the compact C milestone artifacts.
+
+Revision note (2026-07-20 21:05Z): Recorded the clean five-record C++ discovery run, explicit ESPHome cap accounting, all 135 exact reproductions, the confirmed 74/57 product-versus-non-product partition with four ESPHome rows still under public-path review, and assigned issue ledger #940/#1000-#1005 before parallel implementation.
+
+Revision note (2026-07-20 21:12Z): Finished public-path reconciliation of all four pending ESPHome rows, freezing the 78-product/57-non-product partition and allocating the final ESPHome witnesses to #940 and #1000.
+
+Revision note (2026-07-21 06:05Z): Recorded the integrated #940/#1000-#1005 structured fix stack, exact working-runner proof for all product witnesses, focused gates, isolated all-feature Clippy, the environmental interpretation of sandbox/parallel flakes, and the authoritative green serialized full-feature test suite before publication.

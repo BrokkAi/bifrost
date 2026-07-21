@@ -213,6 +213,63 @@ public:
 }
 
 #[test]
+fn newline_exported_class_with_templated_base_keeps_class_identity() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "connection.hpp",
+            r#"#define PN_CPP_CLASS_EXTERN
+struct pn_connection_t;
+namespace proton {
+namespace internal { template <typename T> class object {}; }
+class endpoint {};
+class
+PN_CPP_CLASS_EXTERN connection : public internal::object<pn_connection_t>, public endpoint {
+ public:
+    void open();
+};
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let declarations = analyzer.get_all_declarations();
+
+    let connections = declarations
+        .iter()
+        .filter(|unit| {
+            unit.kind() == CodeUnitType::Class
+                && unit.fq_name() == "proton.connection"
+                && !unit.is_synthetic()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        connections.len(),
+        1,
+        "newline macro class must retain its displaced connection identity: {declarations:#?}"
+    );
+
+    let ancestors = analyzer
+        .get_direct_ancestors(connections[0])
+        .into_iter()
+        .map(|unit| unit.fq_name())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        ancestors,
+        BTreeSet::from([
+            "proton.endpoint".to_string(),
+            "proton::internal.object".to_string(),
+        ]),
+        "templated and terminal bases must both survive structured recovery"
+    );
+    assert!(
+        declarations.iter().all(|unit| {
+            unit.kind() != CodeUnitType::Field || unit.fq_name() != "proton.endpoint"
+        }),
+        "the final base declarator must not leak as a phantom proton.endpoint Field: {declarations:#?}"
+    );
+}
+
+#[test]
 fn cpp_iterative_visitor_preserves_top_level_source_order() {
     let project = inline_cpp_project(&[(
         "ordered.cpp",

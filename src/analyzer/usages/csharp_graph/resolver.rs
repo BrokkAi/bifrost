@@ -2,6 +2,7 @@ pub(in crate::analyzer::usages) use crate::analyzer::usages::common::node_text;
 pub(super) use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
+use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
 use crate::analyzer::{
     CSharpAnalyzer, CSharpMemberName, CallableArity, CodeUnit, IAnalyzer, ProjectFile,
     csharp_callable_arity, csharp_conditional_member_access, csharp_member_name,
@@ -520,6 +521,36 @@ pub(super) fn class_unit_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Opti
     (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
+pub(in crate::analyzer::usages) fn usage_direct_base(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    owner: &CodeUnit,
+) -> Option<CodeUnit> {
+    let mut candidates = csharp
+        .usage_direct_ancestors(owner)
+        .into_iter()
+        .filter(|candidate| csharp_is_class_base_declaration(analyzer, candidate))
+        .collect::<Vec<_>>();
+    csharp.sort_dedup_type_candidates(&mut candidates);
+    (csharp.logical_type_count(&candidates) == 1)
+        .then(|| candidates.into_iter().next())
+        .flatten()
+}
+
+fn csharp_is_class_base_declaration(analyzer: &dyn IAnalyzer, candidate: &CodeUnit) -> bool {
+    let language = tree_sitter_c_sharp::LANGUAGE.into();
+    let Some(parsed) = parse_tree_sitter_file(candidate.source(), &language) else {
+        return false;
+    };
+    analyzer.ranges(candidate).into_iter().any(|range| {
+        parsed
+            .tree
+            .root_node()
+            .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+            .is_some_and(|node| matches!(node.kind(), "class_declaration" | "record_declaration"))
+    })
+}
+
 fn forward_class_unit_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Option<CodeUnit> {
     let mut candidates = forward_type_declarations_for_fq_name(csharp, fqn);
     csharp.sort_dedup_type_candidates(&mut candidates);
@@ -668,6 +699,7 @@ fn method_return_type_fq_name_for_arity_inner(
         owner,
         method_name,
         explicit_generic_arity,
+        arity,
         usage,
     )
     .into_iter()
@@ -804,10 +836,21 @@ fn seed_symbol_for_type(
     bindings: &mut LocalInferenceEngine<String>,
     usage: bool,
 ) {
-    if let Some(target) =
-        resolve_type_fq_name_for_scope(csharp, file, &reference_type_text(type_node, source), usage)
-    {
+    let reference = reference_type_text(type_node, source);
+    if let Some(target) = resolve_type_fq_name_for_scope(csharp, file, &reference, usage) {
         bindings.seed_symbol(node_text(name_node, source), target);
+    } else if !usage {
+        let normalized = normalize_type_text(&reference);
+        let raw_type = csharp
+            .using_aliases_of(file)
+            .get(&normalized)
+            .cloned()
+            .unwrap_or(normalized);
+        if raw_type.is_empty() || raw_type == "var" {
+            bindings.declare_shadow(node_text(name_node, source));
+        } else {
+            bindings.seed_symbol(node_text(name_node, source), raw_type);
+        }
     } else {
         bindings.declare_shadow(node_text(name_node, source));
     }
@@ -1139,13 +1182,17 @@ fn extension_method_receiver_type_inner(
     }
     let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer)?;
     let owner = analyzer.parent_of(unit)?;
-    analyzer
+    let receiver_type = analyzer
         .signatures(unit)
         .iter()
-        .find_map(|signature| extension_receiver_type_from_signature(signature))
-        .and_then(|type_text| {
-            resolve_member_type_fq_name(csharp, unit.source(), &owner, &type_text, usage)
-        })
+        .find_map(|signature| extension_receiver_type_from_signature(signature))?;
+    let resolved =
+        resolve_member_type_fq_name(csharp, unit.source(), &owner, &receiver_type, usage);
+    if usage {
+        resolved
+    } else {
+        resolved.or_else(|| Some(normalize_type_text(&receiver_type)))
+    }
 }
 
 #[derive(Default)]
@@ -1238,6 +1285,9 @@ fn visible_extension_method_candidates_inner(
 ) -> Vec<CodeUnit> {
     let compatible_receiver_types =
         compatible_receiver_type_names(csharp, analyzer, receiver_type_names, usage);
+    if !usage && compatible_receiver_types.is_empty() {
+        return Vec::new();
+    }
     let scopes = extension_visibility_scopes(csharp, source, site, usage);
     let named_candidates = if usage {
         csharp
@@ -1284,18 +1334,22 @@ fn visible_extension_method_candidates_inner(
             })
             .filter(|unit| is_extension_method(analyzer, unit))
             .filter(|unit| {
-                compatible_receiver_types.is_empty()
-                    || (if usage {
-                        usage_extension_method_receiver_type(analyzer, unit)
-                    } else {
-                        extension_method_receiver_type(analyzer, unit)
-                    })
-                    .is_none_or(|receiver| {
-                        let receiver = csharp_normalize_full_name(&receiver);
-                        compatible_receiver_types
-                            .iter()
-                            .any(|candidate| type_identity_matches(candidate, &receiver))
-                    })
+                let receiver = if usage {
+                    usage_extension_method_receiver_type(analyzer, unit)
+                } else {
+                    extension_method_receiver_type(analyzer, unit)
+                };
+                let matches_receiver = |receiver: String| {
+                    let receiver = csharp_normalize_full_name(&receiver);
+                    compatible_receiver_types
+                        .iter()
+                        .any(|candidate| type_identity_matches(candidate, &receiver))
+                };
+                if usage {
+                    compatible_receiver_types.is_empty() || receiver.is_none_or(matches_receiver)
+                } else {
+                    receiver.is_some_and(matches_receiver)
+                }
             })
             .collect::<Vec<_>>();
         let Some(call_arity) = call_arity else {
@@ -1709,6 +1763,10 @@ fn receiver_type_fq_names(
         "this" => enclosing_declared_type(receiver_node, csharp, file, source)
             .map(|owner| SymbolResolution::Precise(std::iter::once(owner.fq_name()).collect()))
             .unwrap_or(SymbolResolution::Unknown),
+        "base" => enclosing_declared_type(receiver_node, csharp, file, source)
+            .and_then(|owner| usage_direct_base(analyzer, csharp, &owner))
+            .map(|owner| SymbolResolution::Precise(std::iter::once(owner.fq_name()).collect()))
+            .unwrap_or(SymbolResolution::Unknown),
         _ => SymbolResolution::Unknown,
     }
 }
@@ -1786,6 +1844,26 @@ pub(super) fn nearest_member_candidates_for_owner(
         owner,
         name,
         explicit_generic_arity,
+        None,
+        true,
+    )
+}
+
+pub(super) fn applicable_member_candidates_for_owner(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    owner: &CodeUnit,
+    name: &str,
+    explicit_generic_arity: Option<usize>,
+    call_arity: usize,
+) -> Vec<CodeUnit> {
+    nearest_member_candidates_for_owner_inner(
+        analyzer,
+        csharp,
+        owner,
+        name,
+        explicit_generic_arity,
+        Some(call_arity),
         true,
     )
 }
@@ -1796,6 +1874,7 @@ fn nearest_member_candidates_for_owner_inner(
     owner: &CodeUnit,
     name: &str,
     explicit_generic_arity: Option<usize>,
+    call_arity: Option<usize>,
     usage: bool,
 ) -> Vec<CodeUnit> {
     let mut hierarchy = None;
@@ -1836,6 +1915,12 @@ fn nearest_member_candidates_for_owner_inner(
                         explicit_generic_arity.is_none_or(|arity| {
                             candidate.is_function()
                                 && csharp_method_generic_arity(candidate.signature()) == arity
+                        })
+                    })
+                    .filter(|candidate| {
+                        call_arity.is_none_or(|arity| {
+                            candidate.is_function()
+                                && csharp_callable_arity(analyzer, candidate).accepts(arity)
                         })
                     }),
             );

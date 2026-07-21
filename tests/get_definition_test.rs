@@ -14973,6 +14973,85 @@ fn csharp_extension_method_resolves_from_visible_namespace() {
 }
 
 #[test]
+fn csharp_extension_candidates_require_structured_external_receiver_evidence() {
+    let source = r#"using System;
+namespace ClosedXML.Excel;
+
+internal static class TypeExtensions {
+    public static string Describe(this Type type) => "type";
+    public static Type GetUnderlyingType(this Type type) => type;
+
+    public static bool IsNullable(Type type) =>
+        Nullable.GetUnderlyingType(type) != null;
+
+    public static string DescribeLocal(Type type) {
+        Type local = type;
+        return local.Describe();
+    }
+}
+
+internal static class UriExtensions {
+    public static string Describe(this Uri uri) => "uri";
+}
+
+internal static class Consumer {
+    public static string DescribeType(Type type) => type.Describe();
+    public static string DescribeUri(Uri uri) => uri.Describe();
+    public static string Unknown() => mystery.Describe();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("ClosedXML/Extensions/TypeExtensions.cs", source)
+        .build();
+
+    let sites = [
+        ("Nullable.GetUnderlyingType", "Nullable."),
+        ("local.Describe()", "local."),
+        ("type.Describe()", "type."),
+        ("uri.Describe()", "uri."),
+        ("mystery.Describe()", "mystery."),
+    ];
+    let references = sites
+        .into_iter()
+        .map(|(needle, receiver)| {
+            let offset = source.find(needle).expect("reference site") + receiver.len();
+            location_query("ClosedXML/Extensions/TypeExtensions.cs", source, offset)
+        })
+        .collect::<Vec<_>>();
+    let value = lookup(
+        project.root(),
+        &json!({ "references": references }).to_string(),
+    );
+
+    for index in [0, 4] {
+        assert_ne!(
+            value["results"][index]["status"], "resolved",
+            "an untyped receiver must not borrow a visible extension owner: {value}"
+        );
+        assert!(
+            value["results"][index]["definitions"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "an untyped receiver must not produce a local definition: {value}"
+        );
+    }
+
+    for index in [1, 2] {
+        assert_eq!(value["results"][index]["status"], "resolved", "{value}");
+        assert_eq!(
+            value["results"][index]["definitions"][0]["fqn"],
+            "ClosedXML.Excel.TypeExtensions.Describe",
+            "declared Type evidence must select only the Type extension: {value}"
+        );
+    }
+    assert_eq!(value["results"][3]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][3]["definitions"][0]["fqn"], "ClosedXML.Excel.UriExtensions.Describe",
+        "declared Uri evidence must select only the Uri extension: {value}"
+    );
+}
+
+#[test]
 fn csharp_inapplicable_direct_member_yields_to_matching_extension() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
@@ -18700,6 +18779,418 @@ fn cpp_unqualified_typo_with_angle_include_returns_no_definition() {
     );
 
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn cpp_explicit_qualified_lookup_preserves_scope_and_symbol_kind() {
+    let api = r#"
+namespace proton {
+template<class K, class V> class map {};
+template<class T> class outer {
+public:
+    template<class U> class nested {};
+};
+class error {};
+class connection { public: int error() const; };
+namespace nested { class item {}; }
+}
+namespace sibling { class item {}; }
+"#;
+    let source = r#"
+#include "api.hpp"
+#include <map>
+std::map<int, int>* external_map;
+proton::error make_error() { return proton::error(); }
+proton::nested::item nested_item;
+::proton::nested::item global_nested_item;
+proton::outer<int>::nested<long> nested_template_item;
+sibling::item sibling_item;
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("api.hpp", api)
+        .file("app.cpp", source)
+        .build();
+
+    let starts = [
+        source.find("map<int").expect("std map terminal"),
+        source
+            .rfind("error();")
+            .expect("qualified error constructor"),
+        source.find("item nested_item").expect("nested item"),
+        source
+            .find("item global_nested_item")
+            .expect("global nested item"),
+        source.find("nested<long>").expect("nested templated type"),
+        source.find("item sibling_item").expect("sibling item"),
+    ];
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": starts
+                .into_iter()
+                .map(|start| location_query("app.cpp", source, start))
+                .collect::<Vec<_>>()
+        })
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+
+    assert!(
+        matches!(
+            results[0]["status"].as_str(),
+            Some("no_definition" | "unresolvable_import_boundary")
+        ),
+        "{value}"
+    );
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[1]["definitions"][0]["fqn"], "proton.error",
+        "{value}"
+    );
+    assert_eq!(results[1]["definitions"][0]["path"], "api.hpp", "{value}");
+    for (result, expected) in results[2..].iter().zip([
+        "proton::nested.item",
+        "proton::nested.item",
+        "proton.outer$nested",
+        "sibling.item",
+    ]) {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
+fn cpp_qpid_qualified_template_and_macro_class_shapes_resolve_exact_types() {
+    let api = r#"
+#define PN_CPP_CLASS_EXTERN
+namespace std {
+template<class K, class T> class map {};
+class runtime_error {};
+class string {};
+}
+namespace proton {
+template<class K, class T> class map : public std::map<K, T> {
+  using std::map<K,T>::map;
+};
+struct
+PN_CPP_CLASS_EXTERN error : public std::runtime_error {
+    explicit error(const std::string&);
+    ~error() throw();
+};
+class connection { public: int error() const; };
+}
+"#;
+    let source = r#"
+#include "api.hpp"
+void stop() { throw proton::error("container is stopping"); }
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("api.hpp", api)
+        .file("app.cpp", source)
+        .build();
+    let using_start = api
+        .find("using std::map<K,T>")
+        .map(|start| start + "using std::".len())
+        .expect("inherited constructor template qualifier");
+    let error_start = source
+        .find("error(\"")
+        .expect("qualified error constructor");
+    let value = lookup(
+        project.root(),
+        &json!({"references": [
+            location_query("api.hpp", api, using_start),
+            location_query("app.cpp", source, error_start),
+        ]})
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "resolved", "{value}");
+    assert_eq!(results[0]["definitions"][0]["fqn"], "std.map", "{value}");
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[1]["definitions"][0]["fqn"], "proton.error",
+        "{value}"
+    );
+    assert_eq!(results[1]["definitions"][0]["kind"], "class", "{value}");
+}
+
+#[test]
+fn cpp_bare_call_prefers_callable_role_over_same_named_nested_type() {
+    let source = r#"
+class message {
+    struct impl { impl(int); };
+    impl& impl() const;
+public:
+    void body() { impl(); this->impl(); impl(1); }
+};
+class unrelated { public: void impl(int); };
+class widget { public: widget(); };
+void local_shadow() { auto impl = []() {}; impl(); }
+void construct() { widget(); }
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+
+    let starts = [
+        source.find("impl(); this").expect("bare member call"),
+        source
+            .find("this->impl")
+            .map(|start| start + "this->".len())
+            .expect("explicit this member call"),
+        source.find("impl(1)").expect("wrong-arity member call"),
+        source.rfind("impl();").expect("local callable shadow"),
+        source.rfind("widget();").expect("constructor control"),
+    ];
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": starts
+                .into_iter()
+                .map(|start| location_query("app.cpp", source, start))
+                .collect::<Vec<_>>()
+        })
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+
+    for result in &results[..2] {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], "message.impl", "{value}");
+        assert_eq!(result["definitions"][0]["kind"], "function", "{value}");
+    }
+    assert_eq!(results[2]["status"], "no_definition", "{value}");
+    assert_eq!(results[3]["status"], "no_definition", "{value}");
+    assert_eq!(results[4]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[4]["definitions"][0]["fqn"], "widget.widget",
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_out_of_line_bare_member_call_prefers_callable_over_nested_type() {
+    let forward = r#"namespace proton { class message; }"#;
+    let header = r#"
+#define PN_CPP_CLASS_EXTERN
+namespace proton {
+class
+PN_CPP_CLASS_EXTERN message {
+    struct impl;
+    struct impl& impl() const;
+public:
+    void body(int);
+};
+}
+"#;
+    let source = r#"
+#include "fwd.hpp"
+#include "message.hpp"
+namespace proton {
+struct message::impl {};
+struct message::impl& message::impl() const { static struct impl value; return value; }
+void message::body(int x) { impl(); }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("fwd.hpp", forward)
+        .file("tracing_private.hpp", forward)
+        .file("message.hpp", header)
+        .file("message.cpp", source)
+        .build();
+    let start = source
+        .rfind("impl();")
+        .expect("bare out-of-line member call");
+    let value = lookup(
+        project.root(),
+        &json!({"references": [location_query("message.cpp", source, start)]}).to_string(),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "proton.message.impl",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["kind"], "function", "{value}");
+}
+
+#[test]
+fn cpp_macro_decorated_out_of_line_owner_prefers_canonical_included_class() {
+    let api = r#"
+#define API
+namespace proton {
+class
+API endpoint {
+public:
+    ~endpoint();
+    void before();
+    void touch();
+};
+class
+API connection : public endpoint { int endpoint; };
+class
+API link : public endpoint { int endpoint; };
+}
+"#;
+    let unrelated = r#"
+#define API
+namespace unrelated { class
+API endpoint { public: ~endpoint(); void touch(); }; }
+"#;
+    let shadow = r#"
+#define API
+namespace proton { class
+API endpoint { public: ~endpoint(); void before(); void touch(); }; }
+"#;
+    let source = r#"
+namespace proton { void endpoint::before() {} }
+#include "api.hpp"
+namespace proton {
+endpoint::~endpoint() = default;
+void endpoint::touch() {}
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("api.hpp", api)
+        .file("unrelated.hpp", unrelated)
+        .file("shadow.hpp", shadow)
+        .file("endpoint.cpp", source)
+        .build();
+
+    let starts = [
+        source
+            .find("endpoint::before")
+            .expect("owner before include"),
+        source.find("endpoint::~").expect("destructor owner"),
+        source
+            .find("endpoint::~endpoint")
+            .map(|start| start + "endpoint::~".len())
+            .expect("terminal destructor type name"),
+        source.find("endpoint::touch").expect("method owner"),
+    ];
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": starts
+                .into_iter()
+                .map(|start| location_query("endpoint.cpp", source, start))
+                .collect::<Vec<_>>()
+        })
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "no_definition", "{value}");
+    for result in &results[1..] {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], "proton.endpoint",
+            "{value}"
+        );
+        assert_eq!(result["definitions"][0]["path"], "api.hpp", "{value}");
+        assert_eq!(
+            result["definitions"].as_array().map(Vec::len),
+            Some(1),
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn cpp_local_and_self_values_do_not_fall_through_to_workspace_homonyms() {
+    let first = r#"
+class duplicate {
+    int state_;
+public:
+    duplicate(int value) : state_(value) {}
+    void reset() { state_ = 0; }
+};
+"#;
+    let second = r#"
+class duplicate {
+    int state_;
+public:
+    duplicate(int value) : state_(value) {}
+};
+"#;
+    let source = r#"
+namespace proton { class url {}; }
+class sender { public: sender(int, int, int); };
+void consume(int);
+void accept(proton::url);
+void run(int container, int url, int address) {
+    sender send(container, url, address);
+    consume(url);
+    accept(proton::url{});
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("first.cpp", first)
+        .file("second.cpp", second)
+        .file("app.cpp", source)
+        .build();
+
+    let first_starts = [
+        first.find("state_(value)").expect("constructor field"),
+        first.rfind("state_ =").expect("member write"),
+    ];
+    let first_value = lookup(
+        project.root(),
+        &json!({
+            "references": first_starts
+                .into_iter()
+                .map(|start| location_query("first.cpp", first, start))
+                .collect::<Vec<_>>()
+        })
+        .to_string(),
+    );
+    for result in first_value["results"]
+        .as_array()
+        .expect("definition results")
+    {
+        assert_eq!(result["status"], "resolved", "{first_value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], "duplicate.state_",
+            "{first_value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["path"], "first.cpp",
+            "{first_value}"
+        );
+    }
+
+    let local_starts = [
+        source.find("url, address").expect("constructor argument"),
+        source.rfind("url);").expect("ordinary local argument"),
+        source.rfind("url{}").expect("qualified type construction"),
+    ];
+    let local_value = lookup(
+        project.root(),
+        &json!({
+            "references": local_starts
+                .into_iter()
+                .map(|start| location_query("app.cpp", source, start))
+                .collect::<Vec<_>>()
+        })
+        .to_string(),
+    );
+    let local_results = local_value["results"]
+        .as_array()
+        .expect("definition results");
+    assert_eq!(local_results[0]["status"], "no_definition", "{local_value}");
+    assert_eq!(local_results[1]["status"], "resolved", "{local_value}");
+    assert_eq!(
+        local_results[1]["definitions"][0]["kind"], "parameter",
+        "{local_value}"
+    );
+    assert_eq!(
+        local_results[1]["definitions"][0]["path"], "app.cpp",
+        "{local_value}"
+    );
+    assert_eq!(local_results[2]["status"], "resolved", "{local_value}");
+    assert_eq!(
+        local_results[2]["definitions"][0]["fqn"], "proton.url",
+        "{local_value}"
+    );
 }
 
 #[test]

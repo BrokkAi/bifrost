@@ -10,7 +10,7 @@ use crate::analyzer::usages::cpp_graph::{
     cpp_function_return_type_text, cpp_initialized_effective_using_imports,
     cpp_is_declaration_name, cpp_is_declarator_node, cpp_name_for, cpp_reference_fqn_candidates,
     cpp_resolve_bare_call_target, cpp_signature_arity, cpp_split_top_level_commas,
-    extract_variable_name, normalize_cpp_type_text,
+    cpp_type_name_components, extract_variable_name, normalize_cpp_type_text,
 };
 use crate::analyzer::usages::csharp_graph::{
     csharp_argument_count, csharp_first_type_child, csharp_is_declaration_name,
