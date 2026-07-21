@@ -82,6 +82,7 @@ use crate::analyzer::{
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use crate::navigation::NavigationOperation;
 use crate::path_utils::rel_path_string;
 use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
@@ -207,6 +208,21 @@ pub(crate) struct DefinitionLookupOutcome {
     pub(crate) diagnostics: Vec<DefinitionLookupDiagnostic>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NavigationTarget {
+    pub(crate) code_unit: CodeUnit,
+    pub(crate) declaration_range: Option<Range>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NavigationLookupOutcome {
+    pub(crate) status: DefinitionLookupStatus,
+    pub(crate) reference: Option<ResolvedReferenceSite>,
+    pub(crate) targets: Vec<NavigationTarget>,
+    pub(crate) lexical_definition: Option<LexicalDefinition>,
+    pub(crate) diagnostics: Vec<DefinitionLookupDiagnostic>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DefinitionLookupStatus {
     Resolved,
@@ -252,7 +268,47 @@ pub(crate) fn resolve_definition_batch(
         profiling::note(format!("request_count={}", requests.len()));
     }
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
-    resolve_definition_requests(analyzer, &mut context, requests, None)
+    resolve_definition_requests(analyzer, &mut context, requests, None, None)
+}
+
+pub(crate) fn resolve_navigation_batch(
+    analyzer: &dyn IAnalyzer,
+    requests: Vec<DefinitionLookupRequest>,
+    operation: NavigationOperation,
+) -> Vec<NavigationLookupOutcome> {
+    let _scope = profiling::scope("get_definition::resolve_navigation_batch");
+    if profiling::enabled() {
+        profiling::note(format!(
+            "request_count={}, operation={operation:?}",
+            requests.len()
+        ));
+    }
+    let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
+    resolve_navigation_requests(analyzer, &mut context, requests, operation)
+}
+
+fn resolve_navigation_requests(
+    analyzer: &dyn IAnalyzer,
+    context: &mut DefinitionBatchContext<'_>,
+    requests: Vec<DefinitionLookupRequest>,
+    operation: NavigationOperation,
+) -> Vec<NavigationLookupOutcome> {
+    const MAX_NAVIGATION_TARGETS_PER_RESULT: usize = 256;
+    const MAX_NAVIGATION_TARGETS_PER_BATCH: usize = 1024;
+    context.navigation_target_limit = (MAX_NAVIGATION_TARGETS_PER_BATCH / requests.len().max(1))
+        .clamp(1, MAX_NAVIGATION_TARGETS_PER_RESULT);
+    let languages: Vec<_> = requests
+        .iter()
+        .map(|request| language_for_file(&request.file))
+        .collect();
+    let outcomes = resolve_definition_requests(analyzer, context, requests, None, Some(operation));
+    languages
+        .into_iter()
+        .zip(outcomes)
+        .map(|(language, outcome)| {
+            navigation_lookup_outcome(analyzer, context, outcome, language, operation)
+        })
+        .collect()
 }
 
 fn resolve_definition_requests(
@@ -260,6 +316,7 @@ fn resolve_definition_requests(
     context: &mut DefinitionBatchContext<'_>,
     requests: Vec<DefinitionLookupRequest>,
     cancellation: Option<&CancellationToken>,
+    operation: Option<NavigationOperation>,
 ) -> Vec<DefinitionLookupOutcome> {
     let _query_scope = AnalyzerQueryScope::new(analyzer);
     let mut remaining_python_requests: HashMap<ProjectFile, usize> = HashMap::default();
@@ -277,7 +334,7 @@ fn resolve_definition_requests(
         .map(|request| {
             let is_python = language_for_file(&request.file) == Language::Python;
             let file = request.file.clone();
-            let outcome = resolve_one(analyzer, context, request);
+            let outcome = resolve_one(analyzer, context, request, operation);
             if is_python && let Some(remaining) = remaining_python_requests.get_mut(&file) {
                 *remaining -= 1;
                 if *remaining == 0 {
@@ -297,7 +354,44 @@ pub(crate) fn resolve_definition_batch_with_source(
 ) -> Vec<DefinitionLookupOutcome> {
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
     context.sources.insert(file, Ok(source));
-    resolve_definition_requests(analyzer, &mut context, requests, None)
+    resolve_definition_requests(analyzer, &mut context, requests, None, None)
+}
+
+pub(crate) fn resolve_navigation_batch_with_source(
+    analyzer: &dyn IAnalyzer,
+    requests: Vec<DefinitionLookupRequest>,
+    file: ProjectFile,
+    source: Arc<String>,
+    operation: NavigationOperation,
+) -> Vec<NavigationLookupOutcome> {
+    let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
+    context.sources.insert(file, Ok(source));
+    resolve_navigation_requests(analyzer, &mut context, requests, operation)
+}
+
+pub(crate) fn navigation_declaration_site_targets(
+    analyzer: &dyn IAnalyzer,
+    candidate: CodeUnit,
+    operation: NavigationOperation,
+) -> Vec<NavigationTarget> {
+    if language_for_file(candidate.source()) != Language::Cpp {
+        return vec![NavigationTarget {
+            code_unit: candidate,
+            declaration_range: None,
+        }];
+    }
+    let mut context = DefinitionBatchContext::new(analyzer, false);
+    cpp::select_navigation_targets(&mut context, &[candidate], operation).targets
+}
+
+pub(crate) fn navigation_declaration_site_at_offset(
+    file: &ProjectFile,
+    source: &str,
+    offset: usize,
+) -> Option<CodeUnit> {
+    (language_for_file(file) == Language::Cpp)
+        .then(|| cpp::declaration_at_offset(file, source, offset))
+        .flatten()
 }
 
 pub(crate) fn resolve_definition_batch_with_source_and_cancellation(
@@ -309,7 +403,7 @@ pub(crate) fn resolve_definition_batch_with_source_and_cancellation(
 ) -> Vec<DefinitionLookupOutcome> {
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
     context.sources.insert(file, Ok(source));
-    resolve_definition_requests(analyzer, &mut context, requests, Some(cancellation))
+    resolve_definition_requests(analyzer, &mut context, requests, Some(cancellation), None)
 }
 
 pub(crate) fn resolve_call_reference_definition_with_source(
@@ -336,7 +430,7 @@ pub(crate) fn resolve_call_reference_definition_with_source(
         return None;
     }
 
-    Some(resolve_one(analyzer, &mut context, request))
+    Some(resolve_one(analyzer, &mut context, request, None))
 }
 
 #[derive(Clone)]
@@ -375,10 +469,12 @@ struct DefinitionBatchContext<'a> {
     // caches must use indexed source rather than the request's live disk source.
     cpp_indexed_sources: HashMap<ProjectFile, Option<Arc<String>>>,
     cpp_indexed_trees: HashMap<ProjectFile, Option<Tree>>,
+    cpp_navigation_indexes: HashMap<ProjectFile, Option<Arc<cpp::CppNavigationIndex>>>,
     cpp_structural_alias_paths: HashMap<CodeUnit, Vec<String>>,
     cpp_class_ranges: HashMap<ProjectFile, Arc<ClassRangeIndex>>,
     cpp_enclosing_class_chains: HashMap<CodeUnit, Arc<Vec<CodeUnit>>>,
     python_contexts: HashMap<ProjectFile, Arc<python::PythonDefinitionContext>>,
+    navigation_target_limit: usize,
     #[cfg(test)]
     cpp_class_range_builds: usize,
     #[cfg(test)]
@@ -402,10 +498,12 @@ impl<'a> DefinitionBatchContext<'a> {
             cpp_visibility: HashMap::default(),
             cpp_indexed_sources: HashMap::default(),
             cpp_indexed_trees: HashMap::default(),
+            cpp_navigation_indexes: HashMap::default(),
             cpp_structural_alias_paths: HashMap::default(),
             cpp_class_ranges: HashMap::default(),
             cpp_enclosing_class_chains: HashMap::default(),
             python_contexts: HashMap::default(),
+            navigation_target_limit: 256,
             #[cfg(test)]
             cpp_class_range_builds: 0,
             #[cfg(test)]
@@ -531,6 +629,21 @@ impl<'a> DefinitionBatchContext<'a> {
         parsed
     }
 
+    fn cpp_navigation_index(&mut self, file: &ProjectFile) -> Option<Arc<cpp::CppNavigationIndex>> {
+        if let Some(index) = self.cpp_navigation_indexes.get(file) {
+            return index.clone();
+        }
+        let index = self.cpp_indexed_source(file).and_then(|source| {
+            let tree = self.cpp_indexed_tree(file)?;
+            Some(Arc::new(cpp::CppNavigationIndex::build(
+                file, &source, &tree,
+            )))
+        });
+        self.cpp_navigation_indexes
+            .insert(file.clone(), index.clone());
+        index
+    }
+
     fn cpp_class_ranges(&mut self, file: &ProjectFile) -> Arc<ClassRangeIndex> {
         if let Some(index) = self.cpp_class_ranges.get(file) {
             return Arc::clone(index);
@@ -610,6 +723,7 @@ fn resolve_one(
     analyzer: &dyn IAnalyzer,
     context: &mut DefinitionBatchContext<'_>,
     request: DefinitionLookupRequest,
+    operation: Option<NavigationOperation>,
 ) -> DefinitionLookupOutcome {
     let _scope = profiling::scope("get_definition::resolve_one");
     let language = language_for_file(&request.file);
@@ -709,6 +823,7 @@ fn resolve_one(
                         tree.as_ref(),
                         &site,
                         rust_type_cache,
+                        operation,
                     )
                 },
             )
@@ -822,6 +937,16 @@ fn resolve_one(
         }
     };
 
+    let resolved = if let Some(operation) = operation {
+        if language == Language::Cpp {
+            resolved
+        } else {
+            finalize_navigation_outcome(resolved, operation)
+        }
+    } else {
+        resolved
+    };
+
     finish_lookup_outcome(resolved, site)
 }
 
@@ -914,6 +1039,177 @@ fn candidates_outcome(mut candidates: Vec<CodeUnit>) -> DefinitionLookupOutcome 
         reference: None,
         definitions: candidates,
         lexical_definition: None,
+        diagnostics,
+    }
+}
+
+fn finalize_navigation_outcome(
+    mut outcome: DefinitionLookupOutcome,
+    operation: NavigationOperation,
+) -> DefinitionLookupOutcome {
+    sort_units(&mut outcome.definitions);
+    outcome.definitions.dedup();
+    if outcome.lexical_definition.is_some() {
+        outcome.status = DefinitionLookupStatus::Resolved;
+        return outcome;
+    }
+    if outcome.definitions.is_empty() {
+        return outcome;
+    }
+    outcome.status = if outcome.definitions.len() == 1 {
+        DefinitionLookupStatus::Resolved
+    } else {
+        DefinitionLookupStatus::Ambiguous
+    };
+    outcome
+        .diagnostics
+        .retain(|diagnostic| diagnostic.kind != "ambiguous_definition");
+    if outcome.status == DefinitionLookupStatus::Ambiguous {
+        outcome.diagnostics.push(DefinitionLookupDiagnostic {
+            kind: "ambiguous_definition".to_string(),
+            message: format!(
+                "{} navigation resolved to multiple workspace targets",
+                match operation {
+                    NavigationOperation::Declaration => "declaration",
+                    NavigationOperation::Definition => "definition",
+                }
+            ),
+        });
+    }
+    outcome
+}
+
+fn navigation_lookup_outcome(
+    _analyzer: &dyn IAnalyzer,
+    context: &mut DefinitionBatchContext<'_>,
+    outcome: DefinitionLookupOutcome,
+    language: Language,
+    operation: NavigationOperation,
+) -> NavigationLookupOutcome {
+    let DefinitionLookupOutcome {
+        mut status,
+        reference,
+        definitions,
+        lexical_definition,
+        mut diagnostics,
+    } = outcome;
+    let (mut targets, structure_unavailable, unproven_link_unit, mut truncated) =
+        if language == Language::Cpp {
+            let selection = cpp::select_navigation_targets(context, &definitions, operation);
+            (
+                selection.targets,
+                selection.structure_unavailable,
+                selection.unproven_link_unit,
+                selection.truncated,
+            )
+        } else {
+            let mut targets: Vec<_> = definitions
+                .iter()
+                .cloned()
+                .map(|code_unit| NavigationTarget {
+                    code_unit,
+                    declaration_range: None,
+                })
+                .collect();
+            let truncated = targets.len() > context.navigation_target_limit;
+            targets.truncate(context.navigation_target_limit);
+            (targets, false, false, truncated)
+        };
+    targets.sort_by(|left, right| {
+        (&left.code_unit, left.declaration_range).cmp(&(&right.code_unit, right.declaration_range))
+    });
+    targets.dedup();
+
+    diagnostics.retain(|diagnostic| {
+        !matches!(
+            diagnostic.kind.as_str(),
+            "no_definition"
+                | "no_declaration"
+                | "navigation_targets_truncated"
+                | cpp::CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC
+                | "cpp_navigation_structure_unavailable"
+        )
+    });
+
+    if lexical_definition.is_some() {
+        status = DefinitionLookupStatus::Resolved;
+        truncated = false;
+    } else if targets.is_empty() {
+        if !definitions.is_empty() {
+            diagnostics.retain(|diagnostic| diagnostic.kind != "ambiguous_definition");
+            status = DefinitionLookupStatus::NoDefinition;
+            diagnostics.push(DefinitionLookupDiagnostic {
+                kind: match operation {
+                    NavigationOperation::Declaration => "no_declaration",
+                    NavigationOperation::Definition => "no_definition",
+                }
+                .to_string(),
+                message: match operation {
+                    NavigationOperation::Declaration => {
+                        "navigation candidates contain no declaration target"
+                    }
+                    NavigationOperation::Definition => {
+                        "navigation candidates contain no implementation body"
+                    }
+                }
+                .to_string(),
+            });
+        }
+    } else {
+        diagnostics.retain(|diagnostic| diagnostic.kind != "ambiguous_definition");
+        status = if targets.len() == 1 && !truncated {
+            DefinitionLookupStatus::Resolved
+        } else {
+            DefinitionLookupStatus::Ambiguous
+        };
+        if status == DefinitionLookupStatus::Ambiguous {
+            diagnostics.push(DefinitionLookupDiagnostic {
+                kind: "ambiguous_definition".to_string(),
+                message: format!(
+                    "{} navigation resolved to multiple workspace targets",
+                    match operation {
+                        NavigationOperation::Declaration => "declaration",
+                        NavigationOperation::Definition => "definition",
+                    }
+                ),
+            });
+        }
+    }
+
+    if structure_unavailable {
+        diagnostics.push(DefinitionLookupDiagnostic {
+            kind: "cpp_navigation_structure_unavailable".to_string(),
+            message: "one or more C/C++ candidates could not be classified from indexed syntax"
+                .to_string(),
+        });
+    }
+    if unproven_link_unit {
+        diagnostics.push(DefinitionLookupDiagnostic {
+            kind: cpp::CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC.to_string(),
+            message:
+                "multiple C/C++ definition bodies remain, but no build graph proves one link unit"
+                    .to_string(),
+        });
+    }
+    if truncated {
+        diagnostics.push(DefinitionLookupDiagnostic {
+            kind: "navigation_targets_truncated".to_string(),
+            message: format!(
+                "{} navigation targets were truncated to the request budget of {}",
+                match operation {
+                    NavigationOperation::Declaration => "declaration",
+                    NavigationOperation::Definition => "definition",
+                },
+                context.navigation_target_limit
+            ),
+        });
+    }
+
+    NavigationLookupOutcome {
+        status,
+        reference,
+        targets,
+        lexical_definition,
         diagnostics,
     }
 }
@@ -1047,7 +1343,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None);
+        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None, None);
 
         assert!(outcomes.iter().all(|outcome| {
             outcome.status == DefinitionLookupStatus::Resolved
@@ -1083,7 +1379,7 @@ mod tests {
             })
             .collect();
 
-        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None);
+        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None, None);
 
         assert!(outcomes.iter().all(|outcome| {
             outcome.status == DefinitionLookupStatus::Resolved
@@ -1206,6 +1502,7 @@ mod tests {
                 end_byte: Some(start_byte + "run".len()),
             }],
             None,
+            None,
         );
 
         assert_eq!(outcomes[0].status, DefinitionLookupStatus::Resolved);
@@ -1260,7 +1557,7 @@ mod tests {
             })
             .collect();
 
-        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None);
+        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None, None);
 
         assert_eq!(
             outcomes[0].definitions[0].fq_name(),
@@ -1313,7 +1610,7 @@ mod tests {
             })
             .collect();
 
-        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None);
+        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None, None);
 
         assert_eq!(
             outcomes[0].definitions[0].fq_name(),
@@ -1373,7 +1670,7 @@ mod tests {
             })
             .collect();
 
-        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None);
+        let outcomes = resolve_definition_requests(analyzer, &mut context, requests, None, None);
 
         assert_eq!(outcomes[0].definitions[0].fq_name(), "service.Service.run");
         assert_eq!(outcomes[1].definitions[0].fq_name(), "other.Other.stop");
@@ -1414,7 +1711,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut context = DefinitionBatchContext::new(&analyzer, true);
 
-        let outcomes = resolve_definition_requests(&analyzer, &mut context, requests, None);
+        let outcomes = resolve_definition_requests(&analyzer, &mut context, requests, None, None);
 
         assert_eq!(outcomes.len(), REFERENCE_COUNT);
         assert!(outcomes.iter().all(|outcome| {

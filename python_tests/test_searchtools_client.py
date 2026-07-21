@@ -23,9 +23,12 @@ from bifrost_searchtools import (
     CodeQueryReferenceSite,
     CodeQueryResult,
     ContainerKind,
+    DeclarationLookupResult,
+    DefinitionLookupResult,
     DirectoryListingEntry,
     FileSummariesResult,
     MostRelevantFilesRankingMode,
+    NavigationOperation,
     SearchToolsClient,
     SearchToolsError,
     SymbolKindFilter,
@@ -58,6 +61,42 @@ def _git_commit(root: Path, message: str) -> None:
 
 
 class CodeQueryModelTest(unittest.TestCase):
+    def test_navigation_models_deserialize_distinct_fields_and_render_operation(self) -> None:
+        candidate = {
+            "fqn": "Runner.run",
+            "path": "Runner.java",
+            "start_line": 2,
+            "end_line": 2,
+            "kind": "function",
+            "signature": "()",
+            "language": "java",
+        }
+        declaration = DeclarationLookupResult.from_dict(
+            {
+                "query": {"path": "App.java", "line": 1},
+                "operation": "declaration",
+                "status": "resolved",
+                "declarations": [candidate],
+                "diagnostics": [],
+            }
+        )
+        definition = DefinitionLookupResult.from_dict(
+            {
+                "query": {"path": "App.java", "line": 1},
+                "operation": "definition",
+                "status": "resolved",
+                "definitions": [candidate],
+                "diagnostics": [],
+            }
+        )
+
+        self.assertIs(declaration.operation, NavigationOperation.DECLARATION)
+        self.assertEqual(["Runner.run"], [item.fqn for item in declaration.declarations])
+        self.assertIn("operation: declaration", declaration.render_text())
+        self.assertIs(definition.operation, NavigationOperation.DEFINITION)
+        self.assertEqual(["Runner.run"], [item.fqn for item in definition.definitions])
+        self.assertIn("operation: definition", definition.render_text())
+
     def test_typed_diagnostics_drive_completion_without_message_parsing(self) -> None:
         advisory = CodeQueryResult.from_dict(
             {
@@ -938,9 +977,24 @@ namespace Demo
         }
 
         self.assertIn("get_definitions_by_location", visible_names)
+        self.assertIn("get_declarations_by_location", visible_names)
         self.assertNotIn("get_definitions_by_reference", visible_names)
         self.assertIn("get_definitions_by_reference", names)
         self.assertNotIn("get_definitions_by_location", names)
+        self.assertNotIn("get_declarations_by_location", names)
+
+    def test_location_navigation_dispatches_typed_declaration_and_definition_results(self) -> None:
+        references = [{"path": "B.java", "line": 8, "column": 11}]
+        with SearchToolsClient(root=self.fixture_root) as client:
+            declarations = client.get_declarations_by_location(references)
+            definitions = client.get_definitions_by_location(references)
+
+        self.assertEqual(1, len(declarations))
+        self.assertIs(declarations[0].operation, NavigationOperation.DECLARATION)
+        self.assertEqual("A.method1", declarations[0].declarations[0].fqn)
+        self.assertEqual(1, len(definitions))
+        self.assertIs(definitions[0].operation, NavigationOperation.DEFINITION)
+        self.assertEqual("A.method1", definitions[0].definitions[0].fqn)
 
     def test_activate_workspace_switches_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

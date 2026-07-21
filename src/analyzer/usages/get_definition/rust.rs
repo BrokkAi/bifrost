@@ -69,6 +69,7 @@ impl RustDefinitionProvider for AnalyzerRustDefinitionProvider<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_rust(
     analyzer: &dyn IAnalyzer,
     support: &dyn RustDefinitionProvider,
@@ -77,6 +78,7 @@ pub(super) fn resolve_rust(
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
     cache: &mut RustTypeLookupCache,
+    operation: Option<NavigationOperation>,
 ) -> DefinitionLookupOutcome {
     let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
         return no_definition("rust_analyzer_unavailable", "Rust analyzer is unavailable");
@@ -126,8 +128,16 @@ pub(super) fn resolve_rust(
         );
     }
     if let Some(tree) = tree
+        && let Some(operation) = operation
+        && let Some(outcome) = rust_qualified_associated_type_navigation_outcome(
+            rust, analyzer, support, file, source, tree, site, operation,
+        )
+    {
+        return outcome;
+    }
+    if let Some(tree) = tree
         && let Some(outcome) = rust_impl_associated_type_declaration_outcome(
-            analyzer, support, file, source, tree, site,
+            rust, support, file, source, tree, site, operation,
         )
     {
         return outcome;
@@ -982,12 +992,13 @@ fn rust_declaration_matches(
 }
 
 fn rust_impl_associated_type_declaration_outcome(
-    analyzer: &dyn IAnalyzer,
+    rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
     site: &ResolvedReferenceSite,
+    operation: Option<NavigationOperation>,
 ) -> Option<DefinitionLookupOutcome> {
     let node =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
@@ -999,9 +1010,14 @@ fn rust_impl_associated_type_declaration_outcome(
         return None;
     }
     let impl_item = rust_enclosing_ancestor(type_item, "impl_item")?;
+    if operation == Some(NavigationOperation::Definition) {
+        let candidate =
+            rust.rust_associated_type_declaration_for_exact_node(file, type_item, associated_type)?;
+        return Some(candidates_outcome(vec![candidate]));
+    }
     let trait_type = impl_item.child_by_field_name("trait")?;
     let trait_fqn = rust_resolve_type_node_fqn(
-        analyzer,
+        rust,
         support,
         file,
         source,
@@ -1019,6 +1035,88 @@ fn rust_impl_associated_type_declaration_outcome(
     sort_units(&mut candidates);
     candidates.dedup();
     Some(candidates_outcome(candidates))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rust_qualified_associated_type_navigation_outcome(
+    rust: &RustAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    operation: NavigationOperation,
+) -> Option<DefinitionLookupOutcome> {
+    let focused =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
+    let scoped = rust_enclosing_ancestor(focused, "scoped_type_identifier")?;
+    let name = scoped.child_by_field_name("name")?;
+    if name.start_byte() > site.focus_start_byte || name.end_byte() < site.focus_end_byte {
+        return None;
+    }
+    let mut qualified = scoped.child_by_field_name("path")?;
+    while qualified.kind() == "bracketed_type" {
+        qualified = qualified.named_child(0)?;
+    }
+    if qualified.kind() != "qualified_type" {
+        return None;
+    }
+    let owner_type = qualified.child_by_field_name("type")?;
+    let trait_type = qualified.child_by_field_name("alias")?;
+    let owner_fqn = rust_resolve_type_node_fqn(
+        analyzer,
+        support,
+        file,
+        source,
+        owner_type,
+        Some(owner_type.start_byte()),
+    )?;
+    let trait_fqn = rust_resolve_type_node_fqn(
+        analyzer,
+        support,
+        file,
+        source,
+        trait_type,
+        Some(trait_type.start_byte()),
+    )?;
+    let member_name = rust_node_text(name, source).trim();
+    let trait_members: Vec<_> = support
+        .fqn(&format!("{trait_fqn}.{member_name}"))
+        .into_iter()
+        .filter(CodeUnit::is_field)
+        .collect();
+    if trait_members.is_empty() {
+        return None;
+    }
+    if operation == NavigationOperation::Declaration {
+        return Some(candidates_outcome(trait_members));
+    }
+    let mut implementations = Vec::new();
+    for trait_member in trait_members {
+        implementations.extend(
+            rust.rust_trait_member_implementations(&trait_member)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|candidate| {
+                    analyzer
+                        .parent_of(candidate)
+                        .is_some_and(|parent| parent.fq_name() == owner_fqn)
+                }),
+        );
+    }
+    sort_units(&mut implementations);
+    implementations.dedup();
+    Some(if implementations.is_empty() {
+        no_definition(
+            "no_indexed_definition",
+            format!(
+                "qualified Rust associated type `{member_name}` has no indexed implementation for `{owner_fqn}`"
+            ),
+        )
+    } else {
+        candidates_outcome(implementations)
+    })
 }
 
 fn rust_enclosing_named_associated_type(

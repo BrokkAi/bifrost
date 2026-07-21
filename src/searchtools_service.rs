@@ -19,11 +19,11 @@ use crate::{
     searchtools::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
         MostRelevantFilesParams, RefreshParams, SymbolLookupParams, SymbolSourcesResult,
-        classify_test_files, get_definitions_by_location, get_definitions_by_reference,
-        get_summaries, get_symbol_ancestors, get_symbol_locations, get_symbol_sources,
-        get_type_by_location, list_symbols, most_relevant_files, refresh_result, rename_symbol,
-        scan_usages_by_location, scan_usages_by_reference, search_symbols,
-        symbol_source_candidate_files, usage_graph,
+        classify_test_files, get_declarations_by_location, get_definitions_by_location,
+        get_definitions_by_reference, get_summaries, get_symbol_ancestors, get_symbol_locations,
+        get_symbol_sources, get_type_by_location, list_symbols, most_relevant_files,
+        refresh_result, rename_symbol, scan_usages_by_location, scan_usages_by_reference,
+        search_symbols, symbol_source_candidate_files, usage_graph,
     },
     searchtools_render::{RenderOptions, RenderText},
     structured_data::{jq, xml_select, xml_skim},
@@ -570,6 +570,11 @@ impl SearchToolsService {
             "get_definitions_by_location" => {
                 Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                     get_definitions_by_location(workspace.analyzer(), params)
+                })
+            }
+            "get_declarations_by_location" => {
+                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
+                    get_declarations_by_location(workspace.analyzer(), params)
                 })
             }
             "get_definitions_by_reference" => {

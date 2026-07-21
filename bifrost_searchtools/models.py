@@ -855,6 +855,11 @@ class DefinitionDiagnostic:
         return f"{self.kind}: {self.message}"
 
 
+class NavigationOperation(StrEnum):
+    DECLARATION = "declaration"
+    DEFINITION = "definition"
+
+
 @dataclass(frozen=True)
 class DefinitionCandidate:
     fqn: str
@@ -896,6 +901,7 @@ class DefinitionReferenceSite:
 @dataclass(frozen=True)
 class DefinitionLookupResult:
     query: dict
+    operation: NavigationOperation
     status: str
     reference: DefinitionReferenceSite | None
     definitions: list[DefinitionCandidate]
@@ -905,6 +911,7 @@ class DefinitionLookupResult:
     def from_dict(cls, data: dict) -> DefinitionLookupResult:
         return cls(
             query=dict(data["query"]),
+            operation=NavigationOperation(data["operation"]),
             status=data["status"],
             reference=(
                 DefinitionReferenceSite.from_dict(data["reference"])
@@ -922,10 +929,49 @@ class DefinitionLookupResult:
         )
 
     def render_text(self) -> str:
-        lines = [f"status: {self.status}"]
+        lines = [f"operation: {self.operation.value}", f"status: {self.status}"]
         if self.reference is not None:
             lines.append(f"reference: {self.reference.path} -> {self.reference.target}")
         lines.extend(definition.render_text() for definition in self.definitions)
+        lines.extend(diagnostic.render_text() for diagnostic in self.diagnostics)
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class DeclarationLookupResult:
+    query: dict
+    operation: NavigationOperation
+    status: str
+    reference: DefinitionReferenceSite | None
+    declarations: list[DefinitionCandidate]
+    diagnostics: list[DefinitionDiagnostic]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> DeclarationLookupResult:
+        return cls(
+            query=dict(data["query"]),
+            operation=NavigationOperation(data["operation"]),
+            status=data["status"],
+            reference=(
+                DefinitionReferenceSite.from_dict(data["reference"])
+                if data.get("reference") is not None
+                else None
+            ),
+            declarations=[
+                DefinitionCandidate.from_dict(item)
+                for item in data.get("declarations", [])
+            ],
+            diagnostics=[
+                DefinitionDiagnostic.from_dict(item)
+                for item in data.get("diagnostics", [])
+            ],
+        )
+
+    def render_text(self) -> str:
+        lines = [f"operation: {self.operation.value}", f"status: {self.status}"]
+        if self.reference is not None:
+            lines.append(f"reference: {self.reference.path} -> {self.reference.target}")
+        lines.extend(declaration.render_text() for declaration in self.declarations)
         lines.extend(diagnostic.render_text() for diagnostic in self.diagnostics)
         return "\n".join(lines)
 

@@ -11,6 +11,23 @@ fn lookup(root: &std::path::Path, args: &str) -> Value {
     call_search_tool_json(root, "get_definitions_by_location", args)
 }
 
+fn lookup_declaration(root: &std::path::Path, args: &str) -> Value {
+    call_search_tool_json(root, "get_declarations_by_location", args)
+}
+
+fn lookup_declaration_with_definition_key(root: &std::path::Path, args: &str) -> Value {
+    let mut value = lookup_declaration(root, args);
+    for result in value["results"].as_array_mut().into_iter().flatten() {
+        if let Some(declarations) = result
+            .as_object_mut()
+            .and_then(|object| object.remove("declarations"))
+        {
+            result["definitions"] = declarations;
+        }
+    }
+    value
+}
+
 fn lookup_reference(root: &std::path::Path, args: &str) -> Value {
     call_search_tool_json(root, "get_definitions_by_reference", args)
 }
@@ -1610,7 +1627,7 @@ pub fn run_via_trait() -> String {
     );
 
     let assoc_line = "    type Output = String;";
-    let assoc = lookup(
+    let assoc = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"src/lib.rs","line":13,"column":{}}}]}}"#,
@@ -1621,6 +1638,87 @@ pub fn run_via_trait() -> String {
     assert_eq!(
         assoc["results"][0]["definitions"][0]["fqn"], "Runner.Output",
         "{assoc}"
+    );
+}
+
+#[test]
+fn rust_associated_type_navigation_distinguishes_contract_and_implementation() {
+    let source = r#"
+pub trait Runner {
+    type Output;
+}
+
+pub struct LocalRunner;
+
+impl Runner for LocalRunner {
+    type Output = String;
+}
+
+pub type Selected = <LocalRunner as Runner>::Output;
+"#;
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", source)
+        .build();
+
+    let impl_item = source.find("type Output =").expect("impl associated type") + 5;
+    let args = location_reference("src/lib.rs", source, impl_item);
+    let declaration = lookup_declaration(project.root(), &args);
+    assert_eq!(declaration["results"][0]["operation"], "declaration");
+    assert_eq!(
+        declaration["results"][0]["status"], "resolved",
+        "{declaration}"
+    );
+    assert_eq!(
+        declaration["results"][0]["declarations"][0]["fqn"], "Runner.Output",
+        "{declaration}"
+    );
+
+    let definition = lookup(project.root(), &args);
+    assert_eq!(definition["results"][0]["operation"], "definition");
+    assert_eq!(
+        definition["results"][0]["status"], "resolved",
+        "{definition}"
+    );
+    assert_eq!(
+        definition["results"][0]["definitions"][0]["fqn"], "LocalRunner.Output",
+        "{definition}"
+    );
+
+    let qualified = source.rfind("Output;").expect("qualified associated type");
+    let definition = lookup(
+        project.root(),
+        &location_reference("src/lib.rs", source, qualified),
+    );
+    assert_eq!(
+        definition["results"][0]["status"], "resolved",
+        "{definition}"
+    );
+    assert_eq!(
+        definition["results"][0]["definitions"][0]["fqn"], "LocalRunner.Output",
+        "{definition}"
+    );
+}
+
+#[test]
+fn java_declaration_navigation_uses_interface_receiver_contract() {
+    let source = r#"
+interface Runner { void run(); }
+class LocalRunner implements Runner { public void run() {} }
+class App { void invoke(Runner runner) { runner.run(); } }
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("App.java", source)
+        .build();
+    let call = source.rfind("run();").expect("interface-typed call");
+    let value = lookup_declaration(
+        project.root(),
+        &location_reference("App.java", source, call),
+    );
+    assert_eq!(value["results"][0]["operation"], "declaration");
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["declarations"][0]["fqn"], "Runner.run",
+        "{value}"
     );
 }
 
@@ -14401,7 +14499,7 @@ namespace Demo {
 }
 
 #[test]
-fn csharp_attribute_two_successful_alias_spellings_to_same_type_are_ambiguous() {
+fn csharp_attribute_two_successful_alias_spellings_to_same_type_resolve_once() {
     let source = r#"
 using Marker = Attributes.SharedAttribute;
 using MarkerAttribute = Attributes.SharedAttribute;
@@ -14430,10 +14528,7 @@ namespace Demo {
     );
 
     let result = &value["results"][0];
-    assert_eq!(
-        result["status"], "ambiguous",
-        "both successful attribute-name spellings are ambiguous even when they name the same logical type: {value}"
-    );
+    assert_eq!(result["status"], "resolved", "{value}");
     assert!(
         result["definitions"]
             .as_array()
@@ -14487,7 +14582,7 @@ namespace Demo {
     );
 
     let result = &value["results"][0];
-    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["status"], "ambiguous", "{value}");
     let mut paths = result["definitions"]
         .as_array()
         .expect("partial attribute definitions")
@@ -15969,7 +16064,7 @@ fn csharp_typed_receiver_method_wrong_arity_returns_overload_definitions() {
     );
 
     let result = &value["results"][0];
-    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["status"], "ambiguous", "{value}");
     assert_eq!(
         result["definitions"].as_array().unwrap().len(),
         2,
@@ -16504,7 +16599,7 @@ fn cpp_exact_fqn_candidate_ordering_does_not_hydrate_hidden_duplicate_files() {
         },
     );
     let result = &value.results[0];
-    assert_eq!(result.status, "resolved", "lookup result: {result:#?}");
+    assert_eq!(result.status, "ambiguous", "lookup result: {result:#?}");
     assert_eq!(
         result.definitions.len(),
         EXACT_CANDIDATES,
@@ -16921,7 +17016,7 @@ fn cpp_constructor_call_resolves_to_header_constructor_declaration() {
         .build();
 
     let line = "namespace example { Service::Service(Repository& repository) {} Service build_service(Repository& repository) { return Service(repository); } }";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"service.cpp","line":2,"column":{}}}]}}"#,
@@ -16952,7 +17047,7 @@ fn cpp_braced_constructor_call_resolves_to_matching_constructor_declaration() {
         .build();
 
     let line = "namespace ns { Target make() { return Target{1}; } }";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
@@ -17002,6 +17097,335 @@ fn cpp_typed_receiver_method_resolves_to_definition() {
 }
 
 #[test]
+fn cpp_navigation_distinguishes_header_declaration_and_source_definition() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "service.h",
+            "namespace ns { class Service { public: void run(); }; }\n",
+        )
+        .file(
+            "service.cpp",
+            "#include \"service.h\"\nnamespace ns { void Service::run() {} }\n",
+        )
+        .file(
+            "app.cpp",
+            "#include \"service.h\"\nvoid invoke(ns::Service& service) { service.run(); }\n",
+        )
+        .build();
+    let source = "#include \"service.h\"\nvoid invoke(ns::Service& service) { service.run(); }\n";
+    let call = source.rfind("run").expect("method call");
+    let args = location_reference("app.cpp", source, call);
+
+    let declaration = lookup_declaration(project.root(), &args);
+    assert_eq!(declaration["results"][0]["operation"], "declaration");
+    assert_eq!(
+        declaration["results"][0]["status"], "resolved",
+        "{declaration}"
+    );
+    assert_eq!(
+        declaration["results"][0]["declarations"][0]["path"], "service.h",
+        "{declaration}"
+    );
+
+    let definition = lookup(project.root(), &args);
+    assert_eq!(definition["results"][0]["operation"], "definition");
+    assert_eq!(
+        definition["results"][0]["status"], "resolved",
+        "{definition}"
+    );
+    assert_eq!(
+        definition["results"][0]["definitions"][0]["path"], "service.cpp",
+        "{definition}"
+    );
+}
+
+#[test]
+fn cpp_navigation_distinguishes_same_file_declaration_and_definition_ranges() {
+    let source = "void run();\nvoid run() {}\nvoid invoke() { run(); }\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+    let call = source.rfind("run").expect("function call");
+    let args = location_reference("app.cpp", source, call);
+
+    let declaration = lookup_declaration(project.root(), &args);
+    assert_eq!(
+        declaration["results"][0]["status"], "resolved",
+        "{declaration}"
+    );
+    assert_eq!(
+        declaration["results"][0]["declarations"][0]["start_line"], 1,
+        "{declaration}"
+    );
+
+    let definition = lookup(project.root(), &args);
+    assert_eq!(
+        definition["results"][0]["status"], "resolved",
+        "{definition}"
+    );
+    assert_eq!(
+        definition["results"][0]["definitions"][0]["start_line"], 2,
+        "{definition}"
+    );
+}
+
+#[test]
+fn cpp_navigation_keeps_general_symbol_ranges_definition_oriented() {
+    let source = "void run();\nvoid run() {}\nvoid invoke() { run(); }\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+
+    let locations = call_search_tool_json(
+        project.root(),
+        "get_symbol_locations",
+        r#"{"symbols":["run"]}"#,
+    );
+    assert_eq!(locations["locations"][0]["start_line"], 2, "{locations}");
+
+    let by_reference = lookup_reference(
+        project.root(),
+        r#"{"references":[{"symbol":"invoke","context":"void invoke() { run(); }","target":"run"}]}"#,
+    );
+    assert_eq!(
+        by_reference["results"][0]["definitions"][0]["start_line"], 2,
+        "{by_reference}"
+    );
+}
+
+#[test]
+fn cpp_declaration_navigation_keeps_all_physical_prototypes_before_filtering() {
+    let header = "void run();\n";
+    let implementation = "#include \"service.h\"\nvoid run();\nvoid run() {}\n";
+    let caller = "#include \"service.h\"\nvoid invoke() { run(); }\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("service.h", header)
+        .file("service.cpp", implementation)
+        .file("app.cpp", caller)
+        .build();
+    let call = caller.rfind("run").expect("function call");
+
+    let declaration =
+        lookup_declaration(project.root(), &location_reference("app.cpp", caller, call));
+    assert_eq!(
+        declaration["results"][0]["status"], "ambiguous",
+        "{declaration}"
+    );
+    let targets = declaration["results"][0]["declarations"]
+        .as_array()
+        .expect("declaration targets");
+    assert_eq!(targets.len(), 2, "{declaration}");
+    assert!(targets.iter().any(|target| target["path"] == "service.h"));
+    assert!(
+        targets
+            .iter()
+            .any(|target| { target["path"] == "service.cpp" && target["start_line"] == 2 })
+    );
+}
+
+#[test]
+fn cpp_navigation_retains_declarations_that_follow_definitions() {
+    let function_source = "void run() {}\nvoid run();\nvoid invoke() { run(); }\n";
+    let function_project = InlineTestProject::with_language(Language::Cpp)
+        .file("function.cpp", function_source)
+        .build();
+    let function_call = function_source.rfind("run").expect("function call");
+    let function_args = location_reference("function.cpp", function_source, function_call);
+    let declaration = lookup_declaration(function_project.root(), &function_args);
+    let definition = lookup(function_project.root(), &function_args);
+    assert_eq!(
+        declaration["results"][0]["declarations"][0]["start_line"],
+        2
+    );
+    assert_eq!(definition["results"][0]["definitions"][0]["start_line"], 1);
+
+    let type_source = "struct Item {};\nstruct Item;\nItem make();\n";
+    let type_project = InlineTestProject::with_language(Language::Cpp)
+        .file("type.cpp", type_source)
+        .build();
+    let type_reference = type_source.rfind("Item").expect("type reference");
+    let type_args = location_reference("type.cpp", type_source, type_reference);
+    let declaration = lookup_declaration(type_project.root(), &type_args);
+    let definition = lookup(type_project.root(), &type_args);
+    assert_eq!(
+        declaration["results"][0]["declarations"][0]["start_line"],
+        2
+    );
+    assert_eq!(definition["results"][0]["definitions"][0]["start_line"], 1);
+}
+
+#[test]
+fn cpp_navigation_bounds_repeated_physical_targets() {
+    let mut source = "void run();\n".repeat(300);
+    source.push_str("void invoke() { run(); }\n");
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("generated.cpp", &source)
+        .build();
+    let call = source.rfind("run").expect("function call");
+    let result = lookup_declaration(
+        project.root(),
+        &location_reference("generated.cpp", &source, call),
+    );
+
+    assert_eq!(result["results"][0]["status"], "ambiguous", "{result}");
+    assert_eq!(
+        result["results"][0]["declarations"]
+            .as_array()
+            .map(Vec::len),
+        Some(256),
+        "{result}"
+    );
+    assert!(
+        result["results"][0]["diagnostics"]
+            .as_array()
+            .is_some_and(|diagnostics| diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic["kind"] == "navigation_targets_truncated")),
+        "{result}"
+    );
+}
+
+#[test]
+fn cpp_navigation_bounds_repeated_targets_across_a_batch() {
+    let mut source = "void run();\n".repeat(300);
+    source.push_str("void invoke() { run(); }\n");
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("generated.cpp", &source)
+        .build();
+    let call = source.rfind("run").expect("function call");
+    let prefix = &source[..call];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, current_line)| current_line)
+        .chars()
+        .count()
+        + 1;
+    let references = (0..5)
+        .map(|_| json!({"path": "generated.cpp", "line": line, "column": column}))
+        .collect::<Vec<_>>();
+    let result = lookup_declaration(
+        project.root(),
+        &json!({"references": references}).to_string(),
+    );
+
+    let results = result["results"].as_array().expect("batch results");
+    assert_eq!(results.len(), 5, "{result}");
+    assert_eq!(
+        results
+            .iter()
+            .map(|item| item["declarations"].as_array().map_or(0, Vec::len))
+            .sum::<usize>(),
+        1020,
+        "{result}"
+    );
+    assert!(results.iter().all(|item| {
+        item["diagnostics"].as_array().is_some_and(|diagnostics| {
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic["kind"] == "navigation_targets_truncated")
+        })
+    }));
+}
+
+#[test]
+fn cpp_overload_ambiguity_does_not_claim_an_unproven_link_unit() {
+    let target = "namespace ns { class Net { public: int load(); int load(int value); }; int Net::load() { return 0; } int Net::load(int value) { return value; } }\n";
+    let caller = "#include \"target.h\"\nvoid invoke(ns::Net& net) { net.load(1, 2); }\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("target.h", target)
+        .file("app.cpp", caller)
+        .build();
+    let call = caller.rfind("load").expect("method call");
+    let result = lookup(project.root(), &location_reference("app.cpp", caller, call));
+
+    assert_eq!(result["results"][0]["status"], "ambiguous", "{result}");
+    assert_eq!(
+        result["results"][0]["definitions"].as_array().map(Vec::len),
+        Some(2),
+        "{result}"
+    );
+    assert!(
+        result["results"][0]["diagnostics"]
+            .as_array()
+            .is_none_or(|diagnostics| diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic["kind"] != "unproven_cpp_link_unit")),
+        "{result}"
+    );
+}
+
+#[test]
+fn cpp_definition_navigation_keeps_multiple_bodies_ambiguous() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("service.h", "void run();\n")
+        .file("first.cpp", "#include \"service.h\"\nvoid run() {}\n")
+        .file("second.cpp", "#include \"service.h\"\nvoid run() {}\n")
+        .file(
+            "app.cpp",
+            "#include \"service.h\"\nvoid invoke() { run(); }\n",
+        )
+        .build();
+    let source = "#include \"service.h\"\nvoid invoke() { run(); }\n";
+    let call = source.rfind("run").expect("function call");
+    let value = lookup(project.root(), &location_reference("app.cpp", source, call));
+    assert_eq!(value["results"][0]["operation"], "definition");
+    assert_eq!(value["results"][0]["status"], "ambiguous", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"].as_array().map(Vec::len),
+        Some(2),
+        "{value}"
+    );
+    assert!(
+        value["results"][0]["diagnostics"]
+            .as_array()
+            .is_some_and(|diagnostics| diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic["kind"] == "unproven_cpp_link_unit" })),
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_definition_navigation_keeps_same_file_bodies_ambiguous() {
+    let source = "void run() {}\nvoid run() {}\nvoid invoke() { run(); }\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+    let call = source.rfind("run").expect("function call");
+    let value = lookup(project.root(), &location_reference("app.cpp", source, call));
+
+    assert_eq!(value["results"][0]["status"], "ambiguous", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"].as_array().map(Vec::len),
+        Some(2),
+        "{value}"
+    );
+    assert!(
+        value["results"][0]["diagnostics"]
+            .as_array()
+            .is_some_and(|diagnostics| diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic["kind"] == "unproven_cpp_link_unit")),
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_definition_navigation_does_not_fall_back_to_a_prototype() {
+    let source = "void run();\nvoid invoke() { run(); }\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+    let call = source.rfind("run").expect("function call");
+    let value = lookup(project.root(), &location_reference("app.cpp", source, call));
+
+    assert_eq!(value["results"][0]["operation"], "definition");
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert!(value["results"][0].get("definitions").is_none(), "{value}");
+}
+
+#[test]
 fn cpp_typed_receiver_method_filters_overloads_by_call_arity() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -17015,7 +17439,7 @@ fn cpp_typed_receiver_method_filters_overloads_by_call_arity() {
         .build();
 
     let line = "void handle(ns::Net& net, const ns::DataReader& dr) { net.load_model(dr); }";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
@@ -17049,7 +17473,7 @@ fn cpp_typed_receiver_method_wrong_arity_returns_overload_definitions() {
         .build();
 
     let line = "void handle(ns::Net& net, const ns::DataReader& dr) { net.load_model(dr, dr); }";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
@@ -17058,7 +17482,7 @@ fn cpp_typed_receiver_method_wrong_arity_returns_overload_definitions() {
     );
 
     let result = &value["results"][0];
-    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["status"], "ambiguous", "{value}");
     assert_eq!(
         result["definitions"].as_array().unwrap().len(),
         2,
@@ -17072,6 +17496,24 @@ fn cpp_typed_receiver_method_wrong_arity_returns_overload_definitions() {
     assert_eq!(
         result["definitions"][1]["signature"], "(DataReader &)",
         "{value}"
+    );
+
+    let definition = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
+            column_of(line, "load_model")
+        ),
+    );
+    let result = &definition["results"][0];
+    assert_eq!(result["status"], "no_definition", "{definition}");
+    assert!(
+        result["diagnostics"]
+            .as_array()
+            .is_none_or(|diagnostics| diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic["kind"] != "ambiguous_definition")),
+        "{definition}"
     );
 }
 
@@ -17089,7 +17531,7 @@ fn cpp_typed_receiver_method_filters_overloads_by_argument_type() {
         .build();
 
     let line = "void bind(Net& net, DataReaderFromMemoryCopy& dr) { net.load_model(dr); }";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":4,"column":{}}}]}}"#,
@@ -17196,13 +17638,8 @@ fn assert_cpp_format_overload_definitions(value: &Value, expected_signature_frag
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     let definitions = result["definitions"].as_array().unwrap();
-    assert_eq!(definitions.len(), 2, "{value}");
-    let mut paths = definitions
-        .iter()
-        .map(|definition| definition["path"].as_str().unwrap_or_default().to_string())
-        .collect::<Vec<_>>();
-    paths.sort();
-    assert_eq!(paths, vec!["include/parity.h", "src/parity.cpp"], "{value}");
+    assert_eq!(definitions.len(), 1, "{value}");
+    assert_eq!(definitions[0]["path"], "src/parity.cpp", "{value}");
     assert!(
         definitions.iter().all(|definition| {
             definition["fqn"] == "parity.format"
@@ -17228,7 +17665,7 @@ fn cpp_typed_receiver_method_wrong_argument_type_returns_overload_definitions() 
         .build();
 
     let line = "void bind(Net& net, Other& other) { net.load_model(other); }";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":3,"column":{}}}]}}"#,
@@ -17237,7 +17674,7 @@ fn cpp_typed_receiver_method_wrong_argument_type_returns_overload_definitions() 
     );
 
     let result = &value["results"][0];
-    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["status"], "ambiguous", "{value}");
     assert_eq!(
         result["definitions"].as_array().unwrap().len(),
         2,
@@ -17271,7 +17708,7 @@ fn cpp_typed_receiver_method_filters_pointer_overload_by_argument_indirection() 
         .build();
 
     let line = "void bind(Sink& sink, Widget* wp) { sink.accept(wp); }";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":3,"column":{}}}]}}"#,
@@ -17309,7 +17746,7 @@ fn cpp_typed_receiver_method_filters_value_overload_by_argument_indirection() {
         .build();
 
     let line = "void bind(Sink& sink, Widget w) { sink.accept(w); }";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":3,"column":{}}}]}}"#,
@@ -17420,7 +17857,7 @@ void run() {
         .build();
 
     let resize = "    img.resize();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":13,"column":{}}},{{"path":"app.cpp","line":14,"column":{}}}]}}"#,
@@ -17487,7 +17924,7 @@ void run() {
         .build();
 
     let line = "    second.use();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":7,"column":{}}}]}}"#,
@@ -17613,7 +18050,7 @@ void run() {
         )
         .build();
 
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         r#"{"references":[{"path":"app.cpp","line":17,"column":9},{"path":"app.cpp","line":18,"column":9}]}"#,
     );
@@ -17651,7 +18088,7 @@ void run() {
         .build();
 
     let line = "    raw.use();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":10,"column":{}}}]}}"#,
@@ -17687,7 +18124,7 @@ void run() {
         .build();
 
     let line = "    raw.use();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":10,"column":{}}}]}}"#,
@@ -17723,7 +18160,7 @@ void run() {
         .build();
 
     let line = "    second.use();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":10,"column":{}}}]}}"#,
@@ -17759,7 +18196,7 @@ void run() {
         .build();
 
     let line = "    second.use();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":10,"column":{}}}]}}"#,
@@ -17795,7 +18232,7 @@ void run() {
         .build();
 
     let line = "    second->use();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":10,"column":{}}}]}}"#,
@@ -17957,7 +18394,7 @@ fn cpp_export_macro_class_recovery_handles_header_variants() {
             .build();
 
         let line = "void handle(Service& service) { service.run(); }";
-        let value = lookup(
+        let value = lookup_declaration_with_definition_key(
             project.root(),
             &format!(
                 r#"{{"references":[{{"path":"src/app.cpp","line":3,"column":{}}}]}}"#,
@@ -18364,7 +18801,7 @@ void Parser::run() {
         .build();
 
     let line = "    if (log_.atErrorLimit()) {}";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"parser.cpp","line":5,"column":{}}}]}}"#,
@@ -18419,7 +18856,7 @@ bool Parser::run() {
         .build();
 
     let line = "    return this->right();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"parser.cpp","line":6,"column":{}}}]}}"#,
@@ -18464,7 +18901,7 @@ bool Visitor::run() {
         .build();
 
     let line = "    return this->traverse();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"visitor.cpp","line":5,"column":{}}}]}}"#,
@@ -18526,7 +18963,7 @@ bool Visitor::run(const ast::TernaryOperator* tern) {
         .build();
 
     let line = "    return tern->condition();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"visitor.cpp","line":6,"column":{}}}]}}"#,
@@ -18833,7 +19270,7 @@ void run() {
         .build();
 
     let line = "    board.SetPowerSaveLevel();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":9,"column":{}}}]}}"#,
@@ -18873,7 +19310,7 @@ void run(NodeDefPtr nodeDef) {
         .build();
 
     let line = "    nodeDef->getActiveOutputs();";
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":13,"column":{}}}]}}"#,

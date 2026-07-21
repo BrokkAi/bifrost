@@ -223,7 +223,7 @@ definition_queries = [
     for expected in [
         "SearchToolsService::snapshot_for_query",
         "SearchToolsService::apply_watcher_delta",
-        "get_definition::resolve_definition_batch",
+        "get_definition::resolve_navigation_batch",
         "language=Java",
         "get_definition::language_dispatch",
     ] {

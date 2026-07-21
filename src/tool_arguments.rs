@@ -131,7 +131,7 @@ pub fn normalize_tool_arguments_for_cli(
             workspace_root,
             &mut overlays,
         )?,
-        "get_definitions_by_location" | "get_type_by_location" => {
+        "get_declarations_by_location" | "get_definitions_by_location" | "get_type_by_location" => {
             normalize_cli_object_array_string_field(
                 &mut arguments,
                 "references",

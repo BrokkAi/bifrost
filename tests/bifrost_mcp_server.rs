@@ -178,6 +178,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "get_symbol_sources",
             "get_summaries",
             "scan_usages_by_location",
+            "get_declarations_by_location",
             "get_definitions_by_location",
             "get_type_by_location",
             "rename_symbol",
@@ -220,6 +221,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "get_symbol_sources",
             "get_summaries",
             "scan_usages_by_location",
+            "get_declarations_by_location",
             "get_definitions_by_location",
             "get_type_by_location",
             "rename_symbol",
@@ -260,7 +262,9 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         expected
     });
     assert_tool_schema_omits_property(tools, "get_definitions_by_location", "include_tests");
+    assert_tool_schema_omits_property(tools, "get_declarations_by_location", "include_tests");
     assert_definition_lookup_schema_limits_and_requires_location(tools);
+    assert_declaration_lookup_schema_limits_and_requires_location(tools);
     assert_tool_schema_contains_property(tools, "scan_usages_by_location", "targets");
     assert_scan_usages_location_schema(tools);
     assert_type_lookup_schema_limits_and_requires_location(tools);
@@ -762,6 +766,74 @@ fn bifrost_defaults_to_cwd_searchtools_server() {
 }
 
 #[test]
+fn bifrost_mcp_dispatches_distinct_location_navigation_results() {
+    let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("testcode-java");
+    let mut child = spawn_server(&fixture_root, "symbol", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let arguments = json!({
+        "references": [{"path": "B.java", "line": 8, "column": 11}]
+    });
+    let declaration = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": "tools/call",
+            "params": {"name": "get_declarations_by_location", "arguments": arguments.clone()}
+        }),
+    );
+    let declaration_result = &declaration["result"]["structuredContent"]["results"][0];
+    assert_eq!(
+        declaration_result["operation"], "declaration",
+        "{declaration}"
+    );
+    assert!(
+        declaration_result.get("declarations").is_some(),
+        "{declaration}"
+    );
+    assert!(
+        declaration_result.get("definitions").is_none(),
+        "{declaration}"
+    );
+
+    let definition = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "tools/call",
+            "params": {"name": "get_definitions_by_location", "arguments": arguments}
+        }),
+    );
+    let definition_result = &definition["result"]["structuredContent"]["results"][0];
+    assert_eq!(definition_result["operation"], "definition", "{definition}");
+    assert!(
+        definition_result.get("definitions").is_some(),
+        "{definition}"
+    );
+    assert!(
+        definition_result.get("declarations").is_none(),
+        "{definition}"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
 fn bifrost_split_servers_publish_expected_tool_sets() {
     let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -772,6 +844,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         "get_symbol_sources",
         "get_summaries",
         "scan_usages_by_location",
+        "get_declarations_by_location",
         "get_definitions_by_location",
         "get_type_by_location",
         "rename_symbol",
@@ -817,6 +890,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "get_symbol_sources",
             "get_summaries",
             "scan_usages_by_location",
+            "get_declarations_by_location",
             "get_definitions_by_location",
             "get_type_by_location",
             "rename_symbol",
@@ -1320,6 +1394,10 @@ fn bifrost_searchtools_server_can_hide_line_numbers_in_text_preview() {
     );
     assert!(names.contains(&"get_definitions_by_reference"), "{names:?}");
     assert!(!names.contains(&"get_definitions_by_location"), "{names:?}");
+    assert!(
+        !names.contains(&"get_declarations_by_location"),
+        "{names:?}"
+    );
     assert!(!names.contains(&"get_type_by_location"), "{names:?}");
     assert!(names.contains(&"scan_usages_by_reference"), "{names:?}");
     assert!(!names.contains(&"scan_usages_by_location"), "{names:?}");
@@ -1424,6 +1502,10 @@ fn bifrost_core_server_can_hide_line_numbers_in_text_preview() {
     );
     assert!(names.contains(&"get_definitions_by_reference"), "{names:?}");
     assert!(!names.contains(&"get_definitions_by_location"), "{names:?}");
+    assert!(
+        !names.contains(&"get_declarations_by_location"),
+        "{names:?}"
+    );
     assert!(!names.contains(&"get_type_by_location"), "{names:?}");
     assert!(names.contains(&"scan_usages_by_reference"), "{names:?}");
     assert!(!names.contains(&"scan_usages_by_location"), "{names:?}");
@@ -2054,6 +2136,20 @@ fn assert_definition_lookup_schema_limits_and_requires_location(tools: &[Value])
         .iter()
         .find(|tool| tool["name"] == "get_definitions_by_location")
         .expect("missing get_definitions_by_location descriptor");
+    let schema = &tool["inputSchema"];
+
+    assert_eq!(schema["properties"]["references"]["maxItems"], 100);
+    assert_eq!(
+        schema["properties"]["references"]["items"]["required"],
+        json!(["path", "line"])
+    );
+}
+
+fn assert_declaration_lookup_schema_limits_and_requires_location(tools: &[Value]) {
+    let tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "get_declarations_by_location")
+        .expect("missing get_declarations_by_location descriptor");
     let schema = &tool["inputSchema"];
 
     assert_eq!(schema["properties"]["references"]["maxItems"], 100);

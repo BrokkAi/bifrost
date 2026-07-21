@@ -20,11 +20,11 @@ use lsp_types::notification::{
 use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
     CodeActionRequest, Completion, DocumentDiagnosticRequest, DocumentHighlightRequest,
-    DocumentSymbolRequest, FoldingRangeRequest, Formatting, GotoDefinition, GotoImplementation,
-    GotoTypeDefinition, HoverRequest, PrepareRenameRequest, References, RegisterCapability, Rename,
-    Request as LspRequestTrait, SemanticTokensFullRequest, SignatureHelpRequest,
-    TypeHierarchyPrepare, TypeHierarchySubtypes, TypeHierarchySupertypes, WorkDoneProgressCreate,
-    WorkspaceConfiguration, WorkspaceSymbolRequest,
+    DocumentSymbolRequest, FoldingRangeRequest, Formatting, GotoDeclaration, GotoDefinition,
+    GotoImplementation, GotoTypeDefinition, HoverRequest, PrepareRenameRequest, References,
+    RegisterCapability, Rename, Request as LspRequestTrait, SemanticTokensFullRequest,
+    SignatureHelpRequest, TypeHierarchyPrepare, TypeHierarchySubtypes, TypeHierarchySupertypes,
+    WorkDoneProgressCreate, WorkspaceConfiguration, WorkspaceSymbolRequest,
 };
 use lsp_types::{
     CancelParams, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
@@ -40,6 +40,7 @@ use lsp_types::{
     WorkDoneProgressReport, WorkspaceEdit,
 };
 
+use crate::NavigationOperation;
 use crate::analyzer::policy::{
     PolicySourceDiagnosticSeverity, rqlp_source_completion_at, rqlp_source_help_at,
     validate_rqlp_source,
@@ -731,6 +732,14 @@ fn handle_request(
                 &params,
             ))
         }),
+        GotoDeclaration::METHOD => decode_and_run::<GotoDeclaration, _>(req, |params| {
+            Ok(definition::handle(
+                &state.workspace,
+                state.project(),
+                &params,
+                NavigationOperation::Declaration,
+            ))
+        }),
         WorkspaceSymbolRequest::METHOD => {
             decode_and_run::<WorkspaceSymbolRequest, _>(req, |params| {
                 Ok(workspace_symbol::handle(&state.workspace, &params))
@@ -741,6 +750,7 @@ fn handle_request(
                 &state.workspace,
                 state.project(),
                 &params,
+                NavigationOperation::Definition,
             ))
         }),
         GotoTypeDefinition::METHOD => decode_and_run::<GotoTypeDefinition, _>(req, |params| {

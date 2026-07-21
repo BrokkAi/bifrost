@@ -983,6 +983,20 @@ impl RustAnalyzer {
                 })
             })
     }
+
+    pub(crate) fn rust_associated_type_declaration_for_exact_node(
+        &self,
+        file: &ProjectFile,
+        node: Node<'_>,
+        member_name: &str,
+    ) -> Option<CodeUnit> {
+        self.rust_declaration_for_exact_node(
+            file,
+            node,
+            member_name,
+            RustTraitMemberKind::AssociatedType,
+        )
+    }
 }
 
 #[derive(Clone, Copy)]

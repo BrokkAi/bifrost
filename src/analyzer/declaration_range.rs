@@ -39,6 +39,20 @@ impl DeclarationNameRangeContext {
         self.name_ranges(analyzer, code_unit).into_iter().next()
     }
 
+    pub(crate) fn name_range_for_declaration(
+        &self,
+        code_unit: &CodeUnit,
+        declaration_range: Range,
+    ) -> Option<Range> {
+        let root = self.root_node()?;
+        code_unit_declaration_name_range_for_range(
+            &self.content,
+            root,
+            code_unit,
+            declaration_range,
+        )
+    }
+
     pub(crate) fn name_ranges(&self, analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<Range> {
         let Some(root) = self.root_node() else {
             return Vec::new();
@@ -87,7 +101,7 @@ fn code_unit_declaration_name_ranges_in_tree(
         .collect()
 }
 
-fn code_unit_declaration_name_range_for_range(
+pub(crate) fn code_unit_declaration_name_range_for_range(
     content: &str,
     root: Node<'_>,
     code_unit: &CodeUnit,
@@ -114,7 +128,7 @@ fn declaration_source_identifier(code_unit: &CodeUnit) -> &str {
 /// nodes share that exact span, return the deepest one. The shallow wrapper
 /// often carries no `name` field, so returning it would defeat declaration-name
 /// resolution.
-fn node_for_exact_range<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
+pub(crate) fn node_for_exact_range<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
     let mut best: Option<Node<'tree>> = None;
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {

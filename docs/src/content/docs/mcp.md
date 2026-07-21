@@ -49,7 +49,9 @@ By default, `bifrost` uses the current working directory as `--root` and `search
 
 `core` expands to `symbol|nlp|workspace`. In a default build, `nlp` contributes no advertised tools, so `core` effectively publishes `symbol|workspace`. `searchtools` expands to every toolset above in registry order: `symbol|nlp|workspace|extended|text|slopcop|cli`.
 
-With line numbers enabled, `symbol` advertises `scan_usages_by_location` and `get_definitions_by_location`. With `--no-line-numbers`, it instead advertises `scan_usages_by_reference` and `get_definitions_by_reference`.
+With line numbers enabled, `symbol` advertises `scan_usages_by_location`, `get_declarations_by_location`, and `get_definitions_by_location`. With `--no-line-numbers`, it instead advertises `scan_usages_by_reference` and `get_definitions_by_reference`; there is no declaration-by-reference tool.
+
+Location navigation keeps declarations and definitions distinct. Both tools accept `{"references":[{"path":"src/file.ext","line":1,"column":1}]}`. Declaration results contain `operation: "declaration"` and a `declarations` array; definition results contain `operation: "definition"` and a `definitions` array. An empty operation-specific selection reports `no_declaration` or `no_definition`, and more than one selected target reports `ambiguous`. Declaration navigation prefers contracts such as C++ prototypes, Java interface methods, and Rust trait items, while definition navigation selects concrete bodies or implementation items. Entities without a separate body remain valid for both operations.
 
 `searchtools` is the compatibility mode and exposes the full current union of MCP tools in toolset order. Use `symbol|extended` for the packaged coding-agent surface, or a smaller composition such as `symbol|workspace` when a host should see fewer tools.
 

@@ -29,6 +29,7 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use crate::lsp::conversion::percent_decode;
 use crate::model_context;
+pub use crate::navigation::NavigationOperation;
 use crate::path_utils::{
     AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver, has_drive_letter_prefix,
     normalize_pattern, rel_path_string, workspace_rel_path,
@@ -358,6 +359,11 @@ pub struct GetDefinitionResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct GetDeclarationResult {
+    pub results: Vec<DeclarationLookupResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct GetTypeResult {
     pub results: Vec<TypeLookupResult>,
 }
@@ -365,11 +371,25 @@ pub struct GetTypeResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct DefinitionLookupResult {
     pub query: DefinitionReferenceQuery,
+    pub operation: NavigationOperation,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reference: Option<DefinitionReferenceSite>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub definitions: Vec<DefinitionCandidate>,
+    #[serde(default)]
+    pub diagnostics: Vec<DefinitionDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeclarationLookupResult {
+    pub query: DefinitionReferenceQuery,
+    pub operation: NavigationOperation,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<DefinitionReferenceSite>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub declarations: Vec<DefinitionCandidate>,
     #[serde(default)]
     pub diagnostics: Vec<DefinitionDiagnostic>,
 }
@@ -1263,26 +1283,59 @@ pub fn get_definitions_by_location(
     params: GetDefinitionParams,
 ) -> GetDefinitionResult {
     let _scope = profiling::scope("searchtools::get_definitions_by_location");
+    GetDefinitionResult {
+        results: get_navigation_by_location(analyzer, params, NavigationOperation::Definition),
+    }
+}
+
+pub fn get_declarations_by_location(
+    analyzer: &dyn IAnalyzer,
+    params: GetDefinitionParams,
+) -> GetDeclarationResult {
+    let _scope = profiling::scope("searchtools::get_declarations_by_location");
+    GetDeclarationResult {
+        results: get_navigation_by_location(analyzer, params, NavigationOperation::Declaration)
+            .into_iter()
+            .map(|result| DeclarationLookupResult {
+                query: result.query,
+                operation: result.operation,
+                status: result.status,
+                reference: result.reference,
+                declarations: result.definitions,
+                diagnostics: result.diagnostics,
+            })
+            .collect(),
+    }
+}
+
+fn get_navigation_by_location(
+    analyzer: &dyn IAnalyzer,
+    params: GetDefinitionParams,
+    operation: NavigationOperation,
+) -> Vec<DefinitionLookupResult> {
+    let tool_name = match operation {
+        NavigationOperation::Declaration => "get_declarations_by_location",
+        NavigationOperation::Definition => "get_definitions_by_location",
+    };
 
     if params.references.len() > DEFINITION_LOOKUP_MAX_REFERENCES {
-        return GetDefinitionResult {
-            results: vec![DefinitionLookupResult {
-                query: DefinitionReferenceQuery {
-                    path: String::new(),
-                    line: None,
-                    column: None,
-                },
-                status: "invalid_location".to_string(),
-                reference: None,
-                definitions: Vec::new(),
-                diagnostics: vec![DefinitionDiagnostic {
-                    kind: "too_many_references".to_string(),
-                    message: format!(
-                        "get_definitions_by_location accepts at most {DEFINITION_LOOKUP_MAX_REFERENCES} references per call"
-                    ),
-                }],
+        return vec![DefinitionLookupResult {
+            query: DefinitionReferenceQuery {
+                path: String::new(),
+                line: None,
+                column: None,
+            },
+            operation,
+            status: "invalid_location".to_string(),
+            reference: None,
+            definitions: Vec::new(),
+            diagnostics: vec![DefinitionDiagnostic {
+                kind: "too_many_references".to_string(),
+                message: format!(
+                    "{tool_name} accepts at most {DEFINITION_LOOKUP_MAX_REFERENCES} references per call"
+                ),
             }],
-        };
+        }];
     }
 
     let resolver = WorkspaceFileResolver::new(analyzer.project());
@@ -1307,6 +1360,7 @@ pub fn get_definitions_by_location(
             ResolvedFileInput::Ambiguous(item) => {
                 results[index] = Some(DefinitionLookupResult {
                     query,
+                    operation,
                     status: "not_found".to_string(),
                     reference: None,
                     definitions: Vec::new(),
@@ -1323,6 +1377,7 @@ pub fn get_definitions_by_location(
             ResolvedFileInput::NotFound(path) => {
                 results[index] = Some(DefinitionLookupResult {
                     query,
+                    operation,
                     status: "not_found".to_string(),
                     reference: None,
                     definitions: Vec::new(),
@@ -1339,8 +1394,9 @@ pub fn get_definitions_by_location(
         .iter()
         .map(|(_, _, request)| request.clone())
         .collect();
-    let outcomes =
-        crate::analyzer::usages::get_definition::resolve_definition_batch(analyzer, requests);
+    let outcomes = crate::analyzer::usages::get_definition::resolve_navigation_batch(
+        analyzer, requests, operation,
+    );
 
     let mut render_cache = DefinitionCandidateRenderCache::default();
     for ((index, query, request), outcome) in pending.into_iter().zip(outcomes) {
@@ -1349,13 +1405,12 @@ pub fn get_definitions_by_location(
             query,
             &request.file,
             outcome,
+            operation,
             &mut render_cache,
         ));
     }
 
-    GetDefinitionResult {
-        results: results.into_iter().flatten().collect(),
-    }
+    results.into_iter().flatten().collect()
 }
 
 pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> GetTypeResult {
@@ -1929,12 +1984,20 @@ fn render_definition_lookup(
     analyzer: &dyn IAnalyzer,
     query: DefinitionReferenceQuery,
     file: &ProjectFile,
-    outcome: crate::analyzer::usages::get_definition::DefinitionLookupOutcome,
+    outcome: crate::analyzer::usages::get_definition::NavigationLookupOutcome,
+    operation: NavigationOperation,
     render_cache: &mut DefinitionCandidateRenderCache,
 ) -> DefinitionLookupResult {
-    let status = outcome.status.as_str().to_string();
+    let status = if operation == NavigationOperation::Declaration
+        && outcome.status
+            == crate::analyzer::usages::get_definition::DefinitionLookupStatus::NoDefinition
+    {
+        "no_declaration".to_string()
+    } else {
+        outcome.status.as_str().to_string()
+    };
     let mut definitions =
-        definition_candidates_with_cache(analyzer, &outcome.definitions, render_cache);
+        navigation_candidates_with_cache(analyzer, &outcome.targets, render_cache);
     if let Some(definition) = outcome.lexical_definition.as_ref()
         && let Some(candidate) = lexical_definition_candidate(analyzer, file, definition)
     {
@@ -1950,7 +2013,7 @@ fn render_definition_lookup(
         .collect();
     if matches!(
         status.as_str(),
-        "invalid_location" | "not_found" | "no_definition"
+        "invalid_location" | "not_found" | "no_definition" | "no_declaration"
     ) {
         enrich_location_diagnostics(
             analyzer,
@@ -1959,12 +2022,27 @@ fn render_definition_lookup(
             query.line,
             query.column,
             &mut diagnostics,
-            "the requested location did not resolve to a definition",
-            "move the location to the intended reference token and retry get_definitions_by_location; use get_summaries on the file or search_symbols if the target is uncertain.",
+            match operation {
+                NavigationOperation::Declaration => {
+                    "the requested location did not resolve to a declaration"
+                }
+                NavigationOperation::Definition => {
+                    "the requested location did not resolve to a definition"
+                }
+            },
+            match operation {
+                NavigationOperation::Declaration => {
+                    "move the location to the intended reference token and retry get_declarations_by_location; use get_summaries on the file or search_symbols if the target is uncertain."
+                }
+                NavigationOperation::Definition => {
+                    "move the location to the intended reference token and retry get_definitions_by_location; use get_summaries on the file or search_symbols if the target is uncertain."
+                }
+            },
         );
     }
     DefinitionLookupResult {
         query,
+        operation,
         status,
         reference: outcome.reference.map(|site| DefinitionReferenceSite {
             path: site.path,
@@ -2025,6 +2103,28 @@ impl DefinitionCandidateRenderCache {
             .as_ref()
             .and_then(|context| context.name_range(analyzer, unit));
         display_range_with_declaration_name(analyzer, unit, name_range)
+    }
+
+    fn navigation_display_range(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        target: &crate::analyzer::usages::get_definition::NavigationTarget,
+    ) -> Option<Range> {
+        let Some(declaration_range) = target.declaration_range else {
+            return self.display_range(analyzer, &target.code_unit);
+        };
+        let context = self
+            .contexts
+            .entry(target.code_unit.source().clone())
+            .or_insert_with(|| load_declaration_name_context(analyzer, target.code_unit.source()));
+        if let Some(mut name_range) = context.as_ref().and_then(|context| {
+            context.name_range_for_declaration(&target.code_unit, declaration_range)
+        }) {
+            name_range.start_line += 1;
+            name_range.end_line += 1;
+            return Some(name_range);
+        }
+        Some(declaration_range)
     }
 }
 
@@ -2142,24 +2242,22 @@ fn definition_candidates(analyzer: &dyn IAnalyzer, units: &[CodeUnit]) -> Vec<De
         .collect()
 }
 
-fn definition_candidates_with_cache(
+fn navigation_candidates_with_cache(
     analyzer: &dyn IAnalyzer,
-    units: &[CodeUnit],
+    targets: &[crate::analyzer::usages::get_definition::NavigationTarget],
     render_cache: &mut DefinitionCandidateRenderCache,
 ) -> Vec<DefinitionCandidate> {
-    units
+    targets
         .iter()
-        .filter_map(|unit| definition_candidate_with_cache(analyzer, unit, render_cache))
+        .filter_map(|target| {
+            let range = render_cache.navigation_display_range(analyzer, target)?;
+            Some(definition_candidate_from_range(
+                analyzer,
+                &target.code_unit,
+                range,
+            ))
+        })
         .collect()
-}
-
-fn definition_candidate_with_cache(
-    analyzer: &dyn IAnalyzer,
-    unit: &CodeUnit,
-    render_cache: &mut DefinitionCandidateRenderCache,
-) -> Option<DefinitionCandidate> {
-    let range = render_cache.display_range(analyzer, unit)?;
-    Some(definition_candidate_from_range(analyzer, unit, range))
 }
 
 fn definition_candidate(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<DefinitionCandidate> {

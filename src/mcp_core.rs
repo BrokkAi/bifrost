@@ -32,10 +32,13 @@ pub fn run_searchtools_stdio_server(
 }
 
 pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
-    let definition_descriptor = if render_line_numbers {
-        get_definitions_by_location_descriptor()
+    let navigation_descriptors = if render_line_numbers {
+        vec![
+            get_declarations_by_location_descriptor(),
+            get_definitions_by_location_descriptor(),
+        ]
     } else {
-        get_definitions_by_reference_descriptor()
+        vec![get_definitions_by_reference_descriptor()]
     };
     let scan_descriptor = if render_line_numbers {
         scan_usages_by_location_descriptor()
@@ -89,8 +92,8 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
             summaries_schema(),
         ),
         scan_descriptor,
-        definition_descriptor,
     ];
+    descriptors.extend(navigation_descriptors);
     if render_line_numbers {
         descriptors.push(get_type_by_location_descriptor());
     }
@@ -166,6 +169,17 @@ fn get_definitions_by_location_descriptor() -> Value {
     tool_descriptor(
         "get_definitions_by_location",
         "Resolve source reference sites back to workspace definition metadata from exact line/column locations. Use when line numbers are visible and you need usage-to-definition navigation without building the whole usage_graph.",
+        location_references_schema(
+            "Project-relative source file path containing the reference.",
+            Some(crate::searchtools::DEFINITION_LOOKUP_MAX_REFERENCES),
+        ),
+    )
+}
+
+fn get_declarations_by_location_descriptor() -> Value {
+    tool_descriptor(
+        "get_declarations_by_location",
+        "Resolve source reference sites to their workspace declarations or contracts from exact line/column locations. Use this to navigate to a prototype, interface member, trait member, or other declaring location independently of a concrete definition body.",
         location_references_schema(
             "Project-relative source file path containing the reference.",
             Some(crate::searchtools::DEFINITION_LOOKUP_MAX_REFERENCES),
