@@ -25,9 +25,9 @@ _Source: `plugins/bifrost-agent/skills/bifrost-code-navigation/SKILL.md`._
 Use these Bifrost MCP tools when you need to find where code is defined,
 where it is used, or which source files are related to a starting point.
 
-The Bifrost agent plugin starts the MCP server with an explicit workspace root,
-so do not call workspace lifecycle tools such as `activate_workspace` for the
-default plugin install.
+The Bifrost agent plugin receives its workspace boundary from the host through
+MCP roots, or from an explicit launcher override. Do not call workspace
+lifecycle tools such as `activate_workspace` for the default plugin install.
 
 #### Tools
 

@@ -2244,6 +2244,270 @@ fn assert_agents_guidance_resource_available(
     assert!(text.contains("get_summaries"), "{read_resource}");
 }
 
+#[test]
+fn rootless_mcp_binds_to_client_roots_without_analyzing_process_cwd() {
+    let plugin_dir = TempDir::new().expect("plugin dir");
+    fs::write(
+        plugin_dir.path().join("PluginOnly.java"),
+        "class PluginOnly {}\n",
+    )
+    .expect("write plugin fixture");
+    let workspace = TempDir::new().expect("workspace");
+    fs::write(
+        workspace.path().join("ClientWorkspace.java"),
+        "class ClientWorkspace {}\n",
+    )
+    .expect("write workspace fixture");
+    let replacement = TempDir::new().expect("replacement workspace");
+    fs::write(
+        replacement.path().join("ReplacementWorkspace.java"),
+        "class ReplacementWorkspace {}\n",
+    )
+    .expect("write replacement fixture");
+
+    let mut child = spawn_rootless_server(plugin_dir.path(), "symbol");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+
+    let initialize = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": { "roots": { "listChanged": true } },
+                "clientInfo": { "name": "roots-test", "version": "0.1.0" }
+            }
+        }),
+    );
+    assert_eq!(initialize["result"]["serverInfo"]["name"], "bifrost");
+
+    write_line(
+        &mut stdin,
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    );
+    let roots_request = read_line(&mut reader, &mut stderr);
+    assert_eq!(roots_request["method"], "roots/list", "{roots_request}");
+    // If the client's roots change before it answers, the in-flight result is
+    // stale and must never become analyzer scope, even briefly.
+    write_line(
+        &mut stdin,
+        json!({ "jsonrpc": "2.0", "method": "notifications/roots/list_changed" }),
+    );
+    let plugin_uri = url::Url::from_directory_path(plugin_dir.path())
+        .expect("plugin file URI")
+        .to_string();
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": roots_request["id"],
+            "result": { "roots": [{ "uri": plugin_uri, "name": "stale" }] }
+        }),
+    );
+    let current_roots_request = read_line(&mut reader, &mut stderr);
+    assert_eq!(
+        current_roots_request["method"], "roots/list",
+        "{current_roots_request}"
+    );
+    let workspace_uri = url::Url::from_directory_path(workspace.path())
+        .expect("workspace file URI")
+        .to_string();
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": current_roots_request["id"],
+            "result": { "roots": [{ "uri": workspace_uri, "name": "fixture" }] }
+        }),
+    );
+
+    let search = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["ClientWorkspace"] }
+            }
+        }),
+    );
+    assert_eq!(search["result"]["isError"], false, "{search}");
+    assert!(search.to_string().contains("ClientWorkspace"), "{search}");
+    assert!(!search.to_string().contains("PluginOnly"), "{search}");
+
+    write_line(
+        &mut stdin,
+        json!({ "jsonrpc": "2.0", "method": "notifications/roots/list_changed" }),
+    );
+    let replacement_request = read_line(&mut reader, &mut stderr);
+    assert_eq!(
+        replacement_request["method"], "roots/list",
+        "{replacement_request}"
+    );
+    let unbound_during_refresh = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["ClientWorkspace"] }
+            }
+        }),
+    );
+    assert!(
+        unbound_during_refresh["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not bound to a workspace")),
+        "{unbound_during_refresh}"
+    );
+    let replacement_uri = url::Url::from_directory_path(replacement.path())
+        .expect("replacement file URI")
+        .to_string();
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": replacement_request["id"],
+            "result": { "roots": [{ "uri": replacement_uri }] }
+        }),
+    );
+    let replacement_search = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["ReplacementWorkspace"] }
+            }
+        }),
+    );
+    assert_eq!(
+        replacement_search["result"]["isError"], false,
+        "{replacement_search}"
+    );
+    assert!(
+        replacement_search
+            .to_string()
+            .contains("ReplacementWorkspace"),
+        "{replacement_search}"
+    );
+
+    write_line(
+        &mut stdin,
+        json!({ "jsonrpc": "2.0", "method": "notifications/roots/list_changed" }),
+    );
+    let revoke_request = read_line(&mut reader, &mut stderr);
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": revoke_request["id"],
+            "result": { "roots": [] }
+        }),
+    );
+    let revoked_search = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["ReplacementWorkspace"] }
+            }
+        }),
+    );
+    assert!(
+        revoked_search["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not bound to a workspace")),
+        "{revoked_search}"
+    );
+    assert!(
+        !plugin_dir.path().join(".brokk/bifrost_cache.db").exists(),
+        "plugin cwd must not become analyzer storage"
+    );
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+#[test]
+fn rootless_mcp_without_client_roots_stays_unbound() {
+    let plugin_dir = TempDir::new().expect("plugin dir");
+    fs::write(
+        plugin_dir.path().join("PluginOnly.java"),
+        "class PluginOnly {}\n",
+    )
+    .expect("write plugin fixture");
+    let mut child = spawn_rootless_server(plugin_dir.path(), "symbol");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let tools = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" }),
+    );
+    assert!(
+        tools["result"]["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()),
+        "{tools}"
+    );
+    let search = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["PluginOnly"] }
+            }
+        }),
+    );
+    assert_eq!(search["error"]["code"], -32603, "{search}");
+    assert!(
+        search["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not bound to a workspace")),
+        "{search}"
+    );
+    assert!(
+        !plugin_dir.path().join(".brokk/bifrost_cache.db").exists(),
+        "plugin cwd must not become analyzer storage"
+    );
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
 fn initialize_session(stdin: &mut impl Write, reader: &mut impl BufRead, stderr: &mut impl Read) {
     round_trip(
         stdin,
@@ -2280,6 +2544,20 @@ fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std:
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn bifrost")
+}
+
+fn spawn_rootless_server(cwd: &std::path::Path, mode: &str) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .env("BIFROST_SEMANTIC_INDEX", "off")
+        .arg("--force-semantic-cpu")
+        .arg("--mcp")
+        .arg(mode)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rootless bifrost")
 }
 
 fn spawn_server_no_args(cwd: &std::path::Path) -> std::process::Child {

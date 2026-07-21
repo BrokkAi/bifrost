@@ -16,6 +16,8 @@ claude plugin install brokk@bifrost
 
 Start a fresh Claude Code session after installing the plugin so the MCP server configuration is loaded at startup.
 
+The plugin automatically registers its packaged MCP server, so do not add a duplicate manual entry. Without an explicit `BIFROST_WORKSPACE_ROOT` or launcher `--root`, Bifrost requests the host-approved project directory through MCP roots and never uses the installed plugin directory as analyzer scope.
+
 ## Local Plugin Testing
 
 From the repository root, build Bifrost and start Claude Code with this package directory:
@@ -45,7 +47,7 @@ The inline call is canonical JSON, not RQL. MCP accepts RQL only from a workspac
 
 ## Manual MCP Entry
 
-Use a manual MCP entry when you want the raw command shape or a different toolset:
+Use a manual MCP entry instead of the plugin-provided server when you want the raw command shape or a different toolset:
 
 ```bash
 claude mcp add --scope user bifrost -- bifrost --root /path/to/project --mcp "symbol|extended"
