@@ -23,6 +23,9 @@ The observable result is twenty-five clean completed repository records, five pe
 - [x] (2026-07-20 10:22-05:00) Reproduced clean minimal production witnesses and created assigned issues #960, #961, and #962 before implementation. Exact baseline SHA-256 values are `1305e84e...` for Laravel `self`, `4669d644...` for the CakePHP call chain, and `fa77f406...` for the CakePHP nullsafe call.
 - [x] (2026-07-20 10:50-05:00) Integrated and reviewed Oldskool's #960 implementation, then implemented #961/#962 with one shared stack-safe structured receiver evaluator, nearest declaring-owner lookup, and targeted/inverted behavior coverage. All 51 targeted PHP tests, all 18 PHP usage-graph tests, formatting, diff hygiene, and isolated all-target/all-feature Clippy pass.
 - [x] (2026-07-20 13:05-05:00) Completed the PHP publication boundary. Commit `14aa44cb` was integrated with current `origin/master`, the resulting head was published at `64de341e`, and the exact release runner SHA-256 was `c2ab9b150125c6467ae5809511be4fdbc59381f60b1d6ed92786105703dbc7fc`. All three exact witnesses and all five authoritative task-ranked repositories completed with zero missing, inconclusive, diagnostics, or file errors. The final corpus SHA-256 is `12e80e0c30b982e54440c2ecf1e43b9e3bc05d632199067b6e57539337cd1e68`; assigned issues #960, #961, and #962 are closed with evidence. See `.agents/docs/reference-differential/php-task-ranked-64de341e-summary.md`.
+- [x] (2026-07-21 08:30-05:00) Integrated and independently reviewed the Rust structured-resolution repairs through `13dda48d`, covering re-exported/private associated calls, exact scoped types, module routing, receiver identity, and candidate authority. Follow-up `22c3a6b9` replaced a per-reference workspace declaration scan with an exact hash lookup. The two focused Rust usage suites pass 21 and 157 tests; publication and the authoritative final Rust corpus remain pending.
+- [x] (2026-07-21 10:15-05:00) Merged the detached structured Scala lineage as `5e57b0e2`, applied its preserved exact hierarchy/callable tail as `6c934486`, and committed review corrections in `6ec3736f`. Full definition lookup (566), Scala hierarchy (21), precedence (43), parameterized enum (7), forward usage graph (55), inverse usage graph (139), cache DB (25), and analyzer store (47) selections pass.
+- [x] (2026-07-21 11:02-05:00) Created and assigned #1034 before completing the newly confirmed Scala-to-Java constructor root. Commit `c579f681` now classifies exact Java constructors from one prepared syntax snapshot, preserves class and record constructor shapes, and indexes compact record constructors with canonical signatures and cache invalidation. Repeated independent review found no remaining correctness or performance issue; the expanded public definition regression and the 643-test definition/Java/cache/store selection pass.
 - [ ] Complete, publish, close owned issues for, and summarize the Rust task-ranked leg.
 - [ ] Complete, publish, close owned issues for, and summarize the Scala task-ranked leg.
 - [ ] Complete, publish, close owned issues for, and summarize the Java task-ranked leg.
@@ -49,6 +52,12 @@ The observable result is twenty-five clean completed repository records, five pe
 - Observation: The shared branch advanced twice during the PHP publication gate, first with the completed TypeScript parity change and then with its lint-only follow-up, while `origin/master` also gained an LSP cache-isolation commit.
   Evidence: The final integrated PHP acceptance head is `64de341e`, containing `14aa44cb`, `de27750d`, `c5e4e3d2`, and `64de341e`. A clean detached build embedded that exact Bifrost head and source path. The unrestricted full gate passed every library test; 186 of 187 LSP tests passed in the suite, and the sole resource-contention SIGKILL (`lsp_server_drop_cleanup_exits_cleanly_after_initialize`) passed immediately when rerun alone.
 
+- Observation: Exact Rust local-module visibility was semantically correct after the scoped-routing repair but initially performed a workspace declaration scan for every qualifying reference.
+  Evidence: Review replaced `declaration_identities.values().find(...)` with an exact `declaration_domains` lookup keyed by file, module, name, and module namespace. Both Rust usage suites remained green while the hot path became constant-time with respect to workspace declarations.
+
+- Observation: Scala hierarchy and Java-constructor correctness both depend on parser context surviving persistence and forward-query boundaries.
+  Evidence: Scala supertype facts now persist lexical scopes and bump the Scala epoch; Java constructor classification reads declaration ranges, owner children, and syntax from one prepared `FileState`. Compact record constructors required a Java epoch bump because they newly enter the persisted declaration surface.
+
 ## Decision Log
 
 - Decision: Treat all previous LOC-ranked language records as regression evidence only and rerun all five requested languages.
@@ -70,6 +79,14 @@ The observable result is twenty-five clean completed repository records, five pe
 - Decision: Partition the 298 PHP residuals into three issues with explicit overlap rather than force them into disjoint symptom buckets.
   Rationale: Nullsafe node dispatch (#962) and call-return receiver inference (#961) are independent structured requirements; two PhpSpreadsheet sites need both. Owner-relative type identity (#960) is separate. The issue ledgers record 96, 200, and 4 affected rows respectively and identify the two-row overlap.
   Date/Author: 2026-07-20 / Codex
+
+- Decision: Integrate the advanced Scala lineage, then preserve and review the current worktree tail as separate checkpoints before corpus publication.
+  Rationale: The lineage contains the structured resolver and persistence foundation required by the task-ranked Scala witnesses, while the tail contains exact enum, constructor, hierarchy, and import-context fixes. Separate checkpoints made conflict resolution and independent review auditable.
+  Date/Author: 2026-07-21 / Codex
+
+- Decision: Treat Scala-to-Java construction as a language-bounded Java declaration problem rather than forcing Java units through Scala callable metadata.
+  Rationale: Constructor kind, ordinary default suppression, record canonical shape, varargs, and compact declarations are Java semantics. Reading them from one prepared Java AST snapshot prevents same-FQN methods and stale parent/range facts from producing false definitions.
+  Date/Author: 2026-07-21 / Codex
 
 ## Outcomes & Retrospective
 
