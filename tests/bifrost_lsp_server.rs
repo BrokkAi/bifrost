@@ -1172,6 +1172,174 @@ fn bifrost_lsp_server_validates_and_hovers_unsaved_rqlp_source() {
 }
 
 #[test]
+fn bifrost_lsp_server_runs_unsaved_rqlp_source_with_workspace_identity() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    fs::write(root.join("app.ts"), "export function target() {}\n").expect("write source fixture");
+    fs::create_dir(root.join("policies")).expect("create policies directory");
+    let policy_path = root.join("policies/live.rqlp");
+    fs::write(
+        &policy_path,
+        r#"(policy
+  :schema-version 1
+  :id "test.saved"
+  :name "Saved policy"
+  :message "Saved source must not run"
+  :severity warning
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql :schema-version 2
+          (language typescript (function :name "other")))))"#,
+    )
+    .expect("write saved policy");
+    let unsaved = r#"(policy
+  :schema-version 1
+  :id "test.unsaved"
+  :name "Unsaved policy"
+  :message "Avoid target"
+  :severity warning
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql :schema-version 2
+          (language typescript (function :name "target")))))"#;
+    let mut server = LspServer::start(&root);
+
+    let response = server.request(
+        "bifrost/runPolicy",
+        json!({
+            "documentUri": uri_for(&policy_path),
+            "sourceIdentity": "policies/live.rqlp",
+            "source": unsaved,
+        }),
+    );
+
+    assert!(response["error"].is_null(), "{response}");
+    assert_eq!(response["result"]["workspaceRootUri"], uri_for(&root));
+    assert_eq!(
+        response["result"]["report"]["rules"][0]["policy_id"],
+        "test.unsaved"
+    );
+    assert_eq!(
+        response["result"]["report"]["rules"][0]["name"],
+        "Unsaved policy"
+    );
+    assert_eq!(
+        response["result"]["report"]["runs"][0]["completion"]["type"],
+        "complete"
+    );
+    let findings = response["result"]["report"]["runs"][0]["findings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected findings: {response}"));
+    assert_eq!(findings.len(), 1, "{response}");
+    assert_eq!(findings[0]["primary"]["path"], "app.ts");
+
+    let invalid = server.request(
+        "bifrost/runPolicy",
+        json!({
+            "documentUri": uri_for(&policy_path),
+            "sourceIdentity": "policies/live.rqlp",
+            "source": "(policy",
+        }),
+    );
+    assert!(invalid["error"].is_null(), "{invalid}");
+    assert_eq!(
+        invalid["result"]["report"]["diagnostics"][0]["code"], "policy-parse-failed",
+        "{invalid}"
+    );
+
+    let endpoint = server.request(
+        "bifrost/runPolicy",
+        json!({
+            "documentUri": uri_for(&policy_path),
+            "sourceIdentity": "policies/live.rqlp",
+            "source": r#"(endpoint
+  :id "endpoint.input"
+  :name "Input"
+  :display-name "input"
+  :role source
+  :categories [input.user]
+  :selector (rql (language typescript (function :name "target")))
+  :binding return-value
+  :supersedes [])"#,
+        }),
+    );
+    assert!(endpoint["error"].is_null(), "{endpoint}");
+    assert_eq!(
+        endpoint["result"]["report"]["diagnostics"][0]["code"], "not-executable-endpoint",
+        "{endpoint}"
+    );
+
+    let taint = server.request(
+        "bifrost/runPolicy",
+        json!({
+            "documentUri": uri_for(&policy_path),
+            "sourceIdentity": "policies/live.rqlp",
+            "source": r#"(policy
+  :id "test.taint"
+  :name "Taint"
+  :message "Taint reached sink"
+  :severity warning
+  :analysis (analysis
+    :type taint
+    :mode may
+    :sources (endpoint-set :entries [
+      (source :id request :display-name "request" :categories [input.user]
+        :selector (rql (name "request")) :bind return-value :labels [untrusted])])
+    :sinks (endpoint-set :entries [
+      (sink :id store :display-name "store" :categories [data.sensitive]
+        :selector (rql (name "store")) :dangerous-operand matched-value
+        :accepts [untrusted])])))"#,
+        }),
+    );
+    assert!(taint["error"].is_null(), "{taint}");
+    assert_eq!(
+        taint["result"]["report"]["runs"][0]["completion"]["type"], "unsupported",
+        "{taint}"
+    );
+    assert_eq!(
+        taint["result"]["report"]["runs"][0]["completion"]["capability"]["type"],
+        "taint_evaluation",
+        "{taint}"
+    );
+
+    let mismatched = server.request(
+        "bifrost/runPolicy",
+        json!({
+            "documentUri": uri_for(&policy_path),
+            "sourceIdentity": "policies/other.rqlp",
+            "source": unsaved,
+        }),
+    );
+    assert_eq!(mismatched["error"]["code"], -32602, "{mismatched}");
+    assert!(
+        mismatched["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("does not match document path")),
+        "{mismatched}"
+    );
+
+    let traversing = server.request(
+        "bifrost/runPolicy",
+        json!({
+            "documentUri": uri_for(&policy_path),
+            "sourceIdentity": "../outside.rqlp",
+            "source": unsaved,
+        }),
+    );
+    assert_eq!(traversing["error"]["code"], -32602, "{traversing}");
+    assert!(
+        traversing["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("must not contain `..`")),
+        "{traversing}"
+    );
+}
+
+#[test]
 fn bifrost_lsp_server_completes_optional_schema_versions_from_unsaved_rqlp_source() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canonical root");

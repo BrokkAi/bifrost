@@ -13,7 +13,7 @@ The behavior is visible by opening a workspace policy, changing it without savin
 - [x] (2026-07-21 18:08Z) Read issue #1041, inspected the current branch and relevant Rust/TypeScript paths, and completed independent diagnosis and planning passes.
 - [x] (2026-07-21 18:08Z) Attached the worktree to the existing `1041-add-first-class-vs-code-execution-and-brokk-branding-for-rqlp-policies` branch.
 - [x] (2026-07-21 18:24Z) Milestone 1: refactored policy coordination to accept an existing analyzer, cancellation, and a live root-document overlay; focused tests prove unsaved bytes and endpoint-root diagnostics.
-- [ ] Milestone 2: expose overlay evaluation through a cancellable `bifrost/runPolicy` LSP request, with integration tests.
+- [x] (2026-07-21 18:45Z) Milestone 2: exposed overlay evaluation through a cancellable, identity-validated `bifrost/runPolicy` LSP request; the focused integration test covers findings, parse diagnostics, endpoint rejection, unsupported taint, and invalid identities.
 - [ ] Milestone 3: add the typed VS Code policy runner, dedicated results view, navigation, and stale-result lifecycle, with TypeScript tests.
 - [ ] Milestone 4: replace the `.rqlp` icon and verify Explorer-size rendering on light and dark themes.
 - [ ] Run formatting, clippy, Rust feature tests, VS Code tests, and manual Extension Development Host validation.
@@ -44,9 +44,17 @@ The behavior is visible by opening a workspace policy, changing it without savin
   Rationale: Old evidence remains useful for inspection, but the UI must not imply it reflects changed policy or workspace state.
   Date/Author: 2026-07-21 / Codex
 
+- Decision: Validate the request identity against `Project::workspace_root_for_file` rather than directly selecting from the server's capability objects.
+  Rationale: The project already implements the authoritative deepest-root selection for single and multi-root workspaces. Comparing its portable relative path to the client-supplied identity rejects traversal and mismatches while giving evaluation only that owning root.
+  Date/Author: 2026-07-21 / Codex
+
+- Decision: Generalize cancellable workers to distinguish cancellation from internal failure strings.
+  Rationale: Policy coordination can fail before a canonical report exists. Returning that as an internal LSP error is accurate, while treating it as cancellation would hide a real failure and duplicating the worker implementation would drift.
+  Date/Author: 2026-07-21 / Codex
+
 ## Outcomes & Retrospective
 
-Milestone 1 is complete. `evaluate_policy_source` now evaluates editor-provided bytes under their supplied identity with a caller-owned `IAnalyzer` and cancellation token, while shared coordination still builds bounded canonical reports and CLI file evaluation retains its original analyzer-building behavior. The focused unsaved-source and endpoint-root tests pass. LSP request validation and integration remain for Milestone 2.
+Milestones 1 and 2 are complete. `evaluate_policy_source` evaluates editor-provided bytes under their supplied identity with a caller-owned `IAnalyzer` and cancellation token, while shared coordination still builds bounded canonical reports and CLI file evaluation retains its original analyzer-building behavior. `bifrost/runPolicy` now selects the document's owning workspace, rejects non-portable or mismatched identities, runs in the existing overlay-snapshot worker, and returns the canonical report plus workspace root URI. Focused tests pass for unsaved findings, parse diagnostics, endpoint-root rejection, unsupported taint, and invalid identities. The VS Code experience remains for Milestone 3.
 
 ## Context and Orientation
 
@@ -115,3 +123,5 @@ The extension must define TypeScript wire types matching canonical schema versio
 Revision note (2026-07-21): Created the initial self-contained plan after diagnosis and independent implementation planning. The milestone split isolates active-analyzer/capability-confinement correctness from editor presentation and visual branding so each risk can be validated independently.
 
 Revision note (2026-07-21 18:24Z): Marked Milestone 1 complete after extracting shared coordination, adding the live-source API, threading cancellation into evaluation, and passing focused tests for unsaved analyzer-backed findings and endpoint-root rejection.
+
+Revision note (2026-07-21 18:45Z): Marked Milestone 2 complete after adding the cancellable `bifrost/runPolicy` request, authoritative workspace-relative identity validation, structured canonical response, and passing end-to-end LSP coverage.
