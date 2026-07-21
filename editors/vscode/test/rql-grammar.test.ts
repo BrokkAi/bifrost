@@ -50,8 +50,8 @@ void test("registers distinct RQL, policy, and Rune IR languages", () => {
       extensions: [".rqlp"],
       configuration: "./language-configuration.json",
       icon: {
-        light: "./icons/bifrost-rql-policy.svg",
-        dark: "./icons/bifrost-rql-policy.svg"
+        light: "./icons/bifrost-rql-policy-light.svg",
+        dark: "./icons/bifrost-rql-policy-dark.svg"
       }
     },
     {
