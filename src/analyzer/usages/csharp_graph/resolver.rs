@@ -1026,7 +1026,7 @@ fn resolve_in_enclosing_type_scopes(
         let mut candidates = parts
             .into_iter()
             .flat_map(|part| csharp.direct_children(&part))
-            .filter(|child| child.is_class() && csharp_source_identifier(child) == name)
+            .filter(|child| child.is_class() && child.identifier() == name)
             .collect::<Vec<_>>();
         if !candidates.is_empty() {
             csharp.sort_dedup_type_candidates(&mut candidates);

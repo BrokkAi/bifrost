@@ -459,6 +459,114 @@ public class OtherOuter {
 }
 
 #[test]
+fn usage_finder_csharp_resolves_generic_nested_constructor_with_independent_owner_arity() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "Demo/NestedGeneric.cs",
+        r#"namespace Demo;
+
+public class ClassMapBuilder<TClass> {
+    private object? map;
+
+    public void Build() {
+        map = new BuilderClassMap<TClass>();
+    }
+
+    public class BuilderClassMap<T> {}
+}
+
+public class OtherBuilder<TClass> {
+    public class BuilderClassMap<T> {}
+    public object Build() => new BuilderClassMap<TClass>();
+}
+
+public class ClassMapBuilder<TClass, TExtra> {
+    public class BuilderClassMap<T> {}
+    public object Build() => new BuilderClassMap<TClass>();
+}
+
+public class OtherArityBuilder<TClass> {
+    public class BuilderClassMap<TFirst, TSecond> {}
+    public object Build() => new BuilderClassMap<TClass, TClass>();
+}
+"#,
+    )]);
+
+    let consumer = project.file("Demo/NestedGeneric.cs");
+    let source = consumer.read_to_string().expect("nested generic source");
+    let target_call = source
+        .find("BuilderClassMap<TClass>();")
+        .expect("target nested generic construction");
+    let other_owner_call = source
+        .find("=> new BuilderClassMap<TClass>();")
+        .expect("other-owner generic control")
+        + "=> new ".len();
+    let other_outer_arity_call = source
+        .rfind("BuilderClassMap<TClass>();")
+        .expect("different outer-arity control");
+    let other_inner_arity_call = source
+        .find("BuilderClassMap<TClass, TClass>();")
+        .expect("different inner-arity control");
+    let target = type_definition(&analyzer, "Demo.ClassMapBuilder`1$BuilderClassMap`1");
+
+    let forward = definition_lookup(
+        project.root(),
+        "Demo/NestedGeneric.cs",
+        target_call,
+        target_call + "BuilderClassMap".len(),
+    );
+    assert_eq!(forward["results"][0]["status"], "resolved", "{forward}");
+    assert_eq!(
+        forward["results"][0]["definitions"][0]["fqn"], "Demo.ClassMapBuilder`1$BuilderClassMap`1",
+        "{forward}"
+    );
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let targeted = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result
+        .into_either()
+        .expect("targeted nested-generic query should resolve");
+    let whole_workspace = UsageFinder::new()
+        .query(&analyzer, std::slice::from_ref(&target), 1000, 1000)
+        .result
+        .into_either()
+        .expect("whole-workspace nested-generic query should resolve");
+
+    for hits in [&targeted, &whole_workspace] {
+        assert_eq!(
+            hits.len(),
+            1,
+            "only the matching lexical owner and independent arities should resolve: {hits:#?}"
+        );
+        let hit = hits.iter().next().expect("nested generic construction hit");
+        assert_eq!(consumer, hit.file);
+        assert!(
+            hit.start_offset <= target_call
+                && target_call + "BuilderClassMap".len() <= hit.end_offset,
+            "the target construction identifier should be covered: {hit:#?}"
+        );
+        for control in [
+            other_owner_call,
+            other_outer_arity_call,
+            other_inner_arity_call,
+        ] {
+            assert!(
+                !(hit.start_offset <= control && control < hit.end_offset),
+                "a control with another owner or arity must not match: {hit:#?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn csharp_graph_nested_type_reference_respects_type_parameter_shadow() {
     let (project, analyzer) = csharp_analyzer_with_files(&[
         (
