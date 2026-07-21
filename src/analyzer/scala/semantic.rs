@@ -563,6 +563,7 @@ fn callable_shape<'tree>(
             is_static: false,
             is_synthetic: synthetic,
             invocation,
+            ..ProcedureProperties::default()
         },
         attach_lexical_parent,
     ))

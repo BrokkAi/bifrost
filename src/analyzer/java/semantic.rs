@@ -512,6 +512,16 @@ fn callable_shape<'tree>(
         ),
         _ => return None,
     };
+    let dispatch_extensibility = if kind == ProcedureKind::Constructor
+        || is_static
+        || has_modifier(node, "private")
+        || has_modifier(node, "final")
+        || enclosing_type_is_final(node)
+    {
+        DispatchExtensibility::Closed
+    } else {
+        DispatchExtensibility::Open
+    };
     Some((
         kind,
         segment_kind,
@@ -522,8 +532,20 @@ fn callable_shape<'tree>(
             is_static,
             is_synthetic: false,
             invocation: ProcedureInvocationKind::Immediate,
+            dispatch_extensibility,
         },
     ))
+}
+
+fn enclosing_type_is_final(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(parent.kind(), "class_declaration" | "record_declaration") {
+            return parent.kind() == "record_declaration" || has_modifier(parent, "final");
+        }
+        current = parent.parent();
+    }
+    false
 }
 
 fn has_modifier(node: Node<'_>, modifier: &str) -> bool {

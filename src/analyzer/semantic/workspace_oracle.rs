@@ -24,8 +24,8 @@ use crate::hash::HashMap;
 use super::{
     CandidateCoverage, ContentIdentity, DeclarationLocator, DeclarationSegment,
     DeclarationSegmentKind, DispatchBoundary, DispatchBoundaryKind, DispatchCandidate,
-    DispatchOracle, DispatchResult, EvidenceCompleteness, EvidenceHandle, OracleLimits,
-    OracleRelationArena, OracleRelationId, OracleRelationOwner, OracleRelationRecord,
+    DispatchExtensibility, DispatchOracle, DispatchResult, EvidenceCompleteness, EvidenceHandle,
+    OracleLimits, OracleRelationArena, OracleRelationId, OracleRelationOwner, OracleRelationRecord,
     OracleRelationSubject, OverlaySnapshotId, ProcedureHandle, ProcedureKind, ProcedureSemantics,
     ProofStatus, SemanticCallSite, SemanticCapability, SemanticGap, SemanticGapKind,
     SemanticGapSubject, SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest,
@@ -568,6 +568,8 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                 merge_dispatch_quality(materialization_quality, DispatchQuality::Truncated);
         }
 
+        let call_dispatch_gap =
+            call_dispatch_gap.filter(|gap| !closed_dispatch_discharges_gap(&candidates, gap));
         let gap_exceeded = call_dispatch_gap
             .and_then(|gap| gap.budget)
             .or_else(|| procedure_call_gap.and_then(|gap| gap.budget));
@@ -709,6 +711,19 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
         };
         dispatch_outcome(result, quality, reported_work)
     }
+}
+
+fn closed_dispatch_discharges_gap(candidates: &[DispatchCandidate], gap: &SemanticGap) -> bool {
+    gap.capability == SemanticCapability::DynamicDispatch
+        && !candidates.is_empty()
+        && candidates.iter().all(|candidate| {
+            candidate
+                .target()
+                .semantics()
+                .properties()
+                .dispatch_extensibility
+                == DispatchExtensibility::Closed
+        })
 }
 
 fn finish_dispatch_interruption(

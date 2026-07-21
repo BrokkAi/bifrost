@@ -468,12 +468,8 @@ fn java_static_method_dispatch_selects_the_arity_overload() {
             root(),
         );
 
-    graph.assert_outcome(IcfgOutcomeKind::Unproven);
-    graph.assert_boundary(
-        "invoke",
-        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
-            .originating_call("target_call"),
-    );
+    graph.assert_outcome(IcfgOutcomeKind::Complete);
+    graph.assert_no_boundaries("invoke");
     graph.assert_successors(
         "invoke",
         &[icfg_edge("string_target_entry", IcfgEdgeKind::Call).originating_call("target_call")],
@@ -545,15 +541,10 @@ fn java_same_arity_overloads_preserve_every_dispatch_candidate() {
             ["target_call"],
         );
 
-    // The resolver retains both same-arity candidates, while the exact
-    // dynamic-dispatch gap prevents candidate multiplicity from masquerading
-    // as complete target coverage.
-    graph.assert_outcome(IcfgOutcomeKind::Unproven);
-    graph.assert_boundary(
-        "invoke",
-        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
-            .originating_call("target_call"),
-    );
+    // The resolver retains both same-arity static candidates. Their target
+    // set is closed even though more than one overload remains possible.
+    graph.assert_outcome(IcfgOutcomeKind::Complete);
+    graph.assert_no_boundaries("invoke");
     graph.assert_successors(
         "invoke",
         &[

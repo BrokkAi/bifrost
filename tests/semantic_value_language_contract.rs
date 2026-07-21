@@ -5,14 +5,14 @@ use brokk_bifrost::analyzer::semantic::{
     AbstractObjectIdentity, AccessPath, AccessPathAtPoint, AccessPathRoot, AccessPathTail,
     AccessSelector, AliasQuery, AliasRelation, AllocationKind, ArgumentDomain,
     CallArgumentExpansion, CallBinding, CallBindings, CancellationToken, CandidateCoverage,
-    CaptureMode, CaptureSource, DispatchCandidate, DispatchOracle, FormalMultiplicity, HeapOracle,
-    IndexSelector, MemoryAccessKind, MemoryLocationKind, MemoryStoreHandle, ObjectCardinality,
-    ObservationPhase, OracleCallContext, OracleContractError, OracleLimits, ProcedureHandle,
-    ProcedureKind, ProcedurePortHandle, ProcedurePortKind, ProcedureSemantics,
-    ScopedSemanticLocator, SemanticBudget, SemanticEffect, SemanticOutcome, SemanticRequest,
-    SemanticValueKind, StoreAtPoint, UpdateEligibility, ValueAtPoint, ValueFlowEndpoint,
-    ValueFlowKind, ValueFlowOracle, ValueFlowRelationKind, ValueFlowSnapshot, WeakUpdateReason,
-    WorkspaceSemanticOracle,
+    CaptureMode, CaptureSource, DispatchCandidate, DispatchExtensibility, DispatchOracle,
+    FormalMultiplicity, HeapOracle, IndexSelector, MemoryAccessKind, MemoryLocationKind,
+    MemoryStoreHandle, ObjectCardinality, ObservationPhase, OracleCallContext, OracleContractError,
+    OracleLimits, ProcedureHandle, ProcedureKind, ProcedurePortHandle, ProcedurePortKind,
+    ProcedureSemantics, ScopedSemanticLocator, SemanticBudget, SemanticEffect, SemanticOutcome,
+    SemanticRequest, SemanticValueKind, StoreAtPoint, UpdateEligibility, ValueAtPoint,
+    ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle, ValueFlowRelationKind, ValueFlowSnapshot,
+    WeakUpdateReason, WorkspaceSemanticOracle,
 };
 
 use common::{InlineTestProject, semantic_graph::SemanticGraph};
@@ -717,6 +717,74 @@ fn dispatch_candidate_named(
         })
         .unwrap_or_else(|| panic!("fixture call must retain the local {name} candidate"))
         .clone()
+}
+
+fn assert_java_dispatch_closure(
+    analyzer: &brokk_bifrost::WorkspaceAnalyzer,
+    graph: &SemanticGraph,
+    source: &str,
+) {
+    for closed in ["consume", "privateTarget", "finalTarget", "target"] {
+        assert_eq!(
+            procedure_named(graph, closed, ProcedureKind::Method)
+                .properties()
+                .dispatch_extensibility,
+            DispatchExtensibility::Closed,
+            "{closed} must publish declaration-backed closed dispatch"
+        );
+    }
+    assert_eq!(
+        procedure_named(graph, "sink", ProcedureKind::Method)
+            .properties()
+            .dispatch_extensibility,
+        DispatchExtensibility::Open,
+        "ordinary overridable methods must remain open"
+    );
+    assert_eq!(
+        procedure_named(graph, "enumTarget", ProcedureKind::Method)
+            .properties()
+            .dispatch_extensibility,
+        DispatchExtensibility::Open,
+        "enum methods remain overridable by constant-specific class bodies"
+    );
+
+    let oracle = analyzer.semantic_oracle_provider();
+    let cancellation = CancellationToken::default();
+    for (procedure, call_source) in [
+        ("staticCall", "consume(input)"),
+        ("closedCalls", "privateTarget(input)"),
+        ("closedCalls", "finalTarget(input)"),
+        ("closedCalls", "service.target(input)"),
+    ] {
+        let call = call_named(graph, source, procedure, call_source);
+        let mut budget = SemanticBudget::default();
+        let dispatch = oracle
+            .resolve_call(&call, &mut SemanticRequest::new(&mut budget, &cancellation))
+            .unwrap_or_else(|error| panic!("dispatch {call_source:?} failed: {error}"));
+        assert_eq!(
+            available(&dispatch).coverage(),
+            CandidateCoverage::Exhaustive,
+            "declaration-closed Java dispatch must be exhaustive for {call_source:?}"
+        );
+        assert!(
+            available(&dispatch).boundaries().is_empty(),
+            "closed Java dispatch must not retain a dynamic boundary for {call_source:?}"
+        );
+    }
+
+    let open_call = call_named(graph, source, "instance", "this.sink(input, made)");
+    let mut budget = SemanticBudget::default();
+    let open_dispatch = oracle
+        .resolve_call(
+            &open_call,
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("ordinary Java virtual dispatch should materialize");
+    assert_eq!(
+        available(&open_dispatch).coverage(),
+        CandidateCoverage::Open,
+        "ordinary Java virtual dispatch must stay open"
+    );
 }
 
 fn bindings_for_call(
@@ -1608,6 +1676,8 @@ class Sample {
 function consume(input: Box) {}
 "#;
     const JAVA: &str = r#"class Box {}
+final class FinalService { Object target(Object input) { return input; } }
+enum ExtensibleEnum { INSTANCE; Object enumTarget(Object input) { return input; } }
 class Sample {
     Object instance(int input) {
         Object made = new Box(input);
@@ -1636,6 +1706,13 @@ class Sample {
     void collect(Object... values) {}
     void variadic(Object input) { this.collect(input, input); }
     static void consume(Object input) {}
+    private Object privateTarget(Object input) { return input; }
+    final Object finalTarget(Object input) { return input; }
+    Object closedCalls(FinalService service, Object input) {
+        privateTarget(input);
+        finalTarget(input);
+        return service.target(input);
+    }
     void looping(boolean flag) { while (flag) { new Box(); flag = false; } }
     Object recursive(boolean flag) { Object made = new Box(); if (flag) return this.recursive(false); return made; }
     Object two() { Object first = new Box(); Object second = new Box(); return first; }
@@ -1676,6 +1753,7 @@ class Sample {
     assert_call_bindings(&analyzer, &java, JAVA);
     assert_variadic_and_static_receiver_bindings(&analyzer, &typescript, TYPESCRIPT);
     assert_variadic_and_static_receiver_bindings(&analyzer, &java, JAVA);
+    assert_java_dispatch_closure(&analyzer, &java, JAVA);
     assert_open_spread_bindings(&analyzer, &typescript, TYPESCRIPT);
     assert_open_default_bindings(&analyzer, &typescript, TYPESCRIPT);
     assert_heap_oracle(&analyzer, &typescript, TYPESCRIPT);

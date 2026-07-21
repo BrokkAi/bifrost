@@ -50,7 +50,7 @@ use crate::analyzer::usages::{
     ExplicitCandidateProvider, FuzzyResult, ReferenceHit, ReferenceKind, UsageFinder, UsageHit,
     UsageHitKind, UsageProof, bind_call_site_arguments,
 };
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::compact_graph::CompactDirectedGraph;
 use crate::hash::{HashMap, HashSet};
@@ -1236,6 +1236,13 @@ pub fn execute(analyzer: &dyn IAnalyzer, query: &CodeQuery) -> CodeQueryResult {
     execute_with_limits(analyzer, query, CodeQueryExecutionLimits::default())
 }
 
+/// Run `query` with access to the generation-bound semantic-oracle facade.
+/// Receiver traversal uses this entrypoint in product code; the analyzer-only
+/// entrypoint remains available for callers that do not own a workspace.
+pub fn execute_workspace(workspace: &WorkspaceAnalyzer, query: &CodeQuery) -> CodeQueryResult {
+    execute_workspace_with_limits(workspace, query, CodeQueryExecutionLimits::default())
+}
+
 /// Honor the query's root execution mode through the public Rust surface.
 /// Ordinary callers that always want rows may continue to use [`execute`].
 pub fn execute_request(analyzer: &dyn IAnalyzer, query: &CodeQuery) -> CodeQueryResponse {
@@ -1247,7 +1254,24 @@ pub fn execute_request_with_limits(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResponse {
-    execute_request_internal(analyzer, query, limits, None)
+    execute_request_internal(analyzer, None, query, limits, None)
+}
+
+/// Honor the query's root execution mode with access to generation-bound
+/// semantic oracles for receiver traversal.
+pub fn execute_workspace_request(
+    workspace: &WorkspaceAnalyzer,
+    query: &CodeQuery,
+) -> CodeQueryResponse {
+    execute_workspace_request_with_limits(workspace, query, CodeQueryExecutionLimits::default())
+}
+
+pub fn execute_workspace_request_with_limits(
+    workspace: &WorkspaceAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+) -> CodeQueryResponse {
+    execute_request_internal(workspace.analyzer(), Some(workspace), query, limits, None)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1692,6 +1716,7 @@ struct CachedSeedExecution {
 
 struct QueryExecutionState<'a> {
     analyzer: &'a dyn IAnalyzer,
+    workspace: Option<&'a WorkspaceAnalyzer>,
     cancellation: Option<&'a CancellationToken>,
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
     budget: CodeQueryExecutionBudget,
@@ -1744,6 +1769,24 @@ pub fn execute_with_limits(
     execute_code_query_detailed(analyzer, query, limits, None).result
 }
 
+#[doc(hidden)]
+pub fn execute_workspace_with_limits(
+    workspace: &WorkspaceAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+) -> CodeQueryResult {
+    execute_internal(
+        workspace.analyzer(),
+        Some(workspace),
+        query,
+        limits,
+        None,
+        None,
+        false,
+    )
+    .result
+}
+
 #[cfg(test)]
 pub(crate) fn execute_with_cancellation(
     analyzer: &dyn IAnalyzer,
@@ -1765,18 +1808,46 @@ pub fn execute_request_with_cancellation(
     limits: CodeQueryExecutionLimits,
     cancellation: &CancellationToken,
 ) -> CodeQueryResponse {
-    execute_request_internal(analyzer, query, limits, Some(cancellation))
+    execute_request_internal(analyzer, None, query, limits, Some(cancellation))
+}
+
+/// Execute a mode-aware workspace query with explicit limits and cooperative
+/// cancellation. Explain mode remains planning-only and does not inspect the
+/// workspace.
+pub fn execute_workspace_request_with_cancellation(
+    workspace: &WorkspaceAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: &CancellationToken,
+) -> CodeQueryResponse {
+    execute_request_internal(
+        workspace.analyzer(),
+        Some(workspace),
+        query,
+        limits,
+        Some(cancellation),
+    )
 }
 
 fn execute_request_internal(
     analyzer: &dyn IAnalyzer,
+    workspace: Option<&WorkspaceAnalyzer>,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
 ) -> CodeQueryResponse {
     match query.execution_mode {
         CodeQueryExecutionMode::Results => CodeQueryResponse::Results(
-            execute_code_query_detailed(analyzer, query, limits, cancellation).result,
+            execute_internal(
+                analyzer,
+                workspace,
+                query,
+                limits,
+                cancellation,
+                None,
+                false,
+            )
+            .result,
         ),
         CodeQueryExecutionMode::Explain => match select_physical_plan(
             query,
@@ -1794,7 +1865,8 @@ fn execute_request_internal(
             Err(error) => CodeQueryResponse::Results(invalid_plan_result(error)),
         },
         CodeQueryExecutionMode::Profile => {
-            let detailed = execute_internal(analyzer, query, limits, cancellation, None, true);
+            let detailed =
+                execute_internal(analyzer, workspace, query, limits, cancellation, None, true);
             let DetailedCodeQueryResult {
                 result, profile, ..
             } = detailed;
@@ -1817,7 +1889,7 @@ pub(crate) fn execute_code_query_detailed(
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DetailedCodeQueryResult {
-    execute_internal(analyzer, query, limits, cancellation, None, false)
+    execute_internal(analyzer, None, query, limits, cancellation, None, false)
 }
 
 /// Internal opt-in profile entry point used by the M2 measurement harness.
@@ -1828,7 +1900,7 @@ pub(crate) fn execute_code_query_profiled(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> DetailedCodeQueryResult {
-    execute_internal(analyzer, query, limits, None, None, true)
+    execute_internal(analyzer, None, query, limits, None, None, true)
 }
 
 /// M4 benchmark/test entry point. A forced strategy still passes through the
@@ -1843,6 +1915,7 @@ pub(crate) fn execute_code_query_with_union_strategy(
 ) -> DetailedCodeQueryResult {
     execute_internal_with_strategy(
         analyzer,
+        None,
         query,
         limits,
         None,
@@ -1861,6 +1934,7 @@ fn execute_with_receiver_budget_for_test(
 ) -> CodeQueryResult {
     execute_internal(
         analyzer,
+        None,
         query,
         CodeQueryExecutionLimits::default(),
         None,
@@ -1872,6 +1946,7 @@ fn execute_with_receiver_budget_for_test(
 
 fn execute_internal(
     analyzer: &dyn IAnalyzer,
+    workspace: Option<&WorkspaceAnalyzer>,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
@@ -1880,6 +1955,7 @@ fn execute_internal(
 ) -> DetailedCodeQueryResult {
     execute_internal_with_strategy(
         analyzer,
+        workspace,
         query,
         limits,
         cancellation,
@@ -1893,6 +1969,7 @@ fn execute_internal(
 #[allow(clippy::too_many_arguments)]
 fn execute_internal_with_strategy(
     analyzer: &dyn IAnalyzer,
+    workspace: Option<&WorkspaceAnalyzer>,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
@@ -1926,6 +2003,7 @@ fn execute_internal_with_strategy(
     let mut diagnostics = Vec::new();
     let mut state = QueryExecutionState {
         analyzer,
+        workspace,
         cancellation,
         receiver_budget_override,
         budget: CodeQueryExecutionBudget::default(),
@@ -3402,6 +3480,9 @@ fn execute_parallel_seed_union(
                 let lease = coordinator.lease(branch);
                 let mut branch_state = QueryExecutionState {
                     analyzer,
+                    // Parallel union dependencies are seed scans only; receiver
+                    // steps execute later against the parent workspace state.
+                    workspace: None,
                     cancellation,
                     receiver_budget_override,
                     budget: base_budget,
@@ -4183,6 +4264,7 @@ fn apply_plan_step(
     };
     let (mut rows, exhausted, step_truncated) = apply_pipeline_step(
         state.analyzer,
+        state.workspace,
         step,
         rows,
         state.import_graph.as_ref(),
@@ -4542,6 +4624,7 @@ fn ensure_forward_import_edges(
 #[allow(clippy::too_many_arguments)]
 fn apply_pipeline_step(
     analyzer: &dyn IAnalyzer,
+    workspace: Option<&WorkspaceAnalyzer>,
     step: &QueryStep,
     rows: Vec<PipelineRow>,
     import_graph: Option<&DirectImportGraph>,
@@ -4572,7 +4655,12 @@ fn apply_pipeline_step(
         step,
         QueryStep::ReceiverTargets(_) | QueryStep::PointsTo(_) | QueryStep::MemberTargets(_)
     )
-    .then(|| ReceiverQueryService::new(analyzer));
+    .then(|| {
+        workspace.map_or_else(
+            || ReceiverQueryService::new(analyzer),
+            ReceiverQueryService::from_workspace,
+        )
+    });
     let mut instrumentation = instrumentation;
 
     let mut indexed_declarations = indexed_declarations;
@@ -9520,6 +9608,7 @@ mod tests {
 
         let detailed = execute_internal(
             &analyzer,
+            None,
             &query,
             CodeQueryExecutionLimits::default(),
             None,
@@ -9816,6 +9905,7 @@ mod tests {
             .expect("absolute globs remain valid query syntax");
             let profile = execute_internal(
                 &analyzer,
+                None,
                 &query,
                 CodeQueryExecutionLimits::default(),
                 None,
@@ -9861,6 +9951,7 @@ mod tests {
 
         let detailed = execute_internal_with_strategy(
             &analyzer,
+            None,
             &query,
             CodeQueryExecutionLimits::default(),
             Some(&cancellation),
@@ -9953,6 +10044,7 @@ mod tests {
 
         let detailed = execute_internal(
             &analyzer,
+            None,
             &query,
             CodeQueryExecutionLimits {
                 max_scanned_files: 1,
@@ -10316,6 +10408,7 @@ mod tests {
 
         let detailed = execute_internal(
             &analyzer,
+            None,
             &query,
             CodeQueryExecutionLimits {
                 max_scanned_source_bytes: source.len().saturating_mul(2).saturating_add(4),
@@ -10399,6 +10492,7 @@ mod tests {
 
         let detailed = execute_internal(
             &analyzer,
+            None,
             &query,
             CodeQueryExecutionLimits::default(),
             None,
@@ -10471,6 +10565,7 @@ mod tests {
                 let cancellation = CancellationToken::cancel_after_checks_for_test(checks);
                 let detailed = execute_internal(
                     &analyzer,
+                    None,
                     &query,
                     CodeQueryExecutionLimits::default(),
                     Some(&cancellation),

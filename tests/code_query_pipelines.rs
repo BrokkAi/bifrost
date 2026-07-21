@@ -2,7 +2,7 @@ mod common;
 
 use brokk_bifrost::analyzer::structural::{
     CodeQuery, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, CodeQueryResult, execute,
-    execute_with_limits,
+    execute_with_limits, execute_workspace,
 };
 use brokk_bifrost::{AnalyzerConfig, WorkspaceAnalyzer};
 use common::InlineTestProject;
@@ -16,7 +16,7 @@ fn run(files: &[(&str, &str)], query: Value) -> CodeQueryResult {
     let project = project.build();
     let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
     let query = CodeQuery::from_json(&query).expect("query should parse");
-    execute(workspace.analyzer(), &query)
+    execute_workspace(&workspace, &query)
 }
 
 fn serialized(result: &CodeQueryResult) -> Value {
@@ -139,6 +139,150 @@ export function caller() {
     assert!(
         target.contains("Service") && !target.contains("Other"),
         "{exact_members}"
+    );
+}
+
+#[test]
+fn java_receiver_traversal_projects_neutral_heap_and_type_facts() {
+    let files = [(
+        "Sample.java",
+        r#"class Service { void run() {} }
+class Sample {
+    void caller() {
+        Service service = new Service();
+        service.run();
+    }
+}
+"#,
+    )];
+    let receiver = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "steps": [{ "op": "receiver_targets" }]
+        }),
+    ));
+    assert_eq!(
+        receiver["results"].as_array().unwrap().len(),
+        1,
+        "{receiver}"
+    );
+    assert_eq!(receiver["results"][0]["outcome"], "precise", "{receiver}");
+    assert_eq!(
+        receiver["results"][0]["values"][0]["receiver_value_kind"], "allocation_site",
+        "{receiver}"
+    );
+    assert!(
+        receiver["results"][0]["values"][0]["type_declaration"]["fq_name"]
+            .as_str()
+            .unwrap()
+            .ends_with("Service"),
+        "{receiver}"
+    );
+
+    let members = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "call", "callee": { "name": "run" } },
+            "steps": [{ "op": "member_targets" }]
+        }),
+    ));
+    assert_eq!(members["results"].as_array().unwrap().len(), 1, "{members}");
+    assert_eq!(members["results"][0]["outcome"], "precise", "{members}");
+    assert_eq!(
+        members["results"][0]["member_targets"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "{members}"
+    );
+    assert!(
+        members["results"][0]["member_targets"][0]["fq_name"]
+            .as_str()
+            .unwrap()
+            .contains("Service"),
+        "{members}"
+    );
+}
+
+#[test]
+fn java_receiver_projection_preserves_type_static_current_and_factory_labels() {
+    let files = [(
+        "Labels.java",
+        r#"class Service {
+    static Service make() { return new Service(); }
+    void run() {}
+}
+class Labels {
+    void helper() {}
+    void parameter(Service service) { service.run(); }
+    void caller() {
+        this.helper();
+        Service service = Service.make();
+        service.run();
+    }
+}
+"#,
+    )];
+
+    let parameter = serialized(&run(
+        &files,
+        json!({
+            "match": {
+                "kind": "call",
+                "callee": { "name": "run" }
+            },
+            "inside": { "kind": "method", "name": "parameter" },
+            "steps": [{ "op": "receiver_targets" }]
+        }),
+    ));
+    assert_eq!(
+        parameter["results"][0]["values"][0]["receiver_value_kind"], "instance_type",
+        "{parameter}"
+    );
+
+    let current = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "call", "callee": { "name": "helper" } },
+            "steps": [{ "op": "receiver_targets" }]
+        }),
+    ));
+    assert_eq!(
+        current["results"][0]["values"][0]["receiver_value_kind"], "current_receiver",
+        "{current}"
+    );
+
+    let static_receiver = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "call", "callee": { "name": "make" } },
+            "steps": [{ "op": "receiver_targets" }]
+        }),
+    ));
+    assert_eq!(
+        static_receiver["results"][0]["values"][0]["receiver_value_kind"], "class_or_static_object",
+        "{static_receiver}"
+    );
+
+    let factory = serialized(&run(
+        &files,
+        json!({
+            "match": { "kind": "call", "callee": { "name": "make" } },
+            "steps": [{ "op": "points_to" }]
+        }),
+    ));
+    assert_eq!(
+        factory["results"][0]["values"][0]["receiver_value_kind"], "factory_return",
+        "{factory}"
+    );
+    assert!(
+        factory["results"][0]["values"][0]["factory"]["fq_name"]
+            .as_str()
+            .unwrap()
+            .ends_with("Service.make"),
+        "{factory}"
     );
 }
 

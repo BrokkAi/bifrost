@@ -28,7 +28,7 @@ pub(crate) fn java_type_lookup_resolution(
     java_type_lookup_node_fqn(analyzer, java, file, source, root, node)
 }
 
-pub(super) fn resolve_java(
+pub(crate) fn resolve_java(
     analyzer: &dyn IAnalyzer,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,

@@ -182,7 +182,15 @@ fn assert_direct_call_conformance(fixture: DirectCallFixture) {
         .file(fixture.callee_path, fixture.callee_source)
         .file(fixture.caller_path, fixture.caller_source)
         .build();
-    assert_direct_call_project_conformance(&project, fixture, false, false);
+    assert_direct_call_project_conformance(&project, fixture, false, false, false);
+}
+
+fn assert_closed_dispatch_direct_call_conformance(fixture: DirectCallFixture) {
+    let project = InlineTestProject::with_language(fixture.language)
+        .file(fixture.callee_path, fixture.callee_source)
+        .file(fixture.caller_path, fixture.caller_source)
+        .build();
+    assert_direct_call_project_conformance(&project, fixture, false, false, true);
 }
 
 fn assert_return_partial_direct_call_conformance(fixture: DirectCallFixture) {
@@ -190,7 +198,7 @@ fn assert_return_partial_direct_call_conformance(fixture: DirectCallFixture) {
         .file(fixture.callee_path, fixture.callee_source)
         .file(fixture.caller_path, fixture.caller_source)
         .build();
-    assert_direct_call_project_conformance(&project, fixture, false, true);
+    assert_direct_call_project_conformance(&project, fixture, false, true, false);
 }
 
 fn assert_direct_call_project_conformance(
@@ -198,6 +206,7 @@ fn assert_direct_call_project_conformance(
     fixture: DirectCallFixture,
     expect_unproven_link_unit: bool,
     expect_unproven_return: bool,
+    expect_closed_dispatch_refinement: bool,
 ) {
     let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
     let mut cfg = SemanticGraph::materialize(project, &analyzer, fixture.caller_path);
@@ -287,6 +296,8 @@ fn assert_direct_call_project_conformance(
             && (gap.subject == SemanticGapSubject::Point
                 || gap.subject == SemanticGapSubject::CallSite(direct_call.id))
     });
+    let has_unresolved_dynamic_dispatch =
+        has_dynamic_dispatch_gap && !expect_closed_dispatch_refinement;
 
     let mut icfg = IcfgGraph::materialize(
         project,
@@ -345,12 +356,12 @@ fn assert_direct_call_project_conformance(
         root(),
     );
 
-    if has_dynamic_dispatch_gap || expect_unproven_link_unit || expect_unproven_return {
+    if has_unresolved_dynamic_dispatch || expect_unproven_link_unit || expect_unproven_return {
         icfg.assert_outcome(IcfgOutcomeKind::Unproven);
     } else {
         icfg.assert_outcome(IcfgOutcomeKind::Complete);
     }
-    if has_dynamic_dispatch_gap || expect_unproven_link_unit {
+    if has_unresolved_dynamic_dispatch || expect_unproven_link_unit {
         icfg.assert_boundary(
             "icfg_invoke",
             ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
@@ -534,12 +545,12 @@ fn assert_declared_cpp_direct_call_conformance(
         .file(fixture.callee_path, fixture.callee_source)
         .file(fixture.caller_path, fixture.caller_source)
         .build();
-    assert_direct_call_project_conformance(&project, fixture, true, false);
+    assert_direct_call_project_conformance(&project, fixture, true, false, false);
 }
 
 #[test]
 fn java_direct_call_conformance() {
-    assert_direct_call_conformance(DirectCallFixture {
+    assert_closed_dispatch_direct_call_conformance(DirectCallFixture {
         language: Language::Java,
         dialect: SemanticLanguage::Standard(Language::Java),
         callee_path: "java/conformance/JavaLibrary.java",

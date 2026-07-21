@@ -424,6 +424,7 @@ fn callable_shape<'tree>(
             is_static: false,
             is_synthetic: false,
             invocation: ProcedureInvocationKind::Immediate,
+            ..ProcedureProperties::default()
         },
     ))
 }

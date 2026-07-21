@@ -197,6 +197,40 @@ fn service_normalizes_query_code_absolute_where_globs() {
 }
 
 #[test]
+fn query_code_service_projects_java_receivers_through_workspace_semantics() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Sample.java",
+            r#"class Service { void run() {} }
+class Sample {
+    void caller() {
+        Service service = new Service();
+        service.run();
+    }
+}
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let value = service
+        .call_tool_value(
+            "query_code",
+            serde_json::json!({
+                "match": { "kind": "call", "callee": { "name": "run" } },
+                "steps": [{ "op": "receiver_targets" }]
+            }),
+        )
+        .expect("Java receiver query");
+
+    assert_eq!(
+        value["results"][0]["values"][0]["receiver_value_kind"], "allocation_site",
+        "payload: {value}"
+    );
+}
+
+#[test]
 fn query_code_loads_workspace_rql_and_json_files() {
     let project = InlineTestProject::with_language(Language::Python)
         .file("app.py", "class App:\n    pass\n")

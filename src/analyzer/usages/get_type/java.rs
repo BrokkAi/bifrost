@@ -6,7 +6,7 @@ use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::{BoundedDefinitionLookup, IAnalyzer, ProjectFile};
 use tree_sitter::Tree;
 
-pub(super) fn resolve_java_type(
+pub(crate) fn resolve_java_type(
     analyzer: &dyn IAnalyzer,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,

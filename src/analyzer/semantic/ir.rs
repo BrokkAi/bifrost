@@ -250,12 +250,34 @@ impl ProcedureInvocationKind {
 
 /// Orthogonal properties that should not be encoded in [`ProcedureKind`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DispatchExtensibility {
+    /// Additional runtime targets may exist unless a dispatch oracle proves
+    /// closure through stronger language-specific evidence.
+    #[default]
+    Open,
+    /// The declaration itself proves that invocation cannot select an
+    /// overriding implementation.
+    Closed,
+}
+
+impl DispatchExtensibility {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+/// Orthogonal properties that should not be encoded in [`ProcedureKind`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcedureProperties {
     pub is_async: bool,
     pub is_generator: bool,
     pub is_static: bool,
     pub is_synthetic: bool,
     pub invocation: ProcedureInvocationKind,
+    pub dispatch_extensibility: DispatchExtensibility,
 }
 
 /// The positional or keyword domain accepted or produced at a call boundary.

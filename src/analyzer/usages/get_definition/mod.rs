@@ -100,7 +100,7 @@ mod call_sites;
 mod cpp;
 mod csharp;
 mod go;
-mod java;
+pub(crate) mod java;
 pub(crate) mod js_ts;
 mod php;
 mod python;

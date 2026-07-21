@@ -442,6 +442,7 @@ fn callable_shape<'tree>(
             } else {
                 ProcedureInvocationKind::Immediate
             },
+            ..ProcedureProperties::default()
         },
     ))
 }
