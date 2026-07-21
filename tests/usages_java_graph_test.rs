@@ -463,6 +463,125 @@ public class Consumer {
 }
 
 #[test]
+fn java_graph_strategy_records_expression_selector_type_segments_exactly() {
+    let (project, analyzer) = java_analyzer_with_files(&[
+        (
+            "app/Selectors.java",
+            r#"
+package app;
+
+public class Selectors {
+    public static class Feature {
+        public static final int TERMINAL = 1;
+        public static void call() {}
+    }
+
+    public static class Media {
+        public static class Player {
+            public static final int JAVA = 1;
+        }
+    }
+
+    public static class Conf {
+        public static String getProperty() { return ""; }
+    }
+}
+"#,
+        ),
+        (
+            "app/Media.java",
+            r#"
+package app;
+
+public class Media {
+    public void setHeight(int height) {}
+}
+"#,
+        ),
+        (
+            "app/HeightSetter.java",
+            r#"
+package app;
+
+interface HeightSetter {
+    void accept(Media media, int height);
+}
+"#,
+        ),
+        (
+            "app/Base.java",
+            r#"
+package app;
+
+public class Base {
+    protected Class<?> instanceType;
+}
+"#,
+        ),
+        (
+            "app/Consumer.java",
+            r#"
+package app;
+
+public class Consumer extends Base {
+    void run() {
+        int terminal = Selectors.Feature.TERMINAL; // field-access-selector
+        Selectors.Feature.call(); // invocation-selector
+        Runnable nestedReference = Selectors.Feature::call; // nested-method-reference-selector
+        HeightSetter directReference = Media::setHeight; // direct-method-reference-selector
+        int deep = Selectors.Media.Player.JAVA; // deep-field-access-selector
+        String property = Selectors.Conf.getProperty(); // invocation-object-selector
+        Object value = instanceType.newInstance(); // inherited-field-receiver-selector
+    }
+}
+"#,
+        ),
+    ]);
+    let candidates = [project.file("app/Consumer.java")].into_iter().collect();
+    let scan = |fq_name: &str| {
+        let target = definition(&analyzer, fq_name);
+        hits(JavaUsageGraphStrategy::new().find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &candidates,
+            1000,
+        ))
+    };
+
+    let feature_hits = scan("app.Selectors.Feature");
+    assert_eq!(3, feature_hits.len(), "{feature_hits:#?}");
+    assert_hit_contains(&feature_hits, "field-access-selector");
+    assert_hit_contains(&feature_hits, "invocation-selector");
+    assert_hit_contains(&feature_hits, "nested-method-reference-selector");
+    assert!(
+        feature_hits
+            .iter()
+            .all(|hit| hit.start_offset + "Feature".len() == hit.end_offset),
+        "nested-type hits must retain the exact focused token: {feature_hits:#?}"
+    );
+
+    let direct_reference_hits = scan("app.Media");
+    assert_eq!(1, direct_reference_hits.len(), "{direct_reference_hits:#?}");
+    assert_hit_contains(&direct_reference_hits, "direct-method-reference-selector");
+
+    let media_hits = scan("app.Selectors.Media");
+    assert_eq!(1, media_hits.len(), "{media_hits:#?}");
+    assert_hit_contains(&media_hits, "deep-field-access-selector");
+
+    let player_hits = scan("app.Selectors.Media.Player");
+    assert_eq!(1, player_hits.len(), "{player_hits:#?}");
+    assert_hit_contains(&player_hits, "deep-field-access-selector");
+
+    let conf_hits = scan("app.Selectors.Conf");
+    assert_eq!(1, conf_hits.len(), "{conf_hits:#?}");
+    assert_hit_contains(&conf_hits, "invocation-object-selector");
+
+    let inherited_field_hits = scan("app.Base.instanceType");
+    assert_eq!(1, inherited_field_hits.len(), "{inherited_field_hits:#?}");
+    assert_hit_contains(&inherited_field_hits, "inherited-field-receiver-selector");
+}
+
+#[test]
 fn java_graph_strategy_filters_same_file_self_calls() {
     let (_project, analyzer) = java_analyzer_with_files(&[(
         "com/example/Target.java",
