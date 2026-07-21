@@ -29,6 +29,14 @@ BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" codex
 
 Start a fresh Codex session after installing the plugin so the MCP server configuration is loaded at startup. The packaged plugin uses `symbol|extended`, so it exposes both symbol navigation and `query_code`.
 
+If the first launch needs to download the pinned Bifrost release, prepare it from a normal host shell before opening that fresh session:
+
+```bash
+~/.codex/.tmp/marketplaces/bifrost/plugins/bifrost-agent/bin/bifrost-launcher.mjs prepare --json
+```
+
+Wait for `"status":"ready"`. This avoids discovering a download, release-pin, or network failure only after Codex has already fixed the task's callable tool surface.
+
 ## Can My Agent Run RQL?
 
 Confirm that `query_code` appears in the fresh session's Bifrost tool list. Then ask Codex to call it once with the inline JSON fields `{"match":{"kind":"declaration"},"limit":1}`. To validate saved RQL, check a workspace file named `bifrost-smoke.rql` containing `(limit 1 (declaration))`, then ask Codex to call `query_code` with `{"query_file":"bifrost-smoke.rql"}`.
