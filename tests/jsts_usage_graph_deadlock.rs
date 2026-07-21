@@ -2,7 +2,7 @@ mod common;
 
 use brokk_bifrost::Language;
 use common::InlineTestProject;
-use common::usage_graph::usage_graph_at;
+use common::usage_graph::{has_edge, usage_graph_at};
 use std::fmt::Write as _;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -108,9 +108,8 @@ export function run{index}() {{
     };
 
     assert!(
-        graph["nodes"]
-            .as_array()
-            .is_some_and(|nodes| nodes.len() >= 300),
-        "usage_graph should include the generated JS functions: {graph}"
+        has_edge(&graph, "run0", "makeThing"),
+        "the triggering imported call must remain a cross-file usage edge: {}",
+        graph["edges"]
     );
 }
