@@ -1265,7 +1265,7 @@ fn enclosing_impl_type_matches_owner(receiver: Node<'_>, ctx: &MemberScanCtx<'_>
 fn self_field_receiver_matches_owner(
     receiver: Node<'_>,
     enclosing: &CodeUnit,
-    ctx: &MemberScanCtx<'_>,
+    ctx: &mut MemberScanCtx<'_>,
 ) -> bool {
     if receiver.kind() != "field_expression" {
         return false;
@@ -1285,11 +1285,15 @@ fn self_field_receiver_matches_owner(
     let Some(self_type) = ctx.analyzer.parent_of(enclosing) else {
         return false;
     };
-    ctx.analyzer
-        .get_members_in_class(&self_type)
-        .into_iter()
-        .filter(|member| member.is_field() && member.identifier() == field_name)
-        .any(|member| field_declared_type_matches_receiver(&member, ctx))
+    for member in ctx.analyzer.get_members_in_class(&self_type) {
+        if member.is_field()
+            && member.identifier() == field_name
+            && field_declared_type_matches_receiver(&member, ctx)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn enclosing_impl_item(mut node: Node<'_>) -> Option<Node<'_>> {
@@ -1332,24 +1336,14 @@ fn fqn_matches_owner(
     canonical.len() == 1 && canonical.first().is_some_and(|unit| unit == owner)
 }
 
-fn field_declared_type_matches_receiver(member: &CodeUnit, ctx: &MemberScanCtx<'_>) -> bool {
-    let Some(range) = ctx.analyzer.ranges(member).into_iter().next() else {
-        return false;
-    };
-    let Ok(source) = member.source().read_to_string() else {
-        return false;
-    };
-    let Some(tree) = parse_rust_source(&source) else {
-        return false;
-    };
-    let Some(field) = node_for_exact_range(tree.root_node(), range.start_byte, range.end_byte)
-    else {
-        return false;
-    };
-    field
-        .child_by_field_name("type")
-        .and_then(|ty| simple_type_name(ty, &source))
-        .is_some_and(|ty| ctx.receiver_type_names.contains(&ty))
+fn field_declared_type_matches_receiver(member: &CodeUnit, ctx: &mut MemberScanCtx<'_>) -> bool {
+    let receiver_types = rust_field_definition_type_candidates_cached(
+        ctx.analyzer,
+        ctx.support,
+        member,
+        ctx.type_lookup_cache,
+    );
+    type_candidates_match_owner(&receiver_types, ctx)
 }
 
 fn node_for_exact_range(root: Node<'_>, start: usize, end: usize) -> Option<Node<'_>> {

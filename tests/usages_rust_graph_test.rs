@@ -5454,6 +5454,79 @@ impl OtherBlock {
 }
 
 #[test]
+fn rust_graph_proves_method_through_cross_file_self_field_receiver_chain() {
+    let metrics = r#"
+use crate::handle::Handle;
+
+impl Handle {
+    fn injection_queue_depth(&self) -> usize {
+        self.shared.injection_queue_depth()
+    }
+
+    fn unrelated_queue_depth(&self) -> usize {
+        self.other_shared.injection_queue_depth()
+    }
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            "mod handle; mod metrics; mod other_worker; mod worker;\n",
+        ),
+        (
+            "src/worker.rs",
+            r#"
+pub(crate) struct Shared;
+impl Shared {
+    pub(crate) fn injection_queue_depth(&self) -> usize { 1 }
+}
+"#,
+        ),
+        (
+            "src/other_worker.rs",
+            r#"
+pub(crate) struct Shared;
+impl Shared {
+    pub(crate) fn injection_queue_depth(&self) -> usize { 2 }
+}
+"#,
+        ),
+        (
+            "src/handle.rs",
+            r#"
+use crate::{other_worker, worker};
+
+pub(crate) struct Handle {
+    pub(super) shared: worker::Shared,
+    pub(super) other_shared: other_worker::Shared,
+}
+"#,
+        ),
+        ("src/metrics.rs", metrics),
+    ]);
+    let target = definition(&analyzer, "worker.Shared.injection_queue_depth");
+    let found = authoritative_hits(
+        &analyzer,
+        &target,
+        analyzer.get_analyzed_files().into_iter().collect(),
+    );
+    let expected = metrics
+        .find("self.shared.injection_queue_depth")
+        .map(|start| start + "self.shared.".len())
+        .map(|start| (start, start + "injection_queue_depth".len()))
+        .expect("method through declared self field");
+
+    assert_eq!(
+        1,
+        found.len(),
+        "unrelated same-name owner must not match: {found:#?}"
+    );
+    let hit = found.iter().next().expect("worker Shared method hit");
+    assert_eq!(project.file("src/metrics.rs"), hit.file);
+    assert_eq!(expected, (hit.start_offset, hit.end_offset));
+}
+
+#[test]
 fn rust_graph_resolves_dotted_member_chains_inside_macro_token_trees() {
     let source = r#"
 pub struct AlertType;
