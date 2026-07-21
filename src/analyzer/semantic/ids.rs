@@ -191,7 +191,7 @@ impl WorkspaceMountId {
 pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic-ir";
 
 /// Current language-neutral semantic IR schema revision.
-pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 4;
+pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 5;
 
 impl SemanticIrVersion {
     /// The contract-owned fingerprint shared by every language adapter that
@@ -1065,10 +1065,10 @@ mod tests {
         let current = SemanticIrVersion::current();
         assert_eq!(
             current.to_string(),
-            "8843e274532ea713716c34e880313f33e77dbd5de2b67f8d6648758b21362ccd"
+            "b962895821730977967b60c508eb6c2cd98b3e3caefdf446bf93641cbbbdd6f3"
         );
         assert_ne!(current.as_bytes(), &[0_u8; 32]);
-        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 4);
+        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 5);
     }
 
     fn digest(label: &str) -> StableDigest {

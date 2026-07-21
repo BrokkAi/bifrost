@@ -1166,11 +1166,6 @@ fn lower_procedure<'tree>(
             ),
         ] {
             let impacts = SemanticGapImpacts::for_gap(capability, SemanticGapSubject::Procedure);
-            let impacts = if capability == SemanticCapability::Calls {
-                impacts.with(SemanticGapImpact::DispatchCoverage)
-            } else {
-                impacts
-            };
             context.add_gap_with_impacts(
                 &mut builder,
                 entry,
@@ -3204,7 +3199,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             point: invoke,
             callee,
             receiver,
-            arguments: argument_values.into_boxed_slice(),
+            arguments: argument_values.into_iter().map(Into::into).collect(),
             result: Some(result),
             thrown: Some(thrown),
             declared_targets: resolution.clone(),

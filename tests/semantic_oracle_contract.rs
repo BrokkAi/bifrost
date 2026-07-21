@@ -12,6 +12,63 @@ const ENTRY: ProgramPointId = ProgramPointId::new(0);
 const NORMAL_EXIT: ProgramPointId = ProgramPointId::new(1);
 const EXCEPTIONAL_EXIT: ProgramPointId = ProgramPointId::new(2);
 
+fn oracle_candidate<T>(
+    value: T,
+    proof: ProofStatus,
+    completeness: EvidenceCompleteness,
+    provenance: impl IntoIterator<Item = OracleRelationHandle>,
+) -> OracleCandidate<T> {
+    OracleCandidate::new(
+        value,
+        proof,
+        completeness,
+        provenance,
+        OracleLimits::default(),
+    )
+    .expect("fixture candidate fits the default oracle limits")
+}
+
+fn proven_candidate<T>(
+    value: T,
+    provenance: impl IntoIterator<Item = OracleRelationHandle>,
+) -> OracleCandidate<T> {
+    OracleCandidate::proven(value, provenance, OracleLimits::default())
+        .expect("fixture candidate fits the default oracle limits")
+}
+
+fn dispatch_candidate_draft(
+    target: ProcedureHandle,
+    proof: ProofStatus,
+    completeness: EvidenceCompleteness,
+    provenance: impl IntoIterator<Item = OracleRelationHandle>,
+) -> DispatchCandidate {
+    DispatchCandidate::new(
+        target,
+        proof,
+        completeness,
+        provenance,
+        OracleLimits::default(),
+    )
+    .expect("fixture dispatch candidate fits the default oracle limits")
+}
+
+fn call_bindings(
+    call: CallSiteHandle,
+    candidate: &DispatchCandidate,
+    context: OracleCallContext,
+    bindings: impl IntoIterator<Item = CallBinding>,
+    coverage: CandidateCoverage,
+) -> Result<CallBindings, OracleContractError> {
+    CallBindings::new(
+        call,
+        candidate,
+        context,
+        bindings,
+        coverage,
+        OracleLimits::default(),
+    )
+}
+
 fn anchor(offset: u32) -> SourceAnchor {
     let start = SourcePosition::new(offset, 0, offset);
     let end = SourcePosition::new(offset + 1, 0, offset + 1);
@@ -204,7 +261,10 @@ fn build_artifact() -> Arc<SemanticArtifact> {
         },
         SemanticValue {
             id: ValueId::new(1),
-            kind: SemanticValueKind::Parameter { ordinal: 0 },
+            kind: SemanticValueKind::Parameter {
+                ordinal: 0,
+                multiplicity: FormalMultiplicity::One,
+            },
             source: SOURCE,
             evidence: EVIDENCE,
         },
@@ -252,13 +312,19 @@ fn build_artifact() -> Arc<SemanticArtifact> {
 
     callee.values.push(SemanticValue {
         id: ValueId::new(0),
-        kind: SemanticValueKind::Parameter { ordinal: 0 },
+        kind: SemanticValueKind::Parameter {
+            ordinal: 0,
+            multiplicity: FormalMultiplicity::One,
+        },
         source: SOURCE,
         evidence: EVIDENCE,
     });
     other_callee.values.push(SemanticValue {
         id: ValueId::new(0),
-        kind: SemanticValueKind::Parameter { ordinal: 0 },
+        kind: SemanticValueKind::Parameter {
+            ordinal: 0,
+            multiplicity: FormalMultiplicity::One,
+        },
         source: SOURCE,
         evidence: EVIDENCE,
     });
@@ -269,7 +335,7 @@ fn build_artifact() -> Arc<SemanticArtifact> {
         point: ENTRY,
         callee: ValueId::new(0),
         receiver: None,
-        arguments: Box::new([ValueId::new(1)]),
+        arguments: Box::new([SemanticCallArgument::direct(ValueId::new(1))]),
         result: Some(ValueId::new(2)),
         thrown: None,
         declared_targets: target.clone(),
@@ -469,6 +535,223 @@ impl Fixture {
     }
 }
 
+fn binding_argument_group(
+    fixture: &BindingFixture,
+    arena: &Arc<OracleRelationArena>,
+    closure_id: u32,
+    sources: impl IntoIterator<Item = u32>,
+    mappings: impl IntoIterator<Item = (u32, CallArgumentMember, u32, u32)>,
+    coverage: CandidateCoverage,
+) -> CallBinding {
+    let mappings = mappings
+        .into_iter()
+        .map(|(source_index, member, formal_ordinal, relation_id)| {
+            let mapping = CallArgumentMapping::new(
+                source_index,
+                member,
+                CallArgumentEndpoint::Value(fixture.arguments[source_index as usize].clone()),
+                ProcedurePortHandle::parameter(fixture.callee.clone(), formal_ordinal).unwrap(),
+                CallPassingMode::Value,
+            );
+            proven_candidate(
+                mapping,
+                [arena.handle(OracleRelationId::new(relation_id)).unwrap()],
+            )
+        })
+        .collect::<Vec<_>>();
+    CallBinding::ArgumentGroup(
+        CallArgumentGroup::new(
+            &fixture.call,
+            arena.handle(OracleRelationId::new(closure_id)).unwrap(),
+            sources,
+            mappings,
+            coverage,
+            OracleLimits::default(),
+        )
+        .unwrap(),
+    )
+}
+
+struct BindingFixture {
+    caller: ProcedureHandle,
+    callee: ProcedureHandle,
+    call: CallSiteHandle,
+    arguments: Vec<ValueHandle>,
+    result: ValueHandle,
+}
+
+impl BindingFixture {
+    fn new(
+        expansions: Vec<CallArgumentExpansion>,
+        multiplicities: Vec<FormalMultiplicity>,
+    ) -> Self {
+        let argument_count = expansions.len();
+        let key = artifact_key();
+        let mut caller = minimal_procedure(&key, ProcedureId::new(0), "binding_caller", 10);
+        let mut callee = minimal_procedure(&key, ProcedureId::new(1), "binding_callee", 20);
+        caller.values.push(SemanticValue {
+            id: ValueId::new(0),
+            kind: SemanticValueKind::Callable,
+            source: SOURCE,
+            evidence: EVIDENCE,
+        });
+        for (index, _) in expansions.iter().enumerate() {
+            caller.values.push(SemanticValue {
+                id: ValueId::new((index + 1) as u32),
+                kind: SemanticValueKind::Local,
+                source: SOURCE,
+                evidence: EVIDENCE,
+            });
+        }
+        let result_id = ValueId::new((expansions.len() + 1) as u32);
+        caller.values.push(SemanticValue {
+            id: result_id,
+            kind: SemanticValueKind::Local,
+            source: SOURCE,
+            evidence: EVIDENCE,
+        });
+        for (ordinal, multiplicity) in multiplicities.into_iter().enumerate() {
+            callee.values.push(SemanticValue {
+                id: ValueId::new(ordinal as u32),
+                kind: SemanticValueKind::Parameter {
+                    ordinal: ordinal as u32,
+                    multiplicity,
+                },
+                source: SOURCE,
+                evidence: EVIDENCE,
+            });
+        }
+
+        let target = CallableTargetResolution::Proven(CallableTarget::Local(ProcedureId::new(1)));
+        let arguments = expansions
+            .into_iter()
+            .enumerate()
+            .map(|(index, expansion)| SemanticCallArgument {
+                value: ValueId::new((index + 1) as u32),
+                expansion,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        caller.call_sites.push(SemanticCallSite {
+            id: CallSiteId::new(0),
+            point: ENTRY,
+            callee: ValueId::new(0),
+            receiver: None,
+            arguments,
+            result: Some(result_id),
+            thrown: None,
+            declared_targets: target.clone(),
+            target_evidence: EVIDENCE,
+            normal_continuation: ControlContinuation::Target(NORMAL_EXIT),
+            exceptional_continuation: ControlContinuation::Target(EXCEPTIONAL_EXIT),
+            source: SOURCE,
+            evidence: EVIDENCE,
+        });
+        caller.points[ENTRY.index()].events = vec![
+            event(SemanticEffect::Entry),
+            event(SemanticEffect::CallableReference {
+                result: ValueId::new(0),
+                callable: CallableValue {
+                    kind: CallableReferenceKind::Function,
+                    targets: target,
+                    target_evidence: EVIDENCE,
+                    bound_receiver: None,
+                    environment: None,
+                },
+            }),
+            event(SemanticEffect::Invoke {
+                call_site: CallSiteId::new(0),
+            }),
+        ]
+        .into_boxed_slice();
+        let mut normal_events = caller.points[NORMAL_EXIT.index()].events.to_vec();
+        normal_events.push(event(SemanticEffect::CallContinuation {
+            call_site: CallSiteId::new(0),
+            kind: CallContinuationKind::Normal,
+        }));
+        caller.points[NORMAL_EXIT.index()].events = normal_events.into_boxed_slice();
+        let mut exceptional_events = caller.points[EXCEPTIONAL_EXIT.index()].events.to_vec();
+        exceptional_events.push(event(SemanticEffect::CallContinuation {
+            call_site: CallSiteId::new(0),
+            kind: CallContinuationKind::Exceptional,
+        }));
+        caller.points[EXCEPTIONAL_EXIT.index()].events = exceptional_events.into_boxed_slice();
+
+        let artifact = Arc::new(
+            SemanticArtifact::try_new(key, capabilities(), vec![caller, callee])
+                .expect("binding fixture should satisfy the semantic IR contract"),
+        );
+        let caller = artifact.procedure_handle(ProcedureId::new(0)).unwrap();
+        let callee = artifact.procedure_handle(ProcedureId::new(1)).unwrap();
+        let arguments = (0..argument_count)
+            .map(|index| {
+                caller
+                    .value_handle(ValueId::new((index + 1) as u32))
+                    .unwrap()
+            })
+            .collect();
+        Self {
+            call: caller.call_site_handle(CallSiteId::new(0)).unwrap(),
+            result: caller.value_handle(result_id).unwrap(),
+            caller,
+            callee,
+            arguments,
+        }
+    }
+
+    fn evidence(&self) -> EvidenceHandle {
+        self.caller.evidence_handle(EVIDENCE).unwrap()
+    }
+
+    fn evidence_with_quality(&self, id: EvidenceId) -> EvidenceHandle {
+        self.caller.evidence_handle(id).unwrap()
+    }
+
+    fn candidate(&self) -> DispatchCandidate {
+        let arena =
+            dispatch_relation_arena(&self.call, [self.callee.clone()], [], &self.evidence());
+        DispatchResult::new(
+            &self.call,
+            vec![dispatch_candidate_draft(
+                self.callee.clone(),
+                ProofStatus::Proven,
+                EvidenceCompleteness::Complete,
+                [arena.handle(OracleRelationId::new(0)).unwrap()],
+            )],
+            Vec::new(),
+            CandidateCoverage::Exhaustive,
+            OracleLimits::default(),
+        )
+        .unwrap()
+        .candidates()[0]
+            .clone()
+    }
+
+    fn binding_arena(
+        &self,
+        context: &OracleCallContext,
+        records: usize,
+    ) -> Arc<OracleRelationArena> {
+        relation_arena(
+            OracleRelationOwner::CallBinding {
+                call: self.call.clone(),
+                callee: self.callee.clone(),
+                context: context.clone(),
+            },
+            std::iter::repeat_n(OracleRelationKind::CallBinding, records),
+            &self.evidence(),
+        )
+    }
+
+    fn return_binding(&self, relation: OracleRelationHandle) -> CallBinding {
+        CallBinding::NormalReturn {
+            relation,
+            formal: ProcedurePortHandle::normal_return(self.callee.clone()),
+            result: self.result.clone(),
+        }
+    }
+}
+
 fn relation_arena(
     owner: OracleRelationOwner,
     kinds: impl IntoIterator<Item = OracleRelationKind>,
@@ -478,8 +761,44 @@ fn relation_arena(
         owner,
         kinds
             .into_iter()
-            .map(|kind| OracleRelationRecord::new(kind, [evidence.clone()]))
+            .map(|kind| {
+                OracleRelationRecord::new(kind, [evidence.clone()], OracleLimits::default())
+                    .unwrap()
+            })
             .collect(),
+        OracleLimits::default(),
+    )
+    .unwrap()
+}
+
+fn dispatch_relation_arena(
+    call: &CallSiteHandle,
+    targets: impl IntoIterator<Item = ProcedureHandle>,
+    boundaries: impl IntoIterator<Item = DispatchBoundaryKind>,
+    evidence: &EvidenceHandle,
+) -> Arc<OracleRelationArena> {
+    let mut records = targets
+        .into_iter()
+        .map(|target| {
+            OracleRelationRecord::dispatch_candidate(
+                target,
+                [evidence.clone()],
+                OracleLimits::default(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    records.extend(boundaries.into_iter().map(|boundary| {
+        OracleRelationRecord::dispatch_boundary(
+            boundary,
+            [evidence.clone()],
+            OracleLimits::default(),
+        )
+        .unwrap()
+    }));
+    OracleRelationArena::new(
+        OracleRelationOwner::Dispatch(call.clone()),
+        records,
         OracleLimits::default(),
     )
     .unwrap()
@@ -501,19 +820,92 @@ fn call_binding_arena(
     )
 }
 
+fn dispatch_candidates(
+    fixture: &Fixture,
+    targets: impl IntoIterator<Item = ProcedureHandle>,
+) -> Vec<DispatchCandidate> {
+    let targets = targets.into_iter().collect::<Vec<_>>();
+    let arena = dispatch_relation_arena(
+        &fixture.call,
+        targets.iter().cloned(),
+        [],
+        &fixture.evidence(),
+    );
+    let drafts = targets
+        .into_iter()
+        .enumerate()
+        .map(|(index, target)| {
+            dispatch_candidate_draft(
+                target,
+                ProofStatus::Proven,
+                EvidenceCompleteness::Complete,
+                [arena
+                    .handle(OracleRelationId::new(index as u32))
+                    .expect("candidate relation")],
+            )
+        })
+        .collect();
+    DispatchResult::new(
+        &fixture.call,
+        drafts,
+        Vec::new(),
+        CandidateCoverage::Exhaustive,
+        OracleLimits::default(),
+    )
+    .expect("valid dispatch candidates")
+    .candidates()
+    .to_vec()
+}
+
+fn dispatch_candidate(fixture: &Fixture) -> DispatchCandidate {
+    dispatch_candidates(fixture, [fixture.callee.clone()])
+        .into_iter()
+        .next()
+        .expect("one dispatch candidate")
+}
+
 fn argument_binding(
     fixture: &Fixture,
-    relation: OracleRelationHandle,
+    closure_relation: OracleRelationHandle,
+    mapping_relation: OracleRelationHandle,
     formal: ProcedureHandle,
 ) -> CallBinding {
-    CallBinding::Argument {
-        relation,
-        actual_index: 0,
-        formal_ordinal: 0,
-        actual: CallArgumentEndpoint::Value(fixture.value.clone()),
-        formal: ProcedurePortHandle::parameter(formal, 0).unwrap(),
-        mode: CallPassingMode::Value,
-    }
+    argument_binding_with_endpoint(
+        fixture,
+        closure_relation,
+        mapping_relation,
+        formal,
+        CallArgumentEndpoint::Value(fixture.value.clone()),
+        CallPassingMode::Value,
+    )
+}
+
+fn argument_binding_with_endpoint(
+    fixture: &Fixture,
+    closure_relation: OracleRelationHandle,
+    mapping_relation: OracleRelationHandle,
+    formal: ProcedureHandle,
+    actual: CallArgumentEndpoint,
+    mode: CallPassingMode,
+) -> CallBinding {
+    let mapping = CallArgumentMapping::new(
+        0,
+        CallArgumentMember::Whole,
+        actual,
+        ProcedurePortHandle::parameter(formal, 0).unwrap(),
+        mode,
+    );
+    CallBinding::ArgumentGroup(
+        CallArgumentGroup::new(
+            &fixture.call,
+            closure_relation,
+            [0],
+            [proven_candidate(mapping, [mapping_relation])],
+            CandidateCoverage::Exhaustive,
+            OracleLimits::default(),
+        )
+        .unwrap(),
+    )
 }
 
 fn return_binding(fixture: &Fixture, relation: OracleRelationHandle) -> CallBinding {
@@ -551,20 +943,20 @@ fn strong_evidence_with_backing(
     );
     StrongUpdateEvidence::new(
         location_set(
-            [OracleCandidate::proven(
+            [proven_candidate(
                 location.clone(),
                 [arena.handle(OracleRelationId::new(0)).unwrap()],
             )],
             CandidateCoverage::Exhaustive,
         ),
         object_set(
-            [OracleCandidate::proven(
+            [proven_candidate(
                 object.clone(),
                 [arena.handle(OracleRelationId::new(1)).unwrap()],
             )],
             CandidateCoverage::Exhaustive,
         ),
-        OracleCandidate::proven(
+        proven_candidate(
             AliasExclusivityWitness::new(
                 store.clone(),
                 location.clone(),
@@ -573,35 +965,27 @@ fn strong_evidence_with_backing(
             .unwrap(),
             [arena.handle(OracleRelationId::new(2)).unwrap()],
         ),
-        OracleCandidate::proven(
+        proven_candidate(
             EscapeWitness::new(store.clone(), object.clone(), EscapeStatus::DoesNotEscape).unwrap(),
             [arena.handle(OracleRelationId::new(3)).unwrap()],
         ),
+        OracleLimits::default(),
     )
+    .expect("fixture strong-update evidence fits the default oracle limits")
 }
 
 fn location_set(
     candidates: impl IntoIterator<Item = OracleCandidate<AbstractLocation>>,
     coverage: CandidateCoverage,
 ) -> OracleSet<AbstractLocation> {
-    OracleSet::bounded(
-        candidates,
-        coverage,
-        OracleLimits::default(),
-        OracleSetLimit::AliasBreadth,
-    )
+    OracleSet::bounded_locations(candidates, coverage, OracleLimits::default())
 }
 
 fn object_set(
     candidates: impl IntoIterator<Item = OracleCandidate<AbstractObject>>,
     coverage: CandidateCoverage,
 ) -> OracleSet<AbstractObject> {
-    OracleSet::bounded(
-        candidates,
-        coverage,
-        OracleLimits::default(),
-        OracleSetLimit::ObjectsPerValue,
-    )
+    OracleSet::bounded_objects(candidates, coverage, OracleLimits::default())
 }
 
 fn rebuild_strong_evidence(
@@ -616,11 +1000,13 @@ fn rebuild_strong_evidence(
         objects.unwrap_or_else(|| evidence.objects().clone()),
         alias_exclusivity.unwrap_or_else(|| evidence.alias_exclusivity().clone()),
         escape.unwrap_or_else(|| evidence.escape().clone()),
+        OracleLimits::default(),
     )
+    .expect("rebuilt fixture evidence fits the default oracle limits")
 }
 
 fn candidate_with_value<T: Clone>(candidate: &OracleCandidate<T>, value: T) -> OracleCandidate<T> {
-    OracleCandidate::new(
+    oracle_candidate(
         value,
         candidate.proof().clone(),
         candidate.completeness().clone(),
@@ -633,7 +1019,7 @@ fn candidate_with_quality<T: Clone>(
     proof: ProofStatus,
     completeness: EvidenceCompleteness,
 ) -> OracleCandidate<T> {
-    OracleCandidate::new(
+    oracle_candidate(
         candidate.value().clone(),
         proof,
         completeness,
@@ -645,7 +1031,7 @@ fn candidate_with_provenance<T: Clone>(
     candidate: &OracleCandidate<T>,
     provenance: impl IntoIterator<Item = OracleRelationHandle>,
 ) -> OracleCandidate<T> {
-    OracleCandidate::new(
+    oracle_candidate(
         candidate.value().clone(),
         candidate.proof().clone(),
         candidate.completeness().clone(),
@@ -666,7 +1052,7 @@ fn assert_weak(eligibility: UpdateEligibility, expected: WeakUpdateReason) {
 #[test]
 fn every_oracle_limit_dimension_rejects_zero() {
     type LimitSetter = fn(&mut OracleLimitValues);
-    let dimensions: [(&str, LimitSetter); 10] = [
+    let dimensions: [(&str, LimitSetter); 12] = [
         ("dispatch_targets", |limits| limits.dispatch_targets = 0),
         ("objects_per_value", |limits| limits.objects_per_value = 0),
         ("interned_roots", |limits| limits.interned_roots = 0),
@@ -676,7 +1062,11 @@ fn every_oracle_limit_dimension_rejects_zero() {
         ("alias_breadth", |limits| limits.alias_breadth = 0),
         ("call_context_depth", |limits| limits.call_context_depth = 0),
         ("summary_depth", |limits| limits.summary_depth = 0),
+        ("call_binding_entries", |limits| {
+            limits.call_binding_entries = 0
+        }),
         ("provenance_records", |limits| limits.provenance_records = 0),
+        ("evidence_handles", |limits| limits.evidence_handles = 0),
     ];
     for (expected, set_zero) in dimensions {
         let mut values = OracleLimitValues::uniform(1);
@@ -692,7 +1082,7 @@ fn candidate_proof_set_coverage_and_object_cardinality_are_independent() {
     let summary = fixture.lexical_object(ObjectCardinality::Summary);
 
     let open_singleton = object_set(
-        [OracleCandidate::new(
+        [oracle_candidate(
             singleton.clone(),
             ProofStatus::Proven,
             EvidenceCompleteness::Complete,
@@ -712,13 +1102,13 @@ fn candidate_proof_set_coverage_and_object_cardinality_are_independent() {
 
     let exhaustive = object_set(
         [
-            OracleCandidate::new(
+            oracle_candidate(
                 summary,
                 ProofStatus::Proven,
                 EvidenceCompleteness::Complete,
                 std::iter::empty(),
             ),
-            OracleCandidate::new(
+            oracle_candidate(
                 singleton,
                 ProofStatus::Unproven("candidate remains possible".into()),
                 EvidenceCompleteness::Partial("candidate proof is incomplete".into()),
@@ -750,35 +1140,37 @@ fn candidate_proof_set_coverage_and_object_cardinality_are_independent() {
 
 #[test]
 fn bounded_oracle_sets_truncate_at_each_public_breadth_limit() {
+    let fixture = Fixture::new();
     let limits = OracleLimits::new(OracleLimitValues {
         objects_per_value: 1,
         alias_breadth: 2,
         ..OracleLimitValues::uniform(3)
     })
     .unwrap();
-    let candidate = |value| {
-        OracleCandidate::new(
-            value,
-            ProofStatus::Proven,
-            EvidenceCompleteness::Complete,
-            std::iter::empty(),
-        )
-    };
+    let object = fixture.lexical_object(ObjectCardinality::Singleton);
+    let location =
+        AbstractLocation::new(object.clone(), fixture.lexical_path(AccessPathTail::Exact)).unwrap();
 
-    let objects = OracleSet::bounded(
-        [candidate(0_u8), candidate(1), candidate(2)],
+    let objects = OracleSet::bounded_objects(
+        [
+            proven_candidate(object.clone(), std::iter::empty()),
+            proven_candidate(object.clone(), std::iter::empty()),
+            proven_candidate(object, std::iter::empty()),
+        ],
         CandidateCoverage::Exhaustive,
         limits,
-        OracleSetLimit::ObjectsPerValue,
     );
     assert_eq!(objects.candidates().len(), 1);
     assert_eq!(objects.coverage(), CandidateCoverage::Truncated);
 
-    let aliases = OracleSet::bounded(
-        [candidate(0_u8), candidate(1), candidate(2)],
+    let aliases = OracleSet::bounded_locations(
+        [
+            proven_candidate(location.clone(), std::iter::empty()),
+            proven_candidate(location.clone(), std::iter::empty()),
+            proven_candidate(location, std::iter::empty()),
+        ],
         CandidateCoverage::Exhaustive,
         limits,
-        OracleSetLimit::AliasBreadth,
     );
     assert_eq!(aliases.candidates().len(), 2);
     assert_eq!(aliases.coverage(), CandidateCoverage::Truncated);
@@ -862,10 +1254,14 @@ fn relation_handles_are_interned_within_and_scoped_between_arenas() {
                 procedure: fixture.caller.clone(),
                 context: context.clone(),
             },
-            vec![OracleRelationRecord::new(
-                OracleRelationKind::ValueFlow,
-                [foreign_evidence],
-            )],
+            vec![
+                OracleRelationRecord::new(
+                    OracleRelationKind::ValueFlow,
+                    [foreign_evidence],
+                    OracleLimits::default(),
+                )
+                .unwrap()
+            ],
             OracleLimits::default(),
         ),
         Err(OracleContractError::CrossProcedure)
@@ -883,8 +1279,18 @@ fn relation_handles_are_interned_within_and_scoped_between_arenas() {
                 context,
             },
             vec![
-                OracleRelationRecord::new(OracleRelationKind::ValueFlow, [fixture.evidence()],),
-                OracleRelationRecord::new(OracleRelationKind::ValueFlow, [fixture.evidence()],),
+                OracleRelationRecord::new(
+                    OracleRelationKind::ValueFlow,
+                    [fixture.evidence()],
+                    one_record,
+                )
+                .unwrap(),
+                OracleRelationRecord::new(
+                    OracleRelationKind::ValueFlow,
+                    [fixture.evidence()],
+                    one_record,
+                )
+                .unwrap(),
             ],
             one_record,
         ),
@@ -894,6 +1300,84 @@ fn relation_handles_are_interned_within_and_scoped_between_arenas() {
             attempted: 2,
         })
     ));
+
+    let one_evidence = OracleLimits::new(OracleLimitValues {
+        evidence_handles: 1,
+        ..OracleLimitValues::uniform(2)
+    })
+    .unwrap();
+    assert!(matches!(
+        OracleRelationRecord::new(
+            OracleRelationKind::ValueFlow,
+            [fixture.evidence(), fixture.evidence()],
+            one_evidence,
+        ),
+        Err(OracleContractError::LimitExceeded {
+            dimension: "evidence_handles",
+            limit: 1,
+            attempted: 2,
+        })
+    ));
+    let records = vec![
+        OracleRelationRecord::new(
+            OracleRelationKind::ValueFlow,
+            [fixture.evidence()],
+            one_evidence,
+        )
+        .unwrap(),
+        OracleRelationRecord::new(
+            OracleRelationKind::ValueFlow,
+            [fixture.evidence()],
+            one_evidence,
+        )
+        .unwrap(),
+    ];
+    assert!(matches!(
+        OracleRelationArena::new(
+            OracleRelationOwner::ProcedureValueFlow {
+                procedure: fixture.caller.clone(),
+                context: OracleCallContext::empty(),
+            },
+            records,
+            one_evidence,
+        ),
+        Err(OracleContractError::LimitExceeded {
+            dimension: "evidence_handles",
+            limit: 1,
+            attempted: 2,
+        })
+    ));
+}
+
+#[test]
+fn relation_record_stops_consuming_evidence_after_bounded_lookahead() {
+    let fixture = Fixture::new();
+    let limits = OracleLimits::new(OracleLimitValues {
+        evidence_handles: 1,
+        ..OracleLimitValues::uniform(2)
+    })
+    .unwrap();
+    let consumed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = Arc::clone(&consumed);
+    let evidence = fixture.evidence();
+    let unbounded = std::iter::from_fn(move || {
+        observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(evidence.clone())
+    });
+
+    assert_eq!(
+        OracleRelationRecord::new(OracleRelationKind::ValueFlow, unbounded, limits),
+        Err(OracleContractError::LimitExceeded {
+            dimension: "evidence_handles",
+            limit: 1,
+            attempted: 2,
+        })
+    );
+    assert_eq!(
+        consumed.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "bounded construction must inspect only the limit plus one item"
+    );
 }
 
 #[test]
@@ -925,6 +1409,7 @@ fn value_flow_snapshots_retain_context_and_reject_multiple_arenas() {
         context.clone(),
         vec![first_relation.clone(), same_arena_relation],
         CandidateCoverage::Exhaustive,
+        OracleLimits::default(),
     )
     .expect("one value-flow arena should retain its exact context");
     assert_eq!(snapshot.context(), &context);
@@ -937,20 +1422,144 @@ fn value_flow_snapshots_retain_context_and_reject_multiple_arenas() {
             context,
             vec![first_relation, other_arena_relation],
             CandidateCoverage::Exhaustive,
+            OracleLimits::default(),
         ),
         Err(OracleContractError::InvalidRelationIdentity)
     );
 }
 
 #[test]
+fn oracle_quality_claims_cannot_inflate_proof_or_completeness_independently() {
+    let fixture = Fixture::new();
+    let query = fixture.value_at_point();
+    let object = fixture.lexical_object(ObjectCardinality::Singleton);
+
+    for (evidence_id, proof, completeness) in [
+        (
+            UNPROVEN_EVIDENCE,
+            ProofStatus::Proven,
+            EvidenceCompleteness::Partial("candidate set remains partial".into()),
+        ),
+        (
+            PARTIAL_EVIDENCE,
+            ProofStatus::Unproven("candidate existence remains unproven".into()),
+            EvidenceCompleteness::Complete,
+        ),
+    ] {
+        let arena = relation_arena(
+            OracleRelationOwner::PointsTo(Box::new(query.clone())),
+            [OracleRelationKind::PointsTo],
+            &fixture.evidence_with_quality(evidence_id),
+        );
+        assert_eq!(
+            PointsToResult::new(
+                query.clone(),
+                [oracle_candidate(
+                    object.clone(),
+                    proof,
+                    completeness,
+                    [arena.handle(OracleRelationId::new(0)).unwrap()],
+                )],
+                CandidateCoverage::Open,
+                OracleLimits::default(),
+            ),
+            Err(OracleContractError::InvalidRelationQuality)
+        );
+    }
+
+    let context = OracleCallContext::empty();
+    for (evidence_id, proof, completeness) in [
+        (
+            UNPROVEN_EVIDENCE,
+            ProofStatus::Proven,
+            EvidenceCompleteness::Partial("flow closure remains partial".into()),
+        ),
+        (
+            PARTIAL_EVIDENCE,
+            ProofStatus::Unproven("flow relation remains unproven".into()),
+            EvidenceCompleteness::Complete,
+        ),
+    ] {
+        let arena = relation_arena(
+            OracleRelationOwner::ProcedureValueFlow {
+                procedure: fixture.caller.clone(),
+                context: context.clone(),
+            },
+            [OracleRelationKind::ValueFlow],
+            &fixture.evidence_with_quality(evidence_id),
+        );
+        let relation = ValueFlowRelation {
+            id: arena.handle(OracleRelationId::new(0)).unwrap(),
+            kind: ValueFlowRelationKind::Assignment,
+            source: ValueFlowEndpoint::Value(fixture.value.clone()),
+            target: ValueFlowEndpoint::Value(fixture.result.clone()),
+            proof,
+            completeness,
+        };
+        assert_eq!(
+            ValueFlowSnapshot::new(
+                fixture.caller.clone(),
+                context.clone(),
+                vec![relation],
+                CandidateCoverage::Open,
+                OracleLimits::default(),
+            ),
+            Err(OracleContractError::InvalidRelationQuality)
+        );
+    }
+
+    let candidate_arena = dispatch_relation_arena(
+        &fixture.call,
+        [fixture.callee.clone()],
+        [],
+        &fixture.evidence_with_quality(UNPROVEN_EVIDENCE),
+    );
+    assert_eq!(
+        DispatchResult::new(
+            &fixture.call,
+            vec![dispatch_candidate_draft(
+                fixture.callee.clone(),
+                ProofStatus::Proven,
+                EvidenceCompleteness::Partial("dispatch set remains partial".into()),
+                [candidate_arena.handle(OracleRelationId::new(0)).unwrap()],
+            )],
+            Vec::new(),
+            CandidateCoverage::Open,
+            OracleLimits::default(),
+        ),
+        Err(OracleContractError::InvalidRelationQuality)
+    );
+
+    let boundary_arena = dispatch_relation_arena(
+        &fixture.call,
+        [],
+        [DispatchBoundaryKind::External(None)],
+        &fixture.evidence_with_quality(PARTIAL_EVIDENCE),
+    );
+    assert_eq!(
+        DispatchResult::new(
+            &fixture.call,
+            Vec::new(),
+            vec![DispatchBoundary {
+                kind: DispatchBoundaryKind::External(None),
+                proof: ProofStatus::Unproven("external target remains unproven".into()),
+                completeness: EvidenceCompleteness::Complete,
+                provenance: Box::new([boundary_arena.handle(OracleRelationId::new(0)).unwrap()]),
+            }],
+            CandidateCoverage::Open,
+            OracleLimits::default(),
+        ),
+        Err(OracleContractError::InvalidRelationQuality)
+    );
+}
+
+#[test]
 fn dispatch_answers_require_one_call_scoped_provenance_arena() {
     let fixture = Fixture::new();
-    let arena = relation_arena(
-        OracleRelationOwner::Dispatch(fixture.call.clone()),
-        [
-            OracleRelationKind::DispatchCandidate,
-            OracleRelationKind::DispatchBoundary,
-        ],
+    let arena = dispatch_relation_arena(
+        &fixture.call,
+        [fixture.callee.clone()],
+        [DispatchBoundaryKind::Unresolved],
         &fixture.evidence(),
     );
     let candidate_relation = arena.handle(OracleRelationId::new(0)).unwrap();
@@ -961,12 +1570,12 @@ fn dispatch_answers_require_one_call_scoped_provenance_arena() {
     let boundary_relation = arena.handle(OracleRelationId::new(1)).unwrap();
     let result = DispatchResult::new(
         &fixture.call,
-        vec![DispatchCandidate {
-            target: fixture.callee.clone(),
-            proof: ProofStatus::Proven,
-            completeness: EvidenceCompleteness::Complete,
-            provenance: Box::new([candidate_relation.clone()]),
-        }],
+        vec![dispatch_candidate_draft(
+            fixture.callee.clone(),
+            ProofStatus::Proven,
+            EvidenceCompleteness::Complete,
+            [candidate_relation.clone()],
+        )],
         vec![DispatchBoundary {
             kind: DispatchBoundaryKind::Unresolved,
             proof: ProofStatus::Unproven("unresolved dispatch arm".into()),
@@ -974,6 +1583,7 @@ fn dispatch_answers_require_one_call_scoped_provenance_arena() {
             provenance: Box::new([boundary_relation.clone()]),
         }],
         CandidateCoverage::Open,
+        OracleLimits::default(),
     )
     .expect("candidate and boundary provenance share one dispatch arena");
     assert_eq!(result.candidates().len(), 1);
@@ -982,32 +1592,34 @@ fn dispatch_answers_require_one_call_scoped_provenance_arena() {
     assert_eq!(
         DispatchResult::new(
             &fixture.call,
-            vec![DispatchCandidate {
-                target: fixture.callee.clone(),
-                proof: ProofStatus::Proven,
-                completeness: EvidenceCompleteness::Complete,
-                provenance: Box::new([boundary_relation]),
-            }],
+            vec![dispatch_candidate_draft(
+                fixture.callee.clone(),
+                ProofStatus::Proven,
+                EvidenceCompleteness::Complete,
+                [boundary_relation],
+            )],
             Vec::new(),
             CandidateCoverage::Open,
+            OracleLimits::default(),
         ),
         Err(OracleContractError::InvalidRelationIdentity)
     );
 
-    let second_arena = relation_arena(
-        OracleRelationOwner::Dispatch(fixture.call.clone()),
-        [OracleRelationKind::DispatchBoundary],
+    let second_arena = dispatch_relation_arena(
+        &fixture.call,
+        [],
+        [DispatchBoundaryKind::Unresolved],
         &fixture.evidence(),
     );
     assert_eq!(
         DispatchResult::new(
             &fixture.call,
-            vec![DispatchCandidate {
-                target: fixture.callee.clone(),
-                proof: ProofStatus::Proven,
-                completeness: EvidenceCompleteness::Complete,
-                provenance: Box::new([candidate_relation]),
-            }],
+            vec![dispatch_candidate_draft(
+                fixture.callee.clone(),
+                ProofStatus::Proven,
+                EvidenceCompleteness::Complete,
+                [candidate_relation],
+            )],
             vec![DispatchBoundary {
                 kind: DispatchBoundaryKind::Unresolved,
                 proof: ProofStatus::Unproven("unresolved dispatch arm".into()),
@@ -1015,19 +1627,212 @@ fn dispatch_answers_require_one_call_scoped_provenance_arena() {
                 provenance: Box::new([second_arena.handle(OracleRelationId::new(0)).unwrap(),]),
             }],
             CandidateCoverage::Open,
+            OracleLimits::default(),
         ),
         Err(OracleContractError::InvalidRelationIdentity)
     );
 }
 
 #[test]
+fn dispatch_result_cannot_seal_a_relation_for_a_different_target() {
+    let fixture = Fixture::new();
+    let arena = dispatch_relation_arena(
+        &fixture.call,
+        [fixture.callee.clone()],
+        [],
+        &fixture.evidence(),
+    );
+    let forged = dispatch_candidate_draft(
+        fixture.other_callee.clone(),
+        ProofStatus::Proven,
+        EvidenceCompleteness::Complete,
+        [arena.handle(OracleRelationId::new(0)).unwrap()],
+    );
+
+    assert_eq!(
+        DispatchResult::new(
+            &fixture.call,
+            vec![forged],
+            Vec::new(),
+            CandidateCoverage::Exhaustive,
+            OracleLimits::default(),
+        ),
+        Err(OracleContractError::InvalidRelationIdentity)
+    );
+}
+
+#[test]
+fn dispatch_boundaries_require_their_exact_structured_relation_identity() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        OracleRelationRecord::new(
+            OracleRelationKind::DispatchBoundary,
+            [fixture.evidence()],
+            OracleLimits::default(),
+        ),
+        Err(OracleContractError::InvalidRelationIdentity)
+    );
+
+    let locator = fixture.callee.semantics().locator().clone();
+    let mismatches = [
+        (
+            DispatchBoundaryKind::External(None),
+            DispatchBoundaryKind::Unresolved,
+        ),
+        (
+            DispatchBoundaryKind::Unmaterialized(locator.clone()),
+            DispatchBoundaryKind::External(Some(locator.clone())),
+        ),
+        (
+            DispatchBoundaryKind::Deferred {
+                target: locator.clone(),
+                kind: DeferredInvocationKind::Async,
+            },
+            DispatchBoundaryKind::Deferred {
+                target: locator,
+                kind: DeferredInvocationKind::Generator,
+            },
+        ),
+    ];
+    for (relation_subject, boundary_kind) in mismatches {
+        let arena =
+            dispatch_relation_arena(&fixture.call, [], [relation_subject], &fixture.evidence());
+        assert_eq!(
+            DispatchResult::new(
+                &fixture.call,
+                Vec::new(),
+                vec![DispatchBoundary {
+                    kind: boundary_kind,
+                    proof: ProofStatus::Proven,
+                    completeness: EvidenceCompleteness::Complete,
+                    provenance: Box::new([arena.handle(OracleRelationId::new(0)).unwrap()]),
+                }],
+                CandidateCoverage::Open,
+                OracleLimits::default(),
+            ),
+            Err(OracleContractError::InvalidRelationIdentity)
+        );
+    }
+}
+
+#[test]
+fn dispatch_result_rejects_duplicate_targets_with_distinct_valid_provenance() {
+    let fixture = Fixture::new();
+    let arena = dispatch_relation_arena(
+        &fixture.call,
+        [fixture.callee.clone(), fixture.callee.clone()],
+        [],
+        &fixture.evidence(),
+    );
+    let candidates = (0..2)
+        .map(|index| {
+            dispatch_candidate_draft(
+                fixture.callee.clone(),
+                ProofStatus::Proven,
+                EvidenceCompleteness::Complete,
+                [arena.handle(OracleRelationId::new(index)).unwrap()],
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        DispatchResult::new(
+            &fixture.call,
+            candidates,
+            Vec::new(),
+            CandidateCoverage::Exhaustive,
+            OracleLimits::default(),
+        ),
+        Err(OracleContractError::DuplicateDispatchTarget)
+    );
+}
+
+#[test]
+fn dispatch_result_revalidates_the_retained_arena_against_query_limits() {
+    let fixture = Fixture::new();
+    let record_arena = dispatch_relation_arena(
+        &fixture.call,
+        [fixture.callee.clone()],
+        [DispatchBoundaryKind::Unresolved],
+        &fixture.evidence(),
+    );
+    let record_limits = OracleLimits::new(OracleLimitValues {
+        provenance_records: 1,
+        ..OracleLimitValues::uniform(2)
+    })
+    .unwrap();
+    assert!(matches!(
+        DispatchResult::new(
+            &fixture.call,
+            vec![dispatch_candidate_draft(
+                fixture.callee.clone(),
+                ProofStatus::Proven,
+                EvidenceCompleteness::Complete,
+                [record_arena.handle(OracleRelationId::new(0)).unwrap()],
+            )],
+            vec![DispatchBoundary {
+                kind: DispatchBoundaryKind::Unresolved,
+                proof: ProofStatus::Unproven("unresolved dispatch arm".into()),
+                completeness: EvidenceCompleteness::Partial("open dispatch".into()),
+                provenance: Box::new([record_arena.handle(OracleRelationId::new(1)).unwrap()]),
+            }],
+            CandidateCoverage::Open,
+            record_limits,
+        ),
+        Err(OracleContractError::LimitExceeded {
+            dimension: "provenance_records",
+            limit: 1,
+            attempted: 2,
+        })
+    ));
+
+    let evidence_record = OracleRelationRecord::dispatch_candidate(
+        fixture.callee.clone(),
+        [fixture.evidence(), fixture.evidence()],
+        OracleLimits::default(),
+    )
+    .unwrap();
+    let evidence_arena = OracleRelationArena::new(
+        OracleRelationOwner::Dispatch(fixture.call.clone()),
+        vec![evidence_record],
+        OracleLimits::default(),
+    )
+    .unwrap();
+    let evidence_limits = OracleLimits::new(OracleLimitValues {
+        evidence_handles: 1,
+        ..OracleLimitValues::uniform(2)
+    })
+    .unwrap();
+    assert!(matches!(
+        DispatchResult::new(
+            &fixture.call,
+            vec![dispatch_candidate_draft(
+                fixture.callee.clone(),
+                ProofStatus::Proven,
+                EvidenceCompleteness::Complete,
+                [evidence_arena.handle(OracleRelationId::new(0)).unwrap()],
+            )],
+            Vec::new(),
+            CandidateCoverage::Exhaustive,
+            evidence_limits,
+        ),
+        Err(OracleContractError::LimitExceeded {
+            dimension: "evidence_handles",
+            limit: 1,
+            attempted: 2,
+        })
+    ));
+}
+
+#[test]
 fn dispatch_boundaries_constrain_candidate_set_coverage() {
     let fixture = Fixture::new();
-    let arena = relation_arena(
-        OracleRelationOwner::Dispatch(fixture.call.clone()),
+    let arena = dispatch_relation_arena(
+        &fixture.call,
+        [],
         [
-            OracleRelationKind::DispatchBoundary,
-            OracleRelationKind::DispatchBoundary,
+            DispatchBoundaryKind::Unresolved,
+            DispatchBoundaryKind::Truncated,
         ],
         &fixture.evidence(),
     );
@@ -1043,6 +1848,7 @@ fn dispatch_boundaries_constrain_candidate_set_coverage() {
             Vec::new(),
             vec![unresolved],
             CandidateCoverage::Exhaustive,
+            OracleLimits::default(),
         ),
         Err(OracleContractError::InconsistentCoverage)
     );
@@ -1059,9 +1865,52 @@ fn dispatch_boundaries_constrain_candidate_set_coverage() {
             Vec::new(),
             vec![truncated],
             CandidateCoverage::Open,
+            OracleLimits::default(),
         ),
         Err(OracleContractError::InconsistentCoverage)
     );
+}
+
+#[test]
+fn dispatch_result_rejects_more_targets_than_its_query_limit() {
+    let fixture = Fixture::new();
+    let arena = dispatch_relation_arena(
+        &fixture.call,
+        [fixture.callee.clone(), fixture.other_callee.clone()],
+        [],
+        &fixture.evidence(),
+    );
+    let candidates = [fixture.callee.clone(), fixture.other_callee.clone()]
+        .into_iter()
+        .enumerate()
+        .map(|(index, target)| {
+            dispatch_candidate_draft(
+                target,
+                ProofStatus::Proven,
+                EvidenceCompleteness::Complete,
+                [arena.handle(OracleRelationId::new(index as u32)).unwrap()],
+            )
+        })
+        .collect();
+    let limits = OracleLimits::new(OracleLimitValues {
+        dispatch_targets: 1,
+        ..OracleLimitValues::uniform(2)
+    })
+    .unwrap();
+    assert!(matches!(
+        DispatchResult::new(
+            &fixture.call,
+            candidates,
+            Vec::new(),
+            CandidateCoverage::Exhaustive,
+            limits,
+        ),
+        Err(OracleContractError::LimitExceeded {
+            dimension: "dispatch_targets",
+            limit: 1,
+            attempted: 2,
+        })
+    ));
 }
 
 #[test]
@@ -1197,7 +2046,7 @@ fn heap_results_bind_provenance_to_the_exact_query_subject_and_context() {
     );
     let result = PointsToResult::new(
         value_query.clone(),
-        [OracleCandidate::proven(
+        [proven_candidate(
             object.clone(),
             [points_to.handle(OracleRelationId::new(0)).unwrap()],
         )],
@@ -1217,7 +2066,7 @@ fn heap_results_bind_provenance_to_the_exact_query_subject_and_context() {
     assert_eq!(
         PointsToResult::new(
             value_query.clone(),
-            [OracleCandidate::proven(
+            [proven_candidate(
                 object.clone(),
                 [other_subject.handle(OracleRelationId::new(0)).unwrap()],
             )],
@@ -1236,7 +2085,7 @@ fn heap_results_bind_provenance_to_the_exact_query_subject_and_context() {
     assert_eq!(
         PointsToResult::new(
             value_query,
-            [OracleCandidate::proven(
+            [proven_candidate(
                 object.clone(),
                 [other_context.handle(OracleRelationId::new(0)).unwrap()],
             )],
@@ -1262,7 +2111,7 @@ fn heap_results_bind_provenance_to_the_exact_query_subject_and_context() {
     );
     let result = LocationResult::new(
         access_query.clone(),
-        [OracleCandidate::proven(
+        [proven_candidate(
             location.clone(),
             [locations.handle(OracleRelationId::new(0)).unwrap()],
         )],
@@ -1293,7 +2142,7 @@ fn heap_results_bind_provenance_to_the_exact_query_subject_and_context() {
     assert_eq!(
         LocationResult::new(
             access_query.clone(),
-            [OracleCandidate::proven(
+            [proven_candidate(
                 location.clone(),
                 [other_subject.handle(OracleRelationId::new(0)).unwrap()],
             )],
@@ -1318,7 +2167,7 @@ fn heap_results_bind_provenance_to_the_exact_query_subject_and_context() {
     assert_eq!(
         LocationResult::new(
             access_query,
-            [OracleCandidate::proven(
+            [proven_candidate(
                 location,
                 [other_context.handle(OracleRelationId::new(0)).unwrap()],
             )],
@@ -1332,17 +2181,19 @@ fn heap_results_bind_provenance_to_the_exact_query_subject_and_context() {
 #[test]
 fn call_bindings_require_complete_unique_candidate_specific_relations() {
     let fixture = Fixture::new();
+    let candidate = dispatch_candidate(&fixture);
     let context = OracleCallContext::empty();
-    let arena = call_binding_arena(&fixture, &context, 4);
+    let arena = call_binding_arena(&fixture, &context, 10);
     let argument = argument_binding(
         &fixture,
         arena.handle(OracleRelationId::new(0)).unwrap(),
+        arena.handle(OracleRelationId::new(1)).unwrap(),
         fixture.callee.clone(),
     );
-    let normal_return = return_binding(&fixture, arena.handle(OracleRelationId::new(1)).unwrap());
-    let bindings = CallBindings::new(
+    let normal_return = return_binding(&fixture, arena.handle(OracleRelationId::new(2)).unwrap());
+    let bindings = call_bindings(
         fixture.call.clone(),
-        fixture.callee.clone(),
+        &candidate,
         context.clone(),
         vec![argument.clone(), normal_return.clone()],
         CandidateCoverage::Exhaustive,
@@ -1351,9 +2202,9 @@ fn call_bindings_require_complete_unique_candidate_specific_relations() {
     assert_eq!(bindings.bindings().len(), 2);
 
     assert!(matches!(
-        CallBindings::new(
+        call_bindings(
             fixture.call.clone(),
-            fixture.callee.clone(),
+            &candidate,
             context.clone(),
             vec![argument.clone()],
             CandidateCoverage::Exhaustive,
@@ -1363,13 +2214,14 @@ fn call_bindings_require_complete_unique_candidate_specific_relations() {
 
     let duplicate_actual = argument_binding(
         &fixture,
-        arena.handle(OracleRelationId::new(2)).unwrap(),
+        arena.handle(OracleRelationId::new(3)).unwrap(),
+        arena.handle(OracleRelationId::new(4)).unwrap(),
         fixture.callee.clone(),
     );
     assert!(matches!(
-        CallBindings::new(
+        call_bindings(
             fixture.call.clone(),
-            fixture.callee.clone(),
+            &candidate,
             context.clone(),
             vec![argument.clone(), duplicate_actual],
             CandidateCoverage::Open,
@@ -1380,9 +2232,9 @@ fn call_bindings_require_complete_unique_candidate_specific_relations() {
     let duplicate_relation_return =
         return_binding(&fixture, arena.handle(OracleRelationId::new(0)).unwrap());
     assert_eq!(
-        CallBindings::new(
+        call_bindings(
             fixture.call.clone(),
-            fixture.callee.clone(),
+            &candidate,
             context.clone(),
             vec![argument.clone(), duplicate_relation_return],
             CandidateCoverage::Open,
@@ -1392,13 +2244,14 @@ fn call_bindings_require_complete_unique_candidate_specific_relations() {
 
     let cross_callee = argument_binding(
         &fixture,
-        arena.handle(OracleRelationId::new(3)).unwrap(),
+        arena.handle(OracleRelationId::new(5)).unwrap(),
+        arena.handle(OracleRelationId::new(6)).unwrap(),
         fixture.other_callee.clone(),
     );
     assert_eq!(
-        CallBindings::new(
+        call_bindings(
             fixture.call.clone(),
-            fixture.callee.clone(),
+            &candidate,
             context.clone(),
             vec![cross_callee],
             CandidateCoverage::Open,
@@ -1417,20 +2270,20 @@ fn call_bindings_require_complete_unique_candidate_specific_relations() {
         CallPassingMode::InputOutputReference,
         CallPassingMode::OutputReference,
     ] {
-        let by_reference = CallBinding::Argument {
-            relation: arena.handle(OracleRelationId::new(2)).unwrap(),
-            actual_index: 0,
-            formal_ordinal: 0,
-            actual: CallArgumentEndpoint::Location {
+        let by_reference = argument_binding_with_endpoint(
+            &fixture,
+            arena.handle(OracleRelationId::new(7)).unwrap(),
+            arena.handle(OracleRelationId::new(8)).unwrap(),
+            fixture.callee.clone(),
+            CallArgumentEndpoint::Location {
                 value: fixture.value.clone(),
                 location: reference_location.clone(),
             },
-            formal: ProcedurePortHandle::parameter(fixture.callee.clone(), 0).unwrap(),
             mode,
-        };
-        CallBindings::new(
+        );
+        call_bindings(
             fixture.call.clone(),
-            fixture.callee.clone(),
+            &candidate,
             context.clone(),
             vec![by_reference],
             CandidateCoverage::Open,
@@ -1438,21 +2291,21 @@ fn call_bindings_require_complete_unique_candidate_specific_relations() {
         .expect("a caller location supports ref/in-out and out passing modes");
     }
 
-    let invalid_by_value = CallBinding::Argument {
-        relation: arena.handle(OracleRelationId::new(3)).unwrap(),
-        actual_index: 0,
-        formal_ordinal: 0,
-        actual: CallArgumentEndpoint::Location {
+    let invalid_by_value = argument_binding_with_endpoint(
+        &fixture,
+        arena.handle(OracleRelationId::new(7)).unwrap(),
+        arena.handle(OracleRelationId::new(8)).unwrap(),
+        fixture.callee.clone(),
+        CallArgumentEndpoint::Location {
             value: fixture.value.clone(),
             location: reference_location,
         },
-        formal: ProcedurePortHandle::parameter(fixture.callee.clone(), 0).unwrap(),
-        mode: CallPassingMode::Value,
-    };
+        CallPassingMode::Value,
+    );
     assert!(matches!(
-        CallBindings::new(
+        call_bindings(
             fixture.call.clone(),
-            fixture.callee.clone(),
+            &candidate,
             context,
             vec![invalid_by_value],
             CandidateCoverage::Open,
@@ -1464,18 +2317,20 @@ fn call_bindings_require_complete_unique_candidate_specific_relations() {
 #[test]
 fn call_bindings_retain_context_and_reject_cross_arena_or_cross_context_inputs() {
     let fixture = Fixture::new();
+    let candidate = dispatch_candidate(&fixture);
     let context = fixture.context();
-    let first = call_binding_arena(&fixture, &context, 2);
+    let first = call_binding_arena(&fixture, &context, 3);
     let second = call_binding_arena(&fixture, &context, 1);
     let argument = argument_binding(
         &fixture,
         first.handle(OracleRelationId::new(0)).unwrap(),
+        first.handle(OracleRelationId::new(1)).unwrap(),
         fixture.callee.clone(),
     );
-    let normal_return = return_binding(&fixture, first.handle(OracleRelationId::new(1)).unwrap());
-    let bindings = CallBindings::new(
+    let normal_return = return_binding(&fixture, first.handle(OracleRelationId::new(2)).unwrap());
+    let bindings = call_bindings(
         fixture.call.clone(),
-        fixture.callee.clone(),
+        &candidate,
         context.clone(),
         vec![argument.clone(), normal_return],
         CandidateCoverage::Exhaustive,
@@ -1486,9 +2341,9 @@ fn call_bindings_retain_context_and_reject_cross_arena_or_cross_context_inputs()
     let cross_arena_return =
         return_binding(&fixture, second.handle(OracleRelationId::new(0)).unwrap());
     assert_eq!(
-        CallBindings::new(
+        call_bindings(
             fixture.call.clone(),
-            fixture.callee.clone(),
+            &candidate,
             context.clone(),
             vec![argument, cross_arena_return],
             CandidateCoverage::Exhaustive,
@@ -1503,24 +2358,511 @@ fn call_bindings_retain_context_and_reject_cross_arena_or_cross_context_inputs()
         OracleCallContext::empty(),
     )
     .unwrap();
-    let reference_argument = CallBinding::Argument {
-        relation: first.handle(OracleRelationId::new(0)).unwrap(),
-        actual_index: 0,
-        formal_ordinal: 0,
-        actual: CallArgumentEndpoint::Location {
+    let reference_argument = argument_binding_with_endpoint(
+        &fixture,
+        first.handle(OracleRelationId::new(0)).unwrap(),
+        first.handle(OracleRelationId::new(1)).unwrap(),
+        fixture.callee.clone(),
+        CallArgumentEndpoint::Location {
             value: fixture.value.clone(),
             location: wrong_context_location,
         },
-        formal: ProcedurePortHandle::parameter(fixture.callee.clone(), 0).unwrap(),
-        mode: CallPassingMode::SharedReference,
-    };
+        CallPassingMode::SharedReference,
+    );
     assert!(matches!(
-        CallBindings::new(
+        call_bindings(
             fixture.call.clone(),
-            fixture.callee.clone(),
+            &candidate,
             context,
             vec![reference_argument],
             CandidateCoverage::Open,
+        ),
+        Err(OracleContractError::InvalidCallBinding(_))
+    ));
+}
+
+#[test]
+fn call_bindings_require_the_exact_validated_dispatch_candidate() {
+    let fixture = Fixture::new();
+    let context = OracleCallContext::empty();
+    let candidates = dispatch_candidates(
+        &fixture,
+        [fixture.callee.clone(), fixture.other_callee.clone()],
+    );
+    let arena = call_binding_arena(&fixture, &context, 2);
+    let argument = argument_binding(
+        &fixture,
+        arena.handle(OracleRelationId::new(0)).unwrap(),
+        arena.handle(OracleRelationId::new(1)).unwrap(),
+        fixture.callee.clone(),
+    );
+    assert_eq!(
+        call_bindings(
+            fixture.call.clone(),
+            &candidates[1],
+            context.clone(),
+            vec![argument.clone()],
+            CandidateCoverage::Open,
+        ),
+        Err(OracleContractError::InvalidRelationIdentity)
+    );
+
+    let draft = dispatch_candidate_draft(
+        fixture.callee.clone(),
+        ProofStatus::Proven,
+        EvidenceCompleteness::Complete,
+        candidates[0].provenance().iter().cloned(),
+    );
+    assert_eq!(
+        call_bindings(
+            fixture.call.clone(),
+            &draft,
+            context,
+            vec![argument],
+            CandidateCoverage::Open,
+        ),
+        Err(OracleContractError::InvalidRelationIdentity)
+    );
+}
+
+#[test]
+fn call_argument_groups_distinguish_rest_formals_from_single_formals() {
+    let context = OracleCallContext::empty();
+    let rest = BindingFixture::new(
+        vec![
+            CallArgumentExpansion::Direct(ArgumentDomain::Positional),
+            CallArgumentExpansion::Direct(ArgumentDomain::Positional),
+        ],
+        vec![FormalMultiplicity::Rest(ArgumentDomain::Positional)],
+    );
+    let rest_candidate = rest.candidate();
+    let rest_arena = rest.binding_arena(&context, 4);
+    let rest_group = binding_argument_group(
+        &rest,
+        &rest_arena,
+        0,
+        [0, 1],
+        [
+            (0, CallArgumentMember::Whole, 0, 1),
+            (1, CallArgumentMember::Whole, 0, 2),
+        ],
+        CandidateCoverage::Exhaustive,
+    );
+    let CallBinding::ArgumentGroup(group) = &rest_group else {
+        unreachable!()
+    };
+    assert_eq!(group.cardinality(), ArgumentCardinality::Exact(2));
+    call_bindings(
+        rest.call.clone(),
+        &rest_candidate,
+        context.clone(),
+        vec![
+            rest_group,
+            rest.return_binding(rest_arena.handle(OracleRelationId::new(3)).unwrap()),
+        ],
+        CandidateCoverage::Exhaustive,
+    )
+    .expect("two direct actuals may map to one IR-declared rest formal");
+
+    let single = BindingFixture::new(
+        vec![
+            CallArgumentExpansion::Direct(ArgumentDomain::Positional),
+            CallArgumentExpansion::Direct(ArgumentDomain::Positional),
+        ],
+        vec![FormalMultiplicity::One],
+    );
+    let single_candidate = single.candidate();
+    let single_arena = single.binding_arena(&context, 3);
+    let duplicate_single = binding_argument_group(
+        &single,
+        &single_arena,
+        0,
+        [0, 1],
+        [
+            (0, CallArgumentMember::Whole, 0, 1),
+            (1, CallArgumentMember::Whole, 0, 2),
+        ],
+        CandidateCoverage::Exhaustive,
+    );
+    assert!(matches!(
+        call_bindings(
+            single.call.clone(),
+            &single_candidate,
+            context,
+            vec![duplicate_single],
+            CandidateCoverage::Open,
+        ),
+        Err(OracleContractError::InvalidCallBinding(_))
+    ));
+}
+
+#[test]
+fn exact_spread_groups_map_structured_members_and_derive_exact_cardinality() {
+    let fixture = BindingFixture::new(
+        vec![CallArgumentExpansion::Spread(ArgumentDomain::Positional)],
+        vec![FormalMultiplicity::One, FormalMultiplicity::One],
+    );
+    let context = OracleCallContext::empty();
+    let candidate = fixture.candidate();
+    let arena = fixture.binding_arena(&context, 4);
+    let argument_group = binding_argument_group(
+        &fixture,
+        &arena,
+        0,
+        [0],
+        [
+            (0, CallArgumentMember::Positional(0), 0, 1),
+            (0, CallArgumentMember::Positional(1), 1, 2),
+        ],
+        CandidateCoverage::Exhaustive,
+    );
+    let CallBinding::ArgumentGroup(group) = &argument_group else {
+        unreachable!()
+    };
+    assert_eq!(group.cardinality(), ArgumentCardinality::Exact(2));
+    call_bindings(
+        fixture.call.clone(),
+        &candidate,
+        context,
+        vec![
+            argument_group,
+            fixture.return_binding(arena.handle(OracleRelationId::new(3)).unwrap()),
+        ],
+        CandidateCoverage::Exhaustive,
+    )
+    .expect("an exact spread may map distinct structured members to fixed formals");
+}
+
+#[test]
+fn argument_cardinality_counts_only_proven_mappings_across_coverage() {
+    let fixture = BindingFixture::new(
+        vec![CallArgumentExpansion::Spread(ArgumentDomain::Positional)],
+        vec![FormalMultiplicity::Rest(ArgumentDomain::Positional)],
+    );
+    let context = OracleCallContext::empty();
+    let candidate = fixture.candidate();
+    let limits = OracleLimits::default();
+    let arena = OracleRelationArena::new(
+        OracleRelationOwner::CallBinding {
+            call: fixture.call.clone(),
+            callee: fixture.callee.clone(),
+            context: context.clone(),
+        },
+        vec![
+            OracleRelationRecord::new(
+                OracleRelationKind::CallBinding,
+                [fixture.evidence()],
+                limits,
+            )
+            .unwrap(),
+            OracleRelationRecord::new(
+                OracleRelationKind::CallBinding,
+                [fixture.evidence()],
+                limits,
+            )
+            .unwrap(),
+            OracleRelationRecord::new(
+                OracleRelationKind::CallBinding,
+                [fixture.evidence_with_quality(UNPROVEN_EVIDENCE)],
+                limits,
+            )
+            .unwrap(),
+            OracleRelationRecord::new(
+                OracleRelationKind::CallBinding,
+                [fixture.evidence()],
+                limits,
+            )
+            .unwrap(),
+        ],
+        limits,
+    )
+    .unwrap();
+    let argument_group = |coverage| {
+        let mapping = |member, proof, relation_id| {
+            oracle_candidate(
+                CallArgumentMapping::new(
+                    0,
+                    member,
+                    CallArgumentEndpoint::Value(fixture.arguments[0].clone()),
+                    ProcedurePortHandle::parameter(fixture.callee.clone(), 0).unwrap(),
+                    CallPassingMode::Value,
+                ),
+                proof,
+                EvidenceCompleteness::Complete,
+                [arena.handle(OracleRelationId::new(relation_id)).unwrap()],
+            )
+        };
+        CallBinding::ArgumentGroup(
+            CallArgumentGroup::new(
+                &fixture.call,
+                arena.handle(OracleRelationId::new(0)).unwrap(),
+                [0],
+                [
+                    mapping(CallArgumentMember::Positional(0), ProofStatus::Proven, 1),
+                    mapping(
+                        CallArgumentMember::Positional(1),
+                        ProofStatus::Unproven("second spread member remains possible".into()),
+                        2,
+                    ),
+                ],
+                coverage,
+                OracleLimits::default(),
+            )
+            .unwrap(),
+        )
+    };
+
+    let exhaustive = argument_group(CandidateCoverage::Exhaustive);
+    let CallBinding::ArgumentGroup(group) = &exhaustive else {
+        unreachable!()
+    };
+    assert_eq!(
+        group.cardinality(),
+        ArgumentCardinality::Between {
+            minimum: 1,
+            maximum: 2,
+        }
+    );
+    call_bindings(
+        fixture.call.clone(),
+        &candidate,
+        context.clone(),
+        vec![
+            exhaustive,
+            fixture.return_binding(arena.handle(OracleRelationId::new(3)).unwrap()),
+        ],
+        CandidateCoverage::Exhaustive,
+    )
+    .expect("closed bindings retain an upper bound for unproven mapping candidates");
+
+    let open = argument_group(CandidateCoverage::Open);
+    let CallBinding::ArgumentGroup(group) = &open else {
+        unreachable!()
+    };
+    assert_eq!(group.cardinality(), ArgumentCardinality::AtLeast(1));
+    call_bindings(
+        fixture.call.clone(),
+        &candidate,
+        context,
+        vec![
+            open,
+            fixture.return_binding(arena.handle(OracleRelationId::new(3)).unwrap()),
+        ],
+        CandidateCoverage::Open,
+    )
+    .expect("open bindings expose only the proven mapping lower bound");
+}
+
+#[test]
+fn open_and_truncated_spreads_bound_cardinality_and_top_level_coverage() {
+    let context = OracleCallContext::empty();
+    let open = BindingFixture::new(
+        vec![CallArgumentExpansion::Spread(ArgumentDomain::Positional)],
+        Vec::new(),
+    );
+    let open_candidate = open.candidate();
+    let open_arena = open.binding_arena(&context, 2);
+    let open_group = binding_argument_group(
+        &open,
+        &open_arena,
+        0,
+        [0],
+        std::iter::empty(),
+        CandidateCoverage::Open,
+    );
+    let CallBinding::ArgumentGroup(group) = &open_group else {
+        unreachable!()
+    };
+    assert_eq!(group.cardinality(), ArgumentCardinality::AtLeast(0));
+    let open_return = open.return_binding(open_arena.handle(OracleRelationId::new(1)).unwrap());
+    call_bindings(
+        open.call.clone(),
+        &open_candidate,
+        context.clone(),
+        vec![open_group.clone(), open_return.clone()],
+        CandidateCoverage::Open,
+    )
+    .expect("an unknown empty spread remains explicitly open");
+    assert!(matches!(
+        call_bindings(
+            open.call.clone(),
+            &open_candidate,
+            context.clone(),
+            vec![open_group, open_return],
+            CandidateCoverage::Exhaustive,
+        ),
+        Err(OracleContractError::InvalidCallBinding(_))
+    ));
+
+    let truncated = BindingFixture::new(
+        vec![CallArgumentExpansion::Spread(ArgumentDomain::Positional)],
+        vec![FormalMultiplicity::Rest(ArgumentDomain::Positional)],
+    );
+    let truncated_candidate = truncated.candidate();
+    let truncated_arena = truncated.binding_arena(&context, 3);
+    let truncated_group = binding_argument_group(
+        &truncated,
+        &truncated_arena,
+        0,
+        [0],
+        [(0, CallArgumentMember::Positional(0), 0, 1)],
+        CandidateCoverage::Truncated,
+    );
+    let CallBinding::ArgumentGroup(group) = &truncated_group else {
+        unreachable!()
+    };
+    assert_eq!(group.cardinality(), ArgumentCardinality::AtLeast(1));
+    let truncated_return =
+        truncated.return_binding(truncated_arena.handle(OracleRelationId::new(2)).unwrap());
+    call_bindings(
+        truncated.call.clone(),
+        &truncated_candidate,
+        context.clone(),
+        vec![truncated_group.clone(), truncated_return.clone()],
+        CandidateCoverage::Truncated,
+    )
+    .expect("a retained spread prefix remains explicitly truncated");
+    assert!(matches!(
+        call_bindings(
+            truncated.call.clone(),
+            &truncated_candidate,
+            context,
+            vec![truncated_group, truncated_return],
+            CandidateCoverage::Open,
+        ),
+        Err(OracleContractError::InvalidCallBinding(_))
+    ));
+}
+
+#[test]
+fn exact_empty_spread_requires_a_proven_complete_closure_witness() {
+    let fixture = BindingFixture::new(
+        vec![CallArgumentExpansion::Spread(ArgumentDomain::Positional)],
+        Vec::new(),
+    );
+    let context = OracleCallContext::empty();
+    let candidate = fixture.candidate();
+    let owner = OracleRelationOwner::CallBinding {
+        call: fixture.call.clone(),
+        callee: fixture.callee.clone(),
+        context: context.clone(),
+    };
+    let limits = OracleLimits::default();
+    let arena = OracleRelationArena::new(
+        owner,
+        vec![
+            OracleRelationRecord::new(
+                OracleRelationKind::CallBinding,
+                [fixture.evidence_with_quality(UNPROVEN_EVIDENCE)],
+                limits,
+            )
+            .unwrap(),
+            OracleRelationRecord::new(
+                OracleRelationKind::CallBinding,
+                [fixture.evidence()],
+                limits,
+            )
+            .unwrap(),
+        ],
+        limits,
+    )
+    .unwrap();
+    let group = binding_argument_group(
+        &fixture,
+        &arena,
+        0,
+        [0],
+        std::iter::empty(),
+        CandidateCoverage::Exhaustive,
+    );
+    assert!(matches!(
+        call_bindings(
+            fixture.call.clone(),
+            &candidate,
+            context,
+            vec![
+                group,
+                fixture.return_binding(arena.handle(OracleRelationId::new(1)).unwrap()),
+            ],
+            CandidateCoverage::Exhaustive,
+        ),
+        Err(OracleContractError::InvalidRelationQuality)
+    ));
+
+    let proven_arena = fixture.binding_arena(&OracleCallContext::empty(), 2);
+    let exact_empty = binding_argument_group(
+        &fixture,
+        &proven_arena,
+        0,
+        [0],
+        std::iter::empty(),
+        CandidateCoverage::Exhaustive,
+    );
+    let CallBinding::ArgumentGroup(group) = &exact_empty else {
+        unreachable!()
+    };
+    assert_eq!(group.cardinality(), ArgumentCardinality::Exact(0));
+    call_bindings(
+        fixture.call.clone(),
+        &candidate,
+        OracleCallContext::empty(),
+        vec![
+            exact_empty,
+            fixture.return_binding(proven_arena.handle(OracleRelationId::new(1)).unwrap()),
+        ],
+        CandidateCoverage::Exhaustive,
+    )
+    .expect("a proven closure witness can establish an exact empty spread");
+}
+
+#[test]
+fn spread_groups_reject_domain_mismatches_and_duplicate_members() {
+    let fixture = BindingFixture::new(
+        vec![CallArgumentExpansion::Spread(ArgumentDomain::Positional)],
+        vec![FormalMultiplicity::Rest(ArgumentDomain::Keyword)],
+    );
+    let context = OracleCallContext::empty();
+    let candidate = fixture.candidate();
+    let arena = fixture.binding_arena(&context, 3);
+    let mismatched = binding_argument_group(
+        &fixture,
+        &arena,
+        0,
+        [0],
+        [(0, CallArgumentMember::Positional(0), 0, 1)],
+        CandidateCoverage::Exhaustive,
+    );
+    assert!(matches!(
+        call_bindings(
+            fixture.call.clone(),
+            &candidate,
+            context,
+            vec![mismatched],
+            CandidateCoverage::Open,
+        ),
+        Err(OracleContractError::InvalidCallBinding(_))
+    ));
+
+    let mapping = || {
+        CallArgumentMapping::new(
+            0,
+            CallArgumentMember::Positional(0),
+            CallArgumentEndpoint::Value(fixture.arguments[0].clone()),
+            ProcedurePortHandle::parameter(fixture.callee.clone(), 0).unwrap(),
+            CallPassingMode::Value,
+        )
+    };
+    assert!(matches!(
+        CallArgumentGroup::new(
+            &fixture.call,
+            arena.handle(OracleRelationId::new(0)).unwrap(),
+            [0],
+            [
+                proven_candidate(mapping(), [arena.handle(OracleRelationId::new(1)).unwrap()],),
+                proven_candidate(mapping(), [arena.handle(OracleRelationId::new(2)).unwrap()],),
+            ],
+            CandidateCoverage::Open,
+            OracleLimits::default(),
         ),
         Err(OracleContractError::InvalidCallBinding(_))
     ));
@@ -2049,5 +3391,564 @@ fn strong_update_rejects_incomplete_alias_and_escape_proofs() {
     assert_weak(
         UpdateEligibility::evaluate(store, missing_provenance),
         WeakUpdateReason::MissingProvenance,
+    );
+}
+
+fn assert_limit_exceeded<T: std::fmt::Debug>(
+    result: Result<T, OracleContractError>,
+    expected_dimension: &'static str,
+    expected_limit: usize,
+    expected_attempted: usize,
+) {
+    match result {
+        Err(OracleContractError::LimitExceeded {
+            dimension,
+            limit,
+            attempted,
+        }) => {
+            assert_eq!(dimension, expected_dimension);
+            assert_eq!(limit, expected_limit);
+            assert_eq!(attempted, expected_attempted);
+        }
+        other => panic!("expected {expected_dimension} limit failure, got {other:?}"),
+    }
+}
+
+#[test]
+fn candidate_provenance_is_bounded_before_collection_and_rejects_duplicates() {
+    let fixture = Fixture::new();
+    let query = fixture.value_at_point();
+    let arena = relation_arena(
+        OracleRelationOwner::PointsTo(Box::new(query)),
+        [OracleRelationKind::PointsTo],
+        &fixture.evidence(),
+    );
+    let relation = arena.handle(OracleRelationId::new(0)).unwrap();
+    let limits = OracleLimits::new(OracleLimitValues {
+        provenance_records: 1,
+        ..OracleLimitValues::uniform(4)
+    })
+    .unwrap();
+
+    let generic_pulls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_pulls = Arc::clone(&generic_pulls);
+    let repeated_relation = relation.clone();
+    let unbounded = std::iter::from_fn(move || {
+        observed_pulls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(repeated_relation.clone())
+    });
+    assert_limit_exceeded(
+        OracleCandidate::new(
+            (),
+            ProofStatus::Proven,
+            EvidenceCompleteness::Complete,
+            unbounded,
+            limits,
+        ),
+        "provenance_records",
+        1,
+        2,
+    );
+    assert_eq!(generic_pulls.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+    let duplicate_limits = OracleLimits::uniform(2).unwrap();
+    assert_eq!(
+        OracleCandidate::proven((), [relation.clone(), relation.clone()], duplicate_limits,),
+        Err(OracleContractError::InvalidRelationIdentity)
+    );
+
+    let dispatch_pulls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_pulls = Arc::clone(&dispatch_pulls);
+    let repeated_relation = relation.clone();
+    let unbounded = std::iter::from_fn(move || {
+        observed_pulls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(repeated_relation.clone())
+    });
+    assert_limit_exceeded(
+        DispatchCandidate::new(
+            fixture.callee.clone(),
+            ProofStatus::Proven,
+            EvidenceCompleteness::Complete,
+            unbounded,
+            limits,
+        ),
+        "provenance_records",
+        1,
+        2,
+    );
+    assert_eq!(dispatch_pulls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert_eq!(
+        DispatchCandidate::new(
+            fixture.callee,
+            ProofStatus::Proven,
+            EvidenceCompleteness::Complete,
+            [relation.clone(), relation],
+            duplicate_limits,
+        ),
+        Err(OracleContractError::InvalidRelationIdentity)
+    );
+}
+
+#[test]
+fn argument_groups_bound_exact_sources_and_mappings_before_collection() {
+    let fixture = BindingFixture::new(
+        vec![CallArgumentExpansion::Direct(ArgumentDomain::Positional)],
+        vec![FormalMultiplicity::One],
+    );
+    let context = OracleCallContext::empty();
+    let arena = fixture.binding_arena(&context, 2);
+    let closure = arena.handle(OracleRelationId::new(0)).unwrap();
+
+    let source_pulls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_pulls = Arc::clone(&source_pulls);
+    let unbounded_sources = std::iter::from_fn(move || {
+        observed_pulls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(0)
+    });
+    assert!(matches!(
+        CallArgumentGroup::new(
+            &fixture.call,
+            closure.clone(),
+            unbounded_sources,
+            std::iter::empty(),
+            CandidateCoverage::Open,
+            OracleLimits::uniform(8).unwrap(),
+        ),
+        Err(OracleContractError::InvalidCallBinding(_))
+    ));
+    assert_eq!(source_pulls.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+    let mapping = proven_candidate(
+        CallArgumentMapping::new(
+            0,
+            CallArgumentMember::Whole,
+            CallArgumentEndpoint::Value(fixture.arguments[0].clone()),
+            ProcedurePortHandle::parameter(fixture.callee.clone(), 0).unwrap(),
+            CallPassingMode::Value,
+        ),
+        [arena.handle(OracleRelationId::new(1)).unwrap()],
+    );
+    let mapping_pulls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_pulls = Arc::clone(&mapping_pulls);
+    let unbounded_mappings = std::iter::from_fn(move || {
+        observed_pulls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(mapping.clone())
+    });
+    let limits = OracleLimits::new(OracleLimitValues {
+        call_binding_entries: 2,
+        ..OracleLimitValues::uniform(8)
+    })
+    .unwrap();
+    assert_limit_exceeded(
+        CallArgumentGroup::new(
+            &fixture.call,
+            closure,
+            [0],
+            unbounded_mappings,
+            CandidateCoverage::Open,
+            limits,
+        ),
+        "call_binding_entries",
+        2,
+        3,
+    );
+    assert_eq!(mapping_pulls.load(std::sync::atomic::Ordering::Relaxed), 2);
+}
+
+#[test]
+fn call_bindings_enforce_the_aggregate_group_entry_budget() {
+    let fixture = BindingFixture::new(
+        vec![CallArgumentExpansion::Direct(ArgumentDomain::Positional)],
+        vec![FormalMultiplicity::One],
+    );
+    let context = OracleCallContext::empty();
+    let candidate = fixture.candidate();
+    let arena = fixture.binding_arena(&context, 2);
+    let group = binding_argument_group(
+        &fixture,
+        &arena,
+        0,
+        [0],
+        [(0, CallArgumentMember::Whole, 0, 1)],
+        CandidateCoverage::Open,
+    );
+    let limits = OracleLimits::new(OracleLimitValues {
+        call_binding_entries: 2,
+        ..OracleLimitValues::uniform(8)
+    })
+    .unwrap();
+
+    assert_limit_exceeded(
+        CallBindings::new(
+            fixture.call,
+            &candidate,
+            context,
+            [group],
+            CandidateCoverage::Open,
+            limits,
+        ),
+        "call_binding_entries",
+        2,
+        3,
+    );
+}
+
+#[test]
+fn strong_update_evidence_revalidates_typed_location_and_object_breadth() {
+    let fixture = Fixture::new();
+    let store = fixture.lexical_store(AccessPathTail::Exact);
+    let object = fixture.lexical_object(ObjectCardinality::Singleton);
+    let location =
+        AbstractLocation::new(object.clone(), fixture.lexical_path(AccessPathTail::Exact)).unwrap();
+    let base = strong_evidence(&fixture, &store, &object, &location);
+
+    let location_candidate = base.locations().candidates()[0].clone();
+    let broad_locations = OracleSet::bounded_locations(
+        [location_candidate.clone(), location_candidate],
+        CandidateCoverage::Exhaustive,
+        OracleLimits::default(),
+    );
+    let location_limits = OracleLimits::new(OracleLimitValues {
+        alias_breadth: 1,
+        ..OracleLimitValues::uniform(8)
+    })
+    .unwrap();
+    assert_limit_exceeded(
+        StrongUpdateEvidence::new(
+            broad_locations,
+            base.objects().clone(),
+            base.alias_exclusivity().clone(),
+            base.escape().clone(),
+            location_limits,
+        ),
+        "alias_breadth",
+        1,
+        2,
+    );
+
+    let object_candidate = base.objects().candidates()[0].clone();
+    let broad_objects = OracleSet::bounded_objects(
+        [object_candidate.clone(), object_candidate],
+        CandidateCoverage::Exhaustive,
+        OracleLimits::default(),
+    );
+    let object_limits = OracleLimits::new(OracleLimitValues {
+        objects_per_value: 1,
+        ..OracleLimitValues::uniform(8)
+    })
+    .unwrap();
+    assert_limit_exceeded(
+        StrongUpdateEvidence::new(
+            base.locations().clone(),
+            broad_objects,
+            base.alias_exclusivity().clone(),
+            base.escape().clone(),
+            object_limits,
+        ),
+        "objects_per_value",
+        1,
+        2,
+    );
+}
+
+#[test]
+fn every_non_dispatch_result_revalidates_whole_retained_arenas() {
+    let fixture = Fixture::new();
+    let limits = OracleLimits::new(OracleLimitValues {
+        provenance_records: 1,
+        ..OracleLimitValues::uniform(8)
+    })
+    .unwrap();
+
+    let value_query = fixture.value_at_point();
+    let object = fixture.lexical_object(ObjectCardinality::Singleton);
+    let points_to_arena = relation_arena(
+        OracleRelationOwner::PointsTo(Box::new(value_query.clone())),
+        [OracleRelationKind::PointsTo, OracleRelationKind::PointsTo],
+        &fixture.evidence(),
+    );
+    assert_limit_exceeded(
+        PointsToResult::new(
+            value_query,
+            [proven_candidate(
+                object.clone(),
+                [points_to_arena.handle(OracleRelationId::new(0)).unwrap()],
+            )],
+            CandidateCoverage::Exhaustive,
+            limits,
+        ),
+        "provenance_records",
+        1,
+        2,
+    );
+
+    let access_query = AccessPathAtPoint::new(
+        fixture.lexical_path(AccessPathTail::Exact),
+        fixture.point.clone(),
+        ObservationPhase::BeforeEffects,
+        OracleCallContext::empty(),
+    )
+    .unwrap();
+    let location =
+        AbstractLocation::new(object.clone(), fixture.lexical_path(AccessPathTail::Exact)).unwrap();
+    let location_arena = relation_arena(
+        OracleRelationOwner::Locations(Box::new(access_query.clone())),
+        [OracleRelationKind::Location, OracleRelationKind::Location],
+        &fixture.evidence(),
+    );
+    assert_limit_exceeded(
+        LocationResult::new(
+            access_query.clone(),
+            [proven_candidate(
+                location.clone(),
+                [location_arena.handle(OracleRelationId::new(0)).unwrap()],
+            )],
+            CandidateCoverage::Exhaustive,
+            limits,
+        ),
+        "provenance_records",
+        1,
+        2,
+    );
+
+    let context = OracleCallContext::empty();
+    let value_flow_arena = relation_arena(
+        OracleRelationOwner::ProcedureValueFlow {
+            procedure: fixture.caller.clone(),
+            context: context.clone(),
+        },
+        [OracleRelationKind::ValueFlow, OracleRelationKind::ValueFlow],
+        &fixture.evidence(),
+    );
+    let relation = ValueFlowRelation {
+        id: value_flow_arena.handle(OracleRelationId::new(0)).unwrap(),
+        kind: ValueFlowRelationKind::Assignment,
+        source: ValueFlowEndpoint::Value(fixture.value.clone()),
+        target: ValueFlowEndpoint::Value(fixture.result.clone()),
+        proof: ProofStatus::Proven,
+        completeness: EvidenceCompleteness::Complete,
+    };
+    assert_limit_exceeded(
+        ValueFlowSnapshot::new(
+            fixture.caller.clone(),
+            context.clone(),
+            vec![relation],
+            CandidateCoverage::Exhaustive,
+            limits,
+        ),
+        "provenance_records",
+        1,
+        2,
+    );
+
+    let alias_query = AliasQuery::new(access_query.clone(), access_query).unwrap();
+    let alias_arena = relation_arena(
+        OracleRelationOwner::Alias(Box::new(alias_query.clone())),
+        [OracleRelationKind::Alias, OracleRelationKind::Alias],
+        &fixture.evidence(),
+    );
+    assert_limit_exceeded(
+        AliasResult::new(
+            alias_query,
+            proven_candidate(
+                AliasRelation::MustAlias,
+                [alias_arena.handle(OracleRelationId::new(0)).unwrap()],
+            ),
+            limits,
+        ),
+        "provenance_records",
+        1,
+        2,
+    );
+
+    let candidate = dispatch_candidate(&fixture);
+    let binding_arena = call_binding_arena(&fixture, &context, 1);
+    assert_limit_exceeded(
+        CallBindings::new(
+            fixture.call.clone(),
+            &candidate,
+            context,
+            [return_binding(
+                &fixture,
+                binding_arena.handle(OracleRelationId::new(0)).unwrap(),
+            )],
+            CandidateCoverage::Open,
+            limits,
+        ),
+        "provenance_records",
+        1,
+        2,
+    );
+
+    let store = fixture.lexical_store(AccessPathTail::Exact);
+    let strong = strong_evidence(&fixture, &store, &object, &location);
+    assert_limit_exceeded(
+        StrongUpdateEvidence::new(
+            strong.locations().clone(),
+            strong.objects().clone(),
+            strong.alias_exclusivity().clone(),
+            strong.escape().clone(),
+            limits,
+        ),
+        "provenance_records",
+        1,
+        4,
+    );
+}
+
+#[test]
+fn every_non_dispatch_result_revalidates_aggregate_retained_evidence() {
+    let fixture = Fixture::new();
+    let limits = OracleLimits::new(OracleLimitValues {
+        evidence_handles: 1,
+        ..OracleLimitValues::uniform(8)
+    })
+    .unwrap();
+    let evidence = fixture.evidence();
+    let arena_with_two_evidence = |owner, kind| {
+        OracleRelationArena::new(
+            owner,
+            vec![
+                OracleRelationRecord::new(
+                    kind,
+                    [evidence.clone(), evidence.clone()],
+                    OracleLimits::default(),
+                )
+                .unwrap(),
+            ],
+            OracleLimits::default(),
+        )
+        .unwrap()
+    };
+
+    let value_query = fixture.value_at_point();
+    let object = fixture.lexical_object(ObjectCardinality::Singleton);
+    let points_to_arena = arena_with_two_evidence(
+        OracleRelationOwner::PointsTo(Box::new(value_query.clone())),
+        OracleRelationKind::PointsTo,
+    );
+    assert_limit_exceeded(
+        PointsToResult::new(
+            value_query,
+            [proven_candidate(
+                object.clone(),
+                [points_to_arena.handle(OracleRelationId::new(0)).unwrap()],
+            )],
+            CandidateCoverage::Exhaustive,
+            limits,
+        ),
+        "evidence_handles",
+        1,
+        2,
+    );
+
+    let access_query = AccessPathAtPoint::new(
+        fixture.lexical_path(AccessPathTail::Exact),
+        fixture.point.clone(),
+        ObservationPhase::BeforeEffects,
+        OracleCallContext::empty(),
+    )
+    .unwrap();
+    let location =
+        AbstractLocation::new(object.clone(), fixture.lexical_path(AccessPathTail::Exact)).unwrap();
+    let location_arena = arena_with_two_evidence(
+        OracleRelationOwner::Locations(Box::new(access_query.clone())),
+        OracleRelationKind::Location,
+    );
+    assert_limit_exceeded(
+        LocationResult::new(
+            access_query.clone(),
+            [proven_candidate(
+                location.clone(),
+                [location_arena.handle(OracleRelationId::new(0)).unwrap()],
+            )],
+            CandidateCoverage::Exhaustive,
+            limits,
+        ),
+        "evidence_handles",
+        1,
+        2,
+    );
+
+    let context = OracleCallContext::empty();
+    let value_flow_arena = arena_with_two_evidence(
+        OracleRelationOwner::ProcedureValueFlow {
+            procedure: fixture.caller.clone(),
+            context: context.clone(),
+        },
+        OracleRelationKind::ValueFlow,
+    );
+    let relation = ValueFlowRelation {
+        id: value_flow_arena.handle(OracleRelationId::new(0)).unwrap(),
+        kind: ValueFlowRelationKind::Assignment,
+        source: ValueFlowEndpoint::Value(fixture.value.clone()),
+        target: ValueFlowEndpoint::Value(fixture.result.clone()),
+        proof: ProofStatus::Proven,
+        completeness: EvidenceCompleteness::Complete,
+    };
+    assert_limit_exceeded(
+        ValueFlowSnapshot::new(
+            fixture.caller.clone(),
+            context.clone(),
+            vec![relation],
+            CandidateCoverage::Exhaustive,
+            limits,
+        ),
+        "evidence_handles",
+        1,
+        2,
+    );
+
+    let alias_query = AliasQuery::new(access_query.clone(), access_query).unwrap();
+    let alias_arena = arena_with_two_evidence(
+        OracleRelationOwner::Alias(Box::new(alias_query.clone())),
+        OracleRelationKind::Alias,
+    );
+    assert_limit_exceeded(
+        AliasResult::new(
+            alias_query,
+            proven_candidate(
+                AliasRelation::MustAlias,
+                [alias_arena.handle(OracleRelationId::new(0)).unwrap()],
+            ),
+            limits,
+        ),
+        "evidence_handles",
+        1,
+        2,
+    );
+
+    let candidate = dispatch_candidate(&fixture);
+    let binding_arena = call_binding_arena(&fixture, &context, 1);
+    assert_limit_exceeded(
+        CallBindings::new(
+            fixture.call.clone(),
+            &candidate,
+            context,
+            [return_binding(
+                &fixture,
+                binding_arena.handle(OracleRelationId::new(0)).unwrap(),
+            )],
+            CandidateCoverage::Open,
+            limits,
+        ),
+        "evidence_handles",
+        1,
+        2,
+    );
+
+    let store = fixture.lexical_store(AccessPathTail::Exact);
+    let strong = strong_evidence(&fixture, &store, &object, &location);
+    assert_limit_exceeded(
+        StrongUpdateEvidence::new(
+            strong.locations().clone(),
+            strong.objects().clone(),
+            strong.alias_exclusivity().clone(),
+            strong.escape().clone(),
+            limits,
+        ),
+        "evidence_handles",
+        1,
+        4,
     );
 }

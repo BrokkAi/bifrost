@@ -18,10 +18,10 @@ use super::{
     DeferredInvocationKind, DispatchBoundary, DispatchBoundaryKind, DispatchOracle, DispatchResult,
     EvidenceCompleteness, EvidenceHandle, OracleLimits, OracleRelationArena, OracleRelationHandle,
     OracleRelationId, OracleRelationKind, OracleRelationOwner, OracleRelationRecord,
-    ProcedureHandle, ProcedureInvocationKind, ProgramPointHandle, ProgramPointId, ProofStatus,
-    SemanticBudgetExceeded, SemanticCallSite, SemanticCapability, SemanticGap, SemanticGapImpact,
-    SemanticGapKind, SemanticGapSubject, SemanticOutcome, SemanticProviderError, SemanticRequest,
-    SemanticWork,
+    OracleRelationSubject, ProcedureHandle, ProcedureInvocationKind, ProgramPointHandle,
+    ProgramPointId, ProofStatus, SemanticBudgetExceeded, SemanticCallSite, SemanticCapability,
+    SemanticGap, SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticOutcome,
+    SemanticProviderError, SemanticRequest, SemanticWork,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -776,18 +776,20 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                     let added_reason_bytes = completeness_reason_bytes(&completeness)
                         .saturating_sub(previous_reason_bytes);
                     let target = candidate.target.semantics().locator().clone();
+                    let boundary_kind = DispatchBoundaryKind::Deferred {
+                        target: target.clone(),
+                        kind: deferred_invocation_kind(properties),
+                    };
                     let (provenance, provenance_work) = deferred_boundary_provenance(
                         &origin,
+                        &boundary_kind,
                         &candidate.provenance,
                         *self.oracle.limits(),
                     )?;
                     boundaries.push(CallBoundary {
                         origin: origin.clone(),
                         dispatch: DispatchBoundary {
-                            kind: DispatchBoundaryKind::Deferred {
-                                target: target.clone(),
-                                kind: deferred_invocation_kind(properties),
-                            },
+                            kind: boundary_kind,
                             proof: candidate.proof,
                             completeness,
                             provenance,
@@ -852,18 +854,25 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
             .map_or(SemanticWork::default(), |(_, work)| *work);
         let original_work = mapped.work();
         let total_work = sum_semantic_work(original_work, additional_work);
-        if let Err(exceeded) = staged_budget.charge(additional_work) {
-            return Ok(SemanticOutcome::ExceededBudget {
-                partial: None,
-                exceeded,
-                work: total_work,
-            });
+        if let Some(outcome) = charge_call_transfer_projection(
+            &mapped,
+            &mut staged_budget,
+            additional_work,
+            total_work,
+            request.cancellation,
+        ) {
+            return Ok(outcome);
         }
-        let outcome = weaken_call_transfer_outcome(
+        let mut outcome = weaken_call_transfer_outcome(
             mapped.map(|(transfer_set, _)| transfer_set),
             &call_evaluation_gaps,
             total_work,
         );
+        if request.cancellation.is_cancelled()
+            && !matches!(outcome, SemanticOutcome::Cancelled { .. })
+        {
+            outcome = cancelled_call_transfer_outcome(outcome, total_work);
+        }
         if outcome.available_value().is_some() {
             *request.budget = staged_budget;
         }
@@ -1065,40 +1074,94 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         let work = builder.work;
         let snapshot = builder.freeze()?;
         *request.budget = staged_budget;
-        if let Some(exceeded) = exceeded {
-            return Ok(SemanticOutcome::ExceededBudget {
-                partial: Some(snapshot),
+        Ok(finish_snapshot_outcome(snapshot, quality, exceeded, work))
+    }
+}
+
+fn charge_call_transfer_projection(
+    mapped: &SemanticOutcome<(CallTransferSet, SemanticWork)>,
+    budget: &mut super::SemanticBudget,
+    additional_work: SemanticWork,
+    total_work: SemanticWork,
+    cancellation: &crate::cancellation::CancellationToken,
+) -> Option<SemanticOutcome<CallTransferSet>> {
+    budget.charge(additional_work).err().map(|exceeded| {
+        if matches!(mapped, SemanticOutcome::Cancelled { .. }) || cancellation.is_cancelled() {
+            SemanticOutcome::Cancelled {
+                // The projected payload cannot be published when its atomic
+                // retained-work charge fails, but the operation-level
+                // cancellation still takes precedence over that failure.
+                partial: None,
+                work: total_work,
+            }
+        } else {
+            SemanticOutcome::ExceededBudget {
+                partial: None,
                 exceeded,
-                work,
-            });
+                work: total_work,
+            }
         }
-        match quality {
-            SnapshotQuality::Complete => Ok(SemanticOutcome::Complete {
-                value: snapshot,
-                work,
-            }),
-            SnapshotQuality::Ambiguous => Ok(SemanticOutcome::Ambiguous {
-                candidates: snapshot,
-                work,
-            }),
-            SnapshotQuality::Unproven => Ok(SemanticOutcome::Unproven {
-                partial: snapshot,
-                work,
-            }),
-            SnapshotQuality::Unknown | SnapshotQuality::Truncated => Ok(SemanticOutcome::Unknown {
-                partial: Some(snapshot),
-                work,
-            }),
-            SnapshotQuality::Unsupported(capability) => Ok(SemanticOutcome::Unsupported {
-                capability,
-                partial: Some(snapshot),
-                work,
-            }),
-            SnapshotQuality::Cancelled => Ok(SemanticOutcome::Cancelled {
-                partial: Some(snapshot),
-                work,
-            }),
-        }
+    })
+}
+
+fn cancelled_call_transfer_outcome(
+    outcome: SemanticOutcome<CallTransferSet>,
+    work: SemanticWork,
+) -> SemanticOutcome<CallTransferSet> {
+    let partial = match outcome {
+        SemanticOutcome::Complete { value, .. } => Some(value),
+        SemanticOutcome::Ambiguous { candidates, .. } => Some(candidates),
+        SemanticOutcome::Unproven { partial, .. } => Some(partial),
+        SemanticOutcome::Unknown { partial, .. }
+        | SemanticOutcome::Unsupported { partial, .. }
+        | SemanticOutcome::ExceededBudget { partial, .. }
+        | SemanticOutcome::Cancelled { partial, .. } => partial,
+    };
+    SemanticOutcome::Cancelled { partial, work }
+}
+
+fn finish_snapshot_outcome(
+    snapshot: IcfgSnapshot,
+    quality: SnapshotQuality,
+    exceeded: Option<SemanticBudgetExceeded>,
+    work: SemanticWork,
+) -> SemanticOutcome<IcfgSnapshot> {
+    if quality == SnapshotQuality::Cancelled {
+        return SemanticOutcome::Cancelled {
+            partial: Some(snapshot),
+            work,
+        };
+    }
+    if let Some(exceeded) = exceeded {
+        return SemanticOutcome::ExceededBudget {
+            partial: Some(snapshot),
+            exceeded,
+            work,
+        };
+    }
+    match quality {
+        SnapshotQuality::Complete => SemanticOutcome::Complete {
+            value: snapshot,
+            work,
+        },
+        SnapshotQuality::Ambiguous => SemanticOutcome::Ambiguous {
+            candidates: snapshot,
+            work,
+        },
+        SnapshotQuality::Unproven => SemanticOutcome::Unproven {
+            partial: snapshot,
+            work,
+        },
+        SnapshotQuality::Unknown | SnapshotQuality::Truncated => SemanticOutcome::Unknown {
+            partial: Some(snapshot),
+            work,
+        },
+        SnapshotQuality::Unsupported(capability) => SemanticOutcome::Unsupported {
+            capability,
+            partial: Some(snapshot),
+            work,
+        },
+        SnapshotQuality::Cancelled => unreachable!("cancelled snapshots return above"),
     }
 }
 
@@ -1150,14 +1213,25 @@ fn try_map_semantic_outcome<T, U>(
 
 fn deferred_boundary_provenance(
     origin: &CallSiteHandle,
+    boundary: &DispatchBoundaryKind,
     candidate_provenance: &[OracleRelationHandle],
     limits: OracleLimits,
 ) -> Result<(Box<[OracleRelationHandle]>, SemanticWork), SemanticProviderError> {
+    let DispatchBoundaryKind::Deferred { target, .. } = boundary else {
+        return Err(SemanticProviderError::internal(
+            "deferred boundary provenance requires a deferred boundary identity",
+        ));
+    };
     let expected_owner = OracleRelationOwner::Dispatch(origin.clone());
     let mut evidence = Vec::<EvidenceHandle>::new();
     for relation in candidate_provenance {
         if relation.owner() != &expected_owner
             || relation.record().kind() != OracleRelationKind::DispatchCandidate
+            || !matches!(
+                relation.record().subject(),
+                Some(OracleRelationSubject::DispatchCandidate(candidate))
+                    if candidate.semantics().locator() == target
+            )
         {
             return Err(SemanticProviderError::internal(
                 "deferred transfer candidate has invalid dispatch provenance",
@@ -1175,29 +1249,33 @@ fn deferred_boundary_provenance(
         ));
     }
     let evidence_entries = evidence.len();
-    let arena = OracleRelationArena::new(
-        expected_owner,
-        vec![OracleRelationRecord::new(
-            OracleRelationKind::DispatchBoundary,
-            evidence,
-        )],
-        limits,
-    )
-    .map_err(|error| {
-        SemanticProviderError::internal(format!(
-            "could not project deferred dispatch-boundary provenance: {error}"
-        ))
-    })?;
+    let record = OracleRelationRecord::dispatch_boundary(boundary.clone(), evidence, limits)
+        .map_err(|error| {
+            SemanticProviderError::internal(format!(
+                "could not project deferred dispatch-boundary provenance: {error}"
+            ))
+        })?;
+    let arena =
+        OracleRelationArena::new(expected_owner, vec![record], limits).map_err(|error| {
+            SemanticProviderError::internal(format!(
+                "could not project deferred dispatch-boundary provenance: {error}"
+            ))
+        })?;
     let relation = arena
         .handle(OracleRelationId::new(0))
         .expect("deferred dispatch-boundary relation was inserted");
+    let subject_work = semantic_locator_work(target);
     Ok((
         vec![relation].into_boxed_slice(),
         SemanticWork {
             // One payload handle, one arena record, and the record's evidence
-            // array are retained independently by this projection.
-            nested_entries: 2usize.saturating_add(evidence_entries),
-            ..SemanticWork::default()
+            // array are retained independently by this projection. The exact
+            // boundary subject additionally deep-clones its target locator.
+            nested_entries: 2usize
+                .saturating_add(evidence_entries)
+                .saturating_add(subject_work.nested_entries),
+            owned_text_bytes: subject_work.owned_text_bytes,
+            ..subject_work
         },
     ))
 }
@@ -1781,6 +1859,65 @@ mod tests {
     use crate::test_support::AnalyzerFixture;
 
     #[test]
+    fn cancelled_dispatch_precedes_a_failed_call_transfer_projection_charge() {
+        let cancellation = CancellationToken::default();
+        let additional_work = SemanticWork {
+            nested_entries: 2,
+            ..SemanticWork::default()
+        };
+        let mapped = SemanticOutcome::Cancelled {
+            partial: Some((CallTransferSet::default(), additional_work)),
+            work: SemanticWork::default(),
+        };
+        let mut budget = SemanticBudget::uniform(1).expect("positive semantic budget");
+
+        let outcome = charge_call_transfer_projection(
+            &mapped,
+            &mut budget,
+            additional_work,
+            additional_work,
+            &cancellation,
+        )
+        .expect("projection work must exceed the nested-entry budget");
+
+        assert!(matches!(
+            outcome,
+            SemanticOutcome::Cancelled {
+                partial: None,
+                work,
+            } if work == additional_work
+        ));
+        assert_eq!(budget.used(), SemanticWork::default());
+    }
+
+    #[test]
+    fn snapshot_cancellation_precedes_an_existing_budget_exhaustion() {
+        let attempted_work = SemanticWork {
+            nested_entries: 2,
+            ..SemanticWork::default()
+        };
+        let exceeded = SemanticBudget::uniform(1)
+            .expect("positive semantic budget")
+            .check(attempted_work)
+            .expect_err("snapshot work must exceed the nested-entry budget");
+
+        let outcome = finish_snapshot_outcome(
+            IcfgSnapshot::empty(),
+            SnapshotQuality::Cancelled,
+            Some(exceeded),
+            attempted_work,
+        );
+
+        assert!(matches!(
+            outcome,
+            SemanticOutcome::Cancelled {
+                partial: Some(_),
+                work,
+            } if work == attempted_work
+        ));
+    }
+
+    #[test]
     fn call_evaluation_gap_scope_covers_procedure_point_and_call_site() {
         let fixture = AnalyzerFixture::new_for_language(
             crate::analyzer::Language::TypeScript,
@@ -1964,11 +2101,36 @@ mod tests {
             deferred.dispatch.provenance[0].record().kind(),
             OracleRelationKind::DispatchBoundary
         );
+        assert!(matches!(
+            deferred.dispatch.provenance[0].record().subject(),
+            Some(OracleRelationSubject::DispatchBoundary(subject))
+                if subject == &deferred.dispatch.kind
+        ));
         assert!(
             !deferred.dispatch.provenance[0]
                 .record()
                 .evidence()
                 .is_empty()
+        );
+        let candidate = &dispatch_outcome.available_value().unwrap().candidates()[0];
+        let (projected, projected_work) = deferred_boundary_provenance(
+            &call,
+            &deferred.dispatch.kind,
+            &candidate.provenance,
+            OracleLimits::default(),
+        )
+        .expect("direct deferred provenance projection");
+        let DispatchBoundaryKind::Deferred { target, .. } = &deferred.dispatch.kind else {
+            unreachable!("selected boundary is deferred")
+        };
+        let locator_work = semantic_locator_work(target);
+        assert_eq!(
+            projected_work.owned_text_bytes,
+            locator_work.owned_text_bytes
+        );
+        assert_eq!(
+            projected_work.nested_entries,
+            2 + projected[0].record().evidence().len() + locator_work.nested_entries
         );
         assert!(
             transfer_outcome.work().nested_entries
@@ -2549,6 +2711,76 @@ int invoke_direct(Base* receiver) {
     }
 
     #[test]
+    fn cpp_syntax_error_elsewhere_does_not_weaken_an_exact_call_dispatch() {
+        let source = r#"
+int exact_target() { return 1; }
+
+int caller_with_error() {
+    int malformed = ;
+    return exact_target();
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::Cpp,
+            &[("syntax_error.cpp", source)],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "syntax_error.cpp");
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("C++ syntax-error materialization")
+            .available_value()
+            .cloned()
+            .expect("C++ syntax-error artifact");
+        let caller = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(DeclarationSegment::name)
+                    == Some("caller_with_error")
+            })
+            .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+            .expect("caller procedure");
+        let call = caller
+            .semantics()
+            .call_sites()
+            .first()
+            .and_then(|call| caller.call_site_handle(call.id))
+            .expect("exact target call site");
+
+        assert!(caller.semantics().gaps().iter().any(|gap| {
+            gap.subject == SemanticGapSubject::Procedure
+                && gap.capability == SemanticCapability::Calls
+                && gap.kind == SemanticGapKind::Unsupported
+                && !gap.impacts.contains(SemanticGapImpact::DispatchCoverage)
+        }));
+
+        let mut dispatch_budget = SemanticBudget::default();
+        let outcome = fixture
+            .analyzer
+            .icfg_provider()
+            .resolve_call(
+                &call,
+                &mut SemanticRequest::new(&mut dispatch_budget, &cancellation),
+            )
+            .expect("exact C++ dispatch despite unrelated syntax error");
+        assert!(matches!(&outcome, SemanticOutcome::Complete { .. }));
+        let dispatch = outcome.available_value().expect("exact dispatch payload");
+        assert_eq!(dispatch.coverage(), CandidateCoverage::Exhaustive);
+        assert_eq!(dispatch.candidates().len(), 1, "{dispatch:#?}");
+    }
+
+    #[test]
     fn cpp_conditional_noexcept_gap_downgrades_exceptional_return() {
         let source = r#"
 void conditional_target() noexcept(sizeof(int) == 4) {
@@ -2787,11 +3019,15 @@ void raii_caller() {
             .sort_by(|left, right| left.semantics().locator().cmp(right.semantics().locator()));
         assert_eq!(procedures.len(), 2);
 
-        let candidate = |target: ProcedureHandle| DispatchCandidate {
-            target,
-            proof: ProofStatus::Proven,
-            completeness: EvidenceCompleteness::Complete,
-            provenance: Box::new([]),
+        let candidate = |target: ProcedureHandle| {
+            DispatchCandidate::new(
+                target,
+                ProofStatus::Proven,
+                EvidenceCompleteness::Complete,
+                std::iter::empty(),
+                OracleLimits::default(),
+            )
+            .expect("an empty dispatch draft fits every positive provenance limit")
         };
         let mut retained = Vec::new();
         let mut indexes = HashMap::default();

@@ -12,9 +12,10 @@ use std::sync::Arc;
 
 use super::ids::{MemoryLocationId, SemanticLocator, SemanticRole};
 use super::ir::{
-    AllocationHandle, CallSiteHandle, EvidenceCompleteness, EvidenceHandle, MemoryLocationHandle,
-    MemoryLocationKind, ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticArtifact,
-    SemanticEffect, SemanticValueKind, ValueHandle,
+    AllocationHandle, ArgumentDomain, CallArgumentExpansion, CallSiteHandle, EvidenceCompleteness,
+    EvidenceHandle, FormalMultiplicity, MemoryLocationHandle, MemoryLocationKind, ProcedureHandle,
+    ProgramPointHandle, ProofStatus, SemanticArtifact, SemanticEffect, SemanticValueKind,
+    ValueHandle,
 };
 use super::provider::{SemanticOutcome, SemanticProviderError, SemanticRequest};
 
@@ -100,33 +101,117 @@ pub enum OracleRelationKind {
     LanguageDefined,
 }
 
+/// The structured fact identified by one relation record when its role needs
+/// more precision than the query-scoped arena owner provides.
+///
+/// Dispatch shares one arena across every retained arm, so each record names
+/// its exact candidate or boundary here. This prevents a valid call-scoped
+/// relation from being reused to seal a different arm.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum OracleRelationSubject {
+    DispatchCandidate(ProcedureHandle),
+    DispatchBoundary(DispatchBoundaryKind),
+}
+
 /// One resolvable relation record backed by validated semantic evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OracleRelationRecord {
     kind: OracleRelationKind,
+    subject: Option<OracleRelationSubject>,
     evidence: Box<[EvidenceHandle]>,
 }
 
 impl OracleRelationRecord {
-    pub fn new<I>(kind: OracleRelationKind, evidence: I) -> Self
+    pub fn new<I>(
+        kind: OracleRelationKind,
+        evidence: I,
+        limits: OracleLimits,
+    ) -> Result<Self, OracleContractError>
     where
         I: IntoIterator<Item = EvidenceHandle>,
     {
-        Self {
+        if matches!(
             kind,
-            evidence: evidence.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+            OracleRelationKind::DispatchCandidate | OracleRelationKind::DispatchBoundary
+        ) {
+            return Err(OracleContractError::InvalidRelationIdentity);
         }
+        Self::with_subject(kind, None, evidence, limits)
+    }
+
+    pub fn dispatch_candidate<I>(
+        target: ProcedureHandle,
+        evidence: I,
+        limits: OracleLimits,
+    ) -> Result<Self, OracleContractError>
+    where
+        I: IntoIterator<Item = EvidenceHandle>,
+    {
+        Self::with_subject(
+            OracleRelationKind::DispatchCandidate,
+            Some(OracleRelationSubject::DispatchCandidate(target)),
+            evidence,
+            limits,
+        )
+    }
+
+    pub fn dispatch_boundary<I>(
+        boundary: DispatchBoundaryKind,
+        evidence: I,
+        limits: OracleLimits,
+    ) -> Result<Self, OracleContractError>
+    where
+        I: IntoIterator<Item = EvidenceHandle>,
+    {
+        Self::with_subject(
+            OracleRelationKind::DispatchBoundary,
+            Some(OracleRelationSubject::DispatchBoundary(boundary)),
+            evidence,
+            limits,
+        )
+    }
+
+    fn with_subject<I>(
+        kind: OracleRelationKind,
+        subject: Option<OracleRelationSubject>,
+        evidence: I,
+        limits: OracleLimits,
+    ) -> Result<Self, OracleContractError>
+    where
+        I: IntoIterator<Item = EvidenceHandle>,
+    {
+        let limit = limits.evidence_handles();
+        let evidence = evidence
+            .into_iter()
+            .take(limit.saturating_add(1))
+            .collect::<Vec<_>>();
+        if evidence.len() > limit {
+            return Err(OracleContractError::LimitExceeded {
+                dimension: "evidence_handles",
+                limit,
+                attempted: evidence.len(),
+            });
+        }
+        Ok(Self {
+            kind,
+            subject,
+            evidence: evidence.into_boxed_slice(),
+        })
     }
 
     pub const fn kind(&self) -> OracleRelationKind {
         self.kind
     }
 
+    pub fn subject(&self) -> Option<&OracleRelationSubject> {
+        self.subject.as_ref()
+    }
+
     pub fn evidence(&self) -> &[EvidenceHandle] {
         &self.evidence
     }
 
-    pub fn is_proven_complete(&self) -> bool {
+    pub fn is_proven(&self) -> bool {
         !self.evidence.is_empty()
             && self.evidence.iter().all(|evidence| {
                 let row = evidence
@@ -135,8 +220,42 @@ impl OracleRelationRecord {
                     .evidence_row(evidence.id())
                     .expect("evidence handles are validated at construction");
                 matches!(row.proof, ProofStatus::Proven)
-                    && matches!(row.completeness, EvidenceCompleteness::Complete)
             })
+    }
+
+    pub fn is_complete(&self) -> bool {
+        !self.evidence.is_empty()
+            && self.evidence.iter().all(|evidence| {
+                let row = evidence
+                    .procedure()
+                    .semantics()
+                    .evidence_row(evidence.id())
+                    .expect("evidence handles are validated at construction");
+                matches!(row.completeness, EvidenceCompleteness::Complete)
+            })
+    }
+
+    pub fn is_proven_complete(&self) -> bool {
+        self.is_proven() && self.is_complete()
+    }
+
+    fn supports_quality(&self, proof: &ProofStatus, completeness: &EvidenceCompleteness) -> bool {
+        (!matches!(proof, ProofStatus::Proven) || self.is_proven())
+            && (!matches!(completeness, EvidenceCompleteness::Complete) || self.is_complete())
+    }
+
+    fn identifies_dispatch_candidate(&self, target: &ProcedureHandle) -> bool {
+        matches!(
+            self.subject(),
+            Some(OracleRelationSubject::DispatchCandidate(subject)) if subject == target
+        )
+    }
+
+    fn identifies_dispatch_boundary(&self, boundary: &DispatchBoundaryKind) -> bool {
+        matches!(
+            self.subject(),
+            Some(OracleRelationSubject::DispatchBoundary(subject)) if subject == boundary
+        )
     }
 }
 
@@ -158,6 +277,16 @@ impl OracleRelationArena {
                 dimension: "provenance_records",
                 limit: limits.provenance_records(),
                 attempted: records.len(),
+            });
+        }
+        let retained_evidence = records.iter().fold(0usize, |total, record| {
+            total.saturating_add(record.evidence().len())
+        });
+        if retained_evidence > limits.evidence_handles() {
+            return Err(OracleContractError::LimitExceeded {
+                dimension: "evidence_handles",
+                limit: limits.evidence_handles(),
+                attempted: retained_evidence,
             });
         }
         if records
@@ -240,6 +369,84 @@ impl Hash for OracleRelationHandle {
     }
 }
 
+fn validate_retained_relation_arenas<'a>(
+    relations: impl IntoIterator<Item = &'a OracleRelationHandle>,
+    limits: OracleLimits,
+) -> Result<(), OracleContractError> {
+    let mut seen = std::collections::HashSet::new();
+    let mut provenance_records = 0usize;
+    let mut evidence_handles = 0usize;
+    for relation in relations {
+        let identity = Arc::as_ptr(&relation.arena);
+        if !seen.insert(identity) {
+            continue;
+        }
+
+        provenance_records = provenance_records.saturating_add(relation.arena.records().len());
+        if provenance_records > limits.provenance_records() {
+            return Err(OracleContractError::LimitExceeded {
+                dimension: "provenance_records",
+                limit: limits.provenance_records(),
+                attempted: provenance_records,
+            });
+        }
+
+        evidence_handles = relation
+            .arena
+            .records()
+            .iter()
+            .map(|record| record.evidence().len())
+            .fold(evidence_handles, usize::saturating_add);
+        if evidence_handles > limits.evidence_handles() {
+            return Err(OracleContractError::LimitExceeded {
+                dimension: "evidence_handles",
+                limit: limits.evidence_handles(),
+                attempted: evidence_handles,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn collect_bounded<T>(
+    values: impl IntoIterator<Item = T>,
+    limit: usize,
+    dimension: &'static str,
+) -> Result<Vec<T>, OracleContractError> {
+    let values = values
+        .into_iter()
+        .take(limit.saturating_add(1))
+        .collect::<Vec<_>>();
+    if values.len() > limit {
+        return Err(OracleContractError::LimitExceeded {
+            dimension,
+            limit,
+            attempted: values.len(),
+        });
+    }
+    Ok(values)
+}
+
+fn collect_candidate_provenance(
+    provenance: impl IntoIterator<Item = OracleRelationHandle>,
+    limits: OracleLimits,
+) -> Result<Box<[OracleRelationHandle]>, OracleContractError> {
+    let provenance = collect_bounded(
+        provenance,
+        limits.provenance_records(),
+        "provenance_records",
+    )?;
+    let mut seen = std::collections::HashSet::new();
+    if provenance
+        .iter()
+        .any(|relation| !seen.insert(relation.clone()))
+    {
+        return Err(OracleContractError::InvalidRelationIdentity);
+    }
+    validate_retained_relation_arenas(&provenance, limits)?;
+    Ok(provenance.into_boxed_slice())
+}
+
 /// Whether a finite candidate set is known to contain every answer.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CandidateCoverage {
@@ -278,22 +485,24 @@ impl<T> OracleCandidate<T> {
         proof: ProofStatus,
         completeness: EvidenceCompleteness,
         provenance: I,
-    ) -> Self
+        limits: OracleLimits,
+    ) -> Result<Self, OracleContractError>
     where
         I: IntoIterator<Item = OracleRelationHandle>,
     {
-        Self {
+        Ok(Self {
             value,
             proof,
             completeness,
-            provenance: provenance
-                .into_iter()
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        }
+            provenance: collect_candidate_provenance(provenance, limits)?,
+        })
     }
 
-    pub fn proven<I>(value: T, provenance: I) -> Self
+    pub fn proven<I>(
+        value: T,
+        provenance: I,
+        limits: OracleLimits,
+    ) -> Result<Self, OracleContractError>
     where
         I: IntoIterator<Item = OracleRelationHandle>,
     {
@@ -302,6 +511,7 @@ impl<T> OracleCandidate<T> {
             ProofStatus::Proven,
             EvidenceCompleteness::Complete,
             provenance,
+            limits,
         )
     }
 
@@ -348,16 +558,10 @@ pub struct OracleSet<T> {
 }
 
 impl<T> OracleSet<T> {
-    pub fn bounded<I>(
-        candidates: I,
-        mut coverage: CandidateCoverage,
-        limits: OracleLimits,
-        dimension: OracleSetLimit,
-    ) -> Self
+    fn bounded<I>(candidates: I, mut coverage: CandidateCoverage, limit: usize) -> Self
     where
         I: IntoIterator<Item = OracleCandidate<T>>,
     {
-        let limit = dimension.limit(limits);
         let mut candidates = candidates
             .into_iter()
             .take(limit.saturating_add(1))
@@ -385,18 +589,29 @@ impl<T> OracleSet<T> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum OracleSetLimit {
-    ObjectsPerValue,
-    AliasBreadth,
+impl OracleSet<AbstractObject> {
+    pub fn bounded_objects<I>(
+        candidates: I,
+        coverage: CandidateCoverage,
+        limits: OracleLimits,
+    ) -> Self
+    where
+        I: IntoIterator<Item = OracleCandidate<AbstractObject>>,
+    {
+        Self::bounded(candidates, coverage, limits.objects_per_value())
+    }
 }
 
-impl OracleSetLimit {
-    const fn limit(self, limits: OracleLimits) -> usize {
-        match self {
-            Self::ObjectsPerValue => limits.objects_per_value(),
-            Self::AliasBreadth => limits.alias_breadth(),
-        }
+impl OracleSet<AbstractLocation> {
+    pub fn bounded_locations<I>(
+        candidates: I,
+        coverage: CandidateCoverage,
+        limits: OracleLimits,
+    ) -> Self
+    where
+        I: IntoIterator<Item = OracleCandidate<AbstractLocation>>,
+    {
+        Self::bounded(candidates, coverage, limits.alias_breadth())
     }
 }
 
@@ -424,7 +639,9 @@ pub struct OracleLimitValues {
     pub alias_breadth: usize,
     pub call_context_depth: usize,
     pub summary_depth: usize,
+    pub call_binding_entries: usize,
     pub provenance_records: usize,
+    pub evidence_handles: usize,
 }
 
 impl OracleLimitValues {
@@ -439,7 +656,9 @@ impl OracleLimitValues {
             alias_breadth: value,
             call_context_depth: value,
             summary_depth: value,
+            call_binding_entries: value,
             provenance_records: value,
+            evidence_handles: value,
         }
     }
 }
@@ -486,7 +705,9 @@ impl OracleLimits {
             ("alias_breadth", values.alias_breadth),
             ("call_context_depth", values.call_context_depth),
             ("summary_depth", values.summary_depth),
+            ("call_binding_entries", values.call_binding_entries),
             ("provenance_records", values.provenance_records),
+            ("evidence_handles", values.evidence_handles),
         ];
         for (dimension, value) in dimensions {
             if value == 0 {
@@ -540,8 +761,16 @@ impl OracleLimits {
         self.values.summary_depth
     }
 
+    pub const fn call_binding_entries(self) -> usize {
+        self.values.call_binding_entries
+    }
+
     pub const fn provenance_records(self) -> usize {
         self.values.provenance_records
+    }
+
+    pub const fn evidence_handles(self) -> usize {
+        self.values.evidence_handles
     }
 }
 
@@ -557,7 +786,9 @@ impl Default for OracleLimits {
             alias_breadth: 1_024,
             call_context_depth: 2,
             summary_depth: 8,
+            call_binding_entries: 4_096,
             provenance_records: 4_096,
+            evidence_handles: 4_096,
         })
         .expect("default oracle limits are positive")
     }
@@ -648,11 +879,15 @@ impl ProcedurePortHandle {
                 return Err(OracleContractError::InvalidReceiverPort);
             }
             ProcedurePortKind::Parameter { ordinal }
-                if !procedure
-                    .semantics()
-                    .values()
-                    .iter()
-                    .any(|value| value.kind == SemanticValueKind::Parameter { ordinal }) =>
+                if !procedure.semantics().values().iter().any(|value| {
+                    matches!(
+                        value.kind,
+                        SemanticValueKind::Parameter {
+                            ordinal: actual,
+                            ..
+                        } if actual == ordinal
+                    )
+                }) =>
             {
                 return Err(OracleContractError::InvalidParameterOrdinal { ordinal });
             }
@@ -710,6 +945,23 @@ impl ProcedurePortHandle {
 
     pub const fn kind(&self) -> ProcedurePortKind {
         self.kind
+    }
+
+    pub fn formal_multiplicity(&self) -> Option<&FormalMultiplicity> {
+        let ProcedurePortKind::Parameter { ordinal } = self.kind else {
+            return None;
+        };
+        self.procedure
+            .semantics()
+            .values()
+            .iter()
+            .find_map(|value| match &value.kind {
+                SemanticValueKind::Parameter {
+                    ordinal: actual,
+                    multiplicity,
+                } if *actual == ordinal => Some(multiplicity),
+                _ => None,
+            })
     }
 }
 
@@ -1316,6 +1568,7 @@ impl ValueFlowSnapshot {
         context: OracleCallContext,
         relations: Vec<ValueFlowRelation>,
         coverage: CandidateCoverage,
+        limits: OracleLimits,
     ) -> Result<Self, OracleContractError> {
         let owner = OracleRelationOwner::ProcedureValueFlow {
             procedure: procedure.clone(),
@@ -1332,12 +1585,17 @@ impl ValueFlowSnapshot {
             {
                 return Err(OracleContractError::InvalidRelationIdentity);
             }
-            if relation.is_proven_complete() && !relation.id.record().is_proven_complete() {
+            if !relation
+                .id
+                .record()
+                .supports_quality(&relation.proof, &relation.completeness)
+            {
                 return Err(OracleContractError::InvalidRelationQuality);
             }
             relation.source.validate_at(&procedure)?;
             relation.target.validate_at(&procedure)?;
         }
+        validate_retained_relation_arenas(relations.iter().map(|relation| &relation.id), limits)?;
         Ok(Self {
             procedure,
             context,
@@ -1399,6 +1657,215 @@ pub enum ImplicitArgumentKind {
     LanguageDefined,
 }
 
+/// One member contributed by a syntactic call argument. Direct arguments
+/// contribute one `Whole` member; spread arguments contribute structured
+/// positional, keyword, or language-defined members.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CallArgumentMember {
+    Whole,
+    Positional(u32),
+    Keyword(Box<str>),
+    LanguageDefined(Box<str>),
+}
+
+/// One retained actual-to-formal mapping inside an argument group.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CallArgumentMapping {
+    source_index: u32,
+    member: CallArgumentMember,
+    actual: CallArgumentEndpoint,
+    formal: ProcedurePortHandle,
+    mode: CallPassingMode,
+}
+
+impl CallArgumentMapping {
+    pub fn new(
+        source_index: u32,
+        member: CallArgumentMember,
+        actual: CallArgumentEndpoint,
+        formal: ProcedurePortHandle,
+        mode: CallPassingMode,
+    ) -> Self {
+        Self {
+            source_index,
+            member,
+            actual,
+            formal,
+            mode,
+        }
+    }
+
+    pub const fn source_index(&self) -> u32 {
+        self.source_index
+    }
+
+    pub fn member(&self) -> &CallArgumentMember {
+        &self.member
+    }
+
+    pub fn actual(&self) -> &CallArgumentEndpoint {
+        &self.actual
+    }
+
+    pub fn formal(&self) -> &ProcedurePortHandle {
+        &self.formal
+    }
+
+    pub const fn mode(&self) -> CallPassingMode {
+        self.mode
+    }
+}
+
+/// Cardinality derived from group coverage and candidate proof. Callers cannot
+/// assert an exact cardinality independently of the validated mapping set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArgumentCardinality {
+    Exact(usize),
+    Between { minimum: usize, maximum: usize },
+    AtLeast(usize),
+}
+
+/// One evidence-backed group of argument sources and retained mappings.
+///
+/// The separate closure relation proves that an exhaustive group has no
+/// omitted members. Keeping source indices even when no mapping is retained
+/// represents an exact empty spread or an open/truncated unknown spread
+/// without pretending that the syntactic actual disappeared.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CallArgumentGroup {
+    closure_relation: OracleRelationHandle,
+    sources: Box<[u32]>,
+    mappings: Box<[EvidenceBacked<CallArgumentMapping>]>,
+    coverage: CandidateCoverage,
+}
+
+impl CallArgumentGroup {
+    pub fn new<I, M>(
+        call: &CallSiteHandle,
+        closure_relation: OracleRelationHandle,
+        sources: I,
+        mappings: M,
+        coverage: CandidateCoverage,
+        limits: OracleLimits,
+    ) -> Result<Self, OracleContractError>
+    where
+        I: IntoIterator<Item = u32>,
+        M: IntoIterator<Item = EvidenceBacked<CallArgumentMapping>>,
+    {
+        let call_row = call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .expect("call-site handles are validated at construction");
+        let entry_limit = limits.call_binding_entries();
+        let source_limit = entry_limit.min(call_row.arguments.len());
+        let sources = sources
+            .into_iter()
+            .take(source_limit.saturating_add(1))
+            .collect::<Vec<_>>();
+        if sources.len() > entry_limit {
+            return Err(OracleContractError::LimitExceeded {
+                dimension: "call_binding_entries",
+                limit: entry_limit,
+                attempted: sources.len(),
+            });
+        }
+        if sources.len() > call_row.arguments.len() {
+            return Err(OracleContractError::InvalidCallBinding(
+                "argument group has more sources than the exact call",
+            ));
+        }
+        if sources.is_empty() {
+            return Err(OracleContractError::InvalidCallBinding(
+                "argument group must name at least one syntactic source",
+            ));
+        }
+        let mut unique_sources = std::collections::HashSet::new();
+        if sources.iter().any(|source| !unique_sources.insert(*source)) {
+            return Err(OracleContractError::InvalidCallBinding(
+                "argument group repeats one syntactic source",
+            ));
+        }
+        if sources
+            .iter()
+            .any(|source| call_row.arguments.get(*source as usize).is_none())
+        {
+            return Err(OracleContractError::InvalidCallBinding(
+                "argument group names a source outside the exact call",
+            ));
+        }
+        let remaining = entry_limit.saturating_sub(sources.len());
+        let mappings = mappings
+            .into_iter()
+            .take(remaining.saturating_add(1))
+            .collect::<Vec<_>>();
+        if mappings.len() > remaining {
+            return Err(OracleContractError::LimitExceeded {
+                dimension: "call_binding_entries",
+                limit: entry_limit,
+                attempted: sources.len().saturating_add(mappings.len()),
+            });
+        }
+        let mut unique_members = std::collections::HashSet::new();
+        if mappings.iter().any(|mapping| {
+            !unique_sources.contains(&mapping.value().source_index)
+                || !unique_members
+                    .insert((mapping.value().source_index, mapping.value().member.clone()))
+        }) {
+            return Err(OracleContractError::InvalidCallBinding(
+                "argument mapping repeats or names an undeclared source member",
+            ));
+        }
+        validate_retained_relation_arenas(
+            std::iter::once(&closure_relation)
+                .chain(mappings.iter().flat_map(OracleCandidate::provenance)),
+            limits,
+        )?;
+        Ok(Self {
+            closure_relation,
+            sources: sources.into_boxed_slice(),
+            mappings: mappings.into_boxed_slice(),
+            coverage,
+        })
+    }
+
+    pub fn closure_relation(&self) -> &OracleRelationHandle {
+        &self.closure_relation
+    }
+
+    pub fn sources(&self) -> &[u32] {
+        &self.sources
+    }
+
+    pub fn mappings(&self) -> &[EvidenceBacked<CallArgumentMapping>] {
+        &self.mappings
+    }
+
+    pub const fn coverage(&self) -> CandidateCoverage {
+        self.coverage
+    }
+
+    pub fn cardinality(&self) -> ArgumentCardinality {
+        let proven = self
+            .mappings
+            .iter()
+            .filter(|mapping| matches!(mapping.proof(), ProofStatus::Proven))
+            .count();
+        match self.coverage {
+            CandidateCoverage::Exhaustive if proven == self.mappings.len() => {
+                ArgumentCardinality::Exact(proven)
+            }
+            CandidateCoverage::Exhaustive => ArgumentCardinality::Between {
+                minimum: proven,
+                maximum: self.mappings.len(),
+            },
+            CandidateCoverage::Open | CandidateCoverage::Truncated => {
+                ArgumentCardinality::AtLeast(proven)
+            }
+        }
+    }
+}
+
 /// One candidate-specific caller/callee boundary relation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CallBinding {
@@ -1407,14 +1874,7 @@ pub enum CallBinding {
         actual: ValueHandle,
         formal: ProcedurePortHandle,
     },
-    Argument {
-        relation: OracleRelationHandle,
-        actual_index: u32,
-        formal_ordinal: u32,
-        actual: CallArgumentEndpoint,
-        formal: ProcedurePortHandle,
-        mode: CallPassingMode,
-    },
+    ArgumentGroup(CallArgumentGroup),
     ImplicitArgument {
         relation: OracleRelationHandle,
         formal_ordinal: u32,
@@ -1434,36 +1894,179 @@ pub enum CallBinding {
     },
 }
 
-impl CallBinding {
-    pub fn relation(&self) -> &OracleRelationHandle {
-        match self {
-            Self::Receiver { relation, .. }
-            | Self::Argument { relation, .. }
-            | Self::ImplicitArgument { relation, .. }
-            | Self::NormalReturn { relation, .. }
-            | Self::ExceptionalReturn { relation, .. } => relation,
-        }
-    }
-}
-
 /// Actual/formal and return bindings for one exact dispatch candidate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CallBindings {
     call: CallSiteHandle,
-    callee: ProcedureHandle,
+    candidate: DispatchCandidate,
     context: OracleCallContext,
     bindings: Box<[CallBinding]>,
     coverage: CandidateCoverage,
 }
 
+fn validate_call_binding_relation(
+    relation: &OracleRelationHandle,
+    owner: &OracleRelationOwner,
+    first: &mut Option<OracleRelationHandle>,
+    seen: &mut std::collections::HashSet<OracleRelationHandle>,
+) -> Result<(), OracleContractError> {
+    if relation.owner() != owner
+        || relation.record().kind() != OracleRelationKind::CallBinding
+        || relation.record().evidence().is_empty()
+        || first
+            .as_ref()
+            .is_some_and(|first| !first.same_arena(relation))
+        || !seen.insert(relation.clone())
+    {
+        return Err(OracleContractError::InvalidRelationIdentity);
+    }
+    if first.is_none() {
+        *first = Some(relation.clone());
+    }
+    Ok(())
+}
+
+fn member_matches_expansion(
+    expansion: &CallArgumentExpansion,
+    member: &CallArgumentMember,
+) -> bool {
+    match (expansion, member) {
+        (CallArgumentExpansion::Direct(_), CallArgumentMember::Whole) => true,
+        (
+            CallArgumentExpansion::Spread(ArgumentDomain::Positional),
+            CallArgumentMember::Positional(_),
+        )
+        | (
+            CallArgumentExpansion::Spread(ArgumentDomain::Keyword),
+            CallArgumentMember::Keyword(_),
+        ) => true,
+        (
+            CallArgumentExpansion::Spread(ArgumentDomain::PositionalOrKeyword),
+            CallArgumentMember::Positional(_) | CallArgumentMember::Keyword(_),
+        ) => true,
+        (
+            CallArgumentExpansion::Spread(ArgumentDomain::LanguageDefined(expected)),
+            CallArgumentMember::LanguageDefined(actual),
+        ) => expected == actual,
+        _ => false,
+    }
+}
+
+fn rest_domain_accepts_mapping(
+    rest: &ArgumentDomain,
+    expansion: &CallArgumentExpansion,
+    member: &CallArgumentMember,
+) -> bool {
+    let accepts_positional = matches!(
+        rest,
+        ArgumentDomain::Positional | ArgumentDomain::PositionalOrKeyword
+    );
+    let accepts_keyword = matches!(
+        rest,
+        ArgumentDomain::Keyword | ArgumentDomain::PositionalOrKeyword
+    );
+    match (expansion, member) {
+        (CallArgumentExpansion::Direct(ArgumentDomain::Positional), CallArgumentMember::Whole) => {
+            accepts_positional
+        }
+        (CallArgumentExpansion::Direct(ArgumentDomain::Keyword), CallArgumentMember::Whole) => {
+            accepts_keyword
+        }
+        (
+            CallArgumentExpansion::Direct(ArgumentDomain::PositionalOrKeyword),
+            CallArgumentMember::Whole,
+        ) => accepts_positional || accepts_keyword,
+        (
+            CallArgumentExpansion::Direct(ArgumentDomain::LanguageDefined(actual)),
+            CallArgumentMember::Whole,
+        )
+        | (
+            CallArgumentExpansion::Spread(ArgumentDomain::LanguageDefined(actual)),
+            CallArgumentMember::LanguageDefined(_),
+        ) => matches!(rest, ArgumentDomain::LanguageDefined(expected) if expected == actual),
+        (CallArgumentExpansion::Spread(_), CallArgumentMember::Positional(_)) => accepts_positional,
+        (CallArgumentExpansion::Spread(_), CallArgumentMember::Keyword(_)) => accepts_keyword,
+        _ => false,
+    }
+}
+
+fn validate_argument_endpoint(
+    actual: &CallArgumentEndpoint,
+    mode: CallPassingMode,
+    caller: &ProcedureHandle,
+    call_point: super::ids::ProgramPointId,
+    context: &OracleCallContext,
+) -> Result<(), OracleContractError> {
+    require_same_procedure(actual.value().procedure(), caller)?;
+    if let CallArgumentEndpoint::Location { location, .. } = actual {
+        require_same_procedure(location.point().procedure(), caller)?;
+        if location.point().id() != call_point
+            || location.phase() != ObservationPhase::BeforeEffects
+            || location.context() != context
+        {
+            return Err(OracleContractError::InvalidCallBinding(
+                "reference argument locations must be observed immediately before the call effects",
+            ));
+        }
+        if !matches!(
+            mode,
+            CallPassingMode::SharedReference
+                | CallPassingMode::MutableReference
+                | CallPassingMode::InputOutputReference
+                | CallPassingMode::OutputReference
+                | CallPassingMode::LanguageDefined
+        ) {
+            return Err(OracleContractError::InvalidCallBinding(
+                "location arguments require a reference-capable passing mode",
+            ));
+        }
+    } else if matches!(
+        mode,
+        CallPassingMode::MutableReference
+            | CallPassingMode::InputOutputReference
+            | CallPassingMode::OutputReference
+    ) {
+        return Err(OracleContractError::InvalidCallBinding(
+            "mutable/output argument modes require a caller location",
+        ));
+    }
+    Ok(())
+}
+
 impl CallBindings {
-    pub fn new(
+    pub fn new<I>(
         call: CallSiteHandle,
-        callee: ProcedureHandle,
+        candidate: &DispatchCandidate,
         context: OracleCallContext,
-        bindings: Vec<CallBinding>,
+        bindings: I,
         coverage: CandidateCoverage,
-    ) -> Result<Self, OracleContractError> {
+        limits: OracleLimits,
+    ) -> Result<Self, OracleContractError>
+    where
+        I: IntoIterator<Item = CallBinding>,
+    {
+        candidate.validate_for_call(&call)?;
+        let bindings = collect_bounded(
+            bindings,
+            limits.call_binding_entries(),
+            "call_binding_entries",
+        )?;
+        let retained_entries = bindings.iter().fold(bindings.len(), |total, binding| {
+            let CallBinding::ArgumentGroup(group) = binding else {
+                return total;
+            };
+            total
+                .saturating_add(group.sources().len())
+                .saturating_add(group.mappings().len())
+        });
+        if retained_entries > limits.call_binding_entries() {
+            return Err(OracleContractError::LimitExceeded {
+                dimension: "call_binding_entries",
+                limit: limits.call_binding_entries(),
+                attempted: retained_entries,
+            });
+        }
+        let callee = candidate.target().clone();
         let caller = call.procedure();
         let call_row = caller
             .semantics()
@@ -1475,25 +2078,32 @@ impl CallBindings {
             context: context.clone(),
         };
         let mut relation_ids = std::collections::HashSet::new();
-        let mut actual_bindings = std::collections::HashSet::new();
+        let mut first_relation = None;
+        let mut actual_sources = std::collections::HashSet::new();
         let mut formal_bindings = std::collections::HashSet::new();
+        let mut formal_mapping_counts = std::collections::HashMap::<u32, usize>::new();
+        let mut implicit_formals = std::collections::HashSet::new();
         let mut has_receiver = false;
         let mut has_normal_return = false;
         let mut has_exceptional_return = false;
-        let first_relation = bindings.first().map(CallBinding::relation);
+        let mut has_open_group = false;
+        let mut has_truncated_group = false;
         for binding in &bindings {
-            let relation = binding.relation();
-            if relation.owner() != &relation_owner
-                || relation.record().kind() != OracleRelationKind::CallBinding
-                || relation.record().evidence().is_empty()
-                || !relation.record().is_proven_complete()
-                || first_relation.is_some_and(|first| !first.same_arena(relation))
-                || !relation_ids.insert(relation.clone())
-            {
-                return Err(OracleContractError::InvalidRelationIdentity);
-            }
             match binding {
-                CallBinding::Receiver { actual, formal, .. } => {
+                CallBinding::Receiver {
+                    relation,
+                    actual,
+                    formal,
+                } => {
+                    validate_call_binding_relation(
+                        relation,
+                        &relation_owner,
+                        &mut first_relation,
+                        &mut relation_ids,
+                    )?;
+                    if !relation.record().is_proven_complete() {
+                        return Err(OracleContractError::InvalidRelationQuality);
+                    }
                     require_same_procedure(actual.procedure(), caller)?;
                     require_same_procedure(formal.procedure(), &callee)?;
                     if call_row.receiver != Some(actual.id())
@@ -1510,76 +2120,136 @@ impl CallBindings {
                     }
                     has_receiver = true;
                 }
-                CallBinding::Argument {
-                    actual_index,
-                    formal_ordinal,
-                    actual,
-                    formal,
-                    mode,
-                    ..
-                } => {
-                    let actual_value = actual.value();
-                    require_same_procedure(actual_value.procedure(), caller)?;
-                    require_same_procedure(formal.procedure(), &callee)?;
-                    if call_row.arguments.get(*actual_index as usize) != Some(&actual_value.id())
-                        || formal.kind()
-                            != (ProcedurePortKind::Parameter {
-                                ordinal: *formal_ordinal,
-                            })
+                CallBinding::ArgumentGroup(group) => {
+                    validate_call_binding_relation(
+                        group.closure_relation(),
+                        &relation_owner,
+                        &mut first_relation,
+                        &mut relation_ids,
+                    )?;
+                    if group.coverage().is_exhaustive()
+                        && !group.closure_relation().record().is_proven_complete()
                     {
-                        return Err(OracleContractError::InvalidCallBinding(
-                            "argument binding does not match the call argument and callee parameter port",
-                        ));
+                        return Err(OracleContractError::InvalidRelationQuality);
                     }
-                    if let CallArgumentEndpoint::Location { location, .. } = actual {
-                        require_same_procedure(location.point().procedure(), caller)?;
-                        if location.point().id() != call_row.point
-                            || location.phase() != ObservationPhase::BeforeEffects
-                            || location.context() != &context
+                    has_open_group |= group.coverage() == CandidateCoverage::Open;
+                    has_truncated_group |= group.coverage().is_truncated();
+                    for source_index in group.sources() {
+                        let Some(argument) = call_row.arguments.get(*source_index as usize) else {
+                            return Err(OracleContractError::InvalidCallBinding(
+                                "argument group names a source outside the exact call",
+                            ));
+                        };
+                        if !actual_sources.insert(*source_index) {
+                            return Err(OracleContractError::InvalidCallBinding(
+                                "one syntactic argument source appears in multiple groups",
+                            ));
+                        }
+                        let has_mapping = group
+                            .mappings()
+                            .iter()
+                            .any(|mapping| mapping.value().source_index == *source_index);
+                        if group.coverage().is_exhaustive()
+                            && !argument.expansion.is_spread()
+                            && !has_mapping
                         {
                             return Err(OracleContractError::InvalidCallBinding(
-                                "reference argument locations must be observed immediately before the call effects",
+                                "an exhaustive direct-argument group omits its mapping",
                             ));
                         }
-                        if !matches!(
-                            mode,
-                            CallPassingMode::SharedReference
-                                | CallPassingMode::MutableReference
-                                | CallPassingMode::InputOutputReference
-                                | CallPassingMode::OutputReference
-                                | CallPassingMode::LanguageDefined
-                        ) {
+                    }
+                    for backed_mapping in group.mappings() {
+                        if backed_mapping.provenance().is_empty() {
+                            return Err(OracleContractError::InvalidRelationIdentity);
+                        }
+                        for relation in backed_mapping.provenance() {
+                            validate_call_binding_relation(
+                                relation,
+                                &relation_owner,
+                                &mut first_relation,
+                                &mut relation_ids,
+                            )?;
+                            if !relation.record().supports_quality(
+                                backed_mapping.proof(),
+                                backed_mapping.completeness(),
+                            ) {
+                                return Err(OracleContractError::InvalidRelationQuality);
+                            }
+                        }
+                        let mapping = backed_mapping.value();
+                        let argument = call_row
+                            .arguments
+                            .get(mapping.source_index as usize)
+                            .expect("group sources were validated above");
+                        validate_argument_endpoint(
+                            &mapping.actual,
+                            mapping.mode,
+                            caller,
+                            call_row.point,
+                            &context,
+                        )?;
+                        require_same_procedure(mapping.formal.procedure(), &callee)?;
+                        let ProcedurePortKind::Parameter { ordinal } = mapping.formal.kind() else {
                             return Err(OracleContractError::InvalidCallBinding(
-                                "location arguments require a reference-capable passing mode",
+                                "argument mapping does not name a callee parameter port",
+                            ));
+                        };
+                        if argument.value != mapping.actual.value().id()
+                            || !member_matches_expansion(&argument.expansion, &mapping.member)
+                        {
+                            return Err(OracleContractError::InvalidCallBinding(
+                                "argument mapping does not match the call source expansion",
                             ));
                         }
-                    } else if matches!(
-                        mode,
-                        CallPassingMode::MutableReference
-                            | CallPassingMode::InputOutputReference
-                            | CallPassingMode::OutputReference
-                    ) {
-                        return Err(OracleContractError::InvalidCallBinding(
-                            "mutable/output argument modes require a caller location",
-                        ));
-                    }
-                    if !actual_bindings.insert(*actual_index) {
-                        return Err(OracleContractError::InvalidCallBinding(
-                            "call binding maps one actual argument more than once",
-                        ));
-                    }
-                    if !formal_bindings.insert(*formal_ordinal) {
-                        return Err(OracleContractError::InvalidCallBinding(
-                            "call binding maps one non-variadic formal more than once",
-                        ));
+                        let multiplicity = mapping
+                            .formal
+                            .formal_multiplicity()
+                            .expect("validated parameter port has multiplicity");
+                        if implicit_formals.contains(&ordinal) {
+                            return Err(OracleContractError::InvalidCallBinding(
+                                "argument mapping conflicts with an implicit formal binding",
+                            ));
+                        }
+                        let count = formal_mapping_counts.entry(ordinal).or_default();
+                        match multiplicity {
+                            FormalMultiplicity::One if *count > 0 => {
+                                return Err(OracleContractError::InvalidCallBinding(
+                                    "call binding maps one non-rest formal more than once",
+                                ));
+                            }
+                            FormalMultiplicity::Rest(domain)
+                                if !rest_domain_accepts_mapping(
+                                    domain,
+                                    &argument.expansion,
+                                    &mapping.member,
+                                ) =>
+                            {
+                                return Err(OracleContractError::InvalidCallBinding(
+                                    "argument member domain is incompatible with the rest formal",
+                                ));
+                            }
+                            FormalMultiplicity::One | FormalMultiplicity::Rest(_) => {}
+                        }
+                        *count = count.saturating_add(1);
+                        formal_bindings.insert(ordinal);
                     }
                 }
                 CallBinding::ImplicitArgument {
+                    relation,
                     formal_ordinal,
                     source,
                     formal,
                     ..
                 } => {
+                    validate_call_binding_relation(
+                        relation,
+                        &relation_owner,
+                        &mut first_relation,
+                        &mut relation_ids,
+                    )?;
+                    if !relation.record().is_proven_complete() {
+                        return Err(OracleContractError::InvalidRelationQuality);
+                    }
                     require_same_procedure(formal.procedure(), &callee)?;
                     if source.procedure() != caller && source.procedure() != &callee {
                         return Err(OracleContractError::CrossProcedure);
@@ -1588,14 +2258,29 @@ impl CallBindings {
                         != (ProcedurePortKind::Parameter {
                             ordinal: *formal_ordinal,
                         })
-                        || !formal_bindings.insert(*formal_ordinal)
+                        || formal_bindings.contains(formal_ordinal)
+                        || !implicit_formals.insert(*formal_ordinal)
                     {
                         return Err(OracleContractError::InvalidCallBinding(
                             "implicit argument does not name one unbound callee parameter",
                         ));
                     }
+                    formal_bindings.insert(*formal_ordinal);
                 }
-                CallBinding::NormalReturn { formal, result, .. } => {
+                CallBinding::NormalReturn {
+                    relation,
+                    formal,
+                    result,
+                } => {
+                    validate_call_binding_relation(
+                        relation,
+                        &relation_owner,
+                        &mut first_relation,
+                        &mut relation_ids,
+                    )?;
+                    if !relation.record().is_proven_complete() {
+                        return Err(OracleContractError::InvalidRelationQuality);
+                    }
                     require_same_procedure(formal.procedure(), &callee)?;
                     require_same_procedure(result.procedure(), caller)?;
                     if call_row.result != Some(result.id())
@@ -1612,7 +2297,20 @@ impl CallBindings {
                     }
                     has_normal_return = true;
                 }
-                CallBinding::ExceptionalReturn { formal, result, .. } => {
+                CallBinding::ExceptionalReturn {
+                    relation,
+                    formal,
+                    result,
+                } => {
+                    validate_call_binding_relation(
+                        relation,
+                        &relation_owner,
+                        &mut first_relation,
+                        &mut relation_ids,
+                    )?;
+                    if !relation.record().is_proven_complete() {
+                        return Err(OracleContractError::InvalidRelationQuality);
+                    }
                     require_same_procedure(formal.procedure(), &callee)?;
                     require_same_procedure(result.procedure(), caller)?;
                     if call_row.thrown != Some(result.id())
@@ -1631,15 +2329,28 @@ impl CallBindings {
                 }
             }
         }
+        if has_truncated_group && coverage != CandidateCoverage::Truncated {
+            return Err(OracleContractError::InvalidCallBinding(
+                "a truncated argument group requires truncated call-binding coverage",
+            ));
+        }
+        if has_open_group && coverage.is_exhaustive() {
+            return Err(OracleContractError::InvalidCallBinding(
+                "an open argument group cannot support exhaustive call bindings",
+            ));
+        }
         if coverage.is_exhaustive() {
-            let all_actuals_bound = (0..call_row.arguments.len())
-                .all(|index| actual_bindings.contains(&(index as u32)));
+            let all_actuals_bound =
+                (0..call_row.arguments.len()).all(|index| actual_sources.contains(&(index as u32)));
             let all_formals_bound = callee
                 .semantics()
                 .values()
                 .iter()
-                .filter_map(|value| match value.kind {
-                    SemanticValueKind::Parameter { ordinal } => Some(ordinal),
+                .filter_map(|value| match &value.kind {
+                    SemanticValueKind::Parameter {
+                        ordinal,
+                        multiplicity: FormalMultiplicity::One,
+                    } => Some(*ordinal),
                     _ => None,
                 })
                 .all(|ordinal| formal_bindings.contains(&ordinal));
@@ -1662,9 +2373,13 @@ impl CallBindings {
                 ));
             }
         }
+        validate_retained_relation_arenas(
+            candidate.provenance().iter().chain(relation_ids.iter()),
+            limits,
+        )?;
         Ok(Self {
             call,
-            callee,
+            candidate: candidate.clone(),
             context,
             bindings: bindings.into_boxed_slice(),
             coverage,
@@ -1676,7 +2391,11 @@ impl CallBindings {
     }
 
     pub fn callee(&self) -> &ProcedureHandle {
-        &self.callee
+        self.candidate.target()
+    }
+
+    pub fn candidate(&self) -> &DispatchCandidate {
+        &self.candidate
     }
 
     pub fn bindings(&self) -> &[CallBinding] {
@@ -1749,12 +2468,7 @@ impl PointsToResult {
     where
         I: IntoIterator<Item = OracleCandidate<AbstractObject>>,
     {
-        let objects = OracleSet::bounded(
-            candidates,
-            coverage,
-            limits,
-            OracleSetLimit::ObjectsPerValue,
-        );
+        let objects = OracleSet::bounded_objects(candidates, coverage, limits);
         validate_candidate_provenance(
             objects.candidates(),
             &OracleRelationOwner::PointsTo(Box::new(query.clone())),
@@ -1763,6 +2477,13 @@ impl PointsToResult {
         for candidate in objects.candidates() {
             candidate.value().validate_at(query.point().procedure())?;
         }
+        validate_retained_relation_arenas(
+            objects
+                .candidates()
+                .iter()
+                .flat_map(OracleCandidate::provenance),
+            limits,
+        )?;
         Ok(Self { query, objects })
     }
 
@@ -1791,8 +2512,7 @@ impl LocationResult {
     where
         I: IntoIterator<Item = OracleCandidate<AbstractLocation>>,
     {
-        let locations =
-            OracleSet::bounded(candidates, coverage, limits, OracleSetLimit::AliasBreadth);
+        let locations = OracleSet::bounded_locations(candidates, coverage, limits);
         validate_candidate_provenance(
             locations.candidates(),
             &OracleRelationOwner::Locations(Box::new(query.clone())),
@@ -1808,6 +2528,13 @@ impl LocationResult {
                 .path()
                 .validate_at(query.point().procedure())?;
         }
+        validate_retained_relation_arenas(
+            locations
+                .candidates()
+                .iter()
+                .flat_map(OracleCandidate::provenance),
+            limits,
+        )?;
         Ok(Self { query, locations })
     }
 
@@ -1830,12 +2557,14 @@ impl AliasResult {
     pub fn new(
         query: AliasQuery,
         answer: EvidenceBacked<AliasRelation>,
+        limits: OracleLimits,
     ) -> Result<Self, OracleContractError> {
         validate_candidate_provenance(
             std::slice::from_ref(&answer),
             &OracleRelationOwner::Alias(Box::new(query.clone())),
             OracleRelationKind::Alias,
         )?;
+        validate_retained_relation_arenas(answer.provenance(), limits)?;
         Ok(Self { query, answer })
     }
 
@@ -1866,10 +2595,16 @@ fn validate_candidate_provenance<T>(
                     || relation.record().evidence().is_empty()
                     || first.is_some_and(|first| !first.same_arena(relation))
                     || !seen.insert(relation.clone())
-                    || (candidate.is_proven_complete() && !relation.record().is_proven_complete())
             })
         {
             return Err(OracleContractError::InvalidRelationIdentity);
+        }
+        if candidate.provenance().iter().any(|relation| {
+            !relation
+                .record()
+                .supports_quality(candidate.proof(), candidate.completeness())
+        }) {
+            return Err(OracleContractError::InvalidRelationQuality);
         }
     }
     Ok(())
@@ -2098,7 +2833,13 @@ fn access_root_matches_value(root: &AccessPathRoot, value: &ValueHandle) -> bool
                         .semantics()
                         .value(value.id())
                         .is_some_and(|row| {
-                            row.kind == (SemanticValueKind::Parameter { ordinal })
+                            matches!(
+                                row.kind,
+                                SemanticValueKind::Parameter {
+                                    ordinal: actual,
+                                    ..
+                                } if actual == ordinal
+                            )
                         }),
                     ProcedurePortKind::NormalReturn
                     | ProcedurePortKind::ExceptionalReturn
@@ -2246,13 +2987,43 @@ impl StrongUpdateEvidence {
         objects: OracleSet<AbstractObject>,
         alias_exclusivity: EvidenceBacked<AliasExclusivityWitness>,
         escape: EvidenceBacked<EscapeWitness>,
-    ) -> Self {
-        Self {
+        limits: OracleLimits,
+    ) -> Result<Self, OracleContractError> {
+        if locations.candidates().len() > limits.alias_breadth() {
+            return Err(OracleContractError::LimitExceeded {
+                dimension: "alias_breadth",
+                limit: limits.alias_breadth(),
+                attempted: locations.candidates().len(),
+            });
+        }
+        if objects.candidates().len() > limits.objects_per_value() {
+            return Err(OracleContractError::LimitExceeded {
+                dimension: "objects_per_value",
+                limit: limits.objects_per_value(),
+                attempted: objects.candidates().len(),
+            });
+        }
+        validate_retained_relation_arenas(
+            locations
+                .candidates()
+                .iter()
+                .flat_map(OracleCandidate::provenance)
+                .chain(
+                    objects
+                        .candidates()
+                        .iter()
+                        .flat_map(OracleCandidate::provenance),
+                )
+                .chain(alias_exclusivity.provenance())
+                .chain(escape.provenance()),
+            limits,
+        )?;
+        Ok(Self {
             locations,
             objects,
             alias_exclusivity,
             escape,
-        }
+        })
     }
 
     pub fn locations(&self) -> &OracleSet<AbstractLocation> {
@@ -2553,12 +3324,89 @@ fn strong_update_reasons(
 }
 
 /// One materialized workspace target for an exact semantic call site.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DispatchCandidate {
-    pub target: ProcedureHandle,
-    pub proof: ProofStatus,
-    pub completeness: EvidenceCompleteness,
-    pub provenance: Box<[OracleRelationHandle]>,
+    pub(crate) target: ProcedureHandle,
+    pub(crate) proof: ProofStatus,
+    pub(crate) completeness: EvidenceCompleteness,
+    pub(crate) provenance: Box<[OracleRelationHandle]>,
+    sealed_call: Option<CallSiteHandle>,
+}
+
+impl DispatchCandidate {
+    /// Create a draft that becomes a candidate-specific query token only
+    /// after validation by [`DispatchResult::new`].
+    pub fn new<I>(
+        target: ProcedureHandle,
+        proof: ProofStatus,
+        completeness: EvidenceCompleteness,
+        provenance: I,
+        limits: OracleLimits,
+    ) -> Result<Self, OracleContractError>
+    where
+        I: IntoIterator<Item = OracleRelationHandle>,
+    {
+        Ok(Self {
+            target,
+            proof,
+            completeness,
+            provenance: collect_candidate_provenance(provenance, limits)?,
+            sealed_call: None,
+        })
+    }
+
+    pub fn target(&self) -> &ProcedureHandle {
+        &self.target
+    }
+
+    pub fn proof(&self) -> &ProofStatus {
+        &self.proof
+    }
+
+    pub fn completeness(&self) -> &EvidenceCompleteness {
+        &self.completeness
+    }
+
+    pub fn provenance(&self) -> &[OracleRelationHandle] {
+        &self.provenance
+    }
+
+    fn seal_for_call(&mut self, call: &CallSiteHandle) {
+        self.sealed_call = Some(call.clone());
+    }
+
+    fn is_sealed_for(&self, call: &CallSiteHandle) -> bool {
+        self.sealed_call.as_ref() == Some(call)
+    }
+
+    fn validate_for_call(&self, call: &CallSiteHandle) -> Result<(), OracleContractError> {
+        if !self.is_sealed_for(call) || self.provenance.is_empty() {
+            return Err(OracleContractError::InvalidRelationIdentity);
+        }
+        let owner = OracleRelationOwner::Dispatch(call.clone());
+        let first = self.provenance.first();
+        let mut seen = std::collections::HashSet::new();
+        if self.provenance.iter().any(|relation| {
+            relation.owner() != &owner
+                || relation.record().kind() != OracleRelationKind::DispatchCandidate
+                || !relation
+                    .record()
+                    .identifies_dispatch_candidate(&self.target)
+                || relation.record().evidence().is_empty()
+                || first.is_some_and(|first| !first.same_arena(relation))
+                || !seen.insert(relation.clone())
+        }) {
+            return Err(OracleContractError::InvalidRelationIdentity);
+        }
+        if self.provenance.iter().any(|relation| {
+            !relation
+                .record()
+                .supports_quality(&self.proof, &self.completeness)
+        }) {
+            return Err(OracleContractError::InvalidRelationQuality);
+        }
+        Ok(())
+    }
 }
 
 /// A dispatch arm that cannot enter a materialized workspace procedure.
@@ -2601,21 +3449,24 @@ pub struct DispatchBoundary {
     pub provenance: Box<[OracleRelationHandle]>,
 }
 
+impl DispatchBoundary {
+    pub(crate) fn target_locator(&self) -> Option<&SemanticLocator> {
+        match &self.kind {
+            DispatchBoundaryKind::External(Some(target))
+            | DispatchBoundaryKind::Unmaterialized(target)
+            | DispatchBoundaryKind::Deferred { target, .. } => Some(target),
+            DispatchBoundaryKind::External(None)
+            | DispatchBoundaryKind::Unresolved
+            | DispatchBoundaryKind::Truncated => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchResult {
     candidates: Box<[DispatchCandidate]>,
     boundaries: Box<[DispatchBoundary]>,
     coverage: CandidateCoverage,
-}
-
-impl Default for DispatchResult {
-    fn default() -> Self {
-        Self {
-            candidates: Box::new([]),
-            boundaries: Box::new([]),
-            coverage: CandidateCoverage::Open,
-        }
-    }
 }
 
 impl DispatchResult {
@@ -2626,8 +3477,23 @@ impl DispatchResult {
         candidates: Vec<DispatchCandidate>,
         boundaries: Vec<DispatchBoundary>,
         coverage: CandidateCoverage,
+        limits: OracleLimits,
     ) -> Result<Self, OracleContractError> {
-        let result = Self {
+        let mut unique_targets = std::collections::HashSet::new();
+        if candidates
+            .iter()
+            .any(|candidate| !unique_targets.insert(candidate.target.clone()))
+        {
+            return Err(OracleContractError::DuplicateDispatchTarget);
+        }
+        if candidates.len() > limits.dispatch_targets() {
+            return Err(OracleContractError::LimitExceeded {
+                dimension: "dispatch_targets",
+                limit: limits.dispatch_targets(),
+                attempted: candidates.len(),
+            });
+        }
+        let mut result = Self {
             candidates: candidates.into_boxed_slice(),
             boundaries: boundaries.into_boxed_slice(),
             coverage,
@@ -2645,7 +3511,23 @@ impl DispatchResult {
         {
             return Err(OracleContractError::InconsistentCoverage);
         }
-        result.validate_for_call(call)?;
+        result.validate_provenance_for_call(call, false)?;
+        validate_retained_relation_arenas(
+            result
+                .candidates
+                .iter()
+                .flat_map(|candidate| candidate.provenance.iter())
+                .chain(
+                    result
+                        .boundaries
+                        .iter()
+                        .flat_map(|boundary| boundary.provenance.iter()),
+                ),
+            limits,
+        )?;
+        for candidate in &mut result.candidates {
+            candidate.seal_for_call(call);
+        }
         Ok(result)
     }
 
@@ -2672,9 +3554,11 @@ impl DispatchResult {
     }
 
     pub fn validate_for_call(&self, call: &CallSiteHandle) -> Result<(), OracleContractError> {
-        let owner = OracleRelationOwner::Dispatch(call.clone());
-        let first = self
-            .candidates
+        self.validate_provenance_for_call(call, true)
+    }
+
+    fn first_provenance(&self) -> Option<&OracleRelationHandle> {
+        self.candidates
             .iter()
             .flat_map(|candidate| candidate.provenance.iter())
             .chain(
@@ -2682,25 +3566,42 @@ impl DispatchResult {
                     .iter()
                     .flat_map(|boundary| boundary.provenance.iter()),
             )
-            .next();
+            .next()
+    }
+
+    fn validate_provenance_for_call(
+        &self,
+        call: &CallSiteHandle,
+        require_sealed_candidates: bool,
+    ) -> Result<(), OracleContractError> {
+        let owner = OracleRelationOwner::Dispatch(call.clone());
+        let first = self.first_provenance();
+        if require_sealed_candidates
+            && self
+                .candidates
+                .iter()
+                .any(|candidate| !candidate.is_sealed_for(call))
+        {
+            return Err(OracleContractError::InvalidRelationIdentity);
+        }
         let mut seen = std::collections::HashSet::new();
-        for (relations, kind, proven_complete) in self
+        for (relations, kind, proof, completeness) in self
             .candidates
             .iter()
             .map(|candidate| {
                 (
                     candidate.provenance.as_ref(),
                     OracleRelationKind::DispatchCandidate,
-                    matches!(candidate.proof, ProofStatus::Proven)
-                        && matches!(candidate.completeness, EvidenceCompleteness::Complete),
+                    &candidate.proof,
+                    &candidate.completeness,
                 )
             })
             .chain(self.boundaries.iter().map(|boundary| {
                 (
                     boundary.provenance.as_ref(),
                     OracleRelationKind::DispatchBoundary,
-                    matches!(boundary.proof, ProofStatus::Proven)
-                        && matches!(boundary.completeness, EvidenceCompleteness::Complete),
+                    &boundary.proof,
+                    &boundary.completeness,
                 )
             }))
         {
@@ -2709,13 +3610,36 @@ impl DispatchResult {
                     relation.owner() != &owner
                         || relation.record().kind() != kind
                         || relation.record().evidence().is_empty()
-                        || (proven_complete && !relation.record().is_proven_complete())
                         || first.is_some_and(|first| !first.same_arena(relation))
                         || !seen.insert(relation.clone())
                 })
             {
                 return Err(OracleContractError::InvalidRelationIdentity);
             }
+            if relations
+                .iter()
+                .any(|relation| !relation.record().supports_quality(proof, completeness))
+            {
+                return Err(OracleContractError::InvalidRelationQuality);
+            }
+        }
+        if self.candidates.iter().any(|candidate| {
+            candidate.provenance.iter().any(|relation| {
+                !relation
+                    .record()
+                    .identifies_dispatch_candidate(&candidate.target)
+            })
+        }) {
+            return Err(OracleContractError::InvalidRelationIdentity);
+        }
+        if self.boundaries.iter().any(|boundary| {
+            boundary.provenance.iter().any(|relation| {
+                !relation
+                    .record()
+                    .identifies_dispatch_boundary(&boundary.kind)
+            })
+        }) {
+            return Err(OracleContractError::InvalidRelationIdentity);
         }
         Ok(())
     }
@@ -2798,6 +3722,7 @@ pub enum OracleContractError {
     ObjectPathMismatch,
     InvalidRelationIdentity,
     InvalidRelationQuality,
+    DuplicateDispatchTarget,
     InconsistentCoverage,
     InvalidCallBinding(&'static str),
     InvalidStoreEvent,
@@ -2818,7 +3743,7 @@ impl fmt::Display for OracleContractError {
                 attempted,
             } => write!(
                 formatter,
-                "oracle limit `{dimension}` is {limit}, but the query attempted {attempted} records"
+                "oracle limit `{dimension}` is {limit}, but the query attempted {attempted} items"
             ),
             Self::InvalidReceiverPort => {
                 formatter.write_str("procedure does not publish a receiver port")
@@ -2843,8 +3768,12 @@ impl fmt::Display for OracleContractError {
             }
             Self::InvalidRelationIdentity => formatter
                 .write_str("oracle relation does not belong to the required query arena and role"),
-            Self::InvalidRelationQuality => formatter
-                .write_str("oracle relation claims stronger proof than its semantic evidence"),
+            Self::InvalidRelationQuality => formatter.write_str(
+                "oracle relation claims stronger proof or completeness than its semantic evidence",
+            ),
+            Self::DuplicateDispatchTarget => {
+                formatter.write_str("dispatch result contains a duplicate procedure target")
+            }
             Self::InconsistentCoverage => formatter
                 .write_str("dispatch coverage contradicts an unresolved or truncated boundary"),
             Self::InvalidStoreEvent => {

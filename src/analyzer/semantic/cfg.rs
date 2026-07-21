@@ -140,8 +140,18 @@ impl ProcedureCfgBuilder {
         let id = super::ValueId::try_from_index(self.parts.values.len())
             .expect("value count is bounded by the u32 semantic budget");
         assert_eq!(value.id, id, "values must use dense builder IDs");
+        let owned_text_bytes = match &value.kind {
+            super::SemanticValueKind::LanguageDefined(name)
+            | super::SemanticValueKind::Parameter {
+                multiplicity:
+                    super::FormalMultiplicity::Rest(super::ArgumentDomain::LanguageDefined(name)),
+                ..
+            } => name.len(),
+            _ => 0,
+        };
         self.reserve(SemanticWork {
             values: 1,
+            owned_text_bytes,
             ..SemanticWork::default()
         })?;
         self.parts.values.push(value);
@@ -155,9 +165,23 @@ impl ProcedureCfgBuilder {
         let id = super::CallSiteId::try_from_index(self.parts.call_sites.len())
             .expect("call-site count is bounded by the u32 semantic budget");
         assert_eq!(call_site.id, id, "call sites must use dense builder IDs");
+        let owned_text_bytes = call_site
+            .arguments
+            .iter()
+            .filter_map(|argument| match argument.expansion.domain() {
+                Some(super::ArgumentDomain::LanguageDefined(name)) => Some(name.len()),
+                Some(
+                    super::ArgumentDomain::Positional
+                    | super::ArgumentDomain::Keyword
+                    | super::ArgumentDomain::PositionalOrKeyword,
+                )
+                | None => None,
+            })
+            .fold(0usize, usize::saturating_add);
         self.reserve(SemanticWork {
             call_sites: 1,
             nested_entries: call_site.arguments.len(),
+            owned_text_bytes,
             ..SemanticWork::default()
         })?;
         self.parts.call_sites.push(call_site);
@@ -848,9 +872,12 @@ fn is_block_barrier(effect: &super::SemanticEffect) -> bool {
 mod tests {
     use super::*;
     use crate::analyzer::semantic::{
-        DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, ProcedureId, ProcedureKind,
-        SemanticBudgetDimension, SemanticEffect, SemanticLanguage, SemanticLocator, SemanticRole,
-        SourceAnchor, SourcePosition, SourceSpan, WorkspaceMountId, WorkspaceRelativePath,
+        ArgumentDomain, CallArgumentExpansion, CallSiteId, CallableTargetResolution,
+        ControlContinuation, DeclarationLocator, DeclarationSegment, DeclarationSegmentKind,
+        FormalMultiplicity, ProcedureId, ProcedureKind, SemanticBudgetDimension,
+        SemanticCallArgument, SemanticEffect, SemanticLanguage, SemanticLocator, SemanticRole,
+        SemanticValueKind, SourceAnchor, SourcePosition, SourceSpan, ValueId, WorkspaceMountId,
+        WorkspaceRelativePath,
     };
 
     fn builder_with_budget(budget: &SemanticBudget) -> ProcedureCfgBuilder {
@@ -882,6 +909,13 @@ mod tests {
 
     fn builder() -> ProcedureCfgBuilder {
         builder_with_budget(&SemanticBudget::default())
+    }
+
+    fn builder_with_owned_text_limit(limit: usize) -> ProcedureCfgBuilder {
+        let mut limits = SemanticBudget::default().limits();
+        limits.owned_text_bytes = limit;
+        let budget = SemanticBudget::new(limits).expect("positive builder limits");
+        builder_with_budget(&budget)
     }
 
     fn point(builder: &mut ProcedureCfgBuilder, effect: SemanticEffect) -> ProgramPointId {
@@ -923,6 +957,91 @@ mod tests {
         assert_eq!(work.procedures, 1);
         assert!(work.nested_entries >= 2);
         assert!(work.owned_text_bytes > 0);
+    }
+
+    #[test]
+    fn builder_budget_charges_owned_value_kind_and_rest_domain_text() {
+        let baseline = builder().prospective_work().owned_text_bytes;
+        for (kind, text_bytes) in [
+            (
+                SemanticValueKind::LanguageDefined("language-value".into()),
+                "language-value".len(),
+            ),
+            (
+                SemanticValueKind::Parameter {
+                    ordinal: 0,
+                    multiplicity: FormalMultiplicity::Rest(ArgumentDomain::LanguageDefined(
+                        "language-rest".into(),
+                    )),
+                },
+                "language-rest".len(),
+            ),
+        ] {
+            let limit = baseline + text_bytes - 1;
+            let mut builder = builder_with_owned_text_limit(limit);
+            let before = builder.prospective_work();
+            let error = builder
+                .add_value(SemanticValue {
+                    id: ValueId::new(0),
+                    kind,
+                    source: SourceMappingId::new(0),
+                    evidence: EvidenceId::new(0),
+                })
+                .expect_err("owned value text must be checked before retention");
+
+            assert_eq!(error.dimension(), SemanticBudgetDimension::OwnedTextBytes);
+            assert_eq!(error.limit(), limit);
+            assert_eq!(error.attempted(), baseline + text_bytes);
+            assert_eq!(builder.prospective_work(), before);
+        }
+    }
+
+    #[test]
+    fn builder_budget_charges_owned_direct_and_spread_argument_domain_text() {
+        let baseline = builder().prospective_work().owned_text_bytes;
+        for (expansion, text_bytes) in [
+            (
+                CallArgumentExpansion::Direct(ArgumentDomain::LanguageDefined(
+                    "direct-domain".into(),
+                )),
+                "direct-domain".len(),
+            ),
+            (
+                CallArgumentExpansion::Spread(ArgumentDomain::LanguageDefined(
+                    "spread-domain".into(),
+                )),
+                "spread-domain".len(),
+            ),
+        ] {
+            let limit = baseline + text_bytes - 1;
+            let mut builder = builder_with_owned_text_limit(limit);
+            let before = builder.prospective_work();
+            let error = builder
+                .add_call_site(SemanticCallSite {
+                    id: CallSiteId::new(0),
+                    point: ProgramPointId::new(0),
+                    callee: ValueId::new(0),
+                    receiver: None,
+                    arguments: Box::new([SemanticCallArgument {
+                        value: ValueId::new(1),
+                        expansion,
+                    }]),
+                    result: None,
+                    thrown: None,
+                    declared_targets: CallableTargetResolution::Unknown,
+                    target_evidence: EvidenceId::new(0),
+                    normal_continuation: ControlContinuation::Unknown,
+                    exceptional_continuation: ControlContinuation::Unknown,
+                    source: SourceMappingId::new(0),
+                    evidence: EvidenceId::new(0),
+                })
+                .expect_err("owned argument-domain text must be checked before retention");
+
+            assert_eq!(error.dimension(), SemanticBudgetDimension::OwnedTextBytes);
+            assert_eq!(error.limit(), limit);
+            assert_eq!(error.attempted(), baseline + text_bytes);
+            assert_eq!(builder.prospective_work(), before);
+        }
     }
 
     #[test]

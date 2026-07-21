@@ -13,11 +13,12 @@ use super::ids::{
     SourceRevision,
 };
 use super::ir::{
-    AllocationKind, AllocationSite, BasicBlock, CallableTarget, CallableTargetResolution,
-    CallableValue, CaptureBinding, CaptureSource, ControlContinuation, ControlEdge, Evidence,
-    EvidenceCompleteness, MemoryLocation, MemoryLocationKind, ProcedureSemantics, ProgramPoint,
-    ProofStatus, SemanticArtifact, SemanticCallSite, SemanticEffect, SemanticEvent, SemanticGap,
-    SemanticGapSubject, SemanticValue, SemanticValueKind, SourceMapping,
+    AllocationKind, AllocationSite, ArgumentDomain, BasicBlock, CallableTarget,
+    CallableTargetResolution, CallableValue, CaptureBinding, CaptureSource, ControlContinuation,
+    ControlEdge, Evidence, EvidenceCompleteness, FormalMultiplicity, MemoryLocation,
+    MemoryLocationKind, ProcedureSemantics, ProgramPoint, ProofStatus, SemanticArtifact,
+    SemanticCallSite, SemanticEffect, SemanticEvent, SemanticGap, SemanticGapSubject,
+    SemanticValue, SemanticValueKind, SourceMapping,
 };
 use super::{
     DispatchBoundaryKind, IcfgBoundary, IcfgBoundaryKind, IcfgEdge, IcfgLimitKind, IcfgNodeKey,
@@ -494,8 +495,21 @@ fn write_value(writer: &mut dyn fmt::Write, value: &SemanticValue) -> fmt::Resul
         quoted(value.kind.label())
     )?;
     match &value.kind {
-        SemanticValueKind::Parameter { ordinal } => {
-            write!(writer, " :ordinal {ordinal}")?;
+        SemanticValueKind::Parameter {
+            ordinal,
+            multiplicity,
+        } => {
+            write!(
+                writer,
+                " :ordinal {ordinal} :multiplicity {}",
+                quoted(multiplicity.label())
+            )?;
+            if let FormalMultiplicity::Rest(domain) = multiplicity {
+                write!(writer, " :argument-domain {}", quoted(domain.label()))?;
+                if let ArgumentDomain::LanguageDefined(detail) = domain {
+                    write!(writer, " :language-domain {}", quoted(detail))?;
+                }
+            }
         }
         SemanticValueKind::LanguageDefined(kind) => {
             write!(writer, " :language-kind {}", quoted(kind))?;
@@ -611,7 +625,26 @@ fn write_call_site(writer: &mut dyn fmt::Write, call_site: &SemanticCallSite) ->
         call_site.callee,
         optional_id(call_site.receiver),
     )?;
-    write_id_list(writer, call_site.arguments.iter().copied())?;
+    writer.write_char('(')?;
+    for (index, argument) in call_site.arguments.iter().enumerate() {
+        if index > 0 {
+            writer.write_char(' ')?;
+        }
+        write!(
+            writer,
+            "(argument :value {} :expansion {}",
+            argument.value,
+            quoted(argument.expansion.label()),
+        )?;
+        if let Some(domain) = argument.expansion.domain() {
+            write!(writer, " :domain {}", quoted(domain.label()))?;
+            if let ArgumentDomain::LanguageDefined(detail) = domain {
+                write!(writer, " :language-domain {}", quoted(detail))?;
+            }
+        }
+        writer.write_char(')')?;
+    }
+    writer.write_char(')')?;
     write!(
         writer,
         " :result {} :thrown {} :declared-targets (",
@@ -1625,7 +1658,9 @@ mod tests {
             point: ProgramPointId::new(4),
             callee: super::super::ids::ValueId::new(0),
             receiver: None,
-            arguments: Box::new([super::super::ids::ValueId::new(1)]),
+            arguments: Box::new([super::super::ir::SemanticCallArgument::direct(
+                super::super::ids::ValueId::new(1),
+            )]),
             result: None,
             thrown: None,
             declared_targets: CallableTargetResolution::ExceededBudget(Box::new([

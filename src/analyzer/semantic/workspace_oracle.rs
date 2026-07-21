@@ -22,8 +22,8 @@ use super::{
     CandidateCoverage, ContentIdentity, DeclarationLocator, DeclarationSegment,
     DeclarationSegmentKind, DispatchBoundary, DispatchBoundaryKind, DispatchCandidate,
     DispatchOracle, DispatchResult, EvidenceCompleteness, EvidenceHandle, OracleLimits,
-    OracleRelationArena, OracleRelationId, OracleRelationKind, OracleRelationOwner,
-    OracleRelationRecord, OverlaySnapshotId, ProcedureHandle, ProcedureKind, ProcedureSemantics,
+    OracleRelationArena, OracleRelationId, OracleRelationOwner, OracleRelationRecord,
+    OracleRelationSubject, OverlaySnapshotId, ProcedureHandle, ProcedureKind, ProcedureSemantics,
     ProofStatus, SemanticCallSite, SemanticCapability, SemanticGap, SemanticGapKind,
     SemanticGapSubject, SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest,
     SemanticRole, SemanticWork, SourceAnchor, SourcePosition, SourceRevision, SourceSpan,
@@ -143,6 +143,26 @@ enum DispatchQuality {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaterializationInterruption {
+    Budget,
+    Cancelled,
+}
+
+fn materialization_interruption(
+    quality: DispatchQuality,
+    budget_exceeded: bool,
+    cancellation: &crate::cancellation::CancellationToken,
+) -> Option<MaterializationInterruption> {
+    if quality == DispatchQuality::Cancelled || cancellation.is_cancelled() {
+        Some(MaterializationInterruption::Cancelled)
+    } else if budget_exceeded {
+        Some(MaterializationInterruption::Budget)
+    } else {
+        None
+    }
+}
+
 impl DispatchOracle for WorkspaceSemanticOracle<'_> {
     fn resolve_call(
         &self,
@@ -230,10 +250,11 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
         );
         if lookup.cancelled || request.cancellation.is_cancelled() {
             return cancelled_lookup_outcome(
+                self.workspace,
                 call,
                 self.limits,
                 CancelledLookupArtifacts {
-                    has_targets: !lookup.targets.is_empty(),
+                    resolved_targets: &lookup.targets,
                     low_level_boundaries: &lookup.boundaries,
                     call_dispatch_gap,
                     procedure_call_gap,
@@ -271,9 +292,11 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
             .iter()
             .map(low_level_boundary)
             .collect::<Vec<_>>();
-        let target_groups = dispatch_target_groups(self.workspace.analyzer(), lookup.targets);
+        let mut target_groups =
+            dispatch_target_groups(self.workspace.analyzer(), lookup.targets).into_iter();
         let mut candidate_indexes = HashMap::<ProcedureHandle, usize>::default();
         let mut final_candidates_truncated = false;
+        let mut cancelled_targets_truncated = false;
         let mut materialization_quality = DispatchQuality::Complete;
         let exploration_exceeded = lookup.truncated.then(|| {
             request
@@ -291,8 +314,17 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
         > = HashMap::default();
         let mut staged_request = SemanticRequest::new(&mut staged_budget, request.cancellation);
 
-        for group in target_groups {
+        while let Some(group) = target_groups.next() {
             if request.cancellation.is_cancelled() {
+                cancelled_targets_truncated |= append_cancelled_target_boundaries(
+                    self.workspace.analyzer(),
+                    &candidates,
+                    &mut boundaries,
+                    std::iter::once(group).chain(target_groups.by_ref()),
+                    self.limits,
+                    call_dispatch_gap,
+                    procedure_call_gap,
+                )?;
                 materialization_quality = DispatchQuality::Cancelled;
                 break;
             }
@@ -475,12 +507,15 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                 }
             }
 
-            let interrupted = materialization_exceeded.is_some()
-                || materialization_quality == DispatchQuality::Cancelled;
+            let interruption = materialization_interruption(
+                materialization_quality,
+                materialization_exceeded.is_some(),
+                request.cancellation,
+            );
             if matched_any {
                 materialization_quality =
                     merge_dispatch_quality(materialization_quality, matched_quality);
-            } else if !interrupted {
+            } else if interruption.is_none() {
                 boundaries.push(DispatchBoundary {
                     kind: DispatchBoundaryKind::Unmaterialized(locator_for_definition(
                         self.workspace.analyzer(),
@@ -501,7 +536,20 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                     merge_dispatch_quality(materialization_quality, missing_quality);
             }
 
-            if interrupted {
+            if let Some(interruption) = interruption {
+                if interruption == MaterializationInterruption::Cancelled {
+                    let current = (!matched_any).then_some(group);
+                    cancelled_targets_truncated |= append_cancelled_target_boundaries(
+                        self.workspace.analyzer(),
+                        &candidates,
+                        &mut boundaries,
+                        current.into_iter().chain(target_groups.by_ref()),
+                        self.limits,
+                        call_dispatch_gap,
+                        procedure_call_gap,
+                    )?;
+                    materialization_quality = DispatchQuality::Cancelled;
+                }
                 break;
             }
         }
@@ -513,7 +561,8 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
             {
                 boundaries.push(truncated_dispatch_boundary());
             }
-            materialization_quality = DispatchQuality::Truncated;
+            materialization_quality =
+                merge_dispatch_quality(materialization_quality, DispatchQuality::Truncated);
         }
 
         let gap_exceeded = call_dispatch_gap
@@ -566,7 +615,9 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
         let provenance_truncated = bound_dispatch_projection(
             &mut candidates,
             &mut boundaries,
-            self.limits.provenance_records(),
+            self.limits,
+            call_dispatch_gap,
+            procedure_call_gap,
         );
         if provenance_truncated {
             materialization_quality =
@@ -582,7 +633,8 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
         )?;
         let cancelled = materialization_quality == DispatchQuality::Cancelled
             || request.cancellation.is_cancelled();
-        let dispatch_truncated = provenance_truncated
+        let dispatch_truncated = cancelled_targets_truncated
+            || provenance_truncated
             || boundaries
                 .iter()
                 .any(|boundary| boundary.kind == DispatchBoundaryKind::Truncated);
@@ -593,8 +645,8 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
         } else {
             dispatch_coverage(lookup.status, &boundaries)
         };
-        let result =
-            DispatchResult::new(call, candidates, boundaries, coverage).map_err(|error| {
+        let result = DispatchResult::new(call, candidates, boundaries, coverage, self.limits)
+            .map_err(|error| {
                 SemanticProviderError::internal(format!(
                     "workspace dispatch produced invalid relation provenance: {error}"
                 ))
@@ -617,22 +669,14 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
         reported_work = total_work;
         *request.budget = staged_budget;
 
-        if let Some(exceeded) = materialization_exceeded
+        let interruption = materialization_exceeded
             .or(exploration_exceeded)
-            .or(gap_exceeded)
-        {
-            return Ok(SemanticOutcome::ExceededBudget {
-                partial: Some(result),
-                exceeded,
-                work: reported_work,
-            });
-        }
-        if cancelled {
-            return Ok(SemanticOutcome::Cancelled {
-                partial: Some(result),
-                work: reported_work,
-            });
-        }
+            .or(gap_exceeded);
+        let result =
+            match finish_dispatch_interruption(result, cancelled, interruption, reported_work) {
+                Ok(result) => result,
+                Err(outcome) => return Ok(*outcome),
+            };
         let status_quality = match lookup.status {
             Some(DefinitionLookupStatus::Resolved) => DispatchQuality::Complete,
             Some(DefinitionLookupStatus::Ambiguous) => DispatchQuality::Ambiguous,
@@ -662,6 +706,28 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
         };
         dispatch_outcome(result, quality, reported_work)
     }
+}
+
+fn finish_dispatch_interruption(
+    result: DispatchResult,
+    cancelled: bool,
+    exceeded: Option<super::SemanticBudgetExceeded>,
+    work: SemanticWork,
+) -> Result<DispatchResult, Box<SemanticOutcome<DispatchResult>>> {
+    if cancelled {
+        return Err(Box::new(SemanticOutcome::Cancelled {
+            partial: Some(result),
+            work,
+        }));
+    }
+    if let Some(exceeded) = exceeded {
+        return Err(Box::new(SemanticOutcome::ExceededBudget {
+            partial: Some(result),
+            exceeded,
+            work,
+        }));
+    }
+    Ok(result)
 }
 
 fn merge_dispatch_quality(current: DispatchQuality, incoming: DispatchQuality) -> DispatchQuality {
@@ -700,14 +766,66 @@ fn low_level_dispatch_work(
 fn bound_dispatch_projection(
     candidates: &mut Vec<DispatchCandidate>,
     boundaries: &mut Vec<DispatchBoundary>,
-    max_records: usize,
+    limits: OracleLimits,
+    call_dispatch_gap: Option<&SemanticGap>,
+    procedure_call_gap: Option<&SemanticGap>,
 ) -> bool {
-    if candidates.len().saturating_add(boundaries.len()) <= max_records {
-        return false;
+    let original_candidates = candidates.len();
+    let original_boundaries = boundaries.len();
+    let retained_candidates = candidates
+        .len()
+        .min(limits.dispatch_targets())
+        .min(limits.provenance_records())
+        .min(limits.evidence_handles());
+    candidates.truncate(retained_candidates);
+
+    let mut remaining_records = limits
+        .provenance_records()
+        .saturating_sub(retained_candidates);
+    let mut remaining_evidence = limits
+        .evidence_handles()
+        .saturating_sub(retained_candidates);
+    let mut retained_boundaries = 0;
+    for boundary in boundaries.iter() {
+        let evidence =
+            dispatch_boundary_evidence_count(boundary, call_dispatch_gap, procedure_call_gap);
+        if remaining_records == 0 || evidence > remaining_evidence {
+            break;
+        }
+        remaining_records -= 1;
+        remaining_evidence -= evidence;
+        retained_boundaries += 1;
     }
-    candidates.truncate(max_records);
-    boundaries.truncate(max_records.saturating_sub(candidates.len()));
-    true
+    boundaries.truncate(retained_boundaries);
+
+    candidates.len() != original_candidates || boundaries.len() != original_boundaries
+}
+
+fn dispatch_boundary_evidence_count(
+    boundary: &DispatchBoundary,
+    call_dispatch_gap: Option<&SemanticGap>,
+    procedure_call_gap: Option<&SemanticGap>,
+) -> usize {
+    let expected_exceeded = match &boundary.kind {
+        DispatchBoundaryKind::Unresolved => Some(false),
+        DispatchBoundaryKind::Truncated => Some(true),
+        DispatchBoundaryKind::External(_)
+        | DispatchBoundaryKind::Unmaterialized(_)
+        | DispatchBoundaryKind::Deferred { .. } => None,
+    };
+    let mut evidence = Vec::with_capacity(2);
+    for gap in [call_dispatch_gap, procedure_call_gap]
+        .into_iter()
+        .flatten()
+    {
+        if expected_exceeded
+            .is_some_and(|exceeded| (gap.kind == SemanticGapKind::ExceededBudget) == exceeded)
+            && !evidence.contains(&gap.evidence)
+        {
+            evidence.push(gap.evidence);
+        }
+    }
+    evidence.len().max(1)
 }
 
 fn attach_dispatch_provenance(
@@ -746,39 +864,72 @@ fn attach_dispatch_provenance(
             })?;
         if !gap_evidence
             .iter()
-            .any(|(_, retained): &(SemanticGapKind, EvidenceHandle)| retained == &evidence)
+            .any(|(kind, retained): &(SemanticGapKind, EvidenceHandle)| {
+                *kind == gap.kind && retained == &evidence
+            })
         {
             gap_evidence.push((gap.kind, evidence));
         }
     }
     let mut records = Vec::with_capacity(candidates.len().saturating_add(boundaries.len()));
-    records.extend((0..candidates.len()).map(|_| {
-        OracleRelationRecord::new(
-            OracleRelationKind::DispatchCandidate,
-            [target_evidence.clone()],
-        )
-    }));
-    records.extend(boundaries.iter().map(|boundary| {
-        let expected_gap_kind = match &boundary.kind {
-            DispatchBoundaryKind::Unresolved => Some(false),
-            DispatchBoundaryKind::Truncated => Some(true),
-            DispatchBoundaryKind::External(_)
-            | DispatchBoundaryKind::Unmaterialized(_)
-            | DispatchBoundaryKind::Deferred { .. } => None,
-        };
-        let mut evidence = gap_evidence
+    records.extend(
+        candidates
             .iter()
-            .filter(|(kind, _)| {
-                expected_gap_kind
-                    .is_some_and(|exceeded| (*kind == SemanticGapKind::ExceededBudget) == exceeded)
+            .map(|candidate| {
+                OracleRelationRecord::dispatch_candidate(
+                    candidate.target().clone(),
+                    [target_evidence.clone()],
+                    limits,
+                )
             })
-            .map(|(_, evidence)| evidence.clone())
-            .collect::<Vec<_>>();
-        if evidence.is_empty() {
-            evidence.push(call_evidence.clone());
-        }
-        OracleRelationRecord::new(OracleRelationKind::DispatchBoundary, evidence)
-    }));
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                SemanticProviderError::internal(format!(
+                    "could not create bounded dispatch provenance: {error}"
+                ))
+            })?,
+    );
+    records.extend(
+        boundaries
+            .iter()
+            .map(|boundary| {
+                let evidence = if boundary.target_locator().is_some() {
+                    vec![target_evidence.clone()]
+                } else {
+                    let expected_gap_kind = match &boundary.kind {
+                        DispatchBoundaryKind::Unresolved => Some(false),
+                        DispatchBoundaryKind::Truncated => Some(true),
+                        DispatchBoundaryKind::External(None) => None,
+                        DispatchBoundaryKind::External(Some(_))
+                        | DispatchBoundaryKind::Unmaterialized(_)
+                        | DispatchBoundaryKind::Deferred { .. } => {
+                            unreachable!("named dispatch boundaries handled above")
+                        }
+                    };
+                    let mut evidence = Vec::new();
+                    for (_, retained) in gap_evidence.iter().filter(|(kind, _)| {
+                        expected_gap_kind.is_some_and(|exceeded| {
+                            (*kind == SemanticGapKind::ExceededBudget) == exceeded
+                        })
+                    }) {
+                        if !evidence.contains(retained) {
+                            evidence.push(retained.clone());
+                        }
+                    }
+                    if evidence.is_empty() {
+                        evidence.push(call_evidence.clone());
+                    }
+                    evidence
+                };
+                OracleRelationRecord::dispatch_boundary(boundary.kind.clone(), evidence, limits)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                SemanticProviderError::internal(format!(
+                    "could not create bounded dispatch provenance: {error}"
+                ))
+            })?,
+    );
     let arena =
         OracleRelationArena::new(OracleRelationOwner::Dispatch(call.clone()), records, limits)
             .map_err(|error| {
@@ -817,7 +968,7 @@ fn attach_dispatch_provenance(
 }
 
 struct CancelledLookupArtifacts<'a> {
-    has_targets: bool,
+    resolved_targets: &'a [CallDispatchTarget],
     low_level_boundaries: &'a [CallDispatchBoundaryKind],
     call_dispatch_gap: Option<&'a SemanticGap>,
     procedure_call_gap: Option<&'a SemanticGap>,
@@ -825,19 +976,23 @@ struct CancelledLookupArtifacts<'a> {
 }
 
 fn cancelled_lookup_outcome(
+    workspace: &WorkspaceAnalyzer,
     call: &super::CallSiteHandle,
     limits: OracleLimits,
     artifacts: CancelledLookupArtifacts<'_>,
     request: &mut SemanticRequest<'_>,
 ) -> Result<SemanticOutcome<DispatchResult>, SemanticProviderError> {
     let CancelledLookupArtifacts {
-        has_targets,
+        resolved_targets,
         low_level_boundaries,
         call_dispatch_gap,
         procedure_call_gap,
         observed_work,
     } = artifacts;
-    if observed_work == SemanticWork::default() && !has_targets && low_level_boundaries.is_empty() {
+    if observed_work == SemanticWork::default()
+        && resolved_targets.is_empty()
+        && low_level_boundaries.is_empty()
+    {
         return Ok(SemanticOutcome::Cancelled {
             partial: None,
             work: SemanticWork::default(),
@@ -848,6 +1003,20 @@ fn cancelled_lookup_outcome(
         .iter()
         .map(low_level_boundary)
         .collect::<Vec<_>>();
+    let resolved_target_groups =
+        dispatch_target_groups(workspace.analyzer(), resolved_targets.to_vec());
+    let resolved_target_limit = limits
+        .dispatch_targets()
+        .min(limits.provenance_records())
+        .min(limits.evidence_handles());
+    let resolved_targets_truncated = resolved_target_groups.len() > resolved_target_limit;
+    boundaries.extend(
+        resolved_target_groups
+            .iter()
+            .take(resolved_target_limit)
+            .map(|target| cancelled_target_boundary(workspace.analyzer(), target))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
     boundaries.sort_by(|left, right| {
         dispatch_boundary_sort_key(left).cmp(&dispatch_boundary_sort_key(right))
     });
@@ -856,7 +1025,9 @@ fn cancelled_lookup_outcome(
     let truncated = bound_dispatch_projection(
         &mut candidates,
         &mut boundaries,
-        limits.provenance_records(),
+        limits,
+        call_dispatch_gap,
+        procedure_call_gap,
     );
     attach_dispatch_provenance(
         call,
@@ -866,6 +1037,11 @@ fn cancelled_lookup_outcome(
         procedure_call_gap,
         limits,
     )?;
+    let retained_truncation = resolved_targets_truncated
+        || truncated
+        || boundaries
+            .iter()
+            .any(|boundary| boundary.kind == DispatchBoundaryKind::Truncated);
     let result = DispatchResult::new(
         call,
         candidates,
@@ -873,11 +1049,12 @@ fn cancelled_lookup_outcome(
         // Cancellation alone leaves coverage open. An independent finite cap
         // still records known omission as truncated while the outer outcome
         // preserves the operation-level cancellation state.
-        if truncated {
+        if retained_truncation {
             CandidateCoverage::Truncated
         } else {
             CandidateCoverage::Open
         },
+        limits,
     )
     .map_err(|error| {
         SemanticProviderError::internal(format!(
@@ -900,7 +1077,94 @@ fn cancelled_lookup_outcome(
     })
 }
 
+fn cancelled_target_boundary(
+    analyzer: &dyn IAnalyzer,
+    target: &DispatchTargetGroup,
+) -> Result<DispatchBoundary, SemanticProviderError> {
+    Ok(DispatchBoundary {
+        kind: DispatchBoundaryKind::Unmaterialized(locator_for_definition(
+            analyzer,
+            &target.representative,
+        )?),
+        proof: proof_from_usage(target.proof),
+        completeness: EvidenceCompleteness::Partial(
+            "resolved target was not materialized because dispatch was cancelled".into(),
+        ),
+        provenance: Box::new([]),
+    })
+}
+
+fn append_cancelled_target_boundaries(
+    analyzer: &dyn IAnalyzer,
+    candidates: &[DispatchCandidate],
+    boundaries: &mut Vec<DispatchBoundary>,
+    groups: impl IntoIterator<Item = DispatchTargetGroup>,
+    limits: OracleLimits,
+    call_dispatch_gap: Option<&SemanticGap>,
+    procedure_call_gap: Option<&SemanticGap>,
+) -> Result<bool, SemanticProviderError> {
+    let retained_target_arms = candidates.len().saturating_add(
+        boundaries
+            .iter()
+            .filter(|boundary| boundary.target_locator().is_some())
+            .count(),
+    );
+    let retained_records = candidates.len().saturating_add(boundaries.len());
+    let retained_evidence = candidates.len().saturating_add(
+        boundaries
+            .iter()
+            .map(|boundary| {
+                dispatch_boundary_evidence_count(boundary, call_dispatch_gap, procedure_call_gap)
+            })
+            .fold(0usize, usize::saturating_add),
+    );
+    let mut remaining_targets = limits
+        .dispatch_targets()
+        .saturating_sub(retained_target_arms);
+    let mut remaining_records = limits.provenance_records().saturating_sub(retained_records);
+    let mut remaining_evidence = limits.evidence_handles().saturating_sub(retained_evidence);
+    let mut groups = groups.into_iter();
+
+    loop {
+        if remaining_targets == 0 || remaining_records == 0 || remaining_evidence == 0 {
+            // Consume at most one omitted group to distinguish an exactly-full
+            // projection from a truncated one without allocating the tail.
+            return Ok(groups.next().is_some());
+        }
+        let Some(group) = groups.next() else {
+            return Ok(false);
+        };
+        let boundary = cancelled_target_boundary(analyzer, &group)?;
+        let evidence =
+            dispatch_boundary_evidence_count(&boundary, call_dispatch_gap, procedure_call_gap);
+        if evidence > remaining_evidence {
+            return Ok(true);
+        }
+        boundaries.push(boundary);
+        remaining_targets -= 1;
+        remaining_records -= 1;
+        remaining_evidence -= evidence;
+    }
+}
+
 fn dispatch_result_work(result: &DispatchResult) -> SemanticWork {
+    let relation_subject_work = result
+        .candidates()
+        .iter()
+        .flat_map(|candidate| candidate.provenance.iter())
+        .chain(
+            result
+                .boundaries()
+                .iter()
+                .flat_map(|boundary| boundary.provenance.iter()),
+        )
+        .filter_map(|relation| match relation.record().subject() {
+            Some(OracleRelationSubject::DispatchBoundary(kind)) => {
+                Some(dispatch_boundary_kind_locator_work(kind))
+            }
+            Some(OracleRelationSubject::DispatchCandidate(_)) | None => None,
+        })
+        .fold(SemanticWork::default(), sum_semantic_work);
     let owned_text_bytes = result
         .candidates()
         .iter()
@@ -913,7 +1177,8 @@ fn dispatch_result_work(result: &DispatchResult) -> SemanticWork {
                 .saturating_add(completeness_reason_bytes(&boundary.completeness))
                 .saturating_add(dispatch_boundary_locator_work(boundary).owned_text_bytes)
         }))
-        .fold(0usize, usize::saturating_add);
+        .fold(0usize, usize::saturating_add)
+        .saturating_add(relation_subject_work.owned_text_bytes);
     let provenance_entries = result
         .candidates()
         .iter()
@@ -943,7 +1208,8 @@ fn dispatch_result_work(result: &DispatchResult) -> SemanticWork {
                     .map(|work| work.nested_entries)
                     .fold(0usize, usize::saturating_add),
             )
-            .saturating_add(provenance_entries),
+            .saturating_add(provenance_entries)
+            .saturating_add(relation_subject_work.nested_entries),
         owned_text_bytes,
         ..SemanticWork::default()
     }
@@ -964,7 +1230,11 @@ pub(super) fn semantic_locator_work(locator: &SemanticLocator) -> SemanticWork {
 }
 
 fn dispatch_boundary_locator_work(boundary: &DispatchBoundary) -> SemanticWork {
-    match &boundary.kind {
+    dispatch_boundary_kind_locator_work(&boundary.kind)
+}
+
+fn dispatch_boundary_kind_locator_work(kind: &DispatchBoundaryKind) -> SemanticWork {
+    match kind {
         DispatchBoundaryKind::External(Some(locator))
         | DispatchBoundaryKind::Unmaterialized(locator)
         | DispatchBoundaryKind::Deferred {
@@ -1279,12 +1549,14 @@ fn retain_artifact_candidates(
         truncated |= retain_dispatch_candidate(
             candidates,
             indexes,
-            DispatchCandidate {
+            DispatchCandidate::new(
                 target,
-                proof: proof.clone(),
-                completeness: completeness.clone(),
-                provenance: Box::new([]),
-            },
+                proof.clone(),
+                completeness.clone(),
+                std::iter::empty(),
+                OracleLimits::default(),
+            )
+            .expect("an empty dispatch draft fits every positive provenance limit"),
             max_candidates,
         );
     }
@@ -1549,13 +1821,14 @@ fn locator_sort_key(locator: &SemanticLocator) -> String {
 mod tests {
     use super::*;
     use crate::analyzer::semantic::{
-        SemanticBudget, SemanticGapId, SemanticGapImpact, SemanticGapImpacts,
+        OracleLimitValues, OracleRelationKind, SemanticBudget, SemanticGapId, SemanticGapImpact,
+        SemanticGapImpacts,
     };
     use crate::analyzer::{Language, ProjectFile};
     use crate::cancellation::CancellationToken;
     use crate::test_support::AnalyzerFixture;
 
-    fn semantic_call_handle() -> crate::analyzer::semantic::CallSiteHandle {
+    fn semantic_call_fixture() -> (AnalyzerFixture, crate::analyzer::semantic::CallSiteHandle) {
         let fixture = AnalyzerFixture::new_for_language(
             Language::TypeScript,
             &[(
@@ -1581,12 +1854,17 @@ mod tests {
             .iter()
             .find(|procedure| !procedure.call_sites().is_empty())
             .expect("caller procedure");
-        artifact
+        let call = artifact
             .procedure_handle(procedure.id())
             .and_then(|procedure| {
                 procedure.call_site_handle(procedure.semantics().call_sites()[0].id)
             })
-            .expect("scoped call handle")
+            .expect("scoped call handle");
+        (fixture, call)
+    }
+
+    fn semantic_call_handle() -> crate::analyzer::semantic::CallSiteHandle {
+        semantic_call_fixture().1
     }
 
     #[test]
@@ -1608,12 +1886,13 @@ mod tests {
             nested_entries: 3,
             ..SemanticWork::default()
         };
-        let call = semantic_call_handle();
+        let (fixture, call) = semantic_call_fixture();
         let outcome = cancelled_lookup_outcome(
+            &fixture.analyzer,
             &call,
             OracleLimits::default(),
             CancelledLookupArtifacts {
-                has_targets: false,
+                resolved_targets: &[],
                 low_level_boundaries: &[CallDispatchBoundaryKind::Unresolved(
                     DefinitionLookupStatus::NotFound,
                 )],
@@ -1644,12 +1923,13 @@ mod tests {
     fn cancelled_partial_preserves_an_independent_projection_cap() {
         let cancellation = CancellationToken::default();
         let mut budget = SemanticBudget::default();
-        let call = semantic_call_handle();
+        let (fixture, call) = semantic_call_fixture();
         let outcome = cancelled_lookup_outcome(
+            &fixture.analyzer,
             &call,
             OracleLimits::uniform(1).expect("positive oracle limits"),
             CancelledLookupArtifacts {
-                has_targets: false,
+                resolved_targets: &[],
                 low_level_boundaries: &[
                     CallDispatchBoundaryKind::External,
                     CallDispatchBoundaryKind::Unresolved(DefinitionLookupStatus::NotFound),
@@ -1668,6 +1948,346 @@ mod tests {
         } = outcome
         else {
             panic!("projection-capped cancellation must retain its partial")
+        };
+        assert_eq!(partial.coverage(), CandidateCoverage::Truncated);
+        assert_eq!(partial.boundaries().len(), 1);
+    }
+
+    #[test]
+    fn cancelled_partial_preserves_a_retained_truncated_boundary() {
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let (fixture, call) = semantic_call_fixture();
+        let outcome = cancelled_lookup_outcome(
+            &fixture.analyzer,
+            &call,
+            OracleLimits::default(),
+            CancelledLookupArtifacts {
+                resolved_targets: &[],
+                low_level_boundaries: &[CallDispatchBoundaryKind::Truncated],
+                call_dispatch_gap: None,
+                procedure_call_gap: None,
+                observed_work: SemanticWork::default(),
+            },
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("truncated cancelled lookup outcome");
+
+        let SemanticOutcome::Cancelled {
+            partial: Some(partial),
+            ..
+        } = outcome
+        else {
+            panic!("cancelled lookup must retain its truncated boundary")
+        };
+        assert_eq!(partial.coverage(), CandidateCoverage::Truncated);
+        assert!(matches!(
+            partial.boundaries(),
+            [DispatchBoundary {
+                kind: DispatchBoundaryKind::Truncated,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn cancelled_partial_preserves_resolved_targets_as_typed_boundaries() {
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let (fixture, call) = semantic_call_fixture();
+        let target = CallDispatchTarget {
+            definition: CodeUnit::new(
+                ProjectFile::new(fixture.project_root(), "call.ts"),
+                CodeUnitType::Function,
+                "",
+                "target",
+            ),
+            proof: UsageProof::Proven,
+        };
+        let outcome = cancelled_lookup_outcome(
+            &fixture.analyzer,
+            &call,
+            OracleLimits::default(),
+            CancelledLookupArtifacts {
+                resolved_targets: &[target],
+                low_level_boundaries: &[],
+                call_dispatch_gap: None,
+                procedure_call_gap: None,
+                observed_work: SemanticWork::default(),
+            },
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("cancelled target projection");
+
+        let SemanticOutcome::Cancelled {
+            partial: Some(partial),
+            ..
+        } = outcome
+        else {
+            panic!("resolved cancelled target must remain in the partial")
+        };
+        assert_eq!(partial.coverage(), CandidateCoverage::Open);
+        assert!(matches!(
+            partial.boundaries(),
+            [DispatchBoundary {
+                kind: DispatchBoundaryKind::Unmaterialized(_),
+                proof: ProofStatus::Proven,
+                completeness: EvidenceCompleteness::Partial(_),
+                ..
+            }]
+        ));
+        let call_row = call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .expect("semantic call row");
+        let boundary = &partial.boundaries()[0];
+        assert_eq!(
+            boundary.provenance[0].record().evidence()[0].id(),
+            call_row.target_evidence
+        );
+        assert!(matches!(
+            boundary.provenance[0].record().subject(),
+            Some(crate::analyzer::semantic::OracleRelationSubject::DispatchBoundary(subject))
+                if subject == &boundary.kind
+        ));
+    }
+
+    #[test]
+    fn cancelled_partial_caps_unique_resolved_target_identities() {
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let (fixture, call) = semantic_call_fixture();
+        let source = ProjectFile::new(fixture.project_root(), "call.ts");
+        let target = CallDispatchTarget {
+            definition: CodeUnit::new(source.clone(), CodeUnitType::Function, "", "target"),
+            proof: UsageProof::Unproven,
+        };
+        let proven_duplicate = CallDispatchTarget {
+            definition: target.definition.clone(),
+            proof: UsageProof::Proven,
+        };
+        let caller = CallDispatchTarget {
+            definition: CodeUnit::new(source, CodeUnitType::Function, "", "caller"),
+            proof: UsageProof::Proven,
+        };
+        let limits = OracleLimits::new(OracleLimitValues {
+            dispatch_targets: 2,
+            ..OracleLimitValues::uniform(4)
+        })
+        .expect("positive dispatch limits");
+        let outcome = cancelled_lookup_outcome(
+            &fixture.analyzer,
+            &call,
+            limits,
+            CancelledLookupArtifacts {
+                resolved_targets: &[target, proven_duplicate, caller],
+                low_level_boundaries: &[],
+                call_dispatch_gap: None,
+                procedure_call_gap: None,
+                observed_work: SemanticWork::default(),
+            },
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("deduplicated cancelled target projection");
+
+        let SemanticOutcome::Cancelled {
+            partial: Some(partial),
+            ..
+        } = outcome
+        else {
+            panic!("cancelled target projection must retain its partial")
+        };
+        assert_eq!(partial.coverage(), CandidateCoverage::Open);
+        assert_eq!(partial.boundaries().len(), 2);
+        assert!(
+            partial.boundaries().iter().all(|boundary| {
+                matches!(&boundary.kind, DispatchBoundaryKind::Unmaterialized(_))
+            })
+        );
+        assert!(
+            partial
+                .boundaries()
+                .iter()
+                .all(|boundary| { matches!(&boundary.proof, ProofStatus::Proven) })
+        );
+    }
+
+    #[test]
+    fn late_cancellation_precedes_budget_and_caps_remaining_target_groups() {
+        let (fixture, call) = semantic_call_fixture();
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        assert_eq!(
+            materialization_interruption(DispatchQuality::Truncated, true, &cancellation),
+            Some(MaterializationInterruption::Cancelled),
+            "token cancellation must win when materialization also exceeds its budget"
+        );
+
+        let source = ProjectFile::new(fixture.project_root(), "call.ts");
+        let targets = ["target", "caller", "not_materialized"]
+            .into_iter()
+            .map(|name| CallDispatchTarget {
+                definition: CodeUnit::new(source.clone(), CodeUnitType::Function, "", name),
+                proof: UsageProof::Proven,
+            })
+            .collect();
+        let groups = dispatch_target_groups(fixture.analyzer.analyzer(), targets);
+        let limits = OracleLimits::new(OracleLimitValues {
+            provenance_records: 2,
+            evidence_handles: 2,
+            ..OracleLimitValues::uniform(4)
+        })
+        .expect("positive cancellation projection limits");
+        let mut candidates = Vec::new();
+        let mut boundaries = Vec::new();
+
+        let truncated = append_cancelled_target_boundaries(
+            fixture.analyzer.analyzer(),
+            &candidates,
+            &mut boundaries,
+            groups,
+            limits,
+            None,
+            None,
+        )
+        .expect("late-cancelled targets project to typed boundaries");
+        assert!(truncated, "the omitted target group must remain observable");
+        assert_eq!(
+            boundaries.len(),
+            2,
+            "the helper must stop at the aggregate provenance/evidence cap"
+        );
+
+        boundaries.sort_by(|left, right| {
+            dispatch_boundary_sort_key(left).cmp(&dispatch_boundary_sort_key(right))
+        });
+        boundaries.dedup();
+        assert!(!bound_dispatch_projection(
+            &mut candidates,
+            &mut boundaries,
+            limits,
+            None,
+            None,
+        ));
+        assert_eq!(boundaries.len(), 2);
+        attach_dispatch_provenance(&call, &mut candidates, &mut boundaries, None, None, limits)
+            .expect("bounded late-cancellation provenance");
+        let result = DispatchResult::new(
+            &call,
+            candidates,
+            boundaries,
+            CandidateCoverage::Truncated,
+            limits,
+        )
+        .expect("bounded late-cancellation dispatch partial");
+        let target_evidence = call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .expect("semantic call row")
+            .target_evidence;
+        assert!(result.boundaries().iter().all(|boundary| {
+            matches!(boundary.kind, DispatchBoundaryKind::Unmaterialized(_))
+                && boundary.provenance[0].record().evidence()[0].id() == target_evidence
+                && matches!(
+                    boundary.provenance[0].record().subject(),
+                    Some(OracleRelationSubject::DispatchBoundary(subject))
+                        if subject == &boundary.kind
+                )
+        }));
+    }
+
+    #[test]
+    fn target_cap_truncation_does_not_overwrite_cancelled_quality() {
+        assert_eq!(
+            merge_dispatch_quality(DispatchQuality::Cancelled, DispatchQuality::Truncated),
+            DispatchQuality::Cancelled
+        );
+    }
+
+    #[test]
+    fn cancellation_precedes_a_retained_budget_interruption() {
+        let call = semantic_call_handle();
+        let mut candidates = Vec::new();
+        let mut boundaries = vec![DispatchBoundary {
+            kind: DispatchBoundaryKind::Unresolved,
+            proof: ProofStatus::Unproven("unresolved dispatch arm".into()),
+            completeness: EvidenceCompleteness::Partial("open dispatch".into()),
+            provenance: Box::new([]),
+        }];
+        attach_dispatch_provenance(
+            &call,
+            &mut candidates,
+            &mut boundaries,
+            None,
+            None,
+            OracleLimits::default(),
+        )
+        .expect("dispatch provenance projection");
+        let result = DispatchResult::new(
+            &call,
+            candidates,
+            boundaries,
+            CandidateCoverage::Open,
+            OracleLimits::default(),
+        )
+        .expect("valid retained dispatch partial");
+        let exceeded = SemanticBudget::uniform(1)
+            .expect("positive semantic budget")
+            .check(SemanticWork {
+                nested_entries: 2,
+                ..SemanticWork::default()
+            })
+            .expect_err("work must exceed the nested-entry budget");
+        let work = dispatch_result_work(&result);
+
+        let outcome = *finish_dispatch_interruption(result, true, Some(exceeded), work)
+            .expect_err("cancellation must remain the outer interruption");
+        assert!(matches!(
+            outcome,
+            SemanticOutcome::Cancelled {
+                partial: Some(partial),
+                work: retained_work,
+            } if partial.coverage() == CandidateCoverage::Open && retained_work == work
+        ));
+    }
+
+    #[test]
+    fn cancelled_projection_truncates_to_the_total_evidence_limit() {
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let (fixture, call) = semantic_call_fixture();
+        let limits = OracleLimits::new(OracleLimitValues {
+            provenance_records: 2,
+            evidence_handles: 1,
+            ..OracleLimitValues::uniform(2)
+        })
+        .expect("positive independent evidence limit");
+        let outcome = cancelled_lookup_outcome(
+            &fixture.analyzer,
+            &call,
+            limits,
+            CancelledLookupArtifacts {
+                resolved_targets: &[],
+                low_level_boundaries: &[
+                    CallDispatchBoundaryKind::External,
+                    CallDispatchBoundaryKind::Unresolved(DefinitionLookupStatus::NotFound),
+                ],
+                call_dispatch_gap: None,
+                procedure_call_gap: None,
+                observed_work: SemanticWork::default(),
+            },
+            &mut SemanticRequest::new(&mut budget, &cancellation),
+        )
+        .expect("evidence-capped cancelled lookup outcome");
+
+        let SemanticOutcome::Cancelled {
+            partial: Some(partial),
+            ..
+        } = outcome
+        else {
+            panic!("evidence-capped cancellation must retain its partial")
         };
         assert_eq!(partial.coverage(), CandidateCoverage::Truncated);
         assert_eq!(partial.boundaries().len(), 1);
@@ -1708,12 +2328,16 @@ mod tests {
             source: call_row.source,
             evidence: gap_evidence,
         };
-        let mut candidates = vec![DispatchCandidate {
-            target: call.procedure().clone(),
-            proof: ProofStatus::Proven,
-            completeness: EvidenceCompleteness::Complete,
-            provenance: Box::new([]),
-        }];
+        let mut candidates = vec![
+            DispatchCandidate::new(
+                call.procedure().clone(),
+                ProofStatus::Proven,
+                EvidenceCompleteness::Complete,
+                std::iter::empty(),
+                OracleLimits::default(),
+            )
+            .expect("an empty dispatch draft fits every positive provenance limit"),
+        ];
         let mut boundaries = Vec::new();
         assert_eq!(
             apply_dynamic_dispatch_gap(&gap, &mut boundaries),
@@ -1753,6 +2377,92 @@ mod tests {
             boundaries[0].provenance[0].record().evidence()[0].id(),
             gap.evidence
         );
+        assert!(matches!(
+            boundaries[0].provenance[0].record().subject(),
+            Some(OracleRelationSubject::DispatchBoundary(subject))
+                if subject == &boundaries[0].kind
+        ));
+    }
+
+    #[test]
+    fn dispatch_gap_evidence_keeps_distinct_kinds_before_handle_deduplication() {
+        let call = semantic_call_handle();
+        let call_row = call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .expect("semantic call row");
+        let shared_evidence = call
+            .procedure()
+            .semantics()
+            .evidence_rows()
+            .iter()
+            .find(|evidence| evidence.id != call_row.evidence)
+            .map(|evidence| evidence.id)
+            .expect("caller has independent semantic evidence");
+        let exceeded = SemanticBudget::uniform(1)
+            .expect("positive semantic budget")
+            .check(SemanticWork {
+                nested_entries: 2,
+                ..SemanticWork::default()
+            })
+            .expect_err("work must exceed the nested-entry budget");
+        let unsupported_gap = SemanticGap {
+            id: SemanticGapId::new(0),
+            point: call_row.point,
+            subject: SemanticGapSubject::CallSite(call_row.id),
+            capability: SemanticCapability::DynamicDispatch,
+            impacts: SemanticGapImpacts::single(SemanticGapImpact::DispatchCoverage),
+            kind: SemanticGapKind::Unsupported,
+            budget: None,
+            detail: "dynamic target discovery is unsupported".into(),
+            source: call_row.source,
+            evidence: shared_evidence,
+        };
+        let exceeded_gap = SemanticGap {
+            id: SemanticGapId::new(1),
+            kind: SemanticGapKind::ExceededBudget,
+            budget: Some(exceeded),
+            detail: "dynamic target exploration exceeded its finite budget".into(),
+            ..unsupported_gap.clone()
+        };
+        let mut candidates = Vec::new();
+        let mut boundaries = vec![
+            DispatchBoundary {
+                kind: DispatchBoundaryKind::Unresolved,
+                proof: ProofStatus::Unproven("unresolved dispatch arm".into()),
+                completeness: EvidenceCompleteness::Partial("open dispatch".into()),
+                provenance: Box::new([]),
+            },
+            DispatchBoundary {
+                kind: DispatchBoundaryKind::Truncated,
+                proof: ProofStatus::Unproven("dispatch limit reached".into()),
+                completeness: EvidenceCompleteness::Partial("targets were omitted".into()),
+                provenance: Box::new([]),
+            },
+        ];
+
+        attach_dispatch_provenance(
+            &call,
+            &mut candidates,
+            &mut boundaries,
+            Some(&unsupported_gap),
+            Some(&exceeded_gap),
+            OracleLimits::default(),
+        )
+        .expect("dispatch gap provenance projection");
+
+        assert!(boundaries.iter().all(|boundary| {
+            boundary.provenance[0].record().evidence()
+                == [call.procedure().evidence_handle(shared_evidence).unwrap()]
+        }));
+        assert!(boundaries.iter().all(|boundary| {
+            matches!(
+                boundary.provenance[0].record().subject(),
+                Some(OracleRelationSubject::DispatchBoundary(subject))
+                    if subject == &boundary.kind
+            )
+        }));
     }
 
     #[test]
@@ -1776,16 +2486,25 @@ mod tests {
             OracleLimits::default(),
         )
         .expect("dispatch provenance projection");
-        let result = DispatchResult::new(&call, candidates, boundaries, CandidateCoverage::Open)
-            .expect("valid unmaterialized dispatch boundary");
+        let result = DispatchResult::new(
+            &call,
+            candidates,
+            boundaries,
+            CandidateCoverage::Open,
+            OracleLimits::default(),
+        )
+        .expect("valid unmaterialized dispatch boundary");
         let work = dispatch_result_work(&result);
 
-        assert_eq!(work.owned_text_bytes, locator_work.owned_text_bytes);
+        assert_eq!(
+            work.owned_text_bytes,
+            locator_work.owned_text_bytes.saturating_mul(2)
+        );
         assert_eq!(
             work.nested_entries,
-            // Boundary row plus locator segments, relation handle, relation
-            // record, and its one evidence handle.
-            1 + locator_work.nested_entries + 3
+            // Boundary row plus both the boundary and relation-subject locator
+            // payloads, relation handle, relation record, and one evidence.
+            1 + locator_work.nested_entries.saturating_mul(2) + 3
         );
     }
 

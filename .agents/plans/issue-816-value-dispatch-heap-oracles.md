@@ -20,7 +20,7 @@ For terminology in this plan, a finite-state automaton (FSA) is a finite protoco
 - [x] (2026-07-21 11:03+02:00) Completed parallel architecture audits for current source seams and future IFDS/IDE, FSA, WPDS, and synchronized call/field pushdown consumers.
 - [x] (2026-07-21 15:30+02:00) Froze the oracle quality, identity, limits, boundary-port, access-path, alias, and update-eligibility vocabulary in `src/analyzer/semantic/oracle.rs`. Twenty-one adversarial synthetic contract tests now cover scoped relation arenas, exact query/context ownership, store/base/root identity, validated call ports and bindings, bounded paths and sets, proof quality, and conservative strong updates.
 - [x] (2026-07-21 15:30+02:00) Separated `WorkspaceSemanticOracle` from ICFG stitching, added explicit target-set coverage, replaced generic language checks with typed semantic-gap impacts, validated complete artifact generations, and preserved partial dispatch artifacts with exact work/provenance accounting. Existing C++ gap and Ruby non-regression behavior remains covered.
-- [ ] (2026-07-21 15:53+02:00) Run focused validation and specialist review of the contract checkpoint, fix accepted findings, and commit the Ultra milestone. Completed: all accepted contract/workspace findings; 21 oracle-contract, 10 semantic-IR, 25 ICFG-contract, 129 language-conformance, 11 provider, and 114 semantic unit tests; formatting/diff checks; and isolated strict all-target/all-feature Clippy. The host-access feature suite passed 1,484 library tests with four intentional ignores and every integration target through `get_definition_test`; that stale branch target passed 565/568 and failed only the three C++ regressions corrected by upstream `0955e1c7` / PR #1020. Remaining: checkpoint commit and post-commit audit; rebasing the eight-commit-stale issue branch is intentionally not performed without user authorization.
+- [x] (2026-07-21 17:10+02:00) Completed the Ultra contract/dispatch checkpoint and its post-commit adversarial review. The initial architecture landed in `0f39b450`; the follow-up checkpoint incorporates every accepted relation-arena, componentwise-quality, grouped-binding, finite-limit, cancellation, and target-projection finding. Independent validation passed 127 semantic unit tests, 41 oracle-contract tests, 11 semantic-IR tests, 25 ICFG-contract tests, 129 language-conformance tests, and 11 provider tests, plus formatting/diff checks and isolated strict all-target/all-feature Clippy. The earlier host-access feature suite passed 1,484 library tests with four intentional ignores and every integration target through `get_definition_test`; that stale branch target passed 565/568 and failed only the three C++ regressions corrected by upstream `0955e1c7` / PR #1020. Rebasing the eight-commit-stale issue branch remains intentionally out of scope without user authorization.
 - [ ] Extract the shared no-semantic-change procedure/call lowering substrate identified after the all-language rollout.
 - [ ] Emit real parameter, receiver, local, allocation, assignment, call-actual/result, return, basic memory, and capture facts from the TypeScript/JavaScript and Java adapters.
 - [ ] Implement `ValueFlowOracle` and candidate-specific `CallBindings` over those scoped facts.
@@ -83,6 +83,27 @@ For terminology in this plan, a finite-state automaton (FSA) is a finite protoco
 - Observation: Java is the strongest static reference language. Its usage graph already has bounded declared-type, local/parameter, allocation, factory-return, overload, shadowing, and same-name-negative behavior that differs materially from JavaScript.
   Evidence: `src/analyzer/usages/java_graph/inverted.rs`, `return_type.rs`, `local_inference.rs`, and their focused Java usage tests.
 
+- Observation: proof and completeness must be checked componentwise; a proven-but-partial row and an unproven-but-complete row cannot jointly justify a proven-complete result.
+  Evidence: the post-milestone audit constructed asymmetric evidence sets for dispatch, value flow, points-to, and call bindings. Relation records and result constructors now require every claimed axis from the same supporting evidence, and argument cardinality counts only proven mappings.
+
+- Observation: a call-scoped relation kind is not enough to identify a dispatch arm, and one visible relation handle retains its entire arena through `Arc`.
+  Evidence: review could reseal one candidate relation for a different procedure, reuse one boundary relation across contradictory boundary kinds, and publish a narrow result backed by an arena built under wider record/evidence limits. Candidate records now name the exact `ProcedureHandle`, boundary records name the full `DispatchBoundaryKind`, and every public result revalidates all distinct retained arenas against its query limits.
+
+- Observation: the old `Box<[ValueId]>` call-argument vocabulary cannot state direct versus spread arguments or one-versus-rest formals without language-shaped side channels.
+  Evidence: schema v5 adds structured argument expansion/domain and formal multiplicity, while grouped candidate-specific bindings retain evidence-backed member mappings and proof-aware cardinality. Existing adapters publish `Unclassified` rather than manufacturing direct/spread semantics; TypeScript/Java refinement remains a later milestone.
+
+- Observation: finite post-publication validation is too late when a public constructor or CFG builder can allocate unbounded iterators or owned language-domain text first.
+  Evidence: candidate provenance and argument-group iterators now use bounded lookahead, call bindings have an explicit entry cap, object/location sets have typed breadth constructors, and `ProcedureCfgBuilder` prospectively charges language-defined value/rest/argument text before retention.
+
+- Observation: cancellation, truncation, and exact target projection must remain independent even in partial workspace answers.
+  Evidence: cancelled dispatch now groups semantic target identities before applying caps, preserves resolved targets as typed unmaterialized boundaries, reports inner `Truncated` coverage for omissions, and keeps outer `Cancelled` precedence over simultaneous budget states. Late materialization cancellation projects the current and remaining known target groups with cap-aware one-item lookahead rather than collecting an unbounded tail. Named boundary provenance uses target evidence; gap evidence retains its kind before handle deduplication.
+
+- Observation: preserving cancellation at workspace dispatch is insufficient if a downstream ICFG projection or snapshot finalizer can relabel the same interrupted operation as budget exhaustion.
+  Evidence: a failed call-transfer payload charge and an already budget-limited snapshot both previously selected `ExceededBudget` before inspecting cancellation. Dedicated finalizers now keep the outer result `Cancelled`, retain only atomically charged partials, and preserve independent inner truncation evidence.
+
+- Observation: a procedure-wide C++ syntax-error gap means the adapter may have omitted call sites; it does not invalidate a different exact call that was retained and resolved.
+  Evidence: removing `DispatchCoverage` from that procedure-wide `Calls` gap leaves call-scoped uncertainty intact, and the focused C++ semantic regression keeps the unrelated exact call proven and exhaustive.
+
 ## Decision Log
 
 - Decision: separate candidate proof, candidate-set coverage, and abstract-object cardinality.
@@ -103,6 +124,22 @@ For terminology in this plan, a finite-state automaton (FSA) is a finite protoco
 
 - Decision: make `CallBindings` candidate-specific. One binding result names one exact call site and one candidate callee, then maps caller receiver/actual values to callee ports and callee return/throw ports back to caller result slots.
   Rationale: overloads and dynamic dispatch can select procedures with different formal layouts. Merging bindings before choosing a callee would manufacture cross-target parameter and return relations.
+  Date: 2026-07-21.
+
+- Decision: represent call arguments as structured direct, spread, or unclassified rows; represent formals as one or domain-specific rest slots; and bind them through evidence-backed argument groups.
+  Rationale: rest/spread expansion is one-to-many and may be open or truncated, so a flat actual-to-formal pair list cannot distinguish an exact empty spread from an omitted mapping. Group coverage and proof-aware `Exact`, `Between`, or `AtLeast` cardinality preserve both axes without embedding JavaScript, Python, or Java rules in the neutral contract.
+  Date: 2026-07-21.
+
+- Decision: make dispatch provenance arm-specific and seal candidates only after the complete result validates the exact call, target, boundary fact, quality, uniqueness, and query limits.
+  Rationale: call ownership alone allowed one valid relation to be reused for a contradictory target or boundary subtype. Full structured subjects make candidate-specific bindings and deferred ICFG projection consume the same exact fact that dispatch published.
+  Date: 2026-07-21.
+
+- Decision: apply oracle limits to the complete retained object graph, not only visible vectors, and bound iterator consumption before collection.
+  Rationale: one relation handle retains every record and evidence handle in its arena. Result constructors therefore aggregate distinct arenas, candidates reject duplicate or over-limit provenance with one-item lookahead, call groups and bindings have an explicit entry limit, and typed object/location sets prevent selecting the wrong breadth dimension.
+  Date: 2026-07-21.
+
+- Decision: outer cancellation takes precedence over simultaneous budget interruption while inner coverage continues to record independent truncation.
+  Rationale: operation timing must not flip an otherwise identical cancelled query into `ExceededBudget`, whether interruption occurs during target materialization, call-transfer projection, or snapshot finalization. Consumers need both facts: the operation stopped because of cancellation, and a finite cap may also have omitted target arms. Known resolver targets remain typed partial boundaries, but construction stops at the applicable target, record, or evidence cap and records the omission as `Truncated`.
   Date: 2026-07-21.
 
 - Decision: define an access path as a symbolic root, a bounded sequence of typed selectors, and an explicit `Exact` or `Summary` tail.
@@ -163,7 +200,7 @@ For terminology in this plan, a finite-state automaton (FSA) is a finite protoco
 
 ## Outcomes & Retrospective
 
-Issue #816 remains open, but its Ultra contract/dispatch checkpoint is complete in the working tree. The checkpoint freezes finite evidence-backed oracle vocabulary, exact query and relation ownership, bounded access paths and contexts, strong-update proof obligations, explicit dispatch coverage, typed gap impacts, complete artifact-key validation, and a separate workspace dispatch facade. It does not implement `ValueFlowOracle` or `HeapOracle`, emit real TypeScript/Java value and heap relations, route receiver queries through the facade, or claim language-backed closed dispatch.
+Issue #816 remains open, but its Ultra contract/dispatch checkpoint is complete on the issue branch. The checkpoint freezes semantic IR schema v5; finite evidence-backed oracle vocabulary; exact query, dispatch-arm, and relation-arena ownership; structured direct/spread/unclassified arguments and one/rest formals; proof-aware grouped call bindings; bounded access paths, contexts, retained arenas, and partial target projection; strong-update proof obligations; explicit dispatch coverage; typed gap impacts; complete artifact-key validation; stable cancellation semantics; and a separate workspace dispatch facade. It does not implement `ValueFlowOracle` or `HeapOracle`, emit real TypeScript/Java value and heap relations, route receiver queries through the facade, or claim language-backed closed dispatch.
 
 The remaining shared-lowering extraction and TypeScript/Java vertical slices are now concrete implementation work suitable for High reasoning. Later milestones still need real oracle implementations, receiver compatibility, dispatch refinement, and measurement before #816 itself can be accepted.
 
@@ -486,3 +523,5 @@ Plan revision note (2026-07-21): Initial focused issue plan written after live d
 Plan revision note (2026-07-21): Reconciled the durable contract narrative after specialist review without advancing implementation status. Renamed the generation-bound facade to `WorkspaceSemanticOracle`; made bounded context part of value-flow and call-binding results and relation ownership; made call bindings query a validated dispatch candidate; described aliasing as one same-observation query; and clarified that `StoreAtPoint` binds the exact store event, full structured address path, and stored value so `update_eligibility` does not accept an independently selected location. Added a self-contained glossary for the prospective FSA, IFDS, IDE, WPDS, and SPDS consumers.
 
 Plan revision note (2026-07-21): Reconciled the implemented Ultra checkpoint after adversarial contract and workspace-dispatch review. Query-bearing result wrappers now retain exact observation identity; relation arenas validate full owners, contexts, evidence kinds, and evidence quality; store observations bind the exact base and root; public result construction is bounded and contradiction-checked; raw dispatch exploration is budgeted separately from final unique target caps; and typed gap scope drives ICFG weakening. This checkpoint deliberately stops before shared lowering, real TypeScript/Java value and heap facts, oracle implementations, receiver projection, dispatch refinement, and measurement.
+
+Plan revision note (2026-07-21): Closed the post-commit Ultra audit after schema v5 grouped-call-binding hardening, whole-arena limit validation, exact dispatch target and full boundary subjects, cap-aware partial target retention, and cancellation-precedence fixes at workspace, call-transfer, and snapshot layers. The remaining milestones are implementation-oriented and can proceed under High reasoning.

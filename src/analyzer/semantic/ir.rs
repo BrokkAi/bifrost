@@ -258,11 +258,54 @@ pub struct ProcedureProperties {
     pub invocation: ProcedureInvocationKind,
 }
 
+/// The positional or keyword domain accepted or produced at a call boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ArgumentDomain {
+    Positional,
+    Keyword,
+    PositionalOrKeyword,
+    LanguageDefined(Box<str>),
+}
+
+impl ArgumentDomain {
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Positional => "positional",
+            Self::Keyword => "keyword",
+            Self::PositionalOrKeyword => "positional_or_keyword",
+            Self::LanguageDefined(_) => "language_defined",
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+pub enum FormalMultiplicity {
+    #[default]
+    One,
+    Rest(ArgumentDomain),
+}
+
+impl FormalMultiplicity {
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::One => "one",
+            Self::Rest(_) => "rest",
+        }
+    }
+
+    pub const fn is_rest(&self) -> bool {
+        matches!(self, Self::Rest(_))
+    }
+}
+
 /// The semantic role of a value row.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SemanticValueKind {
     Local,
-    Parameter { ordinal: u32 },
+    Parameter {
+        ordinal: u32,
+        multiplicity: FormalMultiplicity,
+    },
     Receiver,
     Return,
     Temporary,
@@ -271,6 +314,67 @@ pub enum SemanticValueKind {
     Callable,
     AwaitResult,
     LanguageDefined(Box<str>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CallArgumentExpansion {
+    Unclassified,
+    Direct(ArgumentDomain),
+    Spread(ArgumentDomain),
+}
+
+impl CallArgumentExpansion {
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Unclassified => "unclassified",
+            Self::Direct(_) => "direct",
+            Self::Spread(_) => "spread",
+        }
+    }
+
+    pub const fn domain(&self) -> Option<&ArgumentDomain> {
+        match self {
+            Self::Unclassified => None,
+            Self::Direct(domain) | Self::Spread(domain) => Some(domain),
+        }
+    }
+
+    pub const fn is_spread(&self) -> bool {
+        matches!(self, Self::Spread(_))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SemanticCallArgument {
+    pub value: ValueId,
+    pub expansion: CallArgumentExpansion,
+}
+
+impl SemanticCallArgument {
+    /// Construct a direct argument when structured lowering established that
+    /// the source is not a spread.
+    pub fn direct(value: ValueId) -> Self {
+        Self {
+            value,
+            expansion: CallArgumentExpansion::Direct(ArgumentDomain::PositionalOrKeyword),
+        }
+    }
+
+    /// Preserve the pre-v5 contract without manufacturing direct/spread or
+    /// positional/keyword semantics. Adapters refine this row only from their
+    /// structured syntax.
+    pub fn unclassified(value: ValueId) -> Self {
+        Self {
+            value,
+            expansion: CallArgumentExpansion::Unclassified,
+        }
+    }
+}
+
+impl From<ValueId> for SemanticCallArgument {
+    fn from(value: ValueId) -> Self {
+        Self::unclassified(value)
+    }
 }
 
 impl SemanticValueKind {
@@ -581,7 +685,7 @@ pub struct SemanticCallSite {
     pub point: ProgramPointId,
     pub callee: ValueId,
     pub receiver: Option<ValueId>,
-    pub arguments: Box<[ValueId]>,
+    pub arguments: Box<[SemanticCallArgument]>,
     pub result: Option<ValueId>,
     pub thrown: Option<ValueId>,
     /// Targets named or established by local syntax/declaration semantics.
@@ -2093,8 +2197,21 @@ fn measure_artifact_work(
         account_locator(&procedure.locator, &mut work);
 
         for value in &procedure.values {
-            if let SemanticValueKind::LanguageDefined(name) = &value.kind {
-                account_text(name, &mut work);
+            match &value.kind {
+                SemanticValueKind::LanguageDefined(name) => account_text(name, &mut work),
+                SemanticValueKind::Parameter {
+                    multiplicity: FormalMultiplicity::Rest(ArgumentDomain::LanguageDefined(name)),
+                    ..
+                } => account_text(name, &mut work),
+                SemanticValueKind::Local
+                | SemanticValueKind::Parameter { .. }
+                | SemanticValueKind::Receiver
+                | SemanticValueKind::Return
+                | SemanticValueKind::Temporary
+                | SemanticValueKind::Constant
+                | SemanticValueKind::Exception
+                | SemanticValueKind::Callable
+                | SemanticValueKind::AwaitResult => {}
             }
         }
         for allocation in &procedure.allocations {
@@ -2120,6 +2237,11 @@ fn measure_artifact_work(
             work.nested_entries = work
                 .nested_entries
                 .saturating_add(call_site.arguments.len());
+            for argument in &call_site.arguments {
+                if let Some(ArgumentDomain::LanguageDefined(name)) = argument.expansion.domain() {
+                    account_text(name, &mut work);
+                }
+            }
             account_target_resolution(&call_site.declared_targets, &mut work);
         }
         for mapping in &procedure.source_mappings {
@@ -2457,8 +2579,18 @@ fn validate_procedure(
         gap_index.insert(id, gap)?;
     }
 
+    let mut parameter_ordinals = HashSet::default();
     for value in &procedure.values {
         validate_metadata(id, value.source, value.evidence, procedure, "value")?;
+        if let SemanticValueKind::Parameter { ordinal, .. } = &value.kind
+            && !parameter_ordinals.insert(*ordinal)
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::CallContract,
+                format!("parameter ordinal {ordinal} is published more than once"),
+            ));
+        }
     }
     if !procedure.values.is_empty() {
         require_capability(id, capabilities, SemanticCapability::Values, "value rows")?;
@@ -3113,7 +3245,7 @@ fn validate_call_site(
         ensure_value(id, receiver, procedure.values.len(), "call receiver")?;
     }
     for argument in &call_site.arguments {
-        ensure_value(id, *argument, procedure.values.len(), "call argument")?;
+        ensure_value(id, argument.value, procedure.values.len(), "call argument")?;
     }
     if let Some(result) = call_site.result {
         ensure_value(id, result, procedure.values.len(), "call result")?;

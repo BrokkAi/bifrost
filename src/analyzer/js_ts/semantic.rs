@@ -2487,7 +2487,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             point: invoke,
             callee,
             receiver,
-            arguments: arguments.into_boxed_slice(),
+            arguments: arguments.into_iter().map(Into::into).collect(),
             result: Some(result),
             thrown: Some(thrown),
             declared_targets: resolution.clone(),
