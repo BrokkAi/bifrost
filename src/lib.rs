@@ -17,6 +17,7 @@ pub mod mcp_common;
 pub mod mcp_core;
 pub mod mcp_extended;
 pub mod mcp_nlp;
+pub mod mcp_property_fuzzer;
 pub mod mcp_registry;
 pub mod mcp_slopcop;
 pub mod mcp_text;
