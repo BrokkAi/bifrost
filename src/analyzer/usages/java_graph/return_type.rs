@@ -12,9 +12,16 @@ pub(super) const METHOD_RECEIVER_CHAIN_LIMIT_NAME: &str = "java_method_receiver_
 pub(super) type MethodReturnCacheKey = (ProjectFile, String, Option<String>);
 pub(super) type MethodReturnCache =
     Mutex<HashMap<MethodReturnCacheKey, ReceiverAnalysisOutcome<String>>>;
+pub(super) type MethodAnonymousReturnCache =
+    Mutex<HashMap<MethodReturnCacheKey, ReceiverAnalysisOutcome<String>>>;
 pub(super) type FileReturnCacheKey = (String, Option<String>);
-pub(super) type FileReturnCache =
-    Mutex<HashMap<ProjectFile, HashMap<FileReturnCacheKey, ReceiverAnalysisOutcome<String>>>>;
+pub(super) type FileReturnCache = Mutex<HashMap<ProjectFile, JavaFileReturnFacts>>;
+
+#[derive(Clone, Default)]
+pub(super) struct JavaFileReturnFacts {
+    declared_types: HashMap<FileReturnCacheKey, ReceiverAnalysisOutcome<String>>,
+    anonymous_return_types: HashMap<FileReturnCacheKey, ReceiverAnalysisOutcome<String>>,
+}
 
 pub(super) trait JavaReturnTypeContext {
     fn java(&self) -> &JavaAnalyzer;
@@ -22,6 +29,7 @@ pub(super) trait JavaReturnTypeContext {
     fn source(&self) -> &str;
     fn root(&self) -> Node<'_>;
     fn method_return_cache(&self) -> &MethodReturnCache;
+    fn method_anonymous_return_cache(&self) -> &MethodAnonymousReturnCache;
     fn file_return_cache(&self) -> &FileReturnCache;
 }
 
@@ -117,16 +125,100 @@ where
             .map(|fqn| ReceiverAnalysisOutcome::Precise(vec![fqn]))
             .unwrap_or(ReceiverAnalysisOutcome::Unknown);
     }
-    java_file_return_type_index(ctx, method.source())
+    java_file_return_facts(ctx, method.source())
+        .declared_types
         .get(&(method.fq_name(), method.signature().map(str::to_string)))
         .cloned()
         .unwrap_or(ReceiverAnalysisOutcome::Unknown)
 }
 
-fn java_file_return_type_index<C>(
+pub(super) fn method_anonymous_return_type_for_owner_fqn<C>(
+    owner: &str,
+    name: &str,
+    arity: usize,
     ctx: &C,
-    file: &ProjectFile,
-) -> HashMap<FileReturnCacheKey, ReceiverAnalysisOutcome<String>>
+) -> Option<ReceiverAnalysisOutcome<String>>
+where
+    C: JavaReturnTypeContext + ?Sized,
+{
+    let fqn = format!("{owner}.{name}");
+    let units = ctx
+        .java()
+        .global_usage_definition_index()
+        .by_fqn(&fqn)
+        .iter()
+        .filter(|unit| unit.is_function() && java_callable_arity(ctx.java(), unit).accepts(arity))
+        .cloned()
+        .collect::<Vec<_>>();
+    (!units.is_empty()).then(|| {
+        merge_receiver_type_outcomes(
+            units
+                .iter()
+                .map(|unit| method_unit_anonymous_return_type(unit, ctx)),
+        )
+    })
+}
+
+fn method_unit_anonymous_return_type<C>(
+    method: &CodeUnit,
+    ctx: &C,
+) -> ReceiverAnalysisOutcome<String>
+where
+    C: JavaReturnTypeContext + ?Sized,
+{
+    let cache_key = (
+        method.source().clone(),
+        method.fq_name(),
+        method.signature().map(str::to_string),
+    );
+    if let Some(cached) = ctx
+        .method_anonymous_return_cache()
+        .lock()
+        .expect("java anonymous return cache poisoned")
+        .get(&cache_key)
+        .cloned()
+    {
+        return cached;
+    }
+    let outcome = method_unit_anonymous_return_type_uncached(method, ctx);
+    ctx.method_anonymous_return_cache()
+        .lock()
+        .expect("java anonymous return cache poisoned")
+        .insert(cache_key, outcome.clone());
+    outcome
+}
+
+fn method_unit_anonymous_return_type_uncached<C>(
+    method: &CodeUnit,
+    ctx: &C,
+) -> ReceiverAnalysisOutcome<String>
+where
+    C: JavaReturnTypeContext + ?Sized,
+{
+    let Some(range) = ctx.java().ranges(method).first().copied() else {
+        return ReceiverAnalysisOutcome::Unknown;
+    };
+    if method.source() == ctx.file() {
+        return method_declaration_covering(ctx.root(), &range)
+            .map(|declaration| {
+                method_declaration_anonymous_return_type(
+                    ctx.java(),
+                    ctx.file(),
+                    ctx.source(),
+                    declaration,
+                    method,
+                )
+            })
+            .unwrap_or(ReceiverAnalysisOutcome::Unknown);
+    }
+    java_file_return_facts(ctx, method.source())
+        .anonymous_return_types
+        .get(&(method.fq_name(), method.signature().map(str::to_string)))
+        .cloned()
+        .unwrap_or(ReceiverAnalysisOutcome::Unknown)
+}
+
+fn java_file_return_facts<C>(ctx: &C, file: &ProjectFile) -> JavaFileReturnFacts
 where
     C: JavaReturnTypeContext + ?Sized,
 {
@@ -140,7 +232,7 @@ where
         return cached;
     }
 
-    let index = build_java_file_return_type_index(ctx, file);
+    let index = build_java_file_return_facts(ctx, file);
     ctx.file_return_cache()
         .lock()
         .expect("java file return cache poisoned")
@@ -148,48 +240,55 @@ where
     index
 }
 
-fn build_java_file_return_type_index<C>(
-    ctx: &C,
-    file: &ProjectFile,
-) -> HashMap<FileReturnCacheKey, ReceiverAnalysisOutcome<String>>
+fn build_java_file_return_facts<C>(ctx: &C, file: &ProjectFile) -> JavaFileReturnFacts
 where
     C: JavaReturnTypeContext + ?Sized,
 {
     let Ok(source) = file.read_to_string() else {
-        return HashMap::default();
+        return JavaFileReturnFacts::default();
     };
     let mut parser = Parser::new();
     if parser
         .set_language(&tree_sitter_java::LANGUAGE.into())
         .is_err()
     {
-        return HashMap::default();
+        return JavaFileReturnFacts::default();
     }
     let Some(tree) = parser.parse(source.as_str(), None) else {
-        return HashMap::default();
+        return JavaFileReturnFacts::default();
     };
-    ctx.java()
+    let mut facts = JavaFileReturnFacts::default();
+    for unit in ctx
+        .java()
         .declarations(file)
         .into_iter()
         .filter(|unit| unit.is_function())
-        .map(|unit| {
-            let outcome = ctx
-                .java()
-                .ranges(&unit)
-                .first()
-                .copied()
-                .and_then(|range| java_return_type_node_covering(tree.root_node(), &range))
-                .and_then(|type_node| {
-                    java_declared_type_fqn(ctx.java(), file, &source, type_node, &unit)
-                })
-                .map(|fqn| ReceiverAnalysisOutcome::Precise(vec![fqn]))
-                .unwrap_or(ReceiverAnalysisOutcome::Unknown);
-            (
-                (unit.fq_name(), unit.signature().map(str::to_string)),
-                outcome,
-            )
-        })
-        .collect()
+    {
+        let key = (unit.fq_name(), unit.signature().map(str::to_string));
+        let declaration = ctx
+            .java()
+            .ranges(&unit)
+            .first()
+            .copied()
+            .and_then(|range| method_declaration_covering(tree.root_node(), &range));
+        let declared_type = declaration
+            .and_then(|method| method.child_by_field_name("type"))
+            .and_then(|type_node| {
+                java_declared_type_fqn(ctx.java(), file, &source, type_node, &unit)
+            })
+            .map(|fqn| ReceiverAnalysisOutcome::Precise(vec![fqn]))
+            .unwrap_or(ReceiverAnalysisOutcome::Unknown);
+        let anonymous_return_type = declaration
+            .map(|method| {
+                method_declaration_anonymous_return_type(ctx.java(), file, &source, method, &unit)
+            })
+            .unwrap_or(ReceiverAnalysisOutcome::Unknown);
+        facts.declared_types.insert(key.clone(), declared_type);
+        facts
+            .anonymous_return_types
+            .insert(key, anonymous_return_type);
+    }
+    facts
 }
 
 fn java_declared_type_fqn(
@@ -377,6 +476,80 @@ fn java_return_type_node_covering<'tree>(root: Node<'tree>, range: &Range) -> Op
         }
     }
     result
+}
+
+fn method_declaration_covering<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
+            continue;
+        }
+        if node.kind() == "method_declaration" {
+            return Some(node);
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    None
+}
+
+fn method_declaration_anonymous_return_type(
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    method: Node<'_>,
+    declaration: &CodeUnit,
+) -> ReceiverAnalysisOutcome<String> {
+    let Some(body) = method.child_by_field_name("body") else {
+        return ReceiverAnalysisOutcome::Unknown;
+    };
+    let mut return_types = Vec::new();
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "return_statement" {
+            let Some(value) = node
+                .child_by_field_name("value")
+                .or_else(|| node.named_child(0))
+            else {
+                return ReceiverAnalysisOutcome::Unknown;
+            };
+            if value.kind() != "object_creation_expression" || !has_anonymous_class_body(value) {
+                return ReceiverAnalysisOutcome::Unknown;
+            }
+            let Some(type_node) = value.child_by_field_name("type") else {
+                return ReceiverAnalysisOutcome::Unknown;
+            };
+            let Some(fqn) = java_declared_type_fqn(java, file, source, type_node, declaration)
+            else {
+                return ReceiverAnalysisOutcome::Unknown;
+            };
+            return_types.push(fqn);
+            continue;
+        }
+        if matches!(
+            node.kind(),
+            "class_declaration" | "interface_declaration" | "lambda_expression"
+        ) {
+            continue;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    (!return_types.is_empty())
+        .then_some(ReceiverAnalysisOutcome::Precise(return_types))
+        .unwrap_or(ReceiverAnalysisOutcome::Unknown)
+}
+
+fn has_anonymous_class_body(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| child.kind() == "class_body")
 }
 
 pub(super) fn merge_receiver_type_outcomes(
