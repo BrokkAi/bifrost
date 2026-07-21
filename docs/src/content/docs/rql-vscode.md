@@ -11,6 +11,8 @@ With the Bifrost language server running and indexed, use the Play button in
 an RQL editor title to execute the current document. Unsaved edits are sent to
 the active LSP session, so you can refine a query without first saving it.
 
+For `(explain QUERY)` and `(profile QUERY)`, the extension shows the report in the Bifrost output channel. Profile output includes the complete versioned JSON telemetry, while its nested ordinary results remain available in the grouped query-results tree. Explain mode is planning-only and therefore does not show a misleading “no results” notification. See [Explain and Profile CodeQuery](/code-query-explain-profile/).
+
 Use VS Code's **Format Document** command to format `.rql` and saved `.rune`
 files through the Bifrost language server. Bracketed forms remain on one line
 through 120 columns. Longer forms place their entries on indented lines and

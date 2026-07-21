@@ -95,6 +95,16 @@ The many per-rule tuning knobs on code-quality smell reports are accepted throug
 
 `CodeQueryResult.results` contains seven possible classes according to each item's `result_type`: `CodeQueryMatch`, `CodeQueryDeclaration`, `CodeQueryReferenceSite`, `CodeQueryCallSite`, `CodeQueryExpressionSite`, `CodeQueryReceiverAnalysis`, and `CodeQueryFile`. A receiver analysis row remains present for `unknown`, `unsupported`, and `exceeded_budget`; always inspect `outcome`, `reason`, `limit`, result-level `truncated`, and diagnostics before consuming candidates. Compact output is the default and retains minimal provenance for derived results. Pass `result_detail="full"` when a rule, refactoring step, or follow-up tool call needs deterministic IDs, 1-based character columns, decorator ranges, and capture ranges.
 
+The optional `execution_mode` selects the response contract. Omit it or pass
+`"results"` for `CodeQueryResult`. `"explain"` returns `CodeQueryExplain`
+without executing the query; the response exposes `parsed_query`,
+`logical_plan`, `physical_plan`, and the scheduling selection. `"profile"`
+executes the query and returns `CodeQueryProfile`, whose typed `.result` is
+accompanied by `.explain`, `.timings_ns`, `.work`, `.cache_layers`,
+`.scheduling`, and per-operator observations. Timings are elapsed nanoseconds;
+the per-operator `temporary_capacity_bytes_lower_bound` is a lower-bound
+container-capacity estimate rather than peak process memory.
+
 ## Tests
 
 Run the Python test suite with:

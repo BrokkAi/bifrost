@@ -1,5 +1,5 @@
 use super::super::kinds::{NormalizedKind, Role};
-use super::schema::QueryStepOp;
+use super::schema::{CodeQueryExecutionMode, QueryStepOp};
 use crate::analyzer::Language;
 use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
 use regex::Regex;
@@ -381,6 +381,7 @@ pub struct CodeQuery {
     pub plan: CodeQueryPlan,
     pub limit: usize,
     pub result_detail: CodeQueryResultDetail,
+    pub execution_mode: CodeQueryExecutionMode,
 }
 
 impl CodeQuery {

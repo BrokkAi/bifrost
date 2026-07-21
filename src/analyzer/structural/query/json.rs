@@ -19,6 +19,10 @@ impl CodeQuery {
             "result_detail".to_string(),
             json!(self.result_detail.label()),
         );
+        object.insert(
+            "execution_mode".to_string(),
+            json!(self.execution_mode.label()),
+        );
         Value::Object(object)
     }
 

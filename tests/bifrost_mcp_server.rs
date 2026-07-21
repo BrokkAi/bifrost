@@ -834,6 +834,84 @@ fn bifrost_mcp_dispatches_distinct_location_navigation_results() {
 }
 
 #[test]
+fn bifrost_mcp_query_code_transports_explain_and_profile_reports() {
+    let fixture_root = TempDir::new().expect("temp dir");
+    fs::write(fixture_root.path().join("App.java"), "class App {}\n").expect("write fixture");
+    let mut child = spawn_server(fixture_root.path(), "extended", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let explain = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 40,
+            "method": "tools/call",
+            "params": {
+                "name": "query_code",
+                "arguments": {
+                    "execution_mode": "explain",
+                    "match": {"kind": "class", "name": "App"}
+                }
+            }
+        }),
+    );
+    assert_eq!(explain["result"]["isError"], false, "{explain}");
+    assert_eq!(
+        explain["result"]["structuredContent"]["format"],
+        "bifrost_code_query_explain/v1"
+    );
+    assert!(
+        explain["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("planning only")),
+        "{explain}"
+    );
+
+    let profile = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "tools/call",
+            "params": {
+                "name": "query_code",
+                "arguments": {
+                    "execution_mode": "profile",
+                    "match": {"kind": "class", "name": "App"}
+                }
+            }
+        }),
+    );
+    assert_eq!(profile["result"]["isError"], false, "{profile}");
+    assert_eq!(
+        profile["result"]["structuredContent"]["format"],
+        "bifrost_code_query_profile/v1"
+    );
+    assert_eq!(
+        profile["result"]["structuredContent"]["result"]["results"][0]["kind"],
+        "class"
+    );
+    assert!(
+        profile["result"]["structuredContent"]["operators"]
+            .as_array()
+            .is_some_and(|operators| !operators.is_empty()),
+        "{profile}"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
 fn bifrost_split_servers_publish_expected_tool_sets() {
     let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

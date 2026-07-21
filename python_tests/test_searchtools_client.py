@@ -7,21 +7,30 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from bifrost_searchtools import (
+    CodeQueryCacheLayerKind,
+    CodeQueryCacheMetricsKind,
     CodeQueryCallSite,
     CodeQueryCompletionKind,
     CodeQueryDiagnosticCode,
     CodeQueryDiagnosticImpact,
     CodeQueryExpressionSite,
+    CodeQueryExplain,
     CodeQueryFile,
     CodeQueryMatch,
+    CodeQueryOperatorDisposition,
+    CodeQueryPhysicalOperator,
+    CodeQueryProfile,
+    CodeQueryProfileCacheCounters,
     CodeQueryReferenceSite,
     CodeQueryResult,
+    CodeQueryStructuralFactsCacheCounters,
     ContainerKind,
     DeclarationLookupResult,
     DefinitionLookupResult,
@@ -35,7 +44,11 @@ from bifrost_searchtools import (
     XmlSelectOutput,
     tool_descriptors,
 )
-from bifrost_searchtools.models import SemanticSearchResult, SemanticSearchStatus
+from bifrost_searchtools.models import (
+    SemanticSearchResult,
+    SemanticSearchStatus,
+    parse_code_query_response,
+)
 
 
 def _init_git_repo(root: Path) -> None:
@@ -60,7 +73,274 @@ def _git_commit(root: Path, message: str) -> None:
     )
 
 
+def _code_query_explain_payload() -> dict:
+    return {
+        "format": "bifrost_code_query_explain/v1",
+        "query_schema_version": 2,
+        "parsed_query": {
+            "schema_version": 2,
+            "match": {"kind": "class", "name": "A"},
+            "where": ["src/**"],
+            "limit": 20,
+            "result_detail": "compact",
+            "execution_mode": "explain",
+            "future_parse_fact": "retained",
+        },
+        "logical_plan": {
+            "root": 1,
+            "nodes": [
+                {
+                    "id": 0,
+                    "operation": {
+                        "kind": "seed",
+                        "seed": {"match": {"kind": "class", "name": "A"}},
+                    },
+                    "output_kind": "structural_match",
+                    "dependencies": [],
+                },
+                {
+                    "id": 1,
+                    "operation": {"kind": "limit", "count": 20},
+                    "output_kind": "structural_match",
+                    "dependencies": [0],
+                },
+            ],
+        },
+        "physical_plan": {
+            "root": 1,
+            "nodes": [
+                {
+                    "id": 0,
+                    "logical_node": 0,
+                    "operator": "seed_scan",
+                    "output_kind": "structural_match",
+                    "dependencies": [],
+                },
+                {
+                    "id": 1,
+                    "logical_node": 1,
+                    "operator": "limit",
+                    "output_kind": "structural_match",
+                    "dependencies": [0],
+                    "future_physical_fact": True,
+                },
+            ],
+        },
+        "scheduling": {
+            "policy": "auto",
+            "selected": "sequential",
+            "max_concurrency": 1,
+            "selection_reason": "production policy",
+        },
+    }
+
+
+def _code_query_profile_payload() -> dict:
+    return {
+        "format": "bifrost_code_query_profile/v1",
+        "result": {"results": [], "truncated": False, "diagnostics": []},
+        "explain": _code_query_explain_payload(),
+        "timings_ns": {
+            "planning": 11,
+            "execution": 22,
+            "rendering": 33,
+            "total": 66,
+        },
+        "work": {
+            "scanned_files": 1,
+            "scanned_source_bytes": 120,
+            "fact_nodes": 4,
+            "pipeline_rows": 3,
+            "examined_references": 2,
+            "provenance_steps": 1,
+            "import_files_resolved": 0,
+            "import_edges_resolved": 0,
+        },
+        "cache_layers": [
+            {
+                "layer": "seed_result",
+                "metrics": {
+                    "kind": "complete_value",
+                    "lookups": 1,
+                    "hits": 1,
+                    "future_counter": 7,
+                },
+            },
+            {
+                "layer": "seed_structural_facts",
+                "metrics": {
+                    "kind": "structural_facts",
+                    "lookups": 1,
+                    "memory_hits": 1,
+                    "replayed_files": 1,
+                },
+            },
+        ],
+        "scheduling": {
+            "peak_concurrency": 1,
+            "bounded_dispatch": {
+                "worker_limit": 4,
+                "workers_spawned": 1,
+                "tasks_enqueued": 1,
+                "tasks_started": 1,
+                "tasks_completed": 1,
+                "peak_concurrency": 1,
+                "future_scheduler_fact": 9,
+            },
+        },
+        "operators": [
+            {
+                "node": 0,
+                "branch": [0],
+                "operator": "seed_scan",
+                "disposition": "completed",
+                "timings_ns": {
+                    "elapsed": 20,
+                    "total": 22,
+                    "dependency_execution": 0,
+                    "dependency_wait": 0,
+                    "merge": 1,
+                    "scheduling_overhead": 1,
+                },
+                "input_rows": 0,
+                "rows_visited": 1,
+                "relation_expansions": 0,
+                "rows_discarded": None,
+                "output_rows": 1,
+                "temporary_capacity_bytes_lower_bound": 128,
+                "work": {"scanned_files": 1},
+                "cache_layers": [
+                    {
+                        "layer": "seed_result",
+                        "metrics": {
+                            "kind": "complete_value",
+                            "lookups": 1,
+                            "misses": 1,
+                        },
+                    }
+                ],
+                "terminations": ["result_limit"],
+                "operator_truncated": False,
+                "result_truncated": False,
+                "result_cancelled": False,
+            }
+        ],
+        "future_profile_fact": "retained",
+    }
+
+
 class CodeQueryModelTest(unittest.TestCase):
+    def test_explain_response_parses_typed_plan_layers(self) -> None:
+        response = parse_code_query_response(
+            _code_query_explain_payload(), rendered_text="server explain"
+        )
+
+        self.assertIsInstance(response, CodeQueryExplain)
+        self.assertEqual(response.parsed_query.source_kind, "match")
+        self.assertEqual(response.parsed_query.where, ["src/**"])
+        self.assertEqual(response.parsed_query.execution_mode, "explain")
+        self.assertEqual(
+            response.parsed_query.extra["future_parse_fact"], "retained"
+        )
+        self.assertEqual(response.logical_plan.nodes[1].operation.kind, "limit")
+        self.assertEqual(response.logical_plan.nodes[1].operation.count, 20)
+        self.assertEqual(response.physical_plan.nodes[1].dependencies, [0])
+        self.assertIs(
+            response.physical_plan.nodes[1].operator,
+            CodeQueryPhysicalOperator.LIMIT,
+        )
+        self.assertTrue(
+            response.physical_plan.nodes[1].extra["future_physical_fact"]
+        )
+        self.assertEqual(response.scheduling.selected, "sequential")
+        self.assertEqual(
+            response.scheduling.extra["selection_reason"], "production policy"
+        )
+        self.assertEqual(response.render_text(), "server explain")
+
+    def test_profile_response_parses_results_observations_and_future_metrics(self) -> None:
+        response = parse_code_query_response(
+            _code_query_profile_payload(), rendered_text="server profile"
+        )
+
+        self.assertIsInstance(response, CodeQueryProfile)
+        self.assertIsInstance(response.result, CodeQueryResult)
+        self.assertIsInstance(response.explain, CodeQueryExplain)
+        self.assertEqual(response.timings_ns.total, 66)
+        self.assertEqual(response.work.scanned_source_bytes, 120)
+        self.assertIs(
+            response.cache_layers[0].layer, CodeQueryCacheLayerKind.SEED_RESULT
+        )
+        self.assertIsInstance(
+            response.cache_layers[0].metrics, CodeQueryProfileCacheCounters
+        )
+        self.assertIs(
+            response.cache_layers[0].metrics.kind,
+            CodeQueryCacheMetricsKind.COMPLETE_VALUE,
+        )
+        self.assertEqual(response.cache_layers[0].metrics.hits, 1)
+        self.assertEqual(response.cache_layers[0].metrics.extra["future_counter"], 7)
+        self.assertIsInstance(
+            response.cache_layers[1].metrics,
+            CodeQueryStructuralFactsCacheCounters,
+        )
+        self.assertEqual(response.scheduling.bounded_dispatch.worker_limit, 4)
+        self.assertEqual(
+            response.scheduling.bounded_dispatch.extra["future_scheduler_fact"], 9
+        )
+        self.assertEqual(response.operators[0].timings_ns.elapsed, 20)
+        self.assertEqual(response.operators[0].node, 0)
+        self.assertIs(
+            response.operators[0].disposition,
+            CodeQueryOperatorDisposition.COMPLETED,
+        )
+        self.assertIsNone(response.operators[0].rows_discarded)
+        self.assertIs(
+            response.operators[0].cache_layers[0].layer,
+            CodeQueryCacheLayerKind.SEED_RESULT,
+        )
+        self.assertEqual(response.extra["future_profile_fact"], "retained")
+        self.assertEqual(response.render_text(), "server profile")
+
+    def test_query_code_forwards_execution_mode_and_dispatches_by_format(self) -> None:
+        calls: list[tuple[str, dict]] = []
+        client = object.__new__(SearchToolsClient)
+        payloads = {
+            "results": {"results": [], "truncated": False},
+            "explain": _code_query_explain_payload(),
+            "profile": _code_query_profile_payload(),
+        }
+
+        def call_tool_payload(tool: str, arguments: dict) -> SimpleNamespace:
+            calls.append((tool, arguments))
+            return SimpleNamespace(
+                structured=payloads[arguments["execution_mode"]],
+                rendered_text=f"server {arguments['execution_mode']}",
+            )
+
+        client._call_tool_payload = call_tool_payload
+        results = client.query_code({"kind": "class"}, execution_mode="results")
+        explain = client.query_code({"kind": "class"}, execution_mode="explain")
+        profile = client.query_code({"kind": "class"}, execution_mode="profile")
+
+        self.assertIsInstance(results, CodeQueryResult)
+        self.assertIsInstance(explain, CodeQueryExplain)
+        self.assertIsInstance(profile, CodeQueryProfile)
+        self.assertEqual(
+            [arguments["execution_mode"] for _, arguments in calls],
+            ["results", "explain", "profile"],
+        )
+        self.assertTrue(
+            all(arguments["match"] == {"kind": "class"} for _, arguments in calls)
+        )
+        with self.assertRaisesRegex(ValueError, "execution_mode must be one of"):
+            client.query_code({"kind": "class"}, execution_mode="trace")
+        self.assertEqual(len(calls), 3)
+
+    def test_unknown_formatted_query_response_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported code-query response"):
+            parse_code_query_response({"format": "future/v1"})
+
     def test_navigation_models_deserialize_distinct_fields_and_render_operation(self) -> None:
         candidate = {
             "name": "run",
@@ -366,6 +646,37 @@ class SearchToolsClientTest(unittest.TestCase):
         self.assertIsInstance(files.results[0], CodeQueryFile)
         self.assertEqual(files.results[0].path, "A.java")
         self.assertEqual(len(files.results[0].provenance), 1)
+
+    def test_query_code_returns_typed_explain_and_profile_reports(self) -> None:
+        absolute_where = str(self.fixture_root / "*.java")
+        with SearchToolsClient(root=self.fixture_root) as client:
+            explain = client.query_code(
+                {"kind": "class", "name": "A"},
+                where=[absolute_where],
+                languages=["java"],
+                execution_mode="explain",
+            )
+            profile = client.query_code(
+                {"kind": "class", "name": "A"},
+                where=[absolute_where],
+                languages=["java"],
+                execution_mode="profile",
+            )
+
+        self.assertIsInstance(explain, CodeQueryExplain)
+        self.assertEqual(explain.parsed_query.execution_mode, "explain")
+        self.assertGreaterEqual(len(explain.logical_plan.nodes), 2)
+        self.assertEqual(
+            explain.logical_plan.root,
+            explain.physical_plan.nodes[explain.physical_plan.root].logical_node,
+        )
+        self.assertIsInstance(profile, CodeQueryProfile)
+        self.assertEqual(profile.result.count, 1)
+        self.assertIsInstance(profile.result.results[0], CodeQueryMatch)
+        self.assertEqual(profile.explain.parsed_query.execution_mode, "profile")
+        self.assertGreaterEqual(len(profile.operators), 2)
+        self.assertEqual(len(profile.cache_layers), 8)
+        self.assertGreaterEqual(profile.scheduling.peak_concurrency, 1)
 
     def test_query_code_builds_typed_set_plans_and_parses_branch_paths(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:

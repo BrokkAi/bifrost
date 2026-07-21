@@ -63,9 +63,13 @@ The top-level crate re-exports the public analyzer and service types most caller
 | `FilesystemProject`, `FileSetProject`, `OverlayProject`, `MultiRootProject` | Project backends for different file-source shapes. |
 | `ProjectFile`, `CodeUnit`, `DeclarationInfo`, `Language`, `Range` | Core source and symbol model types. |
 | `SearchToolsService`, `ToolOutput` | In-process access to the same tool implementations exposed over MCP. |
+| `CodeQuery`, `CodeQueryExecutionMode`, `CodeQueryResponse` | Parse a canonical JSON/RQL query and select ordinary results, planning-only explain, or an opt-in profile. |
+| `CodeQueryExplain`, `CodeQueryProfile` | Stable versioned public report models; internal benchmark/profiler structs are not exposed. |
 | `ImportAnalysisProvider`, `TypeHierarchyProvider`, `TypeAliasProvider`, `TestDetectionProvider` | Optional analyzer capability traits. |
 
 For most embedded code-intelligence workflows, prefer `SearchToolsService` over manually composing individual analyzer calls. It keeps the tool argument and rendering behavior aligned with MCP and the Python client.
+
+`analyzer::structural::execute` always returns ordinary rows for embedders that own execution policy. Use the top-level `execute_request` to honor the query's root `execution_mode`; its untagged `CodeQueryResponse::Results` variant preserves the existing serialized result shape. Explain performs logical lowering and physical selection without reading analyzer data during that phase, while profile nests the exact ordinary result. Cancellable embedders can call `execute_request_with_cancellation` with a top-level `CancellationToken` and receive the versioned profile, including cancellation observations and a cancellation-safe partial result. See [Explain and Profile CodeQuery](/code-query-explain-profile/) for the stable wire contract and measurement caveats.
 
 ## Features
 

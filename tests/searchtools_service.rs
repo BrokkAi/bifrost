@@ -256,6 +256,59 @@ fn query_code_loads_workspace_rql_and_json_files() {
 }
 
 #[test]
+fn query_code_exposes_planning_only_explain_and_opt_in_profile_reports() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("app.py", "class App:\n    pass\n")
+        .build();
+    let queries = project.root().join("queries");
+    fs::create_dir(&queries).expect("query directory");
+    fs::write(
+        queries.join("app-profile.rql"),
+        "(profile (class :name \"App\"))\n",
+    )
+    .expect("profile RQL query");
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let ordinary = service
+        .call_tool_value(
+            "query_code",
+            serde_json::json!({ "match": { "kind": "class", "name": "App" } }),
+        )
+        .expect("ordinary query");
+    assert!(ordinary.get("format").is_none(), "{ordinary}");
+
+    let explain = service
+        .call_tool_value(
+            "query_code",
+            serde_json::json!({
+                "execution_mode": "explain",
+                "match": { "kind": "class", "name": "App" }
+            }),
+        )
+        .expect("explain query");
+    assert_eq!(explain["format"], "bifrost_code_query_explain/v1");
+    assert_eq!(explain["scheduling"]["selected"], "sequential");
+    assert!(explain.get("results").is_none(), "{explain}");
+
+    let profile = service
+        .call_tool_value(
+            "query_code",
+            serde_json::json!({ "query_file": "queries/app-profile.rql" }),
+        )
+        .expect("profile query file");
+    assert_eq!(profile["format"], "bifrost_code_query_profile/v1");
+    assert_eq!(profile["result"], ordinary);
+    assert!(
+        profile["operators"]
+            .as_array()
+            .is_some_and(|operators| !operators.is_empty()),
+        "{profile}"
+    );
+    assert_eq!(profile["scheduling"]["peak_concurrency"], 1);
+}
+
+#[test]
 fn query_code_file_input_reports_validation_and_workspace_errors() {
     let project = InlineTestProject::with_language(Language::Python)
         .file("app.py", "class App:\n    pass\n")

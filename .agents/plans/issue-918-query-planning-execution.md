@@ -23,7 +23,7 @@ The first independently verifiable milestone is deliberately sequential. Existin
 - [x] (2026-07-21 13:24Z) Fetched `origin/master` and cleanly rebased the M1-M3 checkpoints onto `0955e1c7`; the rebased M3 checkpoint is `d6d0837f`.
 - [x] (2026-07-21 13:37Z) Milestone 4: added a bounded ready-task scheduler and independently selectable parallel union, preserved authored results/provenance and fair global budgets, hardened cancellation/panic behavior, corrected the A/B harness after adversarial review, and selected the conservative production-sequential policy because no stable cold-and-warm crossover survived.
 - [x] (2026-07-21 14:12Z) Refetched the moving `origin/master` and cleanly rebased all four milestone checkpoints onto current `8f8a0ef7`; the rebased M3 checkpoint is `cf920952`.
-- [ ] Milestone 5: expose explain/profile through the supported query surfaces, document the measured production-sequential scheduling policy and rejected thresholds/alternatives, and complete adversarial review and repository validation.
+- [x] (2026-07-21 16:02Z) Milestone 5: exposed explain/profile through every supported query surface, documented the measured production-sequential scheduling policy and rejected alternatives, completed adversarial review with no remaining P0-P3 findings, and passed final repository validation.
 
 ## Surprises & Discoveries
 
@@ -101,6 +101,18 @@ The first independently verifiable milestone is deliberately sequential. Existin
 
 - Observation: scheduler setup, cancellation, and panic paths need first-class accounting and wakeup behavior even for a two-branch experiment.
   Evidence: adversarial review found worker setup overlapping task timing, misleading cancellation counters, a partial-spawn barrier deadlock, a branch-panic budget-wait deadlock, and cancelled-prefix telemetry loss. The retained scheduler uses a fallible abortable ready/release gate, honest task-elapsed and observed-cancellation fields, panic-triggered coordinator failure, and full completed-worker telemetry folding.
+
+- Observation: execution mode is a root output control, not part of semantic plan identity.
+  Evidence: one declarative `CodeQueryExecutionMode` registry entry now drives JSON decoding, RQL `(explain QUERY)` and `(profile QUERY)` wrappers, source diagnostics, hover, MCP schema, and editor highlighting. The decoder rejects nested controls and policy selectors, while canonical plan projection omits the mode so identical semantic queries retain identical logical identity.
+
+- Observation: the internal profiler is not a safe public wire contract.
+  Evidence: its v4 evidence, fingerprints, generation labels, suffix flags, and worker-overlap fields describe implementation mechanics and can evolve with the benchmark harness. M5 projects them into explicit `bifrost_code_query_explain/v1` and `bifrost_code_query_profile/v1` DTOs with typed logical and physical plans, deterministic cache layers, nested timings, work, bounded scheduling, and operator observations.
+
+- Observation: supported hosts have different cancellation and presentation contracts.
+  Evidence: the public Rust cancellable request API can return a profile with cancellation-safe partial rows and operator termination observations. LSP cancellation must instead return `RequestCancelled`; when a profile completes normally, VS Code prints the complete versioned report while keeping the exact nested ordinary rows navigable in its results tree. The REPL similarly renders ordinary rows plus the full report rather than a lossy summary.
+
+- Observation: profile totals are executor-core measurements, not end-to-end client latency.
+  Evidence: `timings_ns.total` starts after analyzer query-scope setup and ends before scope cleanup, public DTO projection, serialization, transport, or host initialization. M5 documentation names those exclusions and also distinguishes explain's analyzer-data-free planning phase from a CLI host that initializes and indexes its workspace before the request.
 
 ## Decision Log
 
@@ -208,6 +220,26 @@ The first independently verifiable milestone is deliberately sequential. Existin
   Rationale: M4 adds scheduler observations and renames cancellation/task elapsed fields to state their overlap and execution semantics honestly. The candidate-neutral benchmark schema also prevents Auto's sequential control timings from being serialized as parallel work.
   Date/Author: 2026-07-21 / Codex
 
+- Decision: expose one schema-authoritative root `execution_mode` with `results` as the default and RQL wrappers for `explain` and `profile`.
+  Rationale: one enum keeps JSON, RQL, validation, MCP, CLI, Python, LSP, and editor behavior aligned. Root-only placement prevents an output preference from changing branch semantics or entering static-analysis policy identity.
+  Date/Author: 2026-07-21 / Codex
+
+- Decision: preserve the ordinary serialized response exactly and nest that exact result inside profile.
+  Rationale: an untagged `CodeQueryResponse::Results` avoids adding an enum envelope or report allocations to existing calls. Profile can add observations without changing ordering, diagnostics, provenance, truncation, or completion, and tests compare the nested result against the ordinary JSON value.
+  Date/Author: 2026-07-21 / Codex
+
+- Decision: publish explicit v1 explain/profile projections rather than serializing the internal v4 plan and profiler structs.
+  Rationale: public consumers need stable semantic stages and typed metrics, not benchmark evidence, cache fingerprints, generation details, or executor-only state. Separate versioned DTOs let the implementation evolve without accidental wire changes.
+  Date/Author: 2026-07-21 / Codex
+
+- Decision: expose cooperative cancellation through the public Rust request API while preserving normal LSP cancellation errors.
+  Rationale: an embedded caller owns the token and can use a cancellation-safe partial profile; an LSP client expects its cancelled request to terminate with the protocol error. Documenting both avoids implying that every transport delivers partial telemetry.
+  Date/Author: 2026-07-21 / Codex
+
+- Decision: document production `Auto` as sequential and do not expose a force-parallel request control.
+  Rationale: the M4 operator and harness prove a bounded alternative, but the reversed cold/warm results provide no stable pre-execution selector. Public explain reports the selected production plan without turning an evidence-only candidate into a user policy knob.
+  Date/Author: 2026-07-21 / Codex
+
 ## Outcomes & Retrospective
 
 Milestone 1 is complete. Parsed JSON and RQL now converge on a dense dependency-first logical DAG with exact shared seed nodes, then select a one-to-one physical plan with explicit seed, step, sequential set, and root-limit operators. The existing query path executes through that plan while preserving authored branch order, fair budget roll-forward, cache replay and charging, provenance, diagnostics, cancellation checkpoints, intermediate-step exhaustion, and the global `limit + 1` probe.
@@ -269,8 +301,8 @@ sequential. The scheduler, forced alternative, profile, parity suite, and A/B
 harness remain as evidence-bearing infrastructure for a future selector.
 
 No bitmap-backed representation was added because no stable dense identity
-domain was established. No explain/profile control was added to a public query
-surface; that work remains Milestone 5.
+domain was established. At the M4 checkpoint, no explain/profile control had
+yet been added to a public query surface; that work was completed in M5.
 
 Final M4 validation passed 11 execution/scheduler tests with 2 ignored
 benchmarks registered, all 85 structural-query tests, all 46 structural-search
@@ -282,6 +314,36 @@ binary). On this macOS host, Cargo initially selected Homebrew `rustdoc` after
 rustup `rustc` had built the dependencies; the resulting compiler-metadata
 mismatch was environmental, and the zero-example doctest passed once both
 compiler tools were pinned to the same rustup 1.96.0 toolchain.
+
+Milestone 5 is complete. JSON queries accept the root `execution_mode` enum and
+RQL accepts `(explain QUERY)` and `(profile QUERY)` through the declarative
+schema, parser, canonicalizer, source validation, hover, policy rejection, and
+TextMate grammar. `results` remains the default and serializes as the exact
+pre-M5 `CodeQueryResult`. Explain performs logical lowering and physical
+selection without constructing analyzer query state. Profile executes once and
+nests that exact ordinary result with stable public v1 plan, timing, work,
+cache, scheduling, and operator projections.
+
+The same contract is available through the MCP tool schema and runtime,
+one-shot CLI/query files, REPL, top-level Rust API, Python client models, LSP,
+and VS Code. Profiled LSP rows remain navigable while the output channel shows
+the complete report. A public cancellable Rust entry point returns partial
+profile observations; LSP cancellation retains its protocol error semantics.
+The docs include executable JSON/RQL examples, the exact M4 absolute timing
+table and repository scales, the production-sequential policy, and separate
+evidence classifications for the ineligible bitmap representation, discarded
+SQL negative control, and unsafe arbitrary graph splitting.
+
+Final M5 validation passed formatting, `git diff --check`, strict pinned-
+toolchain all-target/all-feature Clippy, and the full `nlp,python` Rust suite.
+The library reported 1,519 passed and 5 ignored; the `bifrost` binary reported
+22 passed, including the complete REPL profile regression; every integration
+binary and doc-test target also passed. The native Python suite passed 51 tests,
+the VS Code formatting/typecheck/lint/compile/license/grammar/unit gates passed
+60 tests, and the Astro build rendered 56 pages and checked 5,210 internal
+links. Browser inspection of the Explain and Profile page found no horizontal
+overflow or console warnings. Final specialist re-review reported no remaining
+P0-P3 findings.
 
 ## Context and Orientation
 
@@ -406,6 +468,29 @@ to reverse cold candidate order and alternate every warm pair:
 
     # Repeat with BIFROST_CODE_QUERY_BENCH_ROUND=13.
 
+For Milestone 5, run the schema, public API, transport, editor, documentation,
+Python, and repository gates:
+
+    cargo fmt --all -- --check
+    cargo test --lib public_ --no-default-features
+    cargo test --test code_query_public_api --no-default-features
+    cargo test --test searchtools_service query_code_exposes_planning_only_explain_and_opt_in_profile_reports --no-default-features
+    cargo test --test bifrost_tool_cli query_code_tool_returns_versioned_explain_and_profile_reports --no-default-features
+    cargo test --test bifrost_mcp_server bifrost_mcp_query_code_transports_explain_and_profile_reports --no-default-features
+    cargo test --test bifrost_lsp_server bifrost_lsp_server_runs_rql_queries_across_all_workspace_folders --no-default-features
+    cargo test --bin bifrost code_query_repl_runs_explain_and_profile_modes --no-default-features
+    cargo test --test code_query_docs --no-default-features
+    ./scripts/test_python.sh
+    (cd editors/vscode && npm test)
+    (cd docs && npm run build)
+    scripts/with-isolated-cargo-target.sh rustup run 1.96.0 cargo-clippy --all-targets --all-features -- -D warnings
+    BIFROST_SEMANTIC_INDEX=off cargo test --features nlp,python
+    git diff --check
+
+Render the built Explain and Profile page through the local Astro preview and
+verify navigation, headings, code blocks, the measurement table, horizontal
+overflow, and browser warnings rather than relying on the static build alone.
+
 ## Validation and Acceptance
 
 Milestone 1 is accepted when equivalent JSON and RQL queries lower to identical logical explain structures; exact repeated seeds produce one seed node referenced by multiple branch edges; all dependency IDs precede their consumers; a union selects `SequentialUnion`; the root limit is explicit; and the structured execution profile reports deterministic operator identities and `peak_concurrency = 1`. The existing query pipeline suite must remain green, with no public result, ordering, provenance, diagnostic, truncation, cancellation, or budget change.
@@ -441,6 +526,11 @@ corrected paired measurements, rejected selector threshold, and retained
 production policy are recorded in
 `.agents/docs/issue-918-parallel-query-scheduling-2026-07-21.md`.
 
+Milestone 5 public syntax and DTO boundaries, cross-surface behavior,
+cancellation/presentation contracts, documentation evidence, and validation
+are recorded in
+`.agents/docs/issue-918-explain-profile-2026-07-21.md`.
+
 The intended first-milestone plan shape for two identical union branches is:
 
     logical node 0: Seed(canonical foo query) -> structural_match
@@ -475,6 +565,8 @@ Revision note (2026-07-20, Milestone 2): Recorded the completed profile schema a
 Revision note (2026-07-21, Milestone 3): Recorded the clean rebase onto current `origin/master`, generic complete-value lifecycle, exact layer-owned key contract and fake-key proof, reverse-import request annotation, versioned execution-profile/benchmark schemas for the added explain metadata, and the measured decision to delete rather than promote the non-equivalent `unit_children` SQL graph prototype. Milestone 4 remains the first scheduler and real sequential-versus-parallel A/B milestone.
 
 Revision note (2026-07-21, Milestone 4): Recorded the clean rebase onto current `origin/master`, bounded ready-task scheduler, independent `ParallelUnion`, ordered fair-budget admission, cancellation and panic wakeups, deterministic authored merge, corrected query-scoped and persistence-isolated v4 A/B harness, stable reversed candidate ordering, and the measured decision to retain production-sequential Auto because no stable observable crossover survived. Milestone 5 remains responsible for supported explain/profile surfaces and final issue-level validation.
+
+Revision note (2026-07-21, Milestone 5): Recorded the schema-authoritative root execution mode, stable public v1 projections, exact ordinary/profile result compatibility, top-level cancellable Rust API, MCP/CLI/REPL/Python/LSP/VS Code surfaces, rendered documentation and measured production-sequential policy, cross-surface adversarial fixes, and final issue-level validation.
 
 ## Interfaces and Dependencies
 

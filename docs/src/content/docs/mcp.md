@@ -24,7 +24,7 @@ RQL is the [Rune Query Language](/rune-query-language/), a human-friendly syntax
 | VS Code RQL Play action | Separate LSP path | No | Yes, including unsaved text | Yes |
 | Skills without MCP | No tools exposed | No | No | No |
 
-For MCP, call `query_code` with either inline canonical JSON fields or one `query_file` field naming a workspace-relative `.rql` or `.json` file. `query_file` is exclusive: filters, limits, and other query fields must be inside the referenced file. MCP never accepts raw inline RQL text.
+For MCP, call `query_code` with either inline canonical JSON fields or one `query_file` field naming a workspace-relative `.rql` or `.json` file. `query_file` is exclusive: filters, limits, execution mode, and other query fields must be inside the referenced file. MCP never accepts raw inline RQL text. Inline JSON can set `execution_mode` to `explain` or `profile`; a saved RQL file can use the equivalent wrappers. The versioned response contracts are documented under [Explain and Profile CodeQuery](/code-query-explain-profile/).
 
 The `--mcp` argument accepts ordered toolset compositions. Combine toolsets with `|`, for example:
 

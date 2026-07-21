@@ -24,7 +24,8 @@ use super::definition::{
 };
 use crate::analyzer::semantic::{WorkspaceRelativePath, WorkspaceRelativePathError};
 use crate::analyzer::structural::{
-    CodeQuery, CodeQueryResultDetail, DEFAULT_LIMIT, SCHEMA_VERSION as RQL_SCHEMA_VERSION,
+    CodeQuery, CodeQueryExecutionMode, CodeQueryResultDetail, DEFAULT_LIMIT,
+    SCHEMA_VERSION as RQL_SCHEMA_VERSION,
 };
 use crate::schema_version::SchemaVersionOrigin;
 use crate::workspace_document::{WorkspaceRoot, read_workspace_document};
@@ -1124,7 +1125,10 @@ fn validate_selector(
             message: format!("catalog selector must use RQL schema version {RQL_SCHEMA_VERSION}"),
         });
     }
-    if query.limit != DEFAULT_LIMIT || query.result_detail != CodeQueryResultDetail::Compact {
+    if query.limit != DEFAULT_LIMIT
+        || query.result_detail != CodeQueryResultDetail::Compact
+        || query.execution_mode != CodeQueryExecutionMode::Results
+    {
         return Err(CatalogRegistryError::InvalidSelector {
             id: id.clone(),
             message: "catalog selectors cannot carry query output controls".to_string(),
@@ -1579,10 +1583,14 @@ fn decode_selector(
             message: "selector query must repeat the exact schema_version pin".to_string(),
         });
     }
-    if query_object.contains_key("limit") || query_object.contains_key("result_detail") {
+    if query_object.contains_key("limit")
+        || query_object.contains_key("result_detail")
+        || query_object.contains_key("execution_mode")
+    {
         return Err(CatalogRegistryError::InvalidSelector {
             id: id.clone(),
-            message: "selector query cannot contain limit or result_detail".to_string(),
+            message: "selector query cannot contain limit, result_detail, or execution_mode"
+                .to_string(),
         });
     }
     let query = CodeQuery::from_json(&wire.query).map_err(|error| {
@@ -2056,6 +2064,41 @@ mod tests {
         assert!(matches!(
             error,
             CatalogRegistryError::HashPinMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn typed_and_json_registration_reject_execution_mode_controls() {
+        let mut typed = catalog("bifrost.sources", "request", "request");
+        let PolicySelector::Inline { query, .. } = &mut typed.sources[0].selector else {
+            panic!("catalog test selector is inline");
+        };
+        query.execution_mode = CodeQueryExecutionMode::Profile;
+        let mut registry = TaintCatalogRegistry::new_without_workspace(Default::default());
+        let error = registry.register(typed).unwrap_err();
+        assert!(matches!(
+            error,
+            CatalogRegistryError::InvalidSelector { ref message, .. }
+                if message.contains("output controls")
+        ));
+
+        let definition =
+            normalize_and_validate_catalog(catalog("bifrost.sources", "request", "request"))
+                .unwrap();
+        let mut value = serde_json::to_value(CatalogWire::from(&definition)).unwrap();
+        value["sources"][0]["selector"]["query"]["execution_mode"] =
+            Value::String("profile".to_string());
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let error = registry
+            .register_json_bytes(
+                CatalogSourceIdentity::new("execution-mode").unwrap(),
+                &bytes,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CatalogRegistryError::InvalidSelector { ref message, .. }
+                if message.contains("execution_mode")
         ));
     }
 

@@ -74,6 +74,8 @@ RQL uses compact S-expressions. The following are independent forms, not one mul
 (language python (call :callee (name "eval")))
 (limit 25 (call :callee (name "eval")))
 (result-detail full (call :callee (name "eval")))
+(explain (call :callee (name "eval")))
+(profile (call :callee (name "eval")))
 (inside (function :name "handler") (call :callee (name "eval")))
 ```
 
@@ -111,9 +113,13 @@ Wrapper forms control the query around the root pattern:
 (language python (call :callee (name "eval")))
 (limit 25 (call :callee (name "eval")))
 (result-detail full (call :callee (name "eval")))
+(explain (call :callee (name "eval")))
+(profile (call :callee (name "eval")))
 (inside (function :name "handler") (call :callee (name "eval")))
 (not-inside (function :name "test") (call :callee (name "eval")))
 ```
+
+`explain` lowers and selects a plan without scanning workspace data. `profile` executes and returns the ordinary result plus structured measurements. They are mutually exclusive root controls and are not legal inside policy selectors. See [Explain and Profile CodeQuery](/code-query-explain-profile/) for the response schemas and measured production scheduling policy.
 
 Pipeline wrappers transform the result domain. Inner wrappers execute first:
 

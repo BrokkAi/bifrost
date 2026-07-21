@@ -8,9 +8,9 @@ use super::ir::{
     ReceiverTraversalFilter, ReferenceTraversalFilter, SetOperator, StringPredicate,
 };
 use super::schema::{
-    ALL_QUERY_STEP_OPS, PatternField, QueryField, QueryStepField, StringPredicateField,
-    reference_kind_from_label, rql_schema_version_registry, usage_proof_from_label,
-    usage_surface_from_label,
+    ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField, QueryStepField,
+    StringPredicateField, reference_kind_from_label, rql_schema_version_registry,
+    usage_proof_from_label, usage_surface_from_label,
 };
 use crate::analyzer::Language;
 use crate::analyzer::structural::kinds::{ALL_KINDS, NormalizedKind, Role};
@@ -42,12 +42,17 @@ impl CodeQuery {
             None => CodeQueryResultDetail::Compact,
             Some(value) => decode_result_detail(value, "result_detail")?,
         };
+        let execution_mode = match fields.execution_mode {
+            None => CodeQueryExecutionMode::default(),
+            Some(value) => decode_execution_mode(value, "execution_mode")?,
+        };
 
         let query = Self {
             schema_version,
             plan: decode_plan(fields, "", &mut budget, true, 0)?,
             limit,
             result_detail,
+            execution_mode,
         };
         query.validate_steps()?;
         Ok(query)
@@ -105,6 +110,7 @@ struct QueryFields<'a> {
     steps: Option<&'a Value>,
     limit: Option<&'a Value>,
     result_detail: Option<&'a Value>,
+    execution_mode: Option<&'a Value>,
     schema_version: Option<&'a Value>,
 }
 
@@ -132,6 +138,7 @@ fn collect_query_fields<'a>(
             QueryField::Steps => fields.steps = Some(value),
             QueryField::Limit => fields.limit = Some(value),
             QueryField::ResultDetail => fields.result_detail = Some(value),
+            QueryField::ExecutionMode => fields.execution_mode = Some(value),
             QueryField::SchemaVersion => fields.schema_version = Some(value),
         }
     }
@@ -163,6 +170,7 @@ fn decode_plan(
             ("schema_version", fields.schema_version),
             ("limit", fields.limit),
             ("result_detail", fields.result_detail),
+            ("execution_mode", fields.execution_mode),
         ] {
             if value.is_some() {
                 return Err(QueryError::new(
@@ -725,6 +733,20 @@ fn decode_result_detail(value: &Value, path: &str) -> Result<CodeQueryResultDeta
         QueryError::new(
             path,
             format!("unknown result detail {label:?}; expected \"compact\" or \"full\""),
+        )
+    })
+}
+
+fn decode_execution_mode(value: &Value, path: &str) -> Result<CodeQueryExecutionMode, QueryError> {
+    let label = value.as_str().ok_or_else(|| {
+        QueryError::new(path, "expected \"results\", \"explain\", or \"profile\"")
+    })?;
+    CodeQueryExecutionMode::from_label(label).ok_or_else(|| {
+        QueryError::new(
+            path,
+            format!(
+                "unknown execution mode {label:?}; expected \"results\", \"explain\", or \"profile\""
+            ),
         )
     })
 }

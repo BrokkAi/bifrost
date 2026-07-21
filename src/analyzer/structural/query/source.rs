@@ -2,9 +2,10 @@
 
 use super::schema::{
     ALL_PATTERN_FIELDS, ALL_QUERY_FIELDS, ALL_QUERY_STEP_FIELDS, ALL_QUERY_STEP_OPS, ALL_RQL_FORMS,
-    ALL_RQL_PROPERTIES, ALL_STRING_PREDICATE_FIELDS, PatternField, QueryField, QueryStepField,
-    RqlForm, RqlFormClass, RqlProperty, StringPredicateField, reference_kind_from_label,
-    rql_schema_version_registry, usage_proof_from_label, usage_surface_from_label,
+    ALL_RQL_PROPERTIES, ALL_STRING_PREDICATE_FIELDS, CodeQueryExecutionMode, PatternField,
+    QueryField, QueryStepField, RqlForm, RqlFormClass, RqlProperty, StringPredicateField,
+    reference_kind_from_label, rql_schema_version_registry, usage_proof_from_label,
+    usage_surface_from_label,
 };
 use super::sexp::{parse_query_sexp, query_to_json};
 use super::{
@@ -321,6 +322,13 @@ fn result_detail_candidates() -> Vec<SuggestionCandidate> {
         .collect()
 }
 
+fn execution_mode_candidates() -> Vec<SuggestionCandidate> {
+    super::schema::ALL_CODE_QUERY_EXECUTION_MODES
+        .iter()
+        .map(|mode| (mode.label().to_string(), mode.label().to_string()))
+        .collect()
+}
+
 fn query_step_candidates() -> Vec<SuggestionCandidate> {
     ALL_QUERY_STEP_OPS
         .iter()
@@ -531,8 +539,8 @@ fn validate_rql_query(
         {
             return;
         }
-        analysis.add_help(head_range, form.signature(), form.description());
-        validate_wrapper(form, args, path, analysis, depth, plan_budget);
+        analysis.add_help(head_range.clone(), form.signature(), form.description());
+        validate_wrapper(form, args, &head_range, path, analysis, depth, plan_budget);
     } else if NormalizedKind::from_label(head).is_none() && RqlForm::from_label(head).is_none() {
         if !plan_budget.enter(depth, expr.range.clone(), analysis) {
             return;
@@ -580,11 +588,30 @@ fn rql_pattern_anchors_root(expr: &Expr) -> Option<bool> {
 fn validate_wrapper(
     form: RqlForm,
     args: &[Expr],
+    head_range: &Range<usize>,
     path: &str,
     analysis: &mut Analysis,
     depth: usize,
     plan_budget: &mut SourcePlanBudget,
 ) {
+    if matches!(form, RqlForm::Explain | RqlForm::Profile) {
+        let mode_path = rql_query_child_path(path, "execution_mode");
+        analysis.path(&mode_path, head_range.clone());
+        if !path.is_empty() {
+            analysis.error(
+                head_range.clone(),
+                "invalid-query",
+                "execution mode is allowed only on the root query",
+            );
+        }
+        if args.len() != 1 {
+            analysis.error(
+                head_range.clone(),
+                "wrong-value-shape",
+                format!("{} expects one query", form.label()),
+            );
+        }
+    }
     let Some(query) = args.last() else {
         return;
     };
@@ -674,6 +701,7 @@ fn validate_wrapper(
                 validate_result_detail(&args[0], analysis);
             }
         }
+        RqlForm::Explain | RqlForm::Profile => {}
         RqlForm::Inside | RqlForm::NotInside => {
             if args.len() != 2 {
                 analysis.error(
@@ -1355,6 +1383,7 @@ fn validate_property_value(
         | super::schema::ValueShape::PositiveInteger
         | super::schema::ValueShape::NonNegativeInteger
         | super::schema::ValueShape::ResultDetail
+        | super::schema::ValueShape::ExecutionMode
         | super::schema::ValueShape::ReferenceKindList
         | super::schema::ValueShape::SchemaVersion
         | super::schema::ValueShape::UsageProof
@@ -1903,6 +1932,17 @@ fn validate_json_query(
                 }
             }
             QueryField::ResultDetail => validate_json_result_detail(child, analysis),
+            QueryField::ExecutionMode => {
+                if path.is_empty() {
+                    validate_json_execution_mode(child, analysis);
+                } else {
+                    analysis.error(
+                        key.range(),
+                        "invalid-query",
+                        "execution mode is allowed only on the root query",
+                    );
+                }
+            }
             QueryField::SchemaVersion => {
                 let Some(version) = child.as_number().and_then(serde_json::Number::as_u64) else {
                     analysis.error(
@@ -2828,6 +2868,30 @@ fn validate_json_result_detail(value: &spanned::Value, analysis: &mut Analysis) 
     }
 }
 
+fn validate_json_execution_mode(value: &spanned::Value, analysis: &mut Analysis) {
+    let Some(label) = value.as_string() else {
+        analysis.error(
+            value.range(),
+            "wrong-value-shape",
+            "expected results, explain, or profile",
+        );
+        return;
+    };
+    if let Some(mode) = CodeQueryExecutionMode::from_label(label) {
+        analysis.add_help(value.range(), mode.label(), mode.description());
+    } else {
+        add_spelling_error(
+            analysis,
+            value.range(),
+            "invalid-execution-mode",
+            "expected results, explain, or profile",
+            label,
+            execution_mode_candidates(),
+            |suggestion| serde_json::to_string(suggestion).expect("suggestions are JSON strings"),
+        );
+    }
+}
+
 fn require_json_string(value: &spanned::Value, analysis: &mut Analysis) {
     if !value.is_string() {
         analysis.error(value.range(), "wrong-value-shape", "expected a string");
@@ -3133,11 +3197,70 @@ mod tests {
     }
 
     #[test]
+    fn execution_mode_frontends_validate_with_exact_ranges_and_shared_help() {
+        let rql = "(profile (call))";
+        let json = r#"{"execution_mode":"profile","match":{"kind":"call"}}"#;
+        assert_eq!(
+            CodeQuery::from_source(rql).unwrap().to_canonical_json(),
+            CodeQuery::from_source(json).unwrap().to_canonical_json()
+        );
+        assert!(validate_query_source(rql).is_empty());
+        assert!(validate_query_source(json).is_empty());
+
+        let nested_rql = "(union (profile (call)) (call))";
+        let diagnostic = validate_query_source(nested_rql)
+            .into_iter()
+            .find(|diagnostic| diagnostic.message.contains("root query"))
+            .expect("nested RQL execution-mode diagnostic");
+        assert_eq!(&nested_rql[diagnostic.range], "profile");
+
+        let nested_json = r#"{"union":[{"execution_mode":"profile","match":{"kind":"call"}},{"match":{"kind":"call"}}]}"#;
+        let diagnostic = validate_query_source(nested_json)
+            .into_iter()
+            .find(|diagnostic| diagnostic.message.contains("root query"))
+            .expect("nested JSON execution-mode diagnostic");
+        assert_eq!(&nested_json[diagnostic.range], r#""execution_mode""#);
+
+        let duplicated = "(profile (explain (call)))";
+        let diagnostic = validate_query_source(duplicated)
+            .into_iter()
+            .find(|diagnostic| diagnostic.message.contains("duplicate S-expression field"))
+            .expect("mutually exclusive execution-mode diagnostic");
+        assert_eq!(&duplicated[diagnostic.range], "profile");
+
+        let invalid_json = r#"{"execution_mode":"profil","match":{"kind":"call"}}"#;
+        let diagnostic = validate_query_source(invalid_json)
+            .into_iter()
+            .find(|diagnostic| diagnostic.code == "invalid-execution-mode")
+            .expect("invalid execution mode diagnostic");
+        assert_eq!(&invalid_json[diagnostic.range.clone()], r#""profil""#);
+        assert_eq!(
+            diagnostic.fix,
+            Some(QuerySourceFix {
+                title: "Replace with `profile`".to_string(),
+                edit: QuerySourceEdit::Replace {
+                    new_text: r#""profile""#.to_string(),
+                },
+            })
+        );
+
+        let rql_help = query_source_help_at(rql, rql.find("profile").unwrap()).unwrap();
+        assert_eq!(&rql[rql_help.range], "profile");
+        assert!(rql_help.description.contains("operator timing"));
+        let value_offset = json.find("profile").unwrap();
+        let json_help = query_source_help_at(json, value_offset).unwrap();
+        assert_eq!(&json[json_help.range], r#""profile""#);
+        assert!(json_help.description.contains("operator-level"));
+    }
+
+    #[test]
     fn accepted_rql_shorthands_have_no_live_diagnostics() {
         for source in [
             r#"(call :callee "run")"#,
             r#"(import :module "os")"#,
             r#"(result-detail "full" (call))"#,
+            r#"(explain (call))"#,
+            r#"(profile (call))"#,
             r#"(imports-of (file-of (class)))"#,
         ] {
             CodeQuery::from_source(source)
@@ -3393,6 +3516,7 @@ mod tests {
             ("(language ruts (call))", "ruts", "rust"),
             ("(language .rss (call))", ".rss", "rust"),
             ("(result-detail ful (call))", "ful", "full"),
+            ("(profle (call))", "profle", "profile"),
             (r#"{"matc":{"kind":"call"}}"#, "\"matc\"", "\"match\""),
             (r#"{"match":{"kind":"cal"}}"#, "\"cal\"", "\"call\""),
             (
@@ -3414,6 +3538,11 @@ mod tests {
                 r#"{"result_detail":"ful","match":{"kind":"call"}}"#,
                 "\"ful\"",
                 "\"full\"",
+            ),
+            (
+                r#"{"execution_mode":"profil","match":{"kind":"call"}}"#,
+                "\"profil\"",
+                "\"profile\"",
             ),
             (
                 r#"{"steps":[{"op":"fileof"}],"match":{"kind":"call"}}"#,

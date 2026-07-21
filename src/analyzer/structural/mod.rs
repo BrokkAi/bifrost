@@ -34,17 +34,27 @@ pub mod rune_ir;
 pub mod search;
 pub mod spec;
 
+pub use execution::{
+    CodeQueryBoundedDispatchProfile, CodeQueryCacheMetricsKind, CodeQueryExplain,
+    CodeQueryExplainScheduling, CodeQueryLogicalNode, CodeQueryLogicalOperation,
+    CodeQueryLogicalPlan, CodeQueryOperatorDisposition, CodeQueryOperatorObservation,
+    CodeQueryOperatorTermination, CodeQueryOperatorTimings, CodeQueryPhysicalNode,
+    CodeQueryPhysicalOperator, CodeQueryPhysicalPlan, CodeQueryProfile,
+    CodeQueryProfileCacheCounters, CodeQueryProfileCacheLayer, CodeQueryProfileScheduling,
+    CodeQueryProfileTimings, CodeQueryProfileWork, CodeQuerySchedulingPolicy,
+    CodeQuerySelectedScheduling, CodeQueryStructuralFactsCacheCounters,
+};
 pub use facts::{FileFacts, NormalizedNode, RoleTarget, Span};
 pub use kinds::{ALL_KINDS, NormalizedKind, Role};
 pub use provider::{StructuralFactsCache, StructuralSearchProvider};
 pub use query::{
-    CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed,
-    DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH, MAX_KWARGS,
-    MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
-    MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
-    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError, QueryStep, QueryValueKind,
-    ReceiverTraversalFilter, ReferenceTraversalFilter, SCHEMA_VERSION, SetOperator,
-    StringPredicate,
+    CodeQuery, CodeQueryExecutionMode, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
+    CodeQuerySeed, DEFAULT_LIMIT, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH,
+    MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES,
+    MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS,
+    MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern, QueryError,
+    QueryStep, QueryValueKind, ReceiverTraversalFilter, ReferenceTraversalFilter, SCHEMA_VERSION,
+    SetOperator, StringPredicate,
 };
 pub use rune_ir::{
     RenderedRuneIr, RuneIrError, RuneIrLanguage, RuneIrLimits, RuneIrSelection,
@@ -55,8 +65,9 @@ pub use search::{
     CodeQueryDeclaration, CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact,
     CodeQueryExecutionLimits, CodeQueryExecutionWork, CodeQueryExpressionSite, CodeQueryFile,
     CodeQueryMatch, CodeQueryProvenance, CodeQueryProvenanceStep, CodeQueryRange,
-    CodeQueryReceiverAnalysis, CodeQueryReceiverValue, CodeQueryReferenceSite, CodeQueryResult,
-    CodeQueryResultItem, CodeQueryResultRef, CodeQueryResultValue, CodeQuerySourceSite, execute,
-    execute_with_limits,
+    CodeQueryReceiverAnalysis, CodeQueryReceiverValue, CodeQueryReferenceSite, CodeQueryResponse,
+    CodeQueryResult, CodeQueryResultItem, CodeQueryResultRef, CodeQueryResultValue,
+    CodeQuerySourceSite, execute, execute_request, execute_request_with_cancellation,
+    execute_request_with_limits, execute_with_limits,
 };
 pub use spec::{RoleSink, StructuralSpec};

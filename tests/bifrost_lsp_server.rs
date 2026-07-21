@@ -727,6 +727,7 @@ fn bifrost_lsp_server_runs_rql_queries_across_all_workspace_folders() {
         json!({"query": r#"{"match":{"kind":"class"}}"#}),
     );
     assert!(json_response["error"].is_null(), "{json_response}");
+    assert_eq!(json_response["result"]["mode"], "results");
     assert_eq!(
         json_response["result"]["results"].as_array().unwrap().len(),
         2
@@ -786,6 +787,52 @@ fn bifrost_lsp_server_runs_rql_queries_across_all_workspace_folders() {
                     .is_some_and(|uri| uri.starts_with("file://"))
         }),
         "expected navigable file results in {files}"
+    );
+
+    let explain = server.request(
+        "bifrost/queryCode",
+        json!({"query": "(explain (union (class :name \"AlphaRoot\") (class :name \"BetaRoot\")))"}),
+    );
+    assert!(explain["error"].is_null(), "{explain}");
+    assert_eq!(explain["result"]["mode"], "explain");
+    assert_eq!(explain["result"]["results"], json!([]));
+    assert_eq!(
+        explain["result"]["report"]["format"],
+        "bifrost_code_query_explain/v1"
+    );
+    assert!(
+        explain["result"]["report"]["logical_plan"]["nodes"]
+            .as_array()
+            .is_some_and(|nodes| !nodes.is_empty()),
+        "expected a logical plan in {explain}"
+    );
+    assert_eq!(
+        explain["result"]["report"]["scheduling"]["selected"],
+        "sequential"
+    );
+
+    let profile = server.request("bifrost/queryCode", json!({"query": "(profile (class))"}));
+    assert!(profile["error"].is_null(), "{profile}");
+    assert_eq!(profile["result"]["mode"], "profile");
+    assert_eq!(
+        profile["result"]["report"]["format"],
+        "bifrost_code_query_profile/v1"
+    );
+    assert_eq!(
+        profile["result"]["results"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        profile["result"]["report"]["result"]["results"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    assert!(
+        profile["result"]["report"]["operators"]
+            .as_array()
+            .is_some_and(|operators| !operators.is_empty()),
+        "expected operator observations in {profile}"
     );
 
     let invalid = server.request("bifrost/queryCode", json!({"query": "(class"}));

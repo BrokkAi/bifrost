@@ -268,6 +268,10 @@ impl LogicalQueryPlanBuilder {
 pub(crate) struct PhysicalQueryNodeId(u32);
 
 impl PhysicalQueryNodeId {
+    pub(crate) const fn get(self) -> u32 {
+        self.0
+    }
+
     const fn index(self) -> usize {
         self.0 as usize
     }
@@ -424,6 +428,11 @@ impl PhysicalQueryPlan {
                 .collect(),
         }
     }
+
+    /// Build the stable public explain contract without executing the plan.
+    pub(crate) fn public_explain(&self, query: &CodeQuery) -> CodeQueryExplain {
+        CodeQueryExplain::from_internal_profile(query, &self.explain())
+    }
 }
 
 /// An owned, deterministic, serializable explanation of a selected physical plan.
@@ -485,6 +494,200 @@ impl LogicalQueryOperatorExplain {
     }
 }
 
+const PUBLIC_EXPLAIN_FORMAT: &str = "bifrost_code_query_explain/v1";
+const PARALLEL_UNION_MAX_CONCURRENCY: usize = 2;
+
+/// Stable, versioned explanation of a parsed query and its selected plan.
+///
+/// This is a projection rather than the serialization of the executor's
+/// internal arenas. Plan-local IDs are meaningful only within one report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryExplain {
+    pub format: &'static str,
+    pub query_schema_version: u64,
+    pub parsed_query: serde_json::Value,
+    pub logical_plan: CodeQueryLogicalPlan,
+    pub physical_plan: CodeQueryPhysicalPlan,
+    pub scheduling: CodeQueryExplainScheduling,
+}
+
+impl CodeQueryExplain {
+    /// Project the plan retained by an internal execution profile into the
+    /// stable public contract. Keeping this conversion here prevents callers
+    /// from accidentally publishing internal-only explain fields.
+    pub(crate) fn from_internal_profile(
+        query: &CodeQuery,
+        plan: &PhysicalQueryPlanExplain,
+    ) -> Self {
+        let selected = if plan
+            .nodes
+            .iter()
+            .any(|node| node.operator == PhysicalQueryOperator::ParallelUnion)
+        {
+            CodeQuerySelectedScheduling::Parallel
+        } else {
+            CodeQuerySelectedScheduling::Sequential
+        };
+        let logical_plan = CodeQueryLogicalPlan {
+            root: plan.logical_node_for_physical(plan.root).get(),
+            nodes: plan
+                .nodes
+                .iter()
+                .map(|node| CodeQueryLogicalNode {
+                    id: node.logical_node.get(),
+                    operation: CodeQueryLogicalOperation::from_internal(&node.logical_operator),
+                    output_kind: node.output_kind,
+                    dependencies: node
+                        .dependencies
+                        .iter()
+                        .map(|dependency| plan.logical_node_for_physical(*dependency).get())
+                        .collect(),
+                })
+                .collect(),
+        };
+        let physical_plan = CodeQueryPhysicalPlan {
+            root: plan.root.get(),
+            nodes: plan
+                .nodes
+                .iter()
+                .map(|node| CodeQueryPhysicalNode {
+                    id: node.physical_node.get(),
+                    logical_node: node.logical_node.get(),
+                    operator: CodeQueryPhysicalOperator::from_internal(node.operator),
+                    output_kind: node.output_kind,
+                    dependencies: node
+                        .dependencies
+                        .iter()
+                        .map(|dependency| dependency.get())
+                        .collect(),
+                })
+                .collect(),
+        };
+        let max_concurrency = match selected {
+            CodeQuerySelectedScheduling::Sequential => 1,
+            CodeQuerySelectedScheduling::Parallel => PARALLEL_UNION_MAX_CONCURRENCY,
+        };
+
+        Self {
+            format: PUBLIC_EXPLAIN_FORMAT,
+            query_schema_version: query.schema_version,
+            parsed_query: query.to_canonical_json(),
+            logical_plan,
+            physical_plan,
+            scheduling: CodeQueryExplainScheduling {
+                policy: CodeQuerySchedulingPolicy::Auto,
+                selected,
+                max_concurrency,
+            },
+        }
+    }
+}
+
+impl PhysicalQueryPlanExplain {
+    fn logical_node_for_physical(&self, id: PhysicalQueryNodeId) -> LogicalQueryNodeId {
+        let node = &self.nodes[id.index()];
+        debug_assert_eq!(node.physical_node, id);
+        node.logical_node
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryLogicalPlan {
+    pub root: u32,
+    pub nodes: Vec<CodeQueryLogicalNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryLogicalNode {
+    pub id: u32,
+    pub operation: CodeQueryLogicalOperation,
+    pub output_kind: &'static str,
+    /// Ordered logical dependencies. Repeated IDs preserve authored branch
+    /// occurrences that share one logical DAG node.
+    pub dependencies: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CodeQueryLogicalOperation {
+    Seed { seed: serde_json::Value },
+    Step { step: serde_json::Value },
+    Set { op: &'static str },
+    Limit { count: usize },
+}
+
+impl CodeQueryLogicalOperation {
+    fn from_internal(operation: &LogicalQueryOperatorExplain) -> Self {
+        match operation {
+            LogicalQueryOperatorExplain::Seed { seed } => Self::Seed { seed: seed.clone() },
+            LogicalQueryOperatorExplain::Step { step, .. } => Self::Step { step: step.clone() },
+            LogicalQueryOperatorExplain::Set { op } => Self::Set { op },
+            LogicalQueryOperatorExplain::Limit { count } => Self::Limit { count: *count },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryPhysicalPlan {
+    pub root: u32,
+    pub nodes: Vec<CodeQueryPhysicalNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryPhysicalNode {
+    pub id: u32,
+    pub logical_node: u32,
+    pub operator: CodeQueryPhysicalOperator,
+    pub output_kind: &'static str,
+    pub dependencies: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeQueryPhysicalOperator {
+    SeedScan,
+    PipelineStep,
+    SequentialUnion,
+    ParallelUnion,
+    SequentialIntersection,
+    SequentialExcept,
+    Limit,
+}
+
+impl CodeQueryPhysicalOperator {
+    pub(crate) const fn from_internal(operator: PhysicalQueryOperator) -> Self {
+        match operator {
+            PhysicalQueryOperator::SeedScan => Self::SeedScan,
+            PhysicalQueryOperator::PipelineStep => Self::PipelineStep,
+            PhysicalQueryOperator::SequentialUnion => Self::SequentialUnion,
+            PhysicalQueryOperator::ParallelUnion => Self::ParallelUnion,
+            PhysicalQueryOperator::SequentialIntersection => Self::SequentialIntersection,
+            PhysicalQueryOperator::SequentialExcept => Self::SequentialExcept,
+            PhysicalQueryOperator::Limit => Self::Limit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryExplainScheduling {
+    pub policy: CodeQuerySchedulingPolicy,
+    pub selected: CodeQuerySelectedScheduling,
+    pub max_concurrency: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeQuerySchedulingPolicy {
+    Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeQuerySelectedScheduling {
+    Sequential,
+    Parallel,
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -520,6 +723,7 @@ mod tests {
             plan,
             limit: 20,
             result_detail: CodeQueryResultDetail::Compact,
+            execution_mode: Default::default(),
         }
     }
 
@@ -558,6 +762,109 @@ mod tests {
             logical.node(inputs[0]).operator(),
             LogicalQueryOperator::Seed(_)
         ));
+    }
+
+    #[test]
+    fn public_explain_separates_stable_logical_and_physical_contracts() {
+        let shared = seed("Widget");
+        let query = query(CodeQueryPlan {
+            source: CodeQueryPlanSource::Set {
+                op: SetOperator::Union,
+                branches: vec![
+                    branch(shared.clone(), Vec::new()),
+                    branch(shared, Vec::new()),
+                ],
+            },
+            steps: Vec::new(),
+        });
+        let physical =
+            PhysicalQueryPlan::select(LogicalQueryPlan::lower(&query).expect("query should lower"));
+        let public = physical.public_explain(&query);
+
+        assert_eq!(
+            serde_json::to_value(&public).expect("public explain should serialize"),
+            json!({
+                "format": "bifrost_code_query_explain/v1",
+                "query_schema_version": SCHEMA_VERSION,
+                "parsed_query": {
+                    "schema_version": SCHEMA_VERSION,
+                    "union": [
+                        { "match": { "name": "Widget" } },
+                        { "match": { "name": "Widget" } }
+                    ],
+                    "limit": 20,
+                    "result_detail": "compact",
+                    "execution_mode": "results"
+                },
+                "logical_plan": {
+                    "root": 2,
+                    "nodes": [
+                        {
+                            "id": 0,
+                            "operation": {
+                                "kind": "seed",
+                                "seed": { "match": { "name": "Widget" } }
+                            },
+                            "output_kind": "structural_match",
+                            "dependencies": []
+                        },
+                        {
+                            "id": 1,
+                            "operation": { "kind": "set", "op": "union" },
+                            "output_kind": "structural_match",
+                            "dependencies": [0, 0]
+                        },
+                        {
+                            "id": 2,
+                            "operation": { "kind": "limit", "count": 20 },
+                            "output_kind": "structural_match",
+                            "dependencies": [1]
+                        }
+                    ]
+                },
+                "physical_plan": {
+                    "root": 2,
+                    "nodes": [
+                        {
+                            "id": 0,
+                            "logical_node": 0,
+                            "operator": "seed_scan",
+                            "output_kind": "structural_match",
+                            "dependencies": []
+                        },
+                        {
+                            "id": 1,
+                            "logical_node": 1,
+                            "operator": "sequential_union",
+                            "output_kind": "structural_match",
+                            "dependencies": [0, 0]
+                        },
+                        {
+                            "id": 2,
+                            "logical_node": 2,
+                            "operator": "limit",
+                            "output_kind": "structural_match",
+                            "dependencies": [1]
+                        }
+                    ]
+                },
+                "scheduling": {
+                    "policy": "auto",
+                    "selected": "sequential",
+                    "max_concurrency": 1
+                }
+            })
+        );
+
+        let serialized = serde_json::to_string(&public).expect("public explain should serialize");
+        for internal_field in [
+            "final_in_authored_suffix",
+            "derived_layer_request",
+            "projection_filter_fingerprint",
+            "representation_version",
+        ] {
+            assert!(!serialized.contains(internal_field));
+        }
     }
 
     #[test]
@@ -712,6 +1019,24 @@ mod tests {
                 .operator(),
             PhysicalQueryOperator::ParallelUnion
         );
+        let public = physical.public_explain(&query(CodeQueryPlan {
+            source: CodeQueryPlanSource::Set {
+                op: SetOperator::Union,
+                branches: vec![
+                    branch(seed("First"), Vec::new()),
+                    branch(seed("Second"), Vec::new()),
+                ],
+            },
+            steps: Vec::new(),
+        }));
+        assert_eq!(
+            public.scheduling,
+            CodeQueryExplainScheduling {
+                policy: CodeQuerySchedulingPolicy::Auto,
+                selected: CodeQuerySelectedScheduling::Parallel,
+                max_concurrency: PARALLEL_UNION_MAX_CONCURRENCY,
+            }
+        );
         let sequential = PhysicalQueryPlan::select(logical);
         assert_eq!(
             sequential
@@ -773,13 +1098,12 @@ mod tests {
 
     #[test]
     fn derived_layer_request_is_visible_in_physical_explain() {
-        let physical = PhysicalQueryPlan::select(
-            LogicalQueryPlan::lower(&query(branch(
-                seed("AnyDeclaration"),
-                vec![QueryStep::FileOf, QueryStep::ImportersOf],
-            )))
-            .expect("query should lower"),
-        );
+        let query = query(branch(
+            seed("AnyDeclaration"),
+            vec![QueryStep::FileOf, QueryStep::ImportersOf],
+        ));
+        let physical =
+            PhysicalQueryPlan::select(LogicalQueryPlan::lower(&query).expect("query should lower"));
         let explained = serde_json::to_value(physical.explain()).expect("explain should serialize");
         let importer_node = explained["nodes"]
             .as_array()
@@ -801,6 +1125,11 @@ mod tests {
                 .all(|node| node.get("derived_layer_request").is_none()),
             "unannotated operators should not gain a null derived-layer field"
         );
+
+        let public = serde_json::to_string(&physical.public_explain(&query))
+            .expect("public explain should serialize");
+        assert!(!public.contains("derived_layer_request"));
+        assert!(!public.contains("final_in_authored_suffix"));
     }
 
     #[test]

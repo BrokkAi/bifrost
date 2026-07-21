@@ -52,6 +52,11 @@ mod workspace_document;
 pub use analyzer::policy;
 pub use analyzer::usages;
 
+pub use analyzer::structural::{
+    CodeQuery, CodeQueryExecutionLimits, CodeQueryExecutionMode, CodeQueryExplain,
+    CodeQueryProfile, CodeQueryResponse, execute_request, execute_request_with_cancellation,
+    execute_request_with_limits,
+};
 pub use analyzer::{
     AnalyzerConfig, AnalyzerDelegate, CSharpAnalyzer, CapabilityProvider, CloneSmell,
     CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CppAnalyzer, DeclarationInfo,

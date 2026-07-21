@@ -56,6 +56,7 @@ pub enum ValueShape {
     PositiveInteger,
     NonNegativeInteger,
     ResultDetail,
+    ExecutionMode,
     SchemaVersion,
     TrueBoolean,
     ReferenceKindList,
@@ -84,6 +85,7 @@ impl ValueShape {
             Self::PositiveInteger => "a positive integer",
             Self::NonNegativeInteger => "a non-negative integer",
             Self::ResultDetail => "compact or full",
+            Self::ExecutionMode => "results, explain, or profile",
             Self::SchemaVersion => "a supported schema version",
             Self::TrueBoolean => "the boolean true",
             Self::ReferenceKindList => "one or more structured reference kinds",
@@ -110,6 +112,49 @@ impl ValueShape {
 pub enum RqlFormClass {
     Wrapper,
     Predicate,
+}
+
+/// Selects whether a CodeQuery returns ordinary results, a plan explanation,
+/// or results accompanied by an execution profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CodeQueryExecutionMode {
+    #[default]
+    Results,
+    Explain,
+    Profile,
+}
+
+pub const ALL_CODE_QUERY_EXECUTION_MODES: &[CodeQueryExecutionMode] = &[
+    CodeQueryExecutionMode::Results,
+    CodeQueryExecutionMode::Explain,
+    CodeQueryExecutionMode::Profile,
+];
+
+impl CodeQueryExecutionMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Results => "results",
+            Self::Explain => "explain",
+            Self::Profile => "profile",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        ALL_CODE_QUERY_EXECUTION_MODES
+            .iter()
+            .copied()
+            .find(|mode| mode.label() == label)
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Results => "Execute the query and return its ordinary typed results.",
+            Self::Explain => "Lower and select the query plan without executing it.",
+            Self::Profile => {
+                "Execute the query and return its typed results with operator-level measurements."
+            }
+        }
+    }
 }
 
 macro_rules! query_step_ops {
@@ -273,6 +318,8 @@ macro_rules! rql_forms {
                     | Self::Language
                     | Self::Limit
                     | Self::ResultDetail
+                    | Self::Explain
+                    | Self::Profile
                     | Self::Inside
                     | Self::NotInside
                     | Self::Union
@@ -338,6 +385,20 @@ rql_forms! {
         shape: ResultDetail,
         signature: "(result-detail compact|full query)",
         description: "Choose compact output or full capture and source details.",
+    }
+    Explain {
+        labels: ["explain"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(explain query)",
+        description: "Lower and select the logical and physical plans without executing the query.",
+    }
+    Profile {
+        labels: ["profile"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(profile query)",
+        description: "Execute the query and include operator timing, work, cache, waiting, and concurrency measurements.",
     }
     Inside {
         labels: ["inside"],
@@ -725,6 +786,7 @@ json_fields! {
     Steps { label: "steps", shape: QuerySteps, signature: "\"steps\": [{ \"op\": \"file_of\" }, ...]", description: "Apply ordered typed transformations to structural matches." }
     Limit { label: "limit", shape: PositiveInteger, signature: "\"limit\": positive integer", description: "Set the maximum number of matches returned." }
     ResultDetail { label: "result_detail", shape: ResultDetail, signature: "\"result_detail\": \"compact\" | \"full\"", description: "Choose compact output or full capture and source details." }
+    ExecutionMode { label: "execution_mode", shape: ExecutionMode, signature: "\"execution_mode\": \"results\" | \"explain\" | \"profile\"", description: "Return ordinary results, explain the selected plan without execution, or execute with an operator profile." }
     SchemaVersion { label: "schema_version", shape: SchemaVersion, signature: "\"schema_version\": supported positive integer", description: "Pin one exact CodeQuery schema version; omission selects the compatible lineage head." }
 }
 
@@ -906,5 +968,20 @@ mod tests {
                 Some(*field)
             );
         }
+    }
+
+    #[test]
+    fn execution_mode_metadata_round_trips_labels_and_help() {
+        for mode in ALL_CODE_QUERY_EXECUTION_MODES {
+            assert_eq!(
+                CodeQueryExecutionMode::from_label(mode.label()),
+                Some(*mode)
+            );
+            assert!(!mode.description().is_empty());
+        }
+        assert_eq!(
+            CodeQueryExecutionMode::default(),
+            CodeQueryExecutionMode::Results
+        );
     }
 }

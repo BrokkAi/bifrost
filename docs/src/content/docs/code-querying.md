@@ -30,7 +30,7 @@ See [Rune IR](/rune-ir/) for the representation, `.rune` files and VS Code previ
 
 ## Version 2 Typed Pipelines
 
-`query_code` validates the structural seed query, chooses candidate files and facts, and then applies an ordered typed pipeline. Queries without steps return tagged structural matches. Complete compatible pipelines can be combined with `union`, `intersect`, and `except`, then passed through another common typed suffix. `enclosing_decl` returns exact indexed declarations; `references_of`, `used_by`, and `uses` traverse exact structured references; `callers`, `callees`, and the call-site steps traverse only AST-confirmed calls; `receiver_targets`, `points_to`, and `member_targets` produce terminal receiver-analysis rows; `file_of`, `imports_of`, and `importers_of` navigate project files; `supertypes` and `subtypes` traverse indexed hierarchy edges; and `members` / `owner` navigate exact declaration ownership. Derived results retain seed-and-edge provenance, including the contributing branch path after composition.
+`query_code` validates the structural seed query, lowers it to a shared logical dependency graph, selects physical operators, and then applies an ordered typed pipeline. Queries without steps return tagged structural matches. Complete compatible pipelines can be combined with `union`, `intersect`, and `except`, then passed through another common typed suffix. `enclosing_decl` returns exact indexed declarations; `references_of`, `used_by`, and `uses` traverse exact structured references; `callers`, `callees`, and the call-site steps traverse only AST-confirmed calls; `receiver_targets`, `points_to`, and `member_targets` produce terminal receiver-analysis rows; `file_of`, `imports_of`, and `importers_of` navigate project files; `supertypes` and `subtypes` traverse indexed hierarchy edges; and `members` / `owner` navigate exact declaration ownership. Derived results retain seed-and-edge provenance, including the contributing branch path after composition.
 
 Semantic declaration steps intentionally stop at the analyzer's indexed declaration boundary. Seeing a reference or usage into a dependency is not evidence that the dependency declaration is indexed. Until Bifrost can target library code for indexing, unindexed library declarations are omitted rather than reconstructed from names, and their absence is not reported as a capability error.
 
@@ -65,7 +65,7 @@ Bifrost currently has two representations for `CodeQuery`:
 
 JSON is not a separate query language. It is the stable serialization of the `CodeQuery` model. RQL is a convenience language that compiles to that JSON-shaped model.
 
-See [JSON CodeQuery](/code-query-json/) for the complete schema, validation rules, result model, and copy-paste examples. See [Rune Query Language](/rune-query-language/) for interactive authoring and canonical JSON inspection.
+See [JSON CodeQuery](/code-query-json/) for the complete schema, validation rules, result model, and copy-paste examples. See [Rune Query Language](/rune-query-language/) for interactive authoring and canonical JSON inspection. Use [Explain and Profile CodeQuery](/code-query-explain-profile/) to inspect logical sharing and physical selection before execution or collect opt-in operator, cache, budget, wait, and concurrency observations from one execution.
 
 For source-first walkthroughs, see the [per-language `query_code` tutorials](/code-query-tutorials/). Their fixtures, RQL and JSON forms, and exact results are exercised against the real structural adapters.
 

@@ -1,9 +1,9 @@
 use brokk_bifrost::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, Role};
 use brokk_bifrost::analyzer::structural::query::schema::ALL_RQL_FORMS;
 use brokk_bifrost::analyzer::structural::{
-    CodeQuery, CodeQueryMatch, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResult,
-    CodeQueryResultValue, Pattern, RuneIrLanguage, RuneIrLimits, RuneIrSelection, StringPredicate,
-    render_source_rune_ir,
+    CodeQuery, CodeQueryMatch, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResponse,
+    CodeQueryResult, CodeQueryResultValue, Pattern, RuneIrLanguage, RuneIrLimits, RuneIrSelection,
+    StringPredicate, render_source_rune_ir,
 };
 use brokk_bifrost::{Language, SearchToolsService};
 use nu_ansi_term::{Color, Style};
@@ -684,6 +684,7 @@ fn query_summary_text(query: &CodeQuery) -> String {
     let mut parts = vec![plan_summary_text(&query.plan)];
     parts.push(format!("limit {}", query.limit));
     parts.push(format!("detail {}", query.result_detail.label()));
+    parts.push(format!("mode {}", query.execution_mode.label()));
     parts.join("; ")
 }
 
@@ -784,7 +785,22 @@ fn predicate_summary(field: &str, predicate: &StringPredicate) -> String {
 
 fn run_query(service: &SearchToolsService, value: &Value, use_color: bool) -> String {
     match service.query_code_result(value.clone()) {
-        Ok(output) => render_code_query_repl_output(&output, use_color),
+        Ok(CodeQueryResponse::Results(output)) => render_code_query_repl_output(&output, use_color),
+        Ok(CodeQueryResponse::Explain(explain)) => format!(
+            "CodeQuery explain (planning only):\n{}",
+            serde_json::to_string_pretty(&explain)
+                .expect("the public CodeQuery explain model is serializable")
+        ),
+        Ok(CodeQueryResponse::Profile(profile)) => {
+            let mut rendered = render_code_query_repl_output(&profile.result, use_color);
+            rendered.push_str("\nCodeQuery profile report:\n");
+            rendered.push_str(
+                &serde_json::to_string_pretty(&profile)
+                    .expect("the public CodeQuery profile report is serializable"),
+            );
+            rendered.push('\n');
+            rendered
+        }
         Err(error) => format!("error: {}", sanitize_terminal_text(&error.to_string())),
     }
 }
@@ -1361,6 +1377,38 @@ mod tests {
         session.process_line(r#"(call :callee (name "eval"))"#, None);
         let (_flow, output) = session.process_line(":validate", None);
         assert_eq!(output, "Query is valid.");
+    }
+
+    #[test]
+    fn code_query_repl_runs_explain_and_profile_modes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        fs::write(temp.path().join("app.py"), "class App:\n    pass\n").expect("write source");
+        let service = SearchToolsService::new_without_semantic_index(temp.path().to_path_buf())
+            .expect("search service");
+        let mut session = ReplSession::new();
+
+        let (_, loaded) = session.process_line("(explain (class :name \"App\"))", None);
+        assert!(loaded.contains("mode explain"), "{loaded}");
+        let (_, canonical) = session.process_line(":json", None);
+        assert!(
+            canonical.contains("\"execution_mode\": \"explain\""),
+            "{canonical}"
+        );
+        let (_, explain) = session.process_line(":run", Some(&service));
+        assert!(explain.contains("planning only"), "{explain}");
+        assert!(
+            explain.contains("bifrost_code_query_explain/v1"),
+            "{explain}"
+        );
+
+        session.process_line("(profile (class :name \"App\"))", None);
+        let (_, profile) = session.process_line(":run", Some(&service));
+        assert!(profile.contains("class App"), "{profile}");
+        assert!(profile.contains("CodeQuery profile report:"), "{profile}");
+        assert!(profile.contains("\"result\""), "{profile}");
+        assert!(profile.contains("\"cache_layers\""), "{profile}");
+        assert!(profile.contains("\"operators\""), "{profile}");
+        assert!(profile.contains("\"peak_concurrency\": 1"), "{profile}");
     }
 
     #[test]

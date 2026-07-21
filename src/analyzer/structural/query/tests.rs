@@ -329,6 +329,43 @@ fn parses_result_detail_mode() {
 }
 
 #[test]
+fn parses_defaults_and_rejects_nested_execution_modes() {
+    for (label, expected) in [
+        ("results", CodeQueryExecutionMode::Results),
+        ("explain", CodeQueryExecutionMode::Explain),
+        ("profile", CodeQueryExecutionMode::Profile),
+    ] {
+        let query = parse_ok(json!({
+            "match": { "kind": "call" },
+            "execution_mode": label
+        }));
+        assert_eq!(query.execution_mode, expected);
+        assert_eq!(query.to_canonical_json()["execution_mode"], label);
+    }
+
+    let defaulted = parse_ok(json!({ "match": { "kind": "call" } }));
+    assert_eq!(defaulted.execution_mode, CodeQueryExecutionMode::Results);
+
+    let error = error_of(json!({
+        "match": { "kind": "call" },
+        "execution_mode": "trace"
+    }));
+    assert_eq!(error.path, "execution_mode");
+
+    let nested = error_of(json!({
+        "union": [
+            {
+                "match": { "kind": "call" },
+                "execution_mode": "profile"
+            },
+            { "match": { "kind": "class" } }
+        ]
+    }));
+    assert_eq!(nested.path, "union[0].execution_mode");
+    assert!(nested.message.contains("root query"));
+}
+
+#[test]
 fn parses_and_rejects_schema_version() {
     let query = parse_ok(json!({
         "schema_version": 2,
@@ -385,7 +422,8 @@ fn canonical_query_plan_projection_excludes_execution_controls() {
         "schema_version": 2,
         "match": { "kind": "call" },
         "limit": 7,
-        "result_detail": "full"
+        "result_detail": "full",
+        "execution_mode": "profile"
     }));
     let projected = query.to_canonical_query_plan_json();
 
@@ -393,6 +431,7 @@ fn canonical_query_plan_projection_excludes_execution_controls() {
     assert!(projected.get("match").is_some());
     assert!(projected.get("limit").is_none());
     assert!(projected.get("result_detail").is_none());
+    assert!(projected.get("execution_mode").is_none());
 }
 
 #[test]

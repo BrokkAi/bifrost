@@ -26,6 +26,8 @@ For example, a saved hierarchy query can use `(members (subtypes :transitive tru
 
 `--query-file` accepts `.rql` and `.json` files only. The default workspace root is the current directory; query-file paths must stay inside that workspace, including after symlinks are resolved. The file contains the complete query, so it cannot be combined with `--tool`, `--args`, or `--sources`.
 
+A saved query may select planning-only explain or measured profile mode with `(explain QUERY)`, `(profile QUERY)`, or the JSON `execution_mode` field. Explain does not access analyzer data while lowering and selecting the query plan, although the one-shot CLI still initializes and indexes its workspace before it runs the request. Profile returns the ordinary result and a versioned telemetry report. See [Explain and Profile CodeQuery](/code-query-explain-profile/).
+
 ## Static-Analysis Policies
 
 > **Warning — only code matching is implemented:** Policy execution currently

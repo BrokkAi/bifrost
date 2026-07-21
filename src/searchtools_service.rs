@@ -715,7 +715,7 @@ impl SearchToolsService {
     pub fn query_code_result(
         &self,
         arguments: Value,
-    ) -> Result<crate::analyzer::structural::CodeQueryResult, SearchToolsServiceError> {
+    ) -> Result<crate::analyzer::structural::CodeQueryResponse, SearchToolsServiceError> {
         let arguments = self.normalize_arguments_for_current_workspace("query_code", arguments)?;
         let snapshot = self.snapshot_for_query()?;
         let result = Self::query_code_result_for_snapshot(&snapshot, arguments);
@@ -725,9 +725,9 @@ impl SearchToolsService {
     fn query_code_result_for_snapshot(
         snapshot: &WorkspaceQueryScope,
         arguments: Value,
-    ) -> Result<crate::analyzer::structural::CodeQueryResult, SearchToolsServiceError> {
+    ) -> Result<crate::analyzer::structural::CodeQueryResponse, SearchToolsServiceError> {
         let query = Self::decode_query_code_input(snapshot, arguments)?;
-        Ok(crate::analyzer::structural::execute(
+        Ok(crate::analyzer::structural::execute_request(
             snapshot.analyzer(),
             &query,
         ))

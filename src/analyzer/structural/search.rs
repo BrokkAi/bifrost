@@ -7,12 +7,12 @@
 //! diagnostics.
 
 use super::execution::plan::{
-    LogicalQueryOperator, LogicalQueryPlan, PhysicalQueryNodeId, PhysicalQueryOperator,
-    PhysicalQueryPlan,
+    CodeQueryExplain, LogicalQueryOperator, LogicalQueryPlan, PhysicalQueryNodeId,
+    PhysicalQueryOperator, PhysicalQueryPlan,
 };
 use super::execution::profile::{
-    QueryCacheProfile, QueryExecutionProfile, QueryOperatorDisposition, QueryOperatorProfile,
-    QueryOperatorTermination, QueryOperatorWorkProfile,
+    CodeQueryProfile, QueryCacheProfile, QueryExecutionProfile, QueryOperatorDisposition,
+    QueryOperatorProfile, QueryOperatorTermination, QueryOperatorWorkProfile,
 };
 use super::execution::scheduler::BoundedReadyScheduler;
 use super::facts::{FileFacts, Span};
@@ -23,8 +23,8 @@ use super::provider::StructuralFactsCacheOutcome;
 use super::query::schema::{reference_kind_label, usage_proof_label};
 use super::query::{
     CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
-    CodeQueryResultDetail, CodeQuerySeed, HierarchyTraversal, QueryStep, ReferenceTraversalFilter,
-    SetOperator,
+    CodeQueryExecutionMode, CodeQueryResultDetail, CodeQuerySeed, HierarchyTraversal, QueryStep,
+    ReferenceTraversalFilter, SetOperator,
 };
 use crate::analyzer::reference_candidates::{
     ReferenceCandidateRanges, reference_candidate_ranges, reference_candidate_ranges_cancellable,
@@ -87,6 +87,65 @@ pub struct CodeQueryResult {
     pub truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<CodeQueryDiagnostic>,
+}
+
+/// The supported `query_code` response selected by the root execution mode.
+///
+/// The enum is deliberately untagged so the default `results` variant retains
+/// the exact existing serialized `CodeQueryResult` shape. Versioned `format`
+/// fields discriminate the two report variants.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum CodeQueryResponse {
+    Results(CodeQueryResult),
+    Explain(CodeQueryExplain),
+    Profile(Box<CodeQueryProfile>),
+}
+
+impl CodeQueryResponse {
+    pub const fn mode(&self) -> CodeQueryExecutionMode {
+        match self {
+            Self::Results(_) => CodeQueryExecutionMode::Results,
+            Self::Explain(_) => CodeQueryExecutionMode::Explain,
+            Self::Profile(_) => CodeQueryExecutionMode::Profile,
+        }
+    }
+
+    /// Return the ordinary result when this response executed the query.
+    pub fn result(&self) -> Option<&CodeQueryResult> {
+        match self {
+            Self::Results(result) => Some(result),
+            Self::Profile(profile) => Some(&profile.result),
+            Self::Explain(_) => None,
+        }
+    }
+
+    /// Human/agent-readable rendering. Structured JSON remains the canonical
+    /// report representation used by MCP, CLI, Python, and editor transports.
+    pub fn render_text(&self) -> String {
+        match self {
+            Self::Results(result) => result.render_text(),
+            Self::Explain(explain) => format!(
+                "CodeQuery explain (planning only):\n{}\n",
+                serde_json::to_string_pretty(explain)
+                    .expect("the public CodeQuery explain model is serializable")
+            ),
+            Self::Profile(profile) => {
+                let mut rendered = profile.result.render_text();
+                rendered.push_str(&format!(
+                    "\nCodeQuery profile: planning {} ns; execution {} ns; rendering {} ns; total {} ns; {} operator{}; peak concurrency {}.\n",
+                    profile.timings_ns.planning,
+                    profile.timings_ns.execution,
+                    profile.timings_ns.rendering,
+                    profile.timings_ns.total,
+                    profile.operators.len(),
+                    if profile.operators.len() == 1 { "" } else { "s" },
+                    profile.scheduling.peak_concurrency,
+                ));
+                rendered
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1079,6 +1138,20 @@ pub fn execute(analyzer: &dyn IAnalyzer, query: &CodeQuery) -> CodeQueryResult {
     execute_with_limits(analyzer, query, CodeQueryExecutionLimits::default())
 }
 
+/// Honor the query's root execution mode through the public Rust surface.
+/// Ordinary callers that always want rows may continue to use [`execute`].
+pub fn execute_request(analyzer: &dyn IAnalyzer, query: &CodeQuery) -> CodeQueryResponse {
+    execute_request_with_limits(analyzer, query, CodeQueryExecutionLimits::default())
+}
+
+pub fn execute_request_with_limits(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+) -> CodeQueryResponse {
+    execute_request_internal(analyzer, query, limits, None)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CodeQueryExecutionLimits {
     pub max_scanned_files: usize,
@@ -1573,6 +1646,7 @@ pub fn execute_with_limits(
     execute_code_query_detailed(analyzer, query, limits, None).result
 }
 
+#[cfg(test)]
 pub(crate) fn execute_with_cancellation(
     analyzer: &dyn IAnalyzer,
     query: &CodeQuery,
@@ -1580,6 +1654,59 @@ pub(crate) fn execute_with_cancellation(
     cancellation: &CancellationToken,
 ) -> CodeQueryResult {
     execute_code_query_detailed(analyzer, query, limits, Some(cancellation)).result
+}
+
+/// Execute a mode-aware query with explicit limits and cooperative cancellation.
+///
+/// Unlike protocol surfaces that translate cancellation into their own error
+/// response, a profiled Rust request returns its cancellation observations and
+/// cancellation-safe partial result to the caller.
+pub fn execute_request_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: &CancellationToken,
+) -> CodeQueryResponse {
+    execute_request_internal(analyzer, query, limits, Some(cancellation))
+}
+
+fn execute_request_internal(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+) -> CodeQueryResponse {
+    match query.execution_mode {
+        CodeQueryExecutionMode::Results => CodeQueryResponse::Results(
+            execute_code_query_detailed(analyzer, query, limits, cancellation).result,
+        ),
+        CodeQueryExecutionMode::Explain => match LogicalQueryPlan::lower(query) {
+            Ok(logical_plan) => {
+                // The measured production Auto policy is sequential. Explain
+                // performs only lowering and physical selection: it does not
+                // construct an analyzer query scope or touch workspace data.
+                let physical_plan =
+                    PhysicalQueryPlan::select_with_parallel_union(logical_plan, None);
+                CodeQueryResponse::Explain(physical_plan.public_explain(query))
+            }
+            Err(error) => CodeQueryResponse::Results(invalid_plan_result(error)),
+        },
+        CodeQueryExecutionMode::Profile => {
+            let detailed = execute_internal(analyzer, query, limits, cancellation, None, true);
+            let DetailedCodeQueryResult {
+                result, profile, ..
+            } = detailed;
+            match profile {
+                Some(profile) => CodeQueryResponse::Profile(Box::new(
+                    CodeQueryProfile::from_internal(query, result, profile),
+                )),
+                // Programmatically constructed invalid plans retain the
+                // existing typed diagnostic instead of panicking while a
+                // decoded request always reaches the profiled branch above.
+                None => CodeQueryResponse::Results(result),
+            }
+        }
+    }
 }
 
 pub(crate) fn execute_code_query_detailed(
@@ -1678,7 +1805,7 @@ fn execute_internal_with_strategy(
     let _query_scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
     let request_started = capture_profile.then(Instant::now);
     let planning_started = capture_profile.then(Instant::now);
-    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+    if !capture_profile && cancellation.is_some_and(CancellationToken::is_cancelled) {
         return detailed_result_without_evidence(
             cancelled_query_result(),
             CodeQueryExecutionBudget::default(),
@@ -1688,17 +1815,7 @@ fn execute_internal_with_strategy(
         Ok(plan) => plan,
         Err(error) => {
             return detailed_result_without_evidence(
-                CodeQueryResult {
-                    results: Vec::new(),
-                    truncated: false,
-                    diagnostics: vec![CodeQueryDiagnostic {
-                        code: CodeQueryDiagnosticCode::InvalidPlan,
-                        impact: CodeQueryDiagnosticImpact::Invalid,
-                        branch: Vec::new(),
-                        language: "workspace",
-                        message: error.to_string(),
-                    }],
-                },
+                invalid_plan_result(error),
                 CodeQueryExecutionBudget::default(),
             );
         }
@@ -4182,6 +4299,20 @@ fn cancelled_query_result() -> CodeQueryResult {
         results: Vec::new(),
         truncated: true,
         diagnostics,
+    }
+}
+
+fn invalid_plan_result(error: impl ToString) -> CodeQueryResult {
+    CodeQueryResult {
+        results: Vec::new(),
+        truncated: false,
+        diagnostics: vec![CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::InvalidPlan,
+            impact: CodeQueryDiagnosticImpact::Invalid,
+            branch: Vec::new(),
+            language: "workspace",
+            message: error.to_string(),
+        }],
     }
 }
 
@@ -7994,6 +8125,127 @@ mod tests {
                 .saturating_add(profile.rendering_work),
             profile.work
         );
+    }
+
+    #[test]
+    fn public_explain_is_planning_only_and_exposes_shared_logical_dependencies() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(root.clone(), "src/app.ts");
+        file.write("class Shared {}\n").expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let query = CodeQuery::from_sexp(
+            "(explain (union (class :name \"Shared\") (class :name \"Shared\")))",
+        )
+        .expect("explain query");
+        let providers = analyzer.structural_search_providers();
+        let extractions_before = providers
+            .iter()
+            .map(|provider| provider.structural_extraction_count())
+            .sum::<u64>();
+
+        let CodeQueryResponse::Explain(explain) = execute_request(&analyzer, &query) else {
+            panic!("explain mode must return a planning report")
+        };
+
+        let extractions_after = providers
+            .iter()
+            .map(|provider| provider.structural_extraction_count())
+            .sum::<u64>();
+        assert_eq!(extractions_after, extractions_before);
+        assert_eq!(explain.scheduling.max_concurrency, 1);
+        assert!(matches!(
+            explain.scheduling.selected,
+            super::super::execution::plan::CodeQuerySelectedScheduling::Sequential
+        ));
+        let shared_set = explain
+            .logical_plan
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(
+                    &node.operation,
+                    super::super::execution::plan::CodeQueryLogicalOperation::Set { .. }
+                )
+            })
+            .expect("logical set node");
+        assert_eq!(shared_set.dependencies.len(), 2);
+        assert_eq!(shared_set.dependencies[0], shared_set.dependencies[1]);
+    }
+
+    #[test]
+    fn public_profile_nests_the_exact_ordered_ordinary_result() {
+        let source = "class First {}\nclass Second {}\n";
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/app.ts")
+            .write(source)
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let mut query =
+            CodeQuery::from_json(&json!({ "match": { "kind": "class" } })).expect("results query");
+        let CodeQueryResponse::Results(ordinary) = execute_request(&analyzer, &query) else {
+            panic!("default mode must return ordinary results")
+        };
+        let ordinary_json = serde_json::to_value(&ordinary).expect("serialize ordinary result");
+        assert_eq!(
+            serde_json::to_value(CodeQueryResponse::Results(ordinary))
+                .expect("serialize ordinary response"),
+            ordinary_json,
+            "default response must not add an enum envelope"
+        );
+
+        query.execution_mode = CodeQueryExecutionMode::Profile;
+        let CodeQueryResponse::Profile(profile) = execute_request(&analyzer, &query) else {
+            panic!("profile mode must return a profile")
+        };
+
+        assert_eq!(
+            serde_json::to_value(&profile.result).expect("serialize profiled result"),
+            ordinary_json
+        );
+        assert_eq!(profile.format, "bifrost_code_query_profile/v1");
+        assert!(!profile.operators.is_empty());
+        assert_eq!(profile.scheduling.peak_concurrency, 1);
+        assert!(profile.scheduling.bounded_dispatch.is_none());
+    }
+
+    #[test]
+    fn public_profile_retains_pre_execution_cancellation_observations() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/app.ts")
+            .write("class Cancelled {}\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let query = CodeQuery::from_json(&json!({
+            "execution_mode": "profile",
+            "match": { "kind": "class" }
+        }))
+        .expect("profile query");
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        let CodeQueryResponse::Profile(profile) = execute_request_with_cancellation(
+            &analyzer,
+            &query,
+            CodeQueryExecutionLimits::default(),
+            &cancellation,
+        ) else {
+            panic!("pre-cancelled profile should retain its report")
+        };
+
+        assert_eq!(profile.result.completion(), CodeQueryCompletion::Cancelled);
+        assert!(profile.operators.iter().any(|operator| {
+            operator.result_cancelled
+                || matches!(
+                    operator.disposition,
+                    super::super::execution::profile::CodeQueryOperatorDisposition::Cancelled
+                )
+        }));
     }
 
     #[test]
