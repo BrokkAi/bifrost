@@ -18,7 +18,8 @@ use serde_json::ser::{CharEscape, Formatter};
 use super::PolicyReportDocument;
 
 pub use human::{
-    EscapedTerminalText, HumanRenderOptions, escape_terminal_text, write_policy_human,
+    EscapedTerminalText, HumanRenderColor, HumanRenderDetail, HumanRenderOptions,
+    escape_terminal_text, write_policy_human,
 };
 pub use sarif::{SarifToolIdentity, write_policy_sarif};
 

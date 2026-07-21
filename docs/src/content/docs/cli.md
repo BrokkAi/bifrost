@@ -73,6 +73,12 @@ uses Unicode-code-point columns and strong finding IDs as stable partial
 fingerprints; weak IDs are labeled inconclusive and are not emitted as stable
 fingerprints.
 
+Human output is concise by default. Add `--verbose` for the complete audit
+record. `--color auto|always|never` controls ANSI severity colors and Unicode
+status symbols; `auto` uses them only for a terminal and respects `NO_COLOR`.
+Redirected and file output is plain and deterministic by default. These two
+options are rejected with JSON or SARIF output.
+
 `--output PATH` writes the bounded report to a temporary file beside the
 destination, synchronizes it, and atomically replaces the destination. A
 serialization, write, or replacement failure leaves an existing destination

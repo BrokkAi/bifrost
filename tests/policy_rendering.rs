@@ -2,8 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use brokk_bifrost::policy::{
-    HumanRenderOptions, PolicyFailOn, PolicyRenderError, evaluate_policy_files, write_policy_human,
-    write_policy_json,
+    HumanRenderColor, HumanRenderDetail, HumanRenderOptions, PolicyFailOn, PolicyRenderError,
+    evaluate_policy_files, write_policy_human, write_policy_json,
 };
 use serde_json::Value;
 
@@ -42,7 +42,7 @@ fn evaluate(
 }
 
 #[test]
-fn human_and_json_render_the_same_complete_finding_deterministically() {
+fn concise_verbose_and_json_render_the_same_complete_finding_deterministically() {
     let workspace = workspace(
         "export function target() { return 1; }\n",
         "render.rqlp",
@@ -72,25 +72,44 @@ fn human_and_json_render_the_same_complete_finding_deterministically() {
     assert_eq!(human_first, human_second);
     assert_eq!(usize::try_from(human_bytes).unwrap(), human_first.len());
     let human = String::from_utf8(human_first).unwrap();
-    assert!(human.starts_with("app.ts:1:8: [warning] test.render: Avoid target\n"));
-    assert!(human.contains(&format!("  finding: {finding_id} (strong)")));
-    assert!(human.contains("  analysis: match (definite, complete)"));
-    assert!(human.contains("  evidence: structural_match function\n"));
-    assert!(human.contains("  match anchor: strong structural_match app.ts\n"));
-    assert!(human.contains("  match terminal: structural_match function; identity "));
-    assert!(human.contains("  proof reason: direct_structural_match\n"));
-    assert!(human.contains("  classification: unclassified\n"));
-    assert!(human.contains("policy rule: test.render (Render test)\n"));
-    assert!(human.contains("  policy schema: 1 (explicit)\n"));
-    assert!(human.contains("  selector schema "));
-    assert!(human.contains("  endpoint dependencies: none\n"));
-    assert!(human.contains("  precedence: none\n"));
-    assert!(human.contains("  message: static - Avoid target\n"));
-    assert!(human.contains("  severity: fixed warning\n"));
-    assert!(!human.contains(" detail: {"));
-    assert!(human.lines().all(|line| line.len() <= 240));
+    assert!(human.starts_with("[warning]  app.ts:1:8\n    Avoid target\n\n"));
+    assert!(!human.contains(&finding_id));
+    assert!(!human.contains("  evidence:"));
+    assert!(!human.contains("policy rule:"));
     assert!(human.ends_with("summary: 1 finding; 1 complete policy run\n"));
     assert!(!human.contains('\u{001B}'));
+
+    let verbose_options =
+        HumanRenderOptions::new(HumanRenderDetail::Verbose, HumanRenderColor::Plain);
+    let mut verbose = Vec::new();
+    write_policy_human(outcome.report(), &verbose_options, &mut verbose, usize::MAX)
+        .expect("verbose human report");
+    let verbose = String::from_utf8(verbose).unwrap();
+    assert!(verbose.starts_with("app.ts:1:8: [warning] test.render: Avoid target\n"));
+    assert!(verbose.contains(&format!("  finding: {finding_id} (strong)")));
+    assert!(verbose.contains("  analysis: match (definite, complete)"));
+    assert!(verbose.contains("  evidence: structural_match function\n"));
+    assert!(verbose.contains("  match anchor: strong structural_match app.ts\n"));
+    assert!(verbose.contains("  match terminal: structural_match function; identity "));
+    assert!(verbose.contains("  proof reason: direct_structural_match\n"));
+    assert!(verbose.contains("  classification: unclassified\n"));
+    assert!(verbose.contains("policy rule: test.render (Render test)\n"));
+    assert!(verbose.contains("  policy schema: 1 (explicit)\n"));
+    assert!(verbose.contains("  selector schema "));
+    assert!(verbose.contains("  endpoint dependencies: none\n"));
+    assert!(verbose.contains("  precedence: none\n"));
+    assert!(verbose.contains("  message: static - Avoid target\n"));
+    assert!(verbose.contains("  severity: fixed warning\n"));
+    assert!(!verbose.contains(" detail: {"));
+    assert!(verbose.lines().all(|line| line.len() <= 240));
+    assert!(verbose.ends_with("summary: 1 finding; 1 complete policy run\n"));
+
+    let ansi_options = HumanRenderOptions::new(HumanRenderDetail::Concise, HumanRenderColor::Ansi);
+    let mut ansi = Vec::new();
+    write_policy_human(outcome.report(), &ansi_options, &mut ansi, usize::MAX)
+        .expect("ANSI human report");
+    let ansi = String::from_utf8(ansi).unwrap();
+    assert!(ansi.starts_with("\u{001B}[33m⚠\u{001B}[0m  app.ts:1:8\n"));
 
     let mut json_first = Vec::new();
     let json_bytes = write_policy_json(outcome.report(), &mut json_first, usize::MAX)
@@ -159,7 +178,7 @@ fn human_complete_empty_and_invalid_reports_are_explicitly_clean_and_non_clean()
     )
     .unwrap();
     let human = String::from_utf8(human).unwrap();
-    assert!(human.contains("policy rule: test.render (Render test)\n"));
+    assert!(!human.contains("policy rule: test.render (Render test)\n"));
     assert!(!human.contains(" detail: {"));
     assert!(human.ends_with("summary: 0 findings; 1 complete policy run; clean\n"));
 
