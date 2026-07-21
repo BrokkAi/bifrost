@@ -3878,13 +3878,12 @@ fn scala_exact_owner_member_candidate_units(
         sort_units(&mut matches);
         matches.dedup();
         if !matches.is_empty() {
-            let physical_owners = matches
-                .iter()
-                .filter_map(|unit| ctx.scala.structural_parent_of(unit))
-                .collect::<HashSet<_>>();
-            if physical_owners.len() > 1 {
-                return ScalaExactMemberResolution::Ambiguous;
-            }
+            // Each ancestor path was already resolved to one exact physical
+            // declaration. Distinct resolved traits at the same inheritance
+            // depth are a legitimate Scala conflict, so definition lookup
+            // returns every declaration and lets the client present the
+            // alternatives. Name/import or duplicate-physical-owner
+            // ambiguity is rejected earlier by the bounded ancestor resolver.
             return ScalaExactMemberResolution::Found(matches);
         }
         if next_is_ambiguous {
