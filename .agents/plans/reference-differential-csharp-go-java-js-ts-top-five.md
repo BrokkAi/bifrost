@@ -67,8 +67,15 @@ The acceptance surface is the MCP `symbols` toolset and its associated Rust and 
 - [x] (2026-07-20) Implement, review, test, exact-prove, and close the remaining assigned JavaScript issue #944 and shared JS/TS default-export issue #964; retain already-closed #665/#942/#943 without speculative changes.
 - [x] (2026-07-20) Complete the same baseline, disposition, issue, implementation, and proof lifecycle for TypeScript.
 - [x] (2026-07-20) Implement, review, test, exact-prove, and close the assigned Go issues #967-#970, Java issues #976-#979/#985/#986/#989, and runner/declaration issues #968/#969.
-- [ ] Run final local gates, integrate directly to `origin/master`, rebuild from the clean pushed head, rerun every affected top-five leg, close assigned issues with evidence, and publish compact checked-in reports.
-- [ ] Perform a 25-repository completion audit against the authoritative artifacts, issue state, clean worktree, and remote master, then record the final retrospective.
+- [x] (2026-07-21) Ran the final publication gates at the integrated source head: formatting and isolated all-target/all-feature Clippy passed, and the complete serialized `cargo test --features nlp,python` run passed outside the restricted process sandbox with 1,469 library tests passed, zero failed, four ignored, and every integration/doc target green. The first sandbox attempt failed only three process-I/O tests with `EPERM`; the identical escalated run passed them.
+- [x] (2026-07-21) Published and closed final residual C# issues #1008 and #1009 at `43002cdd` and `bdc7678a`, and reopened/finally closed Java #976 and #978 at `0ef5a839` and `abb34275`. Clean ephemeral exact records prove delegate-valued property invocation, independent nested generic arities, selector receiver type segments, and active lexical field precedence before the complete replay.
+- [x] (2026-07-21) Froze clean published Bifrost `a328a6737872ee7111d90123325bc9234469f6e5`, rebuilt release runner SHA-256 `69b8aa59f9a6f6e4afea5eca87e6507388f8a644c0ebea62721643639a8b9880`, and completed strict ephemeral five-repository C# and Java replays. Both exited zero; all ten records are clean/completed with zero raw missing, file errors, or candidate-limit exclusions.
+- [x] (2026-07-21) Retained the accepted Go, JavaScript, and TypeScript `94d99c3a` records after proving every later analyzer delta through `a328a673` is confined to C#, Java, Rust, C, or C++ (with only language-specific imports and a Rust epoch in shared files). Replaying unaffected languages would add no semantic evidence.
+- [x] (2026-07-21) Performed the 25-repository completion audit. All records parse and pin clean heads/fingerprints; 231,773 sampled sites contain 30 exhaustively reviewed non-actionable raw missing rows and zero actionable residuals. The structured GitHub audit found every in-scope issue closed as completed and assigned solely to `jbellis`; open #987 is an unrelated Rust campaign issue and was left untouched.
+- [x] (2026-07-21) Published compact manifest `.agents/docs/reference-differential/task-top5-csharp-go-java-js-ts.jsonl` and summary `.agents/docs/reference-differential/task-top5-csharp-go-java-js-ts-summary.md`, including task ranks, heads, fingerprints, checksums, counters, issue state, residual dispositions, and validation evidence.
+- [x] (2026-07-21) Re-ran the exact live `tasks.py` selector during the final completion audit and detected external task-corpus drift after the original selection. Current JavaScript top five adds `argoproj__argo-cd` (266), `pipe-cd__pipecd` (101), and `bancolombia__devsecops-engine-tools` (78); current TypeScript top five adds `woodpecker-ci__woodpecker` (113). Marked the completed 25-record matrix as a historical checkpoint rather than claiming stale-selector completion.
+- [ ] Audit the four newly ranked JavaScript/TypeScript repositories through the full baseline, disposition, issue, implementation, exact-proof, and clean final replay lifecycle.
+- [ ] Regenerate the compact manifest and summary from the live selector, rerun the final completion audit, and publish the clean final reports directly to `origin/master`.
 
 ## Surprises & Discoveries
 
@@ -265,9 +272,29 @@ The acceptance surface is the MCP `symbols` toolset and its associated Rust and 
   Rationale: Four sampled generated files are smaller than the accepted 4 MiB source ceiling but exceed 50,000 structured candidates, so accepting their exclusion would leave known coverage holes. The higher bound remains explicit and finite, applies uniformly to all five C# repositories, and does not alter site, target, usage-file, or usage-count limits. JavaScript and TypeScript retain the original 50,000 bound unless their own completed evidence demonstrates the same conflict.
   Date/Author: 2026-07-20 / Codex
 
+- Decision: Retain the accepted `94d99c3a` Go, JavaScript, and TypeScript records while replaying C# and Java at `a328a673`.
+  Rationale: The complete path diff between those heads contains only C#, Java, Rust, C, and C++ analyzer/test changes. Shared-file changes are import routing for those languages and a Rust-only epoch. No Go or JS/TS semantic dependency changed, so a byte-for-byte fresh corpus would not strengthen behavior provenance.
+  Date/Author: 2026-07-21 / Codex
+
+- Decision: Accept 30 final raw missing rows as reviewed non-actionable residue rather than forcing zero raw rows through broader heuristics.
+  Rationale: The two Go rows are `package main` declaration clauses that resolve spuriously to entry functions, not reference sites. The 28 JavaScript rows have invalid receiver/binding or write/declaration forward identities. None is a semantically correct forward reference omitted by a complete inverse query; broadening inverse lookup would create false edges and violate the structured-failure philosophy.
+  Date/Author: 2026-07-21 / Codex
+
+- Decision: Treat #987 as outside this campaign despite its appearance in a historical cross-campaign issue list.
+  Rationale: The current issue is explicitly a Rust re-export and per-target usage-analysis concern, reopened by the concurrent Rust campaign. It does not affect the requested C#/Go/Java/JavaScript/TypeScript symbols scope and was not used to claim this campaign's closure.
+  Date/Author: 2026-07-21 / Codex
+
+- Decision: Recompute task-ranked membership at the final audit and honor live selector drift even after the prior matrix completed.
+  Rationale: The objective names `tasks.py` as the authority rather than pinning a historical metadata revision. The live filtered counts now place four previously unobserved repositories in the JavaScript/TypeScript top five. Treating the earlier snapshot as final would contradict the current selector and the completion-audit requirement.
+  Date/Author: 2026-07-21 / Codex
+
 ## Outcomes & Retrospective
 
-The selector correction resets objective completion to zero of 25 accepted records. All earlier LOC-ranked Java, Go, C#, JavaScript, and TypeScript artifacts remain regression evidence for the fixes they exposed, but none contains a repository selected by the authoritative task-ranked matrix. The accumulated fixes and their focused production proofs are locally integrated and have passed the complete publication gate. The next acceptance boundary is a clean pushed `origin/master`, a release runner built from that exact revision, and five new explicit-repository corpus legs.
+The original task-ranked selection snapshot is complete: all 25 repositories selected through `task_repos(SFT_PREDICATES, langs=[...])` at campaign start have accepted clean records, every one of the 3,030 baseline raw missing rows received an explicit source/AST/identity disposition, every legitimate in-scope defect was filed or broadened and assigned solely to `jbellis` before implementation, and every such issue is closed with focused tests and clean exact production proof.
+
+The final corpus comprises 231,773 sampled sites across 14,807 audited files. C#, Java, and TypeScript finish with zero raw missing. Go retains two package-clause declaration sites and JavaScript retains 28 invalid-forward/binding rows; exhaustive review classifies all 30 as non-actionable and leaves zero unresolved symbols defects. All 25 records are completed and clean with zero file errors or candidate-limit exclusions. Their per-language fingerprints, repository heads, configured target sampling, raw artifact paths/checksums, and issue ledgers are pinned in the compact manifest and human summary.
+
+The final C# and Java artifacts use strict ephemeral runs at clean published `a328a673`; the accepted Go/JavaScript/TypeScript snapshot artifacts remain at `94d99c3a` because no later change affects those analyzers or shared behavior. Final formatting, isolated all-target/all-feature Clippy, and the complete `cargo test --features nlp,python` suite passed locally. However, the live selector changed before publication: three new JavaScript leaders and one new TypeScript leader remain to be audited. Objective completion is therefore reopened until those four records replace the displaced snapshot rows and the final report is regenerated. GitHub CI remains deliberately non-blocking.
 
 ## Context and Orientation
 
@@ -414,3 +441,7 @@ Revision note (2026-07-20): Preserved the three-envelope `f7511c92` C# run as di
 Revision note (2026-07-20): Accepted and closed #954 after clean `093b17cd` exact proof resolved the 1,219-part runtime `Interop` group in 36.8 seconds with an exact consistent hit and zero file errors, then advanced the C# leg to its raised-ceiling full restart.
 
 Revision note (2026-07-20): Corrected the campaign selection after an explicit `tasks.py` audit proved that the earlier plan used code-LOC ranking. Pinned the five descending fully filtered `SFT_PREDICATES` task-count leaders for C#, Go, Java, JavaScript, and TypeScript, classified all prior LOC-ranked corpus records as regression-only evidence, and required repeated explicit `--repo` filters for the authoritative 25-repository matrix.
+
+Revision note (2026-07-21): Recorded final closure and exact proof for C# #1008/#1009 and reopened Java #976/#978, the clean `a328a673` C#/Java full replays, the justified retention of unaffected `94d99c3a` Go/JS/TS records, the 25-record/231,773-site completion audit, final issue ownership/state audit, complete local gates, and the durable compact manifest plus human summary.
+
+Revision note (2026-07-21): Reopened completion after the required live `tasks.py` audit detected task-corpus drift: Argo CD, PipeCD, and DevSecOps Engine Tools entered the JavaScript top five, and Woodpecker entered the TypeScript top five. Preserved the completed prior matrix as a clearly labeled historical checkpoint and added the four replacement repository lifecycle plus final report regeneration to the remaining work.
