@@ -41,6 +41,10 @@ import {
 import type { RqlQueryDocument, RqlQueryResponse, RqlQueryResultItem } from "./rql_query";
 import { formatRqlQueryOutput, queryResultRange, runRqlQuery } from "./rql_query";
 import { RqlQueryResultsProvider } from "./rql_results";
+import type { RqlPolicyDocument, RqlPolicyResponse } from "./rql_policy";
+import { policyLocationRange, runRqlPolicy } from "./rql_policy";
+import type { PolicyFindingTarget } from "./rql_policy_results";
+import { RqlPolicyResultsProvider } from "./rql_policy_results";
 import type { RuneIrRange, RuneIrResponse } from "./rune_ir";
 import { RUNE_IR_LANGUAGE_ID, RUNE_IR_SOURCE_LANGUAGE_IDS, showRuneIr } from "./rune_ir";
 import type { WireDiagnostic, WireHover } from "./rql_validation";
@@ -56,6 +60,7 @@ let client: LanguageClient | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
 let outputChannel: vscode.OutputChannel | undefined;
 let rqlQueryResults: RqlQueryResultsProvider | undefined;
+let rqlPolicyResults: RqlPolicyResultsProvider | undefined;
 let rqlDiagnostics: vscode.DiagnosticCollection | undefined;
 let rqlValidation: RqlValidationController<vscode.CancellationToken> | undefined;
 let lastLaunchConfig: BifrostLaunchConfig | undefined;
@@ -69,12 +74,18 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(outputChannel);
   rqlQueryResults = new RqlQueryResultsProvider();
   context.subscriptions.push(rqlQueryResults);
+  rqlPolicyResults = new RqlPolicyResultsProvider();
+  context.subscriptions.push(rqlPolicyResults);
   rqlDiagnostics = vscode.languages.createDiagnosticCollection("Bifrost RQL");
   context.subscriptions.push(rqlDiagnostics);
   rqlValidation = createRqlValidationController();
   context.subscriptions.push(
     vscode.window.createTreeView("bifrost.queryResults", {
       treeDataProvider: rqlQueryResults,
+      showCollapseAll: true
+    }),
+    vscode.window.createTreeView("bifrost.policyResults", {
+      treeDataProvider: rqlPolicyResults,
       showCollapseAll: true
     })
   );
@@ -94,16 +105,38 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("bifrost.runRqlQuery", (resource?: vscode.Uri) =>
       runRqlQueryForEditor(resource)
     ),
+    vscode.commands.registerCommand("bifrost.runRqlPolicy", (resource?: vscode.Uri) =>
+      runRqlPolicyForEditor(resource)
+    ),
     vscode.commands.registerCommand("bifrost.showRuneIr", () => showRuneIrForEditor()),
     vscode.commands.registerCommand("bifrost.openRqlQueryResult", (result: RqlQueryResultItem) =>
       openRqlQueryResult(result)
+    ),
+    vscode.commands.registerCommand("bifrost.openRqlPolicyFinding", (target: PolicyFindingTarget) =>
+      openRqlPolicyFinding(target)
     ),
     vscode.commands.registerCommand("bifrost.copyMcpConfig", () => copyMcpConfig(context)),
     vscode.commands.registerCommand("bifrost.openMcpSetup", () => openMcpSetup(context))
   );
 
+  const policyWorkspaceWatcher = vscode.workspace.createFileSystemWatcher(
+    "**/*.{java,go,c,cc,cpp,cxx,h,hpp,hh,hxx,js,mjs,cjs,jsx,ts,tsx,py,rs,php,scala,cs,rb,rql,rqlp,json,toml}"
+  );
+  const markWorkspacePolicyResultsStale = (uri: vscode.Uri): void => {
+    if (!isGeneratedWorkspacePath(uri)) {
+      rqlPolicyResults?.markStale("workspace changed");
+    }
+  };
+  context.subscriptions.push(
+    policyWorkspaceWatcher,
+    policyWorkspaceWatcher.onDidChange(markWorkspacePolicyResultsStale),
+    policyWorkspaceWatcher.onDidCreate(markWorkspacePolicyResultsStale),
+    policyWorkspaceWatcher.onDidDelete(markWorkspacePolicyResultsStale)
+  );
+
   context.subscriptions.push(
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      rqlPolicyResults?.markStale("workspace folders changed");
       if (client?.state === State.Running) {
         void restartClient(context);
       }
@@ -121,6 +154,9 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.workspace.onDidChangeTextDocument((event) => {
       rqlValidation?.schedule(validationDocument(event.document));
+      rqlPolicyResults?.markStale(
+        event.document.languageId === "bifrost-rql-policy" ? "policy changed" : "workspace changed"
+      );
     }),
     vscode.workspace.onDidCloseTextDocument((document) => {
       rqlValidation?.close(document.uri.toString());
@@ -232,6 +268,46 @@ async function runRqlQueryForEditor(resource?: vscode.Uri): Promise<void> {
   }
 }
 
+async function runRqlPolicyForEditor(resource?: vscode.Uri): Promise<void> {
+  const document = resource
+    ? await vscode.workspace.openTextDocument(resource)
+    : vscode.window.activeTextEditor?.document;
+  const workspaceFolder = document ? vscode.workspace.getWorkspaceFolder(document.uri) : undefined;
+  const policyDocument: RqlPolicyDocument | undefined = document
+    ? {
+        languageId: document.languageId,
+        uri: document.uri.toString(),
+        workspaceRootUri: workspaceFolder?.uri.toString() ?? "",
+        sourceIdentity: workspaceFolder
+          ? vscode.workspace.asRelativePath(document.uri, false).replace(/\\/g, "/")
+          : "",
+        text: document.getText()
+      }
+    : undefined;
+  const currentClient = client;
+  rqlPolicyResults?.markStale("a new policy run started");
+  const response = await runRqlPolicy(policyDocument, {
+    isReady: () => currentClient?.state === State.Running,
+    sendRequest: (method, params) => currentClient!.sendRequest<RqlPolicyResponse>(method, params),
+    showError: (message) => {
+      void vscode.window.showErrorMessage(message);
+    },
+    showWarning: (message) => {
+      void vscode.window.showWarningMessage(message);
+    }
+  });
+  if (!response || !rqlPolicyResults) {
+    return;
+  }
+
+  rqlPolicyResults.update(response);
+  await vscode.commands.executeCommand("bifrost.policyResults.focus");
+  const findingCount = response.report.runs.reduce((count, run) => count + run.findings.length, 0);
+  if (findingCount === 0 && response.report.diagnostics.length === 0) {
+    void vscode.window.showInformationMessage("Bifrost RQL policy returned no findings.");
+  }
+}
+
 async function openRqlQueryResult(result: RqlQueryResultItem): Promise<void> {
   const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(result.uri));
   const editor = await vscode.window.showTextDocument(document, { preview: true });
@@ -263,6 +339,35 @@ async function openRqlQueryResult(result: RqlQueryResultItem): Promise<void> {
   const range = new vscode.Range(start, end);
   editor.selection = new vscode.Selection(start, end);
   editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+}
+
+async function openRqlPolicyFinding(target: PolicyFindingTarget): Promise<void> {
+  const root = vscode.Uri.parse(target.workspaceRootUri);
+  const uri = vscode.Uri.joinPath(root, target.finding.primary.path);
+  const document = await vscode.workspace.openTextDocument(uri);
+  const editor = await vscode.window.showTextDocument(document, { preview: true });
+  const locationRange = policyLocationRange(target.finding.primary);
+  if (!locationRange) {
+    return;
+  }
+  const startLine = Math.min(locationRange.start.line, document.lineCount - 1);
+  const endLine = Math.min(Math.max(startLine, locationRange.end.line), document.lineCount - 1);
+  const startColumn = Math.min(
+    locationRange.start.character,
+    document.lineAt(startLine).text.length
+  );
+  const endColumn = Math.min(locationRange.end.character, document.lineAt(endLine).text.length);
+  const start = new vscode.Position(startLine, startColumn);
+  const end = new vscode.Position(endLine, endColumn);
+  const range = new vscode.Range(start, end);
+  editor.selection = new vscode.Selection(start, end);
+  editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+}
+
+function isGeneratedWorkspacePath(uri: vscode.Uri): boolean {
+  return ["/.brokk/", "/.git/", "/node_modules/", "/target/"].some((part) =>
+    uri.path.includes(part)
+  );
 }
 
 export function deactivate(): Thenable<void> | undefined {
@@ -396,6 +501,7 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
       closed: () => {
         log("Bifrost language server connection closed.");
         handleRqlServerClosed(rqlValidation);
+        rqlPolicyResults?.markStale("language server stopped");
         setStatus("$(circle-slash) Bifrost", "Bifrost language server is stopped.");
         return { action: CloseAction.DoNotRestart, handled: true };
       }
@@ -455,6 +561,7 @@ function currentBifrostRuntimeSettings(
 
 async function stopClient(options: { updateUi?: boolean } = {}): Promise<void> {
   rqlValidation?.stop();
+  rqlPolicyResults?.markStale("language server stopped");
   const updateUi = options.updateUi ?? true;
   const startup = startInFlight;
   if (startup) {

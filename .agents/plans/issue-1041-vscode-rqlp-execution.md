@@ -14,7 +14,7 @@ The behavior is visible by opening a workspace policy, changing it without savin
 - [x] (2026-07-21 18:08Z) Attached the worktree to the existing `1041-add-first-class-vs-code-execution-and-brokk-branding-for-rqlp-policies` branch.
 - [x] (2026-07-21 18:24Z) Milestone 1: refactored policy coordination to accept an existing analyzer, cancellation, and a live root-document overlay; focused tests prove unsaved bytes and endpoint-root diagnostics.
 - [x] (2026-07-21 18:45Z) Milestone 2: exposed overlay evaluation through a cancellable, identity-validated `bifrost/runPolicy` LSP request; the focused integration test covers findings, parse diagnostics, endpoint rejection, unsupported taint, and invalid identities.
-- [ ] Milestone 3: add the typed VS Code policy runner, dedicated results view, navigation, and stale-result lifecycle, with TypeScript tests.
+- [x] (2026-07-21 18:57Z) Milestone 3: added the typed VS Code policy runner, dedicated results view, navigation, evidence tooltip, and stale-result lifecycle; the complete 61-test extension suite passes.
 - [ ] Milestone 4: replace the `.rqlp` icon and verify Explorer-size rendering on light and dark themes.
 - [ ] Run formatting, clippy, Rust feature tests, VS Code tests, and manual Extension Development Host validation.
 - [ ] Run the guided-issue specialist review, address material findings, and complete the retrospective.
@@ -29,6 +29,9 @@ The behavior is visible by opening a workspace policy, changing it without savin
 
 - Observation: Endpoint documents do not use the same explicit schema-version field as policies in the current fixture format.
   Evidence: The first endpoint-root test intentionally reached canonical validation failure; adapting it to the checked-in endpoint schema produced `NotExecutableEndpoint` as required.
+
+- Observation: The VS Code worktree initially had no installed Node dependencies.
+  Evidence: `prettier` and `tsc` were missing; `npm ci` installed the locked 431-package dependency graph, after which the full extension test pipeline passed.
 
 ## Decision Log
 
@@ -52,9 +55,13 @@ The behavior is visible by opening a workspace policy, changing it without savin
   Rationale: Policy coordination can fail before a canonical report exists. Returning that as an internal LSP error is accurate, while treating it as cancellation would hide a real failure and duplicating the worker implementation would drift.
   Date/Author: 2026-07-21 / Codex
 
+- Decision: Keep protocol validation and presentation helpers in a VS Code-independent `rql_policy.ts`, with `rql_policy_results.ts` limited to tree-item construction.
+  Rationale: Unsaved request payloads, schema version checks, completion semantics, terminal-symbol extraction, and 1-based-to-0-based ranges can be unit-tested directly. The UI consumes those tested projections without parsing rendered CLI text.
+  Date/Author: 2026-07-21 / Codex
+
 ## Outcomes & Retrospective
 
-Milestones 1 and 2 are complete. `evaluate_policy_source` evaluates editor-provided bytes under their supplied identity with a caller-owned `IAnalyzer` and cancellation token, while shared coordination still builds bounded canonical reports and CLI file evaluation retains its original analyzer-building behavior. `bifrost/runPolicy` now selects the document's owning workspace, rejects non-portable or mismatched identities, runs in the existing overlay-snapshot worker, and returns the canonical report plus workspace root URI. Focused tests pass for unsaved findings, parse diagnostics, endpoint-root rejection, unsupported taint, and invalid identities. The VS Code experience remains for Milestone 3.
+Milestones 1 through 3 are complete. `evaluate_policy_source` evaluates editor-provided bytes under their supplied identity with a caller-owned `IAnalyzer` and cancellation token. `bifrost/runPolicy` selects the owning workspace, rejects unsafe identities, uses the overlay-snapshot analyzer, and returns the canonical report plus root URI. VS Code now exposes a policy-only Play command and results view with explicit completion state, report diagnostics, finding severity/message/location/terminal, navigable ranges, secondary evidence detail, and conservative stale-result marking. The full extension pipeline passes 61 tests. Icon work, broad Rust gates, manual editor verification, and guided review remain.
 
 ## Context and Orientation
 
@@ -125,3 +132,5 @@ Revision note (2026-07-21): Created the initial self-contained plan after diagno
 Revision note (2026-07-21 18:24Z): Marked Milestone 1 complete after extracting shared coordination, adding the live-source API, threading cancellation into evaluation, and passing focused tests for unsaved analyzer-backed findings and endpoint-root rejection.
 
 Revision note (2026-07-21 18:45Z): Marked Milestone 2 complete after adding the cancellable `bifrost/runPolicy` request, authoritative workspace-relative identity validation, structured canonical response, and passing end-to-end LSP coverage.
+
+Revision note (2026-07-21 18:57Z): Marked Milestone 3 complete after adding typed canonical report handling, the dedicated policy-results tree, exact finding navigation, stale lifecycle wiring, manifest contributions, and passing the full VS Code test pipeline.

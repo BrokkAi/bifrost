@@ -254,8 +254,17 @@
         "icon": "$(play)"
       },
       {
+        "command": "bifrost.runRqlPolicy",
+        "title": "Bifrost: Run RQL Policy",
+        "icon": "$(play)"
+      },
+      {
         "command": "bifrost.openRqlQueryResult",
         "title": "Bifrost: Open RQL Query Result"
+      },
+      {
+        "command": "bifrost.openRqlPolicyFinding",
+        "title": "Bifrost: Open RQL Policy Finding"
       },
       {
         "command": "bifrost.showRuneIr",
@@ -267,6 +276,10 @@
         {
           "id": "bifrost.queryResults",
           "name": "Bifrost Query Results"
+        },
+        {
+          "id": "bifrost.policyResults",
+          "name": "Bifrost Policy Results"
         }
       ]
     },
@@ -274,6 +287,10 @@
       {
         "view": "bifrost.queryResults",
         "contents": "Run an RQL query from a `.rql` editor to see its results here."
+      },
+      {
+        "view": "bifrost.policyResults",
+        "contents": "Run an RQL policy from a `.rqlp` editor to see completion state and findings here."
       }
     ],
     "menus": {
@@ -287,6 +304,14 @@
           "when": "false"
         },
         {
+          "command": "bifrost.runRqlPolicy",
+          "when": "resourceLangId == bifrost-rql-policy"
+        },
+        {
+          "command": "bifrost.openRqlPolicyFinding",
+          "when": "false"
+        },
+        {
           "command": "bifrost.showRuneIr",
           "when": "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == ruby"
         }
@@ -295,6 +320,11 @@
         {
           "command": "bifrost.runRqlQuery",
           "when": "resourceLangId == bifrost-rql",
+          "group": "navigation@1"
+        },
+        {
+          "command": "bifrost.runRqlPolicy",
+          "when": "resourceLangId == bifrost-rql-policy",
           "group": "navigation@1"
         }
       ],

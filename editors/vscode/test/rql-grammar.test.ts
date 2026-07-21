@@ -91,6 +91,14 @@ void test("registers distinct RQL, policy, and Rune IR languages", () => {
     }
   );
   assert.deepEqual(
+    manifest.contributes.commands.find((command) => command.command === "bifrost.runRqlPolicy"),
+    {
+      command: "bifrost.runRqlPolicy",
+      title: "Bifrost: Run RQL Policy",
+      icon: "$(play)"
+    }
+  );
+  assert.deepEqual(
     manifest.contributes.commands.find((command) => command.command === "bifrost.showRuneIr"),
     {
       command: "bifrost.showRuneIr",
@@ -102,11 +110,18 @@ void test("registers distinct RQL, policy, and Rune IR languages", () => {
       command: "bifrost.runRqlQuery",
       when: "resourceLangId == bifrost-rql",
       group: "navigation@1"
+    },
+    {
+      command: "bifrost.runRqlPolicy",
+      when: "resourceLangId == bifrost-rql-policy",
+      group: "navigation@1"
     }
   ]);
   assert.deepEqual(manifest.contributes.menus.commandPalette, [
     { command: "bifrost.runRqlQuery", when: "false" },
     { command: "bifrost.openRqlQueryResult", when: "false" },
+    { command: "bifrost.runRqlPolicy", when: "resourceLangId == bifrost-rql-policy" },
+    { command: "bifrost.openRqlPolicyFinding", when: "false" },
     { command: "bifrost.showRuneIr", when: runeIrSourceContext }
   ]);
   assert.deepEqual(manifest.contributes.menus["editor/context"], [
@@ -117,7 +132,8 @@ void test("registers distinct RQL, policy, and Rune IR languages", () => {
     }
   ]);
   assert.deepEqual(manifest.contributes.views.explorer, [
-    { id: "bifrost.queryResults", name: "Bifrost Query Results" }
+    { id: "bifrost.queryResults", name: "Bifrost Query Results" },
+    { id: "bifrost.policyResults", name: "Bifrost Policy Results" }
   ]);
 });
 
