@@ -120,7 +120,7 @@ fn target_owner_sets(
     owner: &CodeUnit,
     kind: TargetKind,
 ) -> TargetOwnerSets {
-    let mut receiver = HashSet::from_iter([owner.fq_name()]);
+    let receiver = HashSet::from_iter([owner.fq_name()]);
     let mut declarations = HashSet::from_iter([owner.fq_name()]);
     if kind != TargetKind::Method {
         return TargetOwnerSets {
@@ -137,7 +137,6 @@ fn target_owner_sets(
 
     for descendant in provider.get_descendants(owner) {
         if java_owner_declares_matching_method(analyzer, &descendant, target) {
-            receiver.insert(descendant.fq_name());
             declarations.insert(descendant.fq_name());
         }
     }
@@ -275,10 +274,10 @@ pub(super) fn receiver_matches_target(
             let match_result = method_invocation_return_type(receiver, ctx)
                 .map(|resolved| receiver_type_matches_target(&resolved, ctx))
                 .unwrap_or(ReceiverTargetMatch::Unresolved);
-            if match_result == ReceiverTargetMatch::Unresolved {
-                method_invocation_anonymous_return_match(receiver, ctx).unwrap_or(match_result)
-            } else {
+            if match_result == ReceiverTargetMatch::Matched {
                 match_result
+            } else {
+                method_invocation_anonymous_return_match(receiver, ctx).unwrap_or(match_result)
             }
         }
         "this" | "super" => {
@@ -315,7 +314,26 @@ fn receiver_fq_names_match_target<'a>(
     }
 }
 
-fn receiver_type_matches_target(
+pub(super) fn receiver_type_matches_target(
+    receiver_type: &CodeUnit,
+    ctx: &ScanCtx<'_>,
+) -> ReceiverTargetMatch {
+    let receiver_fq_name = receiver_type.fq_name();
+    if let Some(cached) = ctx
+        .receiver_target_match_cache
+        .borrow()
+        .get(&receiver_fq_name)
+    {
+        return *cached;
+    }
+    let resolved = receiver_type_matches_target_uncached(receiver_type, ctx);
+    ctx.receiver_target_match_cache
+        .borrow_mut()
+        .insert(receiver_fq_name, resolved);
+    resolved
+}
+
+fn receiver_type_matches_target_uncached(
     receiver_type: &CodeUnit,
     ctx: &ScanCtx<'_>,
 ) -> ReceiverTargetMatch {
@@ -330,27 +348,54 @@ fn receiver_type_matches_target(
     let Some(provider) = ctx.analyzer.type_hierarchy_provider() else {
         return ReceiverTargetMatch::Unresolved;
     };
-    if ctx.spec.kind == TargetKind::Method
-        && provider
+    if ctx.spec.kind == TargetKind::Method {
+        if java_owner_declares_matching_method(ctx.java, receiver_type, &ctx.spec.target) {
+            return ReceiverTargetMatch::Incompatible;
+        }
+        if !provider
             .get_ancestors(receiver_type)
             .iter()
+            .any(|ancestor| ancestor == &ctx.spec.owner)
+        {
+            return ReceiverTargetMatch::Incompatible;
+        }
+        if java_owner_declares_same_arity_overload(ctx.java, receiver_type, &ctx.spec.target) {
+            return ReceiverTargetMatch::Unresolved;
+        }
+        if provider
+            .get_ancestors(receiver_type)
+            .iter()
+            .filter(|ancestor| *ancestor != &ctx.spec.owner)
             .any(|ancestor| {
-                ctx.spec
-                    .receiver_owner_fq_names
-                    .contains(&ancestor.fq_name())
+                java_owner_declares_same_arity_overload(ctx.java, ancestor, &ctx.spec.target)
             })
-    {
-        return ReceiverTargetMatch::Matched;
+        {
+            return ReceiverTargetMatch::Unresolved;
+        }
+        if nearest_declaring_ancestor_matches_target(ctx, receiver_type, |ancestor| {
+            java_owner_declares_matching_method(ctx.java, ancestor, &ctx.spec.target)
+        }) {
+            return ReceiverTargetMatch::Matched;
+        }
     }
-    if provider
-        .get_ancestors(&ctx.spec.owner)
-        .into_iter()
-        .any(|ancestor| ancestor == *receiver_type)
-    {
-        ReceiverTargetMatch::Unresolved
-    } else {
-        ReceiverTargetMatch::Incompatible
-    }
+    ReceiverTargetMatch::Incompatible
+}
+
+fn java_owner_declares_same_arity_overload(
+    analyzer: &JavaAnalyzer,
+    owner: &CodeUnit,
+    target: &CodeUnit,
+) -> bool {
+    let target_arity = java_callable_arity(analyzer, target);
+    analyzer
+        .global_usage_definition_index()
+        .by_fqn(&format!("{}.{}", owner.fq_name(), target.identifier()))
+        .iter()
+        .any(|unit| {
+            unit.is_function()
+                && java_callable_arity(analyzer, unit) == target_arity
+                && !java_method_signatures_match(analyzer, target, unit)
+        })
 }
 
 fn method_invocation_anonymous_return_match(
@@ -568,18 +613,7 @@ pub(super) fn owner_matches_target_context(node: Node<'_>, ctx: &mut ScanCtx<'_>
     let Some(owner) = context.owner.as_ref() else {
         return false;
     };
-    if ctx.spec.receiver_owner_fq_names.contains(&owner.fq_name()) {
-        return true;
-    }
-    ctx.analyzer
-        .type_hierarchy_provider()
-        .is_some_and(|provider| {
-            provider.get_ancestors(owner).iter().any(|ancestor| {
-                ctx.spec
-                    .receiver_owner_fq_names
-                    .contains(&ancestor.fq_name())
-            })
-        })
+    receiver_type_matches_target(owner, ctx) == ReceiverTargetMatch::Matched
 }
 
 fn anonymous_creation_context_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
