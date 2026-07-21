@@ -3,7 +3,7 @@ title: MCP Server
 description: Run Bifrost as a stdio MCP server for code-intelligence tools.
 ---
 
-Bifrost can run as a stdio MCP server. Always pass an explicit workspace root so the host analyzes the intended repository. For a coding agent that should navigate symbols and run structural queries, use the same query-capable composition as the packaged Bifrost plugins:
+Bifrost can run as a stdio MCP server. For a manual configuration, pass an explicit workspace root so the host analyzes the intended repository. For a coding agent that should navigate symbols and run structural queries, use the same query-capable composition as the packaged Bifrost plugins:
 
 ```bash
 bifrost --root /path/to/project --mcp "symbol|extended"
@@ -33,7 +33,9 @@ bifrost --root /path/to/project --mcp "symbol|workspace"
 bifrost --root /path/to/project --mcp "text|extended"
 ```
 
-By default, `bifrost` uses the current working directory as `--root` and `searchtools` as the MCP toolset. For agent-host configuration, pass both values explicitly so the host analyzes the intended repository.
+The no-argument compatibility command, `bifrost`, uses the current working directory and the `searchtools` toolset. An explicit `bifrost --mcp <toolsets>` command without `--root` starts unbound, requests `roots/list` from a roots-capable MCP client after initialization, and selects the first usable local filesystem root in client order. Clients can send `notifications/roots/list_changed` to replace that root transactionally. If the client does not support roots, analyzer calls return an actionable unbound-workspace error instead of analyzing process cwd.
+
+Explicit `--root` integrations remain authoritative and do not require roots negotiation. The packaged launcher also translates `BIFROST_WORKSPACE_ROOT` into an explicit `--root`. Prefer an explicit root for manual fixed-project configurations. Packaged plugins use roots negotiation so package-local command resolution stays independent from analyzer scope.
 
 ## Toolsets
 

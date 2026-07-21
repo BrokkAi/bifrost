@@ -37,6 +37,8 @@ If you are testing the package directory directly instead of the repository mark
 
 After installing the plugin, enable the Bifrost MCP server for the workspace from the plugin's **MCPs** section in Customize. Already-open agent chats may need a fresh chat before newly enabled MCP tools appear.
 
+Enabling the plugin's MCP entry is sufficient; do not create a duplicate manual Bifrost server. Without an explicit launcher override, Bifrost accepts the workspace only from Cursor's MCP roots response and never analyzes the installed plugin directory.
+
 Use a smoke prompt that proves Cursor called Bifrost instead of just reading files:
 
 ```text

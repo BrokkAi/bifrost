@@ -13,11 +13,11 @@ This does not require users to install a second MCP server. The agent plugin con
 - [x] (2026-07-21 18:00Z) Reproduced issue #1031 and confirmed that Codex launches the packaged command from the plugin cache, which the launcher forwards as Bifrost `--root`.
 - [x] (2026-07-21 18:20Z) Audited current Codex source and confirmed that configured plugin cwd overrides the runtime task cwd and that Codex does not currently implement `roots/list` for MCP servers.
 - [x] (2026-07-21 18:45Z) Prototyped exposing existing `activate_workspace`, then backed it out after review showed it could escape the task boundary and broaden nested project roots to an enclosing Git root.
-- [ ] Implement an explicit rootless lifecycle in `SearchToolsService` and MCP startup while preserving all explicit-root callers.
-- [ ] Implement MCP `roots/list` request/response handling and root-change notifications with cross-platform file-URI parsing.
-- [ ] Constrain lifecycle activation to client-approved canonical roots and provide actionable unbound-state errors.
-- [ ] Update the packaged launcher, manifests, skills, release smoke, and editor documentation.
-- [ ] Run focused tests, Rust CI-equivalent checks, real host smokes where possible, and the guided specialist review.
+- [x] (2026-07-21 19:20Z) Implemented an explicit rootless lifecycle in `SearchToolsService` and MCP startup while preserving explicit-root callers and bare-command cwd compatibility.
+- [x] (2026-07-21 19:40Z) Implemented MCP `roots/list` request/response handling, root-change notifications, coalesced refreshes, revocation, and standards-aware file-URI parsing.
+- [x] (2026-07-21 19:45Z) Constrained protocol binding to exact client-returned canonical roots and added actionable unbound-state errors; the unrestricted lifecycle tool remains absent from the packaged toolset.
+- [x] (2026-07-21 20:00Z) Updated the packaged launcher, generated skill bundles, release smoke, security-boundary docs, and Codex/Claude/Cursor installation guidance.
+- [ ] Run Rust CI-equivalent checks, the packaged release smoke where practical, a real roots-capable host smoke, and the guided specialist review. Focused MCP, URI, manifest, and launcher tests pass.
 
 ## Surprises & Discoveries
 
@@ -29,6 +29,9 @@ This does not require users to install a second MCP server. The agent plugin con
 
 - Observation: MCP has a standard client roots capability. Supporting clients declare `capabilities.roots`, servers request `roots/list`, and clients may send `notifications/roots/list_changed`.
   Evidence: MCP specification version 2025-11-25, client feature “Roots”. Bifrost's hand-written JSON-RPC loop currently handles only client requests and notifications, so it needs a small bidirectional connection state machine.
+
+- Observation: A root-change notification can race an outstanding roots request, and an empty replacement list revokes the previous workspace rather than meaning “keep using it.”
+  Evidence: the connection state now coalesces an in-flight change into one follow-up request, and the host-equivalent integration test replaces then revokes the selected workspace.
 
 ## Decision Log
 
@@ -48,9 +51,13 @@ This does not require users to install a second MCP server. The agent plugin con
   Rationale: existing CLI, Amp, release, and manual MCP configurations already provide a trusted root and must not incur a roots negotiation or behavior change.
   Date/Author: 2026-07-21 / Codex
 
+- Decision: Preserve the historical bare `bifrost` command as `searchtools` on cwd, but make explicit `--mcp <toolsets>` launches rootless when no trusted root is supplied.
+  Rationale: packaged and configured MCP clients use the explicit form, while existing shell integrations may rely on the documented no-argument compatibility behavior.
+  Date/Author: 2026-07-21 / Codex
+
 ## Outcomes & Retrospective
 
-No production behavior has changed yet. The initial activation-only prototype proved that the existing analyzer can switch roots, but review exposed a filesystem-boundary flaw and a nested-root semantic mismatch. That prototype was removed. The deliverable now targets a protocol-backed, client-approved root contract.
+The Bifrost and packaging halves are implemented. An explicit root remains deterministic; a package-launched server without one stays unbound until a roots-capable client approves a local directory, follows later root changes, and drops access when the list is revoked. The release smoke now exercises this host-equivalent protocol and a real symbol search. Current Codex still needs its host-side roots implementation before the original clean-install acceptance can pass end to end.
 
 ## Context and Orientation
 

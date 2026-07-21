@@ -19,6 +19,7 @@ const RESOURCE_NOT_FOUND: i64 = -32002;
 const GET_SUMMARIES_RESPONSE_BUDGET_BYTES: usize = 4_096;
 const AGENTS_GUIDANCE_URI: &str = "bifrost://agent-guidance/agents.md";
 const AGENTS_GUIDANCE_MIME_TYPE: &str = "text/markdown";
+const ROOTS_REQUEST_ID_PREFIX: &str = "bifrost-roots-";
 const AGENTS_GUIDANCE_TEXT: &str = include_str!("../resources/agent-guidance/bifrost-agents.md");
 
 pub(crate) const BENCHMARK_PROFILE_BOUNDARY_METHOD: &str = "bifrost/benchmark-profile-boundary";
@@ -46,6 +47,56 @@ pub struct McpServerSpec {
     pub instructions: &'static str,
     pub tool_names: HashSet<String>,
     pub tool_descriptors: Vec<Value>,
+}
+
+#[derive(Debug)]
+struct McpConnectionState {
+    accepts_client_roots: bool,
+    client_supports_roots: bool,
+    initialized: bool,
+    pending_roots_request: Option<String>,
+    roots_refresh_requested: bool,
+    next_request_id: u64,
+}
+
+impl McpConnectionState {
+    fn new(accepts_client_roots: bool) -> Self {
+        Self {
+            accepts_client_roots,
+            client_supports_roots: false,
+            initialized: false,
+            pending_roots_request: None,
+            roots_refresh_requested: false,
+            next_request_id: 1,
+        }
+    }
+
+    fn roots_request(&mut self) -> Option<Value> {
+        if !self.accepts_client_roots
+            || !self.client_supports_roots
+            || !self.initialized
+            || self.pending_roots_request.is_some()
+        {
+            return None;
+        }
+        let id = format!("{ROOTS_REQUEST_ID_PREFIX}{}", self.next_request_id);
+        self.next_request_id += 1;
+        self.pending_roots_request = Some(id.clone());
+        Some(json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "id": id,
+            "method": "roots/list",
+            "params": {},
+        }))
+    }
+
+    fn finish_roots_response(&mut self) -> Option<Value> {
+        if std::mem::take(&mut self.roots_refresh_requested) {
+            self.roots_request()
+        } else {
+            None
+        }
+    }
 }
 
 pub fn build_server_spec(
@@ -77,14 +128,18 @@ pub fn build_server_spec_with_hidden(
 }
 
 pub fn run_stdio_server(
-    root: PathBuf,
+    root: Option<PathBuf>,
     render_options: McpRenderOptions,
     spec: &McpServerSpec,
 ) -> Result<(), String> {
-    // Build the index on a background thread so the MCP `initialize` handshake
-    // is answered immediately; the first tool call blocks only for whatever
-    // build time remains.
-    let service = SearchToolsService::new_deferred(root)?;
+    // Explicit roots build in the background. Rootless servers answer initialize
+    // without touching process cwd and bind only after roots negotiation.
+    let accepts_client_roots = root.is_none();
+    let service = match root {
+        Some(root) => SearchToolsService::new_deferred(root)?,
+        None => SearchToolsService::new_unbound(),
+    };
+    let mut connection = McpConnectionState::new(accepts_client_roots);
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -99,7 +154,9 @@ pub fn run_stdio_server(
         }
 
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(message) => dispatch_message(&service, message, render_options, spec),
+            Ok(message) => {
+                dispatch_message(&service, &mut connection, message, render_options, spec)
+            }
             Err(err) => Some(error_response(
                 Value::Null,
                 PARSE_ERROR,
@@ -131,6 +188,7 @@ pub fn run_stdio_server(
 
 fn dispatch_message(
     service: &SearchToolsService,
+    connection: &mut McpConnectionState,
     message: Value,
     render_options: McpRenderOptions,
     spec: &McpServerSpec,
@@ -157,6 +215,11 @@ fn dispatch_message(
     }
 
     let Some(method) = object.get("method").and_then(Value::as_str) else {
+        if let Some(id) = object.get("id")
+            && (object.contains_key("result") || object.contains_key("error"))
+        {
+            return handle_response(service, connection, id, object);
+        }
         let id = object.get("id").cloned().unwrap_or(Value::Null);
         return Some(error_response(
             id,
@@ -169,19 +232,110 @@ fn dispatch_message(
     let id = object.get("id").cloned();
 
     match id {
-        Some(id) => Some(dispatch_request(
-            service,
-            id,
-            method,
-            params,
-            render_options,
-            spec,
-        )),
-        None => {
-            handle_notification(method, params);
-            None
+        Some(id) => {
+            if method == "initialize" {
+                connection.client_supports_roots = params
+                    .pointer("/capabilities/roots")
+                    .is_some_and(Value::is_object);
+            }
+            Some(dispatch_request(
+                service,
+                id,
+                method,
+                params,
+                render_options,
+                spec,
+            ))
+        }
+        None => handle_notification(connection, method, params),
+    }
+}
+
+fn handle_response(
+    service: &SearchToolsService,
+    connection: &mut McpConnectionState,
+    id: &Value,
+    response: &serde_json::Map<String, Value>,
+) -> Option<Value> {
+    let Some(pending_id) = connection.pending_roots_request.as_deref() else {
+        return None;
+    };
+    if id.as_str() != Some(pending_id) {
+        return None;
+    }
+    connection.pending_roots_request = None;
+
+    if let Some(error) = response.get("error") {
+        eprintln!("bifrost: MCP roots/list failed: {error}");
+        return connection.finish_roots_response();
+    }
+    let Some(roots) = response
+        .get("result")
+        .and_then(|result| result.get("roots"))
+        .and_then(Value::as_array)
+    else {
+        eprintln!("bifrost: MCP roots/list response is missing result.roots");
+        return connection.finish_roots_response();
+    };
+
+    let mut last_error = None;
+    for root in roots {
+        let Some(uri) = root.get("uri").and_then(Value::as_str) else {
+            last_error = Some("root entry is missing a string uri".to_string());
+            continue;
+        };
+        let path = match file_uri_to_path(uri) {
+            Ok(path) => path,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
+        match service.bind_client_workspace(path) {
+            Ok(root) => {
+                eprintln!(
+                    "bifrost: bound MCP workspace root: {}",
+                    root.to_string_lossy()
+                );
+                return connection.finish_roots_response();
+            }
+            Err(error) => last_error = Some(error.to_string()),
         }
     }
+
+    if roots.is_empty() {
+        if let Err(error) = service.unbind_client_workspace() {
+            eprintln!("bifrost: failed to clear revoked MCP workspace root: {error}");
+        }
+        eprintln!("bifrost: MCP client returned no workspace roots; server remains unbound");
+    } else if let Some(error) = last_error {
+        if let Err(unbind_error) = service.unbind_client_workspace() {
+            eprintln!("bifrost: failed to clear unusable MCP workspace roots: {unbind_error}");
+        }
+        eprintln!("bifrost: no usable MCP workspace root: {error}");
+    }
+    connection.finish_roots_response()
+}
+
+fn file_uri_to_path(uri: &str) -> Result<PathBuf, String> {
+    let parsed =
+        url::Url::parse(uri).map_err(|error| format!("invalid root URI `{uri}`: {error}"))?;
+    if parsed.scheme() != "file" {
+        return Err(format!(
+            "unsupported root URI scheme `{}`; expected file",
+            parsed.scheme()
+        ));
+    }
+    parsed
+        .to_file_path()
+        .map_err(|()| format!("root URI is not a local filesystem path: {uri}"))
+        .and_then(|path| {
+            if path.is_absolute() {
+                Ok(path)
+            } else {
+                Err(format!("root URI is not absolute: {uri}"))
+            }
+        })
 }
 
 fn dispatch_request(
@@ -223,8 +377,26 @@ fn write_benchmark_profile_boundary() -> Result<Value, (i64, String)> {
     Ok(json!({}))
 }
 
-fn handle_notification(method: &str, _params: Value) {
-    let _ = method == "notifications/initialized";
+fn handle_notification(
+    connection: &mut McpConnectionState,
+    method: &str,
+    _params: Value,
+) -> Option<Value> {
+    match method {
+        "notifications/initialized" => {
+            connection.initialized = true;
+            connection.roots_request()
+        }
+        "notifications/roots/list_changed" => {
+            if connection.pending_roots_request.is_some() {
+                connection.roots_refresh_requested = true;
+                None
+            } else {
+                connection.roots_request()
+            }
+        }
+        _ => None,
+    }
 }
 
 fn initialize_result(instructions: &str) -> Value {
@@ -320,7 +492,13 @@ fn handle_tool_call(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let workspace_root = service.active_workspace_root();
+    let Some(workspace_root) = service.active_workspace_root() else {
+        return Err((
+            INTERNAL_ERROR,
+            "Bifrost is not bound to a workspace. The MCP client must provide an approved filesystem root via roots/list, or configure Bifrost with --root or BIFROST_WORKSPACE_ROOT."
+                .to_string(),
+        ));
+    };
     let arguments = match normalize_tool_arguments(name, arguments, &workspace_root) {
         Ok(arguments) => arguments,
         Err(message) => return Ok(tool_error_result(message)),
@@ -1146,4 +1324,51 @@ pub fn weight_knob_descriptor(
 pub enum WeightThreshold {
     Negative,
     NonPositive,
+}
+
+#[cfg(test)]
+mod uri_tests {
+    use super::*;
+
+    #[test]
+    fn file_uri_round_trips_native_absolute_paths() {
+        let path = std::env::current_dir()
+            .expect("current directory")
+            .join("workspace with spaces");
+        let uri = url::Url::from_file_path(&path).expect("file URI");
+        assert_eq!(file_uri_to_path(uri.as_str()).unwrap(), path);
+    }
+
+    #[test]
+    fn file_uri_rejects_non_file_schemes() {
+        let error = file_uri_to_path("https://example.com/workspace").unwrap_err();
+        assert!(
+            error.contains("unsupported root URI scheme `https`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn roots_changes_during_a_request_are_coalesced() {
+        let mut connection = McpConnectionState::new(true);
+        connection.client_supports_roots = true;
+        connection.initialized = true;
+        let first = connection.roots_request().expect("first roots request");
+
+        assert!(
+            handle_notification(
+                &mut connection,
+                "notifications/roots/list_changed",
+                Value::Null,
+            )
+            .is_none()
+        );
+        connection.pending_roots_request = None;
+        let second = connection
+            .finish_roots_response()
+            .expect("coalesced roots request");
+
+        assert_ne!(first["id"], second["id"]);
+        assert_eq!(second["method"], "roots/list");
+    }
 }

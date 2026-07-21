@@ -143,7 +143,7 @@ fn production_watcher_starter() -> WatcherStarter {
 }
 
 pub struct SearchToolsService {
-    root: RwLock<PathBuf>,
+    root: RwLock<Option<PathBuf>>,
     session: RwLock<Option<WorkspaceSession>>,
     /// When constructed via `new_deferred`, the initial workspace build (file
     /// discovery + parse) runs on a background thread and lands here.
@@ -403,7 +403,7 @@ impl SearchToolsService {
             &watcher_starter,
         )?;
         Ok(Self {
-            root: RwLock::new(root),
+            root: RwLock::new(Some(root)),
             session: RwLock::new(Some(session)),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
@@ -833,11 +833,8 @@ impl SearchToolsService {
         SearchToolsServiceError::invalid_params(message)
     }
 
-    pub fn active_workspace_root(&self) -> PathBuf {
-        self.root
-            .read()
-            .map(|root| root.clone())
-            .unwrap_or_default()
+    pub fn active_workspace_root(&self) -> Option<PathBuf> {
+        self.root.read().map(|root| root.clone()).unwrap_or(None)
     }
 
     // Note: `--root` and `new_for_python` take the path as-given (canonicalized
@@ -877,7 +874,7 @@ impl SearchToolsService {
             &watcher_starter,
         )?;
         Ok(Self {
-            root: RwLock::new(root),
+            root: RwLock::new(Some(root)),
             session: RwLock::new(Some(session)),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
@@ -916,7 +913,7 @@ impl SearchToolsService {
             &watcher_starter,
         )?;
         Ok(Self {
-            root: RwLock::new(root),
+            root: RwLock::new(Some(root)),
             session: RwLock::new(Some(session)),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
@@ -955,7 +952,7 @@ impl SearchToolsService {
             ));
         }
         Ok(Self {
-            root: RwLock::new(canonical),
+            root: RwLock::new(Some(canonical)),
             session: RwLock::new(None),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
@@ -982,6 +979,103 @@ impl SearchToolsService {
     /// client's startup timeout.
     pub fn new_deferred(root: PathBuf) -> Result<Self, String> {
         Self::new_deferred_with_watcher_starter(root, production_watcher_starter())
+    }
+
+    /// Construct an MCP service that has not yet been bound to a client-approved
+    /// workspace root. Analyzer-backed tools return an actionable error until a
+    /// later protocol roots negotiation installs a workspace.
+    pub fn new_unbound() -> Self {
+        Self {
+            root: RwLock::new(None),
+            session: RwLock::new(None),
+            pending_build: Mutex::new(None),
+            build_error: Mutex::new(None),
+            update_strategy: UpdateStrategy::WatchFiles,
+            semantic_indexing: semantic_indexing_enabled(),
+            watcher_starter: production_watcher_starter(),
+        }
+    }
+
+    /// Bind a rootless MCP service to an exact filesystem root approved by the
+    /// client's roots capability. Unlike the user-facing activation tool, this
+    /// deliberately does not promote a nested directory to an enclosing Git
+    /// repository: the client's declared boundary is authoritative.
+    pub fn bind_client_workspace(&self, root: PathBuf) -> Result<PathBuf, SearchToolsServiceError> {
+        let canonical = root.canonicalize().map_err(|err| {
+            SearchToolsServiceError::invalid_params(format!(
+                "Failed to resolve client workspace root {}: {err}",
+                root.display()
+            ))
+        })?;
+        if !canonical.is_dir() {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "Client workspace root is not a directory: {}",
+                canonical.display()
+            )));
+        }
+
+        if self.active_workspace_root().as_ref() == Some(&canonical) {
+            return Ok(canonical);
+        }
+
+        let (project, workspace) = build_persisted_workspace(canonical.clone()).map_err(|err| {
+            SearchToolsServiceError::internal(format!(
+                "Failed to bind client workspace {}: {err}",
+                canonical.display()
+            ))
+        })?;
+        let new_session = assemble_session(
+            project,
+            workspace,
+            self.update_strategy,
+            self.semantic_indexing,
+            &self.watcher_starter,
+        )
+        .map_err(|err| {
+            SearchToolsServiceError::internal(format!(
+                "Failed to bind client workspace {}: {err}",
+                canonical.display()
+            ))
+        })?;
+
+        let mut session = self
+            .session
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?;
+        let mut active_root = self
+            .root
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?;
+        let old_session = session.replace(new_session);
+        *active_root = Some(canonical.clone());
+        drop(active_root);
+        drop(session);
+        if let Some(old_session) = old_session {
+            old_session.close_semantic();
+        }
+        Ok(canonical)
+    }
+
+    /// Remove a workspace previously supplied through MCP roots. This is used
+    /// when the client explicitly returns an empty or unusable replacement
+    /// root list, so revoked scope never remains queryable.
+    pub fn unbind_client_workspace(&self) -> Result<(), SearchToolsServiceError> {
+        let mut session = self
+            .session
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?;
+        let mut active_root = self
+            .root
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?;
+        let old_session = session.take();
+        *active_root = None;
+        drop(active_root);
+        drop(session);
+        if let Some(old_session) = old_session {
+            old_session.close_semantic();
+        }
+        Ok(())
     }
 
     fn new_deferred_with_watcher_starter(
@@ -1025,7 +1119,7 @@ impl SearchToolsService {
             })
             .map_err(|err| format!("Failed to spawn index build thread: {err}"))?;
         Ok(Self {
-            root: RwLock::new(canonical),
+            root: RwLock::new(Some(canonical)),
             session: RwLock::new(None),
             pending_build: Mutex::new(Some(handle)),
             build_error: Mutex::new(None),
@@ -1078,16 +1172,16 @@ impl SearchToolsService {
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
             .is_none()
         {
-            let built =
-                build_persisted_workspace(self.service_root()?).and_then(|(project, workspace)| {
-                    assemble_session(
-                        project,
-                        workspace,
-                        self.update_strategy,
-                        self.semantic_indexing,
-                        &self.watcher_starter,
-                    )
-                });
+            let root = self.service_root()?;
+            let built = build_persisted_workspace(root).and_then(|(project, workspace)| {
+                assemble_session(
+                    project,
+                    workspace,
+                    self.update_strategy,
+                    self.semantic_indexing,
+                    &self.watcher_starter,
+                )
+            });
             let session = match built {
                 Ok(session) => session,
                 Err(err) => {
@@ -1256,7 +1350,7 @@ impl SearchToolsService {
             .write()
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?;
         let old_session = std::mem::replace(session, new_session);
-        *root = resolved.clone();
+        *root = Some(resolved.clone());
         drop(guard);
         drop(root);
         old_session.close_semantic();
@@ -1656,8 +1750,9 @@ impl SearchToolsService {
     fn service_root(&self) -> Result<PathBuf, SearchToolsServiceError> {
         self.root
             .read()
-            .map(|root| root.clone())
-            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
+            .clone()
+            .ok_or_else(Self::unbound_error)
     }
 
     fn normalize_arguments_for_current_workspace(
@@ -1686,6 +1781,12 @@ impl SearchToolsService {
 
     fn closed_error() -> SearchToolsServiceError {
         SearchToolsServiceError::internal("SearchToolsService is closed")
+    }
+
+    fn unbound_error() -> SearchToolsServiceError {
+        SearchToolsServiceError::internal(
+            "Bifrost is not bound to a workspace. The MCP client must provide an approved filesystem root via roots/list, or configure Bifrost with --root or BIFROST_WORKSPACE_ROOT.",
+        )
     }
 }
 
@@ -2020,7 +2121,7 @@ mod watcher_startup_tests {
             )
             .unwrap_err();
         assert_watcher_error(&error);
-        assert_eq!(service.active_workspace_root(), old_root);
+        assert_eq!(service.active_workspace_root(), Some(old_root.clone()));
 
         let active = service
             .call_tool_value("get_active_workspace", json!({}))
@@ -2243,7 +2344,7 @@ public partial class MudDialogContainer
     fn watching_service_without_watcher(root: PathBuf) -> SearchToolsService {
         let (project, workspace) = build_transient_workspace(root).unwrap();
         SearchToolsService {
-            root: RwLock::new(project.root().to_path_buf()),
+            root: RwLock::new(Some(project.root().to_path_buf())),
             session: RwLock::new(Some(WorkspaceSession {
                 snapshot: Arc::new(workspace),
                 document_root: Arc::new(WorkspaceRoot::open(project.root()).unwrap()),
