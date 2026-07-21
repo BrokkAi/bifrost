@@ -189,6 +189,14 @@ fn cpp_navigation_kind_for_range(
             CppNavigationKind::DeclarationOnly
         };
     }
+    // Export macros between `class`/`struct` and the type name can make
+    // tree-sitter recover a complete class as a function-shaped node. The C++
+    // declaration parser only assigns such a range to a class after recovering
+    // its body structurally, so retain that body classification for explicit
+    // definition navigation.
+    if node.kind() == "function_definition" && node.child_by_field_name("body").is_some() {
+        return CppNavigationKind::Definition;
+    }
     if !cpp_subtree_contains(node, |descendant| {
         matches!(
             descendant.kind(),

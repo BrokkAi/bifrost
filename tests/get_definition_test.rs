@@ -19539,7 +19539,7 @@ void construct() { widget(); }
         source.rfind("impl();").expect("local callable shadow"),
         source.rfind("widget();").expect("constructor control"),
     ];
-    let value = lookup(
+    let value = lookup_declaration_with_definition_key(
         project.root(),
         &json!({
             "references": starts
@@ -19556,13 +19556,28 @@ void construct() { widget(); }
         assert_eq!(result["definitions"][0]["fqn"], "message.impl", "{value}");
         assert_eq!(result["definitions"][0]["kind"], "function", "{value}");
     }
-    assert_eq!(results[2]["status"], "no_definition", "{value}");
-    assert_eq!(results[3]["status"], "no_definition", "{value}");
+    assert_eq!(results[2]["status"], "no_declaration", "{value}");
+    assert_eq!(results[3]["status"], "no_declaration", "{value}");
     assert_eq!(results[4]["status"], "resolved", "{value}");
     assert_eq!(
         results[4]["definitions"][0]["fqn"], "widget.widget",
         "{value}"
     );
+
+    let definition_references = [starts[0], starts[1], starts[4]]
+        .into_iter()
+        .map(|start| location_query("app.cpp", source, start))
+        .collect::<Vec<_>>();
+    let definition_value = lookup(
+        project.root(),
+        &json!({"references": definition_references}).to_string(),
+    );
+    for result in definition_value["results"]
+        .as_array()
+        .expect("definition results")
+    {
+        assert_eq!(result["status"], "no_definition", "{definition_value}");
+    }
 }
 
 #[test]
