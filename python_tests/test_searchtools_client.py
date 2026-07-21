@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 import os
 import shutil
 import subprocess
@@ -8,6 +9,7 @@ import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from typing import get_args
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +22,7 @@ from bifrost_searchtools import (
     CodeQueryCompletionKind,
     CodeQueryDiagnosticCode,
     CodeQueryDiagnosticImpact,
+    CodeQueryExecutionMode,
     CodeQueryExpressionSite,
     CodeQueryExplain,
     CodeQueryFile,
@@ -42,12 +45,16 @@ from bifrost_searchtools import (
     SearchToolsError,
     SymbolKindFilter,
     XmlSelectOutput,
+    parse_code_query_response,
     tool_descriptors,
 )
+from bifrost_searchtools.client import (
+    CodeQueryExecutionMode as ClientCodeQueryExecutionMode,
+)
 from bifrost_searchtools.models import (
+    CodeQueryExecutionMode as ModelCodeQueryExecutionMode,
     SemanticSearchResult,
     SemanticSearchStatus,
-    parse_code_query_response,
 )
 
 
@@ -73,7 +80,9 @@ def _git_commit(root: Path, message: str) -> None:
     )
 
 
-def _code_query_explain_payload() -> dict:
+def _code_query_explain_payload(
+    execution_mode: CodeQueryExecutionMode = "explain",
+) -> dict:
     return {
         "format": "bifrost_code_query_explain/v1",
         "query_schema_version": 2,
@@ -83,7 +92,7 @@ def _code_query_explain_payload() -> dict:
             "where": ["src/**"],
             "limit": 20,
             "result_detail": "compact",
-            "execution_mode": "explain",
+            "execution_mode": execution_mode,
             "future_parse_fact": "retained",
         },
         "logical_plan": {
@@ -139,7 +148,7 @@ def _code_query_profile_payload() -> dict:
     return {
         "format": "bifrost_code_query_profile/v1",
         "result": {"results": [], "truncated": False, "diagnostics": []},
-        "explain": _code_query_explain_payload(),
+        "explain": _code_query_explain_payload(execution_mode="profile"),
         "timings_ns": {
             "planning": 11,
             "execution": 22,
@@ -230,6 +239,14 @@ def _code_query_profile_payload() -> dict:
 
 
 class CodeQueryModelTest(unittest.TestCase):
+    def test_execution_mode_alias_is_reexported_from_public_import_paths(self) -> None:
+        self.assertIs(CodeQueryExecutionMode, ModelCodeQueryExecutionMode)
+        self.assertIs(ClientCodeQueryExecutionMode, ModelCodeQueryExecutionMode)
+        self.assertEqual(
+            get_args(ModelCodeQueryExecutionMode),
+            ("results", "explain", "profile"),
+        )
+
     def test_explain_response_parses_typed_plan_layers(self) -> None:
         response = parse_code_query_response(
             _code_query_explain_payload(), rendered_text="server explain"
@@ -258,6 +275,15 @@ class CodeQueryModelTest(unittest.TestCase):
         )
         self.assertEqual(response.render_text(), "server explain")
 
+    def test_explain_rejects_unknown_execution_mode(self) -> None:
+        payload = _code_query_explain_payload()
+        payload["parsed_query"]["execution_mode"] = "speculate"
+        with self.assertRaisesRegex(
+            ValueError,
+            "execution_mode must be one of 'results', 'explain', 'profile'",
+        ):
+            parse_code_query_response(payload)
+
     def test_profile_response_parses_results_observations_and_future_metrics(self) -> None:
         response = parse_code_query_response(
             _code_query_profile_payload(), rendered_text="server profile"
@@ -266,6 +292,7 @@ class CodeQueryModelTest(unittest.TestCase):
         self.assertIsInstance(response, CodeQueryProfile)
         self.assertIsInstance(response.result, CodeQueryResult)
         self.assertIsInstance(response.explain, CodeQueryExplain)
+        self.assertEqual(response.explain.parsed_query.execution_mode, "profile")
         self.assertEqual(response.timings_ns.total, 66)
         self.assertEqual(response.work.scanned_source_bytes, 120)
         self.assertIs(
@@ -301,6 +328,75 @@ class CodeQueryModelTest(unittest.TestCase):
         )
         self.assertEqual(response.extra["future_profile_fact"], "retained")
         self.assertEqual(response.render_text(), "server profile")
+
+    def test_profile_rejects_noncanonical_cache_layer_shapes(self) -> None:
+        payload = _code_query_profile_payload()
+        payload["cache_layers"] = {
+            "seed_result": {"kind": "complete_value", "lookups": 1}
+        }
+        with self.assertRaisesRegex(ValueError, "cache_layers must be a list"):
+            parse_code_query_response(payload)
+
+        payload = _code_query_profile_payload()
+        payload["cache"] = payload.pop("cache_layers")
+        with self.assertRaisesRegex(ValueError, "cache_layers is required"):
+            parse_code_query_response(payload)
+
+        payload = _code_query_profile_payload()
+        payload["cache_layers"][0] = {
+            "layer": "seed_result",
+            "kind": "complete_value",
+            "lookups": 1,
+        }
+        with self.assertRaisesRegex(ValueError, "metrics must be a nested object"):
+            parse_code_query_response(payload)
+
+    def test_profile_rejects_missing_aliased_or_mismatched_cache_metric_kinds(
+        self,
+    ) -> None:
+        cases = (
+            (None, "None is not a valid CodeQueryCacheMetricsKind"),
+            (
+                "seed_structural_facts",
+                "seed_structural_facts.*is not a valid CodeQueryCacheMetricsKind",
+            ),
+            (
+                "structural_facts",
+                "seed_result.*requires metrics kind 'complete_value'",
+            ),
+        )
+        for kind, error_pattern in cases:
+            with self.subTest(kind=kind):
+                payload = _code_query_profile_payload()
+                metrics = payload["cache_layers"][0]["metrics"]
+                if kind is None:
+                    metrics.pop("kind")
+                else:
+                    metrics["kind"] = kind
+                with self.assertRaisesRegex(ValueError, error_pattern):
+                    parse_code_query_response(payload)
+
+        payload = _code_query_profile_payload()
+        payload["cache_layers"][1]["metrics"]["kind"] = "complete_value"
+        with self.assertRaisesRegex(
+            ValueError,
+            "seed_structural_facts.*requires metrics kind 'structural_facts'",
+        ):
+            parse_code_query_response(payload)
+
+    def test_operator_cache_layers_use_the_same_canonical_decoder(self) -> None:
+        payload = _code_query_profile_payload()
+        operator = payload["operators"][0]
+        operator["cache"] = operator.pop("cache_layers")
+        with self.assertRaisesRegex(ValueError, "cache_layers is required"):
+            parse_code_query_response(payload)
+
+        payload = deepcopy(_code_query_profile_payload())
+        payload["operators"][0]["cache_layers"] = {
+            "seed_result": {"kind": "complete_value", "lookups": 1}
+        }
+        with self.assertRaisesRegex(ValueError, "cache_layers must be a list"):
+            parse_code_query_response(payload)
 
     def test_query_code_forwards_execution_mode_and_dispatches_by_format(self) -> None:
         calls: list[tuple[str, dict]] = []

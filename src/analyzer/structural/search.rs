@@ -23,8 +23,8 @@ use super::provider::StructuralFactsCacheOutcome;
 use super::query::schema::{reference_kind_label, usage_proof_label};
 use super::query::{
     CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
-    CodeQueryExecutionMode, CodeQueryResultDetail, CodeQuerySeed, HierarchyTraversal, QueryStep,
-    ReferenceTraversalFilter, SetOperator,
+    CodeQueryExecutionMode, CodeQueryResultDetail, CodeQuerySeed, HierarchyTraversal, QueryError,
+    QueryStep, ReferenceTraversalFilter, SetOperator,
 };
 use crate::analyzer::reference_candidates::{
     ReferenceCandidateRanges, reference_candidate_ranges, reference_candidate_ranges_cancellable,
@@ -81,7 +81,7 @@ pub(crate) enum UnionExecutionStrategy {
     Parallel,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct CodeQueryResult {
     pub results: Vec<CodeQueryResultItem>,
     pub truncated: bool,
@@ -117,6 +117,58 @@ impl CodeQueryResponse {
             Self::Results(result) => Some(result),
             Self::Profile(profile) => Some(&profile.result),
             Self::Explain(_) => None,
+        }
+    }
+
+    /// Render the complete structured report without first erasing its typed
+    /// field order through `serde_json::Value`.
+    #[doc(hidden)]
+    pub fn render_report_pretty(&self) -> Option<String> {
+        match self {
+            Self::Results(_) => None,
+            Self::Explain(explain) => Some(
+                serde_json::to_string_pretty(explain)
+                    .expect("the public CodeQuery explain model is serializable"),
+            ),
+            Self::Profile(profile) => Some(
+                serde_json::to_string_pretty(profile)
+                    .expect("the public CodeQuery profile model is serializable"),
+            ),
+        }
+    }
+
+    /// Consume this response into the common pieces needed by transports.
+    ///
+    /// The report is serialized before a profiled result is moved out, so the
+    /// structured profile keeps its complete nested `result` while callers can
+    /// also expose ordinary rows through transport-specific fields.
+    #[doc(hidden)]
+    pub fn into_parts(
+        self,
+    ) -> (
+        CodeQueryExecutionMode,
+        Option<CodeQueryResult>,
+        Option<serde_json::Value>,
+    ) {
+        match self {
+            Self::Results(result) => (CodeQueryExecutionMode::Results, Some(result), None),
+            Self::Explain(explain) => (
+                CodeQueryExecutionMode::Explain,
+                None,
+                Some(
+                    serde_json::to_value(explain)
+                        .expect("the public CodeQuery explain model is serializable"),
+                ),
+            ),
+            Self::Profile(profile) => {
+                let report = serde_json::to_value(&profile)
+                    .expect("the public CodeQuery profile model is serializable");
+                (
+                    CodeQueryExecutionMode::Profile,
+                    Some(profile.result),
+                    Some(report),
+                )
+            }
         }
     }
 
@@ -204,6 +256,39 @@ pub struct CodeQueryResultItem {
     pub provenance: Vec<CodeQueryProvenance>,
     #[serde(skip_serializing_if = "is_false")]
     pub provenance_truncated: bool,
+}
+
+impl CodeQueryResultItem {
+    /// Build the shared, unstyled provenance summary used by text transports.
+    #[doc(hidden)]
+    pub fn provenance_summary(&self) -> Option<String> {
+        if self.provenance.is_empty() {
+            return None;
+        }
+
+        let mut branch_labels = Vec::new();
+        for trace in &self.provenance {
+            let label = format_branch_path(&trace.branch);
+            if !label.is_empty() && !branch_labels.contains(&label) {
+                branch_labels.push(label);
+            }
+        }
+        Some(format!(
+            "provenance: {} path{}{}{}",
+            self.provenance.len(),
+            if self.provenance.len() == 1 { "" } else { "s" },
+            if self.provenance_truncated {
+                " (truncated)"
+            } else {
+                ""
+            },
+            if branch_labels.is_empty() {
+                String::new()
+            } else {
+                format!("; branches {}", branch_labels.join(", "))
+            },
+        ))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -651,6 +736,19 @@ pub struct CodeQueryDiagnostic {
     pub branch: Vec<usize>,
     pub language: &'static str,
     pub message: String,
+}
+
+impl CodeQueryDiagnostic {
+    /// Build the shared, unstyled diagnostic label used by text transports.
+    #[doc(hidden)]
+    pub fn presentation_label(&self) -> String {
+        let kind = format!("{} [{}]", self.impact.as_str(), self.code.as_str());
+        if self.branch.is_empty() {
+            kind
+        } else {
+            format!("{kind} [branch {}]", format_branch_path(&self.branch))
+        }
+    }
 }
 
 /// A match found before rendering, held until the rendering pass (which
@@ -1680,14 +1778,18 @@ fn execute_request_internal(
         CodeQueryExecutionMode::Results => CodeQueryResponse::Results(
             execute_code_query_detailed(analyzer, query, limits, cancellation).result,
         ),
-        CodeQueryExecutionMode::Explain => match LogicalQueryPlan::lower(query) {
-            Ok(logical_plan) => {
+        CodeQueryExecutionMode::Explain => match select_physical_plan(
+            query,
+            UnionExecutionStrategy::Auto,
+            CODE_QUERY_SCHEDULER_WORKERS,
+        ) {
+            Ok(physical_plan) => {
                 // The measured production Auto policy is sequential. Explain
                 // performs only lowering and physical selection: it does not
                 // construct an analyzer query scope or touch workspace data.
-                let physical_plan =
-                    PhysicalQueryPlan::select_with_parallel_union(logical_plan, None);
-                CodeQueryResponse::Explain(physical_plan.public_explain(query))
+                CodeQueryResponse::Explain(
+                    physical_plan.public_explain(query, CODE_QUERY_SCHEDULER_WORKERS),
+                )
             }
             Err(error) => CodeQueryResponse::Results(invalid_plan_result(error)),
         },
@@ -1811,7 +1913,7 @@ fn execute_internal_with_strategy(
             CodeQueryExecutionBudget::default(),
         );
     }
-    let logical_plan = match LogicalQueryPlan::lower(query) {
+    let physical_plan = match select_physical_plan(query, union_strategy, scheduler_workers) {
         Ok(plan) => plan,
         Err(error) => {
             return detailed_result_without_evidence(
@@ -1820,8 +1922,6 @@ fn execute_internal_with_strategy(
             );
         }
     };
-    let parallel_union = select_parallel_union(&logical_plan, union_strategy, scheduler_workers);
-    let physical_plan = PhysicalQueryPlan::select_with_parallel_union(logical_plan, parallel_union);
     let planning_ns = planning_started.map(elapsed_ns).unwrap_or(0);
     let mut diagnostics = Vec::new();
     let mut state = QueryExecutionState {
@@ -1836,7 +1936,7 @@ fn execute_internal_with_strategy(
         import_graph: None,
         cache_profile: capture_profile.then(QueryCacheProfile::default),
         profile: capture_profile
-            .then(|| QueryExecutionProfile::sequential(&physical_plan, planning_ns)),
+            .then(|| QueryExecutionProfile::new(&physical_plan, planning_ns, scheduler_workers)),
         parallel_seed_budget: None,
         scheduler_workers,
     };
@@ -1854,7 +1954,7 @@ fn execute_internal_with_strategy(
     if let (Some(profile), Some(started)) = (&mut state.profile, execution_started) {
         profile.execution_ns = elapsed_ns(started);
     }
-    let execution_work_profile = capture_profile.then(|| execution_profile_work(state.budget));
+    let execution_work_profile = capture_profile.then(|| execution_work_snapshot(state.budget));
     let rendering_started = capture_profile.then(Instant::now);
     let mut cancelled = execution.cancelled;
     let mut truncated = execution.truncated;
@@ -1912,9 +2012,9 @@ fn execute_internal_with_strategy(
             &mut render_cache,
         ));
     }
-    let work = execution_work(state.budget);
+    let total_work = execution_work_snapshot(state.budget);
+    let work = public_execution_work(total_work);
     if let Some(profile) = &mut state.profile {
-        let total_work = execution_profile_work(state.budget);
         let execution_work = execution_work_profile.unwrap_or_default();
         profile.rendering_ns = rendering_started.map(elapsed_ns).unwrap_or(0);
         profile.total_elapsed_ns = request_started.map(elapsed_ns).unwrap_or(0);
@@ -1936,6 +2036,19 @@ fn execute_internal_with_strategy(
     };
     detailed.assert_invariants();
     detailed
+}
+
+fn select_physical_plan(
+    query: &CodeQuery,
+    strategy: UnionExecutionStrategy,
+    scheduler_workers: usize,
+) -> Result<PhysicalQueryPlan, QueryError> {
+    let logical_plan = LogicalQueryPlan::lower(query)?;
+    let parallel_union = select_parallel_union(&logical_plan, strategy, scheduler_workers);
+    Ok(PhysicalQueryPlan::select_with_parallel_union(
+        logical_plan,
+        parallel_union,
+    ))
 }
 
 fn select_parallel_union(
@@ -2127,7 +2240,7 @@ fn detailed_result_without_evidence(
 ) -> DetailedCodeQueryResult {
     let detailed = DetailedCodeQueryResult {
         result,
-        work: execution_work(budget),
+        work: public_execution_work(execution_work_snapshot(budget)),
         evidence: Vec::new(),
         profile: None,
     };
@@ -2135,18 +2248,17 @@ fn detailed_result_without_evidence(
     detailed
 }
 
-fn execution_work(budget: CodeQueryExecutionBudget) -> CodeQueryExecutionWork {
-    let as_u64 = |value| u64::try_from(value).expect("usize fits in u64 on supported targets");
+fn public_execution_work(work: QueryOperatorWorkProfile) -> CodeQueryExecutionWork {
     CodeQueryExecutionWork {
-        scanned_files: as_u64(budget.scanned_files),
-        scanned_source_bytes: as_u64(budget.scanned_source_bytes),
-        fact_nodes: as_u64(budget.fact_nodes),
-        pipeline_rows: as_u64(budget.pipeline_rows),
-        examined_references: as_u64(budget.examined_references),
+        scanned_files: work.scanned_files,
+        scanned_source_bytes: work.scanned_source_bytes,
+        fact_nodes: work.fact_nodes,
+        pipeline_rows: work.pipeline_rows,
+        examined_references: work.examined_references,
     }
 }
 
-fn execution_profile_work(budget: CodeQueryExecutionBudget) -> QueryOperatorWorkProfile {
+fn execution_work_snapshot(budget: CodeQueryExecutionBudget) -> QueryOperatorWorkProfile {
     let as_u64 = |value| u64::try_from(value).unwrap_or(u64::MAX);
     QueryOperatorWorkProfile {
         scanned_files: as_u64(budget.scanned_files),
@@ -2869,7 +2981,7 @@ fn execute_plan(
     let mut merge_ns = 0u64;
     let mut scheduling_overhead_ns = 0u64;
     let mut terminations = profiling.then(Vec::new);
-    let mut work_started = profiling.then(|| execution_profile_work(state.budget));
+    let mut work_started = profiling.then(|| execution_work_snapshot(state.budget));
     let mut cache_started = state.cache_profile;
     let mut own_diagnostic_start = diagnostics.len();
 
@@ -2924,7 +3036,7 @@ fn execute_plan(
                     dependency_execution_ns.saturating_add(elapsed_ns(started));
             }
             input_rows = child.rows.len();
-            work_started = profiling.then(|| execution_profile_work(state.budget));
+            work_started = profiling.then(|| execution_work_snapshot(state.budget));
             cache_started = state.cache_profile;
             own_diagnostic_start = diagnostics.len();
             if child.cancelled {
@@ -3004,7 +3116,7 @@ fn execute_plan(
             if self_truncated {
                 push_operator_termination(&mut terminations, QueryOperatorTermination::TerminalCap);
             }
-            work_started = profiling.then(|| execution_profile_work(state.budget));
+            work_started = profiling.then(|| execution_work_snapshot(state.budget));
             cache_started = state.cache_profile;
             own_diagnostic_start = diagnostics.len();
             if parallel.execution.cancelled {
@@ -3080,7 +3192,7 @@ fn execute_plan(
                     if let Some(started) = prefix_started {
                         merge_ns = merge_ns.saturating_add(elapsed_ns(started));
                     }
-                    work_started = profiling.then(|| execution_profile_work(state.budget));
+                    work_started = profiling.then(|| execution_work_snapshot(state.budget));
                     cache_started = state.cache_profile;
                     own_diagnostic_start = diagnostics.len();
                     truncated |= child.truncated;
@@ -3153,7 +3265,7 @@ fn execute_plan(
             input_rows = child.rows.len();
             rows_visited = input_rows;
             rows_discarded = Some(0);
-            work_started = profiling.then(|| execution_profile_work(state.budget));
+            work_started = profiling.then(|| execution_work_snapshot(state.budget));
             cache_started = state.cache_profile;
             own_diagnostic_start = diagnostics.len();
             let dependency_cancelled = child.cancelled;
@@ -3217,7 +3329,7 @@ fn execute_plan(
     if let (Some(profile), Some(started)) = (&mut state.profile, invocation_started) {
         let total_elapsed_ns = elapsed_ns(started);
         let work =
-            execution_profile_work(state.budget).saturating_sub(work_started.unwrap_or_default());
+            execution_work_snapshot(state.budget).saturating_sub(work_started.unwrap_or_default());
         let cache = state
             .cache_profile
             .unwrap_or_default()
@@ -3299,7 +3411,8 @@ fn execute_parallel_seed_union(
                     call_cache: CallTraversalCache::default(),
                     import_graph: None,
                     cache_profile: profiling.then(QueryCacheProfile::default),
-                    profile: profiling.then(|| QueryExecutionProfile::sequential(plan, 0)),
+                    profile: profiling
+                        .then(|| QueryExecutionProfile::new(plan, 0, scheduler_workers)),
                     parallel_seed_budget: Some(lease.clone()),
                     scheduler_workers,
                 };
@@ -7982,51 +8095,17 @@ impl CodeQueryResult {
                         }
                     }
                 }
-                if !result.provenance.is_empty() {
-                    let mut branch_labels = Vec::new();
-                    for trace in &result.provenance {
-                        let label = format_branch_path(&trace.branch);
-                        if !label.is_empty() && !branch_labels.contains(&label) {
-                            branch_labels.push(label);
-                        }
-                    }
-                    out.push_str(&format!(
-                        "  provenance: {} path{}{}{}\n",
-                        result.provenance.len(),
-                        if result.provenance.len() == 1 {
-                            ""
-                        } else {
-                            "s"
-                        },
-                        if result.provenance_truncated {
-                            " (truncated)"
-                        } else {
-                            ""
-                        },
-                        if branch_labels.is_empty() {
-                            String::new()
-                        } else {
-                            format!("; branches {}", branch_labels.join(", "))
-                        },
-                    ));
+                if let Some(summary) = result.provenance_summary() {
+                    out.push_str(&format!("  {summary}\n"));
                 }
             }
         }
         for diagnostic in &self.diagnostics {
-            let label = format!(
-                "{} [{}]",
-                diagnostic.impact.as_str(),
-                diagnostic.code.as_str()
-            );
-            if diagnostic.branch.is_empty() {
-                out.push_str(&format!("{label}: {}\n", diagnostic.message));
-            } else {
-                out.push_str(&format!(
-                    "{label} [branch {}]: {}\n",
-                    format_branch_path(&diagnostic.branch),
-                    diagnostic.message
-                ));
-            }
+            out.push_str(&format!(
+                "{}: {}\n",
+                diagnostic.presentation_label(),
+                diagnostic.message
+            ));
         }
         out
     }
@@ -8085,6 +8164,43 @@ mod tests {
             language: "workspace",
             message: "prose deliberately carries no classification words".to_string(),
         }
+    }
+
+    #[test]
+    fn execution_work_snapshot_is_the_single_budget_projection() {
+        let snapshot = execution_work_snapshot(CodeQueryExecutionBudget {
+            scanned_files: 1,
+            scanned_source_bytes: 2,
+            fact_nodes: 3,
+            examined_references: 4,
+            pipeline_rows: 5,
+            provenance_steps: 6,
+            import_files_resolved: 7,
+            import_edges_resolved: 8,
+        });
+        assert_eq!(
+            snapshot,
+            QueryOperatorWorkProfile {
+                scanned_files: 1,
+                scanned_source_bytes: 2,
+                fact_nodes: 3,
+                pipeline_rows: 5,
+                examined_references: 4,
+                provenance_steps: 6,
+                import_files_resolved: 7,
+                import_edges_resolved: 8,
+            }
+        );
+        assert_eq!(
+            public_execution_work(snapshot),
+            CodeQueryExecutionWork {
+                scanned_files: 1,
+                scanned_source_bytes: 2,
+                fact_nodes: 3,
+                pipeline_rows: 5,
+                examined_references: 4,
+            }
+        );
     }
 
     fn assert_serial_profile_reconciles(profile: &QueryExecutionProfile) {
@@ -8198,18 +8314,145 @@ mod tests {
         );
 
         query.execution_mode = CodeQueryExecutionMode::Profile;
+        let expected_explain = select_physical_plan(
+            &query,
+            UnionExecutionStrategy::Auto,
+            CODE_QUERY_SCHEDULER_WORKERS,
+        )
+        .expect("profile query should select a plan")
+        .public_explain(&query, CODE_QUERY_SCHEDULER_WORKERS);
         let CodeQueryResponse::Profile(profile) = execute_request(&analyzer, &query) else {
             panic!("profile mode must return a profile")
         };
 
+        assert_eq!(profile.explain, expected_explain);
         assert_eq!(
             serde_json::to_value(&profile.result).expect("serialize profiled result"),
             ordinary_json
         );
-        assert_eq!(profile.format, "bifrost_code_query_profile/v1");
+        assert_eq!(profile.format, CodeQueryProfile::FORMAT);
         assert!(!profile.operators.is_empty());
         assert_eq!(profile.scheduling.peak_concurrency, 1);
         assert!(profile.scheduling.bounded_dispatch.is_none());
+    }
+
+    #[test]
+    fn response_parts_preserve_each_public_wire_shape() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/app.ts")
+            .write("class Example {}\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let mut query =
+            CodeQuery::from_json(&json!({ "match": { "kind": "class" } })).expect("query");
+
+        for mode in [
+            CodeQueryExecutionMode::Results,
+            CodeQueryExecutionMode::Explain,
+            CodeQueryExecutionMode::Profile,
+        ] {
+            query.execution_mode = mode;
+            let response = execute_request(&analyzer, &query);
+            let serialized = serde_json::to_value(&response).expect("serialize response");
+            let pretty_report = response.render_report_pretty();
+            let (actual_mode, result, report) = response.into_parts();
+            assert_eq!(actual_mode, mode);
+            match mode {
+                CodeQueryExecutionMode::Results => {
+                    assert_eq!(
+                        serde_json::to_value(result.expect("ordinary result"))
+                            .expect("serialize ordinary result"),
+                        serialized
+                    );
+                    assert!(report.is_none());
+                    assert!(pretty_report.is_none());
+                }
+                CodeQueryExecutionMode::Explain => {
+                    assert!(result.is_none());
+                    assert_eq!(report.expect("explain report"), serialized);
+                    assert!(
+                        pretty_report
+                            .expect("pretty explain report")
+                            .starts_with("{\n  \"format\":")
+                    );
+                }
+                CodeQueryExecutionMode::Profile => {
+                    assert_eq!(
+                        serde_json::to_value(result.expect("profiled result"))
+                            .expect("serialize profiled result"),
+                        serialized["result"]
+                    );
+                    assert_eq!(report.expect("profile report"), serialized);
+                    assert!(
+                        pretty_report
+                            .expect("pretty profile report")
+                            .starts_with("{\n  \"format\":")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_provenance_and_diagnostic_presentation_preserves_order_and_deduplicates() {
+        let item = CodeQueryResultItem {
+            value: CodeQueryResultValue::File {
+                value: CodeQueryFile {
+                    path: "src/app.ts".to_string(),
+                    language: "typescript",
+                },
+            },
+            provenance: vec![
+                CodeQueryProvenance {
+                    branch: vec![1, 0],
+                    seed: CodeQueryResultRef::File {
+                        path: "src/app.ts".to_string(),
+                    },
+                    steps: Vec::new(),
+                },
+                CodeQueryProvenance {
+                    branch: vec![1, 0],
+                    seed: CodeQueryResultRef::File {
+                        path: "src/app.ts".to_string(),
+                    },
+                    steps: Vec::new(),
+                },
+                CodeQueryProvenance {
+                    branch: vec![0],
+                    seed: CodeQueryResultRef::File {
+                        path: "src/app.ts".to_string(),
+                    },
+                    steps: Vec::new(),
+                },
+            ],
+            provenance_truncated: true,
+        };
+        assert_eq!(
+            item.provenance_summary().as_deref(),
+            Some("provenance: 3 paths (truncated); branches 1.0, 0")
+        );
+        let diagnostic = CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::BroadQuery,
+            impact: CodeQueryDiagnosticImpact::Advisory,
+            branch: vec![1, 0],
+            language: "typescript",
+            message: "broad query".to_string(),
+        };
+        assert_eq!(
+            diagnostic.presentation_label(),
+            "advisory [broad_query] [branch 1.0]"
+        );
+
+        let rendered = CodeQueryResult {
+            results: vec![item],
+            truncated: false,
+            diagnostics: vec![diagnostic],
+        }
+        .render_text();
+        assert!(rendered.contains("  provenance: 3 paths (truncated); branches 1.0, 0\n"));
+        assert!(rendered.contains("advisory [broad_query] [branch 1.0]: broad query\n"));
     }
 
     #[test]
@@ -10001,8 +10244,22 @@ mod tests {
 
         assert_eq!(detailed.result.results.len(), 2);
         assert_eq!(detailed.result.completion(), CodeQueryCompletion::Complete);
+        let public_work = detailed.work;
         let profile = detailed.profile.expect("profile");
         assert_serial_profile_reconciles(&profile);
+        assert_eq!(public_work.scanned_files, profile.work.scanned_files);
+        assert_eq!(
+            public_work.scanned_source_bytes,
+            profile.work.scanned_source_bytes
+        );
+        assert_eq!(public_work.fact_nodes, profile.work.fact_nodes);
+        assert_eq!(public_work.pipeline_rows, profile.work.pipeline_rows);
+        assert_eq!(
+            public_work.examined_references,
+            profile.work.examined_references
+        );
+        assert!(profile.work.import_files_resolved > 0);
+        assert!(profile.work.import_edges_resolved > 0);
         assert_eq!(profile.cache.import_reverse.lookups, 2);
         assert_eq!(profile.cache.import_reverse.misses, 1);
         assert_eq!(profile.cache.import_reverse.complete_builds, 1);

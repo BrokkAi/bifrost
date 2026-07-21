@@ -50,7 +50,7 @@ use crate::analyzer::structural::query::{
 };
 use crate::analyzer::structural::search::execute_request_with_cancellation;
 use crate::analyzer::structural::{
-    CodeQuery, CodeQueryExecutionLimits, CodeQueryResponse, CodeQueryResult, CodeQueryResultItem,
+    CodeQuery, CodeQueryExecutionLimits, CodeQueryResponse, CodeQueryResultItem,
     CodeQueryResultValue,
 };
 use crate::analyzer::{
@@ -1130,6 +1130,9 @@ fn handle_run_rql_query_request(
                 CodeQueryExecutionLimits::default(),
                 cancellation,
             );
+            // Avoid rendering and serializing a potentially large response
+            // after execution has already observed cancellation. The common
+            // request guard remains responsible for the race after this check.
             if cancellation.is_cancelled() {
                 return Err(RequestCancelled);
             }
@@ -1143,26 +1146,12 @@ fn run_rql_query_result(
     response: CodeQueryResponse,
 ) -> RunRqlQueryResult {
     let workspace_root = workspace.analyzer().project().root();
-    let mode = response.mode().label();
     let text = response.render_text();
-    let (report, query_result) = match response {
-        CodeQueryResponse::Results(result) => (None, result),
-        CodeQueryResponse::Explain(explain) => (
-            Some(serde_json::to_value(explain).expect("CodeQuery explain is serializable")),
-            CodeQueryResult {
-                results: Vec::new(),
-                truncated: false,
-                diagnostics: Vec::new(),
-            },
-        ),
-        CodeQueryResponse::Profile(profile) => {
-            let report = serde_json::to_value(&profile).expect("CodeQuery profile is serializable");
-            (Some(report), profile.result)
-        }
-    };
+    let (mode, query_result, report) = response.into_parts();
+    let query_result = query_result.unwrap_or_default();
     RunRqlQueryResult {
         text,
-        mode,
+        mode: mode.label(),
         report,
         results: query_result
             .results

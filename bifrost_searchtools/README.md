@@ -152,7 +152,10 @@ its `.result` is the ordinary typed result, while `.explain`, `.timings_ns`,
 `.work`, `.cache_layers`, `.scheduling`, and `.operators` expose structured
 observations. Profile timings are elapsed nanoseconds, and
 `temporary_capacity_bytes_lower_bound` is deliberately only a lower-bound
-container-capacity estimate.
+container-capacity estimate. In the public v1 profile contract, top-level and
+per-operator `.cache_layers` are lists of `{layer, metrics}` records. The nested
+`metrics` object has `kind="structural_facts"` for `seed_structural_facts` and
+`kind="complete_value"` for every other layer.
 
 For decorated or annotated declarations, `node_range` is the matched normalized
 node's parser-backed range. `decorator_ranges` are the decorator or annotation

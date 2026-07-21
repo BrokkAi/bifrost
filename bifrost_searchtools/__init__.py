@@ -1,5 +1,4 @@
 from .client import (
-    CodeQueryExecutionMode,
     MostRelevantFilesRankingMode,
     SearchToolsClient,
     SearchToolsError,
@@ -67,6 +66,7 @@ from .models import (
     CodeQueryDiagnosticImpact,
     CodeQueryCompletion,
     CodeQueryCompletionKind,
+    CodeQueryExecutionMode,
     CodeQueryExplain,
     CodeQueryExplainScheduling,
     CodeQueryExpressionSite,

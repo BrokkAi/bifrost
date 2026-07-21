@@ -28,10 +28,16 @@ pub(crate) struct QueryExecutionProfile {
     /// Total budget-accounted request work (`execution_work + rendering_work`).
     pub(crate) work: QueryOperatorWorkProfile,
     pub(crate) cache: QueryCacheProfile,
+    #[serde(skip)]
+    pub(crate) scheduler_workers: usize,
 }
 
 impl QueryExecutionProfile {
-    pub(crate) fn sequential(plan: &PhysicalQueryPlan, planning_ns: u64) -> Self {
+    pub(crate) fn new(
+        plan: &PhysicalQueryPlan,
+        planning_ns: u64,
+        scheduler_workers: usize,
+    ) -> Self {
         Self {
             format: "bifrost_code_query_execution_profile/v4",
             plan: plan.explain(),
@@ -46,6 +52,7 @@ impl QueryExecutionProfile {
             rendering_work: QueryOperatorWorkProfile::default(),
             work: QueryOperatorWorkProfile::default(),
             cache: QueryCacheProfile::default(),
+            scheduler_workers,
         }
     }
 
@@ -414,8 +421,6 @@ pub(crate) struct QueryOperatorProfile {
     pub(crate) result_cancelled: bool,
 }
 
-const PUBLIC_PROFILE_FORMAT: &str = "bifrost_code_query_profile/v1";
-
 /// Stable, versioned result and observations from one profiled query execution.
 ///
 /// The ordinary query result is nested unchanged. Every other field is an
@@ -434,17 +439,20 @@ pub struct CodeQueryProfile {
 }
 
 impl CodeQueryProfile {
+    pub const FORMAT: &'static str = "bifrost_code_query_profile/v1";
+
     pub(crate) fn from_internal(
         query: &CodeQuery,
         result: CodeQueryResult,
         profile: QueryExecutionProfile,
     ) -> Self {
-        let explain = CodeQueryExplain::from_internal_profile(query, &profile.plan);
+        let explain =
+            CodeQueryExplain::from_internal_plan(query, profile.plan, profile.scheduler_workers);
         let bounded_dispatch = (profile.scheduler.tasks_enqueued > 0)
             .then(|| CodeQueryBoundedDispatchProfile::from_internal(profile.scheduler));
 
         Self {
-            format: PUBLIC_PROFILE_FORMAT,
+            format: Self::FORMAT,
             result,
             explain,
             timings_ns: CodeQueryProfileTimings {
@@ -857,7 +865,7 @@ mod public_contract_tests {
         let physical = PhysicalQueryPlan::select_with_parallel_union(logical, Some(parallel_union));
         let union_node = physical.node(physical.root()).dependencies()[0];
         let union_operator = physical.node(union_node).operator();
-        let mut profile = QueryExecutionProfile::sequential(&physical, 11);
+        let mut profile = QueryExecutionProfile::new(&physical, 11, 7);
         profile.execution_ns = 22;
         profile.rendering_ns = 33;
         profile.total_elapsed_ns = 66;
@@ -946,7 +954,7 @@ mod public_contract_tests {
         let public = CodeQueryProfile::from_internal(&query, result(), profile);
         let value = serde_json::to_value(&public).expect("public profile should serialize");
 
-        assert_eq!(value["format"], "bifrost_code_query_profile/v1");
+        assert_eq!(value["format"], CodeQueryProfile::FORMAT);
         assert_eq!(value["result"], json!({ "results": [], "truncated": true }));
         assert_eq!(
             value["explain"]["scheduling"],
@@ -1088,7 +1096,7 @@ mod public_contract_tests {
             LogicalQueryPlan::lower(&query).expect("query should lower"),
             None,
         );
-        let profile = QueryExecutionProfile::sequential(&physical, 0);
+        let profile = QueryExecutionProfile::new(&physical, 0, 2);
 
         let value =
             serde_json::to_value(CodeQueryProfile::from_internal(&query, result(), profile))

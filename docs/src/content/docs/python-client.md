@@ -103,7 +103,11 @@ executes the query and returns `CodeQueryProfile`, whose typed `.result` is
 accompanied by `.explain`, `.timings_ns`, `.work`, `.cache_layers`,
 `.scheduling`, and per-operator observations. Timings are elapsed nanoseconds;
 the per-operator `temporary_capacity_bytes_lower_bound` is a lower-bound
-container-capacity estimate rather than peak process memory.
+container-capacity estimate rather than peak process memory. In the public v1
+profile contract, top-level and per-operator `.cache_layers` are lists of
+`{layer, metrics}` records. Each nested `metrics` object has
+`kind="structural_facts"` for `seed_structural_facts` and
+`kind="complete_value"` for every other layer.
 
 ## Tests
 

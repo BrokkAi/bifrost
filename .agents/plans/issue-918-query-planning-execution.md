@@ -24,6 +24,7 @@ The first independently verifiable milestone is deliberately sequential. Existin
 - [x] (2026-07-21 13:37Z) Milestone 4: added a bounded ready-task scheduler and independently selectable parallel union, preserved authored results/provenance and fair global budgets, hardened cancellation/panic behavior, corrected the A/B harness after adversarial review, and selected the conservative production-sequential policy because no stable cold-and-warm crossover survived.
 - [x] (2026-07-21 14:12Z) Refetched the moving `origin/master` and cleanly rebased all four milestone checkpoints onto current `8f8a0ef7`; the rebased M3 checkpoint is `cf920952`.
 - [x] (2026-07-21 16:02Z) Milestone 5: exposed explain/profile through every supported query surface, documented the measured production-sequential scheduling policy and rejected alternatives, completed adversarial review with no remaining P0-P3 findings, and passed final repository validation.
+- [x] (2026-07-21 16:53Z) Post-M5 housekeeping: centralized physical-plan selection and capacity, execution-work snapshots, response decomposition, provenance and diagnostic presentation, MCP `query_file` exclusions, and Python execution-mode/cache decoding while preserving the public-v1/internal-v4 compatibility boundary.
 
 ## Surprises & Discoveries
 
@@ -232,6 +233,10 @@ The first independently verifiable milestone is deliberately sequential. Existin
   Rationale: public consumers need stable semantic stages and typed metrics, not benchmark evidence, cache fingerprints, generation details, or executor-only state. Separate versioned DTOs let the implementation evolve without accidental wire changes.
   Date/Author: 2026-07-21 / Codex
 
+- Decision: centralize shared plan, work, response, and presentation mechanics without merging the internal and public DTOs.
+  Rationale: the duplicated mechanics had multiple real consumers and could drift, while the separate DTOs remain the compatibility firewall that prevents internal v4 evidence from leaking into the stable public v1 wire contract. The cleanup therefore consumes internal snapshots into public projections instead of collapsing their ownership.
+  Date/Author: 2026-07-21 / Codex
+
 - Decision: expose cooperative cancellation through the public Rust request API while preserving normal LSP cancellation errors.
   Rationale: an embedded caller owns the token and can use a cancellation-safe partial profile; an LSP client expects its cancelled request to terminate with the protocol error. Documenting both avoids implying that every transport delivers partial telemetry.
   Date/Author: 2026-07-21 / Codex
@@ -344,6 +349,24 @@ the VS Code formatting/typecheck/lint/compile/license/grammar/unit gates passed
 links. Browser inspection of the Explain and Profile page found no horizontal
 overflow or console warnings. Final specialist re-review reported no remaining
 P0-P3 findings.
+
+Post-M5 housekeeping removed the remaining narrow multi-consumer drift points.
+Standalone explain and execution now share physical-plan selection; public
+scheduling capacity comes from the selected plan and configured worker bound;
+ordinary and profiled work share one budget snapshot; and internal plan data is
+consumed into the stable public projection without cloning JSON payloads. Core
+and REPL text rendering share provenance and diagnostic presentation, LSP and
+other transports share exact response decomposition, and MCP `query_file`
+exclusions derive from the authoritative inline property set.
+
+The Python client now owns one execution-mode type and one strict public-v1
+cache-layer decoder. Undocumented internal-v4 cache aliases are intentionally
+not accepted as public-v1 input. Final review also retained the immediate LSP
+cancellation guard and typed REPL report rendering so centralization does not
+delay cancellation or reorder the human-facing report. Validation passed the
+full feature-enabled Rust executable and integration suite, the explicitly
+pinned zero-example doctest, 56 Python tests, focused response/REPL/LSP tests,
+formatting, strict all-target/all-feature Clippy, and `git diff --check`.
 
 ## Context and Orientation
 
@@ -567,6 +590,8 @@ Revision note (2026-07-21, Milestone 3): Recorded the clean rebase onto current 
 Revision note (2026-07-21, Milestone 4): Recorded the clean rebase onto current `origin/master`, bounded ready-task scheduler, independent `ParallelUnion`, ordered fair-budget admission, cancellation and panic wakeups, deterministic authored merge, corrected query-scoped and persistence-isolated v4 A/B harness, stable reversed candidate ordering, and the measured decision to retain production-sequential Auto because no stable observable crossover survived. Milestone 5 remains responsible for supported explain/profile surfaces and final issue-level validation.
 
 Revision note (2026-07-21, Milestone 5): Recorded the schema-authoritative root execution mode, stable public v1 projections, exact ordinary/profile result compatibility, top-level cancellable Rust API, MCP/CLI/REPL/Python/LSP/VS Code surfaces, rendered documentation and measured production-sequential policy, cross-surface adversarial fixes, and final issue-level validation.
+
+Revision note (2026-07-21, post-M5 housekeeping): Recorded the centralized physical-plan selection and capacity, single work snapshot, consuming public projections, shared transport and presentation mechanics, schema-derived MCP exclusions, strict single-owner Python contract, and the review fixes preserving prompt LSP cancellation and typed REPL field order.
 
 ## Interfaces and Dependencies
 

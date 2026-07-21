@@ -10,11 +10,12 @@ from pathlib import Path
 import sys
 import threading
 from types import ModuleType
-from typing import Any, Literal, overload
+from typing import Any, get_args, overload
 
 from .models import (
     CommitAnalysisResult,
     CodeQualityReport,
+    CodeQueryExecutionMode,
     FileSummariesResult,
     DefinitionByReferenceLookupResult,
     DeclarationLookupResult,
@@ -71,8 +72,7 @@ class MostRelevantFilesRankingMode(StrEnum):
     USAGE_GRAPH = "usage_graph"
 
 
-CodeQueryExecutionMode = Literal["results", "explain", "profile"]
-_CODE_QUERY_EXECUTION_MODES = frozenset({"results", "explain", "profile"})
+_CODE_QUERY_EXECUTION_MODES = frozenset(get_args(CodeQueryExecutionMode))
 
 
 class XmlSelectOutput(StrEnum):

@@ -379,6 +379,11 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
             })
         })
         .collect::<Vec<_>>();
+    let query_file_exclusions = query_code_properties
+        .keys()
+        .filter(|field| field.as_str() != "query_file")
+        .map(|field| json!({ "required": [field] }))
+        .collect::<Vec<_>>();
     vec![
         tool_descriptor(
             "query_code",
@@ -393,21 +398,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                     {
                         "required": ["query_file"],
                         "not": {
-                            "anyOf": [
-                                { "required": ["where"] },
-                                { "required": ["languages"] },
-                                { "required": ["match"] },
-                                { "required": ["union"] },
-                                { "required": ["intersect"] },
-                                { "required": ["except"] },
-                                { "required": ["inside"] },
-                                { "required": ["not_inside"] },
-                                { "required": ["steps"] },
-                                { "required": ["limit"] },
-                                { "required": ["result_detail"] },
-                                { "required": ["execution_mode"] },
-                                { "required": ["schema_version"] }
-                            ]
+                            "anyOf": query_file_exclusions
                         }
                     }
                 ],
@@ -792,6 +783,21 @@ mod tests {
                 .collect()
             );
         }
+        let query_file_variant = &query_code["inputSchema"]["oneOf"][1];
+        let excluded = query_file_variant["not"]["anyOf"]
+            .as_array()
+            .expect("query_file exclusions")
+            .iter()
+            .map(|entry| entry["required"][0].as_str().expect("excluded field name"))
+            .collect::<std::collections::BTreeSet<_>>();
+        let inline_properties = query_code["inputSchema"]["properties"]
+            .as_object()
+            .expect("query_code properties")
+            .keys()
+            .map(String::as_str)
+            .filter(|field| *field != "query_file")
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(excluded, inline_properties);
     }
 
     #[test]

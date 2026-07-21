@@ -430,8 +430,12 @@ impl PhysicalQueryPlan {
     }
 
     /// Build the stable public explain contract without executing the plan.
-    pub(crate) fn public_explain(&self, query: &CodeQuery) -> CodeQueryExplain {
-        CodeQueryExplain::from_internal_profile(query, &self.explain())
+    pub(crate) fn public_explain(
+        &self,
+        query: &CodeQuery,
+        scheduler_workers: usize,
+    ) -> CodeQueryExplain {
+        CodeQueryExplain::from_internal_plan(query, self.explain(), scheduler_workers)
     }
 }
 
@@ -494,9 +498,6 @@ impl LogicalQueryOperatorExplain {
     }
 }
 
-const PUBLIC_EXPLAIN_FORMAT: &str = "bifrost_code_query_explain/v1";
-const PARALLEL_UNION_MAX_CONCURRENCY: usize = 2;
-
 /// Stable, versioned explanation of a parsed query and its selected plan.
 ///
 /// This is a projection rather than the serialization of the executor's
@@ -512,12 +513,15 @@ pub struct CodeQueryExplain {
 }
 
 impl CodeQueryExplain {
-    /// Project the plan retained by an internal execution profile into the
-    /// stable public contract. Keeping this conversion here prevents callers
-    /// from accidentally publishing internal-only explain fields.
-    pub(crate) fn from_internal_profile(
+    pub const FORMAT: &'static str = "bifrost_code_query_explain/v1";
+
+    /// Consume an internal plan snapshot into the stable public contract.
+    /// Keeping this conversion here prevents callers from accidentally
+    /// publishing internal-only explain fields or cloning its JSON payloads.
+    pub(crate) fn from_internal_plan(
         query: &CodeQuery,
-        plan: &PhysicalQueryPlanExplain,
+        plan: PhysicalQueryPlanExplain,
+        scheduler_workers: usize,
     ) -> Self {
         let selected = if plan
             .nodes
@@ -528,48 +532,63 @@ impl CodeQueryExplain {
         } else {
             CodeQuerySelectedScheduling::Sequential
         };
-        let logical_plan = CodeQueryLogicalPlan {
-            root: plan.logical_node_for_physical(plan.root).get(),
-            nodes: plan
+        let max_concurrency = match selected {
+            CodeQuerySelectedScheduling::Sequential => 1,
+            CodeQuerySelectedScheduling::Parallel => plan
                 .nodes
                 .iter()
-                .map(|node| CodeQueryLogicalNode {
-                    id: node.logical_node.get(),
-                    operation: CodeQueryLogicalOperation::from_internal(&node.logical_operator),
-                    output_kind: node.output_kind,
-                    dependencies: node
-                        .dependencies
-                        .iter()
-                        .map(|dependency| plan.logical_node_for_physical(*dependency).get())
-                        .collect(),
-                })
-                .collect(),
+                .find(|node| node.operator == PhysicalQueryOperator::ParallelUnion)
+                .map_or(1, |node| {
+                    scheduler_workers.min(node.dependencies.len()).max(1)
+                }),
         };
-        let physical_plan = CodeQueryPhysicalPlan {
-            root: plan.root.get(),
-            nodes: plan
-                .nodes
-                .iter()
-                .map(|node| CodeQueryPhysicalNode {
+        let logical_node_ids = plan
+            .nodes
+            .iter()
+            .map(|node| node.logical_node)
+            .collect::<Vec<_>>();
+        let logical_root = logical_node_ids[plan.root.index()].get();
+        let physical_root = plan.root.get();
+        let (logical_nodes, physical_nodes) = plan
+            .nodes
+            .into_iter()
+            .map(|node| {
+                let logical_dependencies = node
+                    .dependencies
+                    .iter()
+                    .map(|dependency| logical_node_ids[dependency.index()].get())
+                    .collect();
+                let physical_dependencies = node
+                    .dependencies
+                    .iter()
+                    .map(|dependency| dependency.get())
+                    .collect();
+                let logical = CodeQueryLogicalNode {
+                    id: node.logical_node.get(),
+                    operation: CodeQueryLogicalOperation::from_internal(node.logical_operator),
+                    output_kind: node.output_kind,
+                    dependencies: logical_dependencies,
+                };
+                let physical = CodeQueryPhysicalNode {
                     id: node.physical_node.get(),
                     logical_node: node.logical_node.get(),
                     operator: CodeQueryPhysicalOperator::from_internal(node.operator),
                     output_kind: node.output_kind,
-                    dependencies: node
-                        .dependencies
-                        .iter()
-                        .map(|dependency| dependency.get())
-                        .collect(),
-                })
-                .collect(),
+                    dependencies: physical_dependencies,
+                };
+                (logical, physical)
+            })
+            .unzip();
+        let logical_plan = CodeQueryLogicalPlan {
+            root: logical_root,
+            nodes: logical_nodes,
         };
-        let max_concurrency = match selected {
-            CodeQuerySelectedScheduling::Sequential => 1,
-            CodeQuerySelectedScheduling::Parallel => PARALLEL_UNION_MAX_CONCURRENCY,
+        let physical_plan = CodeQueryPhysicalPlan {
+            root: physical_root,
+            nodes: physical_nodes,
         };
-
         Self {
-            format: PUBLIC_EXPLAIN_FORMAT,
+            format: Self::FORMAT,
             query_schema_version: query.schema_version,
             parsed_query: query.to_canonical_json(),
             logical_plan,
@@ -580,14 +599,6 @@ impl CodeQueryExplain {
                 max_concurrency,
             },
         }
-    }
-}
-
-impl PhysicalQueryPlanExplain {
-    fn logical_node_for_physical(&self, id: PhysicalQueryNodeId) -> LogicalQueryNodeId {
-        let node = &self.nodes[id.index()];
-        debug_assert_eq!(node.physical_node, id);
-        node.logical_node
     }
 }
 
@@ -617,12 +628,12 @@ pub enum CodeQueryLogicalOperation {
 }
 
 impl CodeQueryLogicalOperation {
-    fn from_internal(operation: &LogicalQueryOperatorExplain) -> Self {
+    fn from_internal(operation: LogicalQueryOperatorExplain) -> Self {
         match operation {
-            LogicalQueryOperatorExplain::Seed { seed } => Self::Seed { seed: seed.clone() },
-            LogicalQueryOperatorExplain::Step { step, .. } => Self::Step { step: step.clone() },
+            LogicalQueryOperatorExplain::Seed { seed } => Self::Seed { seed },
+            LogicalQueryOperatorExplain::Step { step, .. } => Self::Step { step },
             LogicalQueryOperatorExplain::Set { op } => Self::Set { op },
-            LogicalQueryOperatorExplain::Limit { count } => Self::Limit { count: *count },
+            LogicalQueryOperatorExplain::Limit { count } => Self::Limit { count },
         }
     }
 }
@@ -779,12 +790,12 @@ mod tests {
         });
         let physical =
             PhysicalQueryPlan::select(LogicalQueryPlan::lower(&query).expect("query should lower"));
-        let public = physical.public_explain(&query);
+        let public = physical.public_explain(&query, 2);
 
         assert_eq!(
             serde_json::to_value(&public).expect("public explain should serialize"),
             json!({
-                "format": "bifrost_code_query_explain/v1",
+                "format": CodeQueryExplain::FORMAT,
                 "query_schema_version": SCHEMA_VERSION,
                 "parsed_query": {
                     "schema_version": SCHEMA_VERSION,
@@ -1000,6 +1011,7 @@ mod tests {
                 branches: vec![
                     branch(seed("First"), Vec::new()),
                     branch(seed("Second"), Vec::new()),
+                    branch(seed("Third"), Vec::new()),
                 ],
             },
             steps: Vec::new(),
@@ -1019,22 +1031,26 @@ mod tests {
                 .operator(),
             PhysicalQueryOperator::ParallelUnion
         );
-        let public = physical.public_explain(&query(CodeQueryPlan {
-            source: CodeQueryPlanSource::Set {
-                op: SetOperator::Union,
-                branches: vec![
-                    branch(seed("First"), Vec::new()),
-                    branch(seed("Second"), Vec::new()),
-                ],
-            },
-            steps: Vec::new(),
-        }));
+        let public = physical.public_explain(
+            &query(CodeQueryPlan {
+                source: CodeQueryPlanSource::Set {
+                    op: SetOperator::Union,
+                    branches: vec![
+                        branch(seed("First"), Vec::new()),
+                        branch(seed("Second"), Vec::new()),
+                        branch(seed("Third"), Vec::new()),
+                    ],
+                },
+                steps: Vec::new(),
+            }),
+            7,
+        );
         assert_eq!(
             public.scheduling,
             CodeQueryExplainScheduling {
                 policy: CodeQuerySchedulingPolicy::Auto,
                 selected: CodeQuerySelectedScheduling::Parallel,
-                max_concurrency: PARALLEL_UNION_MAX_CONCURRENCY,
+                max_concurrency: 3,
             }
         );
         let sequential = PhysicalQueryPlan::select(logical);
@@ -1126,7 +1142,7 @@ mod tests {
             "unannotated operators should not gain a null derived-layer field"
         );
 
-        let public = serde_json::to_string(&physical.public_explain(&query))
+        let public = serde_json::to_string(&physical.public_explain(&query, 2))
             .expect("public explain should serialize");
         assert!(!public.contains("derived_layer_request"));
         assert!(!public.contains("final_in_authored_suffix"));

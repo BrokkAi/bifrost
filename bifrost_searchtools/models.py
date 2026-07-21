@@ -2,7 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal, cast, get_args
+
+
+CodeQueryExecutionMode = Literal["results", "explain", "profile"]
+_CODE_QUERY_EXECUTION_MODES = get_args(CodeQueryExecutionMode)
+
+
+def _code_query_execution_mode(value: Any) -> CodeQueryExecutionMode | None:
+    if value is None:
+        return None
+    if value not in _CODE_QUERY_EXECUTION_MODES:
+        expected = ", ".join(repr(mode) for mode in _CODE_QUERY_EXECUTION_MODES)
+        raise ValueError(f"execution_mode must be one of {expected}, got {value!r}")
+    return cast(CodeQueryExecutionMode, value)
 
 
 def _render_numbered_block(text: str, start_line: int) -> str:
@@ -747,7 +760,7 @@ class CodeQueryParsedQuery:
     not_inside: dict[str, Any] | None = None
     limit: int | None = None
     result_detail: str | None = None
-    execution_mode: str | None = None
+    execution_mode: CodeQueryExecutionMode | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -793,7 +806,7 @@ class CodeQueryParsedQuery:
             ),
             limit=_optional_int(data, "limit"),
             result_detail=data.get("result_detail"),
-            execution_mode=data.get("execution_mode"),
+            execution_mode=_code_query_execution_mode(data.get("execution_mode")),
             extra=_extra_fields(data, known),
         )
 
@@ -1084,7 +1097,7 @@ class CodeQueryProfileCacheCounters:
             "replayed_items",
         }
         return cls(
-            kind=CodeQueryCacheMetricsKind(data.get("kind", "complete_value")),
+            kind=CodeQueryCacheMetricsKind(data["kind"]),
             **{key: int(data.get(key, 0)) for key in counters},
             extra=_extra_fields(data, {"kind", *counters}),
         )
@@ -1116,7 +1129,7 @@ class CodeQueryStructuralFactsCacheCounters:
             "replayed_files",
         }
         return cls(
-            kind=CodeQueryCacheMetricsKind(data.get("kind", "structural_facts")),
+            kind=CodeQueryCacheMetricsKind(data["kind"]),
             **{key: int(data.get(key, 0)) for key in counters},
             extra=_extra_fields(data, {"kind", *counters}),
         )
@@ -1146,48 +1159,50 @@ class CodeQueryProfileCacheLayer:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CodeQueryProfileCacheLayer:
-        nested_metrics = data.get("metrics")
-        if isinstance(nested_metrics, dict):
-            metrics_data = nested_metrics
-            extra = _extra_fields(data, {"layer", "metrics"})
-        else:
-            metrics_data = {
-                key: value
-                for key, value in data.items()
-                if key not in {"layer", "metrics"}
-            }
-            extra = (
-                {"unparsed_metrics": nested_metrics}
-                if nested_metrics is not None
-                else {}
-            )
         layer = CodeQueryCacheLayerKind(data["layer"])
-        structural_facts = (
-            layer is CodeQueryCacheLayerKind.SEED_STRUCTURAL_FACTS
-            or metrics_data.get("kind")
-            in {"structural_facts", "seed_structural_facts"}
+        metrics_data = data.get("metrics")
+        if not isinstance(metrics_data, dict):
+            raise ValueError("cache layer metrics must be a nested object")
+        metrics_kind = CodeQueryCacheMetricsKind(metrics_data.get("kind"))
+        expected_kind = (
+            CodeQueryCacheMetricsKind.STRUCTURAL_FACTS
+            if layer is CodeQueryCacheLayerKind.SEED_STRUCTURAL_FACTS
+            else CodeQueryCacheMetricsKind.COMPLETE_VALUE
         )
+        if metrics_kind is not expected_kind:
+            raise ValueError(
+                f"cache layer {layer.value!r} requires metrics kind "
+                f"{expected_kind.value!r}, got {metrics_kind.value!r}"
+            )
         metrics: CodeQueryCacheMetrics
-        if structural_facts:
+        if metrics_kind is CodeQueryCacheMetricsKind.STRUCTURAL_FACTS:
             metrics = CodeQueryStructuralFactsCacheCounters.from_dict(metrics_data)
         else:
             metrics = CodeQueryProfileCacheCounters.from_dict(metrics_data)
         return cls(
             layer=layer,
             metrics=metrics,
-            extra=extra,
+            extra=_extra_fields(data, {"layer", "metrics"}),
         )
 
 
-def _code_query_cache_layers(value: Any) -> list[CodeQueryProfileCacheLayer]:
-    if value is None:
-        return []
-    if isinstance(value, dict):
-        return [
-            CodeQueryProfileCacheLayer.from_dict({"layer": layer, "metrics": metrics})
-            for layer, metrics in value.items()
-        ]
-    return [CodeQueryProfileCacheLayer.from_dict(layer) for layer in value]
+def _code_query_cache_layers(
+    data: dict[str, Any],
+) -> list[CodeQueryProfileCacheLayer]:
+    if "cache_layers" not in data:
+        raise ValueError("cache_layers is required")
+    value = data["cache_layers"]
+    if not isinstance(value, list):
+        raise ValueError("cache_layers must be a list")
+    layers: list[CodeQueryProfileCacheLayer] = []
+    for index, layer in enumerate(value):
+        if not isinstance(layer, dict):
+            raise ValueError(f"cache_layers[{index}] must be an object")
+        try:
+            layers.append(CodeQueryProfileCacheLayer.from_dict(layer))
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"invalid cache_layers[{index}]: {error}") from error
+    return layers
 
 
 @dataclass(frozen=True)
@@ -1308,7 +1323,6 @@ class CodeQueryOperatorObservation:
             "temporary_capacity_bytes_lower_bound",
             "work",
             "cache_layers",
-            "cache",
             "terminations",
             "output_rows",
             "operator_truncated",
@@ -1330,9 +1344,7 @@ class CodeQueryOperatorObservation:
                 data.get("temporary_capacity_bytes_lower_bound", 0)
             ),
             work=CodeQueryProfileWork.from_dict(data.get("work", {})),
-            cache_layers=_code_query_cache_layers(
-                data.get("cache_layers", data.get("cache"))
-            ),
+            cache_layers=_code_query_cache_layers(data),
             terminations=[
                 CodeQueryOperatorTermination(reason)
                 for reason in data.get("terminations", [])
@@ -1393,7 +1405,6 @@ class CodeQueryProfile:
             "timings_ns",
             "work",
             "cache_layers",
-            "cache",
             "scheduling",
             "operators",
         }
@@ -1403,9 +1414,7 @@ class CodeQueryProfile:
             explain=CodeQueryExplain.from_dict(data["explain"]),
             timings_ns=CodeQueryProfileTimings.from_dict(data.get("timings_ns", {})),
             work=CodeQueryProfileWork.from_dict(data.get("work", {})),
-            cache_layers=_code_query_cache_layers(
-                data.get("cache_layers", data.get("cache"))
-            ),
+            cache_layers=_code_query_cache_layers(data),
             scheduling=CodeQueryProfileScheduling.from_dict(
                 data.get("scheduling", {})
             ),
