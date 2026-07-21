@@ -118,6 +118,7 @@ impl RustScan<'_, '_> {
             self.file,
             path,
             name,
+            node.start_byte(),
         ) {
             ReceiverAnalysisOutcome::Precise(mut candidates) if candidates.len() == 1 => {
                 candidates.pop().map(|candidate| candidate.fq_name())

@@ -1984,6 +1984,8 @@ impl Foo {
         (
             "src/main.rs",
             r#"
+mod service;
+
 use crate::service::Foo;
 
 fn run() {
@@ -2086,6 +2088,9 @@ impl Trait for Foo {}
         (
             "src/main.rs",
             r#"
+mod contracts;
+mod service;
+
 use crate::contracts::Trait;
 use crate::service::Foo;
 
@@ -2331,6 +2336,8 @@ impl Trait for Foo {}
         (
             "src/main.rs",
             r#"
+mod service;
+
 use crate::service::{self, Trait};
 
 fn run() {
@@ -2428,6 +2435,8 @@ impl Trait for Foo {}
         (
             "src/main.rs",
             r#"
+mod service;
+
 use crate::service::Trait;
 use crate::service::Foo;
 
@@ -2577,6 +2586,9 @@ impl Two for Foo {}
         (
             "src/main.rs",
             r#"
+mod contracts;
+mod service;
+
 use crate::contracts::One;
 use crate::service::Foo;
 
@@ -2636,6 +2648,8 @@ impl Foo {
         (
             "src/main.rs",
             r#"
+mod service;
+
 use crate::service::Foo;
 
 fn run(x: Foo) {
@@ -3382,6 +3396,8 @@ pub enum Foo {
         (
             "src/main.rs",
             r#"
+mod service;
+
 use crate::service::Foo;
 
 fn run() {
@@ -3451,16 +3467,22 @@ fn rust_graph_strategy_resolves_associated_type_as_static_field() {
         (
             "src/service.rs",
             r#"
+pub trait Trait {
+    type AssocType;
+}
+
 pub struct Foo;
-impl Foo {
-    pub type AssocType = usize;
+impl Trait for Foo {
+    type AssocType = usize;
 }
 "#,
         ),
         (
             "src/main.rs",
             r#"
-use crate::service::Foo;
+mod service;
+
+use crate::service::{Foo, Trait};
 
 fn run(_: Foo::AssocType) {}
 "#,
@@ -3470,7 +3492,7 @@ fn run(_: Foo::AssocType) {}
     let assoc_type = member(
         &analyzer,
         &project.file("src/service.rs"),
-        "Foo",
+        "Trait",
         "AssocType",
     );
     let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
@@ -3688,6 +3710,8 @@ impl Worker for Foo {
         (
             "src/main.rs",
             r#"
+mod service;
+
 use crate::service::{Foo, Worker};
 
 fn run() {
@@ -4140,6 +4164,434 @@ pub fn disabled<S>() -> bool {
             .next()
             .is_some_and(|hit| hit.snippet.contains("Context::<S>::none"))
     );
+}
+
+#[test]
+fn rust_associated_generic_owner_resolution_is_qualified_alias_exact_and_glob_safe() {
+    let consumer = r#"
+use crate::facade::AliasedContext;
+
+fn valid() {
+    let _ = crate::target::Context::<u8>::none(); // QUALIFIED_GENERIC_OWNER
+    let _ = AliasedContext::<u8>::none(); // ALIASED_GENERIC_OWNER
+}
+"#;
+    let ambiguous = r#"
+use crate::decoy::*;
+use crate::target::*;
+
+fn invalid() {
+    let _ = Context::<u8>::none(); // AMBIGUOUS_GLOB_OWNER
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            "pub mod target;\npub mod facade;\npub mod decoy;\nmod consumer;\nmod ambiguous;\n",
+        ),
+        (
+            "src/target.rs",
+            "pub struct Context<S>(pub Option<S>);\nimpl<S> Context<S> { pub fn none() -> Self { Self(None) } }\n",
+        ),
+        (
+            "src/decoy.rs",
+            "pub struct Context<S>(pub Option<S>);\nimpl<S> Context<S> { pub fn none() -> Self { Self(None) } }\n",
+        ),
+        (
+            "src/facade.rs",
+            "pub use crate::target::Context as AliasedContext;\n",
+        ),
+        ("src/consumer.rs", consumer),
+        ("src/ambiguous.rs", ambiguous),
+    ]);
+    let target = member(&analyzer, &project.file("src/target.rs"), "Context", "none");
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("generic associated-owner scan");
+
+    assert_eq!(2, hits.len(), "qualified/aliased generic owners: {hits:#?}");
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file == project.file("src/consumer.rs"))
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("QUALIFIED_GENERIC_OWNER"))
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("ALIASED_GENERIC_OWNER"))
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| !hit.snippet.contains("AMBIGUOUS_GLOB_OWNER"))
+    );
+}
+
+#[test]
+fn rust_associated_owner_resolution_rejects_same_fqn_from_another_physical_root() {
+    let consumer = r#"
+fn valid() {
+    let _ = crate::Context::<u8>::none(); // LIBRARY_CONTEXT_OWNER
+}
+"#;
+    let main = r#"
+struct Context<S>(Option<S>);
+impl<S> Context<S> { fn none() -> Self { Self(None) } }
+fn invalid() {
+    let _ = Context::<u8>::none(); // BINARY_CONTEXT_DECOY
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            "pub struct Context<S>(pub Option<S>);\nimpl<S> Context<S> { pub fn none() -> Self { Self(None) } }\nmod consumer;\n",
+        ),
+        ("src/consumer.rs", consumer),
+        ("src/main.rs", main),
+    ]);
+    let target = member(&analyzer, &project.file("src/lib.rs"), "Context", "none");
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("same-FQN owner scan");
+
+    assert_eq!(1, hits.len(), "same-FQN physical owners: {hits:#?}");
+    let hit = hits.iter().next().expect("library owner usage");
+    assert_eq!(project.file("src/consumer.rs"), hit.file);
+    assert!(hit.snippet.contains("LIBRARY_CONTEXT_OWNER"));
+}
+
+#[test]
+fn rust_trait_associated_fallback_preserves_exact_same_fqn_implementer() {
+    let consumer = r#"
+use crate::{Foo, T};
+fn valid() { Foo::f(); } // LIBRARY_TRAIT_ASSOCIATED
+"#;
+    let main = r#"
+trait T { fn f(); }
+struct Foo;
+impl T for Foo {}
+fn decoy() { Foo::f(); } // BINARY_TRAIT_DECOY
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            "pub trait T { fn f(); }\npub struct Foo;\nimpl T for Foo {}\nmod consumer;\n",
+        ),
+        ("src/consumer.rs", consumer),
+        ("src/main.rs", main),
+    ]);
+    let target = member(&analyzer, &project.file("src/lib.rs"), "T", "f");
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("exact same-FQN trait implementer scan");
+
+    assert_eq!(1, hits.len(), "same-FQN trait implementers: {hits:#?}");
+    let hit = hits.iter().next().expect("library trait associated usage");
+    assert_eq!(project.file("src/consumer.rs"), hit.file);
+    assert!(hit.snippet.contains("LIBRARY_TRAIT_ASSOCIATED"));
+    assert!(
+        hits.iter()
+            .all(|hit| !hit.snippet.contains("BINARY_TRAIT_DECOY"))
+    );
+}
+
+#[test]
+fn rust_inherent_associated_owner_resolves_exact_type_alias_without_cross_root_decoy() {
+    let consumer = r#"
+use crate::Alias;
+fn valid() { let _ = Alias::new(); } // LIBRARY_ALIAS_ASSOCIATED
+"#;
+    let main = r#"
+struct Other;
+impl Other { fn new() -> Self { Self } }
+type Alias = Other;
+fn decoy() { let _ = Alias::new(); } // BINARY_ALIAS_DECOY
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            "pub struct Foo;\nimpl Foo { pub fn new() -> Self { Self } }\npub type Alias = Foo;\nmod consumer;\n",
+        ),
+        ("src/consumer.rs", consumer),
+        ("src/main.rs", main),
+    ]);
+    let target = member(&analyzer, &project.file("src/lib.rs"), "Foo", "new");
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("exact inherent alias owner scan");
+
+    assert_eq!(1, hits.len(), "same-named alias roots: {hits:#?}");
+    let hit = hits.iter().next().expect("library alias associated usage");
+    assert_eq!(project.file("src/consumer.rs"), hit.file);
+    assert!(hit.snippet.contains("LIBRARY_ALIAS_ASSOCIATED"));
+    assert!(
+        hits.iter()
+            .all(|hit| !hit.snippet.contains("BINARY_ALIAS_DECOY"))
+    );
+}
+
+#[test]
+fn rust_token_tree_associated_owner_rejects_same_fqn_physical_decoy() {
+    let consumer = r#"
+macro_rules! wrap { ($value:expr) => { $value }; }
+use crate::Foo;
+fn valid() { let _ = wrap!(Foo::new()); } // LIBRARY_TOKEN_ASSOCIATED
+"#;
+    let main = r#"
+macro_rules! wrap { ($value:expr) => { $value }; }
+struct Foo;
+impl Foo { fn new() -> Self { Self } }
+fn decoy() { let _ = wrap!(Foo::new()); } // BINARY_TOKEN_DECOY
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            "pub struct Foo;\nimpl Foo { pub fn new() -> Self { Self } }\nmod consumer;\n",
+        ),
+        ("src/consumer.rs", consumer),
+        ("src/main.rs", main),
+    ]);
+    let target = member(&analyzer, &project.file("src/lib.rs"), "Foo", "new");
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("exact token-tree owner scan");
+
+    assert_eq!(1, hits.len(), "same-FQN token owners: {hits:#?}");
+    let hit = hits.iter().next().expect("library token-tree usage");
+    assert_eq!(project.file("src/consumer.rs"), hit.file);
+    assert!(hit.snippet.contains("LIBRARY_TOKEN_ASSOCIATED"));
+    assert!(
+        hits.iter()
+            .all(|hit| !hit.snippet.contains("BINARY_TOKEN_DECOY"))
+    );
+}
+
+#[test]
+fn rust_qualified_token_tree_trait_call_preserves_exact_implementer() {
+    let consumer = r#"
+macro_rules! wrap { ($value:expr) => { $value }; }
+use crate::T;
+fn valid() { wrap!(crate::Foo::f()); } // LIBRARY_QUALIFIED_TOKEN_TRAIT
+"#;
+    let main = r#"
+macro_rules! wrap { ($value:expr) => { $value }; }
+trait T { fn f(); }
+struct Foo;
+impl T for Foo {}
+fn decoy() { wrap!(Foo::f()); } // BINARY_QUALIFIED_TOKEN_DECOY
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/lib.rs",
+            "pub trait T { fn f(); }\npub struct Foo;\nimpl T for Foo {}\nmod consumer;\n",
+        ),
+        ("src/consumer.rs", consumer),
+        ("src/main.rs", main),
+    ]);
+    let target = member(&analyzer, &project.file("src/lib.rs"), "T", "f");
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("qualified token-tree trait scan");
+
+    assert_eq!(1, hits.len(), "qualified token trait owners: {hits:#?}");
+    let hit = hits.iter().next().expect("qualified library token usage");
+    assert_eq!(project.file("src/consumer.rs"), hit.file);
+    assert!(hit.snippet.contains("LIBRARY_QUALIFIED_TOKEN_TRAIT"));
+    assert!(
+        hits.iter()
+            .all(|hit| !hit.snippet.contains("BINARY_QUALIFIED_TOKEN_DECOY"))
+    );
+}
+
+#[test]
+fn rust_trait_visibility_respects_function_local_import_extent() {
+    let source = r#"
+mod model {
+    pub trait T { fn f(); }
+    pub struct Foo;
+    impl T for Foo {}
+}
+
+use model::Foo;
+fn valid() {
+    use model::T;
+    Foo::f(); // LOCAL_TRAIT_VISIBLE
+}
+fn sibling() {
+    Foo::f(); // LOCAL_TRAIT_OUT_OF_SCOPE
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[("src/lib.rs", source)]);
+    let target = member(&analyzer, &project.file("src/lib.rs"), "T", "f");
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("function-local trait visibility scan");
+
+    assert_eq!(1, hits.len(), "function-local trait imports: {hits:#?}");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("LOCAL_TRAIT_VISIBLE"))
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| !hit.snippet.contains("LOCAL_TRAIT_OUT_OF_SCOPE"))
+    );
+}
+
+#[test]
+fn rust_trait_visibility_rejects_cross_root_same_fqn_local_trait() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"demo-app\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub trait Trait { fn f(); }\npub struct Foo;\nimpl Trait for Foo {}\n",
+        ),
+        (
+            "src/main.rs",
+            r#"
+use demo_app::Foo;
+trait Trait { fn f(); }
+fn decoy() { Foo::f(); } // LOCAL_SAME_FQN_TRAIT_DECOY
+"#,
+        ),
+    ]);
+    let target = member(&analyzer, &project.file("src/lib.rs"), "Trait", "f");
+    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
+        .find_usages(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &analyzer.get_analyzed_files().into_iter().collect(),
+            1000,
+        )
+        .into_either()
+        .expect("cross-root trait visibility scan");
+
+    assert!(
+        hits.is_empty(),
+        "cross-root same-FQN trait decoy: {hits:#?}"
+    );
+}
+
+#[test]
+fn rust_associated_member_visibility_distinguishes_crate_and_dependency_domains() {
+    let dependency_consumer = r#"
+use crate::PublicOwner;
+fn valid() { let _ = PublicOwner::hidden(); } // SAME_CRATE_HIDDEN
+"#;
+    let downstream_consumer = r#"
+use dep_alias::PublicOwner;
+fn run() {
+    let _ = PublicOwner::hidden(); // DOWNSTREAM_HIDDEN_DECOY
+    let _ = PublicOwner::visible(); // DOWNSTREAM_PUBLIC
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\ndep_alias = { package = \"dep-package\", path = \"dep\" }\n",
+        ),
+        ("src/lib.rs", "mod consumer;\n"),
+        ("src/consumer.rs", downstream_consumer),
+        (
+            "dep/Cargo.toml",
+            "[package]\nname = \"dep-package\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "dep/src/lib.rs",
+            "pub struct PublicOwner;\nimpl PublicOwner { pub(crate) fn hidden() {} pub fn visible() {} }\nmod local_consumer;\n",
+        ),
+        ("dep/src/local_consumer.rs", dependency_consumer),
+    ]);
+    let hidden = member(
+        &analyzer,
+        &project.file("dep/src/lib.rs"),
+        "PublicOwner",
+        "hidden",
+    );
+    let visible = member(
+        &analyzer,
+        &project.file("dep/src/lib.rs"),
+        "PublicOwner",
+        "visible",
+    );
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
+    let hidden_hits = strategy
+        .find_usages(&analyzer, &[hidden], &candidates, 1000)
+        .into_either()
+        .expect("pub(crate) associated visibility");
+    let visible_hits = strategy
+        .find_usages(&analyzer, &[visible], &candidates, 1000)
+        .into_either()
+        .expect("public dependency associated visibility");
+
+    assert_eq!(
+        1,
+        hidden_hits.len(),
+        "pub(crate) visibility: {hidden_hits:#?}"
+    );
+    let hidden_hit = hidden_hits.iter().next().expect("same-crate hidden usage");
+    assert_eq!(project.file("dep/src/local_consumer.rs"), hidden_hit.file);
+    assert!(hidden_hit.snippet.contains("SAME_CRATE_HIDDEN"));
+    assert!(
+        hidden_hits
+            .iter()
+            .all(|hit| !hit.snippet.contains("DOWNSTREAM_HIDDEN_DECOY"))
+    );
+    assert_eq!(
+        1,
+        visible_hits.len(),
+        "public visibility: {visible_hits:#?}"
+    );
+    let visible_hit = visible_hits.iter().next().expect("dependency public usage");
+    assert_eq!(project.file("src/consumer.rs"), visible_hit.file);
+    assert!(visible_hit.snippet.contains("DOWNSTREAM_PUBLIC"));
 }
 
 #[test]

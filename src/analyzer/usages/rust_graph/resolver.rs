@@ -1,4 +1,4 @@
-use crate::analyzer::rust::lexical_scope;
+use crate::analyzer::rust::lexical_scope::{self, RustLexicalScopeIndex};
 use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
 use crate::analyzer::{
     CodeUnit, GlobalUsageDefinitionIndex, IAnalyzer, ProjectFile, RustAnalyzer,
@@ -243,7 +243,15 @@ fn resolve_token_path_segment_fqn(
     {
         return Some(fqn);
     }
-    match resolve_scoped_associated_item(rust, support, refs, file, owner, name) {
+    match resolve_scoped_associated_item(
+        rust,
+        support,
+        refs,
+        file,
+        owner,
+        name,
+        segment.start_byte(),
+    ) {
         ReceiverAnalysisOutcome::Precise(candidates) => {
             let mut fqns = candidates.into_iter().map(|candidate| candidate.fq_name());
             let fqn = fqns.next()?;
@@ -415,32 +423,18 @@ pub(crate) fn resolve_scoped_associated_item(
     file: &ProjectFile,
     path: &str,
     method_name: &str,
+    reference_byte: usize,
 ) -> ReceiverAnalysisOutcome<CodeUnit> {
-    if let Some(direct) = refs.resolve_scoped(path, method_name) {
-        let candidates: Vec<_> = support
-            .fqn(&direct)
-            .into_iter()
-            .filter(|candidate| candidate.identifier() == method_name)
-            .collect();
-        if !candidates.is_empty() {
-            return ReceiverAnalysisOutcome::Precise(candidates);
-        }
-    }
-
-    let Some(owner_fqn) = refs.resolve_scoped_owner(path) else {
-        return ReceiverAnalysisOutcome::Unknown;
-    };
-    let direct = if owner_fqn.is_empty() {
-        method_name.to_string()
-    } else {
-        format!("{owner_fqn}.{method_name}")
-    };
-    let candidates = support.fqn(&direct);
-    if !candidates.is_empty() {
-        return ReceiverAnalysisOutcome::Precise(candidates);
-    }
-
-    resolve_trait_associated_item(rust, support, refs, file, &owner_fqn, method_name)
+    resolve_scoped_associated_item_matching(
+        rust,
+        support,
+        refs,
+        file,
+        path,
+        method_name,
+        CodeUnit::is_function,
+        reference_byte,
+    )
 }
 
 pub(crate) fn resolve_scoped_associated_item_matching(
@@ -451,6 +445,7 @@ pub(crate) fn resolve_scoped_associated_item_matching(
     path: &str,
     item_name: &str,
     item_matches: fn(&CodeUnit) -> bool,
+    reference_byte: usize,
 ) -> ReceiverAnalysisOutcome<CodeUnit> {
     if let Some(direct) = refs.resolve_scoped(path, item_name) {
         let candidates: Vec<_> = support
@@ -466,6 +461,28 @@ pub(crate) fn resolve_scoped_associated_item_matching(
     let Some(owner_fqn) = refs.resolve_scoped_owner(path) else {
         return ReceiverAnalysisOutcome::Unknown;
     };
+    resolve_owner_associated_item_matching(
+        rust,
+        support,
+        refs,
+        file,
+        &owner_fqn,
+        item_name,
+        item_matches,
+        reference_byte,
+    )
+}
+
+pub(crate) fn resolve_owner_associated_item_matching(
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    refs: &RustReferenceContext,
+    file: &ProjectFile,
+    owner_fqn: &str,
+    item_name: &str,
+    item_matches: fn(&CodeUnit) -> bool,
+    reference_byte: usize,
+) -> ReceiverAnalysisOutcome<CodeUnit> {
     let direct = if owner_fqn.is_empty() {
         item_name.to_string()
     } else {
@@ -485,9 +502,50 @@ pub(crate) fn resolve_scoped_associated_item_matching(
         support,
         refs,
         file,
-        &owner_fqn,
+        owner_fqn,
         item_name,
         item_matches,
+        reference_byte,
+    )
+}
+
+pub(crate) fn resolve_exact_owner_associated_item_matching(
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    refs: &RustReferenceContext,
+    file: &ProjectFile,
+    owner: &CodeUnit,
+    item_name: &str,
+    item_matches: fn(&CodeUnit) -> bool,
+    reference_byte: usize,
+) -> ReceiverAnalysisOutcome<CodeUnit> {
+    let canonical_owner = rust
+        .canonical_rust_hierarchy_type(owner.clone())
+        .unwrap_or_else(|| owner.clone());
+    let candidates: Vec<_> = support
+        .members_for_owner_name(&canonical_owner.fq_name(), item_name)
+        .into_iter()
+        .filter(|candidate| item_matches(candidate) && candidate.identifier() == item_name)
+        .filter(|candidate| {
+            rust.structural_parent_of(candidate)
+                .or_else(|| rust.parent_of(candidate))
+                .and_then(|parent| rust.canonical_rust_hierarchy_type(parent))
+                .is_some_and(|parent| parent == canonical_owner)
+        })
+        .collect();
+    if !candidates.is_empty() {
+        return ReceiverAnalysisOutcome::Precise(candidates);
+    }
+
+    resolve_trait_associated_item_for_owner_matching(
+        rust,
+        support,
+        refs,
+        file,
+        &canonical_owner,
+        item_name,
+        item_matches,
+        reference_byte,
     )
 }
 
@@ -503,6 +561,7 @@ pub(crate) fn resolve_trait_associated_item(
     file: &ProjectFile,
     owner_fqn: &str,
     method_name: &str,
+    reference_byte: usize,
 ) -> ReceiverAnalysisOutcome<CodeUnit> {
     resolve_trait_associated_item_matching(
         rust,
@@ -512,6 +571,7 @@ pub(crate) fn resolve_trait_associated_item(
         owner_fqn,
         method_name,
         CodeUnit::is_function,
+        reference_byte,
     )
 }
 
@@ -523,6 +583,7 @@ pub(crate) fn resolve_trait_associated_item_matching(
     owner_fqn: &str,
     item_name: &str,
     item_matches: fn(&CodeUnit) -> bool,
+    reference_byte: usize,
 ) -> ReceiverAnalysisOutcome<CodeUnit> {
     let owner = match ReceiverAnalysisOutcome::single_precise_or_ambiguous(
         support
@@ -544,10 +605,32 @@ pub(crate) fn resolve_trait_associated_item_matching(
         }
     };
 
+    resolve_trait_associated_item_for_owner_matching(
+        rust,
+        support,
+        refs,
+        file,
+        &owner,
+        item_name,
+        item_matches,
+        reference_byte,
+    )
+}
+
+pub(crate) fn resolve_trait_associated_item_for_owner_matching(
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    _refs: &RustReferenceContext,
+    file: &ProjectFile,
+    owner: &CodeUnit,
+    item_name: &str,
+    item_matches: fn(&CodeUnit) -> bool,
+    reference_byte: usize,
+) -> ReceiverAnalysisOutcome<CodeUnit> {
     ReceiverAnalysisOutcome::single_precise_or_ambiguous(
-        rust.get_direct_ancestors(&owner)
+        rust.get_direct_ancestors(owner)
             .into_iter()
-            .filter(|trait_unit| trait_visible_at_call_site(rust, refs, file, trait_unit))
+            .filter(|trait_unit| trait_visible_at_call_site(rust, file, trait_unit, reference_byte))
             .flat_map(|trait_unit| {
                 support
                     .members_for_owner_name(&trait_unit.fq_name(), item_name)
@@ -556,7 +639,8 @@ pub(crate) fn resolve_trait_associated_item_matching(
                         item_matches(candidate)
                             && candidate.identifier() == item_name
                             && rust
-                                .parent_of(candidate)
+                                .structural_parent_of(candidate)
+                                .or_else(|| rust.parent_of(candidate))
                                 .as_ref()
                                 .is_some_and(|parent| parent == &trait_unit)
                     })
@@ -567,24 +651,34 @@ pub(crate) fn resolve_trait_associated_item_matching(
 
 fn trait_visible_at_call_site(
     rust: &RustAnalyzer,
-    refs: &RustReferenceContext,
     file: &ProjectFile,
     trait_unit: &CodeUnit,
+    reference_byte: usize,
 ) -> bool {
-    if !refs
-        .bare_names_resolving_to(&trait_unit.fq_name())
-        .is_empty()
-    {
-        return true;
-    }
-    // Glob imports (`use module::*;`) never land in the reference context's name
-    // maps, so a trait pulled in through a glob/prelude is only reachable via the
-    // import-export resolver.
-    rust.resolve_imported_export(file, trait_unit.identifier())
-        .contains(&(
-            trait_unit.source().clone(),
-            trait_unit.identifier().to_string(),
-        ))
+    let roots = [trait_unit.clone()].into_iter().collect::<BTreeSet<_>>();
+    let seeds = rust.usage_binding_seeds(&roots);
+    let mut names = rust.usage_binding_local_names(file, &seeds);
+    names.insert(trait_unit.identifier().to_string());
+    let Some(prepared) = rust.prepared_syntax(file) else {
+        return false;
+    };
+    let lexical_scope = RustLexicalScopeIndex::new(prepared.tree().root_node(), prepared.source());
+    names.into_iter().any(|name| {
+        let root_shadowed = lexical_scope.name_bound_at(&name, reference_byte)
+            || (lexical_scope.item_bound_at(&name, reference_byte)
+                && !rust.usage_root_declaration_matches_at(file, &seeds, &name, reference_byte)
+                && !rust.usage_local_module_prefix_visible_at(file, &seeds, &name, reference_byte));
+        let resolution = rust.usage_reference_at(
+            file,
+            &seeds,
+            &[name.as_str()],
+            reference_byte,
+            crate::analyzer::rust::RustReferenceNamespace::Type,
+            root_shadowed,
+        );
+        rust.usage_exact_root_for_resolution(&resolution, &seeds)
+            .is_some_and(|resolved| resolved == *trait_unit)
+    })
 }
 
 pub(super) fn canonical_usage_target(rust: &RustAnalyzer, target: &CodeUnit) -> CodeUnit {

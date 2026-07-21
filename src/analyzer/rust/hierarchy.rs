@@ -9,8 +9,8 @@ use crate::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
 pub(super) struct RustHierarchyIndex {
-    direct_ancestors: HashMap<String, Vec<CodeUnit>>,
-    direct_descendants: HashMap<String, HashSet<CodeUnit>>,
+    direct_ancestors: HashMap<CodeUnit, Vec<CodeUnit>>,
+    direct_descendants: HashMap<CodeUnit, HashSet<CodeUnit>>,
     #[allow(dead_code)]
     relations: Vec<TypeRelation>,
 }
@@ -23,7 +23,7 @@ impl TypeHierarchyProvider for RustAnalyzer {
 
         self.hierarchy_index()
             .direct_ancestors
-            .get(&code_unit.fq_name())
+            .get(code_unit)
             .cloned()
             .unwrap_or_default()
     }
@@ -35,7 +35,7 @@ impl TypeHierarchyProvider for RustAnalyzer {
 
         self.hierarchy_index()
             .direct_descendants
-            .get(&code_unit.fq_name())
+            .get(code_unit)
             .cloned()
             .unwrap_or_default()
     }
@@ -236,8 +236,8 @@ impl RustAnalyzer {
 
 impl RustHierarchyIndex {
     fn build(analyzer: &RustAnalyzer) -> Self {
-        let mut direct_ancestors: HashMap<String, Vec<CodeUnit>> = HashMap::default();
-        let mut direct_descendants: HashMap<String, HashSet<CodeUnit>> = HashMap::default();
+        let mut direct_ancestors: HashMap<CodeUnit, Vec<CodeUnit>> = HashMap::default();
+        let mut direct_descendants: HashMap<CodeUnit, HashSet<CodeUnit>> = HashMap::default();
         let mut relations = Vec::new();
 
         for file in analyzer.get_analyzed_files() {
@@ -271,12 +271,12 @@ impl RustHierarchyIndex {
                     continue;
                 };
 
-                let ancestors = direct_ancestors.entry(implementer.fq_name()).or_default();
+                let ancestors = direct_ancestors.entry(implementer.clone()).or_default();
                 if !ancestors.contains(&trait_unit) {
                     ancestors.push(trait_unit.clone());
                 }
                 direct_descendants
-                    .entry(trait_unit.fq_name())
+                    .entry(trait_unit.clone())
                     .or_default()
                     .insert(implementer.clone());
                 relations.push(TypeRelation {

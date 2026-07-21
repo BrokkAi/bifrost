@@ -140,6 +140,7 @@ pub(super) fn rust_path_segments(mut node: Node<'_>) -> Option<Vec<Node<'_>>> {
                 node = node.child_by_field_name("path")?;
             }
             "generic_type" => node = node.child_by_field_name("type")?,
+            "generic_function" => node = node.child_by_field_name("function")?,
             "identifier" | "type_identifier" | "self" | "super" | "crate" => {
                 reversed.push(node);
                 break;

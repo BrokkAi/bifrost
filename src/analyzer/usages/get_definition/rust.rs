@@ -193,6 +193,7 @@ pub(super) fn resolve_rust(
                     candidates = match crate::analyzer::usages::rust_graph::resolve_trait_associated_item_matching(
                             rust, support, &refs, file, &self_type, name,
                             matches_kind,
+                            site.focus_start_byte,
                         ) {
                             ReceiverAnalysisOutcome::Precise(resolved) => {
                                 rust_member_candidates(resolved, member_kind)
@@ -226,7 +227,13 @@ pub(super) fn resolve_rust(
     let (candidates, scoped_lookup_failed) = if let Some((path, name)) = reference.rsplit_once("::")
     {
         let resolved = match crate::analyzer::usages::rust_graph::resolve_scoped_associated_item(
-            rust, support, &refs, file, path, name,
+            rust,
+            support,
+            &refs,
+            file,
+            path,
+            name,
+            site.focus_start_byte,
         ) {
             ReceiverAnalysisOutcome::Precise(candidates) => candidates,
             ReceiverAnalysisOutcome::Ambiguous(_)
@@ -1504,7 +1511,13 @@ fn resolve_rust_field(
             let refs = rust.forward_reference_context_of(file);
             let trait_candidates =
                 match crate::analyzer::usages::rust_graph::resolve_trait_associated_item(
-                    rust, support, &refs, file, &owner, member,
+                    rust,
+                    support,
+                    &refs,
+                    file,
+                    &owner,
+                    member,
+                    field_expression.start_byte(),
                 ) {
                     ReceiverAnalysisOutcome::Precise(resolved) => {
                         rust_member_candidates(resolved, RustMemberKind::Function)
@@ -1614,6 +1627,7 @@ fn rust_token_tree_dotted_member_outcome(
                 &owner,
                 member,
                 CodeUnit::is_function,
+                focused.start_byte(),
             ) {
                 ReceiverAnalysisOutcome::Precise(resolved) => {
                     rust_member_candidates(resolved, RustMemberKind::Function)
@@ -2225,7 +2239,13 @@ fn rust_callable_definition_candidates(
         };
         let refs = rust.forward_reference_context_of(file);
         return match crate::analyzer::usages::rust_graph::resolve_scoped_associated_item(
-            rust, support, &refs, file, path, name,
+            rust,
+            support,
+            &refs,
+            file,
+            path,
+            name,
+            reference_byte,
         ) {
             ReceiverAnalysisOutcome::Precise(candidates) => candidates,
             ReceiverAnalysisOutcome::Ambiguous(_)
@@ -2415,7 +2435,7 @@ fn rust_type_ref(type_node: Node<'_>, source: &str) -> Option<RustTypeRef> {
                 name: name.to_string(),
             })
         }
-        "scoped_type_identifier" => {
+        "scoped_type_identifier" | "scoped_identifier" => {
             let name = node.child_by_field_name("name")?;
             let name = rust_node_text(name, source).trim();
             if name.is_empty() {
@@ -2428,8 +2448,10 @@ fn rust_type_ref(type_node: Node<'_>, source: &str) -> Option<RustTypeRef> {
                 name: name.to_string(),
             })
         }
-        "generic_type" => {
-            let base = node.child_by_field_name("type")?;
+        "generic_type" | "generic_function" => {
+            let base = node
+                .child_by_field_name("type")
+                .or_else(|| node.child_by_field_name("function"))?;
             rust_type_ref(base, source)
         }
         "qualified_type" => {
@@ -2448,8 +2470,9 @@ fn rust_named_type_node(type_node: Node<'_>) -> Option<Node<'_>> {
         "higher_ranked_trait_bound" => type_node
             .child_by_field_name("type")
             .and_then(rust_named_type_node),
-        "generic_type" | "qualified_type" => Some(type_node),
+        "generic_type" | "generic_function" | "qualified_type" => Some(type_node),
         "scoped_type_identifier"
+        | "scoped_identifier"
         | "type_identifier"
         | "identifier"
         | "self"
@@ -2466,8 +2489,9 @@ fn rust_named_type_node(type_node: Node<'_>) -> Option<Node<'_>> {
 
 fn rust_type_path_text(path: Node<'_>, source: &str) -> Option<String> {
     match path.kind() {
-        "generic_type" => path
+        "generic_type" | "generic_function" => path
             .child_by_field_name("type")
+            .or_else(|| path.child_by_field_name("function"))
             .and_then(|base| rust_type_path_text(base, source)),
         "scoped_type_identifier"
         | "scoped_identifier"

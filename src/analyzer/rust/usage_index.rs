@@ -724,6 +724,23 @@ impl RustModuleAliasRoutes {
 }
 
 impl RustUsageIndex {
+    fn exact_root_for_resolution(
+        &self,
+        resolution: &RustReferenceResolution,
+        seeds: &RustBindingSeeds,
+    ) -> Option<CodeUnit> {
+        let RustReferenceResolution::Exact(identity) = resolution else {
+            return None;
+        };
+        let mut matches = seeds.roots.iter().filter(|root| {
+            self.declaration_identities
+                .get(*root)
+                .is_some_and(|candidate| candidate == identity)
+        });
+        let root = matches.next()?.clone();
+        matches.next().is_none().then_some(root)
+    }
+
     fn module_at_byte(&self, file: &ProjectFile, byte: usize) -> Option<&ModuleKey> {
         self.module_extents
             .get(file)?
@@ -761,6 +778,52 @@ impl RustUsageIndex {
                             || (self.actual_crate_roots.contains(&identity.file)
                                 && self.physical_owners.owned_by(caller_file, &identity.file)))
                 })
+    }
+
+    fn declaration_visible_at(
+        &self,
+        analyzer: &RustAnalyzer,
+        declaration: &CodeUnit,
+        caller_file: &ProjectFile,
+        caller_byte: usize,
+    ) -> bool {
+        let Some(caller_module) = self.module_at_byte(caller_file, caller_byte) else {
+            return false;
+        };
+        let immediate_parent = analyzer.structural_parent_of(declaration);
+        let visibility_declaration = immediate_parent
+            .as_ref()
+            .filter(|parent| analyzer.is_rust_trait_declaration(parent))
+            .unwrap_or(declaration);
+        let visibility = analyzer.rust_declaration_visibility(visibility_declaration);
+        let mut parent = immediate_parent;
+        let owner = loop {
+            match parent {
+                Some(ref candidate) if candidate.is_module() => {
+                    break ModuleKey::new(declaration.source(), &candidate.fq_name());
+                }
+                Some(candidate) => parent = analyzer.structural_parent_of(&candidate),
+                None => {
+                    break ModuleKey::new(
+                        declaration.source(),
+                        &rust_package_name(declaration.source()),
+                    );
+                }
+            }
+        };
+        let Some(domain) =
+            direct_import_scope_for_module(declaration.source(), &owner.package(), visibility)
+        else {
+            return false;
+        };
+        if domain == Domain::Public {
+            return true;
+        }
+        (declaration.source() == caller_file
+            || self
+                .physical_owners
+                .intersects(declaration.source(), caller_file))
+            && domain.contains_module(caller_module)
     }
 
     pub(super) fn build(analyzer: &RustAnalyzer) -> Self {
@@ -1281,6 +1344,25 @@ impl RustAnalyzer {
                     identity.file == *file && identity.module == *module && identity.name == name
                 })
         })
+    }
+
+    pub(crate) fn usage_declaration_visible_at(
+        &self,
+        declaration: &CodeUnit,
+        file: &ProjectFile,
+        byte: usize,
+    ) -> bool {
+        self.usage_index()
+            .declaration_visible_at(self, declaration, file, byte)
+    }
+
+    pub(crate) fn usage_exact_root_for_resolution(
+        &self,
+        resolution: &RustReferenceResolution,
+        seeds: &RustBindingSeeds,
+    ) -> Option<CodeUnit> {
+        self.usage_index()
+            .exact_root_for_resolution(resolution, seeds)
     }
 
     pub(crate) fn usage_local_module_prefix_visible_at(

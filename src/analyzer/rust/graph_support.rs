@@ -277,15 +277,6 @@ impl RustAnalyzer {
         binder
     }
 
-    pub(crate) fn resolve_imported_export(
-        &self,
-        file: &ProjectFile,
-        reference: &str,
-    ) -> Vec<(ProjectFile, String)> {
-        let binder = self.import_binder_of(file);
-        self.resolve_imported_export_from_binder(file, &binder, reference)
-    }
-
     pub(crate) fn resolve_imported_export_from_binder_forward(
         &self,
         file: &ProjectFile,
@@ -876,7 +867,7 @@ impl RustAnalyzer {
         let Some(prepared) = self.prepared_syntax(code_unit.source()) else {
             return RustVisibility::Private;
         };
-        self.rust_declaration_node(code_unit, prepared.tree().root_node())
+        self.rust_named_declaration_node(code_unit, prepared.tree().root_node(), prepared.source())
             .map(|node| super::imports::rust_item_visibility(node, prepared.source()))
             .unwrap_or(RustVisibility::Private)
     }
@@ -978,9 +969,26 @@ impl RustAnalyzer {
         let Some(tree) = parse_rust_tree(&source) else {
             return false;
         };
-        self.rust_declaration_node(code_unit, tree.root_node())
+        self.rust_named_declaration_node(code_unit, tree.root_node(), &source)
             .map(|node| predicate(node, &source))
             .unwrap_or(false)
+    }
+
+    fn rust_named_declaration_node<'tree>(
+        &self,
+        code_unit: &CodeUnit,
+        root: Node<'tree>,
+        source: &str,
+    ) -> Option<Node<'tree>> {
+        let mut node = self.rust_declaration_node(code_unit, root)?;
+        loop {
+            if node.child_by_field_name("name").is_some_and(|name| {
+                source.get(name.start_byte()..name.end_byte()) == Some(code_unit.identifier())
+            }) {
+                return Some(node);
+            }
+            node = node.parent()?;
+        }
     }
 
     fn rust_declaration_node<'tree>(

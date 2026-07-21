@@ -7,17 +7,17 @@ use crate::analyzer::usages::common::{TreeWalkAction, same_node, walk_tree_itera
 use crate::analyzer::usages::get_definition::{
     RustTypeLookupCache, rust_expression_type_definition_candidates_cached,
     rust_expression_type_definition_fqn_cached, rust_field_definition_type_candidates_cached,
-    rust_resolve_type_node_fqn,
+    rust_is_type_definition, rust_resolve_type_node_fqn,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
 use crate::analyzer::usages::rust_graph::hits::{
     member_hit_enclosing, push_member_hit, push_self_receiver_member_hit, push_unproven_member_hit,
-    record_hit, record_import_hit, record_module_qualified_hits,
+    record_hit, record_import_hit, record_module_qualified_hits, rust_path_segments,
 };
 use crate::analyzer::usages::rust_graph::resolver::{
-    is_trait_owner, resolve_rust_path_fqn, resolve_scoped_associated_item_matching,
+    is_trait_owner, resolve_exact_owner_associated_item_matching, resolve_rust_path_fqn,
     rust_token_path_segment_is_qualified, trait_member_for_impl_member,
 };
 use crate::analyzer::usages::traits::UsageScanScope;
@@ -526,6 +526,7 @@ pub(super) fn scan_files_for_member_target(
             member_name: &member_name,
             scan_target: target,
             requested_target,
+            seeds,
             target_is_field: requested_target.is_field(),
             target_is_enum_variant: requested_target.is_field()
                 && rust
@@ -582,6 +583,7 @@ struct MemberScanCtx<'a> {
     member_name: &'a str,
     scan_target: &'a CodeUnit,
     requested_target: &'a CodeUnit,
+    seeds: &'a RustBindingSeeds,
     target_is_field: bool,
     target_is_enum_variant: bool,
     target_owner_is_trait: bool,
@@ -1044,28 +1046,31 @@ fn record_token_tree_static_member_hits(node: Node<'_>, ctx: &mut MemberScanCtx<
         if !static_member_role_matches_target(is_call, ctx) {
             continue;
         }
-        let Some(owner_name) = rust_token_owner_path(&children, owner_index, ctx.source) else {
+        let Some(owner_segments) = rust_token_owner_segments(&children, owner_index) else {
             continue;
         };
-        if !scoped_static_member_matches_target(owner, &owner_name, ctx) {
+        if !structured_static_member_matches_target(owner, &owner_segments, ctx) {
             continue;
         }
         record_static_member_name_hit(member, ctx);
     }
 }
 
-fn rust_token_owner_path(children: &[Node<'_>], mut index: usize, source: &str) -> Option<String> {
-    let mut segments = vec![simple_node_text(children[index], source)?];
+fn rust_token_owner_segments<'tree>(
+    children: &[Node<'tree>],
+    mut index: usize,
+) -> Option<Vec<Node<'tree>>> {
+    let mut segments = vec![children[index]];
     while index >= 2 && children[index - 1].kind() == "::" {
         let segment = children[index - 2];
         if !rust_token_path_segment(segment) {
             break;
         }
-        segments.push(simple_node_text(segment, source)?);
+        segments.push(segment);
         index -= 2;
     }
     segments.reverse();
-    Some(segments.join("::"))
+    Some(segments)
 }
 
 fn rust_token_path_segment(node: Node<'_>) -> bool {
@@ -1489,10 +1494,7 @@ fn record_static_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     if !static_member_role_matches_target(field_expression_is_called(node), ctx) {
         return;
     }
-    let Some(owner_name) = simple_node_text(path, ctx.source) else {
-        return;
-    };
-    if !scoped_static_member_matches_target(path, &owner_name, ctx) {
+    if !ast_static_member_matches_target(path, ctx) {
         return;
     }
 
@@ -1531,12 +1533,19 @@ fn node_in_use_declaration(mut node: Node<'_>) -> bool {
     false
 }
 
-fn scoped_static_member_matches_target(
+fn ast_static_member_matches_target(owner_node: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
+    let Some(segments) = rust_path_segments(owner_node) else {
+        return false;
+    };
+    structured_static_member_matches_target(owner_node, &segments, ctx)
+}
+
+fn structured_static_member_matches_target(
     owner_node: Node<'_>,
-    owner_name: &str,
+    segments: &[Node<'_>],
     ctx: &MemberScanCtx<'_>,
 ) -> bool {
-    if owner_name == "Self" {
+    if segments.len() == 1 && simple_node_text(segments[0], ctx.source).as_deref() == Some("Self") {
         return self_static_owner_matches_target(owner_node, ctx);
     }
     let item_matches = if ctx.target_is_field {
@@ -1544,23 +1553,232 @@ fn scoped_static_member_matches_target(
     } else {
         CodeUnit::is_function
     };
-    match resolve_scoped_associated_item_matching(
-        ctx.rust,
-        ctx.support,
-        ctx.refs,
+    let owner = exact_ast_owner(segments, ctx.seeds, ctx).or_else(|| {
+        (!ctx.target_owner_is_trait)
+            .then(|| exact_type_alias_owner(owner_node, segments, ctx))
+            .flatten()
+    });
+    let Some(owner) = owner else {
+        return ctx.target_owner_is_trait
+            && trait_implementer_static_member_matches_target(
+                owner_node,
+                segments,
+                item_matches,
+                ctx,
+            );
+    };
+    let exact_candidates = [ctx.requested_target, ctx.scan_target]
+        .into_iter()
+        .filter(|candidate| {
+            let name_matches = candidate.identifier() == ctx.member_name;
+            let role_matches = item_matches(candidate);
+            let parent = ctx
+                .rust
+                .structural_parent_of(candidate)
+                .or_else(|| ctx.rust.parent_of(candidate));
+            let canonical_parent = parent
+                .clone()
+                .and_then(|parent| ctx.rust.canonical_rust_hierarchy_type(parent));
+            let owner_matches = canonical_parent.as_ref() == Some(&owner);
+            name_matches && role_matches && owner_matches
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let outcome = if !exact_candidates.is_empty() {
+        ReceiverAnalysisOutcome::Precise(exact_candidates.into_iter().collect())
+    } else {
+        resolve_exact_owner_associated_item_matching(
+            ctx.rust,
+            ctx.support,
+            ctx.refs,
+            ctx.file,
+            &owner,
+            ctx.member_name,
+            item_matches,
+            owner_node.start_byte(),
+        )
+    };
+    associated_candidates_match_target(outcome, owner_node, Some(&owner), ctx)
+}
+
+fn exact_type_alias_owner(
+    owner_node: Node<'_>,
+    segments: &[Node<'_>],
+    ctx: &MemberScanCtx<'_>,
+) -> Option<CodeUnit> {
+    let owner_fqn = structured_owner_candidate_fqn(owner_node, segments, ctx)?;
+    let roots = ctx
+        .support
+        .fqn(&owner_fqn)
+        .into_iter()
+        .filter(|candidate| ctx.rust.is_type_alias(candidate))
+        .collect::<BTreeSet<_>>();
+    if roots.is_empty() {
+        return None;
+    }
+    let seeds = ctx.rust.usage_binding_seeds(&roots);
+    let alias_owner = exact_ast_owner(segments, &seeds, ctx)?;
+    let target_owner = ctx.rust.canonical_rust_hierarchy_type(ctx.owner.clone())?;
+    (alias_owner == target_owner).then_some(alias_owner)
+}
+
+fn exact_ast_owner(
+    segments: &[Node<'_>],
+    seeds: &RustBindingSeeds,
+    ctx: &MemberScanCtx<'_>,
+) -> Option<CodeUnit> {
+    let segment_names = segments
+        .iter()
+        .map(|segment| simple_node_text(*segment, ctx.source))
+        .collect::<Option<Vec<_>>>()?;
+    let segment_refs = segment_names.iter().map(String::as_str).collect::<Vec<_>>();
+    let root = *segments.first()?;
+    let root_name = segment_names.first()?;
+    let rooted = matches!(root_name.as_str(), "crate" | "self" | "super");
+    let root_shadowed = !rooted
+        && (ctx
+            .lexical_scope
+            .name_bound_at(root_name, root.start_byte())
+            || (ctx
+                .lexical_scope
+                .item_bound_at(root_name, root.start_byte())
+                && !ctx.rust.usage_root_declaration_matches_at(
+                    ctx.file,
+                    seeds,
+                    root_name,
+                    root.start_byte(),
+                )
+                && !ctx.rust.usage_local_module_prefix_visible_at(
+                    ctx.file,
+                    seeds,
+                    root_name,
+                    root.start_byte(),
+                )));
+    let resolution = ctx.rust.usage_reference_at(
         ctx.file,
-        owner_name,
-        ctx.member_name,
-        item_matches,
-    ) {
+        seeds,
+        &segment_refs,
+        segments.last()?.start_byte(),
+        RustReferenceNamespace::Type,
+        root_shadowed,
+    );
+    let root = ctx
+        .rust
+        .usage_exact_root_for_resolution(&resolution, seeds)?;
+    ctx.rust.canonical_rust_hierarchy_type(root)
+}
+
+fn trait_implementer_static_member_matches_target(
+    owner_node: Node<'_>,
+    segments: &[Node<'_>],
+    item_matches: fn(&CodeUnit) -> bool,
+    ctx: &MemberScanCtx<'_>,
+) -> bool {
+    let Some(owner_fqn) = structured_owner_candidate_fqn(owner_node, segments, ctx) else {
+        return false;
+    };
+    let roots = ctx
+        .support
+        .fqn(&owner_fqn)
+        .into_iter()
+        .filter(|candidate| rust_is_type_definition(ctx.analyzer, candidate))
+        .filter(|candidate| !ctx.rust.is_rust_trait_declaration(candidate))
+        .collect::<BTreeSet<_>>();
+    if roots.is_empty() {
+        return false;
+    }
+    let seeds = ctx.rust.usage_binding_seeds(&roots);
+    let Some(owner) = exact_ast_owner(segments, &seeds, ctx) else {
+        return false;
+    };
+    associated_candidates_match_target(
+        resolve_exact_owner_associated_item_matching(
+            ctx.rust,
+            ctx.support,
+            ctx.refs,
+            ctx.file,
+            &owner,
+            ctx.member_name,
+            item_matches,
+            owner_node.start_byte(),
+        ),
+        owner_node,
+        None,
+        ctx,
+    )
+}
+
+fn structured_owner_candidate_fqn(
+    owner_node: Node<'_>,
+    segments: &[Node<'_>],
+    ctx: &MemberScanCtx<'_>,
+) -> Option<String> {
+    let names = segments
+        .iter()
+        .map(|segment| simple_node_text(*segment, ctx.source))
+        .collect::<Option<Vec<_>>>()?;
+    let (name, prefix) = names.split_last()?;
+    let resolved = if prefix.is_empty() {
+        ctx.refs.resolve_bare(name).map(str::to_string)
+    } else {
+        let path = prefix.join("::");
+        ctx.refs.resolve_scoped(&path, name)
+    };
+    resolved.or_else(|| {
+        rust_resolve_type_node_fqn(
+            ctx.analyzer,
+            ctx.support,
+            ctx.file,
+            ctx.source,
+            owner_node,
+            Some(owner_node.start_byte()),
+        )
+    })
+}
+
+fn associated_candidates_match_target(
+    outcome: ReceiverAnalysisOutcome<CodeUnit>,
+    owner_node: Node<'_>,
+    expected_owner: Option<&CodeUnit>,
+    ctx: &MemberScanCtx<'_>,
+) -> bool {
+    match outcome {
         ReceiverAnalysisOutcome::Precise(candidates) => candidates.into_iter().any(|candidate| {
-            same_rust_declaration_identity(&candidate, ctx.requested_target)
-                || (ctx.rust.is_rust_trait_impl_member_declaration(&candidate)
-                    && trait_member_for_impl_member(ctx.rust, &candidate)
-                        .as_ref()
-                        .is_some_and(|trait_member| {
-                            same_rust_declaration_identity(trait_member, ctx.requested_target)
-                        }))
+            let parent = ctx
+                .rust
+                .structural_parent_of(&candidate)
+                .or_else(|| ctx.rust.parent_of(&candidate));
+            let owner_matches = expected_owner.is_none_or(|expected| {
+                parent.as_ref().is_some_and(|parent| {
+                    ctx.rust.is_rust_trait_declaration(parent)
+                        || ctx
+                            .rust
+                            .canonical_rust_hierarchy_type(parent.clone())
+                            .is_some_and(|owner| owner == *expected)
+                })
+            });
+            let mapped_trait = ctx
+                .rust
+                .is_rust_trait_impl_member_declaration(&candidate)
+                .then(|| trait_member_for_impl_member(ctx.rust, &candidate))
+                .flatten();
+            let enum_parent = ctx
+                .target_is_enum_variant
+                .then_some(parent.as_ref())
+                .flatten()
+                .filter(|parent| ctx.rust.is_rust_enum_declaration(parent));
+            let visibility_declaration =
+                mapped_trait.as_ref().or(enum_parent).unwrap_or(&candidate);
+            let visible = ctx.rust.usage_declaration_visible_at(
+                visibility_declaration,
+                ctx.file,
+                owner_node.start_byte(),
+            );
+            let identity_matches = same_rust_declaration_identity(&candidate, ctx.requested_target)
+                || mapped_trait.as_ref().is_some_and(|trait_member| {
+                    same_rust_declaration_identity(trait_member, ctx.requested_target)
+                });
+            visible && owner_matches && identity_matches
         }),
         ReceiverAnalysisOutcome::Ambiguous(_)
         | ReceiverAnalysisOutcome::Unknown
