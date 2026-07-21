@@ -25,7 +25,8 @@ use std::collections::BTreeSet;
 
 pub(crate) use resolver::{
     RustDefinitionProvider, RustTokenPathRole, resolve_rust_path_fqn,
-    resolve_rust_token_tree_paths, resolve_scoped_associated_item, resolve_trait_associated_item,
+    resolve_rust_token_tree_paths, resolve_scoped_associated_item,
+    resolve_scoped_associated_item_matching, resolve_trait_associated_item,
     resolve_trait_associated_item_matching,
 };
 

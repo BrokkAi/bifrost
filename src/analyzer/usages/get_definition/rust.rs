@@ -243,21 +243,29 @@ pub(super) fn resolve_rust(
     }
     let (candidates, scoped_lookup_failed) = if let Some((path, name)) = reference.rsplit_once("::")
     {
-        let resolved = match crate::analyzer::usages::rust_graph::resolve_scoped_associated_item(
-            rust,
-            support,
-            &refs,
-            file,
-            path,
-            name,
-            site.focus_start_byte,
-        ) {
-            ReceiverAnalysisOutcome::Precise(candidates) => candidates,
-            ReceiverAnalysisOutcome::Ambiguous(_)
-            | ReceiverAnalysisOutcome::Unknown
-            | ReceiverAnalysisOutcome::Unsupported { .. }
-            | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
-        };
+        let role = tree
+            .and_then(|tree| rust_bare_reference_role(tree, site))
+            .unwrap_or(RustBareReferenceRole::Callable);
+        let resolved =
+            match crate::analyzer::usages::rust_graph::resolve_scoped_associated_item_matching(
+                rust,
+                support,
+                &refs,
+                file,
+                path,
+                name,
+                rust_scoped_role_candidate(role),
+                site.focus_start_byte,
+            ) {
+                ReceiverAnalysisOutcome::Precise(candidates) => candidates
+                    .into_iter()
+                    .filter(|candidate| rust_role_accepts_scoped(rust, role, candidate))
+                    .collect(),
+                ReceiverAnalysisOutcome::Ambiguous(_)
+                | ReceiverAnalysisOutcome::Unknown
+                | ReceiverAnalysisOutcome::Unsupported { .. }
+                | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
+            };
         (resolved, true)
     } else {
         let resolved = if let Some(tree) = tree
@@ -934,6 +942,34 @@ fn rust_role_accepts_current_module(
     }
 }
 
+fn rust_role_accepts_scoped(
+    rust: &RustAnalyzer,
+    role: RustBareReferenceRole,
+    candidate: &CodeUnit,
+) -> bool {
+    match role {
+        RustBareReferenceRole::Type => {
+            candidate.is_class() || rust_declaration_is_module_type_alias(rust, candidate)
+        }
+        RustBareReferenceRole::Value => {
+            candidate.is_class()
+                || candidate.is_function()
+                || (candidate.is_field() && rust_declaration_is_value_item(rust, candidate))
+        }
+        RustBareReferenceRole::Callable => {
+            candidate.is_class()
+                || candidate.is_function()
+                || (candidate.is_field() && rust_declaration_is_enum_variant(rust, candidate))
+        }
+        RustBareReferenceRole::Owner => {
+            candidate.is_module()
+                || candidate.is_class()
+                || rust_declaration_is_module_type_alias(rust, candidate)
+        }
+        RustBareReferenceRole::Macro => candidate.is_macro(),
+    }
+}
+
 fn rust_value_namespace_candidate(rust: &RustAnalyzer, candidate: &CodeUnit) -> bool {
     candidate.is_class()
         || (candidate.is_function() && rust_declaration_is_free_function(rust, candidate))
@@ -944,6 +980,29 @@ fn rust_callable_namespace_candidate(rust: &RustAnalyzer, candidate: &CodeUnit) 
     candidate.is_class()
         || (candidate.is_function() && rust_declaration_is_free_function(rust, candidate))
         || (candidate.is_field() && rust_declaration_is_enum_variant(rust, candidate))
+}
+
+fn rust_scoped_role_candidate(role: RustBareReferenceRole) -> fn(&CodeUnit) -> bool {
+    match role {
+        RustBareReferenceRole::Type => rust_scoped_type_candidate,
+        RustBareReferenceRole::Value | RustBareReferenceRole::Callable => {
+            rust_scoped_value_candidate
+        }
+        RustBareReferenceRole::Owner => rust_scoped_owner_candidate,
+        RustBareReferenceRole::Macro => CodeUnit::is_macro,
+    }
+}
+
+fn rust_scoped_type_candidate(candidate: &CodeUnit) -> bool {
+    candidate.is_class() || candidate.is_field()
+}
+
+fn rust_scoped_value_candidate(candidate: &CodeUnit) -> bool {
+    candidate.is_class() || candidate.is_function() || candidate.is_field()
+}
+
+fn rust_scoped_owner_candidate(candidate: &CodeUnit) -> bool {
+    candidate.is_module() || candidate.is_class() || candidate.is_field()
 }
 
 fn rust_declaration_is_free_function(rust: &RustAnalyzer, candidate: &CodeUnit) -> bool {
