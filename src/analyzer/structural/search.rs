@@ -14,6 +14,7 @@ use super::execution::profile::{
     QueryCacheProfile, QueryExecutionProfile, QueryOperatorDisposition, QueryOperatorProfile,
     QueryOperatorTermination, QueryOperatorWorkProfile,
 };
+use super::execution::scheduler::BoundedReadyScheduler;
 use super::facts::{FileFacts, Span};
 use super::kinds::{NormalizedKind, Role};
 use super::matcher::FactMatch;
@@ -58,8 +59,9 @@ use crate::text_utils::{compute_line_starts, line_column_for_offset};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// Longest match/capture snippet reported inline; full content is always
 /// reachable via the returned line range.
@@ -70,6 +72,14 @@ const MAX_FACT_NODES: usize = 2_000_000;
 const MAX_PIPELINE_ROWS: usize = 50_000;
 const MAX_PROVENANCE_TRACES: usize = 16;
 const BROAD_QUERY_SCANNED_FILE_HINT_THRESHOLD: usize = 100;
+const CODE_QUERY_SCHEDULER_WORKERS: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnionExecutionStrategy {
+    Auto,
+    Sequential,
+    Parallel,
+}
 
 #[derive(Debug, Serialize)]
 pub struct CodeQueryResult {
@@ -1216,7 +1226,7 @@ impl Default for CodeQueryExecutionLimits {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct CodeQueryExecutionBudget {
     scanned_files: usize,
     scanned_source_bytes: usize,
@@ -1226,6 +1236,276 @@ struct CodeQueryExecutionBudget {
     provenance_steps: usize,
     import_files_resolved: usize,
     import_edges_resolved: usize,
+}
+
+impl CodeQueryExecutionBudget {
+    fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            scanned_files: self.scanned_files.saturating_sub(earlier.scanned_files),
+            scanned_source_bytes: self
+                .scanned_source_bytes
+                .saturating_sub(earlier.scanned_source_bytes),
+            fact_nodes: self.fact_nodes.saturating_sub(earlier.fact_nodes),
+            examined_references: self
+                .examined_references
+                .saturating_sub(earlier.examined_references),
+            pipeline_rows: self.pipeline_rows.saturating_sub(earlier.pipeline_rows),
+            provenance_steps: self
+                .provenance_steps
+                .saturating_sub(earlier.provenance_steps),
+            import_files_resolved: self
+                .import_files_resolved
+                .saturating_sub(earlier.import_files_resolved),
+            import_edges_resolved: self
+                .import_edges_resolved
+                .saturating_sub(earlier.import_edges_resolved),
+        }
+    }
+
+    fn saturating_add(self, other: Self) -> Self {
+        Self {
+            scanned_files: self.scanned_files.saturating_add(other.scanned_files),
+            scanned_source_bytes: self
+                .scanned_source_bytes
+                .saturating_add(other.scanned_source_bytes),
+            fact_nodes: self.fact_nodes.saturating_add(other.fact_nodes),
+            examined_references: self
+                .examined_references
+                .saturating_add(other.examined_references),
+            pipeline_rows: self.pipeline_rows.saturating_add(other.pipeline_rows),
+            provenance_steps: self.provenance_steps.saturating_add(other.provenance_steps),
+            import_files_resolved: self
+                .import_files_resolved
+                .saturating_add(other.import_files_resolved),
+            import_edges_resolved: self
+                .import_edges_resolved
+                .saturating_add(other.import_edges_resolved),
+        }
+    }
+
+    fn fair_lanes(self) -> [usize; 4] {
+        [
+            self.scanned_files,
+            self.scanned_source_bytes,
+            self.fact_nodes.saturating_add(self.examined_references),
+            self.pipeline_rows.max(self.provenance_steps),
+        ]
+    }
+}
+
+#[derive(Debug)]
+struct FairSeedBudgetState {
+    usage: Vec<CodeQueryExecutionBudget>,
+    finished: Vec<bool>,
+    failed: bool,
+}
+
+#[derive(Debug)]
+struct FairSeedBudgetCoordinator {
+    base: CodeQueryExecutionBudget,
+    limits: CodeQueryExecutionLimits,
+    branch_count: usize,
+    cancellation: Option<CancellationToken>,
+    state: Mutex<FairSeedBudgetState>,
+    changed: Condvar,
+    wait_ns: AtomicU64,
+    waiters: AtomicUsize,
+}
+
+#[derive(Debug, Clone)]
+struct FairSeedBudgetLease {
+    coordinator: Arc<FairSeedBudgetCoordinator>,
+    branch: usize,
+}
+
+enum FairSeedBudgetAdmission {
+    Admitted,
+    Rejected(CodeQueryExecutionBudget),
+    Cancelled,
+}
+
+impl FairSeedBudgetCoordinator {
+    fn new(
+        base: CodeQueryExecutionBudget,
+        limits: CodeQueryExecutionLimits,
+        branch_count: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> Arc<Self> {
+        debug_assert!(branch_count >= 2);
+        Arc::new(Self {
+            base,
+            limits,
+            branch_count,
+            cancellation: cancellation.cloned(),
+            state: Mutex::new(FairSeedBudgetState {
+                usage: vec![CodeQueryExecutionBudget::default(); branch_count],
+                finished: vec![false; branch_count],
+                failed: false,
+            }),
+            changed: Condvar::new(),
+            wait_ns: AtomicU64::new(0),
+            waiters: AtomicUsize::new(0),
+        })
+    }
+
+    fn lease(self: &Arc<Self>, branch: usize) -> FairSeedBudgetLease {
+        debug_assert!(branch < self.branch_count);
+        FairSeedBudgetLease {
+            coordinator: Arc::clone(self),
+            branch,
+        }
+    }
+
+    fn maximum_pipeline_rows(&self) -> usize {
+        self.limits.max_pipeline_rows
+    }
+
+    fn limits_lanes(&self) -> [usize; 4] {
+        [
+            self.limits.max_scanned_files,
+            self.limits.max_scanned_source_bytes,
+            self.limits.max_fact_nodes,
+            self.limits.max_pipeline_rows,
+        ]
+    }
+
+    fn branch_allowance(&self, state: &FairSeedBudgetState, branch: usize) -> [usize; 4] {
+        let base = self.base.fair_lanes();
+        let limits = self.limits_lanes();
+        let mut used = base;
+        for earlier in 0..branch {
+            let remaining = self.branch_count.saturating_sub(earlier).max(1);
+            let earlier_allowance: [usize; 4] = std::array::from_fn(|lane| {
+                limits[lane].saturating_sub(used[lane]).div_ceil(remaining)
+            });
+            let actual = state.usage[earlier].fair_lanes();
+            for lane in 0..used.len() {
+                used[lane] = used[lane].saturating_add(if state.finished[earlier] {
+                    actual[lane]
+                } else {
+                    earlier_allowance[lane]
+                });
+            }
+        }
+        let remaining = self.branch_count.saturating_sub(branch).max(1);
+        std::array::from_fn(|lane| limits[lane].saturating_sub(used[lane]).div_ceil(remaining))
+    }
+
+    fn global_projected(
+        &self,
+        state: &FairSeedBudgetState,
+        branch: usize,
+        local_delta: CodeQueryExecutionBudget,
+    ) -> CodeQueryExecutionBudget {
+        state.usage[..branch]
+            .iter()
+            .copied()
+            .fold(self.base, CodeQueryExecutionBudget::saturating_add)
+            .saturating_add(local_delta)
+    }
+
+    fn committed_budget(&self) -> CodeQueryExecutionBudget {
+        let state = self.state.lock().expect("fair seed budget lock poisoned");
+        state
+            .usage
+            .iter()
+            .copied()
+            .fold(self.base, CodeQueryExecutionBudget::saturating_add)
+    }
+
+    fn wait_ns(&self) -> u64 {
+        self.wait_ns.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn waiting_branches(&self) -> usize {
+        self.waiters.load(Ordering::Acquire)
+    }
+
+    fn fail(&self) {
+        let mut state = self.state.lock().expect("fair seed budget lock poisoned");
+        state.failed = true;
+        self.changed.notify_all();
+    }
+}
+
+impl FairSeedBudgetLease {
+    fn budget_before_branch(&self) -> CodeQueryExecutionBudget {
+        let state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("fair seed budget lock poisoned");
+        state.usage[..self.branch].iter().copied().fold(
+            self.coordinator.base,
+            CodeQueryExecutionBudget::saturating_add,
+        )
+    }
+
+    fn admit(&self, projected_local: CodeQueryExecutionBudget) -> FairSeedBudgetAdmission {
+        let local_delta = projected_local.saturating_sub(self.coordinator.base);
+        let requested = local_delta.fair_lanes();
+        let mut state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("fair seed budget lock poisoned");
+        loop {
+            if state.failed {
+                return FairSeedBudgetAdmission::Cancelled;
+            }
+            if self
+                .coordinator
+                .cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                return FairSeedBudgetAdmission::Cancelled;
+            }
+            let allowance = self.coordinator.branch_allowance(&state, self.branch);
+            if requested
+                .iter()
+                .zip(allowance)
+                .all(|(requested, allowance)| *requested <= allowance)
+            {
+                state.usage[self.branch] = local_delta;
+                return FairSeedBudgetAdmission::Admitted;
+            }
+            if state.finished[..self.branch]
+                .iter()
+                .all(|finished| *finished)
+            {
+                return FairSeedBudgetAdmission::Rejected(self.coordinator.global_projected(
+                    &state,
+                    self.branch,
+                    local_delta,
+                ));
+            }
+            let wait_started = Instant::now();
+            self.coordinator.waiters.fetch_add(1, Ordering::AcqRel);
+            let (next_state, _) = self
+                .coordinator
+                .changed
+                .wait_timeout(state, Duration::from_millis(2))
+                .expect("fair seed budget lock poisoned while waiting");
+            self.coordinator.waiters.fetch_sub(1, Ordering::AcqRel);
+            self.coordinator
+                .wait_ns
+                .fetch_add(elapsed_ns(wait_started), Ordering::Relaxed);
+            state = next_state;
+        }
+    }
+
+    fn finish(&self, local_budget: CodeQueryExecutionBudget) {
+        let mut state = self
+            .coordinator
+            .state
+            .lock()
+            .expect("fair seed budget lock poisoned");
+        state.usage[self.branch] = local_budget.saturating_sub(self.coordinator.base);
+        state.finished[self.branch] = true;
+        self.coordinator.changed.notify_all();
+    }
 }
 
 #[derive(Clone)]
@@ -1251,6 +1531,8 @@ struct QueryExecutionState<'a> {
     import_graph: Option<DirectImportGraph>,
     cache_profile: Option<QueryCacheProfile>,
     profile: Option<QueryExecutionProfile>,
+    parallel_seed_budget: Option<FairSeedBudgetLease>,
+    scheduler_workers: usize,
 }
 
 struct PlanExecution {
@@ -1260,6 +1542,26 @@ struct PlanExecution {
     /// An intermediate authored pipeline step exhausted its budget, so the
     /// remaining steps in that same suffix must not run.
     pipeline_halted: bool,
+}
+
+struct ParallelSeedBranchResult {
+    execution: PlanExecution,
+    diagnostics: Vec<CodeQueryDiagnostic>,
+    seed_cache: HashMap<String, CachedSeedExecution>,
+    cache_profile: Option<QueryCacheProfile>,
+    operators: Vec<QueryOperatorProfile>,
+}
+
+struct ParallelUnionExecution {
+    execution: PlanExecution,
+    input_rows: usize,
+    rows_visited: usize,
+    rows_discarded: Option<usize>,
+    temporary_capacity_bytes_lower_bound: u64,
+    operator_truncated: bool,
+    dependency_wait_ns: u64,
+    scheduling_overhead_ns: u64,
+    merge_ns: u64,
 }
 
 #[doc(hidden)]
@@ -1300,6 +1602,28 @@ pub(crate) fn execute_code_query_profiled(
     execute_internal(analyzer, query, limits, None, None, true)
 }
 
+/// M4 benchmark/test entry point. A forced strategy still passes through the
+/// same semantic eligibility gate as production; unsafe shapes stay serial.
+#[cfg(test)]
+pub(crate) fn execute_code_query_with_union_strategy(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    strategy: UnionExecutionStrategy,
+    capture_profile: bool,
+) -> DetailedCodeQueryResult {
+    execute_internal_with_strategy(
+        analyzer,
+        query,
+        limits,
+        None,
+        None,
+        capture_profile,
+        strategy,
+        CODE_QUERY_SCHEDULER_WORKERS,
+    )
+}
+
 #[cfg(test)]
 fn execute_with_receiver_budget_for_test(
     analyzer: &dyn IAnalyzer,
@@ -1325,6 +1649,33 @@ fn execute_internal(
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
     capture_profile: bool,
 ) -> DetailedCodeQueryResult {
+    execute_internal_with_strategy(
+        analyzer,
+        query,
+        limits,
+        cancellation,
+        receiver_budget_override,
+        capture_profile,
+        UnionExecutionStrategy::Auto,
+        CODE_QUERY_SCHEDULER_WORKERS,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_internal_with_strategy(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    receiver_budget_override: Option<ReceiverAnalysisBudget>,
+    capture_profile: bool,
+    union_strategy: UnionExecutionStrategy,
+    scheduler_workers: usize,
+) -> DetailedCodeQueryResult {
+    // Keep repeated analyzer reads coherent and reusable even for direct API
+    // callers that do not already own a wider request scope. Nested scopes are
+    // supported and preserve an outer caller's store-error observation.
+    let _query_scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
     let request_started = capture_profile.then(Instant::now);
     let planning_started = capture_profile.then(Instant::now);
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -1352,7 +1703,8 @@ fn execute_internal(
             );
         }
     };
-    let physical_plan = PhysicalQueryPlan::select(logical_plan);
+    let parallel_union = select_parallel_union(&logical_plan, union_strategy, scheduler_workers);
+    let physical_plan = PhysicalQueryPlan::select_with_parallel_union(logical_plan, parallel_union);
     let planning_ns = planning_started.map(elapsed_ns).unwrap_or(0);
     let mut diagnostics = Vec::new();
     let mut state = QueryExecutionState {
@@ -1368,6 +1720,8 @@ fn execute_internal(
         cache_profile: capture_profile.then(QueryCacheProfile::default),
         profile: capture_profile
             .then(|| QueryExecutionProfile::sequential(&physical_plan, planning_ns)),
+        parallel_seed_budget: None,
+        scheduler_workers,
     };
     let mut profile_branch = state.profile.as_ref().map(|_| Vec::new());
     let execution_started = capture_profile.then(Instant::now);
@@ -1465,6 +1819,48 @@ fn execute_internal(
     };
     detailed.assert_invariants();
     detailed
+}
+
+fn select_parallel_union(
+    logical_plan: &LogicalQueryPlan,
+    strategy: UnionExecutionStrategy,
+    scheduler_workers: usize,
+) -> Option<super::execution::plan::LogicalQueryNodeId> {
+    if strategy == UnionExecutionStrategy::Sequential || scheduler_workers < 2 {
+        return None;
+    }
+    let LogicalQueryOperator::Limit { input, .. } =
+        logical_plan.node(logical_plan.root()).operator()
+    else {
+        return None;
+    };
+    let union = *input;
+    let LogicalQueryOperator::Set {
+        op: SetOperator::Union,
+        inputs,
+    } = logical_plan.node(union).operator()
+    else {
+        return None;
+    };
+    if inputs.len() != 2 || inputs[0] == inputs[1] {
+        return None;
+    }
+    inputs
+        .iter()
+        .all(|&input| {
+            matches!(
+                logical_plan.node(input).operator(),
+                LogicalQueryOperator::Seed(_)
+            )
+        })
+        .then_some(())?;
+
+    // The corrected M4 request-scoped, persistence-isolated A/B found no
+    // stable cold-and-warm crossover, even at 1,001 analyzed files. Retain the
+    // independently testable physical alternative, but keep production Auto
+    // on the conservative sequential implementation until a later workload
+    // supplies a measured selector with positive evidence.
+    (strategy == UnionExecutionStrategy::Parallel).then_some(union)
 }
 
 impl DetailedCodeQueryResult {
@@ -2352,7 +2748,9 @@ fn execute_plan(
     let mut disposition = QueryOperatorDisposition::Completed;
     let mut self_truncated = false;
     let mut dependency_execution_ns = 0u64;
+    let mut dependency_wait_ns = 0u64;
     let mut merge_ns = 0u64;
+    let mut scheduling_overhead_ns = 0u64;
     let mut terminations = profiling.then(Vec::new);
     let mut work_started = profiling.then(|| execution_profile_work(state.budget));
     let mut cache_started = state.cache_profile;
@@ -2460,6 +2858,46 @@ fn execute_plan(
                 stepped.truncated |= child.truncated;
                 stepped
             }
+        }
+        (
+            PhysicalQueryOperator::ParallelUnion,
+            LogicalQueryOperator::Set {
+                op: SetOperator::Union,
+                ..
+            },
+        ) => {
+            let parallel = execute_parallel_seed_union(
+                plan,
+                physical_node.dependencies(),
+                state,
+                limits,
+                terminal_cap,
+                diagnostics,
+                profile_branch,
+                profiling,
+            );
+            input_rows = parallel.input_rows;
+            rows_visited = parallel.rows_visited;
+            rows_discarded = parallel.rows_discarded;
+            temporary_capacity_bytes_lower_bound = parallel.temporary_capacity_bytes_lower_bound;
+            self_truncated = parallel.operator_truncated;
+            dependency_wait_ns = parallel.dependency_wait_ns;
+            scheduling_overhead_ns = parallel.scheduling_overhead_ns;
+            merge_ns = parallel.merge_ns;
+            if self_truncated {
+                push_operator_termination(&mut terminations, QueryOperatorTermination::TerminalCap);
+            }
+            work_started = profiling.then(|| execution_profile_work(state.budget));
+            cache_started = state.cache_profile;
+            own_diagnostic_start = diagnostics.len();
+            if parallel.execution.cancelled {
+                disposition = QueryOperatorDisposition::Skipped;
+                push_operator_termination(
+                    &mut terminations,
+                    QueryOperatorTermination::DependencyCancelled,
+                );
+            }
+            parallel.execution
         }
         (
             PhysicalQueryOperator::SequentialUnion
@@ -2672,12 +3110,14 @@ fn execute_plan(
             branch: profile_branch.as_deref().unwrap_or_default().to_vec(),
             operator: physical_operator,
             disposition,
-            elapsed_ns: total_elapsed_ns.saturating_sub(dependency_execution_ns),
+            elapsed_ns: total_elapsed_ns
+                .saturating_sub(dependency_execution_ns)
+                .saturating_sub(dependency_wait_ns),
             total_elapsed_ns,
             dependency_execution_ns,
-            dependency_wait_ns: 0,
+            dependency_wait_ns,
             merge_ns,
-            scheduling_overhead_ns: 0,
+            scheduling_overhead_ns,
             input_rows,
             rows_visited,
             relation_expansions,
@@ -2693,6 +3133,204 @@ fn execute_plan(
         });
     }
     execution
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_parallel_seed_union(
+    plan: &PhysicalQueryPlan,
+    dependencies: &[PhysicalQueryNodeId],
+    state: &mut QueryExecutionState<'_>,
+    limits: CodeQueryExecutionLimits,
+    terminal_cap: Option<usize>,
+    diagnostics: &mut Vec<CodeQueryDiagnostic>,
+    profile_branch: &Option<Vec<usize>>,
+    profiling: bool,
+) -> ParallelUnionExecution {
+    debug_assert_eq!(dependencies.len(), 2);
+    debug_assert!(dependencies.iter().all(|dependency| matches!(
+        plan.node(*dependency).operator(),
+        PhysicalQueryOperator::SeedScan
+    )));
+    debug_assert_ne!(dependencies[0], dependencies[1]);
+
+    let coordinator = FairSeedBudgetCoordinator::new(
+        state.budget,
+        limits,
+        dependencies.len(),
+        state.cancellation,
+    );
+    let analyzer = state.analyzer;
+    let cancellation = state.cancellation;
+    let receiver_budget_override = state.receiver_budget_override;
+    let scheduler_workers = state.scheduler_workers;
+    let base_budget = state.budget;
+    let base_profile_branch = profile_branch.as_deref().unwrap_or_default().to_vec();
+    let scheduled = BoundedReadyScheduler::new(scheduler_workers).run(
+        dependencies.len(),
+        cancellation,
+        |branch| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let lease = coordinator.lease(branch);
+                let mut branch_state = QueryExecutionState {
+                    analyzer,
+                    cancellation,
+                    receiver_budget_override,
+                    budget: base_budget,
+                    seed_cache: HashMap::default(),
+                    indexed_declarations: IndexedDeclarations::default(),
+                    reference_cache: ReferenceTraversalCache::default(),
+                    call_cache: CallTraversalCache::default(),
+                    import_graph: None,
+                    cache_profile: profiling.then(QueryCacheProfile::default),
+                    profile: profiling.then(|| QueryExecutionProfile::sequential(plan, 0)),
+                    parallel_seed_budget: Some(lease.clone()),
+                    scheduler_workers,
+                };
+                let mut branch_diagnostics = Vec::new();
+                let mut branch_path = profiling.then(|| {
+                    let mut path = base_profile_branch.clone();
+                    path.push(branch);
+                    path
+                });
+                let execution = execute_plan(
+                    plan,
+                    dependencies[branch],
+                    &mut branch_state,
+                    limits,
+                    None,
+                    &mut branch_diagnostics,
+                    &mut branch_path,
+                );
+                lease.finish(branch_state.budget);
+                debug_assert!(branch_state.import_graph.is_none());
+                debug_assert!(branch_state.reference_cache.inbound.is_empty());
+                debug_assert!(branch_state.reference_cache.outbound.is_empty());
+                debug_assert!(branch_state.call_cache.incoming.is_empty());
+                debug_assert!(branch_state.call_cache.outgoing.is_empty());
+                let operators = branch_state
+                    .profile
+                    .take()
+                    .map(|profile| profile.operators)
+                    .unwrap_or_default();
+                ParallelSeedBranchResult {
+                    execution,
+                    diagnostics: branch_diagnostics,
+                    seed_cache: branch_state.seed_cache,
+                    cache_profile: branch_state.cache_profile,
+                    operators,
+                }
+            }));
+            match result {
+                Ok(result) => result,
+                Err(payload) => {
+                    coordinator.fail();
+                    std::panic::resume_unwind(payload)
+                }
+            }
+        },
+    );
+
+    let mut scheduler_profile = scheduled.profile;
+    scheduler_profile.budget_wait_ns = coordinator.wait_ns();
+    let dependency_wait_ns = scheduler_profile.coordinator_wait_ns;
+    let scheduling_overhead_ns = scheduler_profile.dispatch_overhead_ns;
+    if let Some(profile) = &mut state.profile {
+        profile.record_scheduler_run(scheduler_profile);
+    }
+
+    let mut input_rows = 0usize;
+    let mut branch_rows = Vec::with_capacity(dependencies.len());
+    let mut truncated = false;
+    let mut cancelled_child = None;
+    let prefix_started = profiling.then(Instant::now);
+    for (branch, mut result) in scheduled.results.into_iter().enumerate() {
+        input_rows = input_rows.saturating_add(result.execution.rows.len());
+        let contributes_to_public_prefix = cancelled_child.is_none();
+        if contributes_to_public_prefix {
+            prefix_branch_rows(&mut result.execution.rows, branch);
+            prefix_branch_diagnostics(&mut result.diagnostics, branch);
+            diagnostics.append(&mut result.diagnostics);
+            truncated |= result.execution.truncated;
+        }
+
+        for (key, cached) in result.seed_cache {
+            assert!(
+                state.seed_cache.insert(key, cached).is_none(),
+                "parallel union eligibility requires distinct seed cache keys"
+            );
+        }
+        if let (Some(parent), Some(branch_cache)) = (&mut state.cache_profile, result.cache_profile)
+        {
+            *parent = parent.saturating_add(branch_cache);
+        }
+        if let Some(profile) = &mut state.profile {
+            profile.operators.extend(result.operators);
+        }
+        if contributes_to_public_prefix {
+            if result.execution.cancelled {
+                cancelled_child = Some(result.execution);
+            } else {
+                branch_rows.push(result.execution.rows);
+            }
+        }
+    }
+    state.budget = coordinator.committed_budget();
+    let mut merge_ns = prefix_started.map(elapsed_ns).unwrap_or(0);
+
+    if let Some(child) = cancelled_child {
+        return ParallelUnionExecution {
+            execution: child,
+            input_rows,
+            rows_visited: input_rows,
+            rows_discarded: None,
+            temporary_capacity_bytes_lower_bound: 0,
+            operator_truncated: false,
+            dependency_wait_ns,
+            scheduling_overhead_ns,
+            merge_ns,
+        };
+    }
+
+    let merge_started = profiling.then(Instant::now);
+    let (mut rows, merge_measurement) =
+        combine_set_rows(SetOperator::Union, branch_rows, profiling);
+    if let Some(started) = merge_started {
+        merge_ns = merge_ns.saturating_add(elapsed_ns(started));
+    }
+    let mut rows_discarded = merge_measurement
+        .as_ref()
+        .map(|measurement| measurement.rows_discarded);
+    let temporary_capacity_bytes_lower_bound = merge_measurement
+        .map(|measurement| measurement.temporary_capacity_bytes_lower_bound)
+        .unwrap_or_default();
+    let mut operator_truncated = false;
+    if let Some(cap) = terminal_cap
+        && rows.len() > cap
+    {
+        operator_truncated = true;
+        rows_discarded = Some(
+            rows_discarded
+                .unwrap_or_default()
+                .saturating_add(rows.len() - cap),
+        );
+        rows.truncate(cap);
+    }
+    ParallelUnionExecution {
+        execution: PlanExecution {
+            rows,
+            truncated,
+            cancelled: false,
+            pipeline_halted: false,
+        },
+        input_rows,
+        rows_visited: input_rows,
+        rows_discarded,
+        temporary_capacity_bytes_lower_bound,
+        operator_truncated,
+        dependency_wait_ns,
+        scheduling_overhead_ns,
+        merge_ns,
+    }
 }
 
 fn push_operator_termination(
@@ -2782,9 +3420,19 @@ fn execute_seed(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> PlanExecution {
     let cache_key = seed.canonical_cache_key();
-    let budget_cap = limits
-        .max_pipeline_rows
-        .saturating_sub(state.budget.pipeline_rows);
+    let parallel_budget = state.parallel_seed_budget.clone();
+    if parallel_budget.is_some() {
+        debug_assert!(
+            state.seed_cache.is_empty(),
+            "parallel seed branches start with disjoint empty request caches"
+        );
+    }
+    let pipeline_limit = parallel_budget
+        .as_ref()
+        .map_or(limits.max_pipeline_rows, |lease| {
+            lease.coordinator.maximum_pipeline_rows()
+        });
+    let budget_cap = pipeline_limit.saturating_sub(state.budget.pipeline_rows);
     let desired_rows = terminal_cap.unwrap_or(budget_cap).min(budget_cap);
     let capped_by_budget = terminal_cap.is_none_or(|cap| budget_cap <= cap);
     if let Some(cached) = state.seed_cache.get(&cache_key).cloned() {
@@ -2912,7 +3560,7 @@ fn execute_seed(
     let mut pending: Vec<PendingMatch> = Vec::new();
     let mut truncated = false;
     let mut cache_complete = state.cache_profile.as_ref().map(|_| true);
-    for (_path, language, provider, file) in candidates {
+    'candidates: for (_path, language, provider, file) in candidates {
         if state
             .cancellation
             .is_some_and(CancellationToken::is_cancelled)
@@ -2934,7 +3582,20 @@ fn execute_seed(
         projected.scanned_files = projected.scanned_files.saturating_add(1);
         projected.scanned_source_bytes =
             projected.scanned_source_bytes.saturating_add(source.len());
-        if projected.scanned_files > limits.max_scanned_files
+        if let Some(lease) = &parallel_budget {
+            match lease.admit(projected) {
+                FairSeedBudgetAdmission::Admitted => {}
+                FairSeedBudgetAdmission::Rejected(global_projected) => {
+                    push_budget_diagnostic(diagnostics, &global_projected);
+                    truncated = true;
+                    cache_complete = cache_complete.map(|_| false);
+                    break;
+                }
+                FairSeedBudgetAdmission::Cancelled => {
+                    return cancelled_plan_execution();
+                }
+            }
+        } else if projected.scanned_files > limits.max_scanned_files
             || projected.scanned_source_bytes > limits.max_scanned_source_bytes
         {
             push_budget_diagnostic(diagnostics, &projected);
@@ -2985,7 +3646,20 @@ fn execute_seed(
         };
         projected = state.budget;
         projected.fact_nodes = projected.fact_nodes.saturating_add(facts.nodes().len());
-        if projected
+        if let Some(lease) = &parallel_budget {
+            match lease.admit(projected) {
+                FairSeedBudgetAdmission::Admitted => {}
+                FairSeedBudgetAdmission::Rejected(global_projected) => {
+                    push_budget_diagnostic(diagnostics, &global_projected);
+                    truncated = true;
+                    cache_complete = cache_complete.map(|_| false);
+                    break;
+                }
+                FairSeedBudgetAdmission::Cancelled => {
+                    return cancelled_plan_execution();
+                }
+            }
+        } else if projected
             .fact_nodes
             .saturating_add(projected.examined_references)
             > limits.max_fact_nodes
@@ -2997,12 +3671,35 @@ fn execute_seed(
         }
         state.budget.fact_nodes = projected.fact_nodes;
         let remaining = match_cap.saturating_sub(pending.len());
-        pending.extend(
-            super::matcher::match_query(seed, &facts, remaining)
-                .into_iter()
-                .map(|fact_match| (language, file.clone(), Arc::clone(&facts), fact_match)),
-        );
-        if pending.len() >= match_cap {
+        let matches = super::matcher::match_query(seed, &facts, remaining);
+        if let Some(lease) = &parallel_budget {
+            for fact_match in matches {
+                let mut projected = state.budget;
+                projected.pipeline_rows = projected.pipeline_rows.saturating_add(1);
+                match lease.admit(projected) {
+                    FairSeedBudgetAdmission::Admitted => {
+                        state.budget.pipeline_rows = projected.pipeline_rows;
+                        pending.push((language, file.clone(), Arc::clone(&facts), fact_match));
+                    }
+                    FairSeedBudgetAdmission::Rejected(_) => {
+                        push_pipeline_budget_diagnostic(diagnostics, &lease.budget_before_branch());
+                        truncated = true;
+                        cache_complete = cache_complete.map(|_| false);
+                        break 'candidates;
+                    }
+                    FairSeedBudgetAdmission::Cancelled => {
+                        return cancelled_plan_execution();
+                    }
+                }
+            }
+        } else {
+            pending.extend(
+                matches
+                    .into_iter()
+                    .map(|fact_match| (language, file.clone(), Arc::clone(&facts), fact_match)),
+            );
+        }
+        if parallel_budget.is_none() && pending.len() >= match_cap {
             // The cap stopped the scan before the remaining candidates were
             // examined. This can be enough for a root limit probe while still
             // being unsafe to advertise as a complete reusable seed layer.
@@ -3045,7 +3742,9 @@ fn execute_seed(
                 .iter()
                 .any(|diagnostic| diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete)
     });
-    state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(rows.len());
+    if parallel_budget.is_none() {
+        state.budget.pipeline_rows = state.budget.pipeline_rows.saturating_add(rows.len());
+    }
     state.seed_cache.insert(
         cache_key,
         CachedSeedExecution {
@@ -7258,8 +7957,10 @@ mod tests {
     }
 
     fn assert_serial_profile_reconciles(profile: &QueryExecutionProfile) {
-        assert_eq!(profile.format, "bifrost_code_query_execution_profile/v2");
+        assert_eq!(profile.format, "bifrost_code_query_execution_profile/v4");
         assert_eq!(profile.peak_concurrency, 1);
+        assert_eq!(profile.scheduler.tasks_enqueued, 0);
+        assert_eq!(profile.scheduler.peak_concurrency, 0);
         assert!(
             profile
                 .planning_ns
@@ -8390,6 +9091,354 @@ mod tests {
         assert_eq!(union.output_rows, 1);
         assert_eq!(union.rows_discarded, Some(1));
         assert!(union.temporary_capacity_bytes_lower_bound > 0);
+    }
+
+    #[test]
+    fn parallel_seed_union_matches_serial_fair_budget_roll_forward() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("left.ts"))
+            .write("export const left = 1;\n")
+            .expect("write left source");
+        ProjectFile::new(root.clone(), PathBuf::from("right.ts"))
+            .write(
+                "export function first() {}\nexport function second() {}\nexport function third() {}\n",
+            )
+            .expect("write right source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let query = CodeQuery::from_json(&json!({
+            "union": [
+                {
+                    "where": ["left.ts"],
+                    "match": { "kind": "function", "name": "missing" }
+                },
+                {
+                    "where": ["right.ts"],
+                    "match": { "kind": "function" }
+                }
+            ],
+            "limit": 10
+        }))
+        .expect("query");
+        let limits = CodeQueryExecutionLimits {
+            max_pipeline_rows: 3,
+            ..CodeQueryExecutionLimits::default()
+        };
+
+        let sequential = execute_code_query_with_union_strategy(
+            &analyzer,
+            &query,
+            limits,
+            UnionExecutionStrategy::Sequential,
+            true,
+        );
+        let parallel = execute_code_query_with_union_strategy(
+            &analyzer,
+            &query,
+            limits,
+            UnionExecutionStrategy::Parallel,
+            true,
+        );
+
+        assert_eq!(
+            serde_json::to_value(&parallel.result).expect("parallel result serializes"),
+            serde_json::to_value(&sequential.result).expect("sequential result serializes")
+        );
+        assert_eq!(parallel.work, sequential.work);
+        assert_eq!(parallel.evidence, sequential.evidence);
+        assert!(
+            !parallel.result.truncated,
+            "{:?}",
+            parallel.result.diagnostics
+        );
+        assert_eq!(parallel.result.results.len(), 3);
+
+        let profile = parallel.profile.expect("parallel profile");
+        assert_eq!(profile.format, "bifrost_code_query_execution_profile/v4");
+        assert_eq!(profile.scheduler.worker_limit, 2);
+        assert_eq!(profile.scheduler.tasks_enqueued, 2);
+        assert_eq!(profile.scheduler.tasks_completed, 2);
+        assert!((1..=2).contains(&profile.peak_concurrency));
+        assert_eq!(profile.peak_concurrency, profile.scheduler.peak_concurrency);
+        let parallel_union = profile
+            .operators
+            .iter()
+            .find(|observation| observation.operator == PhysicalQueryOperator::ParallelUnion)
+            .expect("parallel union observation");
+        assert!(parallel_union.dependency_wait_ns > 0);
+        assert!(parallel_union.scheduling_overhead_ns > 0);
+        assert_eq!(
+            parallel_union.total_elapsed_ns,
+            parallel_union
+                .elapsed_ns
+                .saturating_add(parallel_union.dependency_wait_ns)
+        );
+        let operator_work = profile
+            .operators
+            .iter()
+            .fold(QueryOperatorWorkProfile::default(), |work, observation| {
+                work.saturating_add(observation.work)
+            });
+        assert_eq!(operator_work, profile.execution_work);
+        assert!(
+            sequential
+                .profile
+                .expect("sequential profile")
+                .operators
+                .iter()
+                .any(|observation| {
+                    observation.operator == PhysicalQueryOperator::SequentialUnion
+                })
+        );
+    }
+
+    #[test]
+    fn parallel_seed_union_matches_serial_budget_exhaustion() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("left.ts"))
+            .write("export function left_one() {}\nexport function left_two() {}\n")
+            .expect("write left source");
+        ProjectFile::new(root.clone(), PathBuf::from("right.ts"))
+            .write("export function right_one() {}\nexport function right_two() {}\n")
+            .expect("write right source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let query = CodeQuery::from_json(&json!({
+            "union": [
+                { "where": ["left.ts"], "match": { "kind": "function" } },
+                { "where": ["right.ts"], "match": { "kind": "function" } }
+            ]
+        }))
+        .expect("query");
+        let limits = CodeQueryExecutionLimits {
+            max_pipeline_rows: 3,
+            ..CodeQueryExecutionLimits::default()
+        };
+
+        let sequential = execute_code_query_with_union_strategy(
+            &analyzer,
+            &query,
+            limits,
+            UnionExecutionStrategy::Sequential,
+            false,
+        );
+        let parallel = execute_code_query_with_union_strategy(
+            &analyzer,
+            &query,
+            limits,
+            UnionExecutionStrategy::Parallel,
+            false,
+        );
+
+        assert_eq!(
+            serde_json::to_value(&parallel.result).expect("parallel result serializes"),
+            serde_json::to_value(&sequential.result).expect("sequential result serializes")
+        );
+        assert_eq!(parallel.work, sequential.work);
+        assert_eq!(parallel.evidence, sequential.evidence);
+        assert!(parallel.result.truncated);
+        assert_eq!(parallel.result.results.len(), 3);
+    }
+
+    #[test]
+    fn forced_parallel_keeps_shared_and_stepped_unions_serial() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+            .write("export function first() {}\nexport function second() {}\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let shared = json!({ "match": { "kind": "function", "name": "first" } });
+        let stepped = CodeQuery::from_json(&json!({
+            "union": [
+                {
+                    "match": { "kind": "function", "name": "first" },
+                    "steps": [{ "op": "enclosing_decl" }]
+                },
+                {
+                    "match": { "kind": "function", "name": "second" },
+                    "steps": [{ "op": "enclosing_decl" }]
+                }
+            ]
+        }))
+        .expect("stepped query");
+        let shared = CodeQuery::from_json(&json!({
+            "union": [shared.clone(), shared]
+        }))
+        .expect("shared query");
+
+        for query in [&shared, &stepped] {
+            let profile = execute_code_query_with_union_strategy(
+                &analyzer,
+                query,
+                CodeQueryExecutionLimits::default(),
+                UnionExecutionStrategy::Parallel,
+                true,
+            )
+            .profile
+            .expect("profile");
+            assert_eq!(profile.scheduler.tasks_enqueued, 0);
+            assert!(profile.operators.iter().any(|observation| {
+                observation.operator == PhysicalQueryOperator::SequentialUnion
+            }));
+            assert!(!profile.operators.iter().any(|observation| {
+                observation.operator == PhysicalQueryOperator::ParallelUnion
+            }));
+        }
+    }
+
+    #[test]
+    fn absolute_exact_globs_cannot_panic_parallel_selection() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("inside.ts"))
+            .write("export function inside() {}\n")
+            .expect("write source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+
+        for (left, right) in [
+            ("/outside/left.ts", "/outside/right.ts"),
+            ("C:/outside/left.ts", "D:/outside/right.ts"),
+        ] {
+            let query = CodeQuery::from_json(&json!({
+                "union": [
+                    {
+                        "where": [left],
+                        "languages": ["typescript"],
+                        "match": { "kind": "function" }
+                    },
+                    {
+                        "where": [right],
+                        "languages": ["typescript"],
+                        "match": { "kind": "function" }
+                    }
+                ]
+            }))
+            .expect("absolute globs remain valid query syntax");
+            let profile = execute_internal(
+                &analyzer,
+                &query,
+                CodeQueryExecutionLimits::default(),
+                None,
+                None,
+                true,
+            )
+            .profile
+            .expect("profile");
+            assert!(
+                profile.operators.iter().any(|operator| {
+                    operator.operator == PhysicalQueryOperator::SequentialUnion
+                })
+            );
+            assert!(
+                !profile
+                    .operators
+                    .iter()
+                    .any(|operator| { operator.operator == PhysicalQueryOperator::ParallelUnion })
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_bearing_parallel_union_runs_cancellation_safe_tasks() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), PathBuf::from("left.ts"))
+            .write("export function left() {}\n")
+            .expect("write left source");
+        ProjectFile::new(root.clone(), PathBuf::from("right.ts"))
+            .write("export function right() {}\n")
+            .expect("write right source");
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+        let query = CodeQuery::from_json(&json!({
+            "union": [
+                { "where": ["left.ts"], "match": { "kind": "function" } },
+                { "where": ["right.ts"], "match": { "kind": "function" } }
+            ]
+        }))
+        .expect("query");
+        let cancellation = CancellationToken::cancel_after_checks_for_test(2);
+
+        let detailed = execute_internal_with_strategy(
+            &analyzer,
+            &query,
+            CodeQueryExecutionLimits::default(),
+            Some(&cancellation),
+            None,
+            true,
+            UnionExecutionStrategy::Parallel,
+            2,
+        );
+
+        assert_eq!(detailed.result.completion(), CodeQueryCompletion::Cancelled);
+        let profile = detailed.profile.expect("cancelled execution profile");
+        assert!(
+            profile
+                .operators
+                .iter()
+                .any(|operator| { operator.operator == PhysicalQueryOperator::ParallelUnion })
+        );
+        assert_eq!(profile.scheduler.tasks_started, 2);
+        assert_eq!(profile.scheduler.tasks_completed, 2);
+        assert!(profile.scheduler.tasks_observed_cancelled_before_start > 0);
+    }
+
+    #[test]
+    fn fair_budget_wait_is_released_by_cancellation_and_worker_failure() {
+        let limits = CodeQueryExecutionLimits {
+            max_pipeline_rows: 1,
+            ..CodeQueryExecutionLimits::default()
+        };
+        let projected = CodeQueryExecutionBudget {
+            pipeline_rows: 1,
+            ..CodeQueryExecutionBudget::default()
+        };
+
+        let cancellation = CancellationToken::default();
+        let coordinator = FairSeedBudgetCoordinator::new(
+            CodeQueryExecutionBudget::default(),
+            limits,
+            2,
+            Some(&cancellation),
+        );
+        let lease = coordinator.lease(1);
+        let cancelled_waiter = std::thread::spawn(move || lease.admit(projected));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while coordinator.waiting_branches() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "budget branch did not start waiting"
+            );
+            std::thread::yield_now();
+        }
+        cancellation.cancel();
+        assert!(matches!(
+            cancelled_waiter.join().expect("cancelled waiter joins"),
+            FairSeedBudgetAdmission::Cancelled
+        ));
+
+        let coordinator =
+            FairSeedBudgetCoordinator::new(CodeQueryExecutionBudget::default(), limits, 2, None);
+        let lease = coordinator.lease(1);
+        let failed_waiter = std::thread::spawn(move || lease.admit(projected));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while coordinator.waiting_branches() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "budget branch did not start waiting"
+            );
+            std::thread::yield_now();
+        }
+        coordinator.fail();
+        assert!(matches!(
+            failed_waiter.join().expect("failed waiter joins"),
+            FairSeedBudgetAdmission::Cancelled
+        ));
     }
 
     #[test]

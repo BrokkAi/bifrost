@@ -3,6 +3,7 @@ use serde::Serialize;
 use super::plan::{
     PhysicalQueryNodeId, PhysicalQueryOperator, PhysicalQueryPlan, PhysicalQueryPlanExplain,
 };
+use super::scheduler::SchedulerRunProfile;
 
 /// Structured observations from one physical query-plan execution.
 #[derive(Debug, Clone, Serialize)]
@@ -11,6 +12,7 @@ pub(crate) struct QueryExecutionProfile {
     pub(crate) plan: PhysicalQueryPlanExplain,
     pub(crate) operators: Vec<QueryOperatorProfile>,
     pub(crate) peak_concurrency: usize,
+    pub(crate) scheduler: SchedulerRunProfile,
     pub(crate) planning_ns: u64,
     pub(crate) execution_ns: u64,
     pub(crate) rendering_ns: u64,
@@ -28,10 +30,11 @@ pub(crate) struct QueryExecutionProfile {
 impl QueryExecutionProfile {
     pub(crate) fn sequential(plan: &PhysicalQueryPlan, planning_ns: u64) -> Self {
         Self {
-            format: "bifrost_code_query_execution_profile/v2",
+            format: "bifrost_code_query_execution_profile/v4",
             plan: plan.explain(),
             operators: Vec::new(),
             peak_concurrency: 1,
+            scheduler: SchedulerRunProfile::default(),
             planning_ns,
             execution_ns: 0,
             rendering_ns: 0,
@@ -45,6 +48,11 @@ impl QueryExecutionProfile {
 
     pub(crate) fn record(&mut self, observation: QueryOperatorProfile) {
         self.operators.push(observation);
+    }
+
+    pub(crate) fn record_scheduler_run(&mut self, run: SchedulerRunProfile) {
+        self.peak_concurrency = self.peak_concurrency.max(run.peak_concurrency);
+        self.scheduler = self.scheduler.saturating_add(run);
     }
 }
 
@@ -172,6 +180,20 @@ pub(crate) struct QuerySeedStructuralFactsCacheProfile {
 }
 
 impl QuerySeedStructuralFactsCacheProfile {
+    pub(crate) fn saturating_add(self, other: Self) -> Self {
+        Self {
+            lookups: self.lookups.saturating_add(other.lookups),
+            memory_hits: self.memory_hits.saturating_add(other.memory_hits),
+            persisted_hydrations: self
+                .persisted_hydrations
+                .saturating_add(other.persisted_hydrations),
+            extractions: self.extractions.saturating_add(other.extractions),
+            unavailable: self.unavailable.saturating_add(other.unavailable),
+            unknown_outcomes: self.unknown_outcomes.saturating_add(other.unknown_outcomes),
+            replayed_files: self.replayed_files.saturating_add(other.replayed_files),
+        }
+    }
+
     pub(crate) fn record_memory_hit(&mut self, available: bool) {
         self.lookups = self.lookups.saturating_add(1);
         self.memory_hits = self.memory_hits.saturating_add(1);
@@ -216,6 +238,25 @@ impl QuerySeedStructuralFactsCacheProfile {
 }
 
 impl QueryCacheLayerProfile {
+    pub(crate) fn saturating_add(self, other: Self) -> Self {
+        Self {
+            lookups: self.lookups.saturating_add(other.lookups),
+            hits: self.hits.saturating_add(other.hits),
+            misses: self.misses.saturating_add(other.misses),
+            builds: self.builds.saturating_add(other.builds),
+            waits: self.waits.saturating_add(other.waits),
+            wait_ns: self.wait_ns.saturating_add(other.wait_ns),
+            complete_hits: self.complete_hits.saturating_add(other.complete_hits),
+            incomplete_hits: self.incomplete_hits.saturating_add(other.incomplete_hits),
+            complete_builds: self.complete_builds.saturating_add(other.complete_builds),
+            incomplete_builds: self
+                .incomplete_builds
+                .saturating_add(other.incomplete_builds),
+            unknown_outcomes: self.unknown_outcomes.saturating_add(other.unknown_outcomes),
+            replayed_items: self.replayed_items.saturating_add(other.replayed_items),
+        }
+    }
+
     pub(crate) fn record_hit(&mut self, complete: Option<bool>, replayed_items: usize) {
         self.lookups = self.lookups.saturating_add(1);
         self.hits = self.hits.saturating_add(1);
@@ -280,6 +321,25 @@ pub(crate) struct QueryCacheProfile {
 }
 
 impl QueryCacheProfile {
+    pub(crate) fn saturating_add(self, other: Self) -> Self {
+        Self {
+            seed_result: self.seed_result.saturating_add(other.seed_result),
+            seed_structural_facts: self
+                .seed_structural_facts
+                .saturating_add(other.seed_structural_facts),
+            inbound_reference: self
+                .inbound_reference
+                .saturating_add(other.inbound_reference),
+            outbound_reference: self
+                .outbound_reference
+                .saturating_add(other.outbound_reference),
+            incoming_call: self.incoming_call.saturating_add(other.incoming_call),
+            outgoing_call: self.outgoing_call.saturating_add(other.outgoing_call),
+            import_forward: self.import_forward.saturating_add(other.import_forward),
+            import_reverse: self.import_reverse.saturating_add(other.import_reverse),
+        }
+    }
+
     pub(crate) fn saturating_sub(self, earlier: Self) -> Self {
         Self {
             seed_result: self.seed_result.saturating_sub(earlier.seed_result),

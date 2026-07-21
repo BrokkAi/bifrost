@@ -112,8 +112,12 @@ impl LogicalQueryPlan {
         Ok(plan)
     }
 
-    fn node(&self, id: LogicalQueryNodeId) -> &LogicalQueryNode {
+    pub(crate) fn node(&self, id: LogicalQueryNodeId) -> &LogicalQueryNode {
         &self.nodes[id.index()]
+    }
+
+    pub(crate) const fn root(&self) -> LogicalQueryNodeId {
+        self.root
     }
 
     fn validate_dependency_order(&self) -> Result<(), LogicalPlanValidationError> {
@@ -280,6 +284,7 @@ pub(crate) enum PhysicalQueryOperator {
     SeedScan,
     PipelineStep,
     SequentialUnion,
+    ParallelUnion,
     SequentialIntersection,
     SequentialExcept,
     Limit,
@@ -321,7 +326,15 @@ pub(crate) struct PhysicalQueryPlan {
 }
 
 impl PhysicalQueryPlan {
+    #[cfg(test)]
     pub(crate) fn select(logical: LogicalQueryPlan) -> Self {
+        Self::select_with_parallel_union(logical, None)
+    }
+
+    pub(crate) fn select_with_parallel_union(
+        logical: LogicalQueryPlan,
+        parallel_union: Option<LogicalQueryNodeId>,
+    ) -> Self {
         logical
             .validate_dependency_order()
             .expect("logical plan lowering establishes dependency order");
@@ -336,6 +349,9 @@ impl PhysicalQueryPlan {
                     LogicalQueryOperator::Seed(_) => PhysicalQueryOperator::SeedScan,
                     LogicalQueryOperator::Step { .. } => PhysicalQueryOperator::PipelineStep,
                     LogicalQueryOperator::Set { op, .. } => match op {
+                        SetOperator::Union if parallel_union == Some(logical_node) => {
+                            PhysicalQueryOperator::ParallelUnion
+                        }
                         SetOperator::Union => PhysicalQueryOperator::SequentialUnion,
                         SetOperator::Intersect => PhysicalQueryOperator::SequentialIntersection,
                         SetOperator::Except => PhysicalQueryOperator::SequentialExcept,
@@ -666,6 +682,42 @@ mod tests {
                     }
                 ]
             })
+        );
+    }
+
+    #[test]
+    fn physical_selection_can_choose_parallel_union_independently() {
+        let logical = LogicalQueryPlan::lower(&query(CodeQueryPlan {
+            source: CodeQueryPlanSource::Set {
+                op: SetOperator::Union,
+                branches: vec![
+                    branch(seed("First"), Vec::new()),
+                    branch(seed("Second"), Vec::new()),
+                ],
+            },
+            steps: Vec::new(),
+        }))
+        .expect("query should lower");
+        let LogicalQueryOperator::Limit { input: union, .. } =
+            logical.node(logical.root()).operator()
+        else {
+            panic!("root should be a limit");
+        };
+        let union = *union;
+        let physical = PhysicalQueryPlan::select_with_parallel_union(logical.clone(), Some(union));
+
+        assert_eq!(
+            physical
+                .node(PhysicalQueryNodeId::from_logical(union))
+                .operator(),
+            PhysicalQueryOperator::ParallelUnion
+        );
+        let sequential = PhysicalQueryPlan::select(logical);
+        assert_eq!(
+            sequential
+                .node(PhysicalQueryNodeId::from_logical(union))
+                .operator(),
+            PhysicalQueryOperator::SequentialUnion
         );
     }
 

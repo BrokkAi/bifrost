@@ -15,7 +15,9 @@
 //! deliberately distinguishes analyzer-generation cache warmth from sibling
 //! reuse inside one composed request.
 
+use std::collections::BTreeSet;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -31,15 +33,19 @@ use super::profile::QueryExecutionProfile;
 use crate::analyzer::structural::query::{CodeQuery, MAX_LIMIT};
 use crate::analyzer::structural::search::{
     CodeQueryCompletion, CodeQueryExecutionLimits, CodeQueryExecutionWork, DetailedCodeQueryResult,
-    execute_code_query_detailed, execute_code_query_profiled,
+    UnionExecutionStrategy, execute_code_query_with_union_strategy,
 };
-use crate::{AnalyzerConfig, IAnalyzer, Language, Project, TestProject, WorkspaceAnalyzer};
+use crate::{
+    AnalyzerConfig, FileSetProject, IAnalyzer, Language, Project, ProjectFile, TestProject,
+    WorkspaceAnalyzer, analyzer::AnalyzerQueryScope,
+};
 
 const RESULT_PREFIX: &str = "BIFROST_CODE_QUERY_EXECUTION_BENCHMARK=";
 const SMALL_FILES_ENV: &str = "BIFROST_CODE_QUERY_BENCH_SMALL_FILES";
 const LARGE_FILES_ENV: &str = "BIFROST_CODE_QUERY_BENCH_LARGE_FILES";
 const ITERATIONS_ENV: &str = "BIFROST_CODE_QUERY_BENCH_ITERATIONS";
 const ROUND_ENV: &str = "BIFROST_CODE_QUERY_BENCH_ROUND";
+const PARALLEL_SIZES_ENV: &str = "BIFROST_CODE_QUERY_PARALLEL_BENCH_SIZES";
 const DEFAULT_SMALL_FILES: usize = 16;
 const DEFAULT_LARGE_FILES: usize = 128;
 const DEFAULT_ITERATIONS: usize = 8;
@@ -210,10 +216,123 @@ struct BenchmarkResult {
     cases: Vec<CaseResult>,
 }
 
+#[derive(Debug, Serialize)]
+struct CandidateTimingPair {
+    iteration: usize,
+    candidate: &'static str,
+    first: &'static str,
+    baseline_sequential_ns: u64,
+    candidate_ns: u64,
+    savings_ns: i128,
+    savings_pct: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct CandidateTimingSummary {
+    samples: usize,
+    baseline_sequential_median_ns: u64,
+    candidate_median_ns: u64,
+    median_savings_ns: i128,
+    savings_pct_from_medians: f64,
+    candidate_wins: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ParallelSchedulerSummary {
+    worker_limit: usize,
+    tasks_enqueued: usize,
+    tasks_completed: usize,
+    tasks_observed_cancelled_before_start: usize,
+    peak_concurrency: usize,
+    queue_wait_ns: u64,
+    worker_task_elapsed_ns: u64,
+    budget_wait_ns: u64,
+    coordinator_wait_ns: u64,
+    dispatch_overhead_ns: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ParallelCaseResult {
+    name: String,
+    files_per_branch: usize,
+    workspace_files: usize,
+    workspace_source_bytes: u64,
+    candidate_files_per_branch: usize,
+    cold: CandidateTimingPair,
+    warm: Vec<CandidateTimingPair>,
+    warm_summary: CandidateTimingSummary,
+    result_sha256: String,
+    work: CodeQueryExecutionWork,
+    scheduler: ParallelSchedulerSummary,
+    auto_selected_parallel: bool,
+    auto_cold: CandidateTimingPair,
+    auto_warm: Vec<CandidateTimingPair>,
+    auto_warm_summary: CandidateTimingSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct ParallelBenchmarkResult {
+    format: &'static str,
+    kind: &'static str,
+    round: usize,
+    provenance: BenchmarkProvenance,
+    scheduler_workers: usize,
+    warm_iterations_per_strategy: usize,
+    cache_contract: [&'static str; 3],
+    cases: Vec<ParallelCaseResult>,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct FixtureStats {
     files: usize,
     source_bytes: u64,
+}
+
+/// Fixed benchmark sources with a caller-owned, strategy-private durable
+/// store. This preserves real snapshot encoding and SQLite writes without
+/// allowing one cold candidate to hydrate another candidate's artifacts.
+struct PersistentFileSetProject {
+    sources: FileSetProject,
+    persistence_root: PathBuf,
+}
+
+impl PersistentFileSetProject {
+    fn new(
+        source_root: &Path,
+        paths: impl IntoIterator<Item = PathBuf>,
+        persistence_root: &Path,
+    ) -> Self {
+        Self {
+            sources: FileSetProject::new(source_root.to_path_buf(), paths),
+            persistence_root: persistence_root.to_path_buf(),
+        }
+    }
+}
+
+impl Project for PersistentFileSetProject {
+    fn root(&self) -> &Path {
+        self.sources.root()
+    }
+
+    fn analyzer_languages(&self) -> BTreeSet<Language> {
+        self.sources.analyzer_languages()
+    }
+
+    fn all_files(&self) -> io::Result<BTreeSet<ProjectFile>> {
+        self.sources.all_files()
+    }
+
+    fn analyzable_files(&self, language: Language) -> io::Result<BTreeSet<ProjectFile>> {
+        self.sources.analyzable_files(language)
+    }
+
+    fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+        self.sources.file_by_rel_path(rel_path)
+    }
+
+    fn persistence_root(&self) -> Option<&Path> {
+        Some(&self.persistence_root)
+    }
 }
 
 #[derive(Debug)]
@@ -252,6 +371,25 @@ fn non_negative_env(name: &str) -> usize {
         Err(std::env::VarError::NotPresent) => 0,
         Err(error) => panic!("failed to read {name}: {error}"),
     }
+}
+
+fn parallel_benchmark_sizes() -> Vec<usize> {
+    let raw = std::env::var(PARALLEL_SIZES_ENV).unwrap_or_else(|_| "8,16,32,64,128".to_string());
+    let sizes =
+        raw.split(',')
+            .map(|value| {
+                value.trim().parse::<usize>().unwrap_or_else(|_| {
+                    panic!("{PARALLEL_SIZES_ENV} contains invalid size {value:?}")
+                })
+            })
+            .collect::<Vec<_>>();
+    assert!(!sizes.is_empty(), "{PARALLEL_SIZES_ENV} must not be empty");
+    assert!(
+        sizes.iter().all(|size| (1..=MAX_LIMIT / 2).contains(size)),
+        "{PARALLEL_SIZES_ENV} sizes must be between 1 and {}",
+        MAX_LIMIT / 2
+    );
+    sizes
 }
 
 fn write_fixture_file(
@@ -302,6 +440,16 @@ fn generate_typescript_fixture(root: &Path, files_per_branch: usize) -> FixtureS
         );
     }
     stats
+}
+
+fn typescript_fixture_paths(files_per_branch: usize) -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(files_per_branch.saturating_mul(2).saturating_add(1));
+    paths.push(PathBuf::from("shared.ts"));
+    for index in 0..files_per_branch {
+        paths.push(PathBuf::from("left").join(format!("module_{index:04}.ts")));
+        paths.push(PathBuf::from("right").join(format!("module_{index:04}.ts")));
+    }
+    paths
 }
 
 fn generate_java_import_fixture(root: &Path, node_count: usize) -> FixtureStats {
@@ -555,10 +703,13 @@ fn execute_sample(
     let limits = CodeQueryExecutionLimits::default();
     let cache_before = structural_cache_counts(analyzer);
     let started = Instant::now();
-    let detailed = match mode {
-        ExecutionMode::Profiled => execute_code_query_profiled(analyzer, query, limits),
-        ExecutionMode::Unprofiled => execute_code_query_detailed(analyzer, query, limits, None),
-    };
+    let detailed = execute_code_query_with_union_strategy(
+        analyzer,
+        query,
+        limits,
+        UnionExecutionStrategy::Sequential,
+        mode == ExecutionMode::Profiled,
+    );
     let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let cache_after = structural_cache_counts(analyzer);
     finish_sample(
@@ -716,6 +867,428 @@ fn headroom_summary(samples: &[ExecutionSample]) -> Option<IdealizedHeadroomSumm
             median_observed_request_ns,
         ),
     })
+}
+
+fn benchmark_workspace(project: Arc<dyn Project>) -> WorkspaceAnalyzer {
+    WorkspaceAnalyzer::build(
+        project,
+        AnalyzerConfig {
+            parallelism: Some(1),
+            memo_cache_budget_bytes: Some(MEMO_CACHE_BUDGET_BYTES),
+            ..AnalyzerConfig::default()
+        },
+    )
+}
+
+struct TimedExecution {
+    detailed: DetailedCodeQueryResult,
+    elapsed_ns: u64,
+    structural_cache: StructuralCacheCounts,
+}
+
+struct CandidateTimingEvidence {
+    timing: CandidateTimingPair,
+    result_sha256: String,
+    work: CodeQueryExecutionWork,
+    baseline_structural_cache: StructuralCacheCounts,
+    candidate_structural_cache: StructuralCacheCounts,
+}
+
+fn timed_forced_execution(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    strategy: UnionExecutionStrategy,
+) -> TimedExecution {
+    let cache_before = structural_cache_counts(analyzer);
+    let started = Instant::now();
+    let query_scope = AnalyzerQueryScope::new(analyzer);
+    let detailed = execute_code_query_with_union_strategy(
+        analyzer,
+        query,
+        CodeQueryExecutionLimits::default(),
+        strategy,
+        false,
+    );
+    let store_error = query_scope.store_error();
+    drop(query_scope);
+    let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let structural_cache = structural_cache_counts(analyzer).delta_from(cache_before);
+    assert!(
+        store_error.is_none(),
+        "parallel benchmark query scope must not observe a store error"
+    );
+    TimedExecution {
+        detailed,
+        elapsed_ns,
+        structural_cache,
+    }
+}
+
+fn assert_forced_pair_parity(
+    sequential: &DetailedCodeQueryResult,
+    parallel: &DetailedCodeQueryResult,
+    expected_results: usize,
+    case: &str,
+) {
+    assert_eq!(
+        serde_json::to_value(&parallel.result).expect("parallel benchmark result serializes"),
+        serde_json::to_value(&sequential.result).expect("sequential benchmark result serializes"),
+        "{case} public result parity"
+    );
+    assert_eq!(parallel.work, sequential.work, "{case} work parity");
+    assert_eq!(
+        parallel.evidence, sequential.evidence,
+        "{case} evidence parity"
+    );
+    assert_eq!(parallel.result.results.len(), expected_results, "{case}");
+    assert_eq!(
+        parallel.result.completion(),
+        CodeQueryCompletion::Complete,
+        "{case}"
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn strategy_timing_pair(
+    sequential_analyzer: &dyn IAnalyzer,
+    candidate_analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    expected_results: usize,
+    case: &str,
+    iteration: usize,
+    candidate_first: bool,
+    candidate_strategy: UnionExecutionStrategy,
+    candidate_label: &'static str,
+) -> CandidateTimingEvidence {
+    let (sequential, candidate) = if candidate_first {
+        let candidate = timed_forced_execution(candidate_analyzer, query, candidate_strategy);
+        let sequential = timed_forced_execution(
+            sequential_analyzer,
+            query,
+            UnionExecutionStrategy::Sequential,
+        );
+        (sequential, candidate)
+    } else {
+        let sequential = timed_forced_execution(
+            sequential_analyzer,
+            query,
+            UnionExecutionStrategy::Sequential,
+        );
+        let candidate = timed_forced_execution(candidate_analyzer, query, candidate_strategy);
+        (sequential, candidate)
+    };
+    assert_forced_pair_parity(
+        &sequential.detailed,
+        &candidate.detailed,
+        expected_results,
+        case,
+    );
+    let result_sha256 = sha256_json(&sequential.detailed.result);
+    let work = sequential.detailed.work;
+    let savings_ns = i128::from(sequential.elapsed_ns) - i128::from(candidate.elapsed_ns);
+    let savings_pct = if sequential.elapsed_ns == 0 {
+        0.0
+    } else {
+        savings_ns as f64 * 100.0 / sequential.elapsed_ns as f64
+    };
+    CandidateTimingEvidence {
+        timing: CandidateTimingPair {
+            iteration,
+            candidate: candidate_label,
+            first: if candidate_first {
+                candidate_label
+            } else {
+                "sequential"
+            },
+            baseline_sequential_ns: sequential.elapsed_ns,
+            candidate_ns: candidate.elapsed_ns,
+            savings_ns,
+            savings_pct,
+        },
+        result_sha256,
+        work,
+        baseline_structural_cache: sequential.structural_cache,
+        candidate_structural_cache: candidate.structural_cache,
+    }
+}
+
+fn candidate_timing_summary(samples: &[CandidateTimingPair]) -> CandidateTimingSummary {
+    let mut baseline = samples
+        .iter()
+        .map(|sample| sample.baseline_sequential_ns)
+        .collect::<Vec<_>>();
+    let mut candidate = samples
+        .iter()
+        .map(|sample| sample.candidate_ns)
+        .collect::<Vec<_>>();
+    let baseline_sequential_median_ns = median(&mut baseline);
+    let candidate_median_ns = median(&mut candidate);
+    let median_savings_ns =
+        i128::from(baseline_sequential_median_ns) - i128::from(candidate_median_ns);
+    CandidateTimingSummary {
+        samples: samples.len(),
+        baseline_sequential_median_ns,
+        candidate_median_ns,
+        median_savings_ns,
+        savings_pct_from_medians: if baseline_sequential_median_ns == 0 {
+            0.0
+        } else {
+            median_savings_ns as f64 * 100.0 / baseline_sequential_median_ns as f64
+        },
+        candidate_wins: samples
+            .iter()
+            .filter(|sample| sample.candidate_ns < sample.baseline_sequential_ns)
+            .count(),
+    }
+}
+
+fn candidate_first_for_case(round: usize, files_per_branch: usize, case: &str) -> bool {
+    let case_ordinal = match case {
+        "distinct_exact_union" => 0,
+        "distinct_broad_union" => 1,
+        other => panic!("parallel benchmark case has no stable order ordinal: {other}"),
+    };
+    round
+        .saturating_add(files_per_branch.saturating_mul(2))
+        .saturating_add(case_ordinal)
+        .is_multiple_of(2)
+}
+
+fn assert_isolated_cold_pair(evidence: &CandidateTimingEvidence, case: &str) {
+    assert_eq!(
+        evidence.baseline_structural_cache.extractions,
+        evidence.candidate_structural_cache.extractions,
+        "{case} cold strategies must perform equal structural extraction work"
+    );
+    assert!(
+        evidence.baseline_structural_cache.extractions > 0,
+        "{case} cold strategies must extract structural facts"
+    );
+    assert_eq!(
+        evidence.baseline_structural_cache.hydrations, 0,
+        "{case} cold sequential baseline must not hydrate persisted facts"
+    );
+    assert_eq!(
+        evidence.candidate_structural_cache.hydrations, 0,
+        "{case} cold candidate must not hydrate persisted facts"
+    );
+}
+
+fn assert_memory_warm_pair(evidence: &CandidateTimingEvidence, case: &str) {
+    assert_eq!(
+        evidence.baseline_structural_cache,
+        StructuralCacheCounts::default(),
+        "{case} warm sequential baseline must reuse memory-resident facts"
+    );
+    assert_eq!(
+        evidence.candidate_structural_cache,
+        StructuralCacheCounts::default(),
+        "{case} warm candidate must reuse memory-resident facts"
+    );
+}
+
+fn run_parallel_case(
+    root: &Path,
+    stats: FixtureStats,
+    files_per_branch: usize,
+    spec: CaseSpec,
+    iterations: usize,
+    round: usize,
+) -> ParallelCaseResult {
+    let paths = typescript_fixture_paths(files_per_branch);
+    let cold_sequential_store = TempDir::new().expect("cold sequential benchmark store");
+    let cold_parallel_store = TempDir::new().expect("cold parallel benchmark store");
+    let cold_auto_sequential_store = TempDir::new().expect("cold auto baseline benchmark store");
+    let cold_auto_candidate_store = TempDir::new().expect("cold auto candidate benchmark store");
+    let warm_store = TempDir::new().expect("warm benchmark store");
+    let project = |store: &TempDir| -> Arc<dyn Project> {
+        Arc::new(PersistentFileSetProject::new(
+            root,
+            paths.clone(),
+            store.path(),
+        ))
+    };
+    let cold_sequential = benchmark_workspace(project(&cold_sequential_store));
+    let cold_parallel = benchmark_workspace(project(&cold_parallel_store));
+    let cold_auto_sequential = benchmark_workspace(project(&cold_auto_sequential_store));
+    let cold_auto_candidate = benchmark_workspace(project(&cold_auto_candidate_store));
+    let parallel_first = candidate_first_for_case(round, files_per_branch, spec.name);
+    let cold_evidence = strategy_timing_pair(
+        cold_sequential.analyzer(),
+        cold_parallel.analyzer(),
+        &spec.query,
+        spec.expected_results,
+        spec.name,
+        0,
+        parallel_first,
+        UnionExecutionStrategy::Parallel,
+        "parallel",
+    );
+    assert_isolated_cold_pair(&cold_evidence, spec.name);
+    let auto_cold_evidence = strategy_timing_pair(
+        cold_auto_sequential.analyzer(),
+        cold_auto_candidate.analyzer(),
+        &spec.query,
+        spec.expected_results,
+        spec.name,
+        0,
+        !parallel_first,
+        UnionExecutionStrategy::Auto,
+        "auto",
+    );
+    assert_isolated_cold_pair(&auto_cold_evidence, spec.name);
+    assert_eq!(
+        auto_cold_evidence.result_sha256,
+        cold_evidence.result_sha256
+    );
+    assert_eq!(auto_cold_evidence.work, cold_evidence.work);
+    let cold = cold_evidence.timing;
+    let cold_digest = cold_evidence.result_sha256;
+    let cold_work = cold_evidence.work;
+    let auto_cold = auto_cold_evidence.timing;
+
+    let warm_workspace = benchmark_workspace(project(&warm_store));
+    let warm_analyzer = warm_workspace.analyzer();
+    let warmup = timed_forced_execution(
+        warm_analyzer,
+        &spec.query,
+        UnionExecutionStrategy::Sequential,
+    );
+    assert_eq!(warmup.detailed.result.results.len(), spec.expected_results);
+    assert!(warmup.structural_cache.extractions > 0);
+    assert_eq!(warmup.structural_cache.hydrations, 0);
+    let mut warm = Vec::with_capacity(iterations);
+    for iteration in 0..iterations {
+        let evidence = strategy_timing_pair(
+            warm_analyzer,
+            warm_analyzer,
+            &spec.query,
+            spec.expected_results,
+            spec.name,
+            iteration,
+            if iteration.is_multiple_of(2) {
+                parallel_first
+            } else {
+                !parallel_first
+            },
+            UnionExecutionStrategy::Parallel,
+            "parallel",
+        );
+        assert_memory_warm_pair(&evidence, spec.name);
+        assert_eq!(
+            evidence.result_sha256, cold_digest,
+            "{} deterministic digest",
+            spec.name
+        );
+        assert_eq!(evidence.work, cold_work, "{} deterministic work", spec.name);
+        warm.push(evidence.timing);
+    }
+    let mut auto_warm = Vec::with_capacity(iterations);
+    for iteration in 0..iterations {
+        let evidence = strategy_timing_pair(
+            warm_analyzer,
+            warm_analyzer,
+            &spec.query,
+            spec.expected_results,
+            spec.name,
+            iteration,
+            if iteration.is_multiple_of(2) {
+                !parallel_first
+            } else {
+                parallel_first
+            },
+            UnionExecutionStrategy::Auto,
+            "auto",
+        );
+        assert_memory_warm_pair(&evidence, spec.name);
+        assert_eq!(
+            evidence.result_sha256, cold_digest,
+            "{} auto deterministic digest",
+            spec.name
+        );
+        assert_eq!(
+            evidence.work, cold_work,
+            "{} auto deterministic work",
+            spec.name
+        );
+        auto_warm.push(evidence.timing);
+    }
+
+    let profiled = execute_code_query_with_union_strategy(
+        warm_analyzer,
+        &spec.query,
+        CodeQueryExecutionLimits::default(),
+        UnionExecutionStrategy::Parallel,
+        true,
+    );
+    assert_forced_pair_parity(
+        &warmup.detailed,
+        &profiled,
+        spec.expected_results,
+        spec.name,
+    );
+    let profile = profiled.profile.expect("forced parallel profile");
+    assert!(
+        profile
+            .operators
+            .iter()
+            .any(|operator| { operator.operator == PhysicalQueryOperator::ParallelUnion })
+    );
+    let scheduler = profile.scheduler;
+    assert_eq!(scheduler.tasks_enqueued, 2);
+    assert_eq!(scheduler.tasks_completed, 2);
+    assert!(scheduler.peak_concurrency <= scheduler.worker_limit);
+    let auto = execute_code_query_with_union_strategy(
+        warm_analyzer,
+        &spec.query,
+        CodeQueryExecutionLimits::default(),
+        UnionExecutionStrategy::Auto,
+        true,
+    );
+    assert_forced_pair_parity(&warmup.detailed, &auto, spec.expected_results, spec.name);
+    let auto_profile = auto.profile.expect("auto-selection profile");
+    let auto_selected_parallel = auto_profile
+        .operators
+        .iter()
+        .any(|operator| operator.operator == PhysicalQueryOperator::ParallelUnion);
+    assert_eq!(
+        auto_selected_parallel, false,
+        "{} Auto policy must retain the benchmark-derived sequential fallback at {} workspace files",
+        spec.name, stats.files
+    );
+
+    ParallelCaseResult {
+        name: spec.name.to_string(),
+        files_per_branch,
+        workspace_files: stats.files,
+        workspace_source_bytes: stats.source_bytes,
+        candidate_files_per_branch: if spec.name.contains("broad") {
+            files_per_branch
+        } else {
+            1
+        },
+        cold,
+        warm_summary: candidate_timing_summary(&warm),
+        warm,
+        result_sha256: cold_digest,
+        work: cold_work,
+        scheduler: ParallelSchedulerSummary {
+            worker_limit: scheduler.worker_limit,
+            tasks_enqueued: scheduler.tasks_enqueued,
+            tasks_completed: scheduler.tasks_completed,
+            tasks_observed_cancelled_before_start: scheduler.tasks_observed_cancelled_before_start,
+            peak_concurrency: scheduler.peak_concurrency,
+            queue_wait_ns: scheduler.queue_wait_ns,
+            worker_task_elapsed_ns: scheduler.worker_task_elapsed_ns,
+            budget_wait_ns: scheduler.budget_wait_ns,
+            coordinator_wait_ns: scheduler.coordinator_wait_ns,
+            dispatch_overhead_ns: scheduler.dispatch_overhead_ns,
+        },
+        auto_selected_parallel,
+        auto_cold,
+        auto_warm_summary: candidate_timing_summary(&auto_warm),
+        auto_warm,
+    }
 }
 
 fn run_case(
@@ -1214,7 +1787,7 @@ fn code_query_execution_profile_measurement() {
     let limits = CodeQueryExecutionLimits::default();
 
     let result = BenchmarkResult {
-        format: "bifrost_code_query_execution_benchmark/v2",
+        format: "bifrost_code_query_execution_benchmark/v4",
         kind: "sample",
         round,
         provenance,
@@ -1225,7 +1798,7 @@ fn code_query_execution_profile_measurement() {
             analyzer_parallelism: 1,
             memo_cache_budget_bytes: MEMO_CACHE_BUDGET_BYTES,
             maximum_query_results: MAX_LIMIT,
-            physical_execution: "sequential_recursive",
+            physical_execution: "forced_sequential_recursive",
             headroom_model: "ideal_perfect_overlap_projection",
             headroom_assumptions: [
                 "distinct complete branches share no derived dependency",
@@ -1245,4 +1818,87 @@ fn code_query_execution_profile_measurement() {
         "{RESULT_PREFIX}{}",
         serde_json::to_string(&result).expect("serialize CodeQuery execution benchmark")
     );
+}
+
+#[test]
+#[ignore = "M4 sequential/parallel CodeQuery benchmark; run explicitly in release mode"]
+fn code_query_parallel_execution_measurement() {
+    assert!(
+        std::thread::available_parallelism().is_ok_and(|value| value.get() >= 2),
+        "parallel CodeQuery benchmark requires at least two available processors"
+    );
+    let mut sizes = parallel_benchmark_sizes();
+    let iterations = positive_env(ITERATIONS_ENV, DEFAULT_ITERATIONS, 30);
+    let round = non_negative_env(ROUND_ENV);
+    if !round.is_multiple_of(2) {
+        sizes.reverse();
+    }
+
+    let mut cases = Vec::new();
+    for files_per_branch in sizes {
+        let temp = TempDir::new().expect("parallel CodeQuery benchmark temp directory");
+        let root = temp
+            .path()
+            .canonicalize()
+            .expect("canonicalize parallel benchmark root");
+        let stats = generate_typescript_fixture(&root, files_per_branch);
+        let mut specs = typescript_cases(files_per_branch)
+            .into_iter()
+            .filter(|spec| matches!(spec.name, "distinct_exact_union" | "distinct_broad_union"))
+            .collect::<Vec<_>>();
+        if !round.saturating_add(files_per_branch).is_multiple_of(2) {
+            specs.reverse();
+        }
+        for spec in specs {
+            cases.push(run_parallel_case(
+                &root,
+                stats,
+                files_per_branch,
+                spec,
+                iterations,
+                round,
+            ));
+        }
+    }
+
+    let provenance = provenance();
+    assert!(
+        provenance.bifrost_tree_fingerprint.is_some(),
+        "decision-grade benchmark must fingerprint the exact source tree"
+    );
+    let scheduler_workers = cases
+        .first()
+        .map(|case| case.scheduler.worker_limit)
+        .unwrap_or_default();
+    let result = ParallelBenchmarkResult {
+        format: "bifrost_code_query_parallel_execution_benchmark/v4",
+        kind: "isolated_query_scoped_sequential_candidate_ab",
+        round,
+        provenance,
+        scheduler_workers,
+        warm_iterations_per_strategy: iterations,
+        cache_contract: [
+            "cold strategies share fixed source files but use separate fresh analyzers and strategy-private durable stores",
+            "timing includes analyzer query-scope setup and cleanup; cold pairs assert equal extraction work and zero hydration",
+            "warm pairs alternate order on one analyzer after an untimed extracting warmup and assert memory reuse",
+        ],
+        cases,
+    };
+    eprintln!(
+        "{RESULT_PREFIX}{}",
+        serde_json::to_string(&result).expect("serialize parallel CodeQuery benchmark")
+    );
+}
+
+#[test]
+fn paired_parallel_benchmark_rounds_flip_every_cold_candidate_order() {
+    for files_per_branch in [128, 256, 500] {
+        for case in ["distinct_exact_union", "distinct_broad_union"] {
+            assert_ne!(
+                candidate_first_for_case(12, files_per_branch, case),
+                candidate_first_for_case(13, files_per_branch, case),
+                "paired rounds must flip cold order for {case} at {files_per_branch} files per branch"
+            );
+        }
+    }
 }
