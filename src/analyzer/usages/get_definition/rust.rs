@@ -224,6 +224,13 @@ pub(super) fn resolve_rust(
     {
         return outcome;
     }
+    if let Some(tree) = tree
+        && let Some(candidates) = rust_focused_terminal_scoped_type_candidates(
+            analyzer, rust, support, file, source, tree, site, &refs,
+        )
+    {
+        return candidates_outcome(candidates);
+    }
     let (candidates, scoped_lookup_failed) = if let Some((path, name)) = reference.rsplit_once("::")
     {
         let resolved = match crate::analyzer::usages::rust_graph::resolve_scoped_associated_item(
@@ -1094,6 +1101,36 @@ fn rust_enclosing_scoped_type_identifier_name(
         current = candidate.parent();
     }
     None
+}
+
+fn rust_focused_terminal_scoped_type_candidates(
+    analyzer: &dyn IAnalyzer,
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    refs: &RustReferenceContext,
+) -> Option<Vec<CodeUnit>> {
+    let focused =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
+    let scoped = rust_enclosing_scoped_type_identifier_name(
+        focused,
+        site.focus_start_byte,
+        site.focus_end_byte,
+    )?;
+    let full_path = rust_node_text(scoped, source).trim();
+    let fqn =
+        crate::analyzer::usages::rust_graph::resolve_rust_path_fqn(rust, refs, file, full_path)?;
+    let mut candidates = support
+        .fqn(&fqn)
+        .into_iter()
+        .filter(|candidate| rust_is_type_definition(analyzer, candidate))
+        .collect::<Vec<_>>();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    (!candidates.is_empty()).then_some(candidates)
 }
 
 fn rust_enclosing_ancestor<'tree>(mut node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {

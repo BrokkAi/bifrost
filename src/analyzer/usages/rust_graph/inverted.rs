@@ -180,6 +180,12 @@ impl RustScan<'_, '_> {
                         &seeds,
                         root_name,
                         root.start_byte(),
+                    )
+                    && !self.rust.usage_local_module_prefix_visible_at(
+                        self.file,
+                        &seeds,
+                        root_name,
+                        root.start_byte(),
                     )));
         self.rust
             .usage_reference_at(
