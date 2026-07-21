@@ -4,21 +4,29 @@ import type {
   PolicyReportDiagnostic,
   PolicyRule,
   PolicyRun,
+  PolicyRunDiagnostic,
   RqlPolicyResponse
 } from "./rql_policy";
 import {
   policyCompletionDetail,
   policyCompletionLabel,
   policyFindingDetail,
-  policyFindingTerminalSymbol
+  policyFindingTerminalSymbol,
+  policyRunDiagnosticCodeLabel
 } from "./rql_policy";
 
 export interface PolicyFindingTarget {
-  workspaceRootUri: string;
+  reportRootUri: string;
   finding: PolicyFinding;
 }
 
-type PolicyTreeItem = PolicyStaleItem | PolicyRunItem | PolicyFindingItem | PolicyDiagnosticItem;
+type PolicyTreeItem =
+  | PolicyStaleItem
+  | PolicyRunItem
+  | PolicyFindingItem
+  | PolicyDiagnosticItem
+  | PolicyRunDiagnosticItem
+  | PolicyTruncationItem;
 
 export class RqlPolicyResultsProvider implements vscode.TreeDataProvider<PolicyTreeItem> {
   private readonly changeEmitter = new vscode.EventEmitter<PolicyTreeItem | undefined>();
@@ -47,9 +55,18 @@ export class RqlPolicyResultsProvider implements vscode.TreeDataProvider<PolicyT
 
   getChildren(element?: PolicyTreeItem): vscode.ProviderResult<PolicyTreeItem[]> {
     if (element instanceof PolicyRunItem) {
-      return element.run.findings.map(
-        (finding) => new PolicyFindingItem(element.workspaceRootUri, finding)
+      const children: PolicyTreeItem[] = element.run.diagnostics.map(
+        (diagnostic) => new PolicyRunDiagnosticItem(diagnostic)
       );
+      if (element.run.diagnostics_truncated) {
+        children.push(new PolicyTruncationItem("Additional run diagnostics were omitted."));
+      }
+      children.push(
+        ...element.run.findings.map(
+          (finding) => new PolicyFindingItem(element.reportRootUri, finding)
+        )
+      );
+      return children;
     }
     if (element) {
       return [];
@@ -65,12 +82,19 @@ export class RqlPolicyResultsProvider implements vscode.TreeDataProvider<PolicyT
     items.push(
       ...this.response.report.diagnostics.map((diagnostic) => new PolicyDiagnosticItem(diagnostic))
     );
+    if (this.response.report.diagnostics_truncated) {
+      items.push(
+        new PolicyTruncationItem(
+          `At least ${this.response.report.omitted_diagnostics_lower_bound} additional report diagnostics were omitted.`
+        )
+      );
+    }
     const rules = new Map(
       this.response.report.rules.map((rule) => [rule.policy_id, rule] as const)
     );
     items.push(
       ...this.response.report.runs.map(
-        (run) => new PolicyRunItem(this.response!.workspaceRootUri, run, rules.get(run.policy_id))
+        (run) => new PolicyRunItem(this.response!.reportRootUri, run, rules.get(run.policy_id))
       )
     );
     return items;
@@ -92,31 +116,36 @@ class PolicyStaleItem extends vscode.TreeItem {
 
 class PolicyRunItem extends vscode.TreeItem {
   constructor(
-    readonly workspaceRootUri: string,
+    readonly reportRootUri: string,
     readonly run: PolicyRun,
     rule: PolicyRule | undefined
   ) {
     super(
       rule ? `${rule.name} (${run.policy_id})` : run.policy_id,
-      run.findings.length > 0
+      run.findings.length > 0 || run.diagnostics.length > 0 || run.diagnostics_truncated
         ? vscode.TreeItemCollapsibleState.Expanded
         : vscode.TreeItemCollapsibleState.None
     );
     const completion = policyCompletionLabel(run.completion);
     const findings = `${run.findings.length} ${run.findings.length === 1 ? "finding" : "findings"}`;
     this.description = `${completion} · ${findings}`;
-    this.tooltip = new vscode.MarkdownString(
-      `**${rule?.name ?? run.policy_id}**  \nPolicy ID: \`${run.policy_id}\`  \nAnalysis: \`${
-        run.analysis_type
-      }\`  \n${policyCompletionDetail(run.completion)}`
-    );
+    const tooltip = new vscode.MarkdownString();
+    tooltip.appendMarkdown("**Policy:** ");
+    tooltip.appendText(rule?.name ?? run.policy_id);
+    tooltip.appendMarkdown("  \n**Policy ID:** ");
+    tooltip.appendText(run.policy_id);
+    tooltip.appendMarkdown("  \n**Analysis:** ");
+    tooltip.appendText(run.analysis_type);
+    tooltip.appendMarkdown("  \n");
+    tooltip.appendText(policyCompletionDetail(run.completion));
+    this.tooltip = tooltip;
     this.iconPath = new vscode.ThemeIcon(completionIcon(run));
   }
 }
 
 class PolicyFindingItem extends vscode.TreeItem {
   constructor(
-    workspaceRootUri: string,
+    reportRootUri: string,
     readonly finding: PolicyFinding
   ) {
     super(compactText(finding.message), vscode.TreeItemCollapsibleState.None);
@@ -128,9 +157,13 @@ class PolicyFindingItem extends vscode.TreeItem {
     this.description = terminal
       ? `${finding.severity} · ${terminal} · ${location}`
       : `${finding.severity} · ${location}`;
-    const tooltip = new vscode.MarkdownString(
-      `**${finding.severity.toUpperCase()}** — ${finding.message}  \n\`${location}\``
-    );
+    const tooltip = new vscode.MarkdownString();
+    tooltip.appendMarkdown("**Severity:** ");
+    tooltip.appendText(finding.severity.toUpperCase());
+    tooltip.appendMarkdown("  \n**Message:** ");
+    tooltip.appendText(finding.message);
+    tooltip.appendMarkdown("  \n**Location:** ");
+    tooltip.appendText(location);
     tooltip.appendMarkdown("\n\n**Evidence and provenance**\n\n");
     tooltip.appendCodeblock(policyFindingDetail(finding), "json");
     this.tooltip = tooltip;
@@ -138,7 +171,7 @@ class PolicyFindingItem extends vscode.TreeItem {
     this.command = {
       command: "bifrost.openRqlPolicyFinding",
       title: "Open Bifrost Policy Finding",
-      arguments: [{ workspaceRootUri, finding } satisfies PolicyFindingTarget]
+      arguments: [{ reportRootUri, finding } satisfies PolicyFindingTarget]
     };
   }
 }
@@ -151,6 +184,26 @@ class PolicyDiagnosticItem extends vscode.TreeItem {
       ? `${diagnostic.message}\n\nSource: ${diagnostic.source}`
       : diagnostic.message;
     this.iconPath = new vscode.ThemeIcon(severityIcon(diagnostic.severity));
+  }
+}
+
+class PolicyRunDiagnosticItem extends vscode.TreeItem {
+  constructor(diagnostic: PolicyRunDiagnostic) {
+    super(compactText(diagnostic.message), vscode.TreeItemCollapsibleState.None);
+    this.description = `${diagnostic.severity} · ${policyRunDiagnosticCodeLabel(
+      diagnostic.code
+    )} · ${diagnostic.impact}`;
+    this.tooltip = diagnostic.message;
+    this.iconPath = new vscode.ThemeIcon(severityIcon(diagnostic.severity));
+  }
+}
+
+class PolicyTruncationItem extends vscode.TreeItem {
+  constructor(message: string) {
+    super("Diagnostics truncated", vscode.TreeItemCollapsibleState.None);
+    this.description = message;
+    this.tooltip = message;
+    this.iconPath = new vscode.ThemeIcon("ellipsis");
   }
 }
 

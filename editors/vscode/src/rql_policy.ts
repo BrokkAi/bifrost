@@ -5,8 +5,6 @@ export const RUN_RQL_POLICY_METHOD = "bifrost/runPolicy";
 export interface RqlPolicyDocument {
   languageId: string;
   uri: string;
-  workspaceRootUri: string;
-  sourceIdentity: string;
   text: string;
 }
 
@@ -47,8 +45,23 @@ export interface PolicyRun {
   analysis_type: string;
   completion: PolicyRunCompletion;
   findings: PolicyFinding[];
-  diagnostics: unknown[];
+  diagnostics: PolicyRunDiagnostic[];
+  diagnostics_truncated: boolean;
   [key: string]: unknown;
+}
+
+export interface PolicyRunDiagnostic {
+  code: PolicyRunDiagnosticCode;
+  severity: string;
+  impact: string;
+  message: string;
+  primary?: PolicySourceLocation | null;
+  related?: unknown[];
+}
+
+export interface PolicyRunDiagnosticCode {
+  type: string;
+  code?: string;
 }
 
 export interface PolicyRule {
@@ -80,7 +93,8 @@ export interface PolicyReport {
 }
 
 export interface RqlPolicyResponse {
-  workspaceRootUri: string;
+  policyRootUri: string;
+  reportRootUri: string;
   report: PolicyReport;
 }
 
@@ -91,10 +105,7 @@ export interface PolicyEditorRange {
 
 export interface RqlPolicyRunner {
   isReady(): boolean;
-  sendRequest(
-    method: string,
-    params: { documentUri: string; sourceIdentity: string; source: string }
-  ): Promise<unknown>;
+  sendRequest(method: string, params: { documentUri: string; source: string }): Promise<unknown>;
   showError(message: string): void;
   showWarning(message: string): void;
 }
@@ -113,15 +124,9 @@ export async function runRqlPolicy(
     );
     return undefined;
   }
-  if (!document.sourceIdentity || !document.workspaceRootUri) {
-    runner.showWarning("Save the RQL policy inside an active workspace before running it.");
-    return undefined;
-  }
-
   try {
     const response = await runner.sendRequest(RUN_RQL_POLICY_METHOD, {
       documentUri: document.uri,
-      sourceIdentity: document.sourceIdentity,
       source: document.text
     });
     if (!isRqlPolicyResponse(response)) {
@@ -138,8 +143,50 @@ export async function runRqlPolicy(
   }
 }
 
+export interface PolicyRunSnapshot {
+  runId: number;
+  contentRevision: number;
+}
+
+export interface PolicyRunPublication {
+  publish: boolean;
+  staleReason?: string;
+}
+
+export class PolicyRunTracker {
+  private latestRunId = 0;
+  private contentRevision = 0;
+  private staleReason: string | undefined;
+
+  beginRun(): PolicyRunSnapshot {
+    return {
+      runId: ++this.latestRunId,
+      contentRevision: this.contentRevision
+    };
+  }
+
+  markChanged(reason: string): void {
+    this.contentRevision += 1;
+    this.staleReason = reason;
+  }
+
+  publicationFor(snapshot: PolicyRunSnapshot): PolicyRunPublication {
+    if (snapshot.runId !== this.latestRunId) {
+      return { publish: false };
+    }
+    return {
+      publish: true,
+      staleReason: snapshot.contentRevision === this.contentRevision ? undefined : this.staleReason
+    };
+  }
+}
+
 export function isRqlPolicyResponse(value: unknown): value is RqlPolicyResponse {
-  if (!isRecord(value) || typeof value.workspaceRootUri !== "string") {
+  if (
+    !isRecord(value) ||
+    typeof value.policyRootUri !== "string" ||
+    typeof value.reportRootUri !== "string"
+  ) {
     return false;
   }
   const report = value.report;
@@ -187,6 +234,25 @@ export function policyCompletionDetail(completion: PolicyRunCompletion): string 
     case "failed":
       return `The policy run failed: ${formatUnknown(completion.reasons)}.`;
   }
+}
+
+export function policyReportCompletedWithoutFindings(report: PolicyReport): boolean {
+  return (
+    report.runs.length > 0 &&
+    report.diagnostics.length === 0 &&
+    !report.diagnostics_truncated &&
+    report.runs.every(
+      (run) =>
+        run.completion.type === "complete" &&
+        run.findings.length === 0 &&
+        run.diagnostics.length === 0 &&
+        !run.diagnostics_truncated
+    )
+  );
+}
+
+export function policyRunDiagnosticCodeLabel(code: PolicyRunDiagnosticCode): string {
+  return code.type === "code_query" && code.code ? `${code.type}:${code.code}` : code.type;
 }
 
 export function policyFindingTerminalSymbol(finding: PolicyFinding): string | undefined {
@@ -259,7 +325,21 @@ function isPolicyRun(value: unknown): value is PolicyRun {
     isPolicyCompletion(value.completion) &&
     Array.isArray(value.findings) &&
     value.findings.every(isPolicyFinding) &&
-    Array.isArray(value.diagnostics)
+    Array.isArray(value.diagnostics) &&
+    value.diagnostics.every(isPolicyRunDiagnostic) &&
+    typeof value.diagnostics_truncated === "boolean"
+  );
+}
+
+function isPolicyRunDiagnostic(value: unknown): value is PolicyRunDiagnostic {
+  return (
+    isRecord(value) &&
+    isRecord(value.code) &&
+    typeof value.code.type === "string" &&
+    (value.code.code === undefined || typeof value.code.code === "string") &&
+    typeof value.severity === "string" &&
+    typeof value.impact === "string" &&
+    typeof value.message === "string"
   );
 }
 

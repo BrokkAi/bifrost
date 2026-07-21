@@ -16,8 +16,9 @@ The behavior is visible by opening a workspace policy, changing it without savin
 - [x] (2026-07-21 18:45Z) Milestone 2: exposed overlay evaluation through a cancellable, identity-validated `bifrost/runPolicy` LSP request; the focused integration test covers findings, parse diagnostics, endpoint rejection, unsupported taint, and invalid identities.
 - [x] (2026-07-21 18:57Z) Milestone 3: added the typed VS Code policy runner, dedicated results view, navigation, evidence tooltip, and stale-result lifecycle; the complete 61-test extension suite passes.
 - [x] (2026-07-21 19:00Z) Milestone 4: replaced the generic policy artwork with theme-specific Brokk-helmet document icons and inspected 16- and 24-pixel light/dark renders for legibility.
-- [ ] Run formatting, clippy, Rust feature tests, VS Code tests, and manual Extension Development Host validation.
-- [ ] Run the guided-issue specialist review, address material findings, and complete the retrospective.
+- [x] (2026-07-21 19:35Z) Ran `cargo fmt --check`, strict all-target/all-feature clippy, the complete `nlp,python` Rust test suite, 185 matching LSP integration tests, and all 64 VS Code tests.
+- [ ] Run manual Extension Development Host validation; automated editor behavior and the rendered 16/24-pixel icon assets are validated, but an interactive Extension Host was not available in this session.
+- [x] (2026-07-21 19:35Z) Completed the five-specialist guided review, fixed every Critical/High/Medium finding, and received clean senior and architecture re-reviews.
 
 ## Surprises & Discoveries
 
@@ -39,22 +40,28 @@ The behavior is visible by opening a workspace policy, changing it without savin
 - Observation: The shell resolved Homebrew's `clippy-driver` ahead of the repository-pinned rustup toolchain, producing incompatible compiler metadata despite matching version labels.
   Evidence: Reordering `PATH` to put `/Users/dave/.cargo/bin` first aligned Cargo, rustc, and clippy; the strict all-targets/all-features gate then reached source diagnostics and passed after correcting two test-only generic annotations.
 
+- Observation: The canonical run-diagnostic code is a serde-tagged object, and policy source identities and finding paths can inhabit different coordinate systems in a multi-root server.
+  Evidence: Review exposed both assumptions before release. The TypeScript decoder now accepts `{ "type": ... }` codes (including nested CodeQuery codes), while the LSP response separately names `policyRootUri` and `reportRootUri`; configured-root and multi-root tests assert both meanings.
+
+- Observation: The feature-complete implementation needed generation tracking in addition to request cancellation.
+  Evidence: VS Code cancellation is cooperative, so a superseded server response can still arrive. `PolicyRunTracker` gates publication by run ID and content revision, preventing older results from replacing newer ones and preserving a stale marker when content changes during a run.
+
 ## Decision Log
 
 - Decision: Reuse the canonical `PolicyReportDocument` wire shape rather than defining a flattened editor-only report.
   Rationale: Completion states, report diagnostics, findings, evidence, and truncation semantics already have one bounded canonical representation. A second shape would drift and could accidentally turn unsupported or failed runs into empty successes.
   Date/Author: 2026-07-21 / Codex
 
-- Decision: Select exactly one capability-confined workspace root from the active document URI and reject ambiguous, mismatched, traversing, or outside-workspace identities.
-  Rationale: Policy dependencies must resolve relative to the policy's real workspace without widening access to a common ancestor in a multi-root session.
+- Decision: Derive the policy source identity exclusively on the server from the active document URI and its deepest configured root.
+  Rationale: Policy dependencies must resolve relative to the policy's real configured root without trusting a client-provided relative identity or widening access to a common ancestor. This also supports absolute configured roots outside the editor's ordinary workspace folders.
   Date/Author: 2026-07-21 / Codex
 
 - Decision: Retain stale results with an explicit stale marker rather than clearing them silently.
   Rationale: Old evidence remains useful for inspection, but the UI must not imply it reflects changed policy or workspace state.
   Date/Author: 2026-07-21 / Codex
 
-- Decision: Validate the request identity against `Project::workspace_root_for_file` rather than directly selecting from the server's capability objects.
-  Rationale: The project already implements the authoritative deepest-root selection for single and multi-root workspaces. Comparing its portable relative path to the client-supplied identity rejects traversal and mismatches while giving evaluation only that owning root.
+- Decision: Return separate `policyRootUri` and `reportRootUri` coordinates from `bifrost/runPolicy`.
+  Rationale: Policy diagnostics and dependency identities are relative to the capability-confined policy root, while findings are serialized relative to the analyzer project's report root. Making both explicit prevents incorrect navigation in configured-root and multi-root sessions.
   Date/Author: 2026-07-21 / Codex
 
 - Decision: Generalize cancellable workers to distinguish cancellation from internal failure strings.
@@ -69,9 +76,19 @@ The behavior is visible by opening a workspace policy, changing it without savin
   Rationale: The document outline needs opposing contrast across VS Code themes while the red helmet should remain visually stable and immediately recognizable at 16 pixels.
   Date/Author: 2026-07-21 / Codex
 
+- Decision: Treat cancellation, stale publication, and successful-empty presentation as separate concerns.
+  Rationale: Cancellation limits wasted work, generation/revision tracking establishes which response may publish, and completion/diagnostic/truncation checks determine whether zero findings is genuinely clean. Combining these would allow races or unsupported runs to appear successful.
+  Date/Author: 2026-07-21 / Codex
+
+- Decision: Render all report-controlled tooltip text through `MarkdownString.appendText` and evidence through `appendCodeblock`.
+  Rationale: Findings and policy metadata are untrusted workspace content. Separating escaped data from fixed Markdown prevents command-link or formatting injection while preserving useful structured detail.
+  Date/Author: 2026-07-21 / Codex
+
 ## Outcomes & Retrospective
 
-All four implementation milestones are complete. `evaluate_policy_source` evaluates editor-provided bytes under their supplied identity with a caller-owned `IAnalyzer` and cancellation token. `bifrost/runPolicy` selects the owning workspace, rejects unsafe identities, uses the overlay-snapshot analyzer, and returns the canonical report plus root URI. VS Code now exposes a policy-only Play command and results view with explicit completion state, report diagnostics, finding severity/message/location/terminal, navigable ranges, secondary evidence detail, and conservative stale-result marking. Theme-specific Brokk-helmet document icons remain legible in inspected 16- and 24-pixel renders. Broad Rust gates, manual editor verification, and guided review remain.
+All four implementation milestones and automated validation are complete. `evaluate_policy_source` evaluates editor-provided bytes under a server-derived identity with a caller-owned `IAnalyzer`, capability-confined dependencies, and cancellation checks. `bifrost/runPolicy` selects the owning configured root, uses the overlay-snapshot analyzer, and returns the canonical report with explicit policy and report coordinate roots. VS Code now exposes a cancellable policy-only Play command and dedicated results view with exact completion semantics, run/report diagnostics and truncation, safe evidence tooltips, navigable findings, generation-safe publication, and conservative stale-result marking. Theme-specific Brokk-helmet document icons remain legible in inspected 16- and 24-pixel renders.
+
+The five-specialist review found and drove fixes for server-authoritative identity, configured roots outside editor workspaces, multi-root path coordinates, stale response races, user cancellation, unsupported/empty messaging, hidden diagnostics/truncation, canonical tagged diagnostic codes, Markdown injection, and duplicated policy input preparation. Senior and architecture re-reviews found no remaining Critical, High, or Medium issues; security retained only a Low observation that cancellation cannot interrupt one already-running bounded registry load. Formatting, strict clippy, the complete `cargo test --features nlp,python` suite, the 185-test LSP integration selection, and all 64 VS Code tests pass. Interactive Extension Development Host validation remains the sole unperformed acceptance step.
 
 ## Context and Orientation
 
@@ -87,7 +104,7 @@ RQL is Bifrost's structural query language. A `.rql` file is an ad hoc query; a 
 
 Milestone 1 introduces an internal coordinator pipeline that separates root input preparation, registry/evaluator/report coordination, and analyzer acquisition. Keep `evaluate_policy_files` unchanged for CLI callers: it canonicalizes the root, opens a `WorkspaceRoot`, reads the requested disk files, and builds one analyzer. Add a single-policy live-source entry point that accepts a validated workspace-relative `PolicySourceIdentity`, source bytes from the editor, an existing analyzer, and optional cancellation. It must register the active bytes under the supplied identity while every dependency continues to load through `PolicyRegistry::new_for_workspace`. Endpoint roots and invalid source must become canonical report diagnostics. Focused tests prove unsaved source overrides disk, dependency loading remains confined and functional, all completion states survive, and the live path does not construct another analyzer.
 
-Milestone 2 defines `bifrost/runPolicy` in `src/lsp/server.rs`. Its parameters carry the document URI, workspace-relative source identity, and live source. Request handling selects the exact active workspace root, validates that URI and identity describe the same in-root path, snapshots the current overlay, and runs the coordinator entry point through the existing cancellable-worker infrastructure. The result is the serialized canonical report plus enough root identity for source navigation. Integration tests in `tests/bifrost_lsp_server.rs` cover saved and unsaved match policies, clean runs, invalid source, endpoint-root rejection, unsupported taint and typestate, dependency forms, range serialization, identity rejection, and multi-root behavior where supported.
+Milestone 2 defines `bifrost/runPolicy` in `src/lsp/server.rs`. Its parameters carry the document URI and live source. Request handling derives the workspace-relative source identity from the exact owning configured root, snapshots the current overlay, and runs the coordinator entry point through the existing cancellable-worker infrastructure. The result is the serialized canonical report plus explicit policy-root and report-root identities for diagnostic and finding navigation. Integration tests in `tests/bifrost_lsp_server.rs` cover saved and unsaved match policies, clean runs, invalid source, endpoint-root rejection, unsupported taint and typestate, dependency forms, range serialization, configured roots, and multi-root behavior.
 
 Milestone 3 creates `editors/vscode/src/rql_policy.ts` for typed schema-version-one protocol models and the pure run helper, plus `rql_policy_results.ts` for a dedicated tree. The tree groups policy/run metadata above findings, shows exact completion state, severity, message, primary location, and terminal symbol, and exposes detailed evidence through tooltips or secondary expandable nodes. `extension.ts` registers Run Policy and finding navigation, focuses the dedicated view, and marks prior results stale when the active policy, workspace content, workspace folders, or server lifecycle changes. `package.json` contributes the Play button only for `bifrost-rql-policy`, a policy results view, and hidden internal navigation command. TypeScript tests cover request payloads, all states, diagnostics-only reports, rendering, navigation, staleness, and manifest conditions while retaining the test that policies never execute through the ordinary query command.
 
@@ -133,7 +150,7 @@ The issue branch began clean at `d49a4fe0`, which is also the fetched `origin/ma
 
 The final coordinator interface must provide a public single-root live-source function that accepts the workspace root, a portable `PolicySourceIdentity`, editor source text, the existing analyzer interface used by `PolicyEvaluationContext`, and cancellation where supported. Its result is `PolicyBatchOutcome`, whose report is the canonical `PolicyReportDocument`. The exact Rust signature may adapt to existing trait lifetimes, but it must not build a `WorkspaceAnalyzer` or read the root source from disk.
 
-The final private LSP interface is `bifrost/runPolicy`. Its request contains document URI, workspace-relative source identity, and source text. Its response includes the canonical report without parsing or embedding CLI-rendered text, plus the selected workspace root identity required to turn report paths into file URIs.
+The final private LSP interface is `bifrost/runPolicy`. Its request contains document URI and source text; the server derives the source identity. Its response includes the canonical report without parsing or embedding CLI-rendered text, `policyRootUri` for policy diagnostics and dependencies, and `reportRootUri` for finding-path navigation.
 
 The extension must define TypeScript wire types matching canonical schema version 1, a pure `runRqlPolicy` helper suitable for unit testing, and a dedicated `RqlPolicyResultsProvider`. Optional evidence fields may remain loosely typed at the edges where the UI only displays JSON detail, but required rule, run, completion, finding, severity, message, and source-location fields must be validated before rendering.
 
@@ -148,3 +165,5 @@ Revision note (2026-07-21 18:57Z): Marked Milestone 3 complete after adding type
 Revision note (2026-07-21 19:00Z): Marked Milestone 4 complete after replacing the generic icon with separate light/dark Brokk-helmet assets and visually inspecting Explorer-size renders.
 
 Revision note (2026-07-21 19:05Z): Recorded the pinned-toolchain clippy invocation and its clean result after fixing generic annotations in the cancellable-worker unit tests.
+
+Revision note (2026-07-21 19:35Z): Recorded final automated validation and the guided-review fixes for server-derived identity, configured/multi-root coordinates, cancellation and publication races, completion messaging, diagnostic projection, safe Markdown rendering, and canonical tagged diagnostic codes. Senior and architecture re-reviews are clean; only interactive Extension Host validation remains.

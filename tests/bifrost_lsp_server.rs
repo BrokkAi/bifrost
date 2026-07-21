@@ -1177,6 +1177,12 @@ fn bifrost_lsp_server_runs_unsaved_rqlp_source_with_workspace_identity() {
     let root = temp.path().canonicalize().expect("canonical root");
     fs::write(root.join("app.ts"), "export function target() {}\n").expect("write source fixture");
     fs::create_dir(root.join("policies")).expect("create policies directory");
+    fs::create_dir(root.join("queries")).expect("create query directory");
+    fs::write(
+        root.join("queries/target.rql"),
+        r#"(rql :schema-version 2 (language typescript (function :name "target")))"#,
+    )
+    .expect("write selector dependency");
     let policy_path = root.join("policies/live.rqlp");
     fs::write(
         &policy_path,
@@ -1212,13 +1218,13 @@ fn bifrost_lsp_server_runs_unsaved_rqlp_source_with_workspace_identity() {
         "bifrost/runPolicy",
         json!({
             "documentUri": uri_for(&policy_path),
-            "sourceIdentity": "policies/live.rqlp",
             "source": unsaved,
         }),
     );
 
     assert!(response["error"].is_null(), "{response}");
-    assert_eq!(response["result"]["workspaceRootUri"], uri_for(&root));
+    assert_eq!(response["result"]["policyRootUri"], uri_for(&root));
+    assert_eq!(response["result"]["reportRootUri"], uri_for(&root));
     assert_eq!(
         response["result"]["report"]["rules"][0]["policy_id"],
         "test.unsaved"
@@ -1237,11 +1243,43 @@ fn bifrost_lsp_server_runs_unsaved_rqlp_source_with_workspace_identity() {
     assert_eq!(findings.len(), 1, "{response}");
     assert_eq!(findings[0]["primary"]["path"], "app.ts");
 
+    let file_selector = server.request(
+        "bifrost/runPolicy",
+        json!({
+            "documentUri": uri_for(&policy_path),
+            "source": r#"(policy
+  :schema-version 1
+  :id "test.file-selector"
+  :name "File selector"
+  :message "Avoid target"
+  :severity warning
+  :analysis (analysis :type match :selector (rql-file :path "queries/target.rql")))"#,
+        }),
+    );
+    assert!(file_selector["error"].is_null(), "{file_selector}");
+    assert_eq!(
+        file_selector["result"]["report"]["runs"][0]["findings"][0]["primary"]["path"],
+        "app.ts"
+    );
+
+    let clean = server.request(
+        "bifrost/runPolicy",
+        json!({
+            "documentUri": uri_for(&policy_path),
+            "source": unsaved.replace("target", "missing_target"),
+        }),
+    );
+    assert!(clean["error"].is_null(), "{clean}");
+    assert_eq!(
+        clean["result"]["report"]["runs"][0]["completion"]["type"],
+        "complete"
+    );
+    assert_eq!(clean["result"]["report"]["runs"][0]["findings"], json!([]));
+
     let invalid = server.request(
         "bifrost/runPolicy",
         json!({
             "documentUri": uri_for(&policy_path),
-            "sourceIdentity": "policies/live.rqlp",
             "source": "(policy",
         }),
     );
@@ -1255,7 +1293,6 @@ fn bifrost_lsp_server_runs_unsaved_rqlp_source_with_workspace_identity() {
         "bifrost/runPolicy",
         json!({
             "documentUri": uri_for(&policy_path),
-            "sourceIdentity": "policies/live.rqlp",
             "source": r#"(endpoint
   :id "endpoint.input"
   :name "Input"
@@ -1277,7 +1314,6 @@ fn bifrost_lsp_server_runs_unsaved_rqlp_source_with_workspace_identity() {
         "bifrost/runPolicy",
         json!({
             "documentUri": uri_for(&policy_path),
-            "sourceIdentity": "policies/live.rqlp",
             "source": r#"(policy
   :id "test.taint"
   :name "Taint"
@@ -1306,36 +1342,211 @@ fn bifrost_lsp_server_runs_unsaved_rqlp_source_with_workspace_identity() {
         "{taint}"
     );
 
-    let mismatched = server.request(
+    let typestate = server.request(
         "bifrost/runPolicy",
         json!({
             "documentUri": uri_for(&policy_path),
-            "sourceIdentity": "policies/other.rqlp",
-            "source": unsaved,
+            "source": r#"(policy
+  :id "test.typestate"
+  :name "Typestate"
+  :message "Resource was not closed"
+  :severity error
+  :analysis (analysis
+    :type typestate
+    :mode may
+    :subjects (subject-set :entries [
+      (subject :id resource :selector (rql (call :callee (name "open_resource")))
+        :subject return-value)])
+    :uncertainty (uncertainty :unknown-call inconclusive :escape inconclusive)
+    :automaton (automaton
+      :states [open closed violated]
+      :initial open
+      :accepting-states [closed]
+      :error-states [violated]
+      :events [
+        (event :id close
+          :calls (calls :selector (rql (call :callee (name "close_resource")))
+            :subject receiver :phase after-normal-return))]
+      :transitions [(transition :from open :on close :to closed)]
+      :terminal-expectations [
+        (terminal-expectation :id normal-exit
+          :on (normal-procedure-exit :scope analysis-root)
+          :expected-states [closed])])))"#,
         }),
     );
-    assert_eq!(mismatched["error"]["code"], -32602, "{mismatched}");
-    assert!(
-        mismatched["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("does not match document path")),
-        "{mismatched}"
+    assert!(typestate["error"].is_null(), "{typestate}");
+    assert_eq!(
+        typestate["result"]["report"]["runs"][0]["completion"]["type"], "unsupported",
+        "{typestate}"
+    );
+    assert_eq!(
+        typestate["result"]["report"]["runs"][0]["completion"]["capability"]["type"],
+        "typestate_evaluation",
+        "{typestate}"
     );
 
-    let traversing = server.request(
+    let wrong_extension = server.request(
         "bifrost/runPolicy",
         json!({
-            "documentUri": uri_for(&policy_path),
-            "sourceIdentity": "../outside.rqlp",
+            "documentUri": uri_for(&root.join("app.ts")),
             "source": unsaved,
         }),
     );
-    assert_eq!(traversing["error"]["code"], -32602, "{traversing}");
+    assert_eq!(
+        wrong_extension["error"]["code"], -32602,
+        "{wrong_extension}"
+    );
     assert!(
-        traversing["error"]["message"]
+        wrong_extension["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("must not contain `..`")),
-        "{traversing}"
+            .is_some_and(|message| message.contains("`.rqlp` document URI")),
+        "{wrong_extension}"
+    );
+
+    let outside = TempDir::new().expect("outside tempdir");
+    let outside_policy = outside.path().join("outside.rqlp");
+    fs::write(&outside_policy, unsaved).expect("write outside policy");
+    let outside_response = server.request(
+        "bifrost/runPolicy",
+        json!({
+            "documentUri": uri_for(&outside_policy),
+            "source": unsaved,
+        }),
+    );
+    assert_eq!(
+        outside_response["error"]["code"], -32602,
+        "{outside_response}"
+    );
+    assert!(
+        outside_response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("outside the active Bifrost workspace")),
+        "{outside_response}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_derives_policy_identity_from_configured_root() {
+    let workspace = TempDir::new().expect("workspace tempdir");
+    let parent = workspace.path().canonicalize().expect("canonical root");
+    let configured = TempDir::new().expect("external configured root");
+    let included = configured.path().canonicalize().expect("configured root");
+    let policies = included.join("policies");
+    fs::create_dir_all(&policies).expect("create configured policy root");
+    fs::write(included.join("app.ts"), "export function target() {}\n")
+        .expect("write configured-root source");
+    let policy_path = policies.join("live.rqlp");
+    fs::write(&policy_path, "").expect("write policy placeholder");
+    let source = r#"(policy
+  :schema-version 1
+  :id "test.configured-root"
+  :name "Configured root"
+  :message "Avoid target"
+  :severity warning
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql :schema-version 2
+          (language typescript (function :name "target")))))"#;
+    let mut server = LspServer::start_with_params(
+        &parent,
+        json!({
+            "processId": null,
+            "rootUri": uri_for(&parent),
+            "workspaceFolders": [{"uri": uri_for(&parent), "name": "workspace"}],
+            "initializationOptions": {"roots": [included.display().to_string()]},
+            "capabilities": {"workspace": {"workspaceFolders": true}}
+        }),
+    );
+
+    let response = server.request(
+        "bifrost/runPolicy",
+        json!({"documentUri": uri_for(&policy_path), "source": source}),
+    );
+
+    assert!(response["error"].is_null(), "{response}");
+    assert_eq!(response["result"]["policyRootUri"], uri_for(&included));
+    assert_eq!(response["result"]["reportRootUri"], uri_for(&included));
+    assert_eq!(
+        response["result"]["report"]["runs"][0]["findings"][0]["primary"]["path"],
+        "app.ts"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_returns_multi_root_finding_paths_in_report_coordinates() {
+    let temp = TempDir::new().expect("tempdir");
+    let parent = temp.path().canonicalize().expect("canonical root");
+    let service_a = parent.join("service-a");
+    let service_b = parent.join("service-b");
+    fs::create_dir_all(service_a.join("policies")).expect("create service-a policies");
+    fs::create_dir_all(&service_b).expect("create service-b");
+    fs::write(service_a.join("app.ts"), "export function target() {}\n")
+        .expect("write service-a source");
+    fs::write(service_b.join("other.ts"), "export function other() {}\n")
+        .expect("write service-b source");
+    let policy_path = service_a.join("policies/live.rqlp");
+    fs::write(&policy_path, "").expect("write policy placeholder");
+    let source = r#"(policy
+  :schema-version 1
+  :id "test.multi-root"
+  :name "Multi root"
+  :message "Avoid target"
+  :severity warning
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql :schema-version 2
+          (language typescript (function :name "target")))))"#;
+    let mut server = LspServer::start_with_params(
+        &parent,
+        json!({
+            "processId": null,
+            "rootUri": uri_for(&parent),
+            "workspaceFolders": [{"uri": uri_for(&parent), "name": "workspace"}],
+            "initializationOptions": {
+                "roots": [service_a.display().to_string(), service_b.display().to_string()]
+            },
+            "capabilities": {"workspace": {"workspaceFolders": true}}
+        }),
+    );
+
+    let response = server.request(
+        "bifrost/runPolicy",
+        json!({"documentUri": uri_for(&policy_path), "source": source}),
+    );
+
+    assert!(response["error"].is_null(), "{response}");
+    assert_eq!(response["result"]["policyRootUri"], uri_for(&service_a));
+    assert_eq!(response["result"]["reportRootUri"], uri_for(&parent));
+    assert_eq!(
+        response["result"]["report"]["runs"][0]["findings"][0]["primary"]["path"],
+        "service-a/app.ts"
+    );
+
+    let endpoint = server.request(
+        "bifrost/runPolicy",
+        json!({
+            "documentUri": uri_for(&policy_path),
+            "source": r#"(endpoint
+  :id "endpoint.input"
+  :name "Input"
+  :display-name "input"
+  :role source
+  :categories [input.user]
+  :selector (rql (language typescript (function :name "target")))
+  :binding return-value
+  :supersedes [])"#,
+        }),
+    );
+    assert!(endpoint["error"].is_null(), "{endpoint}");
+    assert_eq!(endpoint["result"]["policyRootUri"], uri_for(&service_a));
+    assert_eq!(endpoint["result"]["reportRootUri"], uri_for(&parent));
+    assert_eq!(
+        endpoint["result"]["report"]["diagnostics"][0]["source"],
+        "policies/live.rqlp"
     );
 }
 

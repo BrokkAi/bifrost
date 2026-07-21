@@ -2,10 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   RUN_RQL_POLICY_METHOD,
+  PolicyRunTracker,
   policyCompletionDetail,
   policyCompletionLabel,
   policyFindingTerminalSymbol,
   policyLocationRange,
+  policyReportCompletedWithoutFindings,
+  policyRunDiagnosticCodeLabel,
   runRqlPolicy,
   type PolicyFinding,
   type RqlPolicyRunner
@@ -14,7 +17,8 @@ import { RQL_POLICY_LANGUAGE_ID } from "../src/rql_validation";
 
 function response(completion: unknown = { type: "complete" }): unknown {
   return {
-    workspaceRootUri: "file:///workspace",
+    policyRootUri: "file:///workspace/service-a",
+    reportRootUri: "file:///workspace",
     report: {
       schema_version: 1,
       rules: [
@@ -32,7 +36,8 @@ function response(completion: unknown = { type: "complete" }): unknown {
           analysis_type: "match",
           completion,
           findings: [],
-          diagnostics: []
+          diagnostics: [],
+          diagnostics_truncated: false
         }
       ],
       diagnostics: [],
@@ -53,14 +58,12 @@ function runner(overrides: Partial<RqlPolicyRunner> = {}): RqlPolicyRunner {
   };
 }
 
-void test("runs unsaved policy text with URI and workspace-relative identity", async () => {
+void test("runs unsaved policy text and lets the server derive workspace identity", async () => {
   const requests: Array<[string, unknown]> = [];
   const result = await runRqlPolicy(
     {
       languageId: RQL_POLICY_LANGUAGE_ID,
       uri: "file:///workspace/policies/live.rqlp",
-      workspaceRootUri: "file:///workspace",
-      sourceIdentity: "policies/live.rqlp",
       text: '(policy :id "test.unsaved")'
     },
     runner({
@@ -77,7 +80,6 @@ void test("runs unsaved policy text with URI and workspace-relative identity", a
       RUN_RQL_POLICY_METHOD,
       {
         documentUri: "file:///workspace/policies/live.rqlp",
-        sourceIdentity: "policies/live.rqlp",
         source: '(policy :id "test.unsaved")'
       }
     ]
@@ -95,8 +97,6 @@ void test("keeps every policy completion state explicit", async () => {
       {
         languageId: RQL_POLICY_LANGUAGE_ID,
         uri: "file:///workspace/p.rqlp",
-        workspaceRootUri: "file:///workspace",
-        sourceIdentity: "p.rqlp",
         text: "(policy)"
       },
       runner({ sendRequest: () => Promise.resolve(response(completion)) })
@@ -105,6 +105,65 @@ void test("keeps every policy completion state explicit", async () => {
     assert.equal(policyCompletionLabel(completion), completion.type);
     assert.ok(policyCompletionDetail(completion).includes(completion.type));
   }
+});
+
+void test("accepts and labels canonical tagged run diagnostics", async () => {
+  const unsupported = response({
+    type: "unsupported",
+    capability: { type: "taint_evaluation" }
+  }) as {
+    report: { runs: Array<{ diagnostics: unknown[] }> };
+  };
+  unsupported.report.runs[0].diagnostics = [
+    {
+      code: { type: "unsupported_analysis" },
+      severity: "warning",
+      impact: "run_unsupported",
+      message: "Taint evaluation is not supported.",
+      primary: null,
+      related: []
+    },
+    {
+      code: { type: "code_query", code: "execution_budget_exhausted" },
+      severity: "warning",
+      impact: "run_incomplete",
+      message: "The query budget was exhausted.",
+      primary: null,
+      related: []
+    }
+  ];
+
+  const result = await runRqlPolicy(
+    {
+      languageId: RQL_POLICY_LANGUAGE_ID,
+      uri: "file:///external/p.rqlp",
+      text: "(policy)"
+    },
+    runner({ sendRequest: () => Promise.resolve(unsupported) })
+  );
+
+  assert.equal(result?.report.runs[0].diagnostics.length, 2);
+  assert.equal(
+    policyRunDiagnosticCodeLabel(result.report.runs[0].diagnostics[0].code),
+    "unsupported_analysis"
+  );
+  assert.equal(
+    policyRunDiagnosticCodeLabel(result.report.runs[0].diagnostics[1].code),
+    "code_query:execution_budget_exhausted"
+  );
+});
+
+void test("treats only complete diagnostic-free zero-finding reports as clean", () => {
+  const complete = response() as {
+    report: Parameters<typeof policyReportCompletedWithoutFindings>[0];
+  };
+  const unsupported = response({
+    type: "unsupported",
+    capability: { type: "taint_evaluation" }
+  }) as typeof complete;
+
+  assert.equal(policyReportCompletedWithoutFindings(complete.report), true);
+  assert.equal(policyReportCompletedWithoutFindings(unsupported.report), false);
 });
 
 void test("extracts terminal symbols while keeping evidence structured", () => {
@@ -139,15 +198,13 @@ void test("extracts terminal symbols while keeping evidence structured", () => {
   );
 });
 
-void test("rejects wrong documents, missing workspaces, and outdated report shapes", async () => {
+void test("rejects wrong documents and outdated report shapes", async () => {
   const warnings: string[] = [];
   const errors: string[] = [];
   let requests = 0;
   const base = {
     languageId: RQL_POLICY_LANGUAGE_ID,
     uri: "file:///workspace/p.rqlp",
-    workspaceRootUri: "file:///workspace",
-    sourceIdentity: "p.rqlp",
     text: "(policy)"
   };
   const testRunner = runner({
@@ -160,12 +217,24 @@ void test("rejects wrong documents, missing workspaces, and outdated report shap
   });
 
   assert.equal(await runRqlPolicy({ ...base, languageId: "bifrost-rql" }, testRunner), undefined);
-  assert.equal(
-    await runRqlPolicy({ ...base, workspaceRootUri: "", sourceIdentity: "" }, testRunner),
-    undefined
-  );
   assert.equal(await runRqlPolicy(base, testRunner), undefined);
   assert.equal(requests, 1);
-  assert.equal(warnings.length, 2);
+  assert.equal(warnings.length, 1);
   assert.match(errors[0], /updated language server/);
+});
+
+void test("publishes only the newest run and preserves changes during execution", () => {
+  const tracker = new PolicyRunTracker();
+  const first = tracker.beginRun();
+  const second = tracker.beginRun();
+
+  assert.deepEqual(tracker.publicationFor(first), { publish: false });
+  assert.deepEqual(tracker.publicationFor(second), { publish: true, staleReason: undefined });
+
+  const third = tracker.beginRun();
+  tracker.markChanged("policy changed");
+  assert.deepEqual(tracker.publicationFor(third), {
+    publish: true,
+    staleReason: "policy changed"
+  });
 });

@@ -1191,7 +1191,7 @@ fn handle_run_rql_policy_request(
     };
 
     let (workspace_root, source_identity) =
-        match validate_run_policy_identity(state.project(), &params) {
+        match resolve_run_policy_identity(state.project(), &params.document_uri) {
             Ok(validated) => validated,
             Err(message) => {
                 let response = Response::new_err(id, ErrorCode::InvalidParams as i32, message);
@@ -1202,7 +1202,10 @@ fn handle_run_rql_policy_request(
             }
         };
     let source = params.source;
-    let workspace_root_uri = path_to_uri_string(&workspace_root);
+    // Policy dependencies are confined to `workspace_root`, while analyzer
+    // result paths are relative to the active project's report coordinate root.
+    let policy_root_uri = path_to_uri_string(&workspace_root);
+    let report_root_uri = path_to_uri_string(state.project().root());
 
     start_cancellable_worker(
         connection,
@@ -1227,36 +1230,32 @@ fn handle_run_rql_policy_request(
                 Some(cancellation),
             )
             .map_err(|error| {
-                CancellableWorkerError::Failed(format!("Failed to evaluate RQL policy: {error}"))
+                if cancellation.is_cancelled() {
+                    CancellableWorkerError::Cancelled
+                } else {
+                    CancellableWorkerError::Failed(format!(
+                        "Failed to evaluate RQL policy: {error}"
+                    ))
+                }
             })?;
             if cancellation.is_cancelled() {
                 return Err(CancellableWorkerError::Cancelled);
             }
             Ok(RunRqlPolicyResult {
-                workspace_root_uri,
+                policy_root_uri,
+                report_root_uri,
                 report: outcome.into_report(),
             })
         },
     )
 }
 
-fn validate_run_policy_identity(
+fn resolve_run_policy_identity(
     project: &dyn Project,
-    params: &RunRqlPolicyParams,
+    document_uri: &Uri,
 ) -> Result<(PathBuf, PolicySourceIdentity), String> {
-    let document_path = uri_to_path(&params.document_uri)
+    let document_path = uri_to_path(document_uri)
         .ok_or_else(|| "Run Policy requires a file document URI".to_string())?;
-    let source_path = WorkspaceRelativePath::new(&params.source_identity)
-        .map_err(|error| format!("Invalid policy source identity: {error}"))?;
-    if source_path
-        .as_path()
-        .extension()
-        .and_then(|value| value.to_str())
-        != Some("rqlp")
-    {
-        return Err("Run Policy requires an `.rqlp` source identity".to_string());
-    }
-
     let project_file = project
         .file_by_abs_path_allow_missing(&document_path)
         .ok_or_else(|| "Run Policy document is outside the active Bifrost workspace".to_string())?;
@@ -1265,14 +1264,15 @@ fn validate_run_policy_identity(
     let expected_relative = project_file_path
         .strip_prefix(&workspace_root)
         .map_err(|_| "Run Policy could not determine the document workspace root".to_string())?;
-    let expected_identity = WorkspaceRelativePath::try_from_path(expected_relative)
+    let source_path = WorkspaceRelativePath::try_from_path(expected_relative)
         .map_err(|error| format!("Run Policy document path is not portable: {error}"))?;
-    if source_path != expected_identity {
-        return Err(format!(
-            "Run Policy source identity `{}` does not match document path `{}`",
-            source_path.as_str(),
-            expected_identity.as_str()
-        ));
+    if source_path
+        .as_path()
+        .extension()
+        .and_then(|value| value.to_str())
+        != Some("rqlp")
+    {
+        return Err("Run Policy requires an `.rqlp` document URI".to_string());
     }
 
     Ok((
@@ -2142,14 +2142,14 @@ impl lsp_types::request::Request for RunRqlPolicy {
 #[serde(rename_all = "camelCase")]
 struct RunRqlPolicyParams {
     document_uri: Uri,
-    source_identity: String,
     source: String,
 }
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RunRqlPolicyResult {
-    workspace_root_uri: String,
+    policy_root_uri: String,
+    report_root_uri: String,
     report: PolicyReportDocument,
 }
 
