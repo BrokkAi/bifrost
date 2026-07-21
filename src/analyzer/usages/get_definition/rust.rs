@@ -1548,10 +1548,7 @@ fn rust_token_tree_dotted_member_outcome(
 
     let mut chain = vec![focused];
     let mut current = focused;
-    loop {
-        let Some(separator) = current.prev_sibling() else {
-            break;
-        };
+    while let Some(separator) = current.prev_sibling() {
         if separator.kind() != "." {
             break;
         }
