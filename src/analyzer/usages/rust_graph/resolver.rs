@@ -1,3 +1,4 @@
+use crate::analyzer::rust::lexical_scope;
 use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
 use crate::analyzer::{
     CodeUnit, GlobalUsageDefinitionIndex, IAnalyzer, ProjectFile, RustAnalyzer,
@@ -158,13 +159,33 @@ fn resolve_token_path_segment_fqn(
 ) -> Option<String> {
     let Some(owner_terminal) = owner_terminal else {
         let path = source.get(root.start_byte()..segment.end_byte())?.trim();
-        return resolve_rust_path_fqn(rust, refs, file, path)
-            .filter(|fqn| !support.fqn(fqn).is_empty());
+        return lexical_import_fqn(rust, support, file, source, root).or_else(|| {
+            resolve_rust_path_fqn(rust, refs, file, path).filter(|fqn| !support.fqn(fqn).is_empty())
+        });
     };
     let owner = source
         .get(root.start_byte()..owner_terminal.end_byte())?
         .trim();
     let name = source.get(segment.start_byte()..segment.end_byte())?.trim();
+    if owner_terminal.start_byte() == root.start_byte()
+        && owner_terminal.end_byte() == root.end_byte()
+        && let Some(owner_fqn) = lexical_import_fqn(rust, support, file, source, root)
+    {
+        let fqns: BTreeSet<_> = support
+            .members_for_owner_name(&owner_fqn, name)
+            .into_iter()
+            .map(|candidate| candidate.fq_name())
+            .collect();
+        if fqns.len() == 1 {
+            return fqns.into_iter().next();
+        }
+    }
+    let full_path = source.get(root.start_byte()..segment.end_byte())?.trim();
+    if let Some(fqn) = resolve_rust_path_fqn(rust, refs, file, full_path)
+        && !support.fqn(&fqn).is_empty()
+    {
+        return Some(fqn);
+    }
     match resolve_scoped_associated_item(rust, support, refs, file, owner, name) {
         ReceiverAnalysisOutcome::Precise(candidates) => {
             let mut fqns = candidates.into_iter().map(|candidate| candidate.fq_name());
@@ -175,6 +196,32 @@ fn resolve_token_path_segment_fqn(
         | ReceiverAnalysisOutcome::Unknown
         | ReceiverAnalysisOutcome::Unsupported { .. }
         | ReceiverAnalysisOutcome::ExceededBudget { .. } => None,
+    }
+}
+
+fn lexical_import_fqn(
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    segment: Node<'_>,
+) -> Option<String> {
+    let name = source.get(segment.start_byte()..segment.end_byte())?.trim();
+    let mut root = segment;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let binder = lexical_scope::visible_import_binder_in_tree(root, source, segment.start_byte());
+    let fqns: BTreeSet<_> = rust
+        .resolve_imported_export_from_binder_forward(file, &binder, name)
+        .into_iter()
+        .flat_map(|(target_file, target_name)| support.file_identifier(&target_file, &target_name))
+        .map(|candidate| candidate.fq_name())
+        .collect();
+    if fqns.len() == 1 {
+        fqns.into_iter().next()
+    } else {
+        None
     }
 }
 
@@ -263,37 +310,40 @@ pub(super) fn trait_member_for_impl_member(
     rust.get_direct_ancestors(&owner)
         .into_iter()
         .filter(|trait_unit| rust.is_rust_trait_declaration(trait_unit))
-        .find_map(|trait_unit| trait_member(rust, &trait_unit, target.identifier()))
+        .find_map(|trait_unit| trait_member(rust, &trait_unit, target))
 }
 
 fn is_trait_impl_member_target(rust: &RustAnalyzer, target: &CodeUnit, owner: &CodeUnit) -> bool {
     if !(target.is_function() || target.is_field()) || rust.is_rust_trait_declaration(owner) {
         return false;
     }
-    if rust.is_rust_trait_impl_member_declaration(target) {
-        return true;
-    }
-    rust.get_direct_ancestors(owner)
-        .into_iter()
-        .filter(|trait_unit| rust.is_rust_trait_declaration(trait_unit))
-        .any(|trait_unit| trait_member(rust, &trait_unit, target.identifier()).is_some())
+    rust.is_rust_trait_impl_member_declaration(target)
 }
 
-fn trait_member(rust: &RustAnalyzer, trait_unit: &CodeUnit, member_name: &str) -> Option<CodeUnit> {
+fn trait_member(
+    rust: &RustAnalyzer,
+    trait_unit: &CodeUnit,
+    impl_member: &CodeUnit,
+) -> Option<CodeUnit> {
+    let has_parameters = impl_member.is_function();
     rust.exact_member(
         trait_unit.source(),
         trait_unit.identifier(),
-        member_name,
-        true,
+        impl_member.identifier(),
+        has_parameters,
     )
-    .or_else(|| {
-        rust.exact_member(
-            trait_unit.source(),
-            trait_unit.identifier(),
-            member_name,
-            false,
-        )
-    })
+    .filter(|trait_member| rust_member_roles_match(rust, impl_member, trait_member))
+}
+
+fn rust_member_roles_match(
+    rust: &RustAnalyzer,
+    impl_member: &CodeUnit,
+    trait_member: &CodeUnit,
+) -> bool {
+    (impl_member.is_function() && trait_member.is_function())
+        || (impl_member.is_field()
+            && trait_member.is_field()
+            && rust.is_type_alias(impl_member) == rust.is_type_alias(trait_member))
 }
 
 pub(crate) fn resolve_scoped_associated_item(

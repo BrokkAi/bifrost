@@ -239,9 +239,16 @@ fn shadowed(filter_as_usize: fn(&Option<Level>) -> usize) -> usize {
 #[test]
 fn inverse_rust_usages_resolve_nested_self_crate_import_through_private_module_reexport() {
     let consumer = r#"
-fn main() {
+macro_rules! consume { ($value:expr) => {}; }
+
+fn small() {
     use demo::{Arena, Options};
     let _arena = Arena;
+    consume!(Options::default());
+}
+
+fn large() {
+    use demo::Options;
     let _options = Options::default();
 }
 "#;
@@ -270,15 +277,15 @@ fn main() {
     let target = definition(&analyzer, "parser.options.Options");
     let candidates = [project.file("examples/client.rs")].into_iter().collect();
     let found = authoritative_hits(&analyzer, target, candidates);
-    let expected = consumer
-        .rfind("Options")
-        .map(|start| (start, start + "Options".len()))
-        .expect("Options constructor reference");
+    let expected: Vec<_> = consumer
+        .match_indices("Options::default")
+        .map(|(start, _)| (start, start + "Options".len()))
+        .collect();
 
     assert!(
-        found
+        expected.iter().all(|expected| found
             .iter()
-            .any(|hit| (hit.start_offset, hit.end_offset) == expected),
+            .any(|hit| (hit.start_offset, hit.end_offset) == *expected)),
         "nested import must resolve through the public re-export chain: {found:#?}"
     );
 
@@ -386,6 +393,15 @@ pub struct KeySerializer;
 impl Serializer for KeySerializer {
     type Error = Error;
     type Sequence = Impossible<Self::Error, Error>;
+
+    fn failure(&self) -> Result<(), Error> {
+        let _value: Error = Error;
+        Ok(())
+    }
+
+    fn associated(&self) -> Option<Self::Error> {
+        None
+    }
 }
 
 fn local_alias() {
@@ -420,13 +436,31 @@ fn local_alias() {
         .map(|start| start + "Self::".len())
         .map(|start| (start, start + "Error".len()))
         .expect("Self associated type reference");
+    let method_import_references: Vec<_> = ["Result<(), Error>", "_value: Error", "= Error;"]
+        .into_iter()
+        .map(|needle| {
+            consumer
+                .find(needle)
+                .map(|start| start + needle.rfind("Error").expect("Error in method marker"))
+                .map(|start| (start, start + "Error".len()))
+                .unwrap_or_else(|| panic!("missing method Error reference marker {needle}"))
+        })
+        .collect();
+    let method_self_associated = consumer
+        .rfind("Self::Error")
+        .map(|start| start + "Self::".len())
+        .map(|start| (start, start + "Error".len()))
+        .expect("method Self associated type reference");
     let local_alias_reference = consumer
         .find("let _: Error")
         .map(|start| start + "let _: ".len())
         .map(|start| (start, start + "Error".len()))
         .expect("local type alias reference");
 
-    for expected in [direct_rhs, generic_rhs] {
+    for expected in [direct_rhs, generic_rhs]
+        .into_iter()
+        .chain(method_import_references)
+    {
         assert!(
             found
                 .iter()
@@ -435,10 +469,12 @@ fn local_alias() {
         );
     }
     assert!(
-        found
-            .iter()
-            .all(|hit| ![self_associated, local_alias_reference]
-                .contains(&(hit.start_offset, hit.end_offset))),
+        found.iter().all(|hit| ![
+            self_associated,
+            method_self_associated,
+            local_alias_reference
+        ]
+        .contains(&(hit.start_offset, hit.end_offset))),
         "associated and local aliases must remain distinct from the imported type: {found:#?}"
     );
 }

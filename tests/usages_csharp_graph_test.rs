@@ -22,6 +22,93 @@ fn csharp_analyzer_with_files(
     (project, analyzer)
 }
 
+#[test]
+fn csharp_graph_resolves_delegate_valued_properties_without_method_conflation() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "src/Configuration.cs",
+            r#"namespace Demo;
+
+public delegate bool ConstructorPolicy(int value, int adjustment = 0);
+
+public interface IConfiguration
+{
+    ConstructorPolicy Select { get; }
+}
+
+public class Configuration : IConfiguration
+{
+    public ConstructorPolicy Select { get; set; } = (value, adjustment) => value + adjustment > 0;
+}
+
+public sealed class ShadowConfiguration : Configuration
+{
+    public new ConstructorPolicy Select { get; set; } = (value, adjustment) => value + adjustment > 0;
+}
+
+public sealed class OtherConfiguration
+{
+    public ConstructorPolicy Select { get; set; } = (value, adjustment) => value + adjustment > 0;
+}
+
+public sealed class MethodConfiguration
+{
+    public bool Select(int value) => value > 0;
+}
+"#,
+        ),
+        (
+            "src/Consumer.cs",
+            r#"namespace Demo;
+
+public sealed class Consumer
+{
+    public bool ThroughConcrete(Configuration configuration) => configuration.Select(1);
+
+    public bool ThroughInterface(IConfiguration configuration) => configuration.Select(2, 3);
+
+    public bool ThroughShadow(ShadowConfiguration configuration) => configuration.Select(3);
+
+    public bool ThroughOtherOwner(OtherConfiguration configuration) => configuration.Select(4);
+
+    public bool ThroughOrdinaryMethod(MethodConfiguration configuration) => configuration.Select(5);
+
+    public bool ThroughLocalShadow()
+    {
+        ConstructorPolicy Select = (value, adjustment) => value + adjustment > 0;
+        return Select(6);
+    }
+}
+"#,
+        ),
+    ]);
+
+    let concrete = member_field(&analyzer, "Demo.Configuration", "Select");
+    let interface = member_field(&analyzer, "Demo.IConfiguration", "Select");
+
+    for (target, expected_snippet) in [
+        (concrete, "configuration.Select(1)"),
+        (interface, "configuration.Select(2, 3)"),
+    ] {
+        let graph = graph_hits(&analyzer, &target);
+        let routed = UsageFinder::new()
+            .query(&analyzer, std::slice::from_ref(&target), 1000, 1000)
+            .result
+            .into_either()
+            .unwrap_or_else(|error| panic!("{} should route: {error}", target.fq_name()));
+        for hits in [&graph, &routed] {
+            assert_eq!(1, hits.len(), "{}: {hits:#?}", target.fq_name());
+            assert!(
+                hits.iter().all(|hit| {
+                    hit.file == project.file("src/Consumer.cs")
+                        && hit.snippet.contains(expected_snippet)
+                }),
+                "delegate-property lookup must preserve receiver-owner identity and exclude member shadows, local shadows, and ordinary methods: {hits:#?}"
+            );
+        }
+    }
+}
+
 fn definition_by<F>(analyzer: &CSharpAnalyzer, mut predicate: F) -> CodeUnit
 where
     F: FnMut(&CodeUnit) -> bool,
@@ -456,6 +543,114 @@ public class OtherOuter {
             && hit.start_offset <= other_call
             && other_call + "Target".len() <= hit.end_offset
     }));
+}
+
+#[test]
+fn usage_finder_csharp_resolves_generic_nested_constructor_with_independent_owner_arity() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[(
+        "Demo/NestedGeneric.cs",
+        r#"namespace Demo;
+
+public class ClassMapBuilder<TClass> {
+    private object? map;
+
+    public void Build() {
+        map = new BuilderClassMap<TClass>();
+    }
+
+    public class BuilderClassMap<T> {}
+}
+
+public class OtherBuilder<TClass> {
+    public class BuilderClassMap<T> {}
+    public object Build() => new BuilderClassMap<TClass>();
+}
+
+public class ClassMapBuilder<TClass, TExtra> {
+    public class BuilderClassMap<T> {}
+    public object Build() => new BuilderClassMap<TClass>();
+}
+
+public class OtherArityBuilder<TClass> {
+    public class BuilderClassMap<TFirst, TSecond> {}
+    public object Build() => new BuilderClassMap<TClass, TClass>();
+}
+"#,
+    )]);
+
+    let consumer = project.file("Demo/NestedGeneric.cs");
+    let source = consumer.read_to_string().expect("nested generic source");
+    let target_call = source
+        .find("BuilderClassMap<TClass>();")
+        .expect("target nested generic construction");
+    let other_owner_call = source
+        .find("=> new BuilderClassMap<TClass>();")
+        .expect("other-owner generic control")
+        + "=> new ".len();
+    let other_outer_arity_call = source
+        .rfind("BuilderClassMap<TClass>();")
+        .expect("different outer-arity control");
+    let other_inner_arity_call = source
+        .find("BuilderClassMap<TClass, TClass>();")
+        .expect("different inner-arity control");
+    let target = type_definition(&analyzer, "Demo.ClassMapBuilder`1$BuilderClassMap`1");
+
+    let forward = definition_lookup(
+        project.root(),
+        "Demo/NestedGeneric.cs",
+        target_call,
+        target_call + "BuilderClassMap".len(),
+    );
+    assert_eq!(forward["results"][0]["status"], "resolved", "{forward}");
+    assert_eq!(
+        forward["results"][0]["definitions"][0]["fqn"], "Demo.ClassMapBuilder`1$BuilderClassMap`1",
+        "{forward}"
+    );
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let targeted = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        )
+        .result
+        .into_either()
+        .expect("targeted nested-generic query should resolve");
+    let whole_workspace = UsageFinder::new()
+        .query(&analyzer, std::slice::from_ref(&target), 1000, 1000)
+        .result
+        .into_either()
+        .expect("whole-workspace nested-generic query should resolve");
+
+    for hits in [&targeted, &whole_workspace] {
+        assert_eq!(
+            hits.len(),
+            1,
+            "only the matching lexical owner and independent arities should resolve: {hits:#?}"
+        );
+        let hit = hits.iter().next().expect("nested generic construction hit");
+        assert_eq!(consumer, hit.file);
+        assert!(
+            hit.start_offset <= target_call
+                && target_call + "BuilderClassMap".len() <= hit.end_offset,
+            "the target construction identifier should be covered: {hit:#?}"
+        );
+        for control in [
+            other_owner_call,
+            other_outer_arity_call,
+            other_inner_arity_call,
+        ] {
+            assert!(
+                !(hit.start_offset <= control && control < hit.end_offset),
+                "a control with another owner or arity must not match: {hit:#?}"
+            );
+        }
+    }
 }
 
 #[test]

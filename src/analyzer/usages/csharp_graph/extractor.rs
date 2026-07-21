@@ -396,6 +396,7 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             .callable_arity
             .is_none_or(|arity| arity.accepts(call_arity))
     });
+    let member_call_arity = call_arity.filter(|_| ctx.spec.kind == TargetKind::Method);
     if ctx.spec.kind == TargetKind::Method
         && !ctx.spec.is_extension_method()
         && !ordinary_call_arity_matches
@@ -476,7 +477,7 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 receiver_fqn_target_member_resolution(
                     target,
                     name.explicit_generic_arity,
-                    call_arity,
+                    member_call_arity,
                     ctx,
                 ) == TargetMemberResolution::MatchesTarget
             }) =>

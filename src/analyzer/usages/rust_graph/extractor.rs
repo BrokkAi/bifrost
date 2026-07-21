@@ -5,7 +5,9 @@ use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::usages::ImportKind;
 use crate::analyzer::usages::common::{TreeWalkAction, same_node, walk_tree_iterative};
 use crate::analyzer::usages::get_definition::{
-    RustTypeLookupCache, rust_expression_type_definition_fqn_cached, rust_resolve_type_node_fqn,
+    RustTypeLookupCache, rust_expression_type_definition_candidates_cached,
+    rust_expression_type_definition_fqn_cached, rust_field_definition_type_candidates_cached,
+    rust_resolve_type_node_fqn,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
@@ -368,9 +370,7 @@ fn is_local_use_binding_node(node: Node<'_>) -> bool {
 fn is_shadowed_identifier(text: &str, node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     if lexical_scope::is_pattern_binding_identifier(node)
         || ctx.lexical_scope.name_bound_at(text, node.start_byte())
-        || (!ctx.target_self_file
-            && ctx.lexical_scope.item_bound_at(text, node.start_byte())
-            && !is_impl_associated_type_value_reference(node))
+        || (!ctx.target_self_file && ctx.lexical_scope.item_bound_at(text, node.start_byte()))
     {
         return true;
     }
@@ -384,22 +384,6 @@ fn is_shadowed_identifier(text: &str, node: Node<'_>, ctx: &ScanCtx<'_>) -> bool
         })
 }
 
-fn is_impl_associated_type_value_reference(mut node: Node<'_>) -> bool {
-    while let Some(parent) = node.parent() {
-        if parent.kind() == "type_item" {
-            return enclosing_impl_item(parent).is_some()
-                && parent.child_by_field_name("type").is_some_and(|value| {
-                    value.start_byte() <= node.start_byte() && node.end_byte() <= value.end_byte()
-                });
-        }
-        if matches!(parent.kind(), "block" | "declaration_list" | "source_file") {
-            return false;
-        }
-        node = parent;
-    }
-    false
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_files_for_member_target(
     analyzer: &dyn IAnalyzer,
@@ -411,7 +395,10 @@ pub(super) fn scan_files_for_member_target(
     seeds: &RustBindingSeeds,
     cancellation: Option<&CancellationToken>,
 ) -> RustMemberScanResult {
-    let Some(owner) = rust.parent_of(target) else {
+    let Some(owner) = rust
+        .structural_parent_of(target)
+        .or_else(|| rust.parent_of(target))
+    else {
         return RustMemberScanResult::default();
     };
     let member_name = target.identifier().to_string();
@@ -502,7 +489,8 @@ pub(super) fn scan_files_for_member_target(
             target_is_field: requested_target.is_field(),
             target_is_enum_variant: requested_target.is_field()
                 && rust
-                    .parent_of(requested_target)
+                    .structural_parent_of(requested_target)
+                    .or_else(|| rust.parent_of(requested_target))
                     .is_some_and(|owner| rust.is_rust_enum_declaration(&owner)),
             target_owner_is_trait: trait_owner,
             receiver_names: &receiver_names,
@@ -806,30 +794,35 @@ fn record_token_tree_instance_member_hits(node: Node<'_>, ctx: &mut MemberScanCt
         else {
             continue;
         };
-        let inferred_match =
-            match receiver_owner_proof(*receiver, receiver_name.as_deref(), &enclosing, ctx) {
-                ReceiverOwnerProof::Structured => false,
-                ReceiverOwnerProof::Inferred => true,
-                ReceiverOwnerProof::Mismatches => continue,
-                ReceiverOwnerProof::Unknown => {
-                    if ctx.record_unproven_receivers
-                        && receiver_name.as_ref().is_some_and(|receiver_name| {
-                            !receiver_name_explicitly_mismatched(receiver_name, &enclosing, ctx)
-                        })
-                    {
-                        push_unproven_member_hit(
-                            ctx.file,
-                            ctx.source,
-                            ctx.line_starts,
-                            start,
-                            end,
-                            enclosing,
-                            ctx.unproven_hits,
-                        );
-                    }
-                    continue;
+        let receiver_types = token_tree_receiver_type_candidates(&children, index, ctx);
+        let proof = if receiver_types.is_empty() {
+            receiver_owner_proof(*receiver, receiver_name.as_deref(), &enclosing, ctx)
+        } else {
+            receiver_type_candidates_proof(&receiver_types, ctx)
+        };
+        let inferred_match = match proof {
+            ReceiverOwnerProof::Structured => false,
+            ReceiverOwnerProof::Inferred => true,
+            ReceiverOwnerProof::Mismatches => continue,
+            ReceiverOwnerProof::Unknown => {
+                if ctx.record_unproven_receivers
+                    && receiver_name.as_ref().is_some_and(|receiver_name| {
+                        !receiver_name_explicitly_mismatched(receiver_name, &enclosing, ctx)
+                    })
+                {
+                    push_unproven_member_hit(
+                        ctx.file,
+                        ctx.source,
+                        ctx.line_starts,
+                        start,
+                        end,
+                        enclosing,
+                        ctx.unproven_hits,
+                    );
                 }
-            };
+                continue;
+            }
+        };
         if inferred_match && let Some(receiver_name) = receiver_name.as_ref() {
             let receiver_mismatched = ctx
                 .analyzer
@@ -869,6 +862,75 @@ fn record_token_tree_instance_member_hits(node: Node<'_>, ctx: &mut MemberScanCt
             );
         }
     }
+}
+
+fn token_tree_receiver_type_candidates(
+    children: &[Node<'_>],
+    receiver_index: usize,
+    ctx: &mut MemberScanCtx<'_>,
+) -> Vec<CodeUnit> {
+    let mut root_index = receiver_index;
+    while root_index >= 2 && children[root_index - 1].kind() == "." {
+        let previous = children[root_index - 2];
+        if !matches!(previous.kind(), "identifier" | "self") {
+            break;
+        }
+        root_index -= 2;
+    }
+    let root = children[root_index];
+    if !matches!(root.kind(), "identifier" | "self") {
+        return Vec::new();
+    }
+
+    let mut receiver_types = rust_expression_type_definition_candidates_cached(
+        ctx.analyzer,
+        ctx.support,
+        ctx.file,
+        ctx.source,
+        ctx.root,
+        root,
+        root.start_byte(),
+        ctx.type_lookup_cache,
+    );
+    let mut segment_index = root_index + 2;
+    while segment_index <= receiver_index && !receiver_types.is_empty() {
+        let Some(field_name) = simple_node_text(children[segment_index], ctx.source) else {
+            return Vec::new();
+        };
+        let mut fields = BTreeSet::new();
+        for owner in &receiver_types {
+            for candidate in ctx
+                .support
+                .fqn(&format!("{}.{}", owner.fq_name(), field_name))
+            {
+                if !candidate.is_field() {
+                    continue;
+                }
+                if ctx
+                    .rust
+                    .parent_of(&candidate)
+                    .is_some_and(|parent| same_rust_declaration_identity(&parent, owner))
+                {
+                    fields.insert(candidate);
+                }
+            }
+        }
+        receiver_types = fields
+            .iter()
+            .flat_map(|field| {
+                rust_field_definition_type_candidates_cached(
+                    ctx.analyzer,
+                    ctx.support,
+                    field,
+                    ctx.type_lookup_cache,
+                )
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        segment_index += 2;
+    }
+    receiver_types
 }
 
 fn record_token_tree_static_member_hits(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
@@ -985,6 +1047,22 @@ fn receiver_owner_proof(
     enclosing: &CodeUnit,
     ctx: &mut MemberScanCtx<'_>,
 ) -> ReceiverOwnerProof {
+    let receiver_types = rust_expression_type_definition_candidates_cached(
+        ctx.analyzer,
+        ctx.support,
+        ctx.file,
+        ctx.source,
+        ctx.root,
+        receiver,
+        receiver.start_byte(),
+        ctx.type_lookup_cache,
+    );
+    if !receiver_types.is_empty() {
+        match receiver_type_candidates_proof(&receiver_types, ctx) {
+            ReceiverOwnerProof::Unknown => {}
+            proof => return proof,
+        }
+    }
     if let Some(fqn) = rust_expression_type_definition_fqn_cached(
         ctx.analyzer,
         ctx.support,
@@ -1030,6 +1108,82 @@ fn receiver_owner_proof(
     } else {
         ReceiverOwnerProof::Unknown
     }
+}
+
+fn receiver_type_candidates_proof(
+    receiver_types: &[CodeUnit],
+    ctx: &MemberScanCtx<'_>,
+) -> ReceiverOwnerProof {
+    if !ctx.target_owner_is_trait && type_candidates_match_owner(receiver_types, ctx) {
+        return ReceiverOwnerProof::Structured;
+    }
+    if let Some(matches) = receiver_type_candidates_match_requested_dispatch(receiver_types, ctx) {
+        return if matches {
+            ReceiverOwnerProof::Structured
+        } else {
+            ReceiverOwnerProof::Mismatches
+        };
+    }
+    let resolved_is_alias = receiver_types
+        .iter()
+        .any(|unit| ctx.rust.is_type_alias(unit));
+    if !ctx.target_owner_is_trait && !resolved_is_alias {
+        ReceiverOwnerProof::Mismatches
+    } else {
+        ReceiverOwnerProof::Unknown
+    }
+}
+
+fn type_candidates_match_owner(receiver_types: &[CodeUnit], ctx: &MemberScanCtx<'_>) -> bool {
+    let canonical: Option<BTreeSet<_>> = receiver_types
+        .iter()
+        .cloned()
+        .map(|unit| ctx.rust.canonical_rust_hierarchy_type(unit))
+        .collect();
+    let Some(canonical) = canonical else {
+        return false;
+    };
+    canonical.len() == 1 && canonical.first().is_some_and(|unit| unit == ctx.owner)
+}
+
+fn receiver_type_candidates_match_requested_dispatch(
+    receiver_types: &[CodeUnit],
+    ctx: &MemberScanCtx<'_>,
+) -> Option<bool> {
+    let receiver_types: Vec<_> = receiver_types
+        .iter()
+        .filter(|unit| ctx.rust.supports_type_hierarchy(unit))
+        .collect();
+    if receiver_types.is_empty()
+        || receiver_types
+            .iter()
+            .any(|unit| ctx.rust.is_type_alias(unit))
+    {
+        return None;
+    }
+
+    if ctx.requested_target != ctx.scan_target {
+        let requested_owner = ctx.rust.parent_of(ctx.requested_target)?;
+        return Some(receiver_types.into_iter().any(|receiver_type| {
+            same_rust_declaration_identity(receiver_type, &requested_owner)
+                && ctx
+                    .rust
+                    .get_ancestors(receiver_type)
+                    .iter()
+                    .any(|ancestor| same_rust_declaration_identity(ancestor, ctx.owner))
+        }));
+    }
+
+    ctx.target_owner_is_trait.then(|| {
+        receiver_types.into_iter().any(|receiver_type| {
+            same_rust_declaration_identity(receiver_type, ctx.owner)
+                || ctx
+                    .rust
+                    .get_ancestors(receiver_type)
+                    .iter()
+                    .any(|ancestor| same_rust_declaration_identity(ancestor, ctx.owner))
+        })
+    })
 }
 
 fn receiver_type_matches_requested_dispatch(fqn: &str, ctx: &MemberScanCtx<'_>) -> Option<bool> {

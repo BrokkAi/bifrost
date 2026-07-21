@@ -306,7 +306,10 @@ impl RustLexicalScopeIndex {
                         );
                     }
                 }
-                "struct_item" | "enum_item" | "trait_item" | "type_item" | "mod_item" => {
+                "type_item" if !is_associated_type_item(node) => {
+                    index.add_item_binding(node, scope_start, scope_end, source);
+                }
+                "struct_item" | "enum_item" | "trait_item" | "mod_item" => {
                     index.add_item_binding(node, scope_start, scope_end, source);
                 }
                 _ => {}
@@ -420,6 +423,17 @@ impl RustLexicalScopeIndex {
     }
 }
 
+fn is_associated_type_item(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "impl_item" | "trait_item" => return true,
+            "function_item" | "mod_item" | "source_file" => return false,
+            _ => node = parent,
+        }
+    }
+    false
+}
+
 fn let_condition_visibility_end(mut node: Node<'_>) -> Option<usize> {
     while let Some(parent) = node.parent() {
         if matches!(parent.kind(), "if_expression" | "while_expression") {
@@ -480,7 +494,7 @@ fn collect_visible_local_items(
 /// Whether `node` is the identifier being introduced by a Rust binding pattern.
 /// Type/variant owners in structured patterns are deliberately excluded.
 pub(crate) fn is_pattern_binding_identifier(node: Node<'_>) -> bool {
-    if node.kind() != "identifier" {
+    if !matches!(node.kind(), "identifier" | "shorthand_field_identifier") {
         return false;
     }
     let mut current = node.parent();
@@ -513,7 +527,7 @@ fn pattern_contains_binding_identifier(pattern: Node<'_>, target: Node<'_>) -> b
     let mut stack = vec![pattern];
     while let Some(node) = stack.pop() {
         match node.kind() {
-            "identifier" => {
+            "identifier" | "shorthand_field_identifier" => {
                 if node.id() == target.id() {
                     return true;
                 }
