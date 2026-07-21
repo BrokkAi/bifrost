@@ -13,6 +13,7 @@ Warm persisted Scala symbol queries must resolve inherited members, constructors
 - [x] (2026-07-21 18:02Z) Mapped the 34-file bulk hydration to the lexical-type ancestor callback and enumerated every `project_types()` call reachable from forward Scala definition lookup.
 - [x] (2026-07-21 18:22Z) Replaced forward hierarchy and callable-shape reads with request-bounded live owner/source facts; `get_definition/scala.rs` no longer calls `project_types()`.
 - [x] (2026-07-21 18:34Z) Passed the full 42-test persistence target, the 74 Scala definition tests, 21 hierarchy tests, and both Scala usage suites (55 and 139 tests). Formatting, clippy, and the repository-wide feature-enabled suite remain release gates owned by the parent campaign plan.
+- [x] (2026-07-21 19:20Z) Corrected the unrestricted-suite LSP regression so exact same-depth inherited trait conflicts return all resolved definitions; the exact click-around regression and the 74-test Scala definition subset pass.
 
 ## Surprises & Discoveries
 
@@ -28,6 +29,9 @@ Warm persisted Scala symbol queries must resolve inherited members, constructors
 - Observation: The forward module depended on the inverse projection for more than ancestry.
   Evidence: Constructor applicability, method-value function arity, typed overload selection, callable roles and shapes, subtype checks, and namespace inheritance all contained direct `project_types()` calls. The final implementation removes all of them.
 
+- Observation: Multiple exact ancestors at one inheritance depth are not an owner-resolution ambiguity.
+  Evidence: `ConflictService extends Primary with Secondary` must return both exact `id` declarations. Import/name ambiguity is rejected while resolving each ancestor path; a later structural-parent-count check incorrectly converted this valid conflict to null.
+
 ## Decision Log
 
 - Decision: Preserve the public forward resolver and add bounded owner/callable helpers instead of weakening the persistence thresholds.
@@ -42,11 +46,15 @@ Warm persisted Scala symbol queries must resolve inherited members, constructors
   Rationale: Forward constructor, overload, and method-value behavior still needs exact callable roles and shapes, but the inverse projection's workspace-wide cache is unnecessary for a queried declaration.
   Date/Author: 2026-07-21 / Codex
 
+- Decision: Return all same-depth member definitions from distinct, already-exact ancestor declarations while retaining fail-closed resolution for ambiguous imports, duplicate physical owner candidates, and unresolved type paths.
+  Rationale: The former is the public definition contract for Scala trait conflicts; the latter are cases where no exact physical owner has been proven.
+  Date/Author: 2026-07-21 / Codex
+
 ## Outcomes & Retrospective
 
 Forward Scala lookup now obtains ancestor facts from the exact live owner and callable facts from the exact declaration source. It preserves explicit-import and wildcard ambiguity, dirty-overlay authority, stale-OID exclusion, physical owner identity, constructor roles, typed overloads, and method-value shapes without constructing the inverse `ScalaProjectTypes` model.
 
-The full `analyzer_persistence` target passes 42/42, including all seven warm Scala queries plus dirty-overlay and stale-owner cases. Scala definition lookup passes 74/74 filtered tests, hierarchy passes 21/21, and the forward/inverse usage suites pass 55/55 and 139/139. No thresholds or semantic assertions were weakened.
+The full `analyzer_persistence` target passes 42/42, including all seven warm Scala queries plus dirty-overlay and stale-owner cases. The complete definition target passes 580/580, Scala precedence passes 43/43, residual Scala scope passes 8/8, hierarchy passes 21/21, and the forward/inverse usage suites pass 55/55 and 139/139. The exact Scala extension/trait click-around regression also passes after preserving both definitions for a valid same-depth inherited trait conflict. No thresholds or semantic assertions were weakened.
 
 ## Context and Orientation
 
@@ -101,3 +109,5 @@ Keep `BoundedDefinitionLookup` as the only declaration-query dependency of forwa
 Revision note (2026-07-21): Initial plan created after issue assignment and two exact reproductions.
 
 Revision note (2026-07-21): Recorded the complete bounded implementation and focused validation results. Repository-wide formatting, clippy, and full-suite gates remain tracked by the parent differential campaign.
+
+Revision note (2026-07-21): Recorded the same-depth trait-conflict correction found by the unrestricted suite and its exact plus Scala-definition validation.
