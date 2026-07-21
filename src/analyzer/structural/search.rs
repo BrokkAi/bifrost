@@ -10220,7 +10220,7 @@ mod tests {
             .expect("write right hub");
         for name in ["One", "Two"] {
             ProjectFile::new(root.clone(), PathBuf::from(format!("bench/Node{name}.java")))
-                .write(&format!(
+                .write(format!(
                     "package bench;\nimport bench.LeftHub;\nimport bench.RightHub;\npublic class Node{name} {{}}\n"
                 ))
                 .expect("write importer");

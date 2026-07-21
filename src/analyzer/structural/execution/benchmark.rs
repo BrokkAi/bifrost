@@ -1251,8 +1251,8 @@ fn run_parallel_case(
         .operators
         .iter()
         .any(|operator| operator.operator == PhysicalQueryOperator::ParallelUnion);
-    assert_eq!(
-        auto_selected_parallel, false,
+    assert!(
+        !auto_selected_parallel,
         "{} Auto policy must retain the benchmark-derived sequential fallback at {} workspace files",
         spec.name, stats.files
     );
